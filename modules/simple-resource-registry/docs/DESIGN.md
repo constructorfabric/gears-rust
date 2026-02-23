@@ -114,7 +114,7 @@ All resource types are defined and registered through GTS. The base resource typ
 
 - [ ] `p1` - **ID**: `cpt-cf-srr-constraint-backend-internal-storage`
 
-Storage layout and optimization (table design, indexing, partitioning) are backend-internal concerns documented in each backend's own DESIGN and ADRs. The main module makes no assumptions about the physical storage structure beyond what the `ResourceStoragePluginClient` trait contract requires. For resource types requiring specialized storage (full-text search, dedicated indexing), per-resource-type routing (`cpt-cf-srr-fr-multi-backend-storage`) enables alternative backends.
+Storage layout and optimization (table design, indexing, partitioning) are backend-internal concerns. The main module defines a **canonical reference schema** (see §3.8) as the recommended starting point for relational backends — this ensures predictable performance, easier plugin implementations, and consistent migrations. Non-relational backends may use any internal data structure appropriate to their storage technology. For resource types requiring specialized storage (full-text search, dedicated indexing), per-resource-type routing (`cpt-cf-srr-fr-multi-backend-storage`) enables alternative backends.
 
 #### No Payload Querying
 
@@ -432,6 +432,8 @@ pub trait ResourceStoragePluginClient: Send + Sync {
 
     /// List resources with OData query parameters.
     /// Only called if capabilities().odata_support == true.
+    /// Plugins declaring odata_support MUST support $filter/$orderby on all
+    /// canonical schema fields defined in the OData Query Grammar (§3.3).
     async fn list(
         &self,
         ctx: &SecurityContext,
@@ -611,6 +613,40 @@ Notes:
 - When `type` filter uses a wildcard (trailing `*`), results are intersected with the caller's permitted GTS types from token permissions
 - GTS wildcard must appear only once, at the end, per GTS spec section 10
 
+**OData Query Grammar** (`cpt-cf-srr-fr-odata-schema-fields`):
+
+The OData subset is restricted to an explicit allowlist of schema fields and operators per DNA QUERYING.md. The `ODataFilterable` derive macro enforces the allowlist at compile time; payload fields are unconditionally rejected.
+
+Allowed `$filter` fields:
+
+| Field | Operators | Type | Notes |
+| --- | --- | --- | --- |
+| `type` | `eq` | String | Supports GTS trailing `*` wildcard for prefix matching |
+| `owner_id` | `eq` | UUID | |
+| `created_at` | `eq`, `gt`, `ge`, `lt`, `le` | DateTimeUtc | |
+| `updated_at` | `eq`, `gt`, `ge`, `lt`, `le` | DateTimeUtc | |
+| `id` | `eq`, `in` | UUID | `in` capped at 50 values |
+
+Allowed `$orderby` fields:
+
+| Field | Directions |
+| --- | --- |
+| `created_at` | `asc`, `desc` |
+| `updated_at` | `asc`, `desc` |
+| `id` | `asc`, `desc` (always appended as tiebreaker per DNA QUERYING.md) |
+
+Query limits:
+
+| Limit | Value |
+| --- | --- |
+| Maximum filter predicates per `$filter` | 5 |
+| Maximum page size (`limit`) | 1000 |
+| Default page size | 50 |
+| Nested `or` groups | Forbidden |
+| Payload field references in `$filter`/`$orderby` | Forbidden → 400 `invalid-odata-query` |
+
+All plugins declaring `odata_support: true` **MUST** support `$filter` and `$orderby` on the canonical schema fields listed above. This ensures consistent query behavior regardless of the storage backend.
+
 **Access Control Model** (applies to GET, LIST, UPDATE, DELETE):
 
 All access checks are applied as **backend query filters**, not as post-fetch in-memory checks. The storage plugin query always includes:
@@ -758,7 +794,8 @@ Notes:
 
 Notes:
 
-- Each item is independently resolved with tenant scoping and GTS access control
+- Top-level HTTP status follows DNA aggregate rules: all succeeded → `200`; partial → `207`; all failed same type → matching `4xx`; all failed mixed → `207`
+- Each item is independently resolved with tenant scoping and GTS access control (best-effort semantics)
 - Items that fail access control or do not exist return per-item errors (RFC 9457 Problem Details)
 - Maximum batch size: configurable (default 100)
 
@@ -821,15 +858,18 @@ Notes:
 
 Notes:
 
-- Follows DNA BATCH.md conventions: `POST /resources:batch`, `207 Multi-Status`, per-item `index`/`status`/`data`/`error`
-- Each item is validated and processed independently (best-effort semantics)
+- Follows DNA BATCH.md conventions: `POST /resources:batch`, per-item `index`/`status`/`data`/`error`/`location`
+- Top-level HTTP status follows DNA aggregate rules: all succeeded → `200 OK`; partial success/failure → `207 Multi-Status`; all failed with same error type → matching `4xx`; all failed with mixed errors → `207 Multi-Status`
+- Each item is validated and processed independently (best-effort semantics, not atomic)
 - GTS type validation, access control, and behavioral flag evaluation are applied per item
 - For item-level GET/PUT/DELETE semantics, inaccessible resources return 404 because tenant/user/type checks are applied as backend query filters
 - Partial success is allowed — some items may succeed while others fail
 - `idempotency_key` is required for items with `action: "create"`; optional for `update`/`delete` items (used for batch-level retry safety only)
+- When a create item is replayed from the idempotency cache, the response item includes `"idempotency_replayed": true` (per DNA BATCH.md §Idempotency)
 - Error responses use RFC 9457 Problem Details per item
 - Event/audit emission applies per successfully processed item
 - Maximum batch size: configurable (default 100)
+- Maximum batch request payload: 1 MB (per DNA BATCH.md performance limits)
 
 ### 3.4 Internal Dependencies
 
@@ -1200,12 +1240,44 @@ sequenceDiagram
 
 ### 3.8 Database Schemas & Tables
 
-Database schema design is the responsibility of each storage backend (plugin). The main module defines only the logical `Resource` entity and `ResourceTypeConfig` (see §3.1 Domain Model); physical schema, indexing strategy, and storage optimizations are backend-internal concerns.
+#### Canonical Reference Schema
 
-For the default relational database backend, see:
+The following relational schema is the **recommended starting point** for all relational storage backends. It maps directly to the logical `Resource` entity (§3.1) and is used by the default plugin (`srr-rdb-plugin`). Non-relational backends may use any internal structure but **MUST** persist the same logical fields and support equivalent query patterns.
 
-- **Plugin DESIGN**: [`plugins/srr-rdb-plugin/docs/DESIGN.md`](../plugins/srr-rdb-plugin/docs/DESIGN.md) — table schemas, indexes, idempotency table, group memberships table
-- **Storage optimization ADR**: [`plugins/srr-rdb-plugin/docs/ADR/0001-cpt-cf-srr-rdb-adr-storage-optimization.md`](../plugins/srr-rdb-plugin/docs/ADR/0001-cpt-cf-srr-rdb-adr-storage-optimization.md) — rationale for single-table with indexes over partitioning or per-type tables
+**Table: `simple_resources`**
+
+| Column | Type | Nullable | Description |
+| --- | --- | --- | --- |
+| `id` | UUID | NOT NULL | Primary key (system-generated or caller-supplied) |
+| `type` | VARCHAR(512) | NOT NULL | GTS type identifier |
+| `tenant_id` | UUID | NOT NULL | Tenant owner (from `SecurityContext.subject_tenant_id`) |
+| `owner_id` | UUID | NULL | Subject owner (set when `is_per_owner_resource=true`) |
+| `created_at` | TIMESTAMP WITH TIME ZONE | NOT NULL | Creation timestamp |
+| `updated_at` | TIMESTAMP WITH TIME ZONE | NOT NULL | Last update timestamp |
+| `deleted_at` | TIMESTAMP WITH TIME ZONE | NULL | Soft-delete timestamp (NULL = active) |
+| `payload` | TEXT | NOT NULL | Serialized JSON payload (max 64 KB, validated at API layer) |
+
+**Primary Key**: `id`
+
+**Indexes** (minimum set for the query patterns in §3.3):
+
+| Index | Columns | Purpose |
+| --- | --- | --- |
+| `idx_tenant_type` | `(tenant_id, type)` | List resources of a type within a tenant |
+| `idx_tenant_type_created` | `(tenant_id, type, created_at)` | OData `$orderby created_at` within a type |
+| `idx_tenant_owner` | `(tenant_id, owner_id)` | User-scoped resource queries |
+| `idx_type_deleted` | `(type, deleted_at)` | Retention purge job |
+
+**Benefits**: predictable query performance across plugins; consistent migration paths; easier plugin implementation — new backends start from a known-good schema rather than inventing their own.
+
+**Payload size limit**: Resource payloads are limited to 64 KB (see `cpt-cf-srr-constraint-payload-size`). Validated at the API layer before reaching the plugin.
+
+#### Default Backend Details
+
+For the default relational database backend's complete schema (including the idempotency keys table, group memberships table, and full indexing strategy), see:
+
+- **Plugin DESIGN**: [`plugins/srr-rdb-plugin/docs/DESIGN.md`](../plugins/srr-rdb-plugin/docs/DESIGN.md)
+- **Storage optimization ADR**: [`plugins/srr-rdb-plugin/docs/ADR/0001-cpt-cf-srr-rdb-adr-storage-optimization.md`](../plugins/srr-rdb-plugin/docs/ADR/0001-cpt-cf-srr-rdb-adr-storage-optimization.md)
 
 Other storage backends **MUST** implement equivalent persistence for the `Resource` entity and idempotency deduplication (see `CreateOutcome` in §3.2), but may use any internal data structure appropriate to their storage technology.
 

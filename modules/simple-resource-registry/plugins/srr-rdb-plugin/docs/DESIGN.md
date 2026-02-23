@@ -19,9 +19,9 @@ Idempotency deduplication is handled atomically within a single database transac
 | `cpt-cf-srr-rdb-fr-relational-storage` | SeaORM entity with dedicated columns for schema fields + TEXT column for serialized JSON payload; SecureORM for tenant scoping; declares `odata_support` capability |
 | `cpt-cf-srr-rdb-fr-odata-translation` | OData $filter/$orderby translated to SeaORM `Condition` and `Order` on schema columns; cursor-based pagination via `id > cursor_id` predicate |
 | `cpt-cf-srr-rdb-fr-gts-wildcard` | Trailing `*` in type filter → SQL `LIKE '{prefix}%'`; prefix derived by stripping `*` from the GTS pattern |
-| `cpt-cf-srr-rdb-fr-idempotency` | Single-transaction: `INSERT INTO idempotency_keys ... ON CONFLICT DO NOTHING` + conditional resource insert; returns `CreateOutcome::Duplicate` if key exists |
+| `cpt-cf-srr-rdb-fr-idempotency` | Single-transaction: check-then-insert via SeaORM within a DB transaction — query `idempotency_keys` for existing key, insert resource + idempotency record if absent; returns `CreateOutcome::Duplicate` if key exists |
 | `cpt-cf-srr-rdb-fr-soft-delete` | `UPDATE simple_resources SET deleted_at = now() WHERE id = ? AND tenant_id = ?`; list queries include `WHERE deleted_at IS NULL` |
-| `cpt-cf-srr-rdb-fr-retention-purge` | `DELETE FROM simple_resources WHERE type = ? AND deleted_at < ? LIMIT ?` |
+| `cpt-cf-srr-rdb-fr-retention-purge` | Delete soft-deleted rows older than the cutoff in bounded batches using SeaORM query builders; exact SQL varies by backend (e.g., `LIMIT` on MariaDB/SQLite, CTE or subquery on PostgreSQL) |
 | `cpt-cf-srr-rdb-fr-group-memberships` | Junction table `simple_resource_group_memberships` with `(id, group_id)` PK |
 | `cpt-cf-srr-rdb-fr-db-agnostic` | SeaORM-based implementation behaves consistently across PostgreSQL, MariaDB, and SQLite |
 
@@ -247,10 +247,10 @@ sequenceDiagram
 
 - `idx_simple_resources_tenant` — `(tenant_id)` — Required for tenant-scoped queries
 - `idx_simple_resources_tenant_type` — `(tenant_id, type)` — Primary query pattern: list resources of a type within a tenant
-- `idx_simple_resources_tenant_user` — `(tenant_id, owner_id)` WHERE `owner_id IS NOT NULL` — For user-scoped resource queries
+- `idx_simple_resources_tenant_user` — `(tenant_id, owner_id)` — For user-scoped resource queries
 - `idx_simple_resources_tenant_type_created` — `(tenant_id, type, created_at)` — For OData $orderby on created_at within a type
 - `idx_simple_resources_tenant_deleted` — `(tenant_id, deleted_at)` — For filtering out soft-deleted resources
-- `idx_simple_resources_type_deleted` — `(type, deleted_at)` WHERE `deleted_at IS NOT NULL` — For retention purge job queries
+- `idx_simple_resources_type_deleted` — `(type, deleted_at)` — For retention purge job queries
 
 **Constraints**:
 
