@@ -34,16 +34,16 @@ Idempotency deduplication is handled atomically within a single database transac
 
 ### 1.3 Architecture Layers
 
-```
+```text
 ┌──────────────────────────────────────────────────────────┐
 │              Plugin Entry Point                          │
 │   ClientHub registration, PluginCapabilities             │
 ├──────────────────────────────────────────────────────────┤
 │              Storage Implementation                      │
-│   ResourceStoragePluginClient trait methods               │
+│   ResourceStoragePluginClient trait methods              │
 │   OData → SeaORM translation, GTS wildcard → LIKE        │
 ├──────────────────────────────────────────────────────────┤
-│              SecureORM / SeaORM                           │
+│              SecureORM / SeaORM                          │
 │   Tenant-scoped queries, connection pooling              │
 ├──────────────────────────────────────────────────────────┤
 │              Database                                    │

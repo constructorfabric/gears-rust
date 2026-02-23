@@ -201,7 +201,7 @@ Single-resource fetch-by-ID **MUST** complete within 50ms at p95 under normal lo
 
 ## 8. Use Cases
 
-#### Standard CRUD via Main Module
+### Standard CRUD via Main Module
 
 - [ ] `p1` - **ID**: `cpt-cf-srr-rdb-usecase-crud`
 

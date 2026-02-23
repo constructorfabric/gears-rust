@@ -114,7 +114,7 @@ This means the default plugin does not need to solve every scalability problem â
 
 - **Plugin PRD**: [../PRD.md](../PRD.md)
 - **Plugin DESIGN**: [../DESIGN.md](../DESIGN.md)
-- **Parent Module PRD**: [../../../../simple-resource-registry/docs/PRD.md](../../../../simple-resource-registry/docs/PRD.md)
+- **Parent Module PRD**: [../../../../docs/PRD.md](../../../../docs/PRD.md)
 
 This decision directly addresses the following requirements or design elements:
 

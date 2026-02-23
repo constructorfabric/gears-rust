@@ -6,7 +6,7 @@
 
 Simple Resource Registry follows a layered architecture with a pluggable storage backend. The module exposes a single REST API surface for CRUD operations on typed resources. All resources share a common schema envelope (identity, ownership, timestamps) and an opaque JSON payload. Schema envelope fields are queryable via OData; payload content is opaque and not queryable.
 
-The resource `type` field contains the resource's GTS type identifier in GTS ID format. In other words, the resource `type` value is the same identifier as the resource's GTS schema ID (GTS type ID).
+The resource `type` field contains the resource's GTS type identifier in GTS ID format. In other words, the resource `type` value is the same identifier as the resource's GTS type ID (GTS type ID).
 
 The storage layer is abstracted behind a `ResourceStoragePluginClient` trait, allowing the same API to serve different backends. The default implementation is a relational backend (`cpt-cf-srr-fr-default-storage-backend`) described in the [plugin DESIGN](../plugins/srr-rdb-plugin/docs/DESIGN.md). The interface is intentionally minimal: the core module handles authentication, authorization, GTS type resolution, and event/audit emission, while backends handle persistence and query execution. Multiple backends can coexist with per-resource-type routing.
 
@@ -19,18 +19,18 @@ Resource type definitions are managed through GTS (Global Type System) via the T
 | Requirement | Design Response |
 | --- | --- |
 | `cpt-cf-srr-fr-create-resource` | API layer extracts tenant/user from SecurityContext; domain layer assigns UUID and timestamps; delegates to storage plugin |
-| `cpt-cf-srr-fr-read-resource` | ResourceService resolves permitted GTS types, then storage plugin applies DB-level filters (tenant, type scope, owner_id for per-user types); returns 404 when no row matches |
+| `cpt-cf-srr-fr-read-resource` | ResourceService resolves permitted GTS types, then storage plugin applies backend-level filters (tenant, type scope, owner_id for per-user types); returns 404 when no match found |
 | `cpt-cf-srr-fr-list-resources` | OData parser translates query params to backend query filters on schema columns; plugin executes scoped query |
-| `cpt-cf-srr-fr-update-resource` | ResourceService resolves permitted GTS types, storage plugin fetches target row with DB-level security filters, then domain layer validates payload and updates `updated_at` |
+| `cpt-cf-srr-fr-update-resource` | ResourceService resolves permitted GTS types, storage plugin fetches target resource with backend-level security filters, then domain layer validates payload and updates `updated_at` |
 | `cpt-cf-srr-fr-delete-resource` | Soft-delete via deleted_at timestamp; storage plugin filters soft-deleted records from list queries |
 | `cpt-cf-srr-fr-gts-type-registration` | Base GTS schema registered at module startup; derived types registered by consumer modules via Types Registry SDK |
 | `cpt-cf-srr-fr-default-storage-backend` | Default relational DB backend implemented as a separate plugin module (`srr-rdb-plugin`); declares `odata_support` capability |
 | `cpt-cf-srr-nfr-scalability` | 100M resources / 100 writes·s⁻¹ / 1000 reads-by-ID·s⁻¹ — achieved via proper indexing in the default backend; storage optimization is a per-backend concern |
 | `cpt-cf-srr-fr-odata-schema-fields` | OData $filter/$orderby limited to schema columns; cursor-based pagination (limit, cursor); payload column excluded from query support |
-| `cpt-cf-srr-fr-gts-access-control` | ResourceService checks caller `Permission` entries (`resource_pattern` + action). Returns 403 for pre-query denials (POST, LIST no-intersection). For individual resources (GET/PUT/DELETE), permissions are enforced via DB filters and unmatched scope results in 404 |
+| `cpt-cf-srr-fr-gts-access-control` | ResourceService checks caller `Permission` entries (`resource_pattern` + action). Returns 403 for pre-query denials (POST, LIST no-intersection). For individual resources (GET/PUT/DELETE), permissions are enforced via backend query filters and unmatched scope results in 404 |
 | `cpt-cf-srr-fr-gts-wildcard-filtering` | GET list accepts GTS wildcard in `type` filter (trailing `*`); uses `GtsWildcard::new()` + `gts_id.wildcard_match()` for matching; results intersected with caller's permitted GTS types |
 | `cpt-cf-srr-fr-gts-type-validation` | ResourceService calls Types Registry SDK to verify GTS type existence; returns 400 `gts-type-not-found` if missing |
-| `cpt-cf-srr-fr-deleted-retention` | Jobs Manager job hard-deletes rows where `deleted_at + deleted_resource_retention_days < now()` for soft-deleted resources |
+| `cpt-cf-srr-fr-deleted-retention` | Jobs Manager job permanently removes resources where `deleted_at + deleted_resource_retention_days < now()` for soft-deleted resources |
 | `cpt-cf-srr-fr-notification-events` | Domain layer checks GTS type behavioral flags; emits fixed-schema events (id, type, subject_type, subject_id) via Events Broker SDK when enabled |
 | `cpt-cf-srr-fr-audit-events` | Domain layer checks GTS type audit flags (including inherited flags from parent GTS types); emits fixed-schema audit events (id, type, subject_type, subject_id, previous_payload, new_payload) via Audit SDK when enabled |
 | `cpt-cf-srr-fr-multi-backend-storage` | `ResourceStoragePluginClient` trait enables additional backends including vendor-provided plugins for existing platform storage; GTS-based plugin discovery and scoped ClientHub clients per ModKit plugin pattern |
@@ -57,7 +57,7 @@ Resource type definitions are managed through GTS (Global Type System) via the T
 
 ### 1.3 Architecture Layers
 
-```
+```text
 ┌──────────────────────────────────────────────────────────┐
 │                   API Layer                              │
 │   REST endpoints, OpenAPI, request validation            │
@@ -112,7 +112,7 @@ All resource types are defined and registered through GTS. The base resource typ
 
 #### Backend-Internal Storage Model
 
-- [ ] `p1` - **ID**: `cpt-cf-srr-constraint-single-table`
+- [ ] `p1` - **ID**: `cpt-cf-srr-constraint-backend-internal-storage`
 
 Storage layout and optimization (table design, indexing, partitioning) are backend-internal concerns documented in each backend's own DESIGN and ADRs. The main module makes no assumptions about the physical storage structure beyond what the `ResourceStoragePluginClient` trait contract requires. For resource types requiring specialized storage (full-text search, dedicated indexing), per-resource-type routing (`cpt-cf-srr-fr-multi-backend-storage`) enables alternative backends.
 
@@ -380,7 +380,7 @@ graph TB
 
   - **Retention Purge Jobs Manager job**: Jobs Manager job that periodically scans for soft-deleted resources whose `deleted_at` exceeds their type's `deleted_resource_retention_days` and permanently hard-deletes them from storage. Uses the system default (30 days) when no type-level override is specified.
 
-- [ ] `p5` - **ID**: `cpt-cf-srr-component-search-plugin`
+- [ ] `p4` - **ID**: `cpt-cf-srr-component-search-plugin`
 
   - **Search Plugin**: Future implementation of `ResourceStoragePluginClient` for search-heavy resource types (e.g., ElasticSearch, OpenSearch). Provides full-text search within payload fields. Declares `search_support` capability.
 
@@ -519,6 +519,7 @@ pub trait SimpleResourceRegistryClient: Send + Sync {
 
 ```json
 {
+  "id": "uuid (optional, caller-supplied; system-generated if omitted)",
   "type": "string (GTS type ID of the derived resource type)",
   "idempotency_key": "string (required, caller-supplied deduplication UUID)",
   "payload": { }
@@ -544,7 +545,7 @@ Notes:
 
 - `tenant_id` is set from `SecurityContext.subject_tenant_id` (Subject Owner Tenant)
 - `owner_id` is set from `SecurityContext.subject_id` (only when `is_per_owner_resource=true`)
-- `id` is always system-generated; callers must not include it in the request
+- `id` is optional in the request; if omitted, the system assigns a generated UUID. If provided, it must be a valid UUID
 - `created_at`, `updated_at` are system-generated
 - `201 Created` response includes `Location: /simple-resource-registry/v1/resources/{id}`
 - `idempotency_key` is required; a second POST with the same key within the same tenant returns 409 with the existing resource `id` instead of creating a duplicate
@@ -612,11 +613,11 @@ Notes:
 
 **Access Control Model** (applies to GET, LIST, UPDATE, DELETE):
 
-All access checks are applied as **DB query filters**, not as post-fetch in-memory checks. The storage plugin query always includes:
+All access checks are applied as **backend query filters**, not as post-fetch in-memory checks. The storage plugin query always includes:
 - `tenant_id = ctx.subject_tenant_id` (`subject_tenant_id` is the Subject Owner Tenant from `SecurityContext`)
 - `type IN (permitted GTS types from token claims)`
 - `owner_id = ctx.subject_id` (only when `is_per_owner_resource=true`; `subject_id` is the authenticated subject identifier from `SecurityContext`)
-- `deleted_at IS NULL` (exclude soft-deleted)
+- Exclude soft-deleted resources
 
 This means **403 is never returned for individual resource operations** (GET, UPDATE, DELETE) — if the caller lacks access, the resource is simply not found and the system returns 404. The caller cannot distinguish between "does not exist" and "not authorized." 403 is only returned in two cases: (1) on POST when the resource type is not in the caller's GTS token scope (pre-query check), and (2) on LIST when the requested type filter has zero intersection with the caller's permitted GTS types.
 
@@ -656,11 +657,11 @@ All error responses use the RFC 9457 Problem Details format (`application/proble
 | 400 | `invalid-odata-query` | OData query references payload fields or has invalid syntax |
 | 400 | `payload-too-large` | Payload exceeds 64 KB limit |
 | 400 | `batch-size-exceeded` | Batch request exceeds the maximum allowed items (default: 100) |
-| 400 | `gts-type-not-found` | Referenced resource `type` (GTS schema ID / GTS type ID) does not exist in Types Registry. Response includes the unresolved GTS type ID |
+| 400 | `gts-type-not-found` | Referenced resource `type` (GTS type ID / GTS type ID) does not exist in Types Registry. Response includes the unresolved GTS type ID |
 | 401 | `unauthenticated` | Missing or invalid authentication |
 | 403 | `forbidden` | Caller lacks general permission for this operation |
 | 403 | `gts-type-not-in-scope` | Caller's token permissions do not include a matching GTS resource_pattern for the target resource type. Returned as a pre-query check on POST, or when no permitted types match on LIST. Extensions include the required GTS type and action |
-| 404 | `not-found` | Resource does not exist, or was filtered out by DB-level security filters (tenant scope, owner_id scope for per-user resources, GTS type scope). Because all access checks are applied as DB query filters, a mismatch on any dimension results in 404 — the caller cannot distinguish between "does not exist" and "not authorized" for individual resources |
+| 404 | `not-found` | Resource does not exist, or was filtered out by backend-level security filters (tenant scope, owner_id scope for per-user resources, GTS type scope). Because all access checks are applied as backend query filters, a mismatch on any dimension results in 404 — the caller cannot distinguish between "does not exist" and "not authorized" for individual resources |
 | 409 | `duplicate-idempotency-key` | A resource was already successfully created with the same `idempotency_key` within the same tenant. Response body includes the `id` of the existing resource |
 | 422 | `validation-error` | On POST: resource type requires owner_id (`is_per_owner_resource=true`) but none available in SecurityContext. On POST/PUT: payload fails GTS schema validation. Other semantic validation failures |
 | 501 | `search-not-supported` | The storage plugin for this resource type does not support search operations |
@@ -669,7 +670,7 @@ All error responses use the RFC 9457 Problem Details format (`application/proble
 
 ```json
 {
-  "type": "https://api.hyperspot.io/errors/gts-type-not-in-scope",
+  "type": "gts.x.core.errors.err.v1~x.core.http.forbidden.v1~",
   "title": "GTS type not in scope",
   "status": 403,
   "detail": "Caller lacks 'create' permission for GTS type 'gts.x.core.srr.resource.v1~acme.widget'",
@@ -715,10 +716,10 @@ All error responses use the RFC 9457 Problem Details format (`application/proble
 
 ```json
 {
-  "type": "https://api.hyperspot.io/errors/search-not-supported",
+  "type": "gts.x.core.errors.err.v1~x.core.http.not_implemented.v1~",
   "title": "Search not supported by plugin",
   "status": 501,
-  "detail": "The storage plugin for resource type 'gts.x.srr.resource.v1~acme.widget' does not support search operations",
+  "detail": "The storage plugin for resource type 'gts.x.core.srr.resource.v1~acme.widget' does not support search operations",
   "trace_id": "01J..."
 }
 ```
@@ -750,7 +751,7 @@ Notes:
 {
   "items": [
     { "index": 0, "status": 200, "data": { "...full resource object..." } },
-    { "index": 1, "status": 404, "error": { "type": "https://api.hyperspot.io/errors/not-found", "title": "Resource not found", "status": 404, "detail": "Resource with id '01J...' does not exist", "trace_id": "01J...-item-1" } }
+    { "index": 1, "status": 404, "error": { "type": "gts.x.core.errors.err.v1~x.core.http.not_found.v1~", "title": "Resource not found", "status": 404, "detail": "Resource with id '01J...' does not exist", "trace_id": "01J...-item-1" } }
   ]
 }
 ```
@@ -823,7 +824,7 @@ Notes:
 - Follows DNA BATCH.md conventions: `POST /resources:batch`, `207 Multi-Status`, per-item `index`/`status`/`data`/`error`
 - Each item is validated and processed independently (best-effort semantics)
 - GTS type validation, access control, and behavioral flag evaluation are applied per item
-- For item-level GET/PUT/DELETE semantics, inaccessible resources return 404 because tenant/user/type checks are applied as DB filters
+- For item-level GET/PUT/DELETE semantics, inaccessible resources return 404 because tenant/user/type checks are applied as backend query filters
 - Partial success is allowed — some items may succeed while others fail
 - `idempotency_key` is required for items with `action: "create"`; optional for `update`/`delete` items (used for batch-level retry safety only)
 - Error responses use RFC 9457 Problem Details per item
@@ -835,7 +836,7 @@ Notes:
 | Dependency Module | Interface Used | Purpose | Needed By |
 | --- | --- | --- | --- |
 | Types Registry | Types Registry SDK (ClientHub) | Resolve GTS type definitions, validate type, read behavioral flags | `cpt-cf-srr-fr-gts-type-registration`, `cpt-cf-srr-fr-gts-type-validation` |
-| modkit-db | SecurityContext-based tenant scoping | Tenant-scoped database access infrastructure (used by storage backends) | `cpt-cf-srr-fr-default-storage-backend` |
+| modkit-db | SecurityContext-based tenant scoping | Tenant-scoped database access infrastructure (indirect — used by database-backed storage plugins, not by the main module directly) | `cpt-cf-srr-fr-default-storage-backend` |
 | gts-rust | Rust crate (library) | GTS ID generation, schema utilities, payload validation against GTS type schemas | `cpt-cf-srr-fr-gts-type-registration`, `cpt-cf-srr-fr-create-resource`, `cpt-cf-srr-fr-update-resource` |
 | Events Broker | Events Broker SDK (ClientHub) | Emit domain events for resource lifecycle (fixed schema: id, type, subject_type, subject_id) | `cpt-cf-srr-fr-notification-events` |
 | Audit Module | Audit SDK (ClientHub) | Emit audit events for compliance (fixed schema: id, type, subject_type, subject_id, previous_payload, new_payload) | `cpt-cf-srr-fr-audit-events` |
@@ -862,7 +863,7 @@ None. Simple Resource Registry does not communicate with external systems direct
 ```json
 {
   "id": "string (event id)",
-  "type": "string (gtx.x.core.events.event.v1~ ... created | updated | deleted)",
+  "type": "string (gts.x.core.events.event.v1~ ... created | updated | deleted)",
   "subject_type": "string (GTS type ID of the resource)",
   "subject_id": "uuid (resource identifier)"
 }
@@ -879,7 +880,7 @@ None. Simple Resource Registry does not communicate with external systems direct
 ```json
 {
   "id": "string (event id)",
-  "type": "string (gtx.x.core.events.event.v1~x.core.audit.event.v1~ created | updated | deleted)",
+  "type": "string (gts.x.core.events.event.v1~x.core.audit.event.v1~ created | updated | deleted)",
   "subject_type": "GTS string (GTS type ID of the resource)",
   "subject_id": "uuid (resource identifier)",
   "previous_payload": "object | null (resource payload before operation; null for create)",
@@ -944,7 +945,7 @@ sequenceDiagram
         SVC-->>API: 422 validation-error
         API-->>C: 422 Unprocessable Entity
     end
-    SVC->>SVC: Assign UUID, set tenant_id=ctx.subject_tenant_id,<br/>owner_id=ctx.subject_id (if per_owner), set timestamps
+    SVC->>SVC: Assign UUID if id not provided, set tenant_id=ctx.subject_tenant_id,<br/>owner_id=ctx.subject_id (if per_owner), set timestamps
     SVC->>SP: create(ctx, resource, idempotency_key)
     Note over SP: Plugin atomically checks idempotency_key in its dedup store<br/>and persists resource + idempotency record in one transaction
     alt CreateOutcome::Duplicate
@@ -985,7 +986,7 @@ sequenceDiagram
     SVC->>ACL: get_permitted_types(ctx, "read")
     ACL-->>SVC: permitted GTS types from token claims
     SVC->>SP: get(ctx, id)
-    Note over SP: DB query applies all filters:<br/>- tenant_id = ctx.subject_tenant_id<br/>- type IN (permitted GTS types)<br/>- owner_id = ctx.subject_id (if is_per_owner_resource)<br/>- deleted_at IS NULL
+    Note over SP: Backend query applies all filters:<br/>- tenant_id = ctx.subject_tenant_id<br/>- type IN (permitted GTS types)<br/>- owner_id = ctx.subject_id (if is_per_owner_resource)<br/>- exclude soft-deleted
     SP-->>SVC: resource | None
     alt Resource found
         SVC-->>API: resource
@@ -1026,7 +1027,7 @@ sequenceDiagram
     end
     ACL-->>SVC: allowed (effective_gts_filter)
     SVC->>SP: list(ctx, effective_gts_filter, odata)
-    Note over SP: DB query applies all filters:<br/>- tenant_id = ctx.subject_tenant_id<br/>- type IN (effective_gts_filter)<br/>- owner_id = ctx.subject_id (if is_per_owner_resource)<br/>- deleted_at IS NULL<br/>- OData $filter on schema columns<br/>- $orderby, limit, cursor
+    Note over SP: Backend query applies all filters:<br/>- tenant_id = ctx.subject_tenant_id<br/>- type IN (effective_gts_filter)<br/>- owner_id = ctx.subject_id (if is_per_owner_resource)<br/>- exclude soft-deleted<br/>- OData $filter on schema columns<br/>- $orderby, limit, cursor
     SP-->>SVC: PagedResult<Resource>
     SVC-->>API: paged result
     API-->>C: 200 OK {items: [...], page_info: {...}}
@@ -1056,7 +1057,7 @@ sequenceDiagram
     SVC->>ACL: get_permitted_types(ctx, "update")
     ACL-->>SVC: permitted GTS types from token claims
     SVC->>SP: get(ctx, id)
-    Note over SP: DB query applies all filters:<br/>- tenant_id = ctx.subject_tenant_id<br/>- type IN (permitted GTS types)<br/>- owner_id = ctx.subject_id (if is_per_owner_resource)<br/>- deleted_at IS NULL
+    Note over SP: Backend query applies all filters:<br/>- tenant_id = ctx.subject_tenant_id<br/>- type IN (permitted GTS types)<br/>- owner_id = ctx.subject_id (if is_per_owner_resource)<br/>- exclude soft-deleted
     SP-->>SVC: existing resource | None
     alt Not found (filtered out or does not exist)
         SVC-->>API: 404 not-found
@@ -1111,7 +1112,7 @@ sequenceDiagram
     SVC->>ACL: get_permitted_types(ctx, "delete")
     ACL-->>SVC: permitted GTS types from token claims
     SVC->>SP: get(ctx, id)
-    Note over SP: DB query applies all filters:<br/>- tenant_id = ctx.subject_tenant_id<br/>- type IN (permitted GTS types)<br/>- owner_id = ctx.subject_id (if is_per_owner_resource)<br/>- deleted_at IS NULL
+    Note over SP: Backend query applies all filters:<br/>- tenant_id = ctx.subject_tenant_id<br/>- type IN (permitted GTS types)<br/>- owner_id = ctx.subject_id (if is_per_owner_resource)<br/>- exclude soft-deleted
     SP-->>SVC: existing resource | None
     alt Not found (filtered out or does not exist)
         SVC-->>API: 404 not-found
@@ -1231,7 +1232,7 @@ Other storage backends **MUST** implement equivalent persistence for the `Resour
 ### 4.2 Potential Use Cases
 
 | Use Case | Description |
-| --- | --- | --- |
+| --- | --- |
 | Workflow artifacts | Custom objects generated by workflow automation steps |
 | External object reflections | Entries representing objects from external systems (CRM contacts, ticketing issues) |
 | Domain model consistency | Partial representations of external resources for internal domain model coherence |
@@ -1255,7 +1256,7 @@ simple_resource_registry:
         plugin: vendor1-cmdb-adapter
 ```
 
-The routing configuration maps resource `type` patterns (GTS schema IDs / GTS type IDs) to storage plugin instances. Glob patterns enable grouping related types to the same backend. Unmatched types fall back to the default plugin. Platform vendors can register their own plugin implementations (e.g., `vendor-cmdb-adapter`) to bridge resource operations to existing platform storage components, enabling multiple coexisting plugins for different resource families.
+The routing configuration maps resource `type` patterns (GTS type IDs / GTS type IDs) to storage plugin instances. Glob patterns enable grouping related types to the same backend. Unmatched types fall back to the default plugin. Platform vendors can register their own plugin implementations (e.g., `vendor-cmdb-adapter`) to bridge resource operations to existing platform storage components, enabling multiple coexisting plugins for different resource families.
 
 ### 4.4 Alignment with Platform Architecture (`docs/arch`) and `gts-rust`
 

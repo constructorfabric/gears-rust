@@ -504,8 +504,7 @@ Provide generic CRUD storage for typed resources that do not warrant a dedicated
 - [ ] p2 - per-resource-type audit events via Audit Module
 - [ ] p3 - alternative storage plugins (search engines, vendor-provided backends) with per-type routing
 - [ ] p3 - resource groups for lifecycle-linked collections
-- [ ] p4 - table partitioning by resource type for Relational Database plugin
-- [ ] p5 - full-text search API with search-capable plugin support
+- [ ] p4 - full-text search API with search-capable plugin support
 #### More details
 - [PRD](../modules/simple-resource-registry/docs/PRD.md)
 - [Design](../modules/simple-resource-registry/docs/DESIGN.md)
