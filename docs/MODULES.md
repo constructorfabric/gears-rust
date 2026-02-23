@@ -490,6 +490,29 @@ Provide monitoring primitives and integrations: health checks, alerts, and opera
 - TODO: API link
 - TODO: SDK link
 
+### Simple Resource Registry
+#### Responsibility
+Provide generic CRUD storage for typed resources that do not warrant a dedicated module, using a fixed schema envelope (identity, ownership, timestamps) and a flexible JSON payload governed by GTS type definitions.
+#### High Level Scenarios
+- [ ] p1 - create, read, update, and soft-delete typed resources with tenant isolation and GTS type-based access control
+- [ ] p1 - OData $filter/$orderby and cursor-based pagination on schema fields
+- [ ] p1 - GTS type existence validation via Types Registry
+- [ ] p1 - pluggable storage backend (Relational Database plugin via SecureORM as default)
+- [ ] p1 - configurable soft-delete retention with background purge task
+- [ ] p2 - batch CRUD operations (POST /resources:batch, POST /resources:batch-get) per DNA BATCH.md
+- [ ] p2 - per-resource-type lifecycle notification events (created/updated/deleted) via Events Broker
+- [ ] p2 - per-resource-type audit events via Audit Module
+- [ ] p3 - alternative storage plugins (search engines, vendor-provided backends) with per-type routing
+- [ ] p3 - resource groups for lifecycle-linked collections
+- [ ] p4 - table partitioning by resource type for Relational Database plugin
+- [ ] p5 - full-text search API with search-capable plugin support
+#### More details
+- [PRD](../modules/simple-resource-registry/docs/PRD.md)
+- [Design](../modules/simple-resource-registry/docs/DESIGN.md)
+- TODO: Scenarios link
+- TODO: API link
+- TODO: SDK link
+
 ## Core Platform Integration Modules
 
 **Core Platform Integration Modules** provide a thin abstraction layer between HyperSpot and external or enterprise-grade platform services such as identity providers, license managers, credential stores, and outbound traffic governance systems. These modules expose minimal, stable interfaces that HyperSpot modules can depend on without being coupled to a specific vendor, protocol, or deployment environment.
