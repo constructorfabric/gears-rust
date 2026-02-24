@@ -424,7 +424,18 @@ pub trait ResourceStoragePluginClient: Send + Sync {
     fn capabilities(&self) -> PluginCapabilities;
 
     /// Persist a new resource and atomically record the idempotency key.
-    /// Returns Duplicate(existing_id) if idempotency_key was already used within this tenant.
+    ///
+    /// **Idempotency contract** (all plugins MUST comply):
+    /// - Key scope: `(tenant_id, idempotency_key)` — same key in different tenants is distinct
+    /// - Dedup window: default 24 h from creation (configurable per deployment)
+    /// - Atomicity: check + insert resource + insert idempotency record MUST be
+    ///   atomic (single DB transaction or equivalent)
+    /// - Returns `CreateOutcome::Duplicate(existing_resource_id)` if key exists within window
+    /// - Returns `CreateOutcome::Created(resource)` when no match exists
+    /// - After TTL expiry, the key is no longer enforced; expired records are
+    ///   purged by a background job
+    ///
+    /// All plugins MUST pass the SDK idempotency conformance test suite.
     async fn create(&self, ctx: &SecurityContext, resource: &Resource, idempotency_key: &str) -> Result<CreateOutcome>;
 
     /// Get a single resource by ID
@@ -552,7 +563,7 @@ Notes:
 - `201 Created` response includes `Location: /simple-resource-registry/v1/resources/{id}`
 - `idempotency_key` is required; a second POST with the same key within the same tenant returns 409 with the existing resource `id` instead of creating a duplicate
 - Idempotency keys are scoped to `(tenant_id, idempotency_key)` — the same key in different tenants is treated as distinct
-- The plugin atomically records the idempotency key alongside resource creation; the idempotency storage mechanism is plugin-internal
+- The plugin atomically records the idempotency key alongside resource creation per the SDK idempotency contract (see §3.2 `create` method): key scope `(tenant_id, idempotency_key)`, default 24 h dedup window, atomic check-and-insert
 
 #### GET /resources/{id} — Get Resource
 

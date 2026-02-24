@@ -17,7 +17,7 @@ Idempotency deduplication is handled atomically within a single database transac
 | Requirement | Design Response |
 | --- | --- |
 | `cpt-cf-srr-rdb-fr-relational-storage` | SeaORM entity with dedicated columns for schema fields + TEXT column for serialized JSON payload; SecureORM for tenant scoping; declares `odata_support` capability |
-| `cpt-cf-srr-rdb-fr-odata-translation` | OData $filter/$orderby translated to SeaORM `Condition` and `Order` on schema columns; cursor-based pagination via `id > cursor_id` predicate |
+| `cpt-cf-srr-rdb-fr-odata-translation` | OData $filter/$orderby translated to SeaORM `Condition` and `Order` on schema columns; cursor-based pagination via `(created_at, id)` tuple cursor per DNA QUERYING.md, backed by `idx_simple_resources_tenant_type_created` |
 | `cpt-cf-srr-rdb-fr-gts-wildcard` | Trailing `*` in type filter → SQL `LIKE '{prefix}%'`; prefix derived by stripping `*` from the GTS pattern |
 | `cpt-cf-srr-rdb-fr-idempotency` | Single-transaction: check-then-insert via SeaORM within a DB transaction — query `idempotency_keys` for existing key, insert resource + idempotency record if absent; returns `CreateOutcome::Duplicate` if key exists |
 | `cpt-cf-srr-rdb-fr-soft-delete` | `UPDATE simple_resources SET deleted_at = now() WHERE id = ? AND tenant_id = ?`; list queries include `WHERE deleted_at IS NULL` |
@@ -153,7 +153,7 @@ graph TB
 
 - [ ] `p1` - **ID**: `cpt-cf-srr-rdb-component-idempotency-handler`
 
-  - **Idempotency Handler**: Manages the `idempotency_keys` table within create transactions. Performs atomic check-and-insert: queries for existing `(tenant_id, idempotency_key)`, and if not found, inserts both the resource row and the idempotency record in the same transaction.
+  - **Idempotency Handler**: Implements the SDK idempotency contract (see parent DESIGN §3.2 `create` method). Manages the `idempotency_keys` table within create transactions: queries for existing `(tenant_id, idempotency_key)`, and if not found, inserts both the resource row and the idempotency record in the same transaction. This plugin MUST pass the SDK idempotency conformance test suite.
 
 ### 3.3 API Contracts
 
@@ -217,7 +217,9 @@ sequenceDiagram
     participant DB as Database
 
     Job->>Plugin: purge_deleted_before(type, cutoff, batch_size)
-    Plugin->>DB: DELETE FROM simple_resources<br/>WHERE type = ? AND deleted_at < ?<br/>LIMIT batch_size
+    Plugin->>DB: SELECT id FROM simple_resources<br/>WHERE type = ? AND deleted_at < ?<br/>ORDER BY deleted_at LIMIT batch_size
+    DB-->>Plugin: candidate_ids
+    Plugin->>DB: DELETE FROM simple_resources<br/>WHERE id IN (candidate_ids)
     DB-->>Plugin: deleted_count
     Plugin-->>Job: deleted_count
 ```
@@ -327,9 +329,9 @@ The indexing strategy is designed to support the primary query patterns at scale
 | Fetch by ID (PK lookup) | `PRIMARY KEY (id)` | O(log n) B-tree lookup; < 10ms |
 | List by type within tenant | `idx_simple_resources_tenant_type` | Composite index narrows to type partition within tenant; efficient for up to ~1M per type |
 | List by type ordered by created_at | `idx_simple_resources_tenant_type_created` | Covers the full query without table lookups |
-| Filter soft-deleted resources | `idx_simple_resources_tenant_deleted` | Partial index on active records (deleted_at IS NULL) |
-| Retention purge by type + deleted_at | `idx_simple_resources_type_deleted` | Partial index on deleted records only — small index size |
-| User-scoped queries | `idx_simple_resources_tenant_user` | Partial index on rows with owner_id; avoids indexing tenant-only resources |
+| Filter soft-deleted resources | `idx_simple_resources_tenant_deleted` | Composite index; list queries add `deleted_at IS NULL` predicate |
+| Retention purge by type + deleted_at | `idx_simple_resources_type_deleted` | Composite index on `(type, deleted_at)` for select-then-delete purge pattern |
+| User-scoped queries | `idx_simple_resources_tenant_user` | Composite index on `(tenant_id, owner_id)` for per-user resource queries |
 
 See [ADR-0001: Storage Optimization](./ADR/0001-cpt-cf-srr-rdb-adr-storage-optimization.md) for the rationale behind choosing indexes over partitioning or per-type tables.
 
@@ -344,6 +346,8 @@ See [ADR-0001: Storage Optimization](./ADR/0001-cpt-cf-srr-rdb-adr-storage-optim
 3. **Single-table contention**: Under extreme write loads, the single `simple_resources` table may experience lock contention. This is mitigated by the row-level locking available in PostgreSQL and MariaDB. If contention becomes an issue, the main module's storage routing can redirect high-write types to a dedicated backend.
 
 4. **Idempotency key expiration**: Expired idempotency records are purged by a background job. Between expiration and purge, the record still occupies space but is no longer enforced (the deduplication check uses `WHERE expires_at > now()`).
+
+5. **Idempotency coupling**: Each storage plugin independently implements idempotency deduplication. This risks inconsistent semantics across backends (TTL handling, collision strategy, retry behavior). Mitigated by: (a) a strict SDK trait contract defining key scope, dedup window, atomicity, and response behavior (see parent DESIGN §3.2); (b) a mandatory conformance test suite that every plugin must pass. If this coupling proves problematic, a future evolution could extract idempotency into a domain-layer capability owned by the main module, with plugins providing only raw create + unique-constraint-based duplicate detection.
 
 ## 5. Traceability
 
