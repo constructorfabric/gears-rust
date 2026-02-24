@@ -85,8 +85,9 @@ pub struct AppConfig {
     /// Logging configuration
     #[serde(default = "default_logging_config")]
     pub logging: LoggingConfig,
-    /// Tracing configuration (optional, disabled if None).
-    pub tracing: Option<TracingConfig>,
+    /// Tracing configuration.
+    #[serde(default)]
+    pub tracing: TracingConfig,
     /// Directory containing per-module YAML files (optional).
     #[serde(default)]
     pub modules_dir: Option<String>,
@@ -102,7 +103,7 @@ impl Default for AppConfig {
             server,
             database: None,
             logging: default_logging_config(),
-            tracing: None, // Disabled by default
+            tracing: TracingConfig::default(),
             modules_dir: None,
             modules: HashMap::new(),
         }
@@ -1093,7 +1094,11 @@ pub fn render_module_config_for_oop(
     let logging = app.logging.clone();
 
     // Pass tracing config from master host so OoP modules use the same OTEL settings
-    let tracing = app.tracing.clone();
+    let tracing = if app.tracing.enabled {
+        Some(app.tracing.clone())
+    } else {
+        None
+    };
 
     Ok(RenderedModuleConfig {
         database,

@@ -2,8 +2,8 @@
 
 **Extends**: `../.cypilot/AGENTS.md`
 
-**Version**: 1.0  
-**Last Updated**: 2026-02-05  
+**Version**: 1.0
+**Last Updated**: 2026-02-05
 
 ---
 
@@ -27,6 +27,7 @@ This repository is a **modular monolith** built on top of **CyberFabric**.
 - **Subsystems / modules**: each subsystem is a module under `modules/<module_name>/`.
 - **Cypilot registry convention**: subsystems are registered as `children[]` of the root `cyberfabric` system in `{cypilot_adapter_path}/artifacts.json`.
 - **Docs convention**: each module keeps its artifacts under `modules/<module_name>/docs/`.
+- **Repository Playbook**: `docs/REPO_PLAYBOOK.md` — comprehensive map of all repository artifacts, standards, tooling, and planned gaps (with per-item status, phase, and ID).
 
 ---
 
@@ -39,6 +40,8 @@ ALWAYS open and follow `{cypilot_path}/requirements/artifacts-registry.md` WHEN 
 ALWAYS open and follow `artifacts.json` WHEN registering Cypilot artifacts, updating codebase paths, changing traceability settings, or running Cypilot validation
 
 ALWAYS open and follow `CONTRIBUTING.md` WHEN setting up development environment, creating feature branches, running quality checks (make all, cargo clippy, cargo fmt), signing commits with DCO, writing commit messages, creating pull requests, or understanding the review process
+
+ALWAYS open `docs/REPO_PLAYBOOK.md` WHEN looking for a map of repository artifacts, understanding what standards/tooling exist, identifying coverage gaps, or onboarding to the project structure
 
 ---
 

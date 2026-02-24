@@ -39,6 +39,10 @@ make gts-docs-test    # Run unit tests
 | `--exclude <PATTERN>` | Glob patterns to exclude (can be repeated) |
 | `--json` | Output results as JSON |
 | `--verbose` | Show file scanning progress |
+| `--max-file-size <BYTES>` | Maximum file size to read (default: 10 MB) |
+| `--scan-keys` | Also scan JSON/YAML object keys for GTS identifiers |
+| `--strict` | Heuristic mode: catch ALL `gts.*` strings including malformed IDs (more false positives) |
+| `--skip-token <TOKEN>` | Skip validation for lines containing this token before the GTS ID (can be repeated) |
 
 ## Example Vendors
 

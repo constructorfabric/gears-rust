@@ -1,6 +1,7 @@
 use crate::{claims_error::ClaimsError, plugin_traits::KeyProvider};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{DecodingKey, Header, Validation, decode, decode_header};
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,6 +30,16 @@ struct JwksResponse {
     keys: Vec<Jwk>,
 }
 
+/// Handler for non-string custom JWT header fields; return `Some` to keep as string, or `None` to drop.
+type HeaderExtrasHandler = dyn Fn(&str, &Value) -> Option<String> + Send + Sync;
+
+/// Standard JWT header field names from RFC 7515 (JWS), RFC 7516 (JWE),
+/// RFC 7518 (JWA), RFC 7797 (b64), and RFC 8555 (ACME).
+const STANDARD_HEADER_FIELDS: &[&str] = &[
+    "typ", "alg", "cty", "jku", "jwk", "kid", "x5u", "x5c", "x5t", "x5t#S256", "crit", "enc",
+    "zip", "url", "nonce", "epk", "apu", "apv", "iv", "tag", "p2s", "p2c", "b64",
+];
+
 /// JWKS-based key provider with lock-free reads
 ///
 /// Uses `ArcSwap` for lock-free key lookups and background refresh with exponential backoff.
@@ -55,6 +66,11 @@ pub struct JwksKeyProvider {
 
     /// Cooldown for on-demand refresh (default: 60 seconds)
     on_demand_refresh_cooldown: Duration,
+
+    /// Optional handler for non-string custom JWT header fields.
+    /// Called for each non-standard field whose value is not a JSON string.
+    /// Return `Some(s)` to keep, `None` to drop.
+    header_extras_handler: Option<Arc<HeaderExtrasHandler>>,
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +112,7 @@ impl JwksKeyProvider {
             refresh_interval: Duration::from_secs(300), // 5 minutes
             max_backoff: Duration::from_secs(3600),     // 1 hour
             on_demand_refresh_cooldown: Duration::from_secs(60), // 1 minute
+            header_extras_handler: None,
         })
     }
 
@@ -122,6 +139,29 @@ impl JwksKeyProvider {
     /// Create with custom on-demand refresh cooldown
     pub fn with_on_demand_refresh_cooldown(mut self, cooldown: Duration) -> Self {
         self.on_demand_refresh_cooldown = cooldown;
+        self
+    }
+
+    /// Stringify all non-string custom JWT header fields.
+    ///
+    /// Convenience wrapper around [`with_header_extras_handler`](Self::with_header_extras_handler)
+    /// that converts every non-string value to its JSON representation
+    /// (e.g. `123` → `"123"`, `true` → `"true"`, `[1,2]` → `"[1,2]"`).
+    pub fn with_header_extras_stringified(self) -> Self {
+        self.with_header_extras_handler(|_, v| Some(v.to_string()))
+    }
+
+    /// Set a handler for non-string custom JWT header fields.
+    ///
+    /// `jsonwebtoken::Header::extras` is `HashMap<String, String>` and rejects
+    /// non-string values. This callback is invoked for each such field.
+    /// Return `Some(s)` to keep, `None` to drop.
+    /// Without a handler, upstream `decode_header` is used as-is.
+    pub fn with_header_extras_handler(
+        mut self,
+        handler: impl Fn(&str, &Value) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.header_extras_handler = Some(Arc::new(handler));
         self
     }
 
@@ -335,8 +375,11 @@ impl KeyProvider for JwksKeyProvider {
         let token = token.trim_start_matches("Bearer ").trim();
 
         // Decode header to get kid and algorithm
-        let header = decode_header(token)
-            .map_err(|e| ClaimsError::DecodeFailed(format!("Invalid JWT header: {e}")))?;
+        let header = match &self.header_extras_handler {
+            Some(handler) => decode_header_with_handler(token, handler.as_ref()),
+            None => decode_header(token),
+        }
+        .map_err(|e| ClaimsError::DecodeFailed(format!("Invalid JWT header: {e}")))?;
 
         let kid = header
             .kid
@@ -413,6 +456,40 @@ pub async fn run_jwks_refresh_task(
     }
 }
 
+/// Decode a JWT header, routing non-string custom fields through `handler`.
+///
+/// Returns `Some(s)` to keep the field, `None` to drop it.
+fn decode_header_with_handler(
+    token: &str,
+    handler: &dyn Fn(&str, &Value) -> Option<String>,
+) -> Result<Header, jsonwebtoken::errors::Error> {
+    let header_b64 = token
+        .split('.')
+        .next()
+        .ok_or(jsonwebtoken::errors::ErrorKind::InvalidToken)?;
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64.trim_end_matches('='))
+        .map_err(jsonwebtoken::errors::ErrorKind::Base64)?;
+
+    let mut json: serde_json::Map<String, Value> = serde_json::from_slice(&header_bytes)?;
+
+    json.retain(|key, value| {
+        if STANDARD_HEADER_FIELDS.contains(&key.as_str()) || value.is_string() {
+            return true;
+        }
+        match handler(key, value) {
+            Some(s) => {
+                *value = Value::String(s);
+                true
+            }
+            None => false,
+        }
+    });
+
+    Ok(serde_json::from_value(Value::Object(json))?)
+}
+
 /// Map `HttpError` variants to appropriate `ClaimsError` messages
 fn map_http_error(e: &modkit_http::HttpError) -> ClaimsError {
     ClaimsError::JwksFetchFailed(crate::http_error::format_http_error(e, "JWKS"))
@@ -441,6 +518,7 @@ mod tests {
             refresh_interval: Duration::from_secs(300),
             max_backoff: Duration::from_secs(3600),
             on_demand_refresh_cooldown: Duration::from_secs(60),
+            header_extras_handler: None,
         }
     }
 
@@ -803,5 +881,145 @@ mod tests {
             }
             other => panic!("Expected UnknownKeyId, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_decode_header_with_handler_coerces_non_string_extras() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        // Header with non-standard fields: integer, string, and array
+        let header_json = r#"{"alg":"RS256","eap":1,"iri":"some-string-id","irn":["role_a"],"kid":"kid-1","typ":"at+jwt"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(b"{}");
+        let token = format!("{header_b64}.{payload_b64}.fake");
+
+        let header = decode_header_with_handler(&token, &|_key, value| Some(value.to_string()))
+            .expect("should handle non-standard header fields");
+
+        assert_eq!(header.alg, jsonwebtoken::Algorithm::RS256);
+        assert_eq!(header.kid.as_deref(), Some("kid-1"));
+        assert_eq!(header.typ.as_deref(), Some("at+jwt"));
+
+        // Non-string extras coerced to JSON text
+        assert_eq!(header.extras.get("eap").map(String::as_str), Some("1"));
+        assert_eq!(
+            header.extras.get("irn").map(String::as_str),
+            Some(r#"["role_a"]"#)
+        );
+        // String extras preserved as-is
+        assert_eq!(
+            header.extras.get("iri").map(String::as_str),
+            Some("some-string-id")
+        );
+    }
+
+    #[test]
+    fn test_decode_header_with_handler_can_drop_fields() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let header_json = r#"{"alg":"RS256","eap":1,"iri":"keep-me","kid":"kid-1","typ":"JWT"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let token = format!("{header_b64}.e30.fake");
+
+        let header = decode_header_with_handler(&token, &|_key, _value| None)
+            .expect("should succeed when handler drops non-string fields");
+
+        assert_eq!(header.alg, jsonwebtoken::Algorithm::RS256);
+        assert!(header.extras.get("eap").is_none());
+        assert_eq!(
+            header.extras.get("iri").map(String::as_str),
+            Some("keep-me")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_header_extras_stringified_coerces_non_string_extras() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/jwks");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(valid_jwks_json());
+        });
+
+        let jwks_url = server.url("/jwks");
+        let provider = test_provider_with_http(&jwks_url).with_header_extras_stringified();
+
+        // Header with non-string extras: integer and array
+        let header_json =
+            r#"{"alg":"RS256","kid":"test-key-1","typ":"JWT","eap":1,"irn":["role_a"]}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(b"{}");
+        let token = format!("{header_b64}.{payload_b64}.AAAA");
+
+        let result = provider.validate_and_decode(&token).await;
+
+        // The handler lets header decode succeed; error must come from signature
+        // validation, not from header parsing.
+        let err = result.expect_err("fake signature should fail validation");
+        match &err {
+            ClaimsError::DecodeFailed(msg) => {
+                assert!(
+                    msg.contains("JWT validation failed"),
+                    "Expected signature-validation error, got: {msg}"
+                );
+            }
+            other => panic!("Expected DecodeFailed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_decode_uses_header_extras_handler() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/jwks");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(valid_jwks_json());
+        });
+
+        let jwks_url = server.url("/jwks");
+        let provider = test_provider_with_http(&jwks_url)
+            .with_header_extras_handler(|_key, value| Some(value.to_string()));
+
+        // Header with a non-string extra ("eap":1) that would reject without handler
+        let header_json = r#"{"alg":"RS256","kid":"test-key-1","typ":"JWT","eap":1}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(b"{}");
+        let token = format!("{header_b64}.{payload_b64}.AAAA");
+
+        let result = provider.validate_and_decode(&token).await;
+
+        // Handler lets header decode succeed → error must come from signature
+        // validation, not from header parsing.
+        let err = result.expect_err("fake signature should fail validation");
+        match &err {
+            ClaimsError::DecodeFailed(msg) => {
+                assert!(
+                    msg.contains("JWT validation failed"),
+                    "Expected signature-validation error, got: {msg}"
+                );
+            }
+            other => panic!("Expected DecodeFailed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_header_without_handler_rejects_non_string_extras() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let header_json = r#"{"alg":"RS256","eap":1,"kid":"kid-1","typ":"JWT"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let token = format!("{header_b64}.e30.fake");
+
+        let result = decode_header(&token);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid type: integer"),
+            "expected type error, got: {err}"
+        );
     }
 }

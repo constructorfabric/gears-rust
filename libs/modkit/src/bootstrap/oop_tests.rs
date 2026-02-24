@@ -21,11 +21,8 @@ fn minimal_app_config() -> AppConfig {
         server: ServerConfig {
             home_dir: std::env::temp_dir().join("modkit_test"),
         },
-        database: None,
         logging: default_logging_config(),
-        tracing: None,
-        modules_dir: None,
-        modules: HashMap::new(),
+        ..Default::default()
     }
 }
 

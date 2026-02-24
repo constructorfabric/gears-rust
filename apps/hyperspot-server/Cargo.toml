@@ -53,7 +53,6 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true }
-serde_json = { workspace = true }
 
 # Optional example module
 users-info = { path = "../../examples/modkit/users-info/users-info", optional = true }
@@ -63,3 +62,4 @@ calculator = { path = "../../examples/oop-modules/calculator/calculator", option
 [dev-dependencies]
 tempfile = { workspace = true }
 serde-saphyr = { workspace = true }
+serde_json = { workspace = true }

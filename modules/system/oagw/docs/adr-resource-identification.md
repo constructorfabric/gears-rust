@@ -39,6 +39,12 @@ alias. When subsub-tenant resolves alias `my-service`, system finds 3 upstreams 
 
 Separate concerns into three layers:
 
+Implementation note:
+
+- The layers below describe the **logical model**.
+- The current MVP storage approach can represent the tenant binding by storing one tenant-scoped row per binding (see `ADR: Storage Schema`).
+- Cross-tenant upstream *deduplication* (a shared upstream definition referenced by multiple tenant bindings) is deferred. It can be added later by splitting the shared, immutable core into a separate table (or by introducing a stable `definition_id` that multiple tenant rows can reference).
+
 **Layer 1: Upstream Definition (shared, immutable core)**
 
 - System-generated UUID as primary ID
