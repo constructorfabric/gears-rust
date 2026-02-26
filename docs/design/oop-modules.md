@@ -23,6 +23,7 @@ This document covers architecture, deployment models, fault tolerance strategies
 1. [Architecture Overview](#1-architecture-overview)
 2. [Module Packaging and Executables](#2-module-packaging-and-executables)
 3. [Deployment Models](#3-deployment-models)
+   - 3.4 [Hybrid and Multi-Environment Deployments](#34-hybrid-and-multi-environment-deployments)
 4. [Service Discovery and Communication](#4-service-discovery-and-communication)
 5. [Fault Tolerance](#5-fault-tolerance)
 6. [SDK Pattern](#6-sdk-pattern)
@@ -191,7 +192,206 @@ ENTRYPOINT ["calculator-oop"]
 # Example: ghcr.io/cyberfabric/calculator-oop:1.2.3
 ```
 
-### 2.4 Compile-Time HTTP Client for Backward Compatibility
+### 2.4 Building for Kubernetes: End-to-End Workflow
+
+**"How do I compile all this for my K8s cluster and run it?"**
+
+#### Step 1: Build Docker Images
+
+```bash
+# Build all OoP modules
+for module in calculator file-parser llm-gateway; do
+  docker build -t ghcr.io/cyberfabric/${module}-oop:latest \
+    -f modules/${module}/Dockerfile .
+done
+
+# Or use a multi-stage build script
+make docker-build-all
+```
+
+#### Step 2: Push to Registry
+
+```bash
+# Push to container registry (GitHub, ECR, GCR, etc.)
+docker push ghcr.io/cyberfabric/calculator-oop:latest
+
+# Or use CI/CD (GitHub Actions example)
+# .github/workflows/build.yml handles this automatically
+```
+
+#### Step 3: Deploy to Kubernetes
+
+```bash
+# Option A: Helm chart (recommended)
+helm install cyberfabric ./charts/cyberfabric \
+  --set modules.calculator.enabled=true \
+  --set modules.fileParser.enabled=true
+
+# Option B: Kustomize
+kubectl apply -k k8s/overlays/production
+
+# Option C: Raw manifests
+kubectl apply -f k8s/calculator-deployment.yaml
+kubectl apply -f k8s/calculator-service.yaml
+```
+
+#### Step 4: Verify Deployment
+
+```bash
+# Check pods are running
+kubectl get pods -l app.kubernetes.io/part-of=cyberfabric
+
+# Check services are discoverable
+kubectl get svc
+
+# Test health endpoints
+kubectl port-forward svc/calculator 8080:80
+curl http://localhost:8080/health/ready
+```
+
+#### Minimal K8s Requirements
+
+CyberFabric modules are standard containers. They need:
+
+| Requirement | Provided By | CyberFabric Provides |
+|-------------|-------------|---------------------|
+| Container runtime | K8s (containerd/docker) | Docker images |
+| Service discovery | K8s DNS or DirectoryService | Health endpoints |
+| Load balancing | K8s Service | Readiness probes |
+| Config management | K8s ConfigMap/Secret | Env var support |
+| Scaling | K8s HPA | Stateless design |
+| Logging | K8s logging (fluentd, etc.) | Structured JSON logs |
+| Monitoring | Prometheus/Grafana | Metrics endpoint |
+
+**We don't reinvent K8s primitives** — modules are standard containers that work with any K8s tooling.
+
+### 2.5 Multi-Pod Patterns (Dispatcher/Worker)
+
+Some modules require multiple pod types working together (e.g., dispatcher + workers, API + background processor).
+
+#### 2.5.1 Pattern: Dispatcher + Worker
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Kubernetes Cluster                      │
+│                                                             │
+│  ┌─────────────┐         ┌─────────────────────────────┐    │
+│  │ Dispatcher  │         │        Worker Pool          │    │
+│  │  (1 pod)    │────────▶│  ┌───────┐ ┌───────┐        │    │
+│  │             │  Queue  │  │Worker1│ │Worker2│ ...    │    │
+│  │ REST API    │◀────────│  └───────┘ └───────┘        │    │
+│  └─────────────┘ Results │                             │    │
+│                          └─────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Implementation:**
+
+```yaml
+# dispatcher-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-parser-dispatcher
+spec:
+  replicas: 1  # Single dispatcher
+  template:
+    spec:
+      containers:
+      - name: dispatcher
+        image: ghcr.io/cyberfabric/file-parser-oop:latest
+        args: ["--role", "dispatcher"]
+        env:
+        - name: WORKER_QUEUE_URL
+          value: "redis://redis:6379"
+---
+# worker-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-parser-worker
+spec:
+  replicas: 5  # Scale workers independently
+  template:
+    spec:
+      containers:
+      - name: worker
+        image: ghcr.io/cyberfabric/file-parser-oop:latest
+        args: ["--role", "worker"]
+        env:
+        - name: WORKER_QUEUE_URL
+          value: "redis://redis:6379"
+```
+
+**Module code:**
+
+```rust
+// Single binary, role selected at runtime
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let role = std::env::var("MODKIT_ROLE").unwrap_or_else(|_| "standalone".to_owned());
+    
+    match role.as_str() {
+        "dispatcher" => run_dispatcher().await,
+        "worker" => run_worker().await,
+        "standalone" => run_standalone().await,  // Both in one (for local dev)
+        _ => anyhow::bail!("Unknown role: {}", role),
+    }
+}
+```
+
+#### 2.5.2 Pattern: API + Background Processor
+
+```yaml
+# Same image, different entry points
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notifications-api
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: api
+        image: ghcr.io/cyberfabric/notifications-oop:latest
+        args: ["--role", "api"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notifications-processor
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: processor
+        image: ghcr.io/cyberfabric/notifications-oop:latest
+        args: ["--role", "processor"]
+```
+
+#### 2.5.3 When to Use Multi-Pod Patterns
+
+| Pattern | Use When |
+|---------|----------|
+| **Single pod** | Simple request/response, stateless |
+| **Dispatcher + Workers** | Long-running tasks, need queue-based scaling |
+| **API + Processor** | Async processing, event-driven workflows |
+| **Leader + Followers** | Coordination required, exactly-once semantics |
+
+#### 2.5.4 Communication Between Pods
+
+| Method | Use Case | K8s Primitive |
+|--------|----------|---------------|
+| **REST/gRPC** | Sync request/response | Service |
+| **Message Queue** | Async tasks (Redis, RabbitMQ, SQS) | External or StatefulSet |
+| **Shared DB** | State coordination | External or StatefulSet |
+| **K8s Events** | Loose coupling | K8s API |
+
+**We leverage K8s and external infrastructure** — no custom queue or coordination layer.
+
+### 2.6 Compile-Time HTTP Client for Backward Compatibility
 
 For modules that need to support both in-process and OoP deployment without runtime overhead:
 
@@ -355,16 +555,216 @@ WantedBy=multi-user.target
 - Internal DNS or static IPs for service discovery
 - Manual or Ansible-based scaling
 
-### 3.4 Deployment Model Comparison
+### 3.4 Hybrid and Multi-Environment Deployments
 
-| Aspect | Local | Kubernetes | On-Prem |
-|--------|-------|------------|---------|
-| **Scaling** | Manual | HPA/VPA | Manual/Scripts |
-| **Discovery** | In-process | K8s DNS or DirectoryService | DirectoryService |
-| **Load Balancing** | Round-robin (client) | K8s Service | HAProxy/Nginx |
-| **Health Checks** | Heartbeat | Probes | Heartbeat |
-| **Restart Policy** | Host respawns | Pod restart | systemd |
-| **Resource Limits** | OS limits | Pod limits | cgroups |
+Real-world deployments often involve hybrid environments where CyberFabric services coexist with vendor services, external databases, and legacy systems. This section covers discovery strategies for these scenarios.
+
+#### 3.4.0 ModKit vs External: What's the Boundary?
+
+**ModKit manages:**
+- CyberFabric modules (in-process or OoP)
+- Module lifecycle (init → migrate → start → stop)
+- Inter-module communication (REST/gRPC via DirectoryService or K8s DNS)
+- Module configuration and health
+
+**External (not ModKit's concern):**
+- Customer's existing services
+- Vendor APIs and third-party integrations
+- Databases (Postgres, Redis, etc.) — ModKit connects to them, doesn't manage them
+- Message queues (RabbitMQ, Kafka, SQS) — ModKit uses them, doesn't manage them
+- K8s infrastructure (networking, storage, ingress)
+- Observability stack (Prometheus, Grafana, Jaeger)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Customer's K8s Cluster                           │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    ModKit-Managed (CyberFabric)                 │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────────┐   │    │
+│  │  │Calculator│  │FileParser│  │LLM-GW    │  │DirectoryService│   │    │
+│  │  │  (OoP)   │  │  (OoP)   │  │  (OoP)   │  │   (optional)   │   │    │
+│  │  └──────────┘  └──────────┘  └──────────┘  └────────────────┘   │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                              │                                          │
+│                              │ Standard K8s/HTTP/gRPC                   │
+│                              ▼                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    External (Customer-Managed)                  │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐     │    │
+│  │  │ Postgres │  │  Redis   │  │ Vendor   │  │ Customer's   │     │    │
+│  │  │   (DB)   │  │ (Cache)  │  │   API    │  │  Services    │     │    │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────────┘     │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key principle:** CyberFabric modules are **good K8s citizens** — they use standard protocols (HTTP, gRPC), standard config (env vars, ConfigMaps), and standard observability (health endpoints, structured logs, metrics). They don't require special infrastructure beyond what K8s already provides.
+
+#### 3.4.1 Discovery Strategy Options
+
+| Strategy | Description | Best For |
+|----------|-------------|----------|
+| **DirectoryService** | Central gRPC registry with heartbeats | Cross-environment, metadata-rich |
+| **K8s DNS** | Native Kubernetes service discovery | Pure K8s, simple setups |
+| **Static Config** | Hardcoded endpoints in config | External services, legacy systems |
+| **Hybrid** | DirectoryService for CyberFabric + static for external | Mixed environments |
+
+#### 3.4.2 K8s DNS vs DirectoryService
+
+**When to use K8s DNS:**
+- All services run in the same K8s cluster
+- No need for instance-level metadata (version, tags)
+- Simple deployments with K8s-native health checks
+- Want zero additional infrastructure
+
+**When to use DirectoryService:**
+- Services span multiple clusters or environments
+- Need client-side load balancing control (weighted, sticky)
+- Require instance metadata for routing decisions
+- Local development or on-prem without K8s
+- Need visibility into which instance handled a request
+
+**How communication changes:**
+
+```
+K8s DNS:
+  Client → http://calculator:80 → K8s Service → Pod
+  (K8s handles LB, health checks, retries)
+
+DirectoryService:
+  Client → DirectoryService.resolve("calculator") → http://10.0.1.42:8080 → Pod
+  (Client handles LB, circuit breaker, retries)
+```
+
+#### 3.4.3 Hybrid Environment Patterns
+
+**Pattern 1: CyberFabric in K8s + External Database**
+
+```yaml
+# CyberFabric modules use DirectoryService for inter-module communication
+# External DB configured via static connection string
+modules:
+  calculator:
+    runtime:
+      type: oop
+    database:
+      server: external-postgres  # Static config, not discovered
+      
+database:
+  servers:
+    external-postgres:
+      host: "db.vendor.example.com"  # External vendor DB
+      port: 5432
+```
+
+**Pattern 2: CyberFabric + Vendor Services in Same Cluster**
+
+```yaml
+# CyberFabric modules: DirectoryService discovery
+# Vendor services: K8s DNS or static endpoints
+modules:
+  calculator:
+    runtime:
+      type: oop
+      discovery: directory  # Use DirectoryService
+      
+  vendor-api-gateway:
+    runtime:
+      type: external
+      endpoint: "http://vendor-gateway.vendor-ns.svc.cluster.local"  # K8s DNS
+```
+
+**Pattern 3: Multi-Cluster Federation**
+
+```
+┌─────────────────────────────┐     ┌─────────────────────────────┐
+│      Cluster A (US-East)    │     │     Cluster B (EU-West)     │
+│  ┌─────────────────────┐    │     │    ┌─────────────────────┐  │
+│  │  DirectoryService   │◄───┼─────┼───►│  DirectoryService   │  │
+│  └─────────────────────┘    │     │    └─────────────────────┘  │
+│           │                 │     │             │               │
+│     ┌─────┴─────┐           │     │       ┌─────┴─────┐         │
+│     ▼           ▼           │     │       ▼           ▼         │
+│ Calculator   FileParser     │     │   Calculator   LLM-Gateway  │
+└─────────────────────────────┘     └─────────────────────────────┘
+
+Cross-cluster discovery via federated DirectoryService
+```
+
+#### 3.4.4 External Service Integration
+
+For services outside CyberFabric's control (vendor APIs, legacy systems):
+
+```rust
+// Option 1: Static endpoint in ClientConfig
+impl ClientDescriptor for VendorApiDescriptor {
+    fn config() -> ClientConfig {
+        ClientConfig {
+            discovery: DiscoveryStrategy::Static {
+                endpoint: std::env::var("VENDOR_API_ENDPOINT")
+                    .unwrap_or_else(|_| "https://api.vendor.com".to_owned()),
+            },
+            ..ClientConfig::rest()
+        }
+    }
+}
+
+// Option 2: K8s DNS for in-cluster vendor services
+impl ClientDescriptor for VendorInClusterDescriptor {
+    fn config() -> ClientConfig {
+        ClientConfig {
+            discovery: DiscoveryStrategy::KubernetesDns {
+                service_name: "vendor-service",
+                namespace: Some("vendor-ns".to_owned()),
+                port: 8080,
+            },
+            ..ClientConfig::rest()
+        }
+    }
+}
+```
+
+#### 3.4.5 Discovery Strategy Enum
+
+```rust
+/// How to discover the target service endpoint.
+#[derive(Debug, Clone)]
+pub enum DiscoveryStrategy {
+    /// Use DirectoryService for dynamic discovery (default for CyberFabric modules).
+    Directory,
+    
+    /// Use Kubernetes DNS (service-name.namespace.svc.cluster.local).
+    KubernetesDns {
+        service_name: String,
+        namespace: Option<String>,
+        port: u16,
+    },
+    
+    /// Static endpoint (for external services, legacy systems).
+    Static {
+        endpoint: String,
+    },
+}
+
+impl Default for DiscoveryStrategy {
+    fn default() -> Self {
+        Self::Directory
+    }
+}
+```
+
+### 3.5 Deployment Model Comparison
+
+| Aspect | Local | Kubernetes | On-Prem | Hybrid |
+|--------|-------|------------|---------|--------|
+| **Scaling** | Manual | HPA/VPA | Manual/Scripts | Mixed |
+| **Discovery** | In-process | K8s DNS or DirectoryService | DirectoryService | DirectoryService + Static |
+| **Load Balancing** | Round-robin (client) | K8s Service or client | HAProxy/Nginx | Mixed |
+| **Health Checks** | Heartbeat | Probes | Heartbeat | Mixed |
+| **Restart Policy** | Host respawns | Pod restart | systemd | Mixed |
+| **Resource Limits** | OS limits | Pod limits | cgroups | Mixed |
+| **External Services** | Static config | K8s DNS or static | Static config | Static config |
 
 ---
 
@@ -775,6 +1175,126 @@ CLI args > Local config file > MODKIT_MODULE_CONFIG from host
 | `MODKIT_MODULE_CONFIG` | JSON config from host |
 | `MODKIT_CONFIG_PATH` | Path to config file |
 | `RUST_LOG` | Log level filter |
+
+### 7.4 Runtime Configuration Updates
+
+OoP modules may need configuration updates without restart. This section covers strategies for dynamic configuration.
+
+#### 7.4.1 Configuration Update Strategies
+
+| Strategy | Mechanism | Use Case | Downtime |
+|----------|-----------|----------|----------|
+| **Restart** | Kill + respawn with new config | Simple, stateless modules | Brief (seconds) |
+| **Rolling Update** | K8s Deployment rollout | Stateless, multiple replicas | Zero |
+| **Config Reload Signal** | SIGHUP triggers reload | Long-running, stateful | Zero |
+| **Config Watch** | File/ConfigMap watch | Frequent changes | Zero |
+| **Control Plane API** | gRPC/REST endpoint | Programmatic updates | Zero |
+
+#### 7.4.2 Restart-Based Updates (Default)
+
+For most OoP modules, restart is the simplest and safest approach:
+
+```yaml
+# Kubernetes: Update ConfigMap, then rollout restart
+kubectl rollout restart deployment/calculator
+
+# Local: Host respawns with new config
+# 1. Update config.yaml
+# 2. Send SIGTERM to OoP process
+# 3. Host detects exit and respawns with new config
+```
+
+**Pros:** Simple, no special code needed, guaranteed clean state  
+**Cons:** Brief downtime per instance, connection drain required
+
+#### 7.4.3 Signal-Based Reload (SIGHUP)
+
+For modules that need zero-downtime config updates:
+
+```rust
+// In OoP module bootstrap
+use tokio::signal::unix::{signal, SignalKind};
+
+let mut sighup = signal(SignalKind::hangup())?;
+tokio::spawn(async move {
+    loop {
+        sighup.recv().await;
+        tracing::info!("SIGHUP received, reloading configuration");
+        if let Err(e) = config_provider.reload().await {
+            tracing::error!(error = %e, "Config reload failed");
+        }
+    }
+});
+```
+
+**What can be reloaded:**
+- Feature flags
+- Rate limits
+- Cache TTLs
+- Log levels
+
+**What requires restart:**
+- Database connections
+- Listening ports
+- TLS certificates
+- Module dependencies
+
+#### 7.4.4 Kubernetes ConfigMap Watch
+
+For K8s deployments, modules can watch ConfigMap changes:
+
+```yaml
+# Mount ConfigMap as volume with auto-update
+spec:
+  containers:
+  - name: calculator
+    volumeMounts:
+    - name: config
+      mountPath: /etc/calculator
+  volumes:
+  - name: config
+    configMap:
+      name: calculator-config
+```
+
+```rust
+// Watch for config file changes
+use notify::{Watcher, RecursiveMode};
+
+let mut watcher = notify::recommended_watcher(|res| {
+    if let Ok(event) = res {
+        if event.kind.is_modify() {
+            config_provider.reload().await;
+        }
+    }
+})?;
+watcher.watch("/etc/calculator/config.yaml", RecursiveMode::NonRecursive)?;
+```
+
+#### 7.4.5 Control Plane API (Future)
+
+For programmatic configuration updates, modules can expose a control endpoint:
+
+```rust
+// Control plane endpoint (internal only, not exposed via API gateway)
+POST /internal/config/reload
+POST /internal/config/update { "key": "value" }
+GET  /internal/config/current
+```
+
+**Security considerations:**
+- Control endpoints must be internal-only (not routed through API gateway)
+- Require mTLS or internal network isolation
+- Audit log all configuration changes
+
+#### 7.4.6 Recommended Approach by Module Type
+
+| Module Type | Recommended Strategy |
+|-------------|---------------------|
+| Stateless API handlers | Rolling restart (K8s) or restart (local) |
+| Long-running workers | SIGHUP reload for safe params, restart for connections |
+| Stateful services | SIGHUP reload + graceful drain for restarts |
+| High-availability critical | Multiple replicas + rolling update |
 
 ---
 
