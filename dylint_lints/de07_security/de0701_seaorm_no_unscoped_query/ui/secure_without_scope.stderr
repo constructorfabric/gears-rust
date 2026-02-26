@@ -1,0 +1,30 @@
+error: unscoped .all() query detected — bypasses Secure ORM scoping (DE0701)
+  --> $DIR/secure_without_scope.rs:42:13
+   |
+LL |     let _ = Entity::find().secure().all(conn).await;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: use Entity::find().secure().scope_with(&scope).all(conn) instead
+   = note: unscoped queries bypass tenant isolation; wrap with .secure().scope_with(&scope)
+   = note: `#[deny(de0701_seaorm_no_unscoped_query)]` on by default
+
+error: unscoped .one() query detected — bypasses Secure ORM scoping (DE0701)
+  --> $DIR/secure_without_scope.rs:48:13
+   |
+LL |     let _ = Entity::find().secure().one(conn).await;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: use Entity::find().secure().scope_with(&scope).one(conn) instead
+   = note: unscoped queries bypass tenant isolation; wrap with .secure().scope_with(&scope)
+
+error: unscoped .exec() on update/delete detected — bypasses Secure ORM scoping (DE0701)
+  --> $DIR/secure_without_scope.rs:54:13
+   |
+LL |     let _ = Entity::update_many().secure().exec(conn).await;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: use Entity::update_many().secure().scope_with(&scope).exec(conn) instead
+   = note: unscoped queries bypass tenant isolation; wrap with .secure().scope_with(&scope)
+
+error: aborting due to 3 previous errors
+

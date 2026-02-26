@@ -1,0 +1,12 @@
+error: execute_unprepared() detected — raw SQL bypasses Secure ORM (DE0702)
+  --> $DIR/bad_execute_unprepared.rs:22:5
+   |
+LL |     conn.execute_unprepared("DELETE FROM users WHERE id = 1").await.ok();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: use SecureSelect, SecureUpdateMany, or SecureDeleteMany instead
+   = note: raw SQL bypasses tenant isolation and access scoping; use the Secure ORM layer
+   = note: `#[deny(de0702_seaorm_no_execute_unprepared)]` on by default
+
+error: aborting due to 1 previous error
+

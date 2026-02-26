@@ -1,0 +1,46 @@
+[package]
+name = "de0701_seaorm_no_unscoped_query"
+version = "0.1.0"
+authors = ["Cyber Fabric"]
+description = "Prohibits unscoped SeaORM queries; use .secure().scope_with() instead (DE0701)"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "unscoped_find_all"
+path = "ui/unscoped_find_all.rs"
+
+[[example]]
+name = "unscoped_find_one"
+path = "ui/unscoped_find_one.rs"
+
+[[example]]
+name = "unscoped_find_count"
+path = "ui/unscoped_find_count.rs"
+
+[[example]]
+name = "unscoped_update_delete"
+path = "ui/unscoped_update_delete.rs"
+
+[[example]]
+name = "secure_without_scope"
+path = "ui/secure_without_scope.rs"
+
+[[example]]
+name = "secure_patterns"
+path = "ui/secure_patterns.rs"
+
+[dependencies]
+clippy_utils.workspace = true
+dylint_linting.workspace = true
+lint_utils.workspace = true
+
+[dev-dependencies]
+dylint_testing.workspace = true
+sea-orm.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true

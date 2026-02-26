@@ -13,6 +13,8 @@ members = [
     "de03_domain_layer/de0301_no_infra_in_domain",
     "de03_domain_layer/de0308_no_http_in_domain",
     "de05_client_layer/de0503_plugin_client_suffix",
+    "de07_security/de0701_seaorm_no_unscoped_query",
+    "de07_security/de0702_seaorm_no_execute_unprepared",
     "de07_security/de0706_no_direct_sqlx",
     "de08_rest_api_conventions/de0801_api_endpoint_version",
     "de08_rest_api_conventions/de0802_use_odata_ext",

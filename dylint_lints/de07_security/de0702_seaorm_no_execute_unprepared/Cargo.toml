@@ -1,0 +1,34 @@
+[package]
+name = "de0702_seaorm_no_execute_unprepared"
+version = "0.1.0"
+authors = ["Cyber Fabric"]
+description = "Prohibits ConnectionTrait::execute_unprepared() and raw SQL via Statement::from_string (DE0702)"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "bad_execute_unprepared"
+path = "ui/bad_execute_unprepared.rs"
+
+[[example]]
+name = "bad_statement_from_string"
+path = "ui/bad_statement_from_string.rs"
+
+[[example]]
+name = "good_secure_queries"
+path = "ui/good_secure_queries.rs"
+
+[dependencies]
+clippy_utils.workspace = true
+dylint_linting.workspace = true
+lint_utils.workspace = true
+
+[dev-dependencies]
+dylint_testing.workspace = true
+sea-orm.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true

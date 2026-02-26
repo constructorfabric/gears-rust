@@ -1084,6 +1084,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "de0701_seaorm_no_unscoped_query"
+version = "0.1.0"
+dependencies = [
+ "clippy_utils",
+ "dylint_linting",
+ "dylint_testing",
+ "lint_utils",
+ "sea-orm",
+]
+
+[[package]]
+name = "de0702_seaorm_no_execute_unprepared"
+version = "0.1.0"
+dependencies = [
+ "clippy_utils",
+ "dylint_linting",
+ "dylint_testing",
+ "lint_utils",
+ "sea-orm",
+]
+
+[[package]]
 name = "de0706_no_direct_sqlx"
 version = "0.1.0"
 dependencies = [

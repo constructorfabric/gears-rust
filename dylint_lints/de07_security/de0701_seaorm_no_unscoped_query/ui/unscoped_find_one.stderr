@@ -1,0 +1,12 @@
+error: unscoped .one() query detected — bypasses Secure ORM scoping (DE0701)
+  --> $DIR/unscoped_find_one.rs:25:13
+   |
+LL |     let _ = Entity::find().one(conn).await;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: use Entity::find().secure().scope_with(&scope).one(conn) instead
+   = note: unscoped queries bypass tenant isolation; wrap with .secure().scope_with(&scope)
+   = note: `#[deny(de0701_seaorm_no_unscoped_query)]` on by default
+
+error: aborting due to 1 previous error
+

@@ -1,0 +1,21 @@
+error: unscoped .all() query detected — bypasses Secure ORM scoping (DE0701)
+  --> $DIR/unscoped_find_all.rs:25:13
+   |
+LL |     let _ = Entity::find().all(conn).await;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: use Entity::find().secure().scope_with(&scope).all(conn) instead
+   = note: unscoped queries bypass tenant isolation; wrap with .secure().scope_with(&scope)
+   = note: `#[deny(de0701_seaorm_no_unscoped_query)]` on by default
+
+error: unscoped .all() query detected — bypasses Secure ORM scoping (DE0701)
+  --> $DIR/unscoped_find_all.rs:31:13
+   |
+LL |     let _ = Entity::find().filter(Column::Name.eq("test")).all(conn).await;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: use Entity::find().secure().scope_with(&scope).all(conn) instead
+   = note: unscoped queries bypass tenant isolation; wrap with .secure().scope_with(&scope)
+
+error: aborting due to 2 previous errors
+
