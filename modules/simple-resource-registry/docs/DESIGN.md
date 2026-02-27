@@ -18,7 +18,7 @@ Resource type definitions are managed through GTS (Global Type System) via the T
 
 | Requirement | Design Response |
 | --- | --- |
-| `cpt-cf-srr-fr-create-resource` | API layer extracts tenant/user from SecurityContext; domain layer assigns UUID and timestamps; delegates to storage plugin |
+| `cpt-cf-srr-fr-idempotent-resource-create` | API layer extracts tenant/user from SecurityContext; domain layer assigns UUID and timestamps; delegates to storage plugin; ensure idempotency |
 | `cpt-cf-srr-fr-read-resource` | ResourceService resolves permitted GTS types, then storage plugin applies backend-level filters (tenant, type scope, owner_id for per-user types) integrated with standard authz; returns 404 when no match is found |
 | `cpt-cf-srr-fr-list-resources` | OData parser translates query params to backend query filters on schema columns; plugin executes scoped query |
 | `cpt-cf-srr-fr-update-resource` | ResourceService resolves permitted GTS types, storage plugin fetches target resource with backend-level security filters, then domain layer validates payload and updates `updated_at` |
@@ -515,7 +515,7 @@ pub trait SimpleResourceRegistryClient: Send + Sync {
 
 | Method | Path | Description | FR | Stability |
 | --- | --- | --- | --- | --- |
-| `POST` | `/resources` | Create a new resource | `cpt-cf-srr-fr-create-resource` | stable |
+| `POST` | `/resources` | Create a new resource | `cpt-cf-srr-fr-idempotent-resource-create` | stable |
 | `GET` | `/resources/{id}` | Get a single resource by ID | `cpt-cf-srr-fr-read-resource` | stable |
 | `GET` | `/resources` | List resources (OData filtering) | `cpt-cf-srr-fr-list-resources` | stable |
 | `PUT` | `/resources/{id}` | Update a resource | `cpt-cf-srr-fr-update-resource` | stable |
@@ -888,7 +888,7 @@ Notes:
 | --- | --- | --- | --- |
 | Types Registry | Types Registry SDK (ClientHub) | Resolve GTS type definitions, validate type, read behavioral flags | `cpt-cf-srr-fr-gts-type-registration`, `cpt-cf-srr-fr-gts-type-validation` |
 | modkit-db | SecurityContext-based tenant scoping | Tenant-scoped database access infrastructure (indirect — used by database-backed storage plugins, not by the main module directly) | `cpt-cf-srr-fr-default-storage-backend` |
-| gts-rust | Rust crate (library) | GTS ID generation, schema utilities, payload validation against GTS type schemas | `cpt-cf-srr-fr-gts-type-registration`, `cpt-cf-srr-fr-create-resource`, `cpt-cf-srr-fr-update-resource` |
+| gts-rust | Rust crate (library) | GTS ID generation, schema utilities, payload validation against GTS type schemas | `cpt-cf-srr-fr-gts-type-registration`, `cpt-cf-srr-fr-idempotent-resource-create`, `cpt-cf-srr-fr-update-resource` |
 | Events Broker | Events Broker SDK (ClientHub) | Emit domain events for resource lifecycle (fixed schema: id, type, subject_type, subject_id) | `cpt-cf-srr-fr-notification-events` |
 | Audit Module | Audit SDK (ClientHub) | Emit audit events for compliance (fixed schema: id, type, subject_type, subject_id, previous_payload, new_payload) | `cpt-cf-srr-fr-audit-events` |
 

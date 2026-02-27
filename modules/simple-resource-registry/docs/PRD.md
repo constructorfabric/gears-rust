@@ -138,7 +138,7 @@ Platform users, API clients, and CyberFabric modules can define derived types an
 
 #### Create Resource
 
-- [ ] `p1` - **ID**: `cpt-cf-srr-fr-create-resource`
+- [ ] `p1` - **ID**: `cpt-cf-srr-fr-idempotent-resource-create`
 
 The system **MUST** allow authenticated users, modules, and API clients to create a new resource by specifying a resource `type` (a GTS type ID), a mandatory `idempotency_key` (UUID), and a JSON payload.
 
