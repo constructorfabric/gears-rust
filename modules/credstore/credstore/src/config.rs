@@ -20,3 +20,34 @@ impl Default for CredStoreConfig {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_vendor_is_hyperspot() {
+        let cfg = CredStoreConfig::default();
+        assert_eq!(cfg.vendor, "hyperspot");
+    }
+
+    #[test]
+    fn vendor_can_be_overridden_via_serde() {
+        let json = r#"{"vendor": "acme"}"#;
+        let cfg: CredStoreConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.vendor, "acme");
+    }
+
+    #[test]
+    fn empty_object_applies_defaults() {
+        let cfg: CredStoreConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.vendor, "hyperspot");
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let json = r#"{"vendor": "x", "unexpected": true}"#;
+        assert!(serde_json::from_str::<CredStoreConfig>(json).is_err());
+    }
+}

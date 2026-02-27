@@ -260,4 +260,80 @@ mod tests {
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret"));
     }
+
+    #[test]
+    fn secret_ref_as_ref_returns_inner_string() {
+        let r = SecretRef::new("my-key").unwrap();
+        assert_eq!(r.as_ref(), "my-key");
+    }
+
+    #[test]
+    fn secret_value_new_stores_bytes() {
+        let val = SecretValue::new(b"hello world".to_vec());
+        assert_eq!(val.as_bytes(), b"hello world");
+    }
+
+    #[test]
+    fn sharing_mode_serde_roundtrip() {
+        for (mode, expected_json) in [
+            (SharingMode::Private, "\"private\""),
+            (SharingMode::Tenant, "\"tenant\""),
+            (SharingMode::Shared, "\"shared\""),
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, expected_json);
+            let back: SharingMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, mode);
+        }
+    }
+
+    #[test]
+    fn sharing_mode_clone_and_copy() {
+        let original = SharingMode::Private;
+        let copied = original; // Copy
+        let cloned = original; // Clone via Copy
+        assert_eq!(original, copied);
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn get_secret_response_is_inherited_false() {
+        let resp = GetSecretResponse {
+            value: SecretValue::from("s"),
+            owner_tenant_id: Uuid::nil(),
+            sharing: SharingMode::Tenant,
+            is_inherited: false,
+        };
+        assert!(!resp.is_inherited);
+        assert_eq!(resp.sharing, SharingMode::Tenant);
+    }
+
+    #[test]
+    fn secret_value_from_string_stores_bytes() {
+        let val = SecretValue::from(String::from("owned"));
+        assert_eq!(val.as_bytes(), b"owned");
+    }
+
+    #[test]
+    fn secret_value_from_vec_stores_bytes() {
+        let val = SecretValue::from(vec![0xDE, 0xAD]);
+        assert_eq!(val.as_bytes(), &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn secret_ref_debug_shows_inner_value() {
+        let r = SecretRef::new("my-key").unwrap();
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("SecretRef"));
+        assert!(dbg.contains("my-key"));
+    }
+
+    #[test]
+    fn secret_ref_serialize_roundtrip() {
+        let r = SecretRef::new("round-trip").unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, "\"round-trip\"");
+        let back: SecretRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_ref(), "round-trip");
+    }
 }

@@ -37,3 +37,58 @@ impl CredStoreError {
         Self::Internal(msg.into())
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_ref_constructor_sets_reason() {
+        let e = CredStoreError::invalid_ref("must not be empty");
+        assert!(
+            matches!(e, CredStoreError::InvalidSecretRef { ref reason } if reason == "must not be empty")
+        );
+        assert_eq!(e.to_string(), "invalid secret reference: must not be empty");
+    }
+
+    #[test]
+    fn service_unavailable_constructor_sets_message() {
+        let e = CredStoreError::service_unavailable("backend down");
+        assert!(matches!(e, CredStoreError::ServiceUnavailable(ref m) if m == "backend down"));
+        assert_eq!(e.to_string(), "service unavailable: backend down");
+    }
+
+    #[test]
+    fn internal_constructor_sets_message() {
+        let e = CredStoreError::internal("unexpected state");
+        assert!(matches!(e, CredStoreError::Internal(ref m) if m == "unexpected state"));
+        assert_eq!(e.to_string(), "internal error: unexpected state");
+    }
+
+    #[test]
+    fn not_found_display() {
+        let e = CredStoreError::NotFound;
+        assert_eq!(e.to_string(), "secret not found");
+    }
+
+    #[test]
+    fn no_plugin_available_display() {
+        let e = CredStoreError::NoPluginAvailable;
+        assert_eq!(e.to_string(), "no plugin available");
+    }
+
+    #[test]
+    fn all_variants_are_debug() {
+        let variants: &[CredStoreError] = &[
+            CredStoreError::InvalidSecretRef { reason: "x".into() },
+            CredStoreError::NotFound,
+            CredStoreError::NoPluginAvailable,
+            CredStoreError::ServiceUnavailable("y".into()),
+            CredStoreError::Internal("z".into()),
+        ];
+        for v in variants {
+            drop(format!("{v:?}"));
+        }
+    }
+}
