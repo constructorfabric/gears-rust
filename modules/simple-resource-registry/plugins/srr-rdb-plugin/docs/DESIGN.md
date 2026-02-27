@@ -19,7 +19,7 @@ Idempotency deduplication is handled atomically within a single database transac
 | `cpt-cf-srr-rdb-fr-relational-storage` | SeaORM entity with dedicated columns for schema fields + TEXT column for serialized JSON payload; SecureORM for tenant scoping; declares `odata_support` capability |
 | `cpt-cf-srr-rdb-fr-odata-translation` | OData $filter/$orderby translated to SeaORM `Condition` and `Order` on schema columns; cursor-based pagination via `(created_at, id)` tuple cursor per DNA QUERYING.md, backed by `idx_simple_resources_tenant_type_created` |
 | `cpt-cf-srr-rdb-fr-gts-wildcard` | Trailing `*` in type filter → SQL `LIKE '{prefix}%'`; prefix derived by stripping `*` from the GTS pattern |
-| `cpt-cf-srr-rdb-fr-idempotency` | Single-transaction: check-then-insert via SeaORM within a DB transaction — query `idempotency_keys` for existing key, insert resource + idempotency record if absent; returns `CreateOutcome::Duplicate` if key exists |
+| `cpt-cf-srr-rdb-fr-idempotency` | Single-transaction: check-then-insert via SeaORM within a DB transaction — query `idempotency_keys` for existing key, insert resource + idempotency record if absent; returns `CreateOutcome::Duplicate` if key exists. If a concurrent create races and causes a unique-key constraint violation on `(tenant_id, idempotency_key)`, the implementation MUST catch that error, re-read the existing `idempotency_keys` record (and the associated `resource_id`) from the database, and return `CreateOutcome::Duplicate(existing_resource_id)` — ensuring deterministic behavior across all DB backends. |
 | `cpt-cf-srr-rdb-fr-soft-delete` | `UPDATE simple_resources SET deleted_at = now() WHERE id = ? AND tenant_id = ?`; list queries include `WHERE deleted_at IS NULL` |
 | `cpt-cf-srr-rdb-fr-retention-purge` | Delete soft-deleted rows older than the cutoff in bounded batches using SeaORM query builders; exact SQL varies by backend (e.g., `LIMIT` on MariaDB/SQLite, CTE or subquery on PostgreSQL) |
 | `cpt-cf-srr-rdb-fr-group-memberships` | Junction table `simple_resource_group_memberships` with `(id, group_id)` PK |
@@ -153,7 +153,7 @@ graph TB
 
 - [ ] `p1` - **ID**: `cpt-cf-srr-rdb-component-idempotency-handler`
 
-  - **Idempotency Handler**: Implements the SDK idempotency contract (see parent DESIGN §3.2 `create` method). Manages the `idempotency_keys` table within create transactions: queries for existing `(tenant_id, idempotency_key)`, and if not found, inserts both the resource row and the idempotency record in the same transaction. This plugin MUST pass the SDK idempotency conformance test suite.
+  - **Idempotency Handler**: Implements the SDK idempotency contract (see parent DESIGN §3.2 `create` method). Manages the `idempotency_keys` table within create transactions: queries for existing `(tenant_id, idempotency_key)`, and if not found, inserts both the resource row and the idempotency record in the same transaction. If a concurrent create races and causes a unique-key constraint violation on `(tenant_id, idempotency_key)`, the handler MUST catch that error, re-read the existing `idempotency_keys` record (and the associated `resource_id`) from the database, and return `CreateOutcome::Duplicate(existing_resource_id)` — ensuring deterministic behavior across all DB backends. This plugin MUST pass the SDK idempotency conformance test suite.
 
 ### 3.3 API Contracts
 
@@ -295,7 +295,7 @@ sequenceDiagram
 
 **ID**: `cpt-cf-srr-rdb-dbtable-idempotency-keys`
 
-**Purpose**: Deduplication store for POST create operations. `idempotency_key` is required on every create request; the plugin atomically checks this table and inserts the resource + idempotency record in one transaction. If a matching `(tenant_id, idempotency_key)` row exists and is within the retention window, the plugin returns `CreateOutcome::Duplicate` and the main module returns 409 with the `resource_id` of the previously created resource.
+**Purpose**: Deduplication store for POST create operations. `idempotency_key` is required on every create request; the plugin atomically checks this table and inserts the resource + idempotency record in one transaction. If a matching `(tenant_id, idempotency_key)` row exists and is within the retention window, the plugin returns `CreateOutcome::Duplicate` and the main module returns 409 with the `resource_id` of the previously created resource. If a concurrent create races past the initial check and causes a unique-key constraint violation on `(tenant_id, idempotency_key)`, the plugin MUST catch that constraint error, re-read the existing row from `idempotency_keys` (and look up the associated `resource_id`), and return `CreateOutcome::Duplicate(existing_resource_id)` — making the concurrent-collision behavior identical to the sequential-duplicate case and deterministic across all DB backends.
 
 **Schema**:
 

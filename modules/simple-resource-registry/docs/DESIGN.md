@@ -370,7 +370,7 @@ graph TB
 
 - [ ] `p1` - **ID**: `cpt-cf-srr-component-storage-router`
 
-  - **Storage Router**: Resolves the correct storage plugin for a given resource type based on configuration. At p1, the router always returns the default Relational Database plugin (`cpt-cf-srr-component-relational-db-plugin`); per-type routing configuration is introduced at p3 (`cpt-cf-srr-fr-storage-routing`) to enable multi-plugin resolution based on GTS type ID patterns.
+  - **Storage Router**: Resolves the correct storage plugin for a given resource type based on the `cpt-cf-srr-fr-storage-routing` configuration. For each request, the router matches the resource GTS type ID against configured type ID patterns and returns the associated plugin instance. When no per-type rule matches, the router falls back to the default Relational Database plugin (`cpt-cf-srr-component-relational-db-plugin`).
 
 - [ ] `p1` - **ID**: `cpt-cf-srr-component-relational-db-plugin`
 
