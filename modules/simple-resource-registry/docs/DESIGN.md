@@ -19,7 +19,7 @@ Resource type definitions are managed through GTS (Global Type System) via the T
 | Requirement | Design Response |
 | --- | --- |
 | `cpt-cf-srr-fr-create-resource` | API layer extracts tenant/user from SecurityContext; domain layer assigns UUID and timestamps; delegates to storage plugin |
-| `cpt-cf-srr-fr-read-resource` | ResourceService resolves permitted GTS types, then storage plugin applies backend-level filters (tenant, type scope, owner_id for per-user types); returns 404 when no match found |
+| `cpt-cf-srr-fr-read-resource` | ResourceService resolves permitted GTS types, then storage plugin applies backend-level filters (tenant, type scope, owner_id for per-user types) integrated with standard authz; returns 404 when no match is found |
 | `cpt-cf-srr-fr-list-resources` | OData parser translates query params to backend query filters on schema columns; plugin executes scoped query |
 | `cpt-cf-srr-fr-update-resource` | ResourceService resolves permitted GTS types, storage plugin fetches target resource with backend-level security filters, then domain layer validates payload and updates `updated_at` |
 | `cpt-cf-srr-fr-delete-resource` | Soft-delete via deleted_at timestamp; storage plugin filters soft-deleted records from list queries |
@@ -37,7 +37,7 @@ Resource type definitions are managed through GTS (Global Type System) via the T
 | `cpt-cf-srr-fr-storage-routing` | Configuration maps GTS type IDs to storage plugin instances; router resolves plugin per request |
 | `cpt-cf-srr-fr-batch-operations` | Batch endpoints (POST /resources:batch, POST /resources:batch-get) delegate per-item to ResourceService with shared SecurityContext; 207 Multi-Status with per-item results per DNA BATCH.md; configurable batch size cap |
 | `cpt-cf-srr-fr-resource-groups` | Many-to-many group membership model; group-level batch operations (list, delete); group lifecycle |
-| `cpt-cf-srr-fr-idempotent-create` | POST requires `idempotency_key`; plugin atomically checks and persists the key+resource in one transaction; `CreateOutcome::Duplicate` returned for duplicate key within retention window → 409 with existing resource id |
+| `cpt-cf-srr-fr-idempotent-resource-create` | POST requires `idempotency_key`; plugin atomically checks and persists the key+resource in one transaction; `CreateOutcome::Duplicate` returned for duplicate key within retention window → 409 with existing resource id |
 
 #### ADR Drivers
 

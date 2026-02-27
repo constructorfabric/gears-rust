@@ -35,7 +35,7 @@ The storage layer is abstracted behind a well-defined interface, allowing the sa
 | Resource | A single stored object managed by the registry, consisting of a fixed GTS schema envelope and a type-specific JSON payload |
 | Resource Type (`type`)| A GTS-registered type definition that describes the schema of a resource's payload and its behavioral flags (event/audit configuration). The resource `type` value is a GTS type identifier in GTS ID format — i.e., resource type == resource type ID == GTS type ID. |
 | Resource Tenant (`tenant_id`) | The platform tenant (organization / workspace) that owns the resource. Set from `SecurityContext.subject_tenant_id` and never caller-supplied. Every resource must belong to exactly one tenant. Tenant isolation is enforced at the storage query level. |
-| Resource Owner (`owner_id`) | The subject (typically a human user or a registered API client identified by their `subject_id`) that created or is associated with the resource. Set from `SecurityContext.subject_id`. Populated only when `is_per_owner_resource=true` on the resource type. When set, owner-scoped resources are filtered by `owner_id = ctx.subject_id` at the storage query level, restricting visibility to that subject within the tenant. |
+| Resource Owner (`owner_id`) | The subject (typically a human user or a registered API client identified by their `subject_id`) that created or is associated with the resource. Set from `SecurityContext.subject_id` on any resource creation. When `is_per_owner_resource` resource type trait is set to `true` owner-scoped resources are filtered by `owner_id = ctx.subject_id` at the storage query level, restricting visibility to that subject within the tenant.|
 | Base Resource Type | The GTS schema defining the common envelope fields shared by all resources (id, tenant, timestamps, etc.) |
 | Derived Resource Type | A GTS type that extends the base resource type with a specific payload schema and behavioral configuration |
 | Storage Backend | An interchangeable storage implementation responsible for persisting and querying resources. The registry abstracts storage behind a well-defined interface, allowing different backends (relational databases, search engines, vendor-provided stores) to be used depending on deployment environment and resource type needs. |
@@ -87,8 +87,8 @@ No module-specific environment constraints beyond project defaults. The module o
 - GTS type-based access control on all CRUD operations (permissions checked against token's GTS resource_pattern + action)
 - GTS wildcard filtering on resource listing (trailing `*` per GTS spec)
 - Multi-backend storage architecture with interchangeable storage implementations; relational database as the default backend
-- Per-resource-type event emission (created, updated, deleted) via Events Broker
-- Per-resource-type audit event emission via Audit Module
+- Configurable per-resource-type event emission (created, updated, deleted) via Events Broker
+- Configurable per-resource-type audit event emission via Audit Module
 - SDK client for in-process consumption by other modules
 - Soft-delete support via deleted_at timestamp
 - Configurable deleted resource retention with automatic purge of soft-deleted resources (default: 30 days, type-level override)
@@ -96,13 +96,19 @@ No module-specific environment constraints beyond project defaults. The module o
 - Batch CRUD operations per DNA BATCH.md (`cpt-cf-srr-fr-batch-operations`)
 - Resource groups support (`cpt-cf-srr-fr-resource-groups`)
 
-### 4.2 Out of Scope
+### 4.2 Future scope
 
 - OData query support for payload fields (payload is opaque JSON; filtering/ordering within it is not supported)
 - Full-text search across payload content (use external index if needed)
 - Resource versioning or change history tracking
 - Cross-resource-type queries (e.g., all resources regardless of type in a single request)
 - Resource relationships or foreign key enforcement between resources
+- Time-based shards
+- More complex logic to accommodate for instance the common case of using Postgres or some RDB as the source of truth and then indexing with elastic search. There needs to be some ability to interpret the query to understand when to use certain backends even within a given resource type
+
+### 4.3 Out of Scope
+
+
 - Complex business logic or domain-specific validation beyond JSON Schema
 - Real-time streaming or SSE for resource changes (consumers use Events Broker for notifications)
 - File or binary attachment storage (use File Storage module)
@@ -116,23 +122,32 @@ No module-specific environment constraints beyond project defaults. The module o
 
 > IMPORTANT NOTE: All API endpoints in this section must enforce tenant access scope, user access scope (when applicable), and GTS type access scope filtering.
 
+#### GTS Resource Type Registration
+
+- [ ] `p1` - **ID**: `cpt-cf-srr-fr-gts-type-registration`
+
+The system **MUST** define a base GTS resource type schema with major-version-only versioning. Derived resource types **MUST** extend the base type via GTS schema inheritance. The base type **MUST** include:
+- Behavioral traits: is_per_owner_resource, is_create_event_needed, is_delete_event_needed, is_update_event_needed, is_create_audit_event_needed, is_update_audit_event_needed, is_delete_audit_event_needed
+- Hard-delete retention configuration: deleted_resource_retention_days (integer or null; default 30 if null; 0 means immediate hard-delete on soft-delete)
+
+Platform users, API clients, and CyberFabric modules can define derived types and register them using the Types Registry APIs. To access resources of a given type, the caller (module, user, or API client) must include the corresponding permissions for that type in its token claims.
+
+**Rationale**: GTS type system ensures consistency, discoverability, and validation for all resource types. Embedding the deleted-resource retention policy in the type definition keeps it co-located with other behavioral configuration.
+
+**Actors**: `cpt-cf-srr-actor-platform-user`, `cpt-cf-srr-actor-consumer-module`
+
 #### Create Resource
 
 - [ ] `p1` - **ID**: `cpt-cf-srr-fr-create-resource`
 
-The system **MUST** allow authenticated users to create a new resource by specifying a resource `type` (a GTS type ID), a mandatory `idempotency_key` (UUID), and a JSON payload. The system **MUST** assign a system-generated UUID (if not provided) as the resource `id`, set `tenant_id` from `SecurityContext.subject_tenant_id`, set `owner_id` from `SecurityContext.subject_id` (when `is_per_owner_resource=true`), and set `created_at` and `updated_at` timestamps. If the target resource type is per-owner (`is_per_owner_resource=true`) and `SecurityContext.subject_id` is absent, the system **MUST** return 422 Unprocessable Entity. The system **MUST** validate the payload against the derived GTS type's JSON Schema (using the `gts` crate) and return 422 Unprocessable Entity if validation fails.
+The system **MUST** allow authenticated users, modules, and API clients to create a new resource by specifying a resource `type` (a GTS type ID), a mandatory `idempotency_key` (UUID), and a JSON payload.
 
-**Rationale**: Core functionality — all consumers need to persist typed resources.
-**Actors**: `cpt-cf-srr-actor-platform-user`, `cpt-cf-srr-actor-consumer-module`
+The storage plugin **MUST** atomically check for an existing `(tenant_id, idempotency_key)` record and persist the resource + idempotency record in a single transaction. If a matching record exists and is within the retention window (default 24 h), the plugin returns `CreateOutcome::Duplicate` and the system **MUST** return 409 Conflict with the `id` of the previously created resource. Idempotency keys are scoped per tenant — the same key in different tenants is independent. Idempotency deduplication is storage-backend-owned; callers must always supply a unique key (e.g., a UUID) per intended creation.
 
-#### Idempotent Resource Creation
-
-- [ ] `p1` - **ID**: `cpt-cf-srr-fr-idempotent-create`
-
-The system **MUST** require a `idempotency_key` in every POST /resources request body. The storage plugin **MUST** atomically check for an existing `(tenant_id, idempotency_key)` record and persist the resource + idempotency record in a single transaction. If a matching record exists and is within the retention window (default 24 h), the plugin returns `CreateOutcome::Duplicate` and the system **MUST** return 409 Conflict with the `id` of the previously created resource. Idempotency keys are scoped per tenant — the same key in different tenants is independent. Idempotency deduplication is storage-backend-owned; callers must always supply a unique key (e.g., a UUID) per intended creation.
+Once the idempotency check passes, the system **MUST** assign a system-generated UUID (if not provided) as the resource `id`, set `tenant_id` from `SecurityContext.subject_tenant_id`, set `owner_id` from `SecurityContext.subject_id` (when `is_per_owner_resource=true`), and set `created_at` and `updated_at` timestamps. If the target resource type is per-owner (`is_per_owner_resource=true`) and `SecurityContext.subject_id` is absent, the system **MUST** return 422 Unprocessable Entity. The system **MUST** validate the payload against the derived GTS type's JSON Schema (using the `gts` crate) and return 422 Unprocessable Entity if validation fails.
 
 **Rationale**: Distributed consumers and workflow engines frequently retry failed HTTP requests. Without idempotency, retries after network failures create duplicate resources. The idempotency key lets callers safely retry POST requests without risk of double-creation.
-**Actors**: `cpt-cf-srr-actor-consumer-module`, `cpt-cf-srr-actor-platform-user`
+**Actors**: `cpt-cf-srr-actor-platform-user`, `cpt-cf-srr-actor-api-client`, `cpt-cf-srr-actor-consumer-module`
 
 #### Read Single Resource
 
@@ -141,7 +156,7 @@ The system **MUST** require a `idempotency_key` in every POST /resources request
 The system **MUST** allow authenticated users to retrieve a single resource by ID. All access checks — tenant scope, GTS type scope (from token claims), and owner_id scope (when `is_per_owner_resource=true`) — are applied as backend query filters. If the resource does not exist or is filtered out by any of these security filters, the system **MUST** return 404 Not Found. The caller cannot distinguish between "does not exist" and "not authorized" for individual resources.
 
 **Rationale**: Core functionality — consumers need to fetch individual resources.
-**Actors**: `cpt-cf-srr-actor-platform-user`
+**Actors**: `cpt-cf-srr-actor-platform-user`, `cpt-cf-srr-actor-api-client`, `cpt-cf-srr-actor-consumer-module`
 
 #### List Resources
 
@@ -150,7 +165,7 @@ The system **MUST** allow authenticated users to retrieve a single resource by I
 The system **MUST** allow authenticated users to list resources filtered by resource `type` (a GTS type ID), with OData query support ($filter, $orderby) and cursor-based pagination (limit, cursor) on schema fields. All access checks — tenant scope, GTS type scope (from token claims), and owner_id scope (when `is_per_owner_resource=true`) — are applied as backend query filters. If the requested type filter does not intersect with the caller's permitted GTS types, the system **MUST** return 403 Forbidden. Otherwise, results are filtered at the backend level and an empty result set is a valid response (not an error).
 
 **Rationale**: Consumers need to discover and paginate through resources of a given type.
-**Actors**: `cpt-cf-srr-actor-platform-user`
+**Actors**: `cpt-cf-srr-actor-platform-user`, `cpt-cf-srr-actor-api-client`, `cpt-cf-srr-actor-consumer-module`
 
 #### Update Resource
 
@@ -159,7 +174,7 @@ The system **MUST** allow authenticated users to list resources filtered by reso
 The system **MUST** allow authenticated users to update the payload of an existing resource. The system **MUST** update the updated_at timestamp. All access checks — tenant scope, GTS type scope (from token claims), and `owner_id` scope (when `is_per_owner_resource=true`) — are applied as backend query filters. If the resource does not exist or is filtered out by any of these security filters, the system **MUST** return 404 Not Found.
 
 **Rationale**: Core functionality — consumers need to modify resource data.
-**Actors**: `cpt-cf-srr-actor-platform-user`, `cpt-cf-srr-actor-consumer-module`
+**Actors**: `cpt-cf-srr-actor-platform-user`, `cpt-cf-srr-actor-api-client`, `cpt-cf-srr-actor-consumer-module`
 
 #### Delete Resource
 
@@ -168,17 +183,7 @@ The system **MUST** allow authenticated users to update the payload of an existi
 The system **MUST** allow authenticated users to soft-delete a resource by setting the deleted_at timestamp. All access checks — tenant scope, GTS type scope (from token claims), and `owner_id` scope (when `is_per_owner_resource=true`) — are applied as backend query filters. If the resource does not exist or is filtered out by any of these security filters, the system **MUST** return 404 Not Found. Soft-deleted resources **MUST** be excluded from list results by default.
 
 **Rationale**: Core functionality — consumers need to remove resources while maintaining audit trail.
-**Actors**: `cpt-cf-srr-actor-platform-user`, `cpt-cf-srr-actor-consumer-module`
-
-#### GTS Resource Type Registration
-
-- [ ] `p1` - **ID**: `cpt-cf-srr-fr-gts-type-registration`
-
-The system **MUST** define a base GTS resource type schema with major-version-only versioning. Derived resource types **MUST** extend the base type via GTS schema inheritance. The base type **MUST** include:
-- Behavioral flags: is_per_owner_resource, is_create_event_needed, is_delete_event_needed, is_update_event_needed, is_create_audit_event_needed, is_update_audit_event_needed, is_delete_audit_event_needed
-- Hard-delete retention configuration: deleted_resource_retention_days (integer or null; default 30 if null; 0 means immediate hard-delete on soft-delete)
-
-**Rationale**: GTS type system ensures consistency, discoverability, and validation for all resource types. Embedding the deleted-resource retention policy in the type definition keeps it co-located with other behavioral configuration.
+**Actors**: `cpt-cf-srr-actor-platform-user`, `cpt-cf-srr-actor-api-client`, `cpt-cf-srr-actor-consumer-module`
 
 #### Default Storage Backend
 
@@ -474,7 +479,7 @@ The system **MUST** support storing up to 100 million total resources across all
 - [ ] System returns HTTP STATUS 400 when a referenced GTS type does not exist in Types Registry
 - [ ] System returns HTTP STATUS 403 when the caller's token lacks permissions for POST target type or when LIST type filter has no intersection with caller scope
 - [ ] System returns HTTP STATUS 404 for GET/PUT/DELETE when the target resource is filtered out by tenant/user/type backend-level security filters
-- [ ] POST with a duplicate `idempotency_key` within the same tenant returns HTTP STATUS 409 with the existing resource `id`; no duplicate resource is created (`cpt-cf-srr-fr-idempotent-create`)
+- [ ] POST with a duplicate `idempotency_key` within the same tenant returns HTTP STATUS 409 with the existing resource `id`; no duplicate resource is created (`cpt-cf-srr-fr-idempotent-resource-create`)
 - [ ] Soft-deleted resources are automatically purged (hard-deleted) after the configured retention period (default 30 days)
 - [ ] Event emission respects the behavioral flags on the resource's GTS type (`cpt-cf-srr-fr-notification-events`)
 - [ ] Audit events are emitted according to audit flags on the resource's GTS type or any of its parent GTS types (`cpt-cf-srr-fr-audit-events`)
