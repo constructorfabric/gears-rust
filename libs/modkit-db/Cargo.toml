@@ -29,6 +29,7 @@ integration = []
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 xxhash-rust = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true, features = ["serde", "clock"] }
@@ -47,6 +48,7 @@ rust_decimal = { workspace = true }
 ryu = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }

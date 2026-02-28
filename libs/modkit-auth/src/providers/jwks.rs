@@ -925,7 +925,7 @@ mod tests {
             .expect("should succeed when handler drops non-string fields");
 
         assert_eq!(header.alg, jsonwebtoken::Algorithm::RS256);
-        assert!(header.extras.get("eap").is_none());
+        assert!(!header.extras.contains_key("eap"));
         assert_eq!(
             header.extras.get("iri").map(String::as_str),
             Some("keep-me")

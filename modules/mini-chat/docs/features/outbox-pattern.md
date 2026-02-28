@@ -79,11 +79,9 @@ Outbox events are stored in a shared infrastructure table owned by `modkit-db`:
 The `tenant_id` column and the `dedupe_key` field serve different roles and MUST NOT be conflated:
 
 - **`tenant_id` column** — used for routing, filtering, and downstream partitioning. The dispatcher MAY use it to scope claim queries to a specific tenant. Downstream consumers MAY use it for partition-aware processing. It is nullable to accommodate system-level events that are not tenant-scoped.
-- **`dedupe_key`** — a producer-defined idempotency key whose structure is domain-specific. The partial unique index on `(namespace, topic, dedupe_key)` enforces at-most-once enqueue at the database level. **Mini-Chat-specific (not general-purpose):** In the Mini Chat domain, the canonical format is `"{tenant_id}/{turn_id}/{request_id}"` (see DESIGN.md section 5.6). Mini Chat downstream consumers MUST use the same canonical tuple `(tenant_id, turn_id, request_id)` — extracted from the `dedupe_key` or from the payload — for idempotent processing. Other modules define their own `dedupe_key` format and idempotency extraction rules in their respective feature specs.
+- **`dedupe_key`** — an opaque string defined by the producer. It MUST be stable for the same logical operation (i.e., retrying the same operation MUST produce the same `dedupe_key`). It MUST be unique across distinct operations within a given `(namespace, topic)` scope. The store enforces uniqueness via the partial unique index on `(namespace, topic, dedupe_key)`, guaranteeing at-most-once enqueue at the database level. The dispatcher uses idempotent send semantics so that re-delivery of an already-published message is harmless. The `enqueue` function treats `dedupe_key` as opaque and performs no format validation; each module defines its own `dedupe_key` format in its respective feature spec. **Mini-Chat-specific:** In the Mini Chat domain, the canonical format is `"{tenant_id}/{turn_id}/{request_id}"` (see DESIGN.md section 5.6).
 
-The presence of `tenant_id` as a table column does not replace domain-level idempotency semantics embedded in `dedupe_key`. The two serve different purposes and MUST remain consistent: when both are populated, the `tenant_id` value in the column MUST match the tenant component of the `dedupe_key`.
-
-**Enforcement**: The `enqueue` function (section 1.7) MUST validate this consistency at enqueue time. If `tenant_id` is `Some` and `dedupe_key` is `Some`, the function MUST verify that the `dedupe_key` string begins with the hex representation of `tenant_id` followed by `"/"`. On mismatch, `enqueue` MUST return an error; the row MUST NOT be inserted.
+The presence of `tenant_id` as a table column does not replace domain-level idempotency semantics embedded in `dedupe_key`. The two fields are independent: `tenant_id` is for routing/filtering, `dedupe_key` is for idempotency. No format relationship between them is enforced by the general-purpose `enqueue` function.
 
 ### 1.7 Proposed `modkit_db::outbox` v1 API (sketch)
 
@@ -113,10 +111,6 @@ pub async fn enqueue(
 pub struct ClaimCfg {
     pub batch_size: u32,
     pub lease_duration: Duration,
-    /// Maximum total delivery attempts (including the first).
-    /// Claim query excludes rows where `attempts >= max_attempts`.
-    /// Same value used by retry logic (section 3) for dead-lettering.
-    pub max_attempts: u32,
 }
 
 pub struct ClaimedMessage {
@@ -260,7 +254,7 @@ where
 - Only rows eligible for dispatch MAY be claimed. The claim WHERE clause MUST match rows satisfying:
   - (`status = 'pending'` AND `next_attempt_at <= now()`)
   - OR (`status = 'processing'` AND `locked_until < now()`) — this covers lease-expired rows from crashed workers; the claim query atomically reclaims them. No separate recovery actor or sweep is required.
-  - In both cases: `attempts < max_attempts` (from `ClaimCfg`; rows at or above the limit are ineligible and MUST be transitioned to `dead` by the dispatcher on next encounter or by a periodic sweep).
+  - In both cases: `attempts < max_attempts` (from `RetryCfg`). Rows at or above the limit are excluded from claim. Under normal operation the dispatcher dead-letters exhausted rows during `nack` (when `attempts >= max_attempts` after the final delivery attempt). Rows that become stuck in `processing` with exhausted attempts (e.g., worker crash after the last claim but before `nack`) require a periodic sweep or manual intervention to transition to `dead`.
 - The claim query MUST lock selected rows using `FOR UPDATE SKIP LOCKED`.
 - Upon claim, the worker MUST atomically:
   - transition row to `processing` (or keep `processing` if reclaiming an expired lease)
@@ -298,7 +292,7 @@ where
   > * `attempts` — current value of the row's `attempts` column (persisted, incremented at claim time per section 3 claim algo).
   > * Jitter: uniform random over `[delay/2, delay]` (equal-jitter strategy). Bounding is applied before jitter: `delay` is clamped to `max_delay` first, then jitter is applied to the clamped value.
 
-- If `attempts >= max_attempts`, the dispatcher MUST transition the row to `dead` and MUST NOT retry it automatically. `max_attempts` is the same value as `ClaimCfg.max_attempts` (section 1.7); it represents total delivery attempts. Runtime configuration supplied by the deploying module, immutable per dispatcher instance.
+- If `attempts >= max_attempts`, the dispatcher MUST transition the row to `dead` and MUST NOT retry it automatically. `max_attempts` is defined in `RetryCfg` (section 1.7) and used by both the claim query (to exclude exhausted rows) and the nack logic (to decide dead-lettering vs retry). It represents total delivery attempts. Runtime configuration supplied by the deploying module, immutable per dispatcher instance.
 
 ## 4. States (CDSL)
 

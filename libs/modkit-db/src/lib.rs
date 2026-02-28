@@ -80,6 +80,7 @@ pub mod migration_runner;
 pub mod odata;
 pub mod options;
 
+pub mod outbox;
 pub mod secure;
 
 mod db_provider;
