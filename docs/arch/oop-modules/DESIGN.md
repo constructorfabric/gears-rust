@@ -74,7 +74,7 @@ The system boundary is the ModKit host process and its spawned OoP module proces
 
 Establishes the lazy client pattern where endpoint resolution happens on first use. Clients are registered at module init but don't connect until first API call. This enables graceful startup even when dependencies are unavailable.
 
-**Reference**: [ADR-0003: Universal Lazy Layer](../adrs/modkit/0003-modkit-universal-lazy-layer.md)
+**Reference**: [ADR-0003: Universal Lazy Layer](./ADR/0001-universal-lazy-layer.md)
 
 ### 1.3 Architecture Layers
 
@@ -528,6 +528,6 @@ modules/calculator/
 
 ## 5. Traceability
 
-- **ADRs**: [ADR-0003: Universal Lazy Layer](../adrs/modkit/0003-modkit-universal-lazy-layer.md)
+- **ADRs**: [ADR-0001: Universal Lazy Layer](./ADR/0001-universal-lazy-layer.md)
 
 **Date**: 2026-02-23
