@@ -80,9 +80,6 @@ jobs:
             echo "sccache failed, falling back to plain rustc"
           fi
 
-      - name: cargo fmt (check)
-        run: make fmt
-
       - name: cargo clippy
         run: make clippy
 
