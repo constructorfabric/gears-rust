@@ -1,5 +1,9 @@
 //! Database connection options and configuration types.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 use crate::config::{DbConnConfig, DbEngineCfg, GlobalDatabaseConfig, PoolCfg};
 use crate::{DbError, DbHandle, Result};
 
@@ -688,19 +692,26 @@ fn parse_sqlite_path_from_dsn(dsn: &str) -> Result<std::path::PathBuf> {
 }
 
 /// Expand environment variables in a string.
+///
+/// Uses single-pass replacement so values containing `${...}` are not re-expanded.
 fn expand_env_vars(input: &str) -> Result<String> {
-    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-        .map_err(|e| DbError::InvalidParameter(e.to_string()))?;
-    let mut result = input.to_owned();
-
-    for caps in re.captures_iter(input) {
-        let full_match = &caps[0];
-        let var_name = &caps[1];
-        let value = std::env::var(var_name)?;
-        result = result.replace(full_match, &value);
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap()
+    });
+    let mut err: Option<DbError> = None;
+    let result = RE.replace_all(input, |caps: &regex::Captures| {
+        match std::env::var(&caps[1]) {
+            Ok(val) => val,
+            Err(e) => {
+                err = Some(e.into());
+                String::new()
+            }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
     }
-
-    Ok(result)
+    Ok(result.into_owned())
 }
 
 /// Resolve password from environment variable if it starts with ${VAR}.
@@ -817,6 +828,19 @@ pub fn redact_credentials_in_dsn(dsn: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test: values containing `${...}` must not be re-expanded.
+    /// Input "${A}_${B}" with A="${B}" and B="val" must yield "${B}_val", not "val_val".
+    #[test]
+    fn expand_env_vars_no_double_expansion() {
+        temp_env::with_vars(
+            [("EXPAND_TEST_A", Some("${EXPAND_TEST_B}")), ("EXPAND_TEST_B", Some("val"))],
+            || {
+                let result = expand_env_vars("${EXPAND_TEST_A}_${EXPAND_TEST_B}").unwrap();
+                assert_eq!(result, "${EXPAND_TEST_B}_val");
+            },
+        );
+    }
 
     #[test]
     fn determine_engine_requires_engine_when_dsn_missing() {
