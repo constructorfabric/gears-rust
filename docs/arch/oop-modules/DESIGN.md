@@ -6,23 +6,43 @@
 
 Out-of-Process (OoP) modules are ModKit modules that run as separate OS processes, communicating with the host and other modules via network protocols (REST by default, gRPC opt-in). This architecture enables process isolation, independent scaling, language flexibility, resource isolation, and independent deployment.
 
-The system boundary is the ModKit host process and its spawned OoP module processes. OoP modules register with a DirectoryService for discovery and communicate via REST (default) or gRPC (opt-in). The architecture follows a lazy client pattern where endpoint resolution happens on first use, not at startup.
+#### OoP Module Categories
+
+We distinguish two categories of OoP modules based on lifecycle ownership:
+
+- **Managed OoP modules** – modules whose lifecycle is controlled by the host process. The host is responsible for configuring, starting, stopping, and supervising them.
+
+- **Unmanaged OoP modules** – modules whose lifecycle is not controlled by the host process. They run independently, but the host can still discover them, register them, and interact with their APIs.
+
+For example, services running in a Kubernetes cluster would be considered unmanaged from the host's perspective. Their lifecycle is handled by Kubernetes, not by the host process. However, the host still needs a mechanism to discover these services, register them, and communicate with them through their APIs.
+
+This distinction affects how the design addresses lifecycle management, resource limits, and fault handling—later sections will approach these two types differently where applicable.
+
+#### System Boundary
+
+The system boundary is the ModKit host process and its spawned OoP module processes (managed) or discovered external services (unmanaged). OoP modules register with a DirectoryService for discovery and communicate via REST (default) or gRPC (opt-in). The architecture follows a lazy client pattern where endpoint resolution happens on first use, not at startup.
 
 ### 1.2 Architecture Drivers
 
 #### Product requirements
 
+##### Host management of OoP modules
+
+- [] `p1` - `cpt-oop-fr-host-management`
+
+**Solution**: The ModKit host process must be able to manage (spawn, configure, monitor) the OoP modules. This includes process lifecycle management, configuration injection, and health monitoring with automatic respawn on failure.
+
 ##### Process isolation for fault containment
 
 - [] `p1` - `cpt-oop-fr-process-isolation`
 
-**Solution**: Each OoP module runs as a separate OS process. A crash in one module doesn't bring down others. The host process monitors child processes and can respawn them.
+**Solution**: Each OoP module runs as a separate OS process. A crash in one module doesn't bring down others.
 
 ##### Independent horizontal scaling
 
 - [] `p1` - `cpt-oop-fr-horizontal-scaling`
 
-**Solution**: OoP modules are stateless by design and can be scaled horizontally. Multiple instances register with DirectoryService; client-side round-robin distributes load.
+**Solution**: OoP modules can be scaled horizontally. Multiple instances register with DirectoryService; client-side round-robin distributes load. Modules may expose a capability flag indicating whether they are stateless (safe for round-robin) or stateful (requiring sticky sessions or external state coordination).
 
 ##### Language flexibility for module implementation
 
@@ -34,31 +54,31 @@ The system boundary is the ModKit host process and its spawned OoP module proces
 
 - [] `p1` - `cpt-oop-fr-resource-isolation`
 
-**Solution**: Each OoP module runs in its own process with configurable resource limits (memory, CPU) via OS/container mechanisms.
+**Solution**: The ModKit host process must be able to configure OoP modules resource limits (memory, CPU) via OS/container mechanisms. Each module runs in its own process with these limits enforced.
 
-##### Independent deployment without full restart
+##### Independent deployment without full restart (managed only)
 
 - [] `p1` - `cpt-oop-fr-independent-deployment`
 
-**Solution**: OoP modules can be updated independently. Rolling updates in K8s or process restart locally; no host restart required.
+**Solution**: For managed OoP modules, the host can update them independently via process restart; no host restart required. For unmanaged modules, deployment is controlled by the external orchestrator (e.g., rolling updates in Kubernetes).
 
-##### Lazy client resolution
+##### Lazy client resolution (managed only)
 
 - [] `p1` - `cpt-oop-fr-lazy-resolution`
 
-**Solution**: Endpoint resolution happens on first API call, not at startup. Modules start even if dependencies are unavailable; requests fail gracefully until dependencies are ready.
+**Solution**: For managed OoP modules, endpoint resolution happens on first API call, not at startup. Modules start even if dependencies are unavailable; requests fail gracefully until dependencies are ready.
 
-##### Service discovery and registration
+##### Service discovery and registration (managed and unmanaged)
 
 - [] `p1` - `cpt-oop-fr-service-discovery`
 
-**Solution**: DirectoryService provides central registry. OoP modules register on startup, send heartbeats, and are discovered by consumers via `resolve_rest_service()`.
+**Solution**: DirectoryService provides central registry. Both managed and unmanaged OoP modules register on startup, send heartbeats, and are discovered by consumers via `resolve_rest_service()`.
 
 ##### Fault tolerance with circuit breakers
 
 - [] `p1` - `cpt-oop-nfr-fault-tolerance`
 
-**Solution**: Circuit breaker pattern prevents cascading failures. Retry with exponential backoff, idempotency keys for safe retries, graceful degradation when dependencies unavailable.
+**Solution**: Circuit breaker pattern prevents cascading failures across three scenarios: (1) inter-module communication—when one OoP module calls another and the target is unavailable or slow; (2) host-to-module communication—when the host calls a managed module that becomes unresponsive; (3) external dependency failures—when an OoP module's external dependencies (DB, third-party APIs) fail. Retry with exponential backoff, idempotency keys for safe retries, graceful degradation when dependencies unavailable.
 
 ##### Standard health endpoints
 
@@ -104,12 +124,6 @@ Use REST as the default transport for OoP modules. REST provides broad compatibi
 
 Resolve endpoints on first use, not at startup. This enables graceful startup when dependencies are unavailable and avoids blocking the module lifecycle.
 
-#### Stateless module design
-
-- [] `p1` - **ID**: `cpt-oop-principle-stateless`
-
-Design OoP modules to be stateless. State should be externalized to databases or caches. This enables horizontal scaling and simplifies failover.
-
 #### Fail-fast with graceful degradation
 
 - [] `p1` - **ID**: `cpt-oop-principle-fail-fast-graceful`
@@ -130,11 +144,11 @@ Define API contracts in SDK crates with traits, types, and errors. The SDK is th
 
 ### 2.2 Constraints
 
-#### Single executable per module (recommended)
+#### Multi-module executables supported
 
-- [] `p1` - **ID**: `cpt-oop-constraint-single-executable`
+- [] `p1` - **ID**: `cpt-oop-constraint-multi-module`
 
-Each OoP module should be compilable as a standalone executable. Multi-module executables are supported but not recommended for production due to scaling and deployment complexity.
+The OoP engine must explicitly support multi-module executables. For small or edge systems, multiple modules can be bundled into a single service to minimize the number of deployed services. Single-module executables remain an option for scenarios requiring independent scaling or deployment.
 
 #### DirectoryService for cross-module discovery
 
@@ -198,8 +212,8 @@ Quarantined ──[heartbeat resumes]──▶ Healthy
 │                              Host Process                                   │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐    │
 │  │ api-gateway │  │  Module A   │  │  Module B   │  │ DirectoryService │    │
-│  │ (in-proc)   │  │ (in-proc)   │  │ (in-proc)   │  │    (gRPC hub)    │    │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └────────┬─────────┘    │
+│  │ (in-proc)   │  │ (in-proc)   │  │ (in-proc)   │  │   (registry)     │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────┬────────┘    │
 │         │                │                │                   │             │
 │         └────────────────┴────────────────┴───────────────────┘             │
 │                                   │ ClientHub                               │
@@ -230,7 +244,7 @@ Quarantined ──[heartbeat resumes]──▶ Healthy
 
 - **Responsibilities**: Central registry for module instances, health tracking via heartbeats, endpoint resolution for consumers.
 - **Boundaries**: Does not route traffic; only provides endpoint information.
-- **Dependencies**: gRPC server, in-memory instance registry.
+- **Dependencies**: gRPC server (optional), in-memory instance registry.
 - **Key interfaces**: `DirectoryClient` trait with `resolve_rest_service()`, `register_instance()`, `send_heartbeat()`.
 
 #### OoP Module
@@ -255,10 +269,11 @@ Quarantined ──[heartbeat resumes]──▶ Healthy
 
 - [] `p1` - **ID**: `cpt-oop-component-lazy-client`
 
-- **Responsibilities**: Resolve endpoint on first use, cache endpoint, make HTTP requests, handle retries and circuit breaker.
+- **Responsibilities**: Resolve endpoint on first use (when `lazy_start: true`), cache endpoint, make HTTP requests, handle retries and circuit breaker.
 - **Boundaries**: Does not know module business logic; only transport.
 - **Dependencies**: `RestClientProvider`, `DirectoryClient`, HTTP client (reqwest).
 - **Key interfaces**: Implements SDK API trait, delegates to `RestClientProvider`.
+- **Configuration**: `lazy_start: bool` — when `true`, endpoint resolution happens on first API call (default); when `false`, the module is started eagerly at host startup. Eager start is recommended for modules with long startup times (e.g., database journal replay, slow outbound connections).
 
 #### Circuit Breaker
 
@@ -430,11 +445,16 @@ CLOSED (normal) ──[5 failures]──▶ OPEN (fail fast) ──[30s timeout]
 
 ### 3.7 Database schemas & tables
 
-#### N/A
+#### Module database configuration
 
-- [] `p3` - **ID**: `cpt-oop-dbtable-na`
+- [] `p2` - **ID**: `cpt-oop-dbtable-config`
 
-Not applicable — OoP modules architecture does not define database schemas. Individual modules may have their own database requirements documented in their respective DESIGN documents.
+Since Cyber Fabric is a collection of libraries rather than a standalone platform, any module can operate as an OoP module. The OoP engine must support modules that require access to databases.
+
+- **Managed modules**: The host provides the necessary configuration (e.g., configuration file, database connection string) to the module at startup.
+- **Unmanaged modules**: The module is responsible for obtaining its own configuration from its environment or external configuration sources.
+
+Individual modules may have their own database schemas documented in their respective DESIGN documents.
 
 ### 3.8 Topology
 
