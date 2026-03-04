@@ -140,6 +140,10 @@ jobs:
       - name: Test modkit-db (mysql integration)
         run: make test-mysql
 
+  check-crlf:
+    name: Check for CRLF line endings
+    uses: ./.github/workflows/crlf-check.yml
+
   cypilot:
     name: Cypilot
     uses: ./.github/workflows/cypilot.yml

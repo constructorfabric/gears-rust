@@ -1,0 +1,27 @@
+name: CRLF Line Ending Check
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-files:
+    name: Check for CRLF line endings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find CRLF
+        run: |
+          set -euo pipefail
+          # Search for CRLF in tracked files (git grep -IPl $'\r' ignores binary files)
+          if git grep -IPl $'\r' -- . ':(exclude)*.bat' ':(exclude)*.ps1'; then
+            echo "::error title=CRLF line endings found::CRLF (\\r\\n) line endings detected in repository. Convert files to LF using .gitattributes and recommit."
+            git --no-pager grep -nIP $'\r' -- . ':(exclude)*.bat' ':(exclude)*.ps1'
+            exit 1
+          fi
+
+      - name: Success
+        run: echo "No CRLF line endings detected."
