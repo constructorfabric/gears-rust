@@ -695,15 +695,19 @@ fn parse_sqlite_path_from_dsn(dsn: &str) -> Result<std::path::PathBuf> {
 ///
 /// Uses single-pass replacement so values containing `${...}` are not re-expanded.
 fn expand_env_vars(input: &str) -> Result<String> {
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap()
-    });
+    static RE: LazyLock<std::result::Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"));
+    let re = RE
+        .as_ref()
+        .map_err(|e| DbError::InvalidParameter(e.to_string()))?;
     let mut err: Option<DbError> = None;
-    let result = RE.replace_all(input, |caps: &regex::Captures| {
+    let result = re.replace_all(input, |caps: &regex::Captures| {
         match std::env::var(&caps[1]) {
             Ok(val) => val,
             Err(e) => {
-                err = Some(e.into());
+                if err.is_none() {
+                    err = Some(e.into());
+                }
                 String::new()
             }
         }
