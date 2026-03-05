@@ -464,11 +464,11 @@ The system boundary is the ModKit host process and its spawned OoP module proces
 
 **Solution**: For managed OoP modules, the host can update them independently via process restart; no host restart required. For unmanaged modules, deployment is controlled by the external orchestrator (e.g., rolling updates in Kubernetes).
 
-##### Lazy client resolution (managed only)
+##### Lazy client resolution
 
 - [ ] `p1` - **ID**: `cpt-oop-fr-lazy-resolution`
 
-**Solution**: For managed OoP modules, endpoint resolution happens on first API call, not at startup. Modules start even if dependencies are unavailable; requests fail gracefully until dependencies are ready.
+**Solution**: For OoP modules, endpoint resolution happens on first API call, not at startup. Modules start even if dependencies are unavailable; requests fail gracefully until dependencies are ready.
 
 ##### Service discovery and registration (managed and unmanaged)
 
@@ -583,7 +583,7 @@ Core types and invariants for OoP module communication:
 - `instance_id`: Unique identifier for this instance (UUID)
 - `rest_endpoint`: Optional REST endpoint (host:port)
 - `grpc_services`: List of gRPC service endpoints
-- `state`: Instance health state (Registered, Ready, Healthy, Quarantined, Draining)
+- `state`: Instance health state (Registered, Healthy, Quarantined, Draining)
 - `version`: Optional semantic version string
 
 **Client Configuration**:
@@ -603,7 +603,7 @@ Quarantined ──[heartbeat resumes]──▶ Healthy
 ```
 
 **Invariants**:
-- Only Healthy and Ready instances receive traffic
+- Only Healthy instances receive traffic
 - Quarantined instances are excluded from load balancing
 - Draining instances complete in-flight requests but accept no new ones
 
