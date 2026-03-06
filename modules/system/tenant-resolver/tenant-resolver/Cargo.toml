@@ -18,7 +18,7 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-tenant-resolver-sdk = { package = "cf-tenant-resolver-sdk", version = "0.2.1", path = "../tenant-resolver-sdk" }
+tenant-resolver-sdk = { package = "cf-tenant-resolver-sdk", version = "0.2.2", path = "../tenant-resolver-sdk" }
 types-registry-sdk = { package = "cf-types-registry-sdk", version = "0.1.4", path = "../../types-registry/types-registry-sdk" }
 
 # ModKit dependencies

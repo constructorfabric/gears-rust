@@ -1,7 +1,7 @@
 [package]
 name = "cf-oagw"
 description = "OAGW module - discovers and routes to plugins"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,7 +19,7 @@ path = "src/lib.rs"
 test-utils = ["axum/ws", "dep:async-stream", "dep:futures", "dep:tower", "dep:rustls", "tokio/net", "tokio/sync", "tokio/rt"]
 
 [dependencies]
-oagw-sdk = { path = "../oagw-sdk", package="cf-oagw-sdk", version = "0.1.1", features = ["axum"] }
+oagw-sdk = { path = "../oagw-sdk", package="cf-oagw-sdk", version = "0.1.2", features = ["axum"] }
 modkit = { workspace = true }
 modkit-auth = { workspace = true }
 modkit-http = { workspace = true }
