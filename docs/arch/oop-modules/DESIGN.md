@@ -418,6 +418,29 @@ We distinguish two categories of OoP modules based on lifecycle ownership:
 
 For example, services running in a Kubernetes cluster would be considered unmanaged from the host's perspective. Their lifecycle is handled by Kubernetes, not by the host process. However, the host still needs a mechanism to discover these services, register them, and communicate with them through their APIs.
 
+**DirectoryService Authentication**:
+
+| Module Type | Registration Auth | API Call Auth |
+|-------------|-------------------|---------------|
+| Managed | None (trusted, spawned by host) | `SecurityContext` propagated from caller |
+| Unmanaged | Shared secret or mTLS (configurable) | `SecurityContext` propagated from caller |
+
+For unmanaged modules, DirectoryService registration requires authentication to prevent unauthorized services from registering. The authentication mechanism is configurable:
+- **Shared secret**: Module provides a pre-shared token in the `register_instance()` call. The token is provisioned via environment variable (`MODKIT_DIRECTORY_TOKEN`) or config file.
+- **mTLS**: DirectoryService validates the module's client certificate against a trusted CA. Certificate provisioning is handled by the deployment platform (e.g., cert-manager in K8s).
+
+If registration authentication fails, the module cannot register and will not be discoverable. The module should log the failure and retry with backoff.
+
+**Inter-Module Communication Security**:
+
+| Layer | Mechanism | Notes |
+|-------|-----------|-------|
+| Transport | TLS (HTTPS) | Required in production; optional for localhost in development |
+| Identity | `SecurityContext` propagation | Bearer token + tenant ID forwarded on every call |
+| Authorization | Module-level RBAC (out of scope) | Each module enforces its own authorization rules |
+
+API calls between modules propagate the caller's `SecurityContext`, ensuring the downstream module can enforce authorization based on the original user's identity. This design delegates authorization to individual modules rather than centralizing it in the OoP infrastructure.
+
 This distinction affects how the design addresses lifecycle management, resource limits, and fault handling—later sections will approach these two types differently where applicable.
 
 #### System Boundary
@@ -585,6 +608,18 @@ Core types and invariants for OoP module communication:
 - `grpc_services`: List of gRPC service endpoints
 - `state`: Instance health state (Registered, Healthy, Quarantined, Draining)
 - `version`: Optional semantic version string
+
+**Transport Requirements**:
+
+OoP modules must expose at least one of REST or gRPC:
+
+| Transport | When to Use | Requirements |
+|-----------|-------------|--------------|
+| REST only | Default for most modules | Must expose `/health/live` and `/health/ready` |
+| gRPC only | Streaming-heavy modules (e.g., LLM gateway) | Must expose `grpc.health.v1.Health` service |
+| REST + gRPC | Modules needing both request-response and streaming | Both health endpoints required |
+
+REST is the **recommended default** because it provides easier debugging and broader tooling support. gRPC-only modules are supported for use cases requiring bidirectional streaming or when the module already has a gRPC-first design.
 
 **Client Configuration**:
 - `discovery`: Discovery strategy (Directory, KubernetesDns, Static)
