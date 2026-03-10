@@ -89,7 +89,7 @@ The OAGW design is decomposed into eight features organized along functional bou
 
 - [ ] `p1` - **ID**: `cpt-cf-oagw-feature-management-api`
 
-- **Purpose**: Implement Control Plane CRUD operations for upstreams and routes with REST API handlers, validation, enable/disable semantics, alias generation, and OData query support.
+- **Purpose**: Implement Control Plane CRUD operations for upstreams and routes with REST API handlers, validation, enable/disable semantics, alias enforcement, and OData query support.
 
 - **Depends On**: `cpt-cf-oagw-feature-domain-foundation`
 
@@ -97,7 +97,7 @@ The OAGW design is decomposed into eight features organized along functional bou
   - `ControlPlaneService` CRUD operations for upstreams and routes
   - REST handlers for `/api/oagw/v1/upstreams/*` and `/api/oagw/v1/routes/*`
   - DTOs with serde and utoipa annotations
-  - Alias generation and `(tenant_id, alias)` uniqueness enforcement
+  - Alias enforcement (auto-derived for hostnames, explicit for IPs) and `(tenant_id, alias)` uniqueness enforcement
   - Enable/disable semantics with ancestor inheritance
   - OData query support (`$filter`, `$select`, `$orderby`, `$top`, `$skip`)
   - RFC 9457 Problem Details error responses

@@ -17,7 +17,7 @@
     "alias": {
       "type": "string",
       "pattern": "^[a-z0-9]([a-z0-9.:-]*[a-z0-9])?$",
-      "description": "Human-readable routing identifier. Auto-generated if not specified: single host with standard port (80,443) → hostname; single host with non-standard port → hostname:port; multiple hosts with common suffix → common suffix (e.g., us.vendor.com + eu.vendor.com → vendor.com); IP addresses or heterogeneous hosts → explicit alias required."
+      "description": "Human-readable routing identifier. Enforced by endpoint type: hostname-based endpoints auto-derive alias (user-provided alias rejected); IP-based or non-derivable endpoints require explicit alias. Derivation: single hostname with standard port (HTTP:80, HTTPS/WSS/WT/gRPC:443) → hostname; non-standard port → hostname:port; multiple hostnames with common suffix (≥2 labels) → common suffix (e.g., us.vendor.com + eu.vendor.com → vendor.com). Normalized to ASCII lowercase."
     },
     "tags": {
       "type": "array",

@@ -97,7 +97,7 @@ Given endpoints: ["us.vendor.com", "eu.vendor.com", "ap.vendor.com"]
 
 **Examples**:
 
-**Single hostname (alias auto-generated)**:
+**Single hostname (alias auto-derived)**:
 
 ```json
 {
@@ -107,7 +107,7 @@ Given endpoints: ["us.vendor.com", "eu.vendor.com", "ap.vendor.com"]
 
 > System sets `alias = "api.openai.com"`
 
-**Multi-region with common suffix (alias auto-generated)**:
+**Multi-region with common suffix (alias auto-derived)**:
 
 ```json
 {
@@ -872,7 +872,7 @@ func mergeRateLimit(parent, child *RateLimitConfig, isOwn bool) *RateLimitConfig
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-oagw-fr-alias-resolution` — Alias resolution rules, shadowing, and compatibility validation
-* `cpt-cf-oagw-fr-upstream-mgmt` — UUID-based upstream identification with auto-generated aliases
+* `cpt-cf-oagw-fr-upstream-mgmt` — UUID-based upstream identification with auto-derived aliases
 * `cpt-cf-oagw-fr-hierarchical-config` — Tenant binding sharing modes and merge strategies
 * `cpt-cf-oagw-nfr-observability` — Access log correlation via binding ID and upstream ID
 * `cpt-cf-oagw-nfr-credential-isolation` — Auth config via `cred_store` secret references

@@ -379,16 +379,40 @@ Alias resolution walks tenant hierarchy from descendant to root; closest match w
 
 Upstreams are identified by alias in proxy requests: `{METHOD} /api/oagw/v1/proxy/{alias}/{path}`.
 
-**Alias Generation Rules**:
+**Alias Enforcement Rules**:
 
-| Scenario | Generated Alias | Example |
+Alias behavior is determined entirely by endpoint type. The system enforces strict rules — aliases are not arbitrary labels.
+
+| Endpoint Type | Alias Rule | Example |
 |---|---|---|
-| Single host, standard port | hostname (no port) | `api.openai.com:443` → `api.openai.com` |
-| Single host, non-standard port | hostname:port | `api.openai.com:8443` → `api.openai.com:8443` |
-| Multiple hosts with common suffix | common domain suffix | `us.vendor.com`, `eu.vendor.com` → `vendor.com` |
-| IP addresses or heterogeneous hosts | must be explicit | `10.0.1.1`, `10.0.1.2` → user provides `my-service` |
+| Hostname, standard port | Auto-derived (hostname) | `api.openai.com:443` → `api.openai.com` |
+| Hostname, non-standard port | Auto-derived (hostname:port) | `api.openai.com:8443` → `api.openai.com:8443` |
+| Multiple hostnames, common suffix (≥2 labels) | Auto-derived (common suffix) | `us.vendor.com`, `eu.vendor.com` → `vendor.com` |
+| Multiple hostnames, no common suffix | Explicit alias **required** | `us.foo.com`, `eu.bar.com` → user must provide alias |
+| IP addresses | Explicit alias **required** | `10.0.1.1`, `10.0.1.2` → user provides `my-service` |
 
-**Standard ports** (omitted from alias): HTTP: 80, HTTPS: 443, WebSocket: 80 (ws) / 443 (wss), WebTransport: 443, gRPC: 443.
+**Hostname-based endpoints**: alias is always auto-derived. User-provided alias is **rejected** (400 Validation). Providing the exact derived value is tolerated silently for idempotency.
+
+**IP-based or non-derivable endpoints**: explicit alias is **required** from the user. Omitting the alias field returns 400 Validation.
+
+**Standard ports** (omitted from derived alias): HTTP: 80, HTTPS/WSS/WebTransport/gRPC: 443.
+
+**Alias Normalization**: All aliases are normalized to ASCII lowercase with trailing dots stripped. Resolution is case-insensitive (e.g., `Api.OpenAI.COM` resolves to an upstream with alias `api.openai.com`).
+
+**Hostname Validation**: Endpoint hostnames are validated per RFC 1123: max 253 characters total, each label 1–63 characters, labels contain only ASCII alphanumeric and hyphen, labels cannot start or end with hyphen. A trailing dot (FQDN notation) is tolerated and stripped.
+
+**Alias Update Behavior**:
+
+| Transition | Behavior |
+|---|---|
+| Hostname → Hostname (new host) | Alias recomputed from new endpoints |
+| Hostname → IP | **Rejected** unless user provides explicit alias |
+| IP → IP | Existing alias retained; user may provide a new one |
+| IP → Hostname | Alias recomputed (old explicit alias replaced) |
+| Hostname (no endpoint change) | Alias override **rejected** (400 Validation) |
+| IP (no endpoint change) | User may update alias freely |
+
+For multi-host endpoints with non-standard ports, the common suffix derivation intentionally drops the port — the suffix serves as a grouping label, not a connect target.
 
 **Alias Uniqueness**: Alias is unique **per tenant**, not globally. Database constraint: `UNIQUE (tenant_id, alias)`. Tenants can independently manage upstreams without namespace collisions. Descendants can shadow ancestor aliases for controlled customization.
 

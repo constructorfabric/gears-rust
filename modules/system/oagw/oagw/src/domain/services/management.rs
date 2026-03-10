@@ -77,29 +77,12 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
     ) -> Result<Upstream, DomainError> {
         validate_endpoints(&req.server.endpoints)?;
 
+        // Enforce alias derivation / explicit rules.
+        let alias = enforce_alias_create(req.alias.as_deref(), &req.server.endpoints)?;
+        validate_alias(&alias)?;
+
         let tenant_id = ctx.subject_tenant_id();
         let id = Uuid::new_v4();
-
-        let upstream = Upstream {
-            id,
-            tenant_id,
-            alias: String::new(),
-            server: req.server.clone(),
-            protocol: req.protocol.clone(),
-            enabled: req.enabled,
-            auth: req.auth.clone(),
-            headers: req.headers.clone(),
-            plugins: req.plugins.clone(),
-            rate_limit: req.rate_limit.clone(),
-            tags: req.tags.clone(),
-        };
-
-        let alias = req
-            .alias
-            .clone()
-            .unwrap_or_else(|| generate_alias(&upstream));
-
-        validate_alias(&alias)?;
 
         // Check if an ancestor tenant has an upstream with this alias.
         // If so, this is a "bind" operation requiring ancestor bind validation.
@@ -114,7 +97,19 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         )
         .await?;
 
-        let upstream = Upstream { alias, ..upstream };
+        let upstream = Upstream {
+            id,
+            tenant_id,
+            alias,
+            server: req.server,
+            protocol: req.protocol,
+            enabled: req.enabled,
+            auth: req.auth,
+            headers: req.headers,
+            plugins: req.plugins,
+            rate_limit: req.rate_limit,
+            tags: req.tags,
+        };
 
         self.upstreams
             .create(upstream)
@@ -155,6 +150,9 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             .await
             .map_err(|_| DomainError::not_found("upstream", id))?;
 
+        // Snapshot old endpoints before applying server update (needed for alias enforcement).
+        let old_endpoints = existing.server.endpoints.clone();
+
         // Apply partial update.
         if let Some(server) = req.server {
             validate_endpoints(&server.endpoints)?;
@@ -163,18 +161,32 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         if let Some(protocol) = req.protocol {
             existing.protocol = protocol;
         }
-        if let Some(ref alias) = req.alias {
-            validate_alias(alias)?;
+
+        // Enforce alias re-evaluation when endpoints change.
+        let endpoints_changed = existing.server.endpoints != old_endpoints;
+        if endpoints_changed {
+            let alias = enforce_alias_update(
+                req.alias.as_deref(),
+                &existing.server.endpoints,
+                &existing.alias,
+                &old_endpoints,
+            )?;
+            validate_alias(&alias)?;
+            existing.alias = alias;
+        } else if let Some(ref user_alias) = req.alias {
+            // No endpoint change — allow alias update only for IP-based endpoints.
+            if compute_derived_alias(&existing.server.endpoints).is_some() {
+                return Err(DomainError::validation(
+                    "alias cannot be overridden for hostname-based endpoints",
+                ));
+            }
+            let normalized = normalize_alias(user_alias);
+            validate_alias(&normalized)?;
+            existing.alias = normalized;
         }
 
         // Validate ancestor bind constraints if the resulting alias matches
-        // an ancestor upstream. Use the new alias if provided, else the existing.
-        let effective_alias = req.alias.as_deref().unwrap_or(&existing.alias);
-
-        // Build post-update local state for bind validation. When an alias
-        // changes to match an ancestor, *existing* local overrides (auth,
-        // rate_limit, plugins) must also be validated — not just the fields
-        // present in the patch request.
+        // an ancestor upstream.
         let effective_auth = req.auth.as_ref().or(existing.auth.as_ref());
         let effective_rate_limit = req.rate_limit.as_ref().or(existing.rate_limit.as_ref());
         let effective_plugins = req.plugins.as_ref().or(existing.plugins.as_ref());
@@ -182,10 +194,10 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             || effective_rate_limit.is_some()
             || effective_plugins.is_some();
 
-        if has_overrides || req.alias.is_some() {
+        if has_overrides || endpoints_changed || req.alias.is_some() {
             self.validate_ancestor_bind(
                 ctx,
-                effective_alias,
+                &existing.alias,
                 &BindOverrides {
                     auth: effective_auth,
                     rate_limit: effective_rate_limit,
@@ -195,9 +207,6 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             .await?;
         }
 
-        if let Some(alias) = req.alias {
-            existing.alias = alias;
-        }
         if let Some(auth) = req.auth {
             existing.auth = Some(auth);
         }
@@ -442,6 +451,8 @@ impl ControlPlaneServiceImpl {
         method_path: Option<(&str, &str)>,
     ) -> Result<(Upstream, Option<Route>), DomainError> {
         let tenant_id = ctx.subject_tenant_id();
+        // Normalize the incoming alias for case-insensitive matching.
+        let alias = &normalize_alias(alias);
 
         // Single walk: collect all visible upstreams keyed by chain index.
         let mut found: Vec<(usize, Upstream)> = Vec::new();
@@ -606,6 +617,13 @@ fn validate_endpoints(endpoints: &[Endpoint]) -> Result<(), DomainError> {
         ));
     }
 
+    // Validate hostname format (RFC 1123) for non-IP endpoints.
+    if ip_count == 0 {
+        for (i, ep) in endpoints.iter().enumerate() {
+            validate_hostname(i, &ep.host)?;
+        }
+    }
+
     // Enforce identical scheme and port across the pool.
     if endpoints.len() > 1 {
         let first_scheme = &endpoints[0].scheme;
@@ -626,6 +644,51 @@ fn validate_endpoints(endpoints: &[Endpoint]) -> Result<(), DomainError> {
         }
     }
 
+    Ok(())
+}
+
+/// Validate a hostname per RFC 1123: max 253 chars total, each label 1–63 chars,
+/// labels contain only ASCII alphanumeric + hyphen, labels don't start/end with
+/// hyphen. A trailing dot (FQDN) is tolerated and stripped before validation.
+fn validate_hostname(index: usize, host: &str) -> Result<(), DomainError> {
+    let h = host.strip_suffix('.').unwrap_or(host);
+    if h.is_empty() {
+        return Err(DomainError::validation(format!(
+            "endpoint[{index}] host is empty"
+        )));
+    }
+    if h.len() > 253 {
+        return Err(DomainError::validation(format!(
+            "endpoint[{index}] host '{}' exceeds 253 characters",
+            host
+        )));
+    }
+    for label in h.split('.') {
+        if label.is_empty() {
+            return Err(DomainError::validation(format!(
+                "endpoint[{index}] host '{host}' contains an empty label"
+            )));
+        }
+        if label.len() > 63 {
+            return Err(DomainError::validation(format!(
+                "endpoint[{index}] host '{host}' label '{label}' exceeds 63 characters"
+            )));
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(DomainError::validation(format!(
+                "endpoint[{index}] host '{host}' label '{label}' contains invalid characters; \
+                 only ASCII alphanumeric and '-' are allowed"
+            )));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(DomainError::validation(format!(
+                "endpoint[{index}] host '{host}' label '{label}' must not start or end with '-'"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -661,15 +724,189 @@ fn strip_brackets(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-/// Generate an alias from the upstream's server endpoints.
-/// Single endpoint: host (standard port omitted) or host:port.
-fn generate_alias(upstream: &Upstream) -> String {
-    let endpoints = &upstream.server.endpoints;
-    if endpoints.is_empty() {
-        return String::new();
+/// Normalize an alias to lowercase. Hostname trailing dots are already
+/// handled by `Endpoint::normalized_host()` during derivation; this covers
+/// user-provided explicit aliases.
+fn normalize_alias(alias: &str) -> String {
+    let lower = alias.to_ascii_lowercase();
+    lower.strip_suffix('.').unwrap_or(&lower).to_string()
+}
+
+/// Check whether the given endpoints are all IP addresses.
+fn endpoints_are_ip(endpoints: &[Endpoint]) -> bool {
+    !endpoints.is_empty()
+        && endpoints
+            .iter()
+            .all(|ep| strip_brackets(&ep.host).parse::<IpAddr>().is_ok())
+}
+
+/// Attempt to derive an alias from the endpoint list.
+///
+/// Returns `Some(alias)` when derivation succeeds (hostname-based), or
+/// `None` when an explicit alias is required (IP-based or no common suffix).
+///
+/// Derivation rules:
+/// - Single host, standard port → hostname
+/// - Single host, non-standard port → hostname:port
+/// - Multiple hosts, all identical → treated as single-host
+/// - Multiple hosts, common domain suffix (≥2 labels) → common suffix
+///   (port is intentionally dropped — the suffix is a grouping label,
+///   not a connect target)
+/// - Multiple hosts, no common suffix → `None`
+/// - IP addresses → `None`
+fn compute_derived_alias(endpoints: &[Endpoint]) -> Option<String> {
+    if endpoints.is_empty() || endpoints_are_ip(endpoints) {
+        return None;
     }
-    // Use the first endpoint for alias generation.
-    endpoints[0].alias_contribution()
+
+    // Collect unique normalized host contributions.
+    let contributions: Vec<String> = endpoints.iter().map(|e| e.alias_contribution()).collect();
+
+    // De-duplicate: if all identical, treat as single-endpoint.
+    let unique: Vec<&str> = {
+        let mut v: Vec<&str> = contributions.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+
+    if unique.len() == 1 {
+        return Some(unique[0].to_string());
+    }
+
+    // Multi-host: extract hosts (without port) for common suffix computation.
+    let hosts: Vec<String> = endpoints.iter().map(|e| e.normalized_host()).collect();
+    common_domain_suffix(&hosts)
+}
+
+/// Extract the longest common domain suffix from a set of hostnames.
+///
+/// Returns `Some(suffix)` if the common suffix has ≥2 labels, `None` otherwise.
+/// Example: `["us.vendor.com", "eu.vendor.com"]` → `Some("vendor.com")`.
+fn common_domain_suffix(hosts: &[String]) -> Option<String> {
+    if hosts.is_empty() {
+        return None;
+    }
+
+    // Split each host into labels, reversed (rightmost first).
+    let reversed: Vec<Vec<&str>> = hosts
+        .iter()
+        .map(|h| h.split('.').rev().collect::<Vec<_>>())
+        .collect();
+
+    // Find the longest common prefix of the reversed labels.
+    let min_len = reversed.iter().map(|r| r.len()).min().unwrap_or(0);
+    let mut common_count = 0;
+    for i in 0..min_len {
+        let label = reversed[0][i];
+        if reversed.iter().all(|r| r[i] == label) {
+            common_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Minimum 2 common labels (e.g. `vendor.com`, not just `com`).
+    if common_count < 2 {
+        return None;
+    }
+
+    // Reconstruct the suffix in correct order.
+    let suffix: Vec<&str> = reversed[0][..common_count].iter().rev().copied().collect();
+    Some(suffix.join("."))
+}
+
+/// Enforce alias rules on upstream **creation**.
+///
+/// - Hostname-derivable endpoints: alias is auto-derived; user-provided alias
+///   is rejected with `400 Validation`.
+/// - IP or non-derivable endpoints: explicit alias is required.
+fn enforce_alias_create(
+    user_alias: Option<&str>,
+    endpoints: &[Endpoint],
+) -> Result<String, DomainError> {
+    match compute_derived_alias(endpoints) {
+        Some(derived) => {
+            if let Some(user) = user_alias {
+                // Reject user-provided alias when derivation is possible.
+                let normalized_user = normalize_alias(user);
+                if normalized_user != derived {
+                    return Err(DomainError::validation(format!(
+                        "alias is auto-derived for hostname-based endpoints; \
+                         remove the 'alias' field (derived: '{derived}')"
+                    )));
+                }
+                // User provided the exact derived value — tolerate silently.
+            }
+            Ok(derived)
+        }
+        None => {
+            // Explicit alias required.
+            let alias = user_alias.ok_or_else(|| {
+                DomainError::validation(
+                    "explicit alias is required for IP-based or heterogeneous-host endpoints",
+                )
+            })?;
+            let normalized = normalize_alias(alias);
+            validate_alias(&normalized)?;
+            Ok(normalized)
+        }
+    }
+}
+
+/// Enforce alias rules on upstream **update** when endpoints change.
+///
+/// Re-evaluates alias enforcement against the (possibly new) endpoints:
+/// - hostname→hostname: alias recomputed from new hosts.
+/// - IP→IP: existing alias retained unless user provides a new one.
+/// - hostname→IP: **rejected** unless user provides a new explicit alias.
+/// - IP→hostname: alias recomputed (old explicit alias replaced).
+fn enforce_alias_update(
+    user_alias: Option<&str>,
+    new_endpoints: &[Endpoint],
+    existing_alias: &str,
+    old_endpoints: &[Endpoint],
+) -> Result<String, DomainError> {
+    let old_derivable = compute_derived_alias(old_endpoints).is_some();
+    let new_derived = compute_derived_alias(new_endpoints);
+
+    match (old_derivable, &new_derived) {
+        // hostname → hostname: recompute.
+        (true, Some(derived)) | (false, Some(derived)) => {
+            if let Some(user) = user_alias {
+                let normalized_user = normalize_alias(user);
+                if normalized_user != *derived {
+                    return Err(DomainError::validation(format!(
+                        "alias is auto-derived for hostname-based endpoints; \
+                         remove the 'alias' field (derived: '{derived}')"
+                    )));
+                }
+            }
+            Ok(derived.clone())
+        }
+        // hostname → IP: must provide explicit alias.
+        (true, None) => {
+            let alias = user_alias.ok_or_else(|| {
+                DomainError::validation(
+                    "endpoints changed from hostname to IP-based; \
+                     an explicit alias must be provided",
+                )
+            })?;
+            let normalized = normalize_alias(alias);
+            validate_alias(&normalized)?;
+            Ok(normalized)
+        }
+        // IP → IP: keep existing unless user provides a new one.
+        (false, None) => {
+            if let Some(user) = user_alias {
+                let normalized = normalize_alias(user);
+                validate_alias(&normalized)?;
+                Ok(normalized)
+            } else {
+                Ok(existing_alias.to_string())
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,7 +1428,8 @@ mod tests {
             .expect("test security context")
     }
 
-    fn make_create_upstream(alias: Option<&str>) -> CreateUpstreamRequest {
+    /// Hostname-based upstream — alias is auto-derived as `api.openai.com`.
+    fn make_create_upstream_hostname() -> CreateUpstreamRequest {
         CreateUpstreamRequest {
             server: Server {
                 endpoints: vec![Endpoint {
@@ -1201,7 +1439,28 @@ mod tests {
                 }],
             },
             protocol: "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1".into(),
-            alias: alias.map(String::from),
+            alias: None,
+            auth: None,
+            headers: None,
+            plugins: None,
+            rate_limit: None,
+            tags: vec![],
+            enabled: true,
+        }
+    }
+
+    /// IP-based upstream — requires an explicit alias.
+    fn make_create_upstream_ip(alias: &str) -> CreateUpstreamRequest {
+        CreateUpstreamRequest {
+            server: Server {
+                endpoints: vec![Endpoint {
+                    scheme: Scheme::Https,
+                    host: "10.0.0.1".into(),
+                    port: 443,
+                }],
+            },
+            protocol: "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1".into(),
+            alias: Some(alias.into()),
             auth: None,
             headers: None,
             plugins: None,
@@ -1237,9 +1496,9 @@ mod tests {
         let tenant = Uuid::new_v4();
         let ctx = test_ctx(tenant);
 
-        // Create
+        // Create (IP-based, explicit alias)
         let u = svc
-            .create_upstream(&ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&ctx, make_create_upstream_ip("openai"))
             .await
             .unwrap();
         assert_eq!(u.alias, "openai");
@@ -1248,7 +1507,7 @@ mod tests {
         let fetched = svc.get_upstream(&ctx, u.id).await.unwrap();
         assert_eq!(fetched.id, u.id);
 
-        // Update
+        // Update alias (allowed for IP-based endpoints)
         let updated = svc
             .update_upstream(
                 &ctx,
@@ -1283,7 +1542,7 @@ mod tests {
 
         // Standard port (443) — port omitted in alias.
         let u1 = svc
-            .create_upstream(&ctx, make_create_upstream(None))
+            .create_upstream(&ctx, make_create_upstream_hostname())
             .await
             .unwrap();
         assert_eq!(u1.alias, "api.openai.com");
@@ -1317,7 +1576,7 @@ mod tests {
         let ctx = test_ctx(tenant);
 
         let err = svc
-            .create_upstream(&ctx, make_create_upstream(Some("../../admin")))
+            .create_upstream(&ctx, make_create_upstream_ip("../../admin"))
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation { .. }));
@@ -1330,7 +1589,7 @@ mod tests {
         let ctx = test_ctx(tenant);
 
         let err = svc
-            .create_upstream(&ctx, make_create_upstream(Some("")))
+            .create_upstream(&ctx, make_create_upstream_ip(""))
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation { .. }));
@@ -1343,7 +1602,7 @@ mod tests {
         let ctx = test_ctx(tenant);
 
         let err = svc
-            .create_upstream(&ctx, make_create_upstream(Some("foo/bar")))
+            .create_upstream(&ctx, make_create_upstream_ip("foo/bar"))
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation { .. }));
@@ -1355,12 +1614,12 @@ mod tests {
         let tenant = Uuid::new_v4();
         let ctx = test_ctx(tenant);
 
-        svc.create_upstream(&ctx, make_create_upstream(Some("openai")))
+        svc.create_upstream(&ctx, make_create_upstream_ip("openai"))
             .await
             .unwrap();
 
         let err = svc
-            .create_upstream(&ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&ctx, make_create_upstream_ip("openai"))
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::Conflict { .. }));
@@ -1375,7 +1634,7 @@ mod tests {
         let ctx2 = test_ctx(t2);
 
         let u = svc
-            .create_upstream(&ctx1, make_create_upstream(Some("openai")))
+            .create_upstream(&ctx1, make_create_upstream_ip("openai"))
             .await
             .unwrap();
 
@@ -1394,7 +1653,7 @@ mod tests {
         let ctx = test_ctx(tenant);
 
         let u = svc
-            .create_upstream(&ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&ctx, make_create_upstream_ip("openai"))
             .await
             .unwrap();
 
@@ -1413,7 +1672,7 @@ mod tests {
         let ctx = test_ctx(tenant);
 
         let u = svc
-            .create_upstream(&ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&ctx, make_create_upstream_ip("openai"))
             .await
             .unwrap();
 
@@ -1458,7 +1717,7 @@ mod tests {
         let ctx = test_ctx(tenant);
 
         let u = svc
-            .create_upstream(&ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&ctx, make_create_upstream_ip("openai"))
             .await
             .unwrap();
         let r = svc
@@ -1486,7 +1745,7 @@ mod tests {
         let ctx = test_ctx(tenant);
 
         let u = svc
-            .create_upstream(&ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&ctx, make_create_upstream_ip("openai"))
             .await
             .unwrap();
 
@@ -1685,6 +1944,130 @@ mod tests {
         }
     }
 
+    // -- validate_hostname (RFC 1123) tests --
+
+    #[test]
+    fn validate_endpoints_rejects_empty_label() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api..openai.com".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        match err {
+            DomainError::Validation { detail, .. } => {
+                assert!(
+                    detail.contains("empty label"),
+                    "expected empty label error, got: {detail}"
+                );
+            }
+            _ => panic!("expected Validation, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_endpoints_rejects_leading_hyphen() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "-api.openai.com".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        match err {
+            DomainError::Validation { detail, .. } => {
+                assert!(
+                    detail.contains("must not start or end with '-'"),
+                    "expected hyphen error, got: {detail}"
+                );
+            }
+            _ => panic!("expected Validation, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_endpoints_rejects_trailing_hyphen() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api-.openai.com".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn validate_endpoints_rejects_underscore_in_hostname() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api_v2.openai.com".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        match err {
+            DomainError::Validation { detail, .. } => {
+                assert!(
+                    detail.contains("invalid characters"),
+                    "expected invalid chars error, got: {detail}"
+                );
+            }
+            _ => panic!("expected Validation, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_endpoints_rejects_overlength_label() {
+        let long_label = "a".repeat(64);
+        let host = format!("{long_label}.example.com");
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host,
+            port: 443,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        match err {
+            DomainError::Validation { detail, .. } => {
+                assert!(
+                    detail.contains("exceeds 63"),
+                    "expected label length error, got: {detail}"
+                );
+            }
+            _ => panic!("expected Validation, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_endpoints_accepts_trailing_dot_fqdn() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com.".into(),
+            port: 443,
+        }];
+        assert!(validate_endpoints(&endpoints).is_ok());
+    }
+
+    #[test]
+    fn validate_endpoints_accepts_max_length_label() {
+        let label = "a".repeat(63);
+        let host = format!("{label}.example.com");
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host,
+            port: 443,
+        }];
+        assert!(validate_endpoints(&endpoints).is_ok());
+    }
+
+    #[test]
+    fn validate_endpoints_rejects_empty_hostname() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints(&endpoints).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
     #[tokio::test]
     async fn delete_upstream_cascades_routes() {
         let svc = make_service();
@@ -1692,7 +2075,7 @@ mod tests {
         let ctx = test_ctx(tenant);
 
         let u = svc
-            .create_upstream(&ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&ctx, make_create_upstream_ip("openai"))
             .await
             .unwrap();
         let r = svc
@@ -1719,7 +2102,7 @@ mod tests {
 
         // Create upstream in root tenant with inherit sharing (visible to descendants).
         let root_ctx = test_ctx(root);
-        let mut req = make_create_upstream(Some("openai"));
+        let mut req = make_create_upstream_hostname();
         req.auth = Some(AuthConfig {
             plugin_type: "noop".into(),
             sharing: SharingMode::Inherit,
@@ -1731,7 +2114,7 @@ mod tests {
         let child_ctx = test_ctx(child);
         let chain = svc.build_tenant_chain(&child_ctx).await.unwrap();
         let (resolved, _) = svc
-            .resolve_alias(&child_ctx, &chain, "openai", None)
+            .resolve_alias(&child_ctx, &chain, "api.openai.com", None)
             .await
             .unwrap();
         assert_eq!(resolved.id, root_upstream.id);
@@ -1748,7 +2131,7 @@ mod tests {
 
         // Create upstream in root with inherit sharing.
         let root_ctx = test_ctx(root);
-        let mut req = make_create_upstream(Some("openai"));
+        let mut req = make_create_upstream_hostname();
         req.auth = Some(AuthConfig {
             plugin_type: "noop".into(),
             sharing: SharingMode::Inherit,
@@ -1756,17 +2139,17 @@ mod tests {
         });
         svc.create_upstream(&root_ctx, req).await.unwrap();
 
-        // Create upstream with same alias in child tenant (shadows root).
+        // Create upstream with same host in child tenant (same derived alias shadows root).
         let child_ctx = test_ctx(child);
         let child_upstream = svc
-            .create_upstream(&child_ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&child_ctx, make_create_upstream_hostname())
             .await
             .unwrap();
 
         // Child resolves to its own upstream (shadow wins).
         let chain = svc.build_tenant_chain(&child_ctx).await.unwrap();
         let (resolved, _) = svc
-            .resolve_alias(&child_ctx, &chain, "openai", None)
+            .resolve_alias(&child_ctx, &chain, "api.openai.com", None)
             .await
             .unwrap();
         assert_eq!(resolved.id, child_upstream.id);
@@ -1781,7 +2164,7 @@ mod tests {
 
         // Create upstream in root with all-private sharing (default).
         let root_ctx = test_ctx(root);
-        svc.create_upstream(&root_ctx, make_create_upstream(Some("openai")))
+        svc.create_upstream(&root_ctx, make_create_upstream_hostname())
             .await
             .unwrap();
 
@@ -1789,7 +2172,7 @@ mod tests {
         let child_ctx = test_ctx(child);
         let chain = svc.build_tenant_chain(&child_ctx).await.unwrap();
         let err = svc
-            .resolve_alias(&child_ctx, &chain, "openai", None)
+            .resolve_alias(&child_ctx, &chain, "api.openai.com", None)
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::NotFound { .. }));
@@ -1807,7 +2190,7 @@ mod tests {
 
         // Create disabled upstream in parent with inherit sharing.
         let parent_ctx = test_ctx(parent);
-        let mut req = make_create_upstream(Some("openai"));
+        let mut req = make_create_upstream_hostname();
         req.enabled = false;
         req.auth = Some(AuthConfig {
             plugin_type: "noop".into(),
@@ -1818,7 +2201,7 @@ mod tests {
 
         // Create enabled upstream in root with inherit sharing.
         let root_ctx = test_ctx(root);
-        let mut req2 = make_create_upstream(Some("openai"));
+        let mut req2 = make_create_upstream_hostname();
         req2.auth = Some(AuthConfig {
             plugin_type: "noop".into(),
             sharing: SharingMode::Inherit,
@@ -1830,7 +2213,7 @@ mod tests {
         let child_ctx = test_ctx(child);
         let chain = svc.build_tenant_chain(&child_ctx).await.unwrap();
         let (resolved, _) = svc
-            .resolve_alias(&child_ctx, &chain, "openai", None)
+            .resolve_alias(&child_ctx, &chain, "api.openai.com", None)
             .await
             .unwrap();
         assert_eq!(resolved.id, root_upstream.id);
@@ -1847,7 +2230,7 @@ mod tests {
 
         // Create disabled upstream in root with inherit sharing.
         let root_ctx = test_ctx(root);
-        let mut req = make_create_upstream(Some("openai"));
+        let mut req = make_create_upstream_hostname();
         req.enabled = false;
         req.auth = Some(AuthConfig {
             plugin_type: "noop".into(),
@@ -1860,7 +2243,7 @@ mod tests {
         let child_ctx = test_ctx(child);
         let chain = svc.build_tenant_chain(&child_ctx).await.unwrap();
         let err = svc
-            .resolve_alias(&child_ctx, &chain, "openai", None)
+            .resolve_alias(&child_ctx, &chain, "api.openai.com", None)
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::UpstreamDisabled { .. }));
@@ -1877,7 +2260,7 @@ mod tests {
 
         // Create enabled upstream in root with inherit sharing.
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_hostname();
         root_req.auth = Some(AuthConfig {
             plugin_type: "noop".into(),
             sharing: SharingMode::Inherit,
@@ -1885,9 +2268,9 @@ mod tests {
         });
         let root_upstream = svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
-        // Create disabled upstream in child with same alias.
+        // Create disabled upstream in child with same host (same derived alias).
         let child_ctx = test_ctx(child);
-        let mut child_req = make_create_upstream(Some("openai"));
+        let mut child_req = make_create_upstream_hostname();
         child_req.enabled = false;
         child_req.auth = Some(AuthConfig {
             plugin_type: "noop".into(),
@@ -1899,7 +2282,7 @@ mod tests {
         // Child resolves: own upstream disabled → falls through to root ancestor.
         let chain = svc.build_tenant_chain(&child_ctx).await.unwrap();
         let (resolved, _) = svc
-            .resolve_alias(&child_ctx, &chain, "openai", None)
+            .resolve_alias(&child_ctx, &chain, "api.openai.com", None)
             .await
             .unwrap();
         assert_eq!(resolved.id, root_upstream.id);
@@ -2250,7 +2633,7 @@ mod tests {
 
         // Create upstream in root with auth sharing = enforce.
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_hostname();
         root_req.auth = Some(AuthConfig {
             plugin_type: "apikey".into(),
             sharing: SharingMode::Enforce,
@@ -2258,9 +2641,9 @@ mod tests {
         });
         svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
-        // Child tries to create upstream with same alias AND auth override.
+        // Child tries to create upstream with same host (same derived alias) AND auth override.
         let child_ctx = test_ctx(child);
-        let mut child_req = make_create_upstream(Some("openai"));
+        let mut child_req = make_create_upstream_hostname();
         child_req.auth = Some(AuthConfig {
             plugin_type: "oauth2".into(),
             sharing: SharingMode::Inherit,
@@ -2290,7 +2673,7 @@ mod tests {
 
         // Create upstream in root with rate_limit sharing = private.
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_hostname();
         root_req.rate_limit = Some(make_rate_limit(SharingMode::Private, 100, Window::Minute));
         // Need at least one non-private field so root upstream is visible.
         root_req.auth = Some(AuthConfig {
@@ -2302,7 +2685,7 @@ mod tests {
 
         // Child tries to override rate_limit on private ancestor field.
         let child_ctx = test_ctx(child);
-        let mut child_req = make_create_upstream(Some("openai"));
+        let mut child_req = make_create_upstream_hostname();
         child_req.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 50, Window::Minute));
         let err = svc
             .create_upstream(&child_ctx, child_req)
@@ -2328,7 +2711,7 @@ mod tests {
 
         // Create upstream in root with inherit sharing.
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_hostname();
         root_req.auth = Some(AuthConfig {
             plugin_type: "apikey".into(),
             sharing: SharingMode::Inherit,
@@ -2336,17 +2719,17 @@ mod tests {
         });
         svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
-        // Child creates upstream with same alias and overrides auth.
+        // Child creates upstream with same host (same derived alias) and overrides auth.
         // With allow-all enforcer, bind + override_auth permissions pass.
         let child_ctx = test_ctx(child);
-        let mut child_req = make_create_upstream(Some("openai"));
+        let mut child_req = make_create_upstream_hostname();
         child_req.auth = Some(AuthConfig {
             plugin_type: "oauth2".into(),
             sharing: SharingMode::Inherit,
             config: None,
         });
         let child_upstream = svc.create_upstream(&child_ctx, child_req).await.unwrap();
-        assert_eq!(child_upstream.alias, "openai");
+        assert_eq!(child_upstream.alias, "api.openai.com");
         assert_eq!(child_upstream.auth.unwrap().plugin_type, "oauth2");
     }
 
@@ -2360,7 +2743,7 @@ mod tests {
         // No upstream in root. Child creates fresh upstream — no permission checks needed.
         let child_ctx = test_ctx(child);
         let child_upstream = svc
-            .create_upstream(&child_ctx, make_create_upstream(Some("fresh-alias")))
+            .create_upstream(&child_ctx, make_create_upstream_ip("fresh-alias"))
             .await
             .unwrap();
         assert_eq!(child_upstream.alias, "fresh-alias");
@@ -2389,7 +2772,7 @@ mod tests {
 
         // Root upstream with auth inherit.
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_hostname();
         root_req.auth = Some(AuthConfig {
             plugin_type: "apikey".into(),
             sharing: SharingMode::Inherit,
@@ -2399,7 +2782,7 @@ mod tests {
 
         // Child tries to bind with a secret_ref the credstore doesn't have.
         let child_ctx = test_ctx(child);
-        let mut child_req = make_create_upstream(Some("openai"));
+        let mut child_req = make_create_upstream_hostname();
         child_req.auth = Some(auth_with_secret_ref("cred://missing-key"));
         let err = svc
             .create_upstream(&child_ctx, child_req)
@@ -2428,7 +2811,7 @@ mod tests {
 
         // Root upstream with auth inherit.
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_hostname();
         root_req.auth = Some(AuthConfig {
             plugin_type: "apikey".into(),
             sharing: SharingMode::Inherit,
@@ -2438,10 +2821,10 @@ mod tests {
 
         // Child binds with accessible secret_ref.
         let child_ctx = test_ctx(child);
-        let mut child_req = make_create_upstream(Some("openai"));
+        let mut child_req = make_create_upstream_hostname();
         child_req.auth = Some(auth_with_secret_ref("cred://my-key"));
         let child_upstream = svc.create_upstream(&child_ctx, child_req).await.unwrap();
-        assert_eq!(child_upstream.alias, "openai");
+        assert_eq!(child_upstream.alias, "api.openai.com");
     }
 
     // -- Update upstream bind validation tests --
@@ -2455,7 +2838,7 @@ mod tests {
 
         // Root upstream with auth enforce.
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_hostname();
         root_req.auth = Some(AuthConfig {
             plugin_type: "apikey".into(),
             sharing: SharingMode::Enforce,
@@ -2463,10 +2846,10 @@ mod tests {
         });
         svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
-        // Child creates upstream with same alias (no auth override on create).
+        // Child creates upstream with same host (same derived alias, no auth override on create).
         let child_ctx = test_ctx(child);
         let child_upstream = svc
-            .create_upstream(&child_ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&child_ctx, make_create_upstream_hostname())
             .await
             .unwrap();
 
@@ -2504,9 +2887,9 @@ mod tests {
         let resolver = MockTenantResolverClient::with_hierarchy(vec![root, child]);
         let svc = make_service_with_resolver(resolver);
 
-        // Root upstream with inherit sharing.
+        // Root upstream with inherit sharing (IP-based for explicit alias control).
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_ip("openai");
         root_req.auth = Some(AuthConfig {
             plugin_type: "apikey".into(),
             sharing: SharingMode::Inherit,
@@ -2514,10 +2897,10 @@ mod tests {
         });
         svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
-        // Child creates upstream with different alias.
+        // Child creates upstream with different alias (IP-based).
         let child_ctx = test_ctx(child);
         let child_upstream = svc
-            .create_upstream(&child_ctx, make_create_upstream(Some("other")))
+            .create_upstream(&child_ctx, make_create_upstream_ip("other"))
             .await
             .unwrap();
 
@@ -2543,9 +2926,9 @@ mod tests {
         let resolver = MockTenantResolverClient::with_hierarchy(vec![root, child]);
         let svc = make_service_with_resolver(resolver);
 
-        // Root upstream with auth enforce.
+        // Root upstream with auth enforce (IP-based for explicit alias control).
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_ip("openai");
         root_req.auth = Some(AuthConfig {
             plugin_type: "apikey".into(),
             sharing: SharingMode::Enforce,
@@ -2553,9 +2936,9 @@ mod tests {
         });
         svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
-        // Child creates upstream with a different alias but with auth already set.
+        // Child creates upstream with a different alias but with auth already set (IP-based).
         let child_ctx = test_ctx(child);
-        let mut child_req = make_create_upstream(Some("other"));
+        let mut child_req = make_create_upstream_ip("other");
         child_req.auth = Some(AuthConfig {
             plugin_type: "oauth2".into(),
             sharing: SharingMode::Inherit,
@@ -2594,10 +2977,10 @@ mod tests {
         let resolver = MockTenantResolverClient::with_hierarchy(vec![root, child]);
         let svc = make_service_with_resolver(resolver);
 
-        // Child creates upstream.
+        // Child creates upstream (IP-based for explicit alias).
         let child_ctx = test_ctx(child);
         let child_upstream = svc
-            .create_upstream(&child_ctx, make_create_upstream(Some("my-svc")))
+            .create_upstream(&child_ctx, make_create_upstream_ip("my-svc"))
             .await
             .unwrap();
 
@@ -2631,9 +3014,9 @@ mod tests {
         let resolver = MockTenantResolverClient::with_hierarchy(vec![root, child]);
         let svc = make_service_with_resolver(resolver);
 
-        // Root creates upstream "openai" with auth inherit.
+        // Root creates upstream with auth inherit (hostname-based, derived alias).
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_hostname();
         root_req.auth = Some(AuthConfig {
             plugin_type: "apikey".into(),
             sharing: SharingMode::Inherit,
@@ -2661,22 +3044,22 @@ mod tests {
         };
         let root_route = svc.create_route(&root_ctx, route_req).await.unwrap();
 
-        // Child creates upstream with same alias (bind to ancestor).
+        // Child creates upstream with same host (same derived alias, bind to ancestor).
         let child_ctx = test_ctx(child);
         let _child_upstream = svc
-            .create_upstream(&child_ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&child_ctx, make_create_upstream_hostname())
             .await
             .unwrap();
 
         // Child resolves proxy target — should find the route defined on
         // the root's upstream ID, not the child's.
         let (effective, route) = svc
-            .resolve_proxy_target(&child_ctx, "openai", "POST", "/v1/chat")
+            .resolve_proxy_target(&child_ctx, "api.openai.com", "POST", "/v1/chat")
             .await
             .unwrap();
 
         assert_eq!(route.id, root_route.id);
-        assert_eq!(effective.alias, "openai");
+        assert_eq!(effective.alias, "api.openai.com");
     }
 
     #[tokio::test]
@@ -2688,9 +3071,9 @@ mod tests {
         let resolver = MockTenantResolverClient::with_hierarchy(vec![root, child]);
         let svc = make_service_with_resolver(resolver);
 
-        // Root creates upstream "openai" with auth inherit.
+        // Root creates upstream with auth inherit (hostname-based, derived alias).
         let root_ctx = test_ctx(root);
-        let mut root_req = make_create_upstream(Some("openai"));
+        let mut root_req = make_create_upstream_hostname();
         root_req.auth = Some(AuthConfig {
             plugin_type: "apikey".into(),
             sharing: SharingMode::Inherit,
@@ -2718,10 +3101,10 @@ mod tests {
         };
         svc.create_route(&root_ctx, root_route_req).await.unwrap();
 
-        // Child creates upstream with same alias.
+        // Child creates upstream with same host (same derived alias).
         let child_ctx = test_ctx(child);
         let child_upstream = svc
-            .create_upstream(&child_ctx, make_create_upstream(Some("openai")))
+            .create_upstream(&child_ctx, make_create_upstream_hostname())
             .await
             .unwrap();
 
@@ -2747,7 +3130,7 @@ mod tests {
 
         // Child resolves — should prefer its own route (child upstream ID checked first).
         let (_effective, route) = svc
-            .resolve_proxy_target(&child_ctx, "openai", "POST", "/v1/chat")
+            .resolve_proxy_target(&child_ctx, "api.openai.com", "POST", "/v1/chat")
             .await
             .unwrap();
 
@@ -2907,5 +3290,514 @@ mod tests {
         // Enforced "audit-log" must survive even though descendant set Private.
         assert!(items.contains(&"audit-log".to_string()));
         assert!(items.contains(&"my-plugin".to_string()));
+    }
+
+    // -- Alias enforcement tests --
+
+    #[test]
+    fn compute_derived_alias_single_hostname_standard_port() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com".into(),
+            port: 443,
+        }];
+        assert_eq!(compute_derived_alias(&eps), Some("api.openai.com".into()));
+    }
+
+    #[test]
+    fn compute_derived_alias_single_hostname_non_standard_port() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com".into(),
+            port: 8443,
+        }];
+        assert_eq!(
+            compute_derived_alias(&eps),
+            Some("api.openai.com:8443".into())
+        );
+    }
+
+    #[test]
+    fn compute_derived_alias_http_standard_port() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Http,
+            host: "api.example.com".into(),
+            port: 80,
+        }];
+        assert_eq!(compute_derived_alias(&eps), Some("api.example.com".into()));
+    }
+
+    #[test]
+    fn compute_derived_alias_grpc_standard_port() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Grpc,
+            host: "grpc.example.com".into(),
+            port: 443,
+        }];
+        assert_eq!(compute_derived_alias(&eps), Some("grpc.example.com".into()));
+    }
+
+    #[test]
+    fn compute_derived_alias_multi_host_common_suffix() {
+        let eps = vec![
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "us.vendor.com".into(),
+                port: 443,
+            },
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "eu.vendor.com".into(),
+                port: 443,
+            },
+        ];
+        assert_eq!(compute_derived_alias(&eps), Some("vendor.com".into()));
+    }
+
+    #[test]
+    fn compute_derived_alias_multi_host_deeper_common_suffix() {
+        let eps = vec![
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "a.b.vendor.com".into(),
+                port: 443,
+            },
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "c.b.vendor.com".into(),
+                port: 443,
+            },
+        ];
+        assert_eq!(compute_derived_alias(&eps), Some("b.vendor.com".into()));
+    }
+
+    #[test]
+    fn compute_derived_alias_multi_host_no_common_suffix() {
+        let eps = vec![
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "us.foo.com".into(),
+                port: 443,
+            },
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "eu.bar.com".into(),
+                port: 443,
+            },
+        ];
+        // Only 1 common label ("com") — minimum is 2.
+        assert_eq!(compute_derived_alias(&eps), None);
+    }
+
+    #[test]
+    fn compute_derived_alias_multi_host_identical_treated_as_single() {
+        let eps = vec![
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "api.vendor.com".into(),
+                port: 443,
+            },
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "api.vendor.com".into(),
+                port: 443,
+            },
+        ];
+        assert_eq!(compute_derived_alias(&eps), Some("api.vendor.com".into()));
+    }
+
+    #[test]
+    fn compute_derived_alias_ip_returns_none() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.1.1".into(),
+            port: 443,
+        }];
+        assert_eq!(compute_derived_alias(&eps), None);
+    }
+
+    #[test]
+    fn compute_derived_alias_normalizes_case() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "Api.OpenAI.COM".into(),
+            port: 443,
+        }];
+        assert_eq!(compute_derived_alias(&eps), Some("api.openai.com".into()));
+    }
+
+    #[test]
+    fn compute_derived_alias_strips_trailing_dot() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.example.com.".into(),
+            port: 443,
+        }];
+        assert_eq!(compute_derived_alias(&eps), Some("api.example.com".into()));
+    }
+
+    #[test]
+    fn normalize_alias_lowercases() {
+        assert_eq!(normalize_alias("My-Service"), "my-service");
+    }
+
+    #[test]
+    fn normalize_alias_strips_trailing_dot() {
+        assert_eq!(normalize_alias("api.example.com."), "api.example.com");
+    }
+
+    #[test]
+    fn enforce_alias_create_hostname_rejects_user_alias() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com".into(),
+            port: 443,
+        }];
+        let err = enforce_alias_create(Some("custom-alias"), &eps).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn enforce_alias_create_hostname_tolerates_exact_match() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com".into(),
+            port: 443,
+        }];
+        let alias = enforce_alias_create(Some("api.openai.com"), &eps).unwrap();
+        assert_eq!(alias, "api.openai.com");
+    }
+
+    #[test]
+    fn enforce_alias_create_hostname_auto_derives() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com".into(),
+            port: 443,
+        }];
+        let alias = enforce_alias_create(None, &eps).unwrap();
+        assert_eq!(alias, "api.openai.com");
+    }
+
+    #[test]
+    fn enforce_alias_create_ip_requires_explicit() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.1.1".into(),
+            port: 443,
+        }];
+        let err = enforce_alias_create(None, &eps).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn enforce_alias_create_ip_accepts_explicit() {
+        let eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.1.1".into(),
+            port: 443,
+        }];
+        let alias = enforce_alias_create(Some("my-backend"), &eps).unwrap();
+        assert_eq!(alias, "my-backend");
+    }
+
+    #[test]
+    fn enforce_alias_update_hostname_to_hostname_recomputes() {
+        let old_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "old.vendor.com".into(),
+            port: 443,
+        }];
+        let new_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "new.vendor.com".into(),
+            port: 443,
+        }];
+        let alias = enforce_alias_update(None, &new_eps, "old.vendor.com", &old_eps).unwrap();
+        assert_eq!(alias, "new.vendor.com");
+    }
+
+    #[test]
+    fn enforce_alias_update_hostname_to_ip_requires_alias() {
+        let old_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com".into(),
+            port: 443,
+        }];
+        let new_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.1.1".into(),
+            port: 443,
+        }];
+        let err = enforce_alias_update(None, &new_eps, "api.openai.com", &old_eps).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn enforce_alias_update_hostname_to_ip_with_alias_succeeds() {
+        let old_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com".into(),
+            port: 443,
+        }];
+        let new_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.1.1".into(),
+            port: 443,
+        }];
+        let alias =
+            enforce_alias_update(Some("my-backend"), &new_eps, "api.openai.com", &old_eps).unwrap();
+        assert_eq!(alias, "my-backend");
+    }
+
+    #[test]
+    fn enforce_alias_update_ip_to_ip_retains_existing() {
+        let old_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.1.1".into(),
+            port: 443,
+        }];
+        let new_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.1.2".into(),
+            port: 443,
+        }];
+        let alias = enforce_alias_update(None, &new_eps, "my-backend", &old_eps).unwrap();
+        assert_eq!(alias, "my-backend");
+    }
+
+    #[test]
+    fn enforce_alias_update_ip_to_hostname_recomputes() {
+        let old_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.1.1".into(),
+            port: 443,
+        }];
+        let new_eps = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com".into(),
+            port: 443,
+        }];
+        let alias = enforce_alias_update(None, &new_eps, "my-backend", &old_eps).unwrap();
+        assert_eq!(alias, "api.openai.com");
+    }
+
+    #[tokio::test]
+    async fn create_hostname_rejects_explicit_alias() {
+        let svc = make_service();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        let mut req = make_create_upstream_hostname();
+        req.alias = Some("custom".into());
+        let err = svc.create_upstream(&ctx, req).await.unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_ip_requires_explicit_alias() {
+        let svc = make_service();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        let req = CreateUpstreamRequest {
+            server: Server {
+                endpoints: vec![Endpoint {
+                    scheme: Scheme::Https,
+                    host: "10.0.0.1".into(),
+                    port: 443,
+                }],
+            },
+            protocol: "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1".into(),
+            alias: None,
+            auth: None,
+            headers: None,
+            plugins: None,
+            rate_limit: None,
+            tags: vec![],
+            enabled: true,
+        };
+        let err = svc.create_upstream(&ctx, req).await.unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_hostname_rejects_alias_override() {
+        let svc = make_service();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        let u = svc
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        assert_eq!(u.alias, "api.openai.com");
+
+        // Try to override alias on hostname-based upstream — should fail.
+        let err = svc
+            .update_upstream(
+                &ctx,
+                u.id,
+                UpdateUpstreamRequest {
+                    alias: Some("custom".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_endpoints_recomputes_alias() {
+        let svc = make_service();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        let u = svc
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        assert_eq!(u.alias, "api.openai.com");
+
+        // Update endpoints to a different host — alias should recompute.
+        let updated = svc
+            .update_upstream(
+                &ctx,
+                u.id,
+                UpdateUpstreamRequest {
+                    server: Some(Server {
+                        endpoints: vec![Endpoint {
+                            scheme: Scheme::Https,
+                            host: "api.anthropic.com".into(),
+                            port: 443,
+                        }],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.alias, "api.anthropic.com");
+    }
+
+    #[tokio::test]
+    async fn update_hostname_to_ip_without_alias_fails() {
+        let svc = make_service();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        let u = svc
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+
+        // Switch to IP endpoints without providing alias.
+        let err = svc
+            .update_upstream(
+                &ctx,
+                u.id,
+                UpdateUpstreamRequest {
+                    server: Some(Server {
+                        endpoints: vec![Endpoint {
+                            scheme: Scheme::Https,
+                            host: "10.0.0.1".into(),
+                            port: 443,
+                        }],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_hostname_to_ip_with_alias_succeeds() {
+        let svc = make_service();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        let u = svc
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+
+        // Switch to IP endpoints with explicit alias.
+        let updated = svc
+            .update_upstream(
+                &ctx,
+                u.id,
+                UpdateUpstreamRequest {
+                    server: Some(Server {
+                        endpoints: vec![Endpoint {
+                            scheme: Scheme::Https,
+                            host: "10.0.0.1".into(),
+                            port: 443,
+                        }],
+                    }),
+                    alias: Some("my-backend".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.alias, "my-backend");
+    }
+
+    #[tokio::test]
+    async fn resolve_alias_case_insensitive() {
+        let svc = make_service();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        let u = svc
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        assert_eq!(u.alias, "api.openai.com");
+
+        // Resolve with different casing — should still find the upstream.
+        let chain = svc.build_tenant_chain(&ctx).await.unwrap();
+        let (resolved, _) = svc
+            .resolve_alias(&ctx, &chain, "Api.OpenAI.COM", None)
+            .await
+            .unwrap();
+        assert_eq!(resolved.id, u.id);
+    }
+
+    #[tokio::test]
+    async fn multi_endpoint_common_suffix_alias() {
+        let svc = make_service();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        let req = CreateUpstreamRequest {
+            server: Server {
+                endpoints: vec![
+                    Endpoint {
+                        scheme: Scheme::Https,
+                        host: "us.vendor.com".into(),
+                        port: 443,
+                    },
+                    Endpoint {
+                        scheme: Scheme::Https,
+                        host: "eu.vendor.com".into(),
+                        port: 443,
+                    },
+                ],
+            },
+            protocol: "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1".into(),
+            alias: None,
+            auth: None,
+            headers: None,
+            plugins: None,
+            rate_limit: None,
+            tags: vec![],
+            enabled: true,
+        };
+        let u = svc.create_upstream(&ctx, req).await.unwrap();
+        assert_eq!(u.alias, "vendor.com");
     }
 }

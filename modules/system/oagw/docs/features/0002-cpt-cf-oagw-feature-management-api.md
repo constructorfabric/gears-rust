@@ -9,7 +9,7 @@
 
 ### 1.1 Overview
 
-Implement Control Plane CRUD operations for upstreams and routes with REST API handlers, validation, alias generation, enable/disable semantics, OData query support, and RFC 9457 error responses.
+Implement Control Plane CRUD operations for upstreams and routes with REST API handlers, validation, alias enforcement, enable/disable semantics, OData query support, and RFC 9457 error responses.
 
 ### 1.2 Purpose
 
@@ -46,7 +46,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 **Actor**: `cpt-cf-oagw-actor-platform-operator`, `cpt-cf-oagw-actor-tenant-admin`
 
 **Success Scenarios**:
-- Upstream is created with generated alias and persisted to database
+- Upstream is created with enforced alias (auto-derived or explicit) and persisted to database
 - Response contains the created upstream with GTS anonymous identifier
 
 **Error Scenarios**:
@@ -62,7 +62,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 5. [ ] - `p1` - Domain: Execute upstream validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-upstream`) - `inst-create-us-5`
 6. [ ] - `p1` - **IF** validation fails - `inst-create-us-6`
    1. [ ] - `p1` - **RETURN** 400 ValidationError (RFC 9457 Problem Details) - `inst-create-us-6a`
-7. [ ] - `p1` - Domain: Execute alias generation algorithm (`cpt-cf-oagw-algo-mgmt-generate-alias`) - `inst-create-us-7`
+7. [x] - `p1` - Domain: Execute alias enforcement algorithm (`cpt-cf-oagw-algo-mgmt-enforce-alias`) - `inst-create-us-7`
 8. [ ] - `p1` - DB: BEGIN transaction - `inst-create-us-8`
 9. [ ] - `p1` - DB: INSERT oagw_upstream (id, tenant_id, alias, protocol, enabled, server_config, auth_config, headers_config, rate_limit_config, cors_config, plugins_config) - `inst-create-us-9`
 10. [ ] - `p1` - DB: INSERT oagw_upstream_tag for each tag in request - `inst-create-us-10`
@@ -79,13 +79,15 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 **Actor**: `cpt-cf-oagw-actor-platform-operator`, `cpt-cf-oagw-actor-tenant-admin`
 
 **Success Scenarios**:
-- Upstream configuration is updated; alias is re-generated if endpoints change
+- Upstream configuration is updated; alias is re-enforced if endpoints change
 - Response contains the updated upstream
 
 **Error Scenarios**:
 - Upstream not found (wrong ID or tenant)
 - Validation fails (same as create)
-- Alias conflict after re-generation
+- Alias conflict after re-enforcement
+- Alias override rejected for hostname-based endpoints (400 Validation)
+- Hostname→IP endpoint transition without explicit alias (400 Validation)
 
 **Steps**:
 1. [ ] - `p1` - Actor sends PUT /api/oagw/v1/upstreams/{id} with updated configuration - `inst-update-us-1`
@@ -96,7 +98,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
    1. [ ] - `p1` - **RETURN** 404 Not Found - `inst-update-us-5a`
 6. [ ] - `p1` - Domain: Execute upstream validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-upstream`) - `inst-update-us-6`
 7. [ ] - `p1` - **IF** server endpoints changed - `inst-update-us-7`
-   1. [ ] - `p1` - Domain: Re-execute alias generation algorithm (`cpt-cf-oagw-algo-mgmt-generate-alias`) - `inst-update-us-7a`
+   1. [x] - `p1` - Domain: Re-execute alias enforcement algorithm (`cpt-cf-oagw-algo-mgmt-enforce-alias`) - `inst-update-us-7a`
 8. [ ] - `p1` - DB: BEGIN transaction - `inst-update-us-8`
 9. [ ] - `p1` - DB: UPDATE oagw_upstream SET (updated fields) WHERE id = :uuid - `inst-update-us-9`
 10. [ ] - `p1` - DB: DELETE + re-INSERT oagw_upstream_tag for updated tags - `inst-update-us-10`
@@ -254,28 +256,50 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
    1. [ ] - `p1` - Add error: "Unsupported protocol: {protocol}" - `inst-val-us-6a`
 7. [ ] - `p1` - **RETURN** { valid: errors.length == 0, errors } - `inst-val-us-7`
 
-### Alias Generation Algorithm
+### Alias Enforcement Algorithm
 
-- [ ] `p1` - **ID**: `cpt-cf-oagw-algo-mgmt-generate-alias`
+- [x] `p1` - **ID**: `cpt-cf-oagw-algo-mgmt-enforce-alias`
 
-**Input**: Server endpoints list, optional explicit alias from request
+**Input**: Server endpoints list, optional explicit alias from request, existing upstream (for update path)
 
-**Output**: Resolved alias string
+**Output**: Resolved alias string or validation error
 
-**Steps**:
-1. [ ] - `p1` - **IF** explicit alias provided in request - `inst-alias-1`
-   1. [ ] - `p1` - **RETURN** explicit alias (user override) - `inst-alias-1a`
-2. [ ] - `p1` - **IF** single endpoint - `inst-alias-2`
-   1. [ ] - `p1` - Extract hostname from endpoint - `inst-alias-2a`
-   2. [ ] - `p1` - **IF** port is a standard port for the scheme (HTTPS: 443, HTTP: 80, WSS: 443, WS: 80, WebTransport: 443, gRPC: 443) - `inst-alias-2b`
-      1. [ ] - `p1` - **RETURN** hostname without port (e.g., `api.openai.com`) - `inst-alias-2b1`
-   3. [ ] - `p1` - **RETURN** hostname:port (e.g., `api.openai.com:8443`) - `inst-alias-2c`
-3. [ ] - `p1` - **IF** multiple endpoints - `inst-alias-3`
-   1. [ ] - `p1` - **IF** all hosts are IP addresses or have no common domain suffix - `inst-alias-3a`
-      1. [ ] - `p1` - Add validation error: "Explicit alias required for IP-based or heterogeneous endpoints" - `inst-alias-3a1`
-      2. [ ] - `p1` - **RETURN** error - `inst-alias-3a2`
-   2. [ ] - `p1` - Compute longest common domain suffix across all endpoint hosts - `inst-alias-3b`
-   3. [ ] - `p1` - **RETURN** common suffix (e.g., `us.vendor.com`, `eu.vendor.com` → `vendor.com`) - `inst-alias-3c`
+Alias behavior is determined entirely by endpoint type. Hostname-based endpoints always auto-derive; IP-based endpoints require explicit alias.
+
+**Create path** (`enforce_alias_create`):
+1. [x] - `p1` - Attempt to derive alias from endpoints (`compute_derived_alias`) - `inst-alias-1`
+2. [x] - `p1` - **IF** derivable (hostname-based) - `inst-alias-2`
+   1. [x] - `p1` - **IF** user provided explicit alias AND it differs from derived value - `inst-alias-2a`
+      1. [x] - `p1` - **RETURN** 400 Validation: "alias is auto-derived for hostname-based endpoints" - `inst-alias-2a1`
+   2. [x] - `p1` - **RETURN** derived alias (normalized: lowercase, trailing dot stripped) - `inst-alias-2b`
+3. [x] - `p1` - **IF** not derivable (IP-based or no common suffix) - `inst-alias-3`
+   1. [x] - `p1` - **IF** no explicit alias provided - `inst-alias-3a`
+      1. [x] - `p1` - **RETURN** 400 Validation: "explicit alias is required for IP-based or heterogeneous-host endpoints" - `inst-alias-3a1`
+   2. [x] - `p1` - Normalize and validate explicit alias (charset, length) - `inst-alias-3b`
+   3. [x] - `p1` - **RETURN** normalized alias - `inst-alias-3c`
+
+**Update path** (`enforce_alias_update` — when endpoints change):
+1. [x] - `p1` - Determine old and new endpoint derivability - `inst-alias-upd-1`
+2. [x] - `p1` - **IF** new endpoints are hostname-based (derivable) - `inst-alias-upd-2`
+   1. [x] - `p1` - Recompute alias from new endpoints; reject user-provided alias if different - `inst-alias-upd-2a`
+3. [x] - `p1` - **IF** old hostname → new IP (hostname→IP transition) - `inst-alias-upd-3`
+   1. [x] - `p1` - **IF** no explicit alias provided - `inst-alias-upd-3a`
+      1. [x] - `p1` - **RETURN** 400 Validation: "endpoints changed from hostname to IP-based; an explicit alias must be provided" - `inst-alias-upd-3a1`
+   2. [x] - `p1` - **RETURN** normalized user alias - `inst-alias-upd-3b`
+4. [x] - `p1` - **IF** IP → IP (no transition) - `inst-alias-upd-4`
+   1. [x] - `p1` - Retain existing alias unless user provides a new one - `inst-alias-upd-4a`
+
+**Derivation rules** (`compute_derived_alias`):
+- Single hostname, standard port → hostname (e.g., `api.openai.com`)
+- Single hostname, non-standard port → hostname:port (e.g., `api.openai.com:8443`)
+- Multiple hostnames, all identical → treated as single-host
+- Multiple hostnames, common domain suffix (≥2 labels) → common suffix (e.g., `vendor.com`); port intentionally dropped
+- Multiple hostnames, no common suffix (only TLD in common) → `None` (explicit required)
+- IP addresses → `None` (explicit required)
+
+**Standard ports** (omitted from derived alias): HTTP: 80, HTTPS/WSS/WebTransport/gRPC: 443.
+
+**Hostname validation** (RFC 1123): max 253 chars total, each label 1–63 chars, labels ASCII alphanumeric + hyphen only, labels cannot start/end with hyphen. Trailing dot (FQDN) tolerated.
 
 ### Route Validation Algorithm
 
@@ -365,14 +389,14 @@ The system **MUST** provide REST handlers for POST, GET (list + by-ID), PUT, and
 - DB: `oagw_route`, `oagw_route_http_match`, `oagw_route_grpc_match`, `oagw_route_method`, `oagw_route_tag`, `oagw_route_plugin`
 - Entities: Route
 
-### Implement Alias Generation and Uniqueness
+### Implement Alias Enforcement and Uniqueness
 
-- [ ] `p1` - **ID**: `cpt-cf-oagw-dod-mgmt-alias-generation`
+- [x] `p1` - **ID**: `cpt-cf-oagw-dod-mgmt-alias-enforcement`
 
-The system **MUST** auto-generate upstream aliases from server endpoints following the rules defined in `cpt-cf-oagw-algo-mgmt-generate-alias`. Aliases **MUST** be unique per `(tenant_id, alias)` with a database uniqueness constraint. Explicit aliases **MUST** override auto-generation. The system **MUST** reject IP-based or heterogeneous multi-endpoint upstreams that lack an explicit alias.
+The system **MUST** enforce alias rules based on endpoint type following `cpt-cf-oagw-algo-mgmt-enforce-alias`. Hostname-based endpoints auto-derive alias (user-provided alias is rejected). IP-based or non-derivable endpoints require explicit alias. Aliases **MUST** be normalized (ASCII lowercase, trailing dot stripped) and unique per `(tenant_id, alias)` with a database uniqueness constraint. On update, alias is re-enforced when endpoints change per the transition rules (hostname→hostname recomputes, hostname→IP requires explicit, IP→IP retains, IP→hostname recomputes). Endpoint hostnames **MUST** be validated per RFC 1123.
 
 **Implements**:
-- `cpt-cf-oagw-algo-mgmt-generate-alias`
+- `cpt-cf-oagw-algo-mgmt-enforce-alias`
 
 **Touches**:
 - DB: `oagw_upstream` (alias column, UNIQUE constraint on `(tenant_id, alias)`)
@@ -422,7 +446,8 @@ The system **MUST** return all management API errors in RFC 9457 Problem Details
 
 - [ ] Upstream CRUD: create, read (single + list), update, and delete operations work with tenant scoping via secure ORM
 - [ ] Route CRUD: create, read (single + list), update, and delete operations work with upstream reference validation and tenant scoping
-- [ ] Alias auto-generated from server endpoints per DESIGN rules (hostname for single, common suffix for multi-endpoint)
+- [x] Alias enforcement: hostname-based endpoints auto-derive alias (user-provided rejected); IP-based/non-derivable require explicit alias; aliases normalized (lowercase, trailing dot stripped); update re-enforces on endpoint change per transition rules
+- [x] Hostname validation: RFC 1123 (max 253 chars, labels 1–63 chars, ASCII alphanumeric + hyphen, no leading/trailing hyphen)
 - [ ] `(tenant_id, alias)` uniqueness enforced at database level; 409 Conflict returned on violation
 - [ ] OData $filter, $select, $orderby, $top (default 50, max 100), $skip supported on list endpoints; invalid syntax returns 400
 - [ ] Enable/disable: disabled upstream causes proxy requests to be rejected (503); disabled route excluded from matching; ancestor-disabled upstream cannot be re-enabled by descendant
