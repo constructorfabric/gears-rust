@@ -370,7 +370,6 @@ pub fn test_catalog_entry(params: TestCatalogEntryParams) -> ModelCatalogEntry {
         provider_display_name: params.provider_display_name,
         icon: String::new(),
         tier: params.tier,
-        system_prompt: None,
         enabled: params.enabled,
         multimodal_capabilities: params.multimodal_capabilities,
         context_window: params.context_window,

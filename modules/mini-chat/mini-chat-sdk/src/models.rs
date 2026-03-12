@@ -54,9 +54,6 @@ pub struct ModelCatalogEntry {
     pub icon: String,
     /// Model tier (standard or premium).
     pub tier: ModelTier,
-    /// System prompt applied to this model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
     pub enabled: bool,
     /// Multimodal capability flags, e.g. `VISION_INPUT`, `IMAGE_GENERATION`.
     pub multimodal_capabilities: Vec<String>,
@@ -349,7 +346,6 @@ mod tests {
             provider_display_name: "Default".to_owned(),
             icon: String::new(),
             tier: ModelTier::Standard,
-            system_prompt: None,
             enabled: true,
             multimodal_capabilities: vec![],
             context_window: 128_000,
@@ -365,6 +361,8 @@ mod tests {
                 is_default: false,
                 sort_order: 0,
             },
+            system_prompt: String::new(),
+            thread_summary_prompt: String::new(),
         }
     }
 
@@ -456,47 +454,30 @@ mod tests {
     }
 
     // ── ModelCatalogEntry: system_prompt serde contract ──
-    // `system_prompt` is optional: omitted from JSON when `None`, defaults
-    // to `None` when absent in input. Removing the `#[serde(default,
-    // skip_serializing_if)]` attributes would break the API contract.
+    // `system_prompt` defaults to empty string when absent in JSON input.
 
     #[test]
-    fn system_prompt_none_omitted_from_json() {
-        let mut entry = sample_catalog_entry();
-        entry.system_prompt = None;
-        let json = serde_json::to_value(&entry).unwrap();
-
-        assert!(
-            json.get("system_prompt").is_none(),
-            "system_prompt must be omitted when None"
-        );
-    }
-
-    #[test]
-    fn system_prompt_absent_in_json_deserializes_to_none() {
+    fn system_prompt_absent_in_json_deserializes_to_empty() {
         let mut json = serde_json::to_value(sample_catalog_entry()).unwrap();
         json.as_object_mut().unwrap().remove("system_prompt");
 
         let entry: ModelCatalogEntry = serde_json::from_value(json).unwrap();
         assert!(
-            entry.system_prompt.is_none(),
-            "missing system_prompt must deserialize to None"
+            entry.system_prompt.is_empty(),
+            "missing system_prompt must deserialize to empty string"
         );
     }
 
     #[test]
-    fn system_prompt_some_roundtrips() {
+    fn system_prompt_roundtrips() {
         let mut entry = sample_catalog_entry();
-        entry.system_prompt = Some("You are a helpful assistant.".to_owned());
+        entry.system_prompt = "You are a helpful assistant.".to_owned();
 
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["system_prompt"], "You are a helpful assistant.");
 
         let deserialized: ModelCatalogEntry = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            deserialized.system_prompt.as_deref(),
-            Some("You are a helpful assistant.")
-        );
+        assert_eq!(deserialized.system_prompt, "You are a helpful assistant.");
     }
 
     // ── ModelTier serde representation ──

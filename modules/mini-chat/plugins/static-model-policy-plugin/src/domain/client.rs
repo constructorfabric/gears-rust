@@ -111,7 +111,6 @@ mod tests {
             provider_display_name: "Default".to_owned(),
             icon: String::new(),
             tier,
-            system_prompt: None,
             enabled: true,
             multimodal_capabilities: vec![],
             context_window: 128_000,
