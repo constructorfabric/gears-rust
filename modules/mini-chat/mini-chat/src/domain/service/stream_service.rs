@@ -19,11 +19,27 @@ use crate::domain::repos::{
 use crate::domain::stream_events::{DoneData, ErrorData, StreamEvent};
 use crate::infra::db::entity::chat_turn::{Model as TurnModel, TurnState};
 use crate::infra::llm::{
-    ClientSseEvent, LlmMessage, LlmProvider, LlmProviderError, LlmRequestBuilder, TerminalOutcome,
-    Usage, provider_resolver::ProviderResolver,
+    ClientSseEvent, LlmMessage, LlmProvider, LlmProviderError, LlmRequestBuilder, LlmTool,
+    TerminalOutcome, Usage, provider_resolver::ProviderResolver, request::ContentPart,
 };
 
+use super::retrieval_scope::RetrievalScope;
 use super::{DbProvider, actions, resources};
+
+/// Pre-resolved attachment context passed into the stream pipeline.
+/// Computed by the handler from `validate_send_message_attachments` + `resolve_retrieval_scope`.
+#[derive(Debug, Clone, Default)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct StreamAttachmentContext {
+    /// LLM tools to include (e.g. `file_search` with `vector_store_ids`).
+    pub tools: Vec<LlmTool>,
+    /// Provider file IDs for image attachments (multimodal input).
+    pub image_file_ids: Vec<String>,
+    /// Whether `file_search` is active (for preflight surcharge).
+    pub file_search_enabled: bool,
+    /// Number of images (for preflight estimation).
+    pub num_images: u32,
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // StreamTerminal — service-level terminal classification
@@ -384,6 +400,7 @@ impl<
         request_id: Uuid,
         content: String,
         resolved_model: ResolvedModel,
+        attachment_ctx: StreamAttachmentContext,
         cancel: CancellationToken,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<tokio::task::JoinHandle<StreamOutcome>, StreamError> {
@@ -462,9 +479,10 @@ impl<
                 user_id,
                 selected_model: selected_model.clone(),
                 utf8_bytes: content.len() as u64,
-                num_images: 0,
-                tools_enabled: false,
+                num_images: attachment_ctx.num_images,
+                tools_enabled: !attachment_ctx.tools.is_empty(),
                 web_search_enabled: false,
+                file_search_enabled: attachment_ctx.file_search_enabled,
                 max_output_tokens_cap: self.streaming_config.max_output_tokens,
             })
             .await
@@ -520,8 +538,6 @@ impl<
                 source: DomainError::internal(format!("provider resolution: {e}")),
             }
         })?;
-        // Build the full OAGW proxy path: {alias}{api_path} with {model} substituted.
-        // Use provider_model_id (the actual provider-facing model name) for the LLM request.
         let api_path = resolved_provider
             .api_path
             .replace("{model}", &provider_model_id);
@@ -538,6 +554,8 @@ impl<
             cancel,
             tx,
             Some(finalization_ctx),
+            attachment_ctx.tools,
+            attachment_ctx.image_file_ids,
         ))
     }
 
@@ -696,6 +714,7 @@ impl<
                 num_images: 0,
                 tools_enabled: false,
                 web_search_enabled: false,
+                file_search_enabled: false, // TODO: set from RetrievalScope
                 max_output_tokens_cap: self.streaming_config.max_output_tokens,
             })
             .await
@@ -790,6 +809,8 @@ impl<
             cancel,
             tx,
             Some(finalization_ctx),
+            Vec::new(), // TODO: populate tools from retrieval scope
+            Vec::new(), // TODO: populate image_file_ids from attachment_ids
         ))
     }
 }
@@ -820,6 +841,8 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
     cancel: CancellationToken,
     tx: mpsc::Sender<StreamEvent>,
     fin_ctx: Option<FinalizationCtx<TR, MR>>,
+    tools: Vec<LlmTool>,
+    image_file_ids: Vec<String>,
 ) -> tokio::task::JoinHandle<StreamOutcome> {
     let span = if let Some(ref fctx) = fin_ctx {
         tracing::info_span!(
@@ -838,11 +861,32 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
         let mut first_token_time: Option<std::time::Duration> = None;
         let msg_id_str = fin_ctx.as_ref().map(|p| p.message_id.to_string());
 
-        // Build the LLM request using provider_model_id (the actual provider-facing name)
-        let request = LlmRequestBuilder::new(&provider_model_id)
-            .message(LlmMessage::user(&content))
-            .max_output_tokens(u64::from(max_output_tokens))
-            .build_streaming();
+        // Build the LLM request using provider_model_id (the actual provider-facing name).
+        // If image file_ids are present, build a multimodal user message.
+        let user_message = if image_file_ids.is_empty() {
+            LlmMessage::user(&content)
+        } else {
+            let mut parts = vec![ContentPart::Text { text: content.clone() }];
+            for file_id in &image_file_ids {
+                parts.push(ContentPart::Image {
+                    file_id: file_id.clone(),
+                });
+            }
+            LlmMessage {
+                role: crate::infra::llm::request::Role::User,
+                content: parts,
+            }
+        };
+
+        let mut builder = LlmRequestBuilder::new(&provider_model_id)
+            .message(user_message)
+            .max_output_tokens(u64::from(max_output_tokens));
+
+        for tool in tools {
+            builder = builder.tool(tool);
+        }
+
+        let request = builder.build_streaming();
 
         // Call the provider to start streaming
         let stream_result = llm
@@ -1486,6 +1530,8 @@ mod tests {
             cancel,
             tx,
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         // Collect all events from the channel
@@ -1532,6 +1578,8 @@ mod tests {
             cancel,
             tx,
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         let mut events = Vec::new();
@@ -1571,6 +1619,8 @@ mod tests {
             cancel,
             tx,
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         let mut events = Vec::new();
@@ -1659,6 +1709,8 @@ mod tests {
             cancel.clone(),
             tx,
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         // Read the first delta
@@ -1896,6 +1948,7 @@ mod tests {
                 request_id,
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -1958,6 +2011,7 @@ mod tests {
                 request_id,
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -2037,6 +2091,7 @@ mod tests {
                 request_id,
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -2116,6 +2171,7 @@ mod tests {
                 request_id,
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -2180,6 +2236,7 @@ mod tests {
                 Uuid::new_v4(),
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -2215,6 +2272,7 @@ mod tests {
                 Uuid::new_v4(),
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -2266,6 +2324,7 @@ mod tests {
                 request_id,
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel1,
                 tx1,
             )
@@ -2291,6 +2350,7 @@ mod tests {
                 request_id,
                 "hello again".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel2,
                 tx2,
             )
@@ -2374,6 +2434,7 @@ mod tests {
                 request_id,
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel.clone(),
                 tx,
             )
@@ -2439,6 +2500,7 @@ mod tests {
                 Uuid::new_v4(),
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -2569,6 +2631,8 @@ mod tests {
             cancel,
             tx,
             Some(fctx),
+            Vec::new(),
+            Vec::new(),
         );
 
         // Collect events
@@ -2752,6 +2816,7 @@ mod tests {
                 Uuid::new_v4(),
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -2844,6 +2909,7 @@ mod tests {
                 Uuid::new_v4(),
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -2913,6 +2979,7 @@ mod tests {
                     multimodal_capabilities: vec![],
                     context_window: 128_000,
                 },
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )
@@ -2975,6 +3042,7 @@ mod tests {
                 Uuid::new_v4(),
                 "hello".into(),
                 test_resolved_model(),
+                StreamAttachmentContext::default(),
                 cancel,
                 tx,
             )

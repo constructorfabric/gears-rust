@@ -75,6 +75,7 @@ pub enum SettlementMethod {
 
 /// Input to `preflight_reserve()`.
 #[domain_model]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PreflightInput {
     pub tenant_id: Uuid,
     pub user_id: Uuid,
@@ -83,6 +84,7 @@ pub struct PreflightInput {
     pub num_images: u32,
     pub tools_enabled: bool,
     pub web_search_enabled: bool,
+    pub file_search_enabled: bool,
     pub max_output_tokens_cap: u32,
 }
 

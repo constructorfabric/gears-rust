@@ -24,6 +24,18 @@ pub struct MiniChatConfig {
     #[expand_vars]
     #[serde(default = "default_providers")]
     pub providers: HashMap<String, ProviderEntry>,
+
+    /// OAGW upstream alias for AI provider APIs.
+    #[serde(default = "default_oagw_alias")]
+    pub oagw_alias: String,
+
+    /// Storage backend identifier (written to `attachments.storage_backend`).
+    #[serde(default = "default_storage_backend")]
+    pub storage_backend: String,
+
+    /// Uploads / Attachments / Images configuration (DESIGN B.8 + B.7 RAG limits).
+    #[serde(default)]
+    pub attachments: AttachmentConfig,
 }
 
 /// Configuration for a single LLM provider.
@@ -101,6 +113,89 @@ fn default_providers() -> HashMap<String, ProviderEntry> {
     m
 }
 
+/// Uploads, attachments, images, thumbnails, and RAG-limit configuration.
+///
+/// Corresponds to DESIGN appendix sections B.7 (File search / RAG) and B.8
+/// (Uploads / Attachments / Images).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentConfig {
+    // --- Thumbnail settings (B.8) ---
+    /// Target thumbnail width in pixels.
+    #[serde(default = "default_thumbnail_width")]
+    pub thumbnail_width: u32,
+
+    /// Target thumbnail height in pixels.
+    #[serde(default = "default_thumbnail_height")]
+    pub thumbnail_height: u32,
+
+    /// Max decoded thumbnail size in bytes (default: 128 KiB).
+    #[serde(default = "default_thumbnail_max_bytes")]
+    pub thumbnail_max_bytes: usize,
+
+    /// Max source image pixels before skipping generation (pre-screen heuristic).
+    #[serde(default = "default_thumbnail_max_pixels")]
+    pub thumbnail_max_pixels: u64,
+
+    /// SECURITY BOUNDARY: max bytes the image decoder may consume.
+    /// Protects against pixel-bomb attacks (default: 32 MiB).
+    #[serde(default = "default_thumbnail_max_decode_bytes")]
+    pub thumbnail_max_decode_bytes: usize,
+
+    // --- Doc summary settings ---
+    /// Enable/disable async doc summary generation on document upload (default: false).
+    /// When disabled, documents are still indexed in the vector store for `file_search`.
+    #[serde(default)]
+    pub doc_summary_enabled: bool,
+
+    /// Model to use for document summarization.
+    #[serde(default = "default_doc_summary_model")]
+    pub doc_summary_model: String,
+
+    /// System prompt for document summarization.
+    #[serde(default = "default_doc_summary_prompt")]
+    pub doc_summary_prompt: String,
+
+    /// Provider ID for document summarization (must match a key in `providers`).
+    #[serde(default = "default_doc_summary_provider_id")]
+    pub doc_summary_provider_id: String,
+
+    /// Maximum character count of document text sent to the LLM for summarization.
+    /// Documents exceeding this limit are truncated (with a trailing note).
+    #[serde(default = "default_doc_summary_max_input_chars")]
+    pub doc_summary_max_input_chars: usize,
+
+    // --- Upload limits (B.8) ---
+    /// Per-file size limit in bytes (default: 25 MiB).
+    #[serde(default = "default_max_upload_size_bytes")]
+    pub max_upload_size_bytes: usize,
+
+    // --- Daily per-user quota (DESIGN §Error Catalogue: quota_exceeded / uploads) ---
+    /// Maximum uploads per user per day across all chats (default: 200).
+    /// Set to 0 to disable the daily quota check.
+    #[serde(default = "default_max_uploads_per_user_per_day")]
+    pub max_uploads_per_user_per_day: usize,
+
+    // --- RAG Quality & Scale Controls (B.7) ---
+    /// Maximum document attachments per chat (default: 50).
+    #[serde(default = "default_max_documents_per_chat")]
+    pub max_documents_per_chat: usize,
+
+    /// Max total document MB per chat (default: 100).
+    #[serde(default = "default_max_total_upload_mb_per_chat")]
+    pub max_total_upload_mb_per_chat: usize,
+
+    // --- Worker settings ---
+    /// Bounded mpsc channel capacity for the attachment worker (default: 16).
+    ///
+    /// **Memory implication**: each queued command holds the full file `Bytes` in
+    /// memory. With `max_upload_size_bytes = 25 MiB`, worst-case memory for a full
+    /// channel is `channel_size × 25 MiB`. Keep this value small (8–16) to bound
+    /// backpressure memory.
+    #[serde(default = "default_worker_channel_size")]
+    pub worker_channel_size: usize,
+}
+
 /// SSE streaming tuning parameters.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -173,6 +268,65 @@ impl Default for MiniChatConfig {
             quota: QuotaConfig::default(),
             outbox: OutboxConfig::default(),
             providers: default_providers(),
+            oagw_alias: default_oagw_alias(),
+            storage_backend: default_storage_backend(),
+            attachments: AttachmentConfig::default(),
+        }
+    }
+}
+
+impl AttachmentConfig {
+    /// Validate attachment configuration at startup.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.thumbnail_width == 0 {
+            return Err("thumbnail_width must be > 0".to_owned());
+        }
+        if self.thumbnail_height == 0 {
+            return Err("thumbnail_height must be > 0".to_owned());
+        }
+        if self.thumbnail_max_bytes == 0 {
+            return Err("thumbnail_max_bytes must be > 0".to_owned());
+        }
+        if self.thumbnail_max_pixels == 0 {
+            return Err("thumbnail_max_pixels must be > 0".to_owned());
+        }
+        if self.thumbnail_max_decode_bytes == 0 {
+            return Err("thumbnail_max_decode_bytes must be > 0".to_owned());
+        }
+        if self.doc_summary_model.trim().is_empty() {
+            return Err("doc_summary_model must be non-empty".to_owned());
+        }
+        if self.max_upload_size_bytes == 0 {
+            return Err("max_upload_size_bytes must be > 0".to_owned());
+        }
+        if self.max_documents_per_chat == 0 {
+            return Err("max_documents_per_chat must be > 0".to_owned());
+        }
+        if self.max_total_upload_mb_per_chat == 0 {
+            return Err("max_total_upload_mb_per_chat must be > 0".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl Default for AttachmentConfig {
+    fn default() -> Self {
+        Self {
+            thumbnail_width: default_thumbnail_width(),
+            thumbnail_height: default_thumbnail_height(),
+            thumbnail_max_bytes: default_thumbnail_max_bytes(),
+            thumbnail_max_pixels: default_thumbnail_max_pixels(),
+            thumbnail_max_decode_bytes: default_thumbnail_max_decode_bytes(),
+            doc_summary_enabled: false,
+            doc_summary_model: default_doc_summary_model(),
+            doc_summary_prompt: default_doc_summary_prompt(),
+            doc_summary_provider_id: default_doc_summary_provider_id(),
+            doc_summary_max_input_chars: default_doc_summary_max_input_chars(),
+            max_upload_size_bytes: default_max_upload_size_bytes(),
+            max_uploads_per_user_per_day: default_max_uploads_per_user_per_day(),
+            max_documents_per_chat: default_max_documents_per_chat(),
+            max_total_upload_mb_per_chat: default_max_total_upload_mb_per_chat(),
+            worker_channel_size: default_worker_channel_size(),
         }
     }
 }
@@ -330,6 +484,70 @@ fn default_vendor() -> String {
     "hyperspot".to_owned()
 }
 
+fn default_oagw_alias() -> String {
+    "openai".to_owned()
+}
+
+fn default_storage_backend() -> String {
+    "azure".to_owned()
+}
+
+fn default_thumbnail_width() -> u32 {
+    128
+}
+
+fn default_thumbnail_height() -> u32 {
+    128
+}
+
+fn default_thumbnail_max_bytes() -> usize {
+    131_072 // 128 KiB
+}
+
+fn default_thumbnail_max_pixels() -> u64 {
+    100_000_000
+}
+
+fn default_thumbnail_max_decode_bytes() -> usize {
+    33_554_432 // 32 MiB
+}
+
+fn default_doc_summary_model() -> String {
+    "gpt-4o-mini".to_owned()
+}
+
+fn default_doc_summary_prompt() -> String {
+    "Summarize the following document concisely. Focus on key topics, purpose, and main conclusions.".to_owned()
+}
+
+fn default_doc_summary_provider_id() -> String {
+    "openai".to_owned()
+}
+
+fn default_doc_summary_max_input_chars() -> usize {
+    100_000
+}
+
+fn default_max_upload_size_bytes() -> usize {
+    26_214_400 // 25 MiB
+}
+
+fn default_max_uploads_per_user_per_day() -> usize {
+    200
+}
+
+fn default_max_documents_per_chat() -> usize {
+    50
+}
+
+fn default_max_total_upload_mb_per_chat() -> usize {
+    100
+}
+
+fn default_worker_channel_size() -> usize {
+    16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +558,25 @@ mod tests {
         EstimationBudgets::default().validate().unwrap();
         QuotaConfig::default().validate().unwrap();
         OutboxConfig::default().validate().unwrap();
+        AttachmentConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn default_config_matches_design_spec() {
+        let config = MiniChatConfig::default();
+        assert_eq!(config.url_prefix, "/mini-chat");
+        assert_eq!(config.oagw_alias, "openai");
+        assert_eq!(config.storage_backend, "azure");
+        let att = &config.attachments;
+        assert_eq!(att.thumbnail_width, 128);
+        assert_eq!(att.thumbnail_height, 128);
+        assert_eq!(att.thumbnail_max_bytes, 131_072);
+        assert_eq!(att.thumbnail_max_pixels, 100_000_000);
+        assert_eq!(att.thumbnail_max_decode_bytes, 33_554_432);
+        assert_eq!(att.max_upload_size_bytes, 26_214_400);
+        assert_eq!(att.max_documents_per_chat, 50);
+        assert_eq!(att.max_total_upload_mb_per_chat, 100);
+        assert_eq!(att.doc_summary_model, "gpt-4o-mini");
     }
 
     #[test]

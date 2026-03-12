@@ -483,6 +483,9 @@ http = "1.3"
 httpdate = "1"
 matchit = "0.9"
 
+# Image processing
+image = { version = "=0.25.9", default-features = false }
+
 # Document and file handling
 rust-embed = "8"
 bytes = "1.11"

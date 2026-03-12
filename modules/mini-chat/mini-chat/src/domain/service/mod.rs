@@ -5,11 +5,12 @@ use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
 use modkit_db::DBProvider;
 use modkit_macros::domain_model;
 
-use crate::config::{EstimationBudgets, QuotaConfig, StreamingConfig};
+use crate::config::{EstimationBudgets, MiniChatConfig, QuotaConfig, StreamingConfig};
 use crate::domain::repos::{
-    AttachmentRepository, ChatRepository, MessageRepository, ModelResolver, OutboxEnqueuer,
-    PolicySnapshotProvider, QuotaUsageRepository, ReactionRepository, ThreadSummaryRepository,
-    TurnRepository, UserLimitsProvider, VectorStoreRepository,
+    AttachmentOutboxEnqueuer, AttachmentRepository, ChatRepository, MessageRepository,
+    ModelResolver, OutboxEnqueuer, PolicySnapshotProvider, QuotaUsageRepository,
+    ReactionRepository, ThreadSummaryRepository, TurnRepository, UserLimitsProvider,
+    VectorStoreRepository,
 };
 use crate::domain::service::quota_settler::QuotaSettler;
 use crate::infra::llm::provider_resolver::ProviderResolver;
@@ -24,6 +25,7 @@ mod quota_service;
 pub(crate) mod quota_settler;
 mod reaction_service;
 pub(crate) mod replay;
+pub(crate) mod retrieval_scope;
 mod stream_service;
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -37,7 +39,7 @@ pub(crate) use message_service::MessageService;
 pub(crate) use model_service::ModelService;
 pub(crate) use quota_service::QuotaService;
 pub(crate) use reaction_service::ReactionService;
-pub(crate) use stream_service::{StreamError, StreamService};
+pub(crate) use stream_service::{StreamAttachmentContext, StreamError, StreamService};
 pub(crate) use turn_service::{MutationError, MutationResult, TurnService};
 
 pub(crate) type DbProvider = DBProvider<modkit_db::DbError>;
@@ -94,22 +96,24 @@ pub(crate) struct Repositories<
     QR: QuotaUsageRepository,
     RR: ReactionRepository,
     CR: ChatRepository,
+    A: AttachmentRepository + 'static,
+    V: VectorStoreRepository + 'static,
 > {
     pub(crate) chat: Arc<CR>,
-    pub(crate) attachment: Arc<dyn AttachmentRepository>,
+    pub(crate) attachment: Arc<A>,
     pub(crate) message: Arc<MR>,
     pub(crate) quota: Arc<QR>,
     pub(crate) turn: Arc<TR>,
     pub(crate) reaction: Arc<RR>,
     pub(crate) thread_summary: Arc<dyn ThreadSummaryRepository>,
-    pub(crate) vector_store: Arc<dyn VectorStoreRepository>,
+    pub(crate) vector_store: Arc<V>,
 }
 
 /// DI container — aggregates all domain services.
 ///
 /// Created once during `Module::init` and shared with handlers via `Arc`.
-/// Services acquire database connections internally via `DbProvider`;
-/// handlers call service methods with business parameters only.
+/// Services acquire database connections via `DbProvider` and pass them
+/// to stateless repositories per the canonical modkit pattern.
 #[domain_model]
 #[allow(dead_code)]
 pub(crate) struct AppServices<
@@ -118,13 +122,15 @@ pub(crate) struct AppServices<
     QR: QuotaUsageRepository + 'static,
     RR: ReactionRepository + 'static,
     CR: ChatRepository + 'static,
+    A: AttachmentRepository + 'static,
+    V: VectorStoreRepository + 'static,
 > {
     pub(crate) chats: ChatService<CR>,
     pub(crate) messages: MessageService<MR, CR>,
     pub(crate) stream: StreamService<TR, MR, QR, CR>,
     pub(crate) turns: TurnService<TR, MR, CR>,
     pub(crate) reactions: ReactionService<RR, MR, CR>,
-    pub(crate) attachments: AttachmentService<CR>,
+    pub(crate) attachments: AttachmentService<A, V>,
     pub(crate) models: ModelService,
     pub(crate) quota: Arc<QuotaService<QR>>,
     pub(crate) finalization: Arc<FinalizationService<TR, MR>>,
@@ -140,11 +146,13 @@ impl<
     QR: QuotaUsageRepository + 'static,
     RR: ReactionRepository + 'static,
     CR: ChatRepository + 'static,
-> AppServices<TR, MR, QR, RR, CR>
+    A: AttachmentRepository + 'static,
+    V: VectorStoreRepository + 'static,
+> AppServices<TR, MR, QR, RR, CR, A, V>
 {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        repos: &Repositories<TR, MR, QR, RR, CR>,
+        repos: &Repositories<TR, MR, QR, RR, CR, A, V>,
         db: Arc<DbProvider>,
         authz: Arc<dyn AuthZResolverClient>,
         model_resolver: &Arc<dyn ModelResolver>,
@@ -155,6 +163,8 @@ impl<
         estimation_budgets: EstimationBudgets,
         quota_config: QuotaConfig,
         outbox_enqueuer: Arc<dyn OutboxEnqueuer>,
+        attachment_outbox: Arc<dyn AttachmentOutboxEnqueuer>,
+        config: Arc<MiniChatConfig>,
     ) -> Self {
         let enforcer = PolicyEnforcer::new(authz);
 
@@ -221,9 +231,10 @@ impl<
             attachments: AttachmentService::new(
                 Arc::clone(&db),
                 Arc::clone(&repos.attachment),
-                Arc::clone(&repos.chat),
                 Arc::clone(&repos.vector_store),
                 enforcer.clone(),
+                config,
+                attachment_outbox,
             ),
             models: ModelService::new(
                 Arc::clone(&db),

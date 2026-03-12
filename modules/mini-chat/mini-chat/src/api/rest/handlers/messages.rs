@@ -19,7 +19,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use crate::api::rest::dto::{MessageDto, StreamMessageRequest};
 use crate::api::rest::sse::{StreamEventKind, StreamPhase};
-use crate::domain::service::{StreamError, replay};
+use crate::domain::service::{StreamAttachmentContext, StreamError, replay};
 use crate::domain::stream_events::StreamEvent;
 use crate::infra::db::entity::chat_turn::Model as TurnModel;
 use crate::module::AppServices;
@@ -93,6 +93,22 @@ pub(crate) async fn stream_message(
         }
     };
 
+    // ── Validate attachments & build retrieval scope ────────────────────
+    let attachment_ctx = match build_attachment_context(
+        &svc,
+        &ctx,
+        chat_id,
+        &body.attachment_ids,
+        &body.rag_attachment_ids,
+    )
+    .await
+    {
+        Ok(ac) => ac,
+        Err(e) => {
+            return Problem::from(e).into_response();
+        }
+    };
+
     // ── Wire up streaming pipeline ─────────────────────────────────────
     let capacity = svc.stream.channel_capacity();
     let ping_secs = svc.stream.ping_interval_secs();
@@ -110,6 +126,7 @@ pub(crate) async fn stream_message(
             request_id,
             body.content,
             resolved,
+            attachment_ctx,
             cancel.clone(),
             tx,
         )
@@ -139,6 +156,115 @@ pub(crate) async fn stream_message(
     Sse::new(relay)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
         .into_response()
+}
+
+/// Build the attachment context for the streaming pipeline.
+///
+/// Validates `attachment_ids` + `rag_attachment_ids`, resolves the retrieval scope,
+/// and builds the tools/image inputs for the provider request.
+async fn build_attachment_context(
+    svc: &AppServices,
+    ctx: &SecurityContext,
+    chat_id: uuid::Uuid,
+    attachment_ids: &[uuid::Uuid],
+    rag_attachment_ids: &[uuid::Uuid],
+) -> Result<StreamAttachmentContext, crate::domain::error::DomainError> {
+    use crate::domain::service::retrieval_scope::{self, AttachmentKind, RetrievalScope};
+    use StreamAttachmentContext;
+    use mini_chat_sdk::models::AttachmentKind as SdkAttachmentKind;
+
+    // If no attachments at all, return default (no tools, no images)
+    if attachment_ids.is_empty() && rag_attachment_ids.is_empty() {
+        // Still check if chat has documents for implicit AllChat scope
+        let validated = svc
+            .attachments
+            .validate_send_message_attachments(ctx, chat_id, &[], &[])
+            .await?;
+
+        if !validated.chat_has_ready_documents {
+            return Ok(StreamAttachmentContext::default());
+        }
+
+        // Chat has documents but no explicit scope — get vector store for AllChat
+        let vs = svc
+            .attachments
+            .get_chat_vector_store_id(ctx, chat_id)
+            .await?;
+        return Ok(match vs {
+            Some(vs_id) => StreamAttachmentContext {
+                tools: vec![crate::infra::llm::LlmTool::FileSearch {
+                    vector_store_ids: vec![vs_id],
+                }],
+                file_search_enabled: true,
+                ..Default::default()
+            },
+            None => StreamAttachmentContext::default(),
+        });
+    }
+
+    let validated = svc
+        .attachments
+        .validate_send_message_attachments(ctx, chat_id, attachment_ids, rag_attachment_ids)
+        .await?;
+
+    // Build attachment kind map for retrieval scope resolution
+    let kind_map: std::collections::HashMap<uuid::Uuid, AttachmentKind> = validated
+        .message_attachments
+        .iter()
+        .map(|a| {
+            let kind = match a.attachment.kind {
+                SdkAttachmentKind::Image => AttachmentKind::Image,
+                SdkAttachmentKind::Document => AttachmentKind::Document,
+            };
+            (a.attachment.id, kind)
+        })
+        .collect();
+
+    let scope = retrieval_scope::resolve_retrieval_scope(
+        rag_attachment_ids,
+        attachment_ids,
+        &kind_map,
+        validated.chat_has_ready_documents,
+    );
+
+    // Resolve image file IDs from attachment_ids
+    let image_file_ids: Vec<String> = validated
+        .message_attachments
+        .iter()
+        .filter(|a| a.attachment.kind == SdkAttachmentKind::Image)
+        .map(|a| a.provider_file_id.clone())
+        .collect();
+    let num_images = u32::try_from(image_file_ids.len()).unwrap_or(u32::MAX);
+
+    // Build tools based on retrieval scope
+    let (tools, file_search_enabled) = match &scope {
+        RetrievalScope::None => (vec![], false),
+        RetrievalScope::AllChat | RetrievalScope::Scoped(_) => {
+            match svc
+                .attachments
+                .get_chat_vector_store_id(ctx, chat_id)
+                .await?
+            {
+                Some(vs_id) => {
+                    // TODO: add metadata filtering for Scoped(ids) when provider supports it
+                    (
+                        vec![crate::infra::llm::LlmTool::FileSearch {
+                            vector_store_ids: vec![vs_id],
+                        }],
+                        true,
+                    )
+                }
+                None => (vec![], false),
+            }
+        }
+    };
+
+    Ok(StreamAttachmentContext {
+        tools,
+        image_file_ids,
+        file_search_enabled,
+        num_images,
+    })
 }
 
 /// Map a [`StreamError`] to an appropriate HTTP error response.

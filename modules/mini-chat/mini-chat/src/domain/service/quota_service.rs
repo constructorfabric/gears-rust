@@ -284,6 +284,7 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                 num_images: input.num_images,
                 tools_enabled: input.tools_enabled,
                 web_search_enabled: input.web_search_enabled,
+                file_search_enabled: input.file_search_enabled,
             },
             &self.estimation_budgets,
         );
@@ -1520,6 +1521,7 @@ mod tests {
             num_images: 0,
             tools_enabled: false,
             web_search_enabled: false,
+            file_search_enabled: false,
             max_output_tokens_cap: 4096,
         }
     }

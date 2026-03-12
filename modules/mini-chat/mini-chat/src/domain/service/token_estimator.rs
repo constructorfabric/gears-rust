@@ -8,11 +8,14 @@ use crate::config::EstimationBudgets;
 /// Input to the token estimation function.
 #[domain_model]
 #[allow(dead_code)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct EstimationInput {
     pub utf8_bytes: u64,
     pub num_images: u32,
     pub tools_enabled: bool,
     pub web_search_enabled: bool,
+    /// When true, adds `file_search` surcharge (`tool_surcharge_tokens` * `max_calls_per_message`).
+    pub file_search_enabled: bool,
 }
 
 /// Result of token estimation.
@@ -56,12 +59,19 @@ pub fn estimate_tokens(input: &EstimationInput, budgets: &EstimationBudgets) -> 
     } else {
         0
     };
+    // File search surcharge: tool_surcharge_tokens applied per max_calls_per_message (default 2).
+    let file_search_surcharge = if input.file_search_enabled {
+        u64::from(budgets.tool_surcharge_tokens).saturating_mul(2)
+    } else {
+        0
+    };
 
     // Step 4: totals
     let estimated_input_tokens = estimated_text_tokens
         .saturating_add(image_surcharge)
         .saturating_add(tool_surcharge)
-        .saturating_add(web_search_surcharge);
+        .saturating_add(web_search_surcharge)
+        .saturating_add(file_search_surcharge);
 
     EstimationResult {
         estimated_input_tokens,
@@ -91,6 +101,7 @@ mod tests {
             num_images: 0,
             tools_enabled: false,
             web_search_enabled: false,
+            file_search_enabled: false,
         };
         let result = estimate_tokens(&input, &default_budgets());
 
@@ -106,6 +117,7 @@ mod tests {
             num_images: 3,
             tools_enabled: false,
             web_search_enabled: false,
+            file_search_enabled: false,
         };
         let result = estimate_tokens(&input, &default_budgets());
 
@@ -121,6 +133,7 @@ mod tests {
             num_images: 0,
             tools_enabled: true,
             web_search_enabled: true,
+            file_search_enabled: false,
         };
         let result = estimate_tokens(&input, &default_budgets());
 
@@ -135,6 +148,7 @@ mod tests {
             num_images: 2,
             tools_enabled: true,
             web_search_enabled: true,
+            file_search_enabled: false,
         };
         let result = estimate_tokens(&input, &default_budgets());
 
@@ -150,6 +164,7 @@ mod tests {
             num_images: 0,
             tools_enabled: false,
             web_search_enabled: false,
+            file_search_enabled: false,
         };
         let result = estimate_tokens(&input, &default_budgets());
 
@@ -169,6 +184,7 @@ mod tests {
             num_images: 0,
             tools_enabled: false,
             web_search_enabled: false,
+            file_search_enabled: false,
         };
         let result = estimate_tokens(&input, &budgets);
 
@@ -176,5 +192,50 @@ mod tests {
         // margin: ceil(200 * 110 / 100) = ceil(22000/100) = 220
         assert!(result.estimated_input_tokens > 200);
         assert_eq!(result.estimated_input_tokens, 220);
+    }
+
+    #[test]
+    fn file_search_surcharge_applied() {
+        let input = EstimationInput {
+            utf8_bytes: 0,
+            num_images: 0,
+            tools_enabled: false,
+            web_search_enabled: false,
+            file_search_enabled: true,
+        };
+        let result = estimate_tokens(&input, &default_budgets());
+
+        // base = 100, margin = 110, file_search = 500 * 2 = 1000
+        assert_eq!(result.estimated_input_tokens, 110 + 1000);
+    }
+
+    #[test]
+    fn file_search_with_images_and_tools() {
+        let input = EstimationInput {
+            utf8_bytes: 4000,
+            num_images: 2,
+            tools_enabled: true,
+            web_search_enabled: false,
+            file_search_enabled: true,
+        };
+        let result = estimate_tokens(&input, &default_budgets());
+
+        // text: 1210, images: 2000, tool: 500, file_search: 1000
+        assert_eq!(result.estimated_input_tokens, 1210 + 2000 + 500 + 1000);
+    }
+
+    #[test]
+    fn file_search_disabled_no_surcharge() {
+        let input = EstimationInput {
+            utf8_bytes: 0,
+            num_images: 0,
+            tools_enabled: false,
+            web_search_enabled: false,
+            file_search_enabled: false,
+        };
+        let result = estimate_tokens(&input, &default_budgets());
+
+        // Only base + margin = 110
+        assert_eq!(result.estimated_input_tokens, 110);
     }
 }

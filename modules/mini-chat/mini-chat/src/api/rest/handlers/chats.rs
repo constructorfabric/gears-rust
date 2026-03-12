@@ -76,5 +76,16 @@ pub(crate) async fn delete_chat(
     Path(id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
     svc.chats.delete_chat(&ctx, id).await?;
+
+    // Mark attachments for cleanup (best-effort — chat is already soft-deleted).
+    // The cleanup worker will handle provider file/vector store deletion asynchronously.
+    if let Err(e) = svc
+        .attachments
+        .mark_chat_attachments_for_cleanup(&ctx, id)
+        .await
+    {
+        tracing::warn!(chat_id = %id, error = %e, "failed to mark attachments for cleanup");
+    }
+
     Ok(no_content().into_response())
 }

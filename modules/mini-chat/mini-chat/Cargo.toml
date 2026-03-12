@@ -53,7 +53,7 @@ serde_json = { workspace = true }
 utoipa = { workspace = true, features = ["time"] }
 
 # HTTP and REST
-axum = { workspace = true, features = ["macros"] }
+axum = { workspace = true, features = ["macros", "multipart"] }
 http = { workspace = true }
 
 # Time handling
@@ -65,6 +65,9 @@ uuid = { workspace = true }
 # Database - SeaORM (driver features come from modkit-db)
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
+
+# Image processing for thumbnails
+image = { workspace = true, default-features = false, features = ["jpeg", "png", "webp"] }
 
 # Error handling
 thiserror = { workspace = true }
@@ -79,4 +82,4 @@ modkit-odata = { workspace = true, features = ["with-utoipa"] }
 
 [dev-dependencies]
 chrono = { workspace = true }
-
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -1,5 +1,9 @@
 pub mod db;
+pub mod image;
 pub mod llm;
 pub(crate) mod model_policy;
+pub mod oagw;
 pub(crate) mod oagw_provisioning;
 pub(crate) mod outbox;
+pub(crate) mod outbox_attachment;
+pub(crate) mod workers;

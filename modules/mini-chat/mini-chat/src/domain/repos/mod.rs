@@ -1,4 +1,5 @@
-mod attachment_repo;
+pub(crate) mod attachment_outbox;
+pub(crate) mod attachment_repo;
 mod chat_repo;
 mod message_repo;
 pub(crate) mod model_resolver;
@@ -9,8 +10,9 @@ mod reaction_repo;
 mod thread_summary_repo;
 mod turn_repo;
 mod user_limits_provider;
-mod vector_store_repo;
+pub(crate) mod vector_store_repo;
 
+pub(crate) use attachment_outbox::{AttachmentOutboxEnqueuer, AttachmentProcessingEvent};
 pub(crate) use attachment_repo::AttachmentRepository;
 pub(crate) use chat_repo::ChatRepository;
 pub(crate) use message_repo::{

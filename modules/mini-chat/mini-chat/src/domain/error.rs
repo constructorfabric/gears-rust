@@ -15,6 +15,39 @@ pub enum DomainError {
     #[error("Invalid model: {model}")]
     InvalidModel { model: String },
 
+    #[error("Attachment not found: {id}")]
+    AttachmentNotFound { id: Uuid },
+
+    #[error("Attachment not ready: {id}")]
+    AttachmentNotReady { id: Uuid },
+
+    #[error("Invalid attachment: {message}")]
+    InvalidAttachment { message: String },
+
+    #[error("File too large: max {max_bytes} bytes")]
+    FileTooLarge { max_bytes: usize },
+
+    #[error("Unsupported file type: {content_type}")]
+    UnsupportedFileType { content_type: String },
+
+    #[error("Document limit exceeded: max {max} documents per chat")]
+    DocumentLimitExceeded { max: usize },
+
+    #[error("Upload size limit exceeded: max {max_mb} MB per chat")]
+    UploadSizeLimitExceeded { max_mb: usize },
+
+    #[error("Upload quota exceeded")]
+    UploadQuotaExceeded,
+
+    #[error("Images cannot be used in rag_attachment_ids: {id}")]
+    ImageInRagScope { id: Uuid },
+
+    #[error("Attachment ID appears in both attachment_ids and rag_attachment_ids: {id}")]
+    AttachmentIdOverlap { id: Uuid },
+
+    #[error("Duplicate attachment ID: {id}")]
+    DuplicateAttachmentId { id: Uuid },
+
     #[error("Validation failed: {message}")]
     Validation { message: String },
 
@@ -27,8 +60,8 @@ pub enum DomainError {
     #[error("{entity} not found: {id}")]
     NotFound { entity: String, id: Uuid },
 
-    #[error("Access denied")]
-    Forbidden,
+    #[error("Already exists: {message}")]
+    AlreadyExists { message: String },
 
     #[error("Message not found: {id}")]
     MessageNotFound { id: Uuid },
@@ -39,8 +72,11 @@ pub enum DomainError {
     #[error("Model not found: {model_id}")]
     ModelNotFound { model_id: String },
 
+    #[error("Access forbidden: {message}")]
+    Forbidden { message: String },
+
     #[error("Internal error: {message}")]
-    InternalError { message: String },
+    Internal { message: String },
 }
 
 impl DomainError {
@@ -82,8 +118,14 @@ impl DomainError {
         }
     }
 
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::Forbidden {
+            message: message.into(),
+        }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
-        Self::InternalError {
+        Self::Internal {
             message: message.into(),
         }
     }
@@ -137,11 +179,15 @@ impl From<ScopeError> for DomainError {
             ScopeError::Db(ref db_err) => map_db_err(db_err),
             ScopeError::Denied(msg) => {
                 tracing::warn!("scope denied: {msg}");
-                DomainError::Forbidden
+                DomainError::Forbidden {
+                    message: "access denied".to_owned(),
+                }
             }
             ScopeError::TenantNotInScope { tenant_id } => {
                 tracing::warn!("tenant {tenant_id} not in scope");
-                DomainError::Forbidden
+                DomainError::Forbidden {
+                    message: "access denied".to_owned(),
+                }
             }
             ScopeError::Invalid(msg) => {
                 tracing::error!("invalid scope: {msg}");
@@ -155,14 +201,10 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     #[allow(clippy::cognitive_complexity)]
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
         match e {
-            authz_resolver_sdk::EnforcerError::Denied { ref deny_reason } => {
-                tracing::warn!(deny_reason = ?deny_reason, "AuthZ denied access");
-                Self::Forbidden
-            }
-            authz_resolver_sdk::EnforcerError::CompileFailed(ref err) => {
-                tracing::warn!(error = %err, "AuthZ constraint compile failed - access denied");
-                Self::Forbidden
-            }
+            authz_resolver_sdk::EnforcerError::Denied { .. }
+            | authz_resolver_sdk::EnforcerError::CompileFailed(_) => Self::Forbidden {
+                message: e.to_string(),
+            },
             authz_resolver_sdk::EnforcerError::EvaluationFailed(ref err) => {
                 tracing::error!(error = %err, "AuthZ evaluation failed (internal error)");
                 Self::internal(err.to_string())
@@ -172,10 +214,10 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
 }
 
 fn map_db_err(db_err: &sea_orm::DbErr) -> DomainError {
-    if let Some(sea_orm::SqlErr::UniqueConstraintViolation(msg)) = db_err.sql_err() {
+    if let Some(sea_orm::SqlErr::UniqueConstraintViolation(constraint_msg)) = db_err.sql_err() {
         return DomainError::Conflict {
             code: "unique_violation".into(),
-            message: msg,
+            message: constraint_msg,
         };
     }
     DomainError::database(db_err.to_string())

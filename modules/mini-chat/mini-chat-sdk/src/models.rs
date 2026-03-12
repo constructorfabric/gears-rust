@@ -2,6 +2,133 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+// ── Attachment ──
+
+/// Attachment status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentStatus {
+    Pending,
+    Ready,
+    Failed,
+}
+
+impl AttachmentStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "ready" => Some(Self::Ready),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Attachment kind derived from content type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Document,
+    Image,
+}
+
+impl AttachmentKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Document => "document",
+            Self::Image => "image",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "document" => Some(Self::Document),
+            "image" => Some(Self::Image),
+            _ => None,
+        }
+    }
+
+    /// Derive kind from MIME content type.
+    ///
+    /// Normalises the input by trimming whitespace, lowercasing, and stripping
+    /// any MIME parameters (everything after `;`) before matching.
+    #[must_use]
+    pub fn from_content_type(content_type: &str) -> Self {
+        let normalized = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match normalized.as_str() {
+            "image/png" | "image/jpeg" | "image/webp" => Self::Image,
+            _ => Self::Document,
+        }
+    }
+}
+
+/// Thumbnail data stored in DB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbnailData {
+    pub data: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// A file attachment (public-facing — never includes `provider_file_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub id: Uuid,
+    pub chat_id: Uuid,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub storage_backend: String,
+    pub status: AttachmentStatus,
+    pub kind: AttachmentKind,
+    pub doc_summary: Option<String>,
+    pub img_thumbnail: Option<ThumbnailData>,
+    pub error_code: Option<String>,
+    pub summary_updated_at: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
+    pub deleted_at: Option<OffsetDateTime>,
+}
+
+/// Data for creating a new attachment.
+#[derive(Debug, Clone)]
+pub struct NewAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub kind: AttachmentKind,
+}
+
+/// A chat vector store mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatVectorStore {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub chat_id: Uuid,
+    pub vector_store_id: Option<String>,
+    pub provider: String,
+    pub file_count: i32,
+    pub created_at: OffsetDateTime,
+}
+
+// ── Policy ──
+
 /// Current policy version metadata for a user.
 #[derive(Debug, Clone)]
 pub struct PolicyVersionInfo {
@@ -284,9 +411,88 @@ pub struct UsageEvent {
 mod tests {
     use super::*;
 
+    // ── Attachment tests ──
+
+    #[test]
+    fn status_round_trip_all_variants() {
+        for status in [
+            AttachmentStatus::Pending,
+            AttachmentStatus::Ready,
+            AttachmentStatus::Failed,
+        ] {
+            let s = status.as_str();
+            let parsed = AttachmentStatus::parse(s);
+            assert_eq!(parsed, Some(status), "round-trip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn status_from_str_unknown_returns_none() {
+        assert_eq!(AttachmentStatus::parse("unknown"), None);
+        assert_eq!(AttachmentStatus::parse(""), None);
+        assert_eq!(AttachmentStatus::parse("READY"), None);
+    }
+
+    #[test]
+    fn kind_round_trip_all_variants() {
+        for kind in [AttachmentKind::Document, AttachmentKind::Image] {
+            let s = kind.as_str();
+            let parsed = AttachmentKind::parse(s);
+            assert_eq!(parsed, Some(kind), "round-trip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn kind_from_str_unknown_returns_none() {
+        assert_eq!(AttachmentKind::parse("video"), None);
+        assert_eq!(AttachmentKind::parse(""), None);
+    }
+
+    #[test]
+    fn from_content_type_documents() {
+        let doc_types = [
+            "application/pdf",
+            "text/plain",
+            "text/markdown",
+            "text/csv",
+            "application/json",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ];
+        for ct in doc_types {
+            assert_eq!(
+                AttachmentKind::from_content_type(ct),
+                AttachmentKind::Document,
+                "{ct} should be Document"
+            );
+        }
+    }
+
+    #[test]
+    fn from_content_type_images() {
+        for ct in ["image/png", "image/jpeg", "image/webp"] {
+            assert_eq!(
+                AttachmentKind::from_content_type(ct),
+                AttachmentKind::Image,
+                "{ct} should be Image"
+            );
+        }
+    }
+
+    #[test]
+    fn from_content_type_unknown_defaults_to_document() {
+        assert_eq!(
+            AttachmentKind::from_content_type("application/octet-stream"),
+            AttachmentKind::Document
+        );
+        assert_eq!(
+            AttachmentKind::from_content_type("video/mp4"),
+            AttachmentKind::Document
+        );
+    }
+
     // ── KillSwitches::default safety invariant ──
-    // All kill switches must default to false; a new field defaulting to true
-    // would accidentally disable functionality across all tenants.
 
     #[test]
     fn kill_switches_default_all_disabled() {
@@ -299,9 +505,6 @@ mod tests {
     }
 
     // ── EstimationBudgets::default spec values ──
-    // These defaults are specified in DESIGN.md §B.5.2 and used as the
-    // ConfigMap fallback. Changing them silently would alter token estimation
-    // for every deployment that relies on defaults.
 
     #[test]
     fn estimation_budgets_default_matches_spec() {
@@ -316,8 +519,6 @@ mod tests {
     }
 
     // ── ModelGeneralConfig: serde(rename = "type") contract ──
-    // The upstream API sends `"type"` not `"config_type"`. If the rename
-    // attribute is removed, deserialization from the real API breaks.
 
     fn sample_general_config() -> ModelGeneralConfig {
         ModelGeneralConfig {
@@ -407,8 +608,6 @@ mod tests {
     }
 
     // ── ModelTier serde representation ──
-    // Serializes as PascalCase ("Standard"/"Premium") for the UI/API.
-    // Accepts lowercase aliases for CCM/DESIGN compatibility.
 
     #[test]
     fn model_tier_serializes_as_pascal_case() {
@@ -435,8 +634,6 @@ mod tests {
     }
 
     // ── KillSwitches serde roundtrip ──
-    // Verifies that enabled switches survive serialization and that
-    // the default (all-off) state roundtrips correctly.
 
     #[test]
     fn kill_switches_serde_roundtrip_with_enabled_switches() {

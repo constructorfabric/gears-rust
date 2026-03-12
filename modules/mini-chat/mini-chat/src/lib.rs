@@ -1,5 +1,10 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+// === PUBLIC API (from SDK) ===
+pub use mini_chat_sdk::{
+    Attachment, AttachmentKind, AttachmentStatus, ChatVectorStore, NewAttachment, ThumbnailData,
+};
+
 // === MODULE DEFINITION ===
 pub mod module;
 pub use module::MiniChatModule;

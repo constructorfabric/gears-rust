@@ -198,7 +198,7 @@ async fn list_models_denied_returns_forbidden() {
         .expect_err("should fail when enforcer denies");
 
     assert!(
-        matches!(err, DomainError::Forbidden),
+        matches!(err, DomainError::Forbidden { .. }),
         "expected Forbidden, got: {err:?}"
     );
 }
@@ -214,7 +214,7 @@ async fn get_model_denied_returns_forbidden() {
         .expect_err("should fail when enforcer denies");
 
     assert!(
-        matches!(err, DomainError::Forbidden),
+        matches!(err, DomainError::Forbidden { .. }),
         "expected Forbidden, got: {err:?}"
     );
 }

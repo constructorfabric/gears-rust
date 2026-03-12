@@ -13,7 +13,9 @@ pub use audit_models::{
 pub use error::{MiniChatAuditPluginError, MiniChatModelPolicyPluginError, PublishError};
 pub use gts::{MiniChatAuditPluginSpecV1, MiniChatModelPolicyPluginSpecV1};
 pub use models::{
-    EstimationBudgets, KillSwitches, ModelCatalogEntry, ModelGeneralConfig, ModelPreference,
-    ModelTier, PolicySnapshot, PolicyVersionInfo, TierLimits, UsageEvent, UsageTokens, UserLimits,
+    Attachment, AttachmentStatus, ChatVectorStore, EstimationBudgets, KillSwitches,
+    ModelCatalogEntry, ModelGeneralConfig, ModelPreference, ModelTier, NewAttachment,
+    PolicySnapshot, PolicyVersionInfo, ThumbnailData, TierLimits, UsageEvent, UsageTokens,
+    UserLimits,
 };
 pub use plugin_api::{MiniChatAuditPluginClientV1, MiniChatModelPolicyPluginClientV1};

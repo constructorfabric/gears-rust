@@ -7,6 +7,8 @@
 //! and ordering enforcement live in `api::rest::sse`.
 
 use crate::domain::models::{AttachmentSummary, ChatDetail, ImgThumbnail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use mini_chat_sdk::models::{Attachment, AttachmentKind, AttachmentStatus};
 use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -232,9 +234,12 @@ pub struct StreamMessageRequest {
     /// Client-generated idempotency key (UUID v4). Optional in P1.
     #[serde(default)]
     pub request_id: Option<uuid::Uuid>,
-    /// Attachment IDs to include.
+    /// Attachment IDs to include (displayed in UI, images go to multimodal input).
     #[serde(default)]
     pub attachment_ids: Vec<uuid::Uuid>,
+    /// Document IDs for retrieval scope only (not displayed in UI, documents only).
+    #[serde(default)]
+    pub rag_attachment_ids: Vec<uuid::Uuid>,
     /// Web search configuration.
     #[serde(default)]
     pub web_search: Option<WebSearchConfig>,
@@ -246,4 +251,290 @@ impl modkit::api::api_dto::RequestApiDto for StreamMessageRequest {}
 #[derive(Debug, Clone, serde::Deserialize, ToSchema)]
 pub struct WebSearchConfig {
     pub enabled: bool,
+}
+
+// ── Attachment DTOs ──
+
+/// Structured thumbnail response.
+#[derive(Debug, Clone)]
+#[modkit_macros::api_dto(response)]
+pub struct ThumbnailDto {
+    pub content_type: String,
+    pub width: i32,
+    pub height: i32,
+    pub data_base64: String,
+}
+
+/// Full attachment metadata response.
+#[derive(Debug, Clone)]
+#[modkit_macros::api_dto(response)]
+pub struct AttachmentResponseDto {
+    #[serde(rename = "attachment_id")]
+    pub id: Uuid,
+    pub status: String,
+    pub kind: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub img_thumbnail: Option<ThumbnailDto>,
+    /// Present only when status == "failed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub summary_updated_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+impl From<Attachment> for AttachmentResponseDto {
+    fn from(a: Attachment) -> Self {
+        let error_code = if a.status == AttachmentStatus::Failed {
+            a.error_code
+        } else {
+            None
+        };
+
+        // DESIGN: img_thumbnail present only when status=ready AND kind=image.
+        let img_thumbnail =
+            if a.status == AttachmentStatus::Ready && a.kind == AttachmentKind::Image {
+                a.img_thumbnail.map(|t| ThumbnailDto {
+                    content_type: "image/webp".to_owned(),
+                    width: t.width,
+                    height: t.height,
+                    data_base64: BASE64.encode(&t.data),
+                })
+            } else {
+                None
+            };
+
+        Self {
+            id: a.id,
+            status: a.status.as_str().to_owned(),
+            kind: a.kind.as_str().to_owned(),
+            filename: a.filename,
+            content_type: a.content_type,
+            size_bytes: a.size_bytes,
+            doc_summary: a.doc_summary,
+            img_thumbnail,
+            error_code,
+            summary_updated_at: a.summary_updated_at,
+            created_at: a.created_at,
+        }
+    }
+}
+
+/// Minimal upload response (201 Created).
+#[derive(Debug, Clone)]
+#[modkit_macros::api_dto(response)]
+pub struct UploadAttachmentResponseDto {
+    #[serde(rename = "attachment_id")]
+    pub id: Uuid,
+    pub status: String,
+}
+
+impl UploadAttachmentResponseDto {
+    #[must_use]
+    pub fn pending(id: Uuid) -> Self {
+        Self {
+            id,
+            status: AttachmentStatus::Pending.as_str().to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mini_chat_sdk::models::{Attachment, AttachmentKind, AttachmentStatus, ThumbnailData};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::{AttachmentResponseDto, StreamMessageRequest, UploadAttachmentResponseDto};
+
+    fn make_attachment(status: AttachmentStatus, kind: AttachmentKind) -> Attachment {
+        Attachment {
+            id: Uuid::nil(),
+            chat_id: Uuid::nil(),
+            filename: "test.pdf".to_owned(),
+            content_type: "application/pdf".to_owned(),
+            size_bytes: 1024,
+            storage_backend: "azure".to_owned(),
+            status,
+            kind,
+            doc_summary: None,
+            img_thumbnail: None,
+            error_code: None,
+            summary_updated_at: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn ready_attachment_omits_error_code_in_json() {
+        let attachment = make_attachment(AttachmentStatus::Ready, AttachmentKind::Document);
+        let dto = AttachmentResponseDto::from(attachment);
+        assert!(dto.error_code.is_none());
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            !json.contains("error_code"),
+            "error_code should be absent from JSON"
+        );
+    }
+
+    #[test]
+    fn failed_attachment_includes_error_code() {
+        let mut attachment = make_attachment(AttachmentStatus::Failed, AttachmentKind::Document);
+        attachment.error_code = Some("provider_upload_failed".to_owned());
+        let dto = AttachmentResponseDto::from(attachment);
+        assert_eq!(dto.error_code.as_deref(), Some("provider_upload_failed"));
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains("provider_upload_failed"));
+    }
+
+    #[test]
+    fn pending_attachment_omits_error_code_even_if_set() {
+        let mut attachment = make_attachment(AttachmentStatus::Pending, AttachmentKind::Document);
+        attachment.error_code = Some("should_not_appear".to_owned());
+        let dto = AttachmentResponseDto::from(attachment);
+        assert!(dto.error_code.is_none());
+    }
+
+    #[test]
+    fn thumbnail_encoded_as_base64_webp_object() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let raw_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mut attachment = make_attachment(AttachmentStatus::Ready, AttachmentKind::Image);
+        attachment.img_thumbnail = Some(ThumbnailData {
+            data: raw_bytes.clone(),
+            width: 64,
+            height: 48,
+        });
+        let dto = AttachmentResponseDto::from(attachment);
+        let thumb = dto.img_thumbnail.unwrap();
+        assert_eq!(thumb.content_type, "image/webp");
+        assert_eq!(thumb.width, 64);
+        assert_eq!(thumb.height, 48);
+        let decoded = STANDARD.decode(&thumb.data_base64).unwrap();
+        assert_eq!(decoded, raw_bytes);
+    }
+
+    #[test]
+    fn no_thumbnail_omits_field_in_json() {
+        let attachment = make_attachment(AttachmentStatus::Ready, AttachmentKind::Document);
+        let dto = AttachmentResponseDto::from(attachment);
+        assert!(dto.img_thumbnail.is_none());
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            !json.contains("img_thumbnail"),
+            "thumbnail should be absent"
+        );
+    }
+
+    #[test]
+    fn provider_file_id_not_in_dto_fields() {
+        let attachment = make_attachment(AttachmentStatus::Ready, AttachmentKind::Document);
+        let json = serde_json::to_string(&AttachmentResponseDto::from(attachment)).unwrap();
+        assert!(
+            !json.contains("provider_file_id"),
+            "provider_file_id must never appear in API response"
+        );
+    }
+
+    #[test]
+    fn upload_response_pending_factory() {
+        let id = Uuid::new_v4();
+        let dto = UploadAttachmentResponseDto::pending(id);
+        assert_eq!(dto.id, id);
+        assert_eq!(dto.status, "pending");
+    }
+
+    #[test]
+    fn thumbnail_suppressed_for_pending_image() {
+        let mut attachment = make_attachment(AttachmentStatus::Pending, AttachmentKind::Image);
+        attachment.img_thumbnail = Some(ThumbnailData {
+            data: vec![0xFF],
+            width: 10,
+            height: 10,
+        });
+        let dto = AttachmentResponseDto::from(attachment);
+        assert!(
+            dto.img_thumbnail.is_none(),
+            "thumbnail must be suppressed when status != ready"
+        );
+    }
+
+    #[test]
+    fn thumbnail_suppressed_for_failed_image() {
+        let mut attachment = make_attachment(AttachmentStatus::Failed, AttachmentKind::Image);
+        attachment.error_code = Some("processing_failed".to_owned());
+        attachment.img_thumbnail = Some(ThumbnailData {
+            data: vec![0xFF],
+            width: 10,
+            height: 10,
+        });
+        let dto = AttachmentResponseDto::from(attachment);
+        assert!(
+            dto.img_thumbnail.is_none(),
+            "thumbnail must be suppressed when status == failed"
+        );
+    }
+
+    #[test]
+    fn thumbnail_suppressed_for_ready_document() {
+        let mut attachment = make_attachment(AttachmentStatus::Ready, AttachmentKind::Document);
+        attachment.img_thumbnail = Some(ThumbnailData {
+            data: vec![0xFF],
+            width: 10,
+            height: 10,
+        });
+        let dto = AttachmentResponseDto::from(attachment);
+        assert!(
+            dto.img_thumbnail.is_none(),
+            "thumbnail must be suppressed when kind != image"
+        );
+    }
+
+    #[test]
+    fn doc_summary_absent_when_none() {
+        let attachment = make_attachment(AttachmentStatus::Ready, AttachmentKind::Document);
+        let json = serde_json::to_string(&AttachmentResponseDto::from(attachment)).unwrap();
+        assert!(!json.contains("doc_summary"));
+    }
+
+    #[test]
+    fn doc_summary_present_when_set() {
+        let mut attachment = make_attachment(AttachmentStatus::Ready, AttachmentKind::Document);
+        attachment.doc_summary = Some("A brief summary.".to_owned());
+        let json = serde_json::to_string(&AttachmentResponseDto::from(attachment)).unwrap();
+        assert!(json.contains("A brief summary."));
+    }
+
+    // ── StreamMessageRequest deserialization ─────────────────────────────
+
+    #[test]
+    fn deserialize_stream_request_with_rag_attachment_ids() {
+        let json = r#"{
+            "content": "hello",
+            "attachment_ids": ["00000000-0000-0000-0000-000000000001"],
+            "rag_attachment_ids": ["00000000-0000-0000-0000-000000000002"]
+        }"#;
+        let req: StreamMessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.content, "hello");
+        assert_eq!(req.attachment_ids.len(), 1);
+        assert_eq!(req.rag_attachment_ids.len(), 1);
+    }
+
+    #[test]
+    fn deserialize_stream_request_without_rag_attachment_ids() {
+        let json = r#"{"content": "hello"}"#;
+        let req: StreamMessageRequest = serde_json::from_str(json).unwrap();
+        assert!(req.rag_attachment_ids.is_empty());
+        assert!(req.attachment_ids.is_empty());
+    }
 }

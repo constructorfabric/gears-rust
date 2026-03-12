@@ -60,3 +60,46 @@ impl PublishError {
         matches!(self, Self::Permanent(_))
     }
 }
+
+/// Errors exposed via the mini-chat SDK client.
+#[derive(Debug, Error)]
+pub enum MiniChatError {
+    #[error("Chat not found: {id}")]
+    ChatNotFound { id: uuid::Uuid },
+
+    /// Attachment not found.
+    #[error("Attachment not found: {id}")]
+    AttachmentNotFound { id: uuid::Uuid },
+
+    /// Attachment not in ready state.
+    #[error("Attachment not ready: {id}")]
+    AttachmentNotReady { id: uuid::Uuid },
+
+    /// Access denied (authorization failure).
+    #[error("Access denied")]
+    Forbidden,
+
+    /// File exceeds maximum upload size.
+    #[error("File too large: max {max_bytes} bytes")]
+    FileTooLarge { max_bytes: usize },
+
+    /// Unsupported file content type.
+    #[error("Unsupported file type: {content_type}")]
+    UnsupportedFileType { content_type: String },
+
+    /// Per-chat document limit exceeded.
+    #[error("Document limit exceeded: max {max} documents per chat")]
+    DocumentLimitExceeded { max: usize },
+
+    /// Per-chat total upload size limit exceeded.
+    #[error("Upload size limit exceeded: max {max_mb} MB per chat")]
+    UploadSizeLimitExceeded { max_mb: usize },
+
+    /// Upload quota exceeded.
+    #[error("Upload quota exceeded")]
+    UploadQuotaExceeded,
+
+    /// An internal error occurred.
+    #[error("Internal error")]
+    Internal,
+}

@@ -36,10 +36,11 @@ pub(crate) fn register_routes(
     openapi: &dyn OpenApiRegistry,
     services: Arc<AppServices>,
     prefix: &str,
+    max_upload_bytes: usize,
 ) -> Router {
     let router = chats::register_chat_routes(router, openapi, prefix);
     let router = messages::register_message_routes(router, openapi, prefix);
-    let router = attachments::register_attachment_routes(router, openapi, prefix);
+    let router = attachments::register_attachment_routes(router, openapi, prefix, max_upload_bytes);
     let router = turns::register_turn_routes(router, openapi, prefix);
     let router = models::register_model_routes(router, openapi, prefix);
     let router = reactions::register_reaction_routes(router, openapi, prefix);

@@ -16,14 +16,8 @@ use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 use crate::api::rest::routes;
 use crate::domain::service::{AppServices as GenericAppServices, Repositories};
 use crate::infra::outbox::{InfraOutboxEnqueuer, UsageEventHandler};
+use crate::infra::outbox_attachment::{AttachmentProcessingHandler, InfraAttachmentOutboxEnqueuer};
 
-pub(crate) type AppServices = GenericAppServices<
-    TurnRepository,
-    MessageRepository,
-    QuotaUsageRepository,
-    ReactionRepository,
-    ChatRepository,
->;
 use crate::infra::db::repo::attachment_repo::AttachmentRepository;
 use crate::infra::db::repo::chat_repo::ChatRepository;
 use crate::infra::db::repo::message_repo::MessageRepository;
@@ -34,6 +28,19 @@ use crate::infra::db::repo::turn_repo::TurnRepository;
 use crate::infra::db::repo::vector_store_repo::VectorStoreRepository;
 use crate::infra::llm::provider_resolver::ProviderResolver;
 use crate::infra::model_policy::ModelPolicyGateway;
+use crate::infra::oagw::files_client::OagwFilesClient;
+use crate::infra::oagw::vector_store_client::OagwVectorStoreClient;
+
+/// Concrete `AppServices` with `SeaORM` repository implementations.
+pub(crate) type AppServices = GenericAppServices<
+    TurnRepository,
+    MessageRepository,
+    QuotaUsageRepository,
+    ReactionRepository,
+    ChatRepository,
+    AttachmentRepository,
+    VectorStoreRepository,
+>;
 
 /// Default URL prefix for all mini-chat REST routes.
 pub const DEFAULT_URL_PREFIX: &str = "/mini-chat";
@@ -48,6 +55,7 @@ pub struct MiniChatModule {
     service: OnceLock<Arc<AppServices>>,
     url_prefix: OnceLock<String>,
     outbox_handle: Mutex<Option<OutboxHandle>>,
+    max_upload_bytes: OnceLock<usize>,
 }
 
 impl Default for MiniChatModule {
@@ -56,6 +64,7 @@ impl Default for MiniChatModule {
             service: OnceLock::new(),
             url_prefix: OnceLock::new(),
             outbox_handle: Mutex::new(None),
+            max_upload_bytes: OnceLock::new(),
         }
     }
 }
@@ -65,7 +74,7 @@ impl Module for MiniChatModule {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
         info!("Initializing {} module", Self::MODULE_NAME);
 
-        let cfg: crate::config::MiniChatConfig = ctx.config_expanded()?;
+        let mut cfg: crate::config::MiniChatConfig = ctx.config_expanded()?;
         cfg.streaming
             .validate()
             .map_err(|e| anyhow::anyhow!("streaming config: {e}"))?;
@@ -83,6 +92,9 @@ impl Module for MiniChatModule {
                 .validate(id)
                 .map_err(|e| anyhow::anyhow!("providers config: {e}"))?;
         }
+        cfg.attachments
+            .validate()
+            .map_err(|e| anyhow::anyhow!("attachments config: {e}"))?;
 
         let vendor = cfg.vendor.trim().to_owned();
         if vendor.is_empty() {
@@ -91,6 +103,24 @@ impl Module for MiniChatModule {
                 Self::MODULE_NAME
             ));
         }
+
+        let oagw_alias = cfg.oagw_alias.trim().to_owned();
+        if oagw_alias.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{}: oagw_alias must be a non-empty string",
+                Self::MODULE_NAME
+            ));
+        }
+        cfg.oagw_alias = oagw_alias;
+
+        let storage_backend = cfg.storage_backend.trim().to_owned();
+        if storage_backend.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{}: storage_backend must be a non-empty string",
+                Self::MODULE_NAME
+            ));
+        }
+        cfg.storage_backend = storage_backend;
 
         let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
         register_plugin_schemas(
@@ -110,59 +140,21 @@ impl Module for MiniChatModule {
         )
         .await?;
 
+        let config = Arc::new(cfg.clone());
+
         self.url_prefix
             .set(cfg.url_prefix)
             .map_err(|_| anyhow::anyhow!("{} url_prefix already set", Self::MODULE_NAME))?;
+
+        self.max_upload_bytes
+            .set(cfg.attachments.max_upload_size_bytes)
+            .map_err(|_| anyhow::anyhow!("{} max_upload_bytes already set", Self::MODULE_NAME))?;
 
         let db_provider = ctx.db_required()?;
         let db = Arc::new(db_provider);
 
         // Create the model-policy gateway early for both outbox handler and services.
         let model_policy_gw = Arc::new(ModelPolicyGateway::new(ctx.client_hub(), vendor));
-
-        // Start the outbox pipeline eagerly in init() (migrations ran in phase 2, DB is ready).
-        // The framework guarantees stop() is called on init failure, so the pipeline
-        // will be shut down cleanly if any later init step errors.
-        // The handler resolves the plugin lazily on first message delivery,
-        // avoiding a hard dependency on plugin availability during init().
-        let outbox_db = db.db();
-        let num_partitions = cfg.outbox.num_partitions;
-        let queue_name = cfg.outbox.queue_name.clone();
-
-        let outbox_handle =
-            Outbox::builder(outbox_db)
-                .queue(
-                    &queue_name,
-                    Partitions::of(u16::try_from(num_partitions).map_err(|_| {
-                        anyhow::anyhow!("num_partitions {num_partitions} exceeds u16")
-                    })?),
-                )
-                .decoupled(UsageEventHandler {
-                    plugin_provider: model_policy_gw.clone(),
-                })
-                .start()
-                .await
-                .map_err(|e| anyhow::anyhow!("outbox start: {e}"))?;
-
-        let outbox = Arc::clone(outbox_handle.outbox());
-        let outbox_enqueuer =
-            Arc::new(InfraOutboxEnqueuer::new(outbox, queue_name, num_partitions));
-
-        {
-            let mut guard = self
-                .outbox_handle
-                .lock()
-                .map_err(|e| anyhow::anyhow!("outbox_handle lock: {e}"))?;
-            if guard.is_some() {
-                return Err(anyhow::anyhow!(
-                    "{} outbox_handle already set",
-                    Self::MODULE_NAME
-                ));
-            }
-            *guard = Some(outbox_handle);
-        }
-
-        info!("Outbox pipeline started");
 
         let authz = ctx
             .client_hub()
@@ -178,6 +170,16 @@ impl Module for MiniChatModule {
         crate::infra::oagw_provisioning::register_oagw_upstreams(&gateway, &cfg.providers).await?;
 
         let provider_resolver = Arc::new(ProviderResolver::new(&gateway, cfg.providers));
+
+        // OAGW clients for attachment processing
+        let oagw_files = Arc::new(OagwFilesClient::new(
+            Arc::clone(&gateway),
+            config.oagw_alias.clone(),
+        ));
+        let oagw_vector_stores = Arc::new(OagwVectorStoreClient::new(
+            Arc::clone(&gateway),
+            config.oagw_alias.clone(),
+        ));
 
         let repos = Repositories {
             chat: Arc::new(ChatRepository::new(modkit_db::odata::LimitCfg {
@@ -196,6 +198,71 @@ impl Module for MiniChatModule {
             vector_store: Arc::new(VectorStoreRepository),
         };
 
+        // ── Outbox pipeline ───────────────────────────────────────────────
+        // Started after repos/OAGW clients are available so the attachment
+        // processing handler can access them.
+        let outbox_db = db.db();
+        let num_partitions = cfg.outbox.num_partitions;
+        let queue_name = cfg.outbox.queue_name.clone();
+        let attachment_queue_name = format!("{queue_name}.attachments");
+
+        let partitions = Partitions::of(
+            u16::try_from(num_partitions)
+                .map_err(|_| anyhow::anyhow!("num_partitions {num_partitions} exceeds u16"))?,
+        );
+
+        // Create the attachment worker (shared with the outbox handler).
+        let attachment_worker = Arc::new(crate::infra::workers::AttachmentWorker::new(
+            Arc::clone(&db),
+            Arc::clone(&oagw_files),
+            Arc::clone(&oagw_vector_stores),
+            Arc::clone(&repos.attachment),
+            Arc::clone(&repos.vector_store),
+            provider_resolver.clone(),
+            Arc::clone(&config),
+        ));
+
+        let outbox_handle = Outbox::builder(outbox_db)
+            .queue(&queue_name, partitions)
+            .decoupled(UsageEventHandler {
+                plugin_provider: model_policy_gw.clone(),
+            })
+            .queue(&attachment_queue_name, partitions)
+            .decoupled(AttachmentProcessingHandler {
+                worker: attachment_worker,
+            })
+            .start()
+            .await
+            .map_err(|e| anyhow::anyhow!("outbox start: {e}"))?;
+
+        let outbox = Arc::clone(outbox_handle.outbox());
+        let outbox_enqueuer = Arc::new(InfraOutboxEnqueuer::new(
+            Arc::clone(&outbox),
+            queue_name,
+            num_partitions,
+        ));
+        let attachment_outbox_enqueuer = Arc::new(InfraAttachmentOutboxEnqueuer::new(
+            Arc::clone(&outbox),
+            attachment_queue_name,
+            num_partitions,
+        ));
+
+        {
+            let mut guard = self
+                .outbox_handle
+                .lock()
+                .map_err(|e| anyhow::anyhow!("outbox_handle lock: {e}"))?;
+            if guard.is_some() {
+                return Err(anyhow::anyhow!(
+                    "{} outbox_handle already set",
+                    Self::MODULE_NAME
+                ));
+            }
+            *guard = Some(outbox_handle);
+        }
+
+        info!("Outbox pipeline started (usage + attachment processing)");
+
         let services = Arc::new(AppServices::new(
             &repos,
             db,
@@ -208,6 +275,8 @@ impl Module for MiniChatModule {
             cfg.estimation_budgets,
             cfg.quota,
             outbox_enqueuer,
+            attachment_outbox_enqueuer as Arc<dyn crate::domain::repos::AttachmentOutboxEnqueuer>,
+            config,
         ));
 
         self.service
@@ -247,7 +316,17 @@ impl RestApiCapability for MiniChatModule {
             .get()
             .ok_or_else(|| anyhow::anyhow!("{} not initialized (url_prefix)", Self::MODULE_NAME))?;
 
-        let router = routes::register_routes(router, openapi, Arc::clone(services), prefix);
+        let max_upload_bytes = *self.max_upload_bytes.get().ok_or_else(|| {
+            anyhow::anyhow!("{} not initialized (max_upload_bytes)", Self::MODULE_NAME)
+        })?;
+
+        let router = routes::register_routes(
+            router,
+            openapi,
+            Arc::clone(services),
+            prefix,
+            max_upload_bytes,
+        );
         info!("Mini-chat REST routes registered successfully");
         Ok(router)
     }
