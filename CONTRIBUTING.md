@@ -302,157 +302,50 @@ See the results in `.prs/{ID}/` folder.
 See [docs/pr-review/README.md](./docs/pr-review/README.md) for full setup (GitHub CLI authentication, configuration, available review prompts) and usage details.
 
 
-## 3. Versioning
+## 3. Versioning and Releases
 
-This topic defines how Cyber Fabric versions crates and handles breaking changes.
+For the full versioning, branching, and release policy see **[RELEASE_POLICY.md](./RELEASE_POLICY.md)**.
 
-## Scope
+The key points for contributors:
 
-Applies to:
-- All Rust crates in this repository (libraries, modules, SDKs, macros).
-- Public APIs and contracts exposed to downstream users (Rust API, REST, gRPC/proto, CLI).
+### SemVer Quick Reference
 
-Non-goals:
-- Internal-only refactors that do not change any public contract (still must be tested, but do not force version bumps).
+| Change                                 | Pre-1.0 bump       | Post-1.0 bump |
+|----------------------------------------|---------------------|---------------|
+| Bugfix only                            | PATCH               | PATCH         |
+| Backward-compatible new API / feature  | PATCH               | MINOR         |
+| Any breaking change                    | MINOR (`0.(x+1).0`) | MAJOR         |
 
-## SemVer Rules (Crates)
+If in doubt, treat the change as breaking.
 
-We use Semantic Versioning: `MAJOR.MINOR.PATCH`.
+### What Counts as Breaking
 
-### PATCH (x.y.Z)
-Allowed:
-- Bugfixes
-- Performance improvements
-- Internal refactors
-- Doc and test updates
-  Not allowed:
-- Any public API or behavior change that can break downstream compilation
+Breaking means existing downstream code may fail to compile or a stable contract is violated:
 
-### MINOR (x.Y.z)
-Allowed:
-- Backward compatible new features
-- New APIs that do not break existing code
-  Not allowed:
-- Breaking changes
-
-### MAJOR (X.y.z)
-Required for:
-- Any breaking change (see the definition below)
-
-## Pre-1.0 Policy (0.x)
-
-For crates with version `0.x.y`:
-- `0.(x+1).0` is treated as a breaking release.
-- `0.x.(y+1)` is treated as non-breaking.
-
-Rule of thumb: before 1.0, MINOR behaves like MAJOR.
-
-## What Counts as a Breaking Change (Rust)
-
-Breaking means: existing downstream code may fail to compile or a stable contract is violated.
-
-Examples:
 - Removing or renaming any `pub` item
 - Changing function signatures (params, generics, bounds, return type)
 - Changing public struct/enum layout in a way that breaks construction or pattern matching
-- Removing a `pub` field
 - Removing trait impls that downstream relies on
 - Adding a method to a public trait without a default implementation
-- Tightening trait bounds or visibility in a way that reduces what compiles
+- Breaking REST response formats, gRPC `.proto` contracts, or CLI interfaces
 
-If in doubt: treat it as breaking.
+### Release Automation
 
-## What Is Not Breaking (But Must Be Noted)
+Releases are automated via [release-plz](https://release-plz.dev/):
 
-Not breaking (SemVer-wise), but must be documented in changelog/release notes:
-- Performance changes
-- Changes in logging text, error strings, metrics naming
-- More strict validation returning errors in previously accepted edge cases (allowed only if it does not violate an explicit documented contract)
+1. Changes merge into `main` via PR.
+2. release-plz opens a release PR (labeled `release-plz`) with computed version bumps and changelog updates.
+3. When the release PR is merged, crates are published to crates.io with crate-specific tags.
 
-## Public Contract Types and Their Versioning
+Contributors do **not** need to manually bump versions or edit `CHANGELOG.md` — write clear [conventional commit messages](#26-commit-changes) and the automation handles the rest.
 
-### Rust crate API
-- Governed by SemVer rules above.
-
-### REST API
-- Versioned in the URL (`/v1/...`, `/v2/...`).
-- Breaking REST changes require a new API version (for example `/v2`) and a deprecation period for old versions.
-
-### gRPC / Protobuf
-- Treat `.proto` as a public contract.
-- Follow protobuf compatibility rules:
-    - Do not reuse field numbers.
-    - Do not change field types in incompatible ways.
-    - Prefer adding optional fields over changing existing ones.
-- Breaking proto changes require a MAJOR bump for affected crates and, if exposed externally, a new API/proto version strategy.
-
-### CLI
-- User-facing CLI flags, commands, and output formats are public.
-- Breaking CLI changes require MAJOR.
-
-## Deprecation Policy
-
-When feasible, prefer deprecation over immediate removal:
-- Mark APIs as deprecated for at least one MINOR release before removal.
-- Include migration notes (what to use instead).
-
-Removal of deprecated APIs is breaking and requires MAJOR.
-
-## Workspace Policy (Monorepo)
-
-We use per-crate versioning, controlled via Cargo manifests and release automation.
-
-### Publishable vs internal crates
-- `publish = false` means the crate is internal and must not be published.
-- Internal crates can still follow SemVer for sanity, but do not promise external stability.
-
-### Version sources
-- Modules and SDKs keep explicit `version = "..."` in their `Cargo.toml`.
-- ModKit libs may use `version.workspace = true` (unified framework versioning).
-
-## ModKit Unified Release Rule
-
-ModKit is released as a unified framework:
-- Only `cf-modkit` produces changelog entries and GitHub releases.
-- Other `cf-modkit-*` crates are published to crates.io but do not create separate changelog entries/releases.
-
-## Release Process (Automation)
-
-We use release-plz:
-- Release PRs are labeled `release-plz`.
-- Repository-level `CHANGELOG.md` is the single changelog source.
-- GitHub releases are enabled where configured.
-
-SemVer checks:
-- We aim to run semver checks for published crates.
-- If temporarily disabled (bootstrap or tooling noise), do not use that as an excuse to sneak breaking changes into MINOR/PATCH.
-
-## How to Decide the Version Bump
-
-Use this table:
-
-| Change | Bump |
-|------|------|
-| Bugfix only | PATCH |
-| Backward compatible new API/feature | MINOR |
-| Any breaking change | MAJOR |
-| Pre-1.0: breaking change | bump 0.(x+1).0 |
-
-## Required Release Notes
-
-Every release must document:
-- Added
-- Changed
-- Fixed
-- Breaking (if any) with migration steps
-
-No "minor fixes" wording for releases that break users.
-
-## Enforcement
+### Enforcement
 
 Before merging changes that affect public crates/contracts:
+
 - Tests must pass.
-- If you touched a public surface, you must justify the version bump category in the PR description.
+- If you touched a public surface, justify the version bump category in the PR description.
+- For breaking changes, use `feat!:`/`fix!:` or include a `BREAKING CHANGE:` footer in your commit message.
 
 ## Getting Help
 
