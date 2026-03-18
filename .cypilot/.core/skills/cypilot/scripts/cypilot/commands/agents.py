@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -146,6 +147,245 @@ def _load_json_file(path: Path) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except (json.JSONDecodeError, OSError, IOError):
         return None
+
+def _write_or_skip(
+    out_path: Path,
+    content: str,
+    result: Dict[str, Any],
+    project_root: Path,
+    dry_run: bool,
+) -> None:
+    """Write *content* to *out_path*, tracking create/update/unchanged in *result*.
+
+    *result* must have ``created``, ``updated``, and ``outputs`` lists.
+    """
+    rel = _safe_relpath(out_path, project_root)
+    if not out_path.exists():
+        result["created"].append(out_path.as_posix())
+        if not dry_run:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(content, encoding="utf-8")
+        result["outputs"].append({"path": rel, "action": "created"})
+    else:
+        try:
+            old = out_path.read_text(encoding="utf-8")
+        except Exception:
+            old = ""
+        if old != content:
+            result["updated"].append(out_path.as_posix())
+            if not dry_run:
+                out_path.write_text(content, encoding="utf-8")
+            result["outputs"].append({"path": rel, "action": "updated"})
+        else:
+            result["outputs"].append({"path": rel, "action": "unchanged"})
+
+def _discover_kit_agents(
+    cypilot_root: Path,
+    project_root: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """Discover agent definitions from core skill area and installed kits.
+
+    Scans kits first (higher precedence), then core skill area (fallback).
+    First definition seen for each name wins.
+
+    Each ``[agents.<name>]`` section declares semantic capabilities (mode,
+    isolation, model) that the per-tool template mapper translates to
+    tool-specific frontmatter.
+
+    Returns a list of dicts, each with keys:
+    ``name``, ``description``, ``prompt_file_abs``, ``mode``, ``isolation``,
+    ``model``, ``source_dir``.
+    """
+    _VALID_MODES = {"readwrite", "readonly"}
+    _VALID_MODELS = {"inherit", "fast"}
+
+    seen_names: Set[str] = set()
+    out: List[Dict[str, Any]] = []
+
+    def _load_agents_toml(toml_path: Path, source_dir: Path) -> None:
+        if not toml_path.is_file():
+            return
+        try:
+            with open(toml_path, "rb") as f:
+                data = tomllib.load(f)
+        except Exception as exc:
+            sys.stderr.write(f"WARNING: failed to parse {toml_path}: {exc}\n")
+            return
+        agents_section = data.get("agents")
+        if not isinstance(agents_section, dict):
+            return
+        for name, info in agents_section.items():
+            if not isinstance(info, dict):
+                continue
+            if name in seen_names:
+                continue
+            # Reject names containing path separators to prevent path traversal
+            if "/" in name or "\\" in name or ".." in name:
+                sys.stderr.write(f"WARNING: skipping agent with unsafe name: {name!r}\n")
+                continue
+            seen_names.add(name)
+            prompt_rel = info.get("prompt_file", "")
+            prompt_abs = None
+            if prompt_rel:
+                candidate = (source_dir / prompt_rel).resolve()
+                # Ensure resolved path stays within source_dir (prevent path traversal)
+                try:
+                    candidate.relative_to(source_dir.resolve())
+                    prompt_abs = candidate
+                except ValueError:
+                    sys.stderr.write(
+                        f"WARNING: agent {name!r} prompt_file escapes source dir, skipping\n"
+                    )
+                    continue
+            mode = info.get("mode", "readwrite")
+            model = info.get("model", "inherit")
+            if mode not in _VALID_MODES:
+                sys.stderr.write(
+                    f"WARNING: agent {name!r} has invalid mode {mode!r}, skipping\n"
+                )
+                continue
+            if model not in _VALID_MODELS:
+                sys.stderr.write(
+                    f"WARNING: agent {name!r} has invalid model {model!r}, skipping\n"
+                )
+                continue
+            out.append({
+                "name": name,
+                "description": info.get("description", f"Cypilot {name} subagent"),
+                "prompt_file_abs": prompt_abs,
+                "mode": mode,
+                "isolation": bool(info.get("isolation", False)),
+                "model": model,
+                "source_dir": source_dir,
+            })
+
+    # 1. Installed kits — agents defined by kit packages
+    config_kits = _resolve_config_kits(cypilot_root, project_root)
+    if config_kits.is_dir():
+        registered = _registered_kit_dirs(project_root)
+        try:
+            kit_dirs = sorted(config_kits.iterdir())
+        except Exception:
+            kit_dirs = []
+        for kit_dir in kit_dirs:
+            if not kit_dir.is_dir():
+                continue
+            if registered is not None and kit_dir.name not in registered:
+                continue
+            _load_agents_toml(kit_dir / "agents.toml", kit_dir)
+
+    # 2. Core skill area — fallback for agents not already defined by kits
+    core_skill = core_subpath(cypilot_root, "skills", "cypilot")
+    _load_agents_toml(core_skill / "agents.toml", core_skill)
+
+    return out
+
+
+# ── Per-tool subagent template mapping ──────────────────────────────
+#
+# These functions map semantic agent capabilities (mode, isolation, model)
+# to tool-specific YAML frontmatter lines.  Tool knowledge stays here;
+# kit knowledge stays in agents.toml.
+
+def _agent_template_claude(agent: Dict[str, Any]) -> List[str]:
+    """Build Claude Code agent proxy template lines."""
+    lines = [
+        "---",
+        "name: {name}",
+        "description: {description}",
+    ]
+    if agent["mode"] == "readonly":
+        lines.append("tools: Bash, Read, Glob, Grep")
+        lines.append("disallowedTools: Write, Edit")
+    else:
+        lines.append("tools: Bash, Read, Write, Edit, Glob, Grep")
+    model = agent["model"]
+    lines.append(f"model: {'sonnet' if model == 'fast' else model}")
+    if agent["isolation"]:
+        lines.append("isolation: worktree")
+    lines += ["---", "", "ALWAYS open and follow `{target_agent_path}`"]
+    return lines
+
+
+def _agent_template_cursor(agent: Dict[str, Any]) -> List[str]:
+    """Build Cursor agent proxy template lines."""
+    lines = [
+        "---",
+        "name: {name}",
+        "description: {description}",
+    ]
+    if agent["mode"] == "readonly":
+        lines.append("tools: grep, view, bash")
+        lines.append("readonly: true")
+    else:
+        lines.append("tools: grep, view, edit, bash")
+    model = agent["model"]
+    lines.append(f"model: {model}")
+    lines += ["---", "", "ALWAYS open and follow `{target_agent_path}`"]
+    return lines
+
+
+def _agent_template_copilot(agent: Dict[str, Any]) -> List[str]:
+    """Build GitHub Copilot agent proxy template lines."""
+    lines = [
+        "---",
+        "name: {name}",
+        "description: {description}",
+    ]
+    if agent["mode"] == "readonly":
+        lines.append('tools: ["read", "search"]')
+    else:
+        lines.append('tools: ["*"]')
+    lines += ["---", "", "ALWAYS open and follow `{target_agent_path}`"]
+    return lines
+
+
+_TOOL_AGENT_CONFIG: Dict[str, Dict[str, Any]] = {
+    "claude": {
+        "output_dir": ".claude/agents",
+        "filename_format": "{name}.md",
+        "template_fn": _agent_template_claude,
+    },
+    "cursor": {
+        "output_dir": ".cursor/agents",
+        "filename_format": "{name}.md",
+        "template_fn": _agent_template_cursor,
+    },
+    "copilot": {
+        "output_dir": ".github/agents",
+        "filename_format": "{name}.agent.md",
+        "template_fn": _agent_template_copilot,
+    },
+    "openai": {
+        "output_dir": ".codex/agents",
+        "format": "toml",
+    },
+}
+
+
+def _render_toml_agents(agents: List[Dict[str, Any]], target_agent_paths: Dict[str, str]) -> str:
+    """Render OpenAI Codex TOML agent configuration.
+
+    Generated TOML uses ``ALWAYS open and follow`` pointers to shared agent
+    definition files, consistent with the proxy pattern used for markdown tools.
+
+    *agents* is a list of semantic agent dicts from ``_discover_kit_agents()``.
+    """
+    lines: List[str] = ["# Cypilot subagent definitions for OpenAI Codex", ""]
+    for agent in agents:
+        name = agent["name"]
+        desc = " ".join(agent.get("description", "").split())
+        agent_path = target_agent_paths.get(name, "")
+        prompt = f"ALWAYS open and follow `{agent_path}`"
+        desc_escaped = desc.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'[agents.{name.replace("-", "_")}]')
+        lines.append(f'description = "{desc_escaped}"')
+        lines.append('developer_instructions = """')
+        lines.append(prompt)
+        lines.append('"""')
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
 
 # @cpt-begin:cpt-cypilot-algo-agent-integration-discover-agents:p1:inst-define-registry
 def _default_agents_config() -> dict:
@@ -848,26 +1088,74 @@ def _process_single_agent(
                         },
                     )
 
-                    if not out_path.exists():
-                        skills_result["created"].append(out_path.as_posix())
-                        if not dry_run:
-                            out_path.parent.mkdir(parents=True, exist_ok=True)
-                            out_path.write_text(content, encoding="utf-8")
-                        skills_result["outputs"].append({"path": _safe_relpath(out_path, project_root), "action": "created"})
-                    else:
-                        try:
-                            old = out_path.read_text(encoding="utf-8")
-                        except Exception:
-                            old = ""
-                        if old != content:
-                            skills_result["updated"].append(out_path.as_posix())
-                            if not dry_run:
-                                out_path.write_text(content, encoding="utf-8")
-                            skills_result["outputs"].append({"path": _safe_relpath(out_path, project_root), "action": "updated"})
-                        else:
-                            skills_result["outputs"].append({"path": _safe_relpath(out_path, project_root), "action": "unchanged"})
+                    _write_or_skip(out_path, content, skills_result, project_root, dry_run)
 
-    all_errors = workflows_result.get("errors", []) + skills_result.get("errors", [])
+    # ── Subagent generation ────────────────────────────────────────────
+    subagents_result: Dict[str, Any] = {"created": [], "updated": [], "skipped": False, "outputs": [], "errors": []}
+
+    tool_cfg = _TOOL_AGENT_CONFIG.get(agent)
+    kit_agents = _discover_kit_agents(cypilot_root, project_root)
+
+    if tool_cfg is None or not kit_agents:
+        subagents_result["skipped"] = True
+        if tool_cfg is None:
+            subagents_result["skip_reason"] = f"{agent} does not support subagents"
+        else:
+            subagents_result["skip_reason"] = "no agents discovered"
+    else:
+        output_dir_rel = tool_cfg["output_dir"]
+        output_format = tool_cfg.get("format", "markdown")
+        filename_fmt = tool_cfg.get("filename_format", "{name}.md")
+        output_dir = (project_root / output_dir_rel).resolve()
+
+        # Build target_agent_paths from discovered kit agents
+        target_agent_paths: Dict[str, str] = {}
+        for ka in kit_agents:
+            if ka.get("prompt_file_abs"):
+                target_agent_paths[ka["name"]] = _target_path_from_root(
+                    ka["prompt_file_abs"], project_root, cypilot_root,
+                )
+
+        if output_format == "toml":
+            # Render all agents into a single TOML file
+            toml_path = (output_dir / "cypilot-agents.toml").resolve()
+            content = _render_toml_agents(kit_agents, target_agent_paths)
+            _write_or_skip(toml_path, content, subagents_result, project_root, dry_run)
+        else:
+            # Markdown + YAML frontmatter (claude, cursor, copilot)
+            template_fn = tool_cfg.get("template_fn")
+            if template_fn is None:
+                subagents_result["errors"].append(f"No template function for {agent}")
+            else:
+                for ka in kit_agents:
+                    name = ka["name"]
+                    template = template_fn(ka)
+                    target_agent_rel = target_agent_paths.get(name, "")
+
+                    content = _render_template(
+                        template,
+                        {
+                            "name": name,
+                            "description": ka["description"],
+                            "target_agent_path": target_agent_rel,
+                        },
+                    )
+
+                    filename = filename_fmt.format(name=name)
+                    out_path = (output_dir / filename).resolve()
+
+                    # Ensure output stays within output_dir (prevent path traversal)
+                    try:
+                        out_path.relative_to(output_dir)
+                    except ValueError:
+                        subagents_result["errors"].append(
+                            f"agent {name!r} would write outside {output_dir_rel}, skipped"
+                        )
+                        continue
+
+                    _write_or_skip(out_path, content, subagents_result, project_root, dry_run)
+
+    all_errors = workflows_result.get("errors", []) + skills_result.get("errors", []) + subagents_result.get("errors", [])
     agent_status = "PASS" if not all_errors else "PARTIAL"
 
     return {
@@ -894,6 +1182,17 @@ def _process_single_agent(
             "counts": {
                 "created": len(skills_result["created"]),
                 "updated": len(skills_result["updated"]),
+            },
+        },
+        "subagents": {
+            "created": subagents_result["created"],
+            "updated": subagents_result["updated"],
+            "skipped": subagents_result["skipped"],
+            "skip_reason": subagents_result.get("skip_reason", ""),
+            "outputs": subagents_result["outputs"],
+            "counts": {
+                "created": len(subagents_result["created"]),
+                "updated": len(subagents_result["updated"]),
             },
         },
         "errors": all_errors if all_errors else None,

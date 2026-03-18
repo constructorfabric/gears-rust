@@ -358,6 +358,8 @@ agents --agent <name> [--root <path>] [--cypilot-root <path>] [--dry-run]
 Generates agent-specific workflow proxies and skill entry points.
 Supported: windsurf, cursor, claude, copilot, openai.
 
+Generates workflow commands, skill outputs, and **subagents** (isolated agent definitions with scoped tools and dedicated prompts). Two subagents are created for tools that support them: `cypilot-codegen` (full write access, worktree isolation) and `cypilot-pr-review` (read-only). Windsurf does not support subagents and is gracefully skipped.
+
 Shortcut: `agents --openai`
 
 ### Migration Commands

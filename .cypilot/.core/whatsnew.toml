@@ -156,3 +156,17 @@ details = """\
 - **Secret scanner fix** — sanitized high-entropy string in `git_utils.py` to avoid false positives from trufflehog3 and similar tools
 - **Fix: new manifest resources registered during kit update** — when a kit adds new resources in `manifest.toml`, `cpt kit update` now merges them into `core.toml` resource bindings instead of ignoring them\
 """
+
+["v3.1.0-beta"]
+summary = "Subagent registration, execution plan improvements, ADR-0017"
+details = """\
+- **Subagent generation** — `cpt agents` generates isolated subagent definitions (`cypilot-codegen`, `cypilot-pr-review`) with scoped tools and dedicated prompts
+- **`agents.toml` discovery** — agent definitions loaded from kit `agents.toml` files with semantic capabilities (mode, isolation, model)
+- **Per-tool template mapping** — translates semantic agent config to tool-specific frontmatter (Claude, Cursor, Copilot, OpenAI)
+- **Windsurf graceful skip** — subagent generation skipped for IDEs without subagent support
+- **Recursive interaction scanning** — plan workflow now recursively scans all referenced files for interaction points with regex patterns
+- **Mandatory plan validation gate** — Phase 4.1 requires self-validation against checklist before execution; reports per-category PASS/FAIL
+- **Plan completion lifecycle** — explicit lifecycle strategy execution (gitignore/cleanup/archive/manual) with user prompts
+- **Abandoned plan recovery** — plan.toml serves as checkpoint; recovery prompt for resuming incomplete plans
+- **New plan-checklist.md** — 7-category validation checklist for plan quality assurance
+"""

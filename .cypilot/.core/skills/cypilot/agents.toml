@@ -1,0 +1,27 @@
+# Cypilot SDLC Kit — Subagent Definitions
+#
+# Declares agents that the `cypilot agents` command generates as
+# tool-specific proxy files (Claude Code, Cursor, Copilot, OpenAI Codex).
+#
+# Semantic fields (mode, isolation, model) are mapped to per-tool
+# frontmatter by the agents command — kits never need tool-specific knowledge.
+
+[agents.cypilot-codegen]
+description = """\
+Cypilot code generator. Use when requirements are fully specified and \
+no clarification is needed. Takes a complete task description and \
+implements it in an isolated context \u2014 no back-and-forth, just code."""
+prompt_file = "agents/cypilot-codegen.md"
+mode = "readwrite"
+isolation = true
+model = "inherit"
+
+[agents.cypilot-pr-review]
+description = """\
+Cypilot PR reviewer. Use to review pull requests with structured \
+checklist-based analysis. Runs in a separate context so detailed \
+review output stays isolated from the main conversation."""
+prompt_file = "agents/cypilot-pr-review.md"
+mode = "readonly"
+isolation = false
+model = "fast"

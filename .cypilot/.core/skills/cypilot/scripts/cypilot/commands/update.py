@@ -576,11 +576,14 @@ def _maybe_regenerate_agents(
         )
         wf = result.get("workflows", {})
         sk = result.get("skills", {})
+        sa = result.get("subagents", {})
         n_changed = (
             len(wf.get("updated", []))
             + len(wf.get("created", []))
             + len(sk.get("updated", []))
             + len(sk.get("created", []))
+            + len(sa.get("updated", []))
+            + len(sa.get("created", []))
         )
         if n_changed:
             regenerated.append(agent)

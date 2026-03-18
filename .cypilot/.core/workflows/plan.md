@@ -17,6 +17,10 @@ purpose: Universal workflow for generating execution plans with phased delivery
 
 > **⛔ CRITICAL CONSTRAINT — DETERMINISTIC FIRST**: Every phase step that CAN be done by a deterministic tool (cpt command, script, shell command) MUST use that tool instead of LLM reasoning. Discover available tools dynamically in Phase 0 — do NOT assume a fixed set of commands. Tool capabilities change between versions. The CLISPEC file is the source of truth for what commands exist and what they can do.
 
+> **⛔ CRITICAL CONSTRAINT — INTERACTIVE QUESTIONS COMPLETENESS** *(mandatory)*: You MUST find ALL interactive questions, user input requests, confirmation gates, review requests, and decision points from: (1) the target workflow, (2) `rules.md` for the target artifact kind, (3) `checklist.md`, (4) `template.md`, AND (5) **every file referenced by navigation rules** (`ALWAYS open`, `OPEN and follow`) in those files — recursively. Every interaction point found MUST appear in the compiled plan: pre-resolvable questions asked BEFORE plan generation, phase-bound questions embedded in phase files. **Missing even ONE interaction point = plan is INVALID.** See `{cypilot_path}/.core/requirements/plan-checklist.md` Section 2 for the complete extraction procedure.
+
+> **⛔ CRITICAL CONSTRAINT — BRIEF BEFORE COMPILE**: Phase files MUST NOT be written directly. Every phase file MUST be compiled from a corresponding compilation brief (`brief-{NN}-{slug}.md`) that was written to disk in Phase 3.2. The brief is the contract between decomposition (what to include) and compilation (how to assemble). Skipping briefs produces phase files that silently omit kit content, miss load instructions, or inline wrong sections. **If you find yourself writing a phase file without first reading its brief from disk — STOP, you are violating the workflow.** Write the brief first, write it to disk, THEN compile from it. A phase file without a corresponding brief file on disk = INVALID plan.
+
 ALWAYS open and follow `{cypilot_path}/.core/skills/cypilot/SKILL.md` FIRST WHEN {cypilot_mode} is `off`
 
 **Type**: Operation
@@ -28,6 +32,8 @@ ALWAYS open and follow `{cypilot_path}/.core/requirements/plan-template.md` WHEN
 ALWAYS open and follow `{cypilot_path}/.core/requirements/plan-decomposition.md` WHEN decomposing tasks into phases
 
 OPEN and follow `{cypilot_path}/.core/requirements/prompt-engineering.md` WHEN compiling phase files (phase files ARE agent instructions)
+
+OPEN and follow `{cypilot_path}/.core/requirements/plan-checklist.md` WHEN validating plans (Phase 4.1 self-validation or /cypilot-analyze on plan)
 
 For context compaction recovery during multi-phase workflows, follow `{cypilot_path}/.core/requirements/execution-protocol.md` Section "Compaction Recovery".
 
@@ -45,7 +51,7 @@ For context compaction recovery during multi-phase workflows, follow `{cypilot_p
     - [1.1 Identify Task Type](#11-identify-task-type)
     - [1.1b Extract Target Workflow Navigation Rules (CRITICAL)](#11b-extract-target-workflow-navigation-rules-critical)
     - [1.2 Estimate Compiled Size](#12-estimate-compiled-size)
-    - [1.3 Scan for User Interaction Points](#13-scan-for-user-interaction-points)
+    - [1.3 Scan for User Interaction Points (CRITICAL)](#13-scan-for-user-interaction-points-critical)
     - [1.4 Identify Target](#14-identify-target)
   - [Phase 2: Decompose](#phase-2-decompose)
     - [For `generate` tasks:](#for-generate-tasks)
@@ -55,12 +61,15 @@ For context compaction recovery during multi-phase workflows, follow `{cypilot_p
     - [Review Phases](#review-phases)
     - [Execution Context Prediction](#execution-context-prediction)
   - [Phase 3: Compile Phase Files](#phase-3-compile-phase-files)
-    - [3.1 Load Phase Dependencies](#31-load-phase-dependencies)
-    - [3.2 Compile Phase File](#32-compile-phase-file)
-    - [3.3 Validate Phase File](#33-validate-phase-file)
-    - [3.4 Write Phase File](#34-write-phase-file)
-  - [Phase 4: Write Plan](#phase-4-write-plan)
+    - [3.1 Write Plan Manifest](#31-write-plan-manifest)
+    - [3.2 Generate Compilation Briefs (from Template)](#32-generate-compilation-briefs-from-template)
+    - [3.3 Compile Phase Files (Agent + Context Boundary)](#33-compile-phase-files-agent--context-boundary)
+      - [Context boundary (CRITICAL)](#context-boundary-critical)
+      - [Compilation steps](#compilation-steps)
+    - [3.4 Validate Phase Files](#34-validate-phase-files)
+  - [Phase 4: Finalize Plan](#phase-4-finalize-plan)
     - [Plan Lifecycle Strategy](#plan-lifecycle-strategy)
+    - [Phase 4.1: Validate Plan Before Execution (MANDATORY)](#phase-41-validate-plan-before-execution-mandatory)
     - [New-Chat Startup Prompt](#new-chat-startup-prompt)
   - [Phase 5: Execute Phases](#phase-5-execute-phases)
     - [5.1 Load Phase](#51-load-phase)
@@ -69,6 +78,8 @@ For context compaction recovery during multi-phase workflows, follow `{cypilot_p
     - [5.4 Report](#54-report)
     - [5.5 Update Status](#55-update-status)
     - [5.6 Phase Handoff](#56-phase-handoff)
+      - [Context boundary for continue mode](#context-boundary-for-continue-mode)
+    - [5.7 Abandoned Plan Recovery](#57-abandoned-plan-recovery)
   - [Phase 6: Check Status](#phase-6-check-status)
   - [Plan Storage Format](#plan-storage-format)
   - [Execution Log](#execution-log)
@@ -247,17 +258,38 @@ estimated_size = template_lines + rules_lines + checklist_lines + existing_conte
   **STOP HERE.** Do not proceed with plan generation or task execution.
 - If `estimated_size > 500`: Proceed to Phase 2.
 
-### 1.3 Scan for User Interaction Points
+### 1.3 Scan for User Interaction Points (CRITICAL)
 
-Scan the source workflow, rules, checklist, and template for interaction points — places where the agent is expected to ask the user something, wait for input, or request review. Look for these patterns:
+> **⛔ MANDATORY**: This step MUST be completed exhaustively. Missing interaction points is the #2 source of plan failures (after missing rules).
 
-| Pattern | Type | Example |
-|---------|------|---------|
-| Questions to user | `question` | "Ask the user which modules to include" |
-| Expected user input | `input` | "User provides project name and tech stack" |
-| Confirmation gates | `confirm` | "Wait for user confirmation before proceeding" |
-| Review requests | `review` | "Present output for user review before writing" |
-| Choice/decision points | `decision` | "User selects between option A and B" |
+**Scan scope** — you MUST scan ALL of these sources:
+
+1. **Target workflow** (`generate.md`, `analyze.md`, etc.)
+2. **`rules.md`** for the target artifact kind
+3. **`checklist.md`** for the target artifact kind
+4. **`template.md`** for the target artifact kind
+5. **Every file referenced by navigation rules** in the above files — follow `ALWAYS open`, `OPEN and follow`, `ALWAYS open and follow` directives **recursively**
+
+**Recursive scanning procedure**:
+
+1. Start with the target workflow file
+2. Extract all navigation directives (ALWAYS open, OPEN and follow)
+3. For each referenced file:
+   a. Open and scan for interaction patterns
+   b. Extract any navigation directives in THAT file
+   c. Recursively scan those files too
+4. Continue until no new files are discovered
+5. Record the complete file manifest with interaction points found in each
+
+Scan for interaction points — places where the agent is expected to ask the user something, wait for input, or request review. Look for these patterns:
+
+| Pattern | Type | Regex/Keywords | Example |
+|---------|------|----------------|---------|
+| Questions to user | `question` | `ask the user`, `ask user`, `what is`, `which`, `?` at end | "Ask the user which modules to include" |
+| Expected user input | `input` | `user provides`, `user specifies`, `user enters`, `input from user` | "User provides project name and tech stack" |
+| Confirmation gates | `confirm` | `wait for`, `confirm`, `approval`, `before proceeding` | "Wait for user confirmation before proceeding" |
+| Review requests | `review` | `review`, `present for`, `show to user`, `user inspects` | "Present output for user review before writing" |
+| Choice/decision points | `decision` | `choose`, `select`, `option A or B`, `decide` | "User selects between option A and B" |
 
 Collect all found interaction points into a list:
 
@@ -287,6 +319,24 @@ Phase-bound interactions (will be handled during execution):
 ```
 
 Record all answers in a `decisions` block to include in phase files.
+
+**Completeness verification** (MANDATORY before proceeding):
+
+```
+Interaction points scan complete:
+  Files scanned: {N} (list all files)
+  Interaction points found: {M}
+    - Pre-resolvable: {count} (asked and answered above)
+    - Phase-bound: {count} (will be embedded in phase files)
+    - Cross-phase: {count} (asked and answered above)
+  
+  All source files scanned? [YES/NO]
+  All interaction points classified? [YES/NO]
+```
+
+**Gate**: Do NOT proceed to Phase 1.4 if any source file was not scanned or any interaction point was not classified. Missing interaction points will cause plan validation to FAIL.
+
+**If zero interaction points found**: This is valid for some tasks (e.g., pure structural analysis, deterministic validation). Report "No interaction points detected — task is fully autonomous" and proceed to Phase 1.4. The User Decisions section will be omitted from phase files.
 
 ### 1.4 Identify Target
 
@@ -383,11 +433,13 @@ If the source workflow expects a **major review** (e.g., full artifact review be
 
 ### Execution Context Prediction
 
-After creating the initial phase list, estimate **execution-time context usage** for each phase per the Execution Context Prediction section in `plan-decomposition.md`:
+After creating the initial phase list, estimate **total execution context** for each phase per the Execution Context Prediction section in `plan-decomposition.md`:
 
-1. For each phase, calculate: phase file + input files + intermediate inputs + estimated output + tool output + 30% reasoning overhead
-2. Flag phases that exceed 5000 lines (OVERFLOW) — these MUST be split further
-3. Flag phases that exceed 3000 lines (WARNING) — note for user
+1. For each phase, calculate: `phase_file_lines + sum(input_files lines) + sum(inputs lines) + estimated_output_lines`
+2. Flag phases that exceed **2000 lines** (OVERFLOW) — these MUST be split further
+3. Flag phases that exceed **1500 lines** (WARNING) — note for user
+
+> **Budget = 2000 lines max** per phase (phase file + runtime reads). Better to have more phases than risk context overflow during execution.
 
 If any phase is in OVERFLOW, apply the auto-split strategies from `plan-decomposition.md` and re-estimate until all phases are within budget.
 
@@ -395,14 +447,15 @@ Report decomposition to user:
 
 ```
 Decomposition ({strategy} strategy):
-  Phase 1: {title} — ~{N} lines execution context ✓
-  Phase 2: {title} — ~{N} lines execution context ✓
-  Phase 3: {title} — ~{N} lines execution context ⚠ (warning)
+  Phase 1: {title} — ~{N} lines (phase: {P}, runtime: {R}) ✓
+  Phase 2: {title} — ~{N} lines (phase: {P}, runtime: {R}) ✓
+  Phase 3: {title} — ~{N} lines (phase: {P}, runtime: {R}) ⚠ WARNING
   ...
-  Phase N: {title} — ~{N} lines execution context ✓
+  Phase N: {title} — ~{N} lines (phase: {P}, runtime: {R}) ✓
   
   Total phases: {N}
   Overflow phases: 0
+  Budget: 2000 lines max per phase
   
   Proceed with compilation? [y/n]
 ```
@@ -415,97 +468,151 @@ Wait for user confirmation before proceeding.
 
 Open and follow `{cypilot_path}/.core/requirements/plan-template.md`.
 
-For each phase (one at a time, to manage context):
+Compilation is split into three steps to **minimize agent context usage**: a deterministic script inlines kit content, then the agent fills only the creative sections one phase at a time.
 
-### 3.1 Load Phase Dependencies
+### 3.1 Write Plan Manifest
 
-Load ONLY the rules and input needed for THIS phase:
-
-- For generate: load the template sections assigned to this phase + relevant rules
-- For analyze: load the checklist categories assigned to this phase + target content
-- For implement: load the CDSL block assigned to this phase + coding rules
-
-If this phase has `inputs` from prior phases (intermediate results), include **read instructions** in the phase file's Task section:
-- Specify exact file paths to read (e.g., `{cypilot_path}/.plans/{task-slug}/out/phase-01-actors.md`)
-- These paths will be absolute by the time the phase file is compiled
-
-### 3.2 Compile Phase File
-
-Following the template structure from `plan-template.md`, create the phase file:
-
-1. **TOML frontmatter** — fill in all metadata fields with resolved values
-2. **Preamble** — include verbatim (do NOT modify)
-3. **What** — describe this phase's concrete deliverable and scope boundary
-4. **Prior Context** — summarize relevant outputs from earlier phases (≤ 20 lines). Include pre-resolved user decisions that affect this phase.
-5. **User Decisions** (if this phase has interaction points) — list decisions already made and questions to ask during execution (see plan-template.md Section 4b)
-6. **Rules** — inline ALL rules from `rules.md` (and `checklist.md` for analyze tasks) that apply to this phase's artifact kind. Rules MUST be inlined **verbatim and completely** — never summarized, trimmed, or selectively excerpted. If the full applicable rules exceed 300 lines, do NOT cut rules — instead, narrow the phase scope (fewer template sections / checklist categories) and re-split so that each sub-phase carries the full rules for its narrower scope. Target ≤ 200 lines but completeness overrides the budget.
-7. **Input** — inline all input content verbatim (≤ 300 lines target)
-8. **Task** — write 3-10 concrete steps with verifiable outcomes. Apply the **deterministic-first** principle: for each step, check the tool capability map (from Phase 0.1) and use a `cpt` command or script if one can do the job. Write the exact command with arguments. Only fall back to LLM reasoning for steps that no tool can handle (creative writing, synthesis, judgment). If this phase has a review gate, include a step: "Present output to user for review. Wait for approval before writing." If this phase has intermediate outputs needed by later phases, include a final step: "Save {description} to `{output_path}`."
-   - **Deterministic step example**: `EXECUTE: {cypilot_command} validate --artifact architecture/PRD.md --output out/phase-03-validation.json`
-   - **Deterministic step example**: `EXECUTE: {cypilot_command} list-ids --artifact architecture/PRD.md --kind requirement`
-   - **LLM step example**: "Analyze the validation report and write a summary of findings"
-9. **Acceptance Criteria** — write 3-10 binary pass/fail checks. Prefer machine-verifiable criteria (exit code = 0, file exists, JSON field = value) over subjective ones. If review gate: include "User has reviewed and approved the output." If intermediate outputs: include "File `{output_path}` exists and contains {expected content}."
-10. **Output Format** — include verbatim (do NOT modify)
-
-### 3.3 Validate Phase File
-
-Before writing:
-
-1. Scan for unresolved `{...}` variables outside code fences → MUST be zero
-2. Scan for external file references ("open file", "read", "see {path}") → MUST be zero
-3. Count total lines → MUST be ≤ 1000
-4. If > 1000: split into sub-phases per the budget enforcement rules in `plan-decomposition.md`
-5. **Context coverage check**: verify that rules inlined in this phase's Rules section originate from the files loaded in Step 1.1b. If a navigation rule's content is relevant to this phase but was not inlined → add it. Missing rules = broken phase.
-6. **Kit rules completeness check** *(highest priority)*: compare the phase's Rules section against the full `rules.md` for the target artifact kind. Every MUST/MUST NOT rule that applies to this phase's scope MUST be present verbatim in the Rules section. If any rule is missing → add it. If adding it pushes the phase over budget → split the phase (narrow scope), do NOT drop the rule. After the last phase is compiled, verify that the **union of all phases' Rules sections covers 100% of `rules.md`** — no rule left behind.
-
-### 3.4 Write Phase File
-
-Write the compiled phase file to: `{cypilot_path}/.plans/{task-slug}/phase-{NN}-{slug}.md`
-
-Where:
-- `{task-slug}` = task type + target (e.g., `generate-prd-myapp`, `analyze-design-myapp`)
-- `{NN}` = zero-padded phase number (01, 02, ...)
-- `{slug}` = short phase title slug
-
-After writing, release the phase content from context before compiling the next phase.
-
----
-
-## Phase 4: Write Plan
-
-Create the plan manifest at `{cypilot_path}/.plans/{task-slug}/plan.toml`:
+Write `plan.toml` **before** compilation so the script can read it:
 
 ```toml
 [plan]
 task = "{task description}"
 type = "{generate|analyze|implement}"
-target = "{artifact kind or feature name}"
+target = "{artifact kind}"          # e.g. "PRD", "DESIGN", "FEATURE"
+kit_path = "{absolute path to kit}" # e.g. "/abs/path/config/kits/sdlc"
 created = "{ISO 8601 timestamp}"
 total_phases = {N}
 
 [[phases]]
 number = 1
 title = "{phase title}"
+slug = "{short-slug}"
 file = "phase-01-{slug}.md"
+brief_file = "brief-01-{slug}.md"  # compilation brief (MUST exist before phase file)
 status = "pending"
 depends_on = []
-outputs = ["out/phase-01-actors.md", "architecture/PRD.md"]
-inputs = []
-
-[[phases]]
-number = 2
-title = "{phase title}"
-file = "phase-02-{slug}.md"
-status = "pending"
-depends_on = [1]
-outputs = ["architecture/PRD.md"]
-inputs = ["out/phase-01-actors.md"]
+input_files = []                    # project files to read at runtime
+output_files = ["{target file}"]    # project files this phase creates/modifies
+outputs = ["out/phase-01-{what}.md"] # intermediate results for later phases
+inputs = []                         # intermediate results from prior phases
+template_sections = [1, 2, 3]      # H2 numbers from template.md (generate tasks)
+checklist_sections = []             # H2 numbers from checklist.md (analyze tasks)
 
 # ... one [[phases]] block per phase
-# outputs/inputs paths are relative to .plans/{task-slug}/ for out/, or to project root for target files
 ```
 
-**Status values**: `pending`, `in_progress`, `done`, `failed`
+**New fields vs. old schema**:
+- `kit_path` — absolute path to kit directory (from `cpt info` output)
+- `template_sections` — which H2 sections from `template.md` to inline (for generate)
+- `checklist_sections` — which H2 sections from `checklist.md` to inline (for analyze)
+- `slug` — short slug for filename generation
+
+Write to: `{cypilot_path}/.plans/{task-slug}/plan.toml`
+
+### 3.2 Generate Compilation Briefs (from Template)
+
+For each phase in `plan.toml`, generate a **compilation brief** — a short instruction file (~50–80 lines) that tells the agent exactly what kit files to read, what to skip, and how to compile the phase file.
+
+ALWAYS open and follow `{cypilot_path}/.core/requirements/brief-template.md` to fill one brief per phase.
+
+**Steps**:
+
+1. **Estimate kit file sizes** (for context budget):
+   ```
+   EXECUTE: wc -l {kit_path}/artifacts/{kind}/rules.md {kit_path}/artifacts/{kind}/template.md {kit_path}/artifacts/{kind}/checklist.md
+   ```
+2. **List examples** (if any):
+   ```
+   EXECUTE: ls {kit_path}/artifacts/{kind}/examples/*.md 2>/dev/null
+   ```
+3. **Fill the brief template** for each phase using data from `plan.toml`:
+   - Substitute phase metadata (number, title, depends_on, files)
+   - Fill Load Instructions — which kit files to read based on `template_sections` and `checklist_sections`
+   - Omit unused Load Instructions (e.g., no checklist for generate phases)
+   - Set context budget estimate from `wc -l` results
+4. **Write each brief** to `{cypilot_path}/.plans/{task-slug}/brief-{NN}-{slug}.md`
+
+**What a brief contains** (per phase):
+- Context boundary instruction (disregard prior context)
+- Phase metadata (from plan.toml)
+- Load instructions: which kit files to read, which sections to keep/skip
+- Phase file structure guide (10 sections)
+- Context budget estimate
+
+**What a brief does NOT contain**:
+- The phase file itself — that's the agent's job in 3.3
+- No kit content is copied — the brief points to files with read instructions
+
+**Gate — Brief files MUST exist on disk before compilation**:
+
+> **⛔ MANDATORY**: Before proceeding to 3.3, verify every brief file was written to disk:
+>
+> ```
+> for each [[phases]] in plan.toml:
+>   VERIFY: {plan_dir}/{brief_file} exists on disk
+>   FAIL if: any brief file missing — STOP and write missing briefs
+> ```
+>
+> Do NOT proceed to 3.3 until ALL brief files pass this check. This gate prevents the most common plan generation failure: skipping briefs and writing phase files directly from accumulated context.
+
+### 3.3 Compile Phase Files (Agent + Context Boundary)
+
+For each phase, one at a time:
+
+#### Context boundary (CRITICAL)
+
+Before compiling each phase, apply the context boundary protocol:
+
+```
+--- CONTEXT BOUNDARY ---
+Disregard all previous context. The brief below is self-contained.
+Read ONLY the files listed in the brief. Follow its instructions exactly.
+---
+```
+
+This ensures each phase compilation starts with minimal context (~50 lines brief + ~400-600 lines kit files = ~700 lines total) instead of accumulated context from prior phases.
+
+#### Compilation steps
+
+1. **Read the brief FROM DISK** — `{cypilot_path}/.plans/{task-slug}/{brief_file}`
+   ⛔ You MUST read the brief file from disk using a file read tool, not from memory or accumulated context. If the file does not exist on disk, it was never written — go back to 3.2 and write it. Compiling a phase without reading its brief from disk = INVALID.
+2. **Read kit files** per the brief's Load Instructions:
+   - Rules: read `rules.md`, inline MUST/MUST NOT rules (skip Prerequisites, Tasks, Next Steps)
+   - Template: read specified H2 sections, inline into Input
+   - Example: read for style reference, inline into Input
+3. **Write the phase file** per the brief's Compile Phase File section:
+   - TOML frontmatter, Preamble, What, Prior Context, User Decisions, Rules, Input, Task, Acceptance Criteria, Output Format
+4. **Apply deterministic-first principle** to Task steps:
+   - Use `EXECUTE: {cypilot_command} ...` for deterministic steps
+   - Use LLM reasoning only for creative/synthesis steps
+   - Add "Read <file>" steps for `input_files` and `inputs`
+   - If review gate: add "Present output to user for review. Wait for approval."
+5. **Report**: "Phase {N} compiled → {filename} ({lines} lines)"
+6. **Apply context boundary** before next phase
+
+**Continue mode** (default): compile next phase in same chat with context boundary.
+**New chat mode** (recommended for 4+ phases): copy prompt to new chat for guaranteed clean context.
+
+### 3.4 Validate Phase Files
+
+After all phases are compiled, validate each one:
+
+1. **Brief files exist**: verify every `brief_file` in `plan.toml` has a corresponding file on disk. Missing brief = compilation was done without brief = INVALID plan. If any brief is missing, the plan MUST be regenerated from Phase 3.2.
+2. **Phase-brief consistency**: for each phase, verify the phase file's Rules section covers the same kit file ranges specified in the brief's Load Instructions. Drift between brief and compiled phase = content was added or dropped outside the brief contract.
+3. Scan for unresolved `{...}` variables outside code fences → MUST be zero
+4. Count total lines → MUST be ≤ 1000
+5. If > 1000: split into sub-phases per budget enforcement rules in `plan-decomposition.md`
+6. **Kit rules completeness check** *(highest priority)*: verify Rules section contains all MUST/MUST NOT rules from `rules.md`. If any rule is missing → add it. If adding pushes over budget → narrow scope and re-split. NEVER drop rules.
+7. **Context budget check**: estimate `phase_file_lines + sum(input_files lines) + sum(inputs lines) + output_lines`. Must be ≤ 2000 lines. If over, split the phase.
+8. After the last phase: verify that the **union of all phases' Rules sections covers 100% of applicable rules from `rules.md`** — no rule left behind.
+
+---
+
+## Phase 4: Finalize Plan
+
+> **Note**: `plan.toml` was already written in Phase 3.1 and phase files compiled in Phase 3.2-3.3.
+
+**Status values** in `plan.toml`: `pending`, `in_progress`, `done`, `failed`
 
 ### Plan Lifecycle Strategy
 
@@ -542,6 +649,55 @@ Plan created: {cypilot_path}/.plans/{task-slug}/
   Files: plan.toml + {N} phase files
   Lifecycle: {choice}
 ```
+
+### Phase 4.1: Validate Plan Before Execution (MANDATORY)
+
+> **⛔ CRITICAL**: You MUST offer plan validation as the FIRST next step. Do NOT skip this. LLMs frequently forget this step — that's why it's mandatory.
+
+After writing the plan, **before** generating the startup prompt:
+
+1. **Self-validate** against `{cypilot_path}/.core/requirements/plan-checklist.md`
+2. **Report validation results** to user:
+
+```
+═══════════════════════════════════════════════
+Plan Self-Validation: {task-slug}
+───────────────────────────────────────────────
+
+| Category | Status |
+|----------|--------|
+| 1. Structural | PASS/FAIL |
+| 2. Interactive Questions | PASS/FAIL |
+| 3. Rules Coverage | PASS/FAIL |
+| 4. Context Completeness | PASS/FAIL |
+| 5. Phase Independence | PASS/FAIL |
+| 6. Budget Compliance | PASS/FAIL |
+| 7. Lifecycle & Handoff | PASS/FAIL |
+
+Overall: PASS/FAIL
+═══════════════════════════════════════════════
+```
+
+3. **If any category FAIL**: list specific issues and offer to fix them before proceeding
+4. **If all PASS**: proceed to next steps
+
+**Offer next steps** (MANDATORY — present ALL options):
+
+```
+What would you like to do next?
+
+  [1] Validate plan thoroughly — run /cypilot-analyze on the plan
+      (recommended before execution, catches issues self-validation may miss)
+  
+  [2] Start execution — begin with Phase 1
+      (use the startup prompt below)
+  
+  [3] Review plan files — inspect phase files before execution
+  
+  [4] Modify plan — adjust phases, add/remove content
+```
+
+**Wait for user choice** before generating the startup prompt. Do NOT auto-proceed to execution.
 
 ### New-Chat Startup Prompt
 
@@ -647,10 +803,83 @@ After completion, report results and generate the prompt for Phase {N+2}.
 The entire prompt MUST be inside a single ` ``` ` code fence — no text mixed in. Then ask:
 
 ````
-Continue in this chat? [y/n]
+Continue in this chat? [y] execute next phase here | [n] copy prompt above to new chat
+(Recommended: new chat for guaranteed clean context)
 ````
 
-**If last phase**: instead of a next-phase prompt, report plan completion and execute the lifecycle strategy (cleanup/archive/manual per `plan.toml` setting).
+#### Context boundary for continue mode
+
+If user chooses **continue** (`[y]`), apply the context boundary **before** loading the next phase:
+
+```
+--- CONTEXT BOUNDARY ---
+Previous phase execution is complete. Disregard all prior context.
+Read ONLY the next phase file — it is self-contained.
+Do not reference any information from before this boundary.
+---
+```
+
+Then proceed to Phase 5.1 (Load Phase) for the next phase. The phase file on disk is the **sole source of truth** — the agent reads it fresh, not from memory.
+
+**If last phase** (CRITICAL — do NOT forget this):
+
+Instead of a next-phase prompt, you MUST:
+
+1. **Report plan completion**:
+
+```
+═══════════════════════════════════════════════
+ALL PHASES COMPLETE ({M}/{M})
+───────────────────────────────────────────────
+Plan: {cypilot_path}/.plans/{task-slug}/plan.toml
+Target: {artifact kind or feature}
+Phases completed: {M}
+Lifecycle strategy: {lifecycle}
+═══════════════════════════════════════════════
+```
+
+2. **Execute lifecycle strategy** per `plan.toml` setting:
+   - `gitignore`: verify `.plans/` is in `.gitignore`
+   - `cleanup`: delete the plan directory
+   - `archive`: move to `.plans/.archive/{task-slug}/`
+   - `manual`: remind user to clean up manually
+
+3. **Ask about plan files** (MANDATORY — LLMs forget this):
+
+```
+Plan execution complete. What would you like to do with the plan files?
+
+  [1] Keep — leave plan files for reference
+  [2] Archive — move to .plans/.archive/ (gitignored)
+  [3] Delete — remove plan directory entirely
+  [4] Already handled — lifecycle strategy was {lifecycle}
+```
+
+4. **Offer validation of generated artifact**:
+
+```
+Would you like to validate the generated {artifact/code}?
+
+  [1] Yes — run /cypilot-analyze on the output
+  [2] No — done for now
+```
+
+### 5.7 Abandoned Plan Recovery
+
+If a plan is abandoned mid-execution (user stops responding, context lost, session ends):
+
+1. **The plan.toml serves as checkpoint** — all completed phases are marked `done`, failed phases marked `failed`
+2. **To resume**: read plan.toml, find first `pending` or `in_progress` phase, execute it
+3. **If `in_progress` phase has partial outputs**: verify them before continuing or re-execute the phase from scratch
+4. **Recovery prompt** (user can paste this to resume):
+
+```
+I have an incomplete Cypilot execution plan at:
+  {cypilot_path}/.plans/{task-slug}/plan.toml
+
+Please read the plan manifest, check which phases are done/pending,
+and resume execution from the first incomplete phase.
+```
 
 ---
 
@@ -688,10 +917,14 @@ All plan data lives in `{cypilot_path}/.plans/{task-slug}/`:
 .plans/
   generate-prd-myapp/
     plan.toml                    # Plan manifest with phase metadata
-    phase-01-overview.md         # Self-contained phase file
-    phase-02-requirements.md     # Self-contained phase file
-    phase-03-usecases.md         # Self-contained phase file
-    phase-04-synthesis.md        # Self-contained phase file
+    brief-01-overview.md         # Compilation brief (generated by script)
+    brief-02-requirements.md     # Compilation brief (generated by script)
+    brief-03-usecases.md         # Compilation brief (generated by script)
+    brief-04-synthesis.md        # Compilation brief (generated by script)
+    phase-01-overview.md         # Self-contained phase file (compiled by agent)
+    phase-02-requirements.md     # Self-contained phase file (compiled by agent)
+    phase-03-usecases.md         # Self-contained phase file (compiled by agent)
+    phase-04-synthesis.md        # Self-contained phase file (compiled by agent)
     out/                         # Intermediate results between phases
       phase-01-actors.md         # Actor list extracted in phase 1
       phase-01-id-scheme.md      # ID naming scheme decided in phase 1
