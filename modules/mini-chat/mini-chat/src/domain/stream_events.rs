@@ -123,6 +123,13 @@ pub struct QuotaWarning {
     pub remaining_percentage: u8,
     pub warning: bool,
     pub exhausted: bool,
+    /// RFC 3339 timestamp of the next quota-period reset.
+    /// Present when `warning` or `exhausted` is true; absent otherwise.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub next_reset: Option<time::OffsetDateTime>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════

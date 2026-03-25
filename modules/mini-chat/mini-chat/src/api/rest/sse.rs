@@ -296,6 +296,7 @@ mod tests {
                 remaining_percentage: 20,
                 warning: true,
                 exhausted: false,
+                next_reset: Some(time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()),
             }]),
         };
         let json = serde_json::to_string(&data).unwrap();
@@ -304,6 +305,7 @@ mod tests {
         assert!(json.contains("\"warning\":true"));
         assert!(json.contains("\"exhausted\":false"));
         assert!(json.contains("\"tier\":\"premium\""));
+        assert!(json.contains("\"next_reset\""));
     }
 
     #[test]

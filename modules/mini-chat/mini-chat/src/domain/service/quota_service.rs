@@ -94,6 +94,11 @@ impl<QR: QuotaUsageRepository> QuotaService<QR> {
                     remaining_percentage: p.remaining_percentage,
                     warning: p.warning,
                     exhausted: p.exhausted,
+                    next_reset: if p.warning || p.exhausted {
+                        Some(p.next_reset)
+                    } else {
+                        None
+                    },
                 })
             })
             .collect())
