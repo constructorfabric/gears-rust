@@ -321,6 +321,14 @@ impl DataPlaneService for DataPlaneServiceImpl {
             });
         }
 
+        // Validate Content-Type format if present.
+        if !headers::is_valid_content_type(&req_headers) {
+            return Err(DomainError::Validation {
+                detail: "Content-Type header is not a recognized MIME type".into(),
+                instance: instance_uri,
+            });
+        }
+
         // Conditional body conversion — keep streams for streaming request bodies.
         let max_body = self.max_body_size;
         let (body_bytes, body_stream): (Bytes, Option<BodyStream>) = match body {

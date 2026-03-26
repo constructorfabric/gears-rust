@@ -49,6 +49,7 @@ credstore-sdk = { workspace = true }
 dashmap = { workspace = true }
 psl = { workspace = true }
 thiserror = { workspace = true }
+mime = { workspace = true }
 # DP deps
 form_urlencoded = "1"
 pingora-memory-cache = "0.8"

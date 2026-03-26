@@ -150,6 +150,20 @@ pub fn apply_header_rules(headers: &mut HeaderMap, rules: &RequestHeaderRules) {
     }
 }
 
+/// Returns `true` if the Content-Type header (when present) is a valid MIME type.
+/// Returns `false` if the value is not valid UTF-8 or cannot be parsed as a MIME type.
+/// Returns `true` if the header is absent (nothing to validate).
+pub fn is_valid_content_type(headers: &HeaderMap) -> bool {
+    match headers.get(http::header::CONTENT_TYPE) {
+        None => true,
+        Some(ct) => ct
+            .to_str()
+            .ok()
+            .and_then(|v| v.parse::<mime::Mime>().ok())
+            .is_some(),
+    }
+}
+
 /// Set the Host header to match the upstream endpoint.
 pub fn set_host_header(headers: &mut HeaderMap, host: &str, port: u16) {
     let host_value = if port == 443 || port == 80 {
@@ -556,5 +570,32 @@ mod tests {
         assert!(headers.get("x-oagw-debug").is_none());
         assert!(headers.get("x-oagw-trace-id").is_none());
         assert_eq!(headers.get("x-custom").unwrap(), "keep");
+    }
+
+    #[test]
+    fn valid_content_type_accepted() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        assert!(is_valid_content_type(&headers));
+    }
+
+    #[test]
+    fn valid_content_type_with_charset_accepted() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+        assert!(is_valid_content_type(&headers));
+    }
+
+    #[test]
+    fn missing_content_type_accepted() {
+        let headers = HeaderMap::new();
+        assert!(is_valid_content_type(&headers));
+    }
+
+    #[test]
+    fn invalid_content_type_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "not a valid mime type!!!".parse().unwrap());
+        assert!(!is_valid_content_type(&headers));
     }
 }
