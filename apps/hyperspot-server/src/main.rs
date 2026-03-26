@@ -65,6 +65,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install FIPS crypto provider before anything else.
+    // Must run before any TLS config, HTTP client, DB connection, or JWT operation.
+    #[cfg(feature = "fips")]
+    modkit::bootstrap::init_fips_crypto_provider();
+
     let cli = Cli::parse();
 
     // Layered config:

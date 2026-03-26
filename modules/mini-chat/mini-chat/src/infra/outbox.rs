@@ -838,6 +838,9 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 20,
                 model: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+                reasoning_tokens: None,
             },
             latency_ms: mini_chat_sdk::LatencyMs::default(),
             policy_decisions: mini_chat_sdk::PolicyDecisions {

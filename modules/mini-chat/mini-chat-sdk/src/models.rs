@@ -284,9 +284,15 @@ pub struct TierLimits {
 
 /// Token usage reported by the provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct UsageTokens {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens served from provider cache (`OpenAI`: `cached_tokens`).
+    pub cache_read_input_tokens: u64,
+    /// Tokens written to provider cache. Reserved for Anthropic.
+    pub cache_write_input_tokens: u64,
+    pub reasoning_tokens: u64,
 }
 
 /// Canonical usage event payload published via the outbox after finalization.
@@ -308,9 +314,7 @@ pub struct UsageEvent {
     pub actual_credits_micro: i64,
     pub settlement_method: String,
     pub policy_version_applied: i64,
-    #[serde(default)]
     pub web_search_calls: u32,
-    #[serde(default)]
     pub code_interpreter_calls: u32,
     #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,

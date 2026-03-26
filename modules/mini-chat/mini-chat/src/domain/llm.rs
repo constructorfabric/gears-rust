@@ -157,9 +157,24 @@ pub enum LlmTool {
 /// Token usage counters.
 #[domain_model]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[allow(clippy::struct_field_names)]
 pub struct Usage {
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Tokens served from provider cache (`OpenAI`: `cached_tokens`).
+    /// Not exposed in REST/SSE API — used internally for audit and usage events.
+    #[serde(default, skip_serializing)]
+    #[schema(read_only)]
+    pub cache_read_input_tokens: i64,
+    /// Tokens written to provider cache. Reserved for Anthropic.
+    /// Not exposed in REST/SSE API — used internally for audit and usage events.
+    #[serde(default, skip_serializing)]
+    #[schema(read_only)]
+    pub cache_write_input_tokens: i64,
+    /// Not exposed in REST/SSE API — used internally for audit and usage events.
+    #[serde(default, skip_serializing)]
+    #[schema(read_only)]
+    pub reasoning_tokens: i64,
 }
 
 /// A citation extracted from provider annotations.

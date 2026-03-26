@@ -247,6 +247,9 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_tokens: 0,
             }),
             effective_model: "gpt-4o-mini".into(),
             selected_model: "gpt-4o".into(),
@@ -284,6 +287,9 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: 50,
                 output_tokens: 20,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_tokens: 0,
             }),
             effective_model: "gpt-5.2".into(),
             selected_model: "gpt-5.2".into(),

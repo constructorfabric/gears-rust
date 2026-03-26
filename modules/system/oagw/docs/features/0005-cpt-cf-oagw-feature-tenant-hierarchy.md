@@ -176,7 +176,7 @@ Enables partner/customer hierarchies where partners share upstream access with c
 
 ### Enforced Constraint Validation
 
-- [ ] `p2` - **ID**: `cpt-cf-oagw-flow-tenant-enforce-constraints`
+- [x] `p2` - **ID**: `cpt-cf-oagw-flow-tenant-enforce-constraints`
 
 **Actor**: `cpt-cf-oagw-actor-platform-operator`
 
@@ -197,15 +197,15 @@ Enables partner/customer hierarchies where partners share upstream access with c
       1. [x] - `p2` - Override effective auth with ancestor's enforced auth configuration - `inst-enforce-3b1`
    3. [x] - `p2` - **IF** field is plugins with `sharing: enforce` - `inst-enforce-3c`
       1. [x] - `p2` - Ensure enforced plugins remain in chain; descendant cannot remove them - `inst-enforce-3c1`
-   4. [ ] - `p2` - **IF** field is cors with `sharing: enforce` - `inst-enforce-3d`
-      1. [ ] - `p2` - Override effective CORS with ancestor's enforced CORS configuration - `inst-enforce-3d1`
+   4. [x] - `p2` - **IF** field is cors with `sharing: enforce` - `inst-enforce-3d`
+      1. [x] - `p2` - Override effective CORS with ancestor's enforced CORS configuration - `inst-enforce-3d1`
 4. [x] - `p2` - **RETURN** final effective configuration with all enforced constraints applied - `inst-enforce-4`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### Hierarchical Config Merge
 
-- [ ] `p2` - **ID**: `cpt-cf-oagw-algo-tenant-config-merge`
+- [x] `p2` - **ID**: `cpt-cf-oagw-algo-tenant-config-merge`
 
 **Input**: Selected upstream (from alias resolution), ancestor chain (ordered root → descendant), matched route (if any)
 
@@ -220,7 +220,7 @@ Enables partner/customer hierarchies where partners share upstream access with c
       2. [x] - `p2` - Merge rate_limit: **IF** field is absent, inherit from previous level (no limit = unbounded); **IF** `rate_limit_sharing == private` and ancestor is `enforce`, apply `min(ancestor_enforced, descendant)` (enforce cannot be bypassed); **IF** `rate_limit_sharing == private` and no ancestor enforce, replace with descendant rate (local-only); **IF** present with `inherit` or `enforce`, `effective = min(ancestor, descendant)` — stricter always wins - `inst-merge-3a2`
       3. [x] - `p2` - Merge plugins: **IF** field is absent, inherit ancestor plugins; **IF** `plugins_sharing == private` and ancestor is `enforce`, preserve enforced items and append descendant items; **IF** `plugins_sharing == private` and no ancestor enforce, replace with descendant plugins (local-only); **IF** present with `inherit` or `enforce`, concatenate `ancestor.plugins + descendant.plugins`; enforced plugins cannot be removed - `inst-merge-3a3`
       4. [x] - `p2` - Merge tags: `effective_tags = union(ancestor_tags, descendant_tags)` — always add-only semantics; absent tags treated as empty set - `inst-merge-3a4`
-      5. [ ] - `p2` - Merge CORS: **IF** `cors_sharing == private`, skip; **IF** field is absent, inherit from previous level; **IF** `cors_sharing: inherit`, union origins; **IF** `cors_sharing: enforce`, use ancestor CORS - `inst-merge-3a5`
+      5. [x] - `p2` - Merge CORS: **IF** `cors_sharing == private`, skip; **IF** field is absent, inherit from previous level; **IF** `cors_sharing: inherit`, union origins; **IF** `cors_sharing: enforce`, use ancestor CORS - `inst-merge-3a5`
 4. [x] - `p2` - **RETURN** effective configuration with all three layers merged - `inst-merge-4`
 
 > **Layering note**: Per `cpt-cf-oagw-fr-config-layering`, the merge priority is: Upstream (base) < Route < Tenant (highest priority). Step 1 initializes the upstream base. Step 2 applies route-level overrides (route > upstream). Step 3 applies tenant hierarchy overrides last (tenant > route), ensuring tenant `enforce` constraints are never bypassed. Route-level sharing follows the same `private`/`inherit`/`enforce` semantics as upstream-level sharing.
@@ -307,11 +307,9 @@ The system **MUST** support `private`, `inherit`, and `enforce` sharing modes on
 
 ### Implement Hierarchical Config Merge
 
-- [ ] `p2` - **ID**: `cpt-cf-oagw-dod-tenant-config-merge`
+- [x] `p2` - **ID**: `cpt-cf-oagw-dod-tenant-config-merge`
 
-The system **MUST** merge configurations across tenant hierarchy with the following per-field strategies: auth override if `inherit`; rate limits `min(ancestor.enforced, descendant)` — stricter always wins; plugins concatenation (ancestor + descendant); tags union with add-only semantics. The system **MUST** apply the 3-layer merge priority (upstream base < route < tenant) per `cpt-cf-oagw-fr-config-layering`. Absent/null fields **MUST** inherit from the previous level (absent rate_limit = unbounded). Enforced ancestor constraints **MUST** never be bypassed.
-
-> **TODO**: CORS merge paths (union origins for `inherit`, forced for `enforce`) are not yet implemented — `inst-merge-3a5` is open and `cors_sharing` is not yet on the domain model. Uncheck this DoD item until CORS merge is implemented and validated.
+The system **MUST** merge configurations across tenant hierarchy with the following per-field strategies: auth override if `inherit`; rate limits `min(ancestor.enforced, descendant)` — stricter always wins; plugins concatenation (ancestor + descendant); tags union with add-only semantics; CORS unions origins for `inherit` and uses ancestor config for `enforce`. The system **MUST** apply the 3-layer merge priority (upstream base < route < tenant) per `cpt-cf-oagw-fr-config-layering`. Absent/null fields **MUST** inherit from the previous level (absent rate_limit = unbounded). Enforced ancestor constraints **MUST** never be bypassed.
 
 **Implements**:
 - `cpt-cf-oagw-algo-tenant-config-merge`
@@ -373,7 +371,7 @@ The system **MUST** validate `secret_ref` accessibility via `cred_store` for the
 - [x] Plugin merge produces concatenated chain: `ancestor.plugins + descendant.plugins`
 - [x] Enforced ancestor plugins cannot be removed by descendant
 - [x] Tag merge produces union; descendants can add but not remove inherited tags
-- [ ] CORS merge unions origins for `inherit`; uses ancestor config for `enforce`
+- [x] CORS merge unions origins for `inherit`; uses ancestor config for `enforce`
 - [x] Alias resolution walks tenant hierarchy from descendant to root; closest enabled match wins
 - [x] Alias shadowing preserves all enforced ancestor constraints on the shadowed upstream
 - [x] Disabled upstream is skipped during resolution, falling through to next ancestor

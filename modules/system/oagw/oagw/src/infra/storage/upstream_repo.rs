@@ -178,6 +178,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
         }
     }

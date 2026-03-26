@@ -331,6 +331,9 @@ impl ProviderStream {
                 usage: Usage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 partial_content: self.accumulated_text,
             },

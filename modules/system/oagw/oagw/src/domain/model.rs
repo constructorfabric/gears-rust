@@ -198,6 +198,35 @@ pub enum RateLimitStrategy {
 }
 
 // ---------------------------------------------------------------------------
+// CorsConfig
+// ---------------------------------------------------------------------------
+
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CorsHttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+    Head,
+    Options,
+}
+
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorsConfig {
+    pub sharing: SharingMode,
+    pub enabled: bool,
+    pub allowed_origins: Vec<String>,
+    pub allowed_methods: Vec<CorsHttpMethod>,
+    pub allowed_headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub max_age: u32,
+    pub allow_credentials: bool,
+}
+
+// ---------------------------------------------------------------------------
 // PluginBinding / PluginsConfig
 // ---------------------------------------------------------------------------
 
@@ -273,6 +302,7 @@ pub struct Route {
     pub match_rules: MatchRules,
     pub plugins: Option<PluginsConfig>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub cors: Option<CorsConfig>,
     pub tags: Vec<String>,
     pub priority: i32,
     pub enabled: bool,
@@ -291,6 +321,7 @@ pub struct Upstream {
     pub headers: Option<HeadersConfig>,
     pub plugins: Option<PluginsConfig>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub cors: Option<CorsConfig>,
     pub tags: Vec<String>,
 }
 
@@ -325,6 +356,7 @@ pub struct CreateUpstreamRequest {
     pub headers: Option<HeadersConfig>,
     pub plugins: Option<PluginsConfig>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub cors: Option<CorsConfig>,
     pub tags: Vec<String>,
     pub enabled: bool,
 }
@@ -339,6 +371,7 @@ pub struct UpdateUpstreamRequest {
     pub headers: Option<HeadersConfig>,
     pub plugins: Option<PluginsConfig>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub cors: Option<CorsConfig>,
     pub tags: Option<Vec<String>>,
     pub enabled: Option<bool>,
 }
@@ -350,6 +383,7 @@ pub struct CreateRouteRequest {
     pub match_rules: MatchRules,
     pub plugins: Option<PluginsConfig>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub cors: Option<CorsConfig>,
     pub tags: Vec<String>,
     pub priority: i32,
     pub enabled: bool,
@@ -361,6 +395,7 @@ pub struct UpdateRouteRequest {
     pub match_rules: Option<MatchRules>,
     pub plugins: Option<PluginsConfig>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub cors: Option<CorsConfig>,
     pub tags: Option<Vec<String>>,
     pub priority: Option<i32>,
     pub enabled: Option<bool>,

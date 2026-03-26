@@ -209,6 +209,35 @@ pub struct PluginsConfig {
 }
 
 // ---------------------------------------------------------------------------
+// CorsConfig
+// ---------------------------------------------------------------------------
+
+/// HTTP methods supported by CORS configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CorsHttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+    Head,
+    Options,
+}
+
+/// Cross-Origin Resource Sharing (CORS) configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorsConfig {
+    pub sharing: SharingMode,
+    pub enabled: bool,
+    pub allowed_origins: Vec<String>,
+    pub allowed_methods: Vec<CorsHttpMethod>,
+    pub allowed_headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub max_age: u32,
+    pub allow_credentials: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Route matching
 // ---------------------------------------------------------------------------
 
@@ -269,6 +298,7 @@ pub struct Route {
     pub match_rules: MatchRules,
     pub plugins: Option<PluginsConfig>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub cors: Option<CorsConfig>,
     pub tags: Vec<String>,
     pub priority: i32,
     pub enabled: bool,
@@ -288,6 +318,7 @@ pub struct Upstream {
     pub headers: Option<HeadersConfig>,
     pub plugins: Option<PluginsConfig>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub cors: Option<CorsConfig>,
     pub tags: Vec<String>,
 }
 
@@ -324,6 +355,7 @@ pub struct CreateUpstreamRequest {
     headers: Option<HeadersConfig>,
     plugins: Option<PluginsConfig>,
     rate_limit: Option<RateLimitConfig>,
+    cors: Option<CorsConfig>,
     tags: Vec<String>,
     enabled: bool,
 }
@@ -339,6 +371,7 @@ impl CreateUpstreamRequest {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         }
@@ -365,6 +398,9 @@ impl CreateUpstreamRequest {
     pub fn rate_limit(&self) -> Option<&RateLimitConfig> {
         self.rate_limit.as_ref()
     }
+    pub fn cors(&self) -> Option<&CorsConfig> {
+        self.cors.as_ref()
+    }
     pub fn tags(&self) -> &[String] {
         &self.tags
     }
@@ -381,6 +417,7 @@ pub struct CreateUpstreamRequestBuilder {
     headers: Option<HeadersConfig>,
     plugins: Option<PluginsConfig>,
     rate_limit: Option<RateLimitConfig>,
+    cors: Option<CorsConfig>,
     tags: Vec<String>,
     enabled: bool,
 }
@@ -406,6 +443,10 @@ impl CreateUpstreamRequestBuilder {
         self.rate_limit = Some(rate_limit);
         self
     }
+    pub fn cors(mut self, cors: CorsConfig) -> Self {
+        self.cors = Some(cors);
+        self
+    }
     pub fn tags(mut self, tags: Vec<String>) -> Self {
         self.tags = tags;
         self
@@ -423,6 +464,7 @@ impl CreateUpstreamRequestBuilder {
             headers: self.headers,
             plugins: self.plugins,
             rate_limit: self.rate_limit,
+            cors: self.cors,
             tags: self.tags,
             enabled: self.enabled,
         }
@@ -440,6 +482,7 @@ pub struct UpdateUpstreamRequest {
     headers: Option<HeadersConfig>,
     plugins: Option<PluginsConfig>,
     rate_limit: Option<RateLimitConfig>,
+    cors: Option<CorsConfig>,
     tags: Option<Vec<String>>,
     enabled: Option<bool>,
 }
@@ -471,6 +514,9 @@ impl UpdateUpstreamRequest {
     pub fn rate_limit(&self) -> Option<&RateLimitConfig> {
         self.rate_limit.as_ref()
     }
+    pub fn cors(&self) -> Option<&CorsConfig> {
+        self.cors.as_ref()
+    }
     pub fn tags(&self) -> Option<&[String]> {
         self.tags.as_deref()
     }
@@ -488,6 +534,7 @@ pub struct UpdateUpstreamRequestBuilder {
     headers: Option<HeadersConfig>,
     plugins: Option<PluginsConfig>,
     rate_limit: Option<RateLimitConfig>,
+    cors: Option<CorsConfig>,
     tags: Option<Vec<String>>,
     enabled: Option<bool>,
 }
@@ -521,6 +568,10 @@ impl UpdateUpstreamRequestBuilder {
         self.rate_limit = Some(rate_limit);
         self
     }
+    pub fn cors(mut self, cors: CorsConfig) -> Self {
+        self.cors = Some(cors);
+        self
+    }
     pub fn tags(mut self, tags: Vec<String>) -> Self {
         self.tags = Some(tags);
         self
@@ -538,6 +589,7 @@ impl UpdateUpstreamRequestBuilder {
             headers: self.headers,
             plugins: self.plugins,
             rate_limit: self.rate_limit,
+            cors: self.cors,
             tags: self.tags,
             enabled: self.enabled,
         }
@@ -555,6 +607,7 @@ pub struct CreateRouteRequest {
     match_rules: MatchRules,
     plugins: Option<PluginsConfig>,
     rate_limit: Option<RateLimitConfig>,
+    cors: Option<CorsConfig>,
     tags: Vec<String>,
     priority: i32,
     enabled: bool,
@@ -568,6 +621,7 @@ impl CreateRouteRequest {
             match_rules,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             priority: 0,
             enabled: true,
@@ -586,6 +640,9 @@ impl CreateRouteRequest {
     pub fn rate_limit(&self) -> Option<&RateLimitConfig> {
         self.rate_limit.as_ref()
     }
+    pub fn cors(&self) -> Option<&CorsConfig> {
+        self.cors.as_ref()
+    }
     pub fn tags(&self) -> &[String] {
         &self.tags
     }
@@ -602,6 +659,7 @@ pub struct CreateRouteRequestBuilder {
     match_rules: MatchRules,
     plugins: Option<PluginsConfig>,
     rate_limit: Option<RateLimitConfig>,
+    cors: Option<CorsConfig>,
     tags: Vec<String>,
     priority: i32,
     enabled: bool,
@@ -614,6 +672,10 @@ impl CreateRouteRequestBuilder {
     }
     pub fn rate_limit(mut self, rate_limit: RateLimitConfig) -> Self {
         self.rate_limit = Some(rate_limit);
+        self
+    }
+    pub fn cors(mut self, cors: CorsConfig) -> Self {
+        self.cors = Some(cors);
         self
     }
     pub fn tags(mut self, tags: Vec<String>) -> Self {
@@ -634,6 +696,7 @@ impl CreateRouteRequestBuilder {
             match_rules: self.match_rules,
             plugins: self.plugins,
             rate_limit: self.rate_limit,
+            cors: self.cors,
             tags: self.tags,
             priority: self.priority,
             enabled: self.enabled,
@@ -648,6 +711,7 @@ pub struct UpdateRouteRequest {
     match_rules: Option<MatchRules>,
     plugins: Option<PluginsConfig>,
     rate_limit: Option<RateLimitConfig>,
+    cors: Option<CorsConfig>,
     tags: Option<Vec<String>>,
     priority: Option<i32>,
     enabled: Option<bool>,
@@ -668,6 +732,9 @@ impl UpdateRouteRequest {
     pub fn rate_limit(&self) -> Option<&RateLimitConfig> {
         self.rate_limit.as_ref()
     }
+    pub fn cors(&self) -> Option<&CorsConfig> {
+        self.cors.as_ref()
+    }
     pub fn tags(&self) -> Option<&[String]> {
         self.tags.as_deref()
     }
@@ -684,6 +751,7 @@ pub struct UpdateRouteRequestBuilder {
     match_rules: Option<MatchRules>,
     plugins: Option<PluginsConfig>,
     rate_limit: Option<RateLimitConfig>,
+    cors: Option<CorsConfig>,
     tags: Option<Vec<String>>,
     priority: Option<i32>,
     enabled: Option<bool>,
@@ -700,6 +768,10 @@ impl UpdateRouteRequestBuilder {
     }
     pub fn rate_limit(mut self, rate_limit: RateLimitConfig) -> Self {
         self.rate_limit = Some(rate_limit);
+        self
+    }
+    pub fn cors(mut self, cors: CorsConfig) -> Self {
+        self.cors = Some(cors);
         self
     }
     pub fn tags(mut self, tags: Vec<String>) -> Self {
@@ -719,6 +791,7 @@ impl UpdateRouteRequestBuilder {
             match_rules: self.match_rules,
             plugins: self.plugins,
             rate_limit: self.rate_limit,
+            cors: self.cors,
             tags: self.tags,
             priority: self.priority,
             enabled: self.enabled,
@@ -797,6 +870,7 @@ mod tests {
             },
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             priority: 0,
             enabled: true,

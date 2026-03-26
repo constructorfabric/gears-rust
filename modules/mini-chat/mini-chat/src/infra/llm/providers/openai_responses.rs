@@ -79,10 +79,26 @@ pub struct ResponseObject {
     pub usage: RawUsage,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct InputTokensDetails {
+    #[serde(default)]
+    cached_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OutputTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
+    #[serde(default)]
+    input_tokens_details: Option<InputTokensDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<OutputTokensDetails>,
 }
 
 /// Provider error payload from `response.failed` event.
@@ -462,6 +478,17 @@ fn translate_provider_event(event: &ProviderEvent, accumulated_text: &str) -> Tr
             let usage = Usage {
                 input_tokens: response.usage.input_tokens,
                 output_tokens: response.usage.output_tokens,
+                cache_read_input_tokens: response
+                    .usage
+                    .input_tokens_details
+                    .as_ref()
+                    .map_or(0, |d| d.cached_tokens),
+                cache_write_input_tokens: 0,
+                reasoning_tokens: response
+                    .usage
+                    .output_tokens_details
+                    .as_ref()
+                    .map_or(0, |d| d.reasoning_tokens),
             };
             let raw = serde_json::to_value(response).unwrap_or_default();
             TranslatedEvent::Terminal(TerminalOutcome::Completed {
@@ -492,6 +519,9 @@ fn translate_provider_event(event: &ProviderEvent, accumulated_text: &str) -> Tr
                 usage: Usage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 partial_content: accumulated_text.to_owned(),
             })
@@ -878,6 +908,17 @@ impl crate::infra::llm::LlmProvider for OpenAiResponsesProvider {
         let usage = Usage {
             input_tokens: response_obj.usage.input_tokens,
             output_tokens: response_obj.usage.output_tokens,
+            cache_read_input_tokens: response_obj
+                .usage
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens),
+            cache_write_input_tokens: 0,
+            reasoning_tokens: response_obj
+                .usage
+                .output_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.reasoning_tokens),
         };
 
         let raw = serde_json::to_value(&response_obj).unwrap_or_default();
@@ -1588,6 +1629,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_completed_with_token_details() {
+        let event = ServerEvent {
+            event: Some("response.completed".to_string()),
+            data: r#"{"response":{"id":"resp-abc","output":[],"usage":{"input_tokens":800,"output_tokens":200,"input_tokens_details":{"cached_tokens":300},"output_tokens_details":{"reasoning_tokens":60}}}}"#.to_string(),
+            id: None,
+            retry: None,
+        };
+        let result = ProviderEvent::from_server_event(event).unwrap();
+        match result {
+            ProviderEvent::ResponseCompleted { response } => {
+                assert_eq!(
+                    response
+                        .usage
+                        .input_tokens_details
+                        .as_ref()
+                        .unwrap()
+                        .cached_tokens,
+                    300
+                );
+                assert_eq!(
+                    response
+                        .usage
+                        .output_tokens_details
+                        .as_ref()
+                        .unwrap()
+                        .reasoning_tokens,
+                    60
+                );
+            }
+            _ => panic!("expected ResponseCompleted"),
+        }
+    }
+
+    #[test]
     fn parse_response_failed_event() {
         let event = ServerEvent {
             event: Some("response.failed".to_string()),
@@ -1787,6 +1862,8 @@ mod tests {
                 usage: RawUsage {
                     input_tokens: 500,
                     output_tokens: 120,
+                    input_tokens_details: None,
+                    output_tokens_details: None,
                 },
             },
         };
@@ -1802,6 +1879,33 @@ mod tests {
                 assert_eq!(usage.output_tokens, 120);
                 assert_eq!(response_id, "resp-abc");
                 assert_eq!(content, "Hello");
+            }
+            _ => panic!("expected Terminal(Completed)"),
+        }
+    }
+
+    #[test]
+    fn translate_completed_propagates_token_details() {
+        let event = ProviderEvent::ResponseCompleted {
+            response: ResponseObject {
+                id: "resp-xyz".into(),
+                output: vec![],
+                usage: RawUsage {
+                    input_tokens: 800,
+                    output_tokens: 200,
+                    input_tokens_details: Some(InputTokensDetails { cached_tokens: 300 }),
+                    output_tokens_details: Some(OutputTokensDetails {
+                        reasoning_tokens: 60,
+                    }),
+                },
+            },
+        };
+        let translated = translate_provider_event(&event, "");
+        match translated {
+            TranslatedEvent::Terminal(TerminalOutcome::Completed { usage, .. }) => {
+                assert_eq!(usage.cache_read_input_tokens, 300);
+                assert_eq!(usage.reasoning_tokens, 60);
+                assert_eq!(usage.cache_write_input_tokens, 0);
             }
             _ => panic!("expected Terminal(Completed)"),
         }
@@ -1877,6 +1981,8 @@ mod tests {
             usage: RawUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                input_tokens_details: None,
+                output_tokens_details: None,
             },
         };
         let citations = extract_citations(&response, "");
@@ -1911,6 +2017,8 @@ mod tests {
             usage: RawUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                input_tokens_details: None,
+                output_tokens_details: None,
             },
         };
         let citations = extract_citations(&response, "");
@@ -1935,6 +2043,8 @@ mod tests {
             usage: RawUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                input_tokens_details: None,
+                output_tokens_details: None,
             },
         };
         let citations = extract_citations(&response, "");
@@ -1965,6 +2075,8 @@ mod tests {
             usage: RawUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                input_tokens_details: None,
+                output_tokens_details: None,
             },
         };
         let citations = extract_citations(&response, accumulated);
@@ -1995,6 +2107,8 @@ mod tests {
             usage: RawUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                input_tokens_details: None,
+                output_tokens_details: None,
             },
         };
         let citations = extract_citations(&response, "Hello world");
@@ -2025,6 +2139,8 @@ mod tests {
             usage: RawUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                input_tokens_details: None,
+                output_tokens_details: None,
             },
         };
         let citations = extract_citations(&response, "Hello");

@@ -191,6 +191,47 @@ pub enum RateLimitStrategy {
 }
 
 // ---------------------------------------------------------------------------
+// CorsConfig
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "UPPERCASE")]
+#[allow(unknown_lints, de0803_api_snake_case)] // HTTP methods are uppercase per RFC 9110
+pub enum CorsHttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+    Head,
+    Options,
+}
+
+fn default_max_age() -> u32 {
+    86400
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub sharing: SharingMode,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_methods: Vec<CorsHttpMethod>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose_headers: Vec<String>,
+    #[serde(default = "default_max_age")]
+    pub max_age: u32,
+    #[serde(default)]
+    pub allow_credentials: bool,
+}
+
+// ---------------------------------------------------------------------------
 // PluginBinding / PluginsConfig
 // ---------------------------------------------------------------------------
 
@@ -274,6 +315,8 @@ pub struct CreateUpstreamRequest {
     pub plugins: Option<PluginsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default = "default_true")]
@@ -297,6 +340,8 @@ pub struct UpdateUpstreamRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -315,6 +360,8 @@ pub struct CreateRouteRequest {
     pub plugins: Option<PluginsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -331,6 +378,8 @@ pub struct UpdateRouteRequest {
     pub plugins: Option<PluginsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,6 +408,8 @@ pub struct UpstreamResponse {
     pub plugins: Option<PluginsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
@@ -374,6 +425,8 @@ pub struct RouteResponse {
     pub plugins: Option<PluginsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     pub priority: i32,
@@ -562,6 +615,35 @@ impl From<PluginsConfig> for domain::PluginsConfig {
         Self {
             sharing: v.sharing.into(),
             items: v.items.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<CorsHttpMethod> for domain::CorsHttpMethod {
+    fn from(v: CorsHttpMethod) -> Self {
+        match v {
+            CorsHttpMethod::Get => Self::Get,
+            CorsHttpMethod::Post => Self::Post,
+            CorsHttpMethod::Put => Self::Put,
+            CorsHttpMethod::Delete => Self::Delete,
+            CorsHttpMethod::Patch => Self::Patch,
+            CorsHttpMethod::Head => Self::Head,
+            CorsHttpMethod::Options => Self::Options,
+        }
+    }
+}
+
+impl From<CorsConfig> for domain::CorsConfig {
+    fn from(v: CorsConfig) -> Self {
+        Self {
+            sharing: v.sharing.into(),
+            enabled: v.enabled,
+            allowed_origins: v.allowed_origins,
+            allowed_methods: v.allowed_methods.into_iter().map(Into::into).collect(),
+            allowed_headers: v.allowed_headers,
+            expose_headers: v.expose_headers,
+            max_age: v.max_age,
+            allow_credentials: v.allow_credentials,
         }
     }
 }
@@ -802,6 +884,35 @@ impl From<domain::PluginsConfig> for PluginsConfig {
     }
 }
 
+impl From<domain::CorsHttpMethod> for CorsHttpMethod {
+    fn from(v: domain::CorsHttpMethod) -> Self {
+        match v {
+            domain::CorsHttpMethod::Get => Self::Get,
+            domain::CorsHttpMethod::Post => Self::Post,
+            domain::CorsHttpMethod::Put => Self::Put,
+            domain::CorsHttpMethod::Delete => Self::Delete,
+            domain::CorsHttpMethod::Patch => Self::Patch,
+            domain::CorsHttpMethod::Head => Self::Head,
+            domain::CorsHttpMethod::Options => Self::Options,
+        }
+    }
+}
+
+impl From<domain::CorsConfig> for CorsConfig {
+    fn from(v: domain::CorsConfig) -> Self {
+        Self {
+            sharing: v.sharing.into(),
+            enabled: v.enabled,
+            allowed_origins: v.allowed_origins,
+            allowed_methods: v.allowed_methods.into_iter().map(Into::into).collect(),
+            allowed_headers: v.allowed_headers,
+            expose_headers: v.expose_headers,
+            max_age: v.max_age,
+            allow_credentials: v.allow_credentials,
+        }
+    }
+}
+
 impl From<domain::HttpMethod> for HttpMethod {
     fn from(v: domain::HttpMethod) -> Self {
         match v {
@@ -866,6 +977,7 @@ impl From<CreateUpstreamRequest> for domain::CreateUpstreamRequest {
             headers: r.headers.map(Into::into),
             plugins: r.plugins.map(Into::into),
             rate_limit: r.rate_limit.map(Into::into),
+            cors: r.cors.map(Into::into),
             tags: r.tags,
             enabled: r.enabled,
         }
@@ -882,6 +994,7 @@ impl From<UpdateUpstreamRequest> for domain::UpdateUpstreamRequest {
             headers: r.headers.map(Into::into),
             plugins: r.plugins.map(Into::into),
             rate_limit: r.rate_limit.map(Into::into),
+            cors: r.cors.map(Into::into),
             tags: r.tags,
             enabled: r.enabled,
         }
@@ -895,6 +1008,7 @@ impl From<CreateRouteRequest> for domain::CreateRouteRequest {
             match_rules: r.match_rules.into(),
             plugins: r.plugins.map(Into::into),
             rate_limit: r.rate_limit.map(Into::into),
+            cors: r.cors.map(Into::into),
             tags: r.tags,
             priority: r.priority,
             enabled: r.enabled,
@@ -908,6 +1022,7 @@ impl From<UpdateRouteRequest> for domain::UpdateRouteRequest {
             match_rules: r.match_rules.map(Into::into),
             plugins: r.plugins.map(Into::into),
             rate_limit: r.rate_limit.map(Into::into),
+            cors: r.cors.map(Into::into),
             tags: r.tags,
             priority: r.priority,
             enabled: r.enabled,

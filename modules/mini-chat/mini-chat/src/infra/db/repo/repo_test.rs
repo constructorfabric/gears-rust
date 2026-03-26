@@ -435,6 +435,9 @@ async fn cas_update_completed_sets_assistant_message_id() {
                 content: "response".to_owned(),
                 input_tokens: None,
                 output_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+                reasoning_tokens: None,
                 model: None,
                 provider_response_id: None,
             },
@@ -622,6 +625,9 @@ async fn insert_assistant_message_with_usage() {
                 content: "sure, here's the answer".to_owned(),
                 input_tokens: Some(100),
                 output_tokens: Some(50),
+                cache_read_input_tokens: Some(42),
+                cache_write_input_tokens: Some(17),
+                reasoning_tokens: Some(88),
                 model: Some("gpt-5.2".to_owned()),
                 provider_response_id: Some("resp_abc".to_owned()),
             },
@@ -632,6 +638,9 @@ async fn insert_assistant_message_with_usage() {
     assert_eq!(msg.role, MessageRole::Assistant);
     assert_eq!(msg.input_tokens, 100);
     assert_eq!(msg.output_tokens, 50);
+    assert_eq!(msg.cache_read_input_tokens, 42);
+    assert_eq!(msg.cache_write_input_tokens, 17);
+    assert_eq!(msg.reasoning_tokens, 88);
     assert_eq!(msg.model.as_deref(), Some("gpt-5.2"));
 }
 
@@ -672,6 +681,9 @@ async fn find_messages_by_chat_and_request_id() {
             content: "answer".to_owned(),
             input_tokens: None,
             output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
+            reasoning_tokens: None,
             model: None,
             provider_response_id: None,
         },

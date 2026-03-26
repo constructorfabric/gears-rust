@@ -21,6 +21,8 @@ workspace = true
 # Enable the runner and the runtime integration by default.
 default = ["otel", "db"]
 coverage_nightly = []
+# FIPS-140-3: install the AWS-LC FIPS-validated crypto provider at bootstrap
+fips = ["dep:rustls", "rustls/fips"]
 
 # Database integration (modkit-db, migrations, DbManager/DbHandle in contexts/runtime)
 db = ["dep:modkit-db", "dep:sea-orm-migration"]
@@ -72,6 +74,7 @@ chrono = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 dsn = { workspace = true, optional = true }
 modkit-utils = { workspace = true }
+rustls = { workspace = true, optional = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }

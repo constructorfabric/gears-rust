@@ -24,6 +24,10 @@ pub struct Model {
     pub features_used: serde_json::Value,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    /// Reserved for Anthropic cache creation tokens.
+    pub cache_write_input_tokens: i64,
+    pub reasoning_tokens: i64,
     #[sea_orm(column_type = "String(StringLen::N(1024))", nullable)]
     pub model: Option<String>,
     pub is_compressed: bool,

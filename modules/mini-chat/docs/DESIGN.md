@@ -492,7 +492,7 @@ System-task usage messages are enqueued to the dedicated Mini-Chat usage outbox 
   "system_task_type": "thread_summary_update",
   "chat_id": "<chat_uuid>",
   "request_id": "<system_request_uuid>",
-  "usage": { "input_tokens": 5000, "output_tokens": 200 },
+  "usage": { "input_tokens": 5000, "output_tokens": 200, "cache_read_input_tokens": 4000, "cache_write_input_tokens": 0, "reasoning_tokens": 0 },
   "actual_credits_micro": 125000,
   "effective_model": "claude-opus-4",
   "outcome": "completed",
@@ -1914,6 +1914,9 @@ Vector-store cleanup does not have an independent persisted `pending|in_progress
 | features_used | JSONB | Feature flags and counters (nullable) |
 | input_tokens | BIGINT | Actual input tokens for assistant messages (nullable) |
 | output_tokens | BIGINT | Actual output tokens for assistant messages (nullable) |
+| cache_read_input_tokens | BIGINT | Input tokens served from provider cache (default 0). Subset of `input_tokens`, not additive. |
+| cache_write_input_tokens | BIGINT | Input tokens written to provider cache (default 0). Reserved for Anthropic. Subset of `input_tokens`, not additive. |
+| reasoning_tokens | BIGINT | Output tokens consumed by model reasoning/thinking (default 0). Subset of `output_tokens`, not additive. |
 | model | TEXT | **effective_model**: actual model used for this turn after quota/policy evaluation (nullable; set for assistant messages). May differ from `chats.model` (selected_model) when a downgrade occurred. Derived from `chat_turns.effective_model`. |
 | is_compressed | BOOLEAN | True if included in a thread summary |
 | created_at | TIMESTAMPTZ | Creation time |
@@ -5189,7 +5192,14 @@ Settlement (per bucket row — see section 5.4.4):
 
 The authoritative source of actual token usage in P1 is the **provider-reported usage metadata** (`usage.input_tokens`, `usage.output_tokens`) returned by the provider in the terminal response event. If provider usage is present, MiniChat MUST use those values for credit computation. MiniChat MUST NOT attempt to recompute actual token usage independently (e.g., by re-tokenizing the response body or summing estimated component costs).
 
-**Scope of provider-reported usage**: the provider's `input_tokens` and `output_tokens` values reflect the provider's own accounting. Tools, web_search, or RAG internal operations (retrieval passes, reranks, sub-queries) are NOT included in provider token usage unless explicitly reported by the provider in those fields. P1 does NOT rely on provider-specific cost breakdown fields beyond `input_tokens` and `output_tokens`.
+**Scope of provider-reported usage**: the provider's `input_tokens` and `output_tokens` values reflect the provider's own accounting. Tools, web_search, or RAG internal operations (retrieval passes, reranks, sub-queries) are NOT included in provider token usage unless explicitly reported by the provider in those fields.
+
+**Detailed token breakdown**: In addition to total `input_tokens` and `output_tokens`, providers may report detailed breakdowns:
+- `cache_read_input_tokens` — input tokens served from the provider's prompt cache (OpenAI: `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`; Anthropic: `cache_read_input_tokens`). These are a subset of `input_tokens`, not additive.
+- `cache_write_input_tokens` — input tokens written to the provider's prompt cache (reserved for Anthropic: `cache_creation_input_tokens`). These are a subset of `input_tokens`, not additive.
+- `reasoning_tokens` — output tokens consumed by model reasoning/thinking (OpenAI: `completion_tokens_details.reasoning_tokens` / `output_tokens_details.reasoning_tokens`). These are a subset of `output_tokens`, not additive.
+
+These breakdown fields are captured and propagated through audit events and usage events for observability. **Credit computation in P1 uses only total `input_tokens` and `output_tokens`** — cached/reasoning token discounts are not applied. Future phases may introduce differentiated multipliers for cached tokens.
 
 **"Actual spend" in P1** refers strictly to **token-usage-based credits** computed via the canonical `credits_micro()` formula (section 5.3) applied to provider-reported token counts. No separate runtime billing signal is expected for tool execution, web search invocations, or RAG operations in P1. 
 Settlement in P1 is strictly based on provider-reported `input_tokens` and `output_tokens`. 
@@ -6570,7 +6580,10 @@ This endpoint accepts usage settlement events from MiniChat for finalized turn o
   "completion_signal": null,
   "usage": {
     "input_tokens": 123,
-    "output_tokens": 456
+    "output_tokens": 456,
+    "cache_read_input_tokens": 80,
+    "cache_write_input_tokens": 0,
+    "reasoning_tokens": 20
   },
   "actual_credits_micro": 3750000,
   "reserved_credits_micro": 4000000,

@@ -258,6 +258,7 @@ mod tests {
             },
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             priority,
             enabled: true,

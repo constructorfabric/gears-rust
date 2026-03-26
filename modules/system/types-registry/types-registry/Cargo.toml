@@ -1,6 +1,6 @@
 [package]
 name = "cf-types-registry"
-version = "0.1.16"
+version = "0.1.17"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

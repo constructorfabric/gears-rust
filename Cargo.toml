@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Cyber Fabric"]
@@ -212,40 +212,40 @@ verbose_file_reads = "deny"
 
 [workspace.dependencies]
 # libs
-modkit = { package = "cf-modkit", version = "0.6.0", path = "libs/modkit" }
-modkit-http = { package = "cf-modkit-http", version = "0.6.0", path = "libs/modkit-http" }
-modkit-auth = { package = "cf-modkit-auth", version = "0.6.0", path = "libs/modkit-auth" }
-modkit-canonical-errors = { package = "cf-modkit-canonical-errors", version = "0.6.0", path = "libs/modkit-canonical-errors" }
-modkit-db = { package = "cf-modkit-db", version = "0.6.0", path = "libs/modkit-db" }
-modkit-db-macros = { package = "cf-modkit-db-macros", version = "0.6.0", path = "libs/modkit-db-macros" }
-modkit-errors = { package = "cf-modkit-errors", version = "0.6.0", path = "libs/modkit-errors" }
-modkit-errors-macro = { package = "cf-modkit-errors-macro", version = "0.6.0", path = "libs/modkit-errors-macro" }
-modkit-macros = { package = "cf-modkit-macros", version = "0.6.0", path = "libs/modkit-macros" }
-modkit-node-info = { package = "cf-modkit-node-info", version = "0.6.0", path = "libs/modkit-node-info" }
-modkit-odata = { package = "cf-modkit-odata", version = "0.6.0", path = "libs/modkit-odata" }
-modkit-odata-macros = { package = "cf-modkit-odata-macros", version = "0.6.0", path = "libs/modkit-odata-macros" }
-modkit-sdk = { package = "cf-modkit-sdk", version = "0.6.0", path = "libs/modkit-sdk" }
-modkit-security = { package = "cf-modkit-security", version = "0.6.0", path = "libs/modkit-security" }
-modkit-transport-grpc = { package = "cf-modkit-transport-grpc", version = "0.6.0", path = "libs/modkit-transport-grpc" }
-modkit-utils = { package = "cf-modkit-utils", version = "0.6.0", path = "libs/modkit-utils" }
+modkit = { package = "cf-modkit", version = "0.6.1", path = "libs/modkit" }
+modkit-http = { package = "cf-modkit-http", version = "0.6.1", path = "libs/modkit-http" }
+modkit-auth = { package = "cf-modkit-auth", version = "0.6.1", path = "libs/modkit-auth" }
+modkit-canonical-errors = { package = "cf-modkit-canonical-errors", version = "0.6.1", path = "libs/modkit-canonical-errors" }
+modkit-db = { package = "cf-modkit-db", version = "0.6.1", path = "libs/modkit-db" }
+modkit-db-macros = { package = "cf-modkit-db-macros", version = "0.6.1", path = "libs/modkit-db-macros" }
+modkit-errors = { package = "cf-modkit-errors", version = "0.6.1", path = "libs/modkit-errors" }
+modkit-errors-macro = { package = "cf-modkit-errors-macro", version = "0.6.1", path = "libs/modkit-errors-macro" }
+modkit-macros = { package = "cf-modkit-macros", version = "0.6.1", path = "libs/modkit-macros" }
+modkit-node-info = { package = "cf-modkit-node-info", version = "0.6.1", path = "libs/modkit-node-info" }
+modkit-odata = { package = "cf-modkit-odata", version = "0.6.1", path = "libs/modkit-odata" }
+modkit-odata-macros = { package = "cf-modkit-odata-macros", version = "0.6.1", path = "libs/modkit-odata-macros" }
+modkit-sdk = { package = "cf-modkit-sdk", version = "0.6.1", path = "libs/modkit-sdk" }
+modkit-security = { package = "cf-modkit-security", version = "0.6.1", path = "libs/modkit-security" }
+modkit-transport-grpc = { package = "cf-modkit-transport-grpc", version = "0.6.1", path = "libs/modkit-transport-grpc" }
+modkit-utils = { package = "cf-modkit-utils", version = "0.6.1", path = "libs/modkit-utils" }
 
-cf-system-sdks = { version = "0.1.31", path = "libs/system-sdks" }
-cf-system-sdk-directory = { version = "0.1.31", path = "libs/system-sdks/sdks/directory" }
+cf-system-sdks = { version = "0.1.32", path = "libs/system-sdks" }
+cf-system-sdk-directory = { version = "0.1.32", path = "libs/system-sdks/sdks/directory" }
 
 # system modules SDKs
 types-registry-sdk = { package = "cf-types-registry-sdk", version = "0.1.5", path = "modules/system/types-registry/types-registry-sdk" }
-tenant-resolver-sdk = { package = "cf-tenant-resolver-sdk", version = "0.2.14", path = "modules/system/tenant-resolver/tenant-resolver-sdk" }
-authz-resolver-sdk = { package = "cf-authz-resolver-sdk", version = "0.2.15", path = "modules/system/authz-resolver/authz-resolver-sdk" }
-oagw-sdk = { package = "cf-oagw-sdk", version = "0.2.9", path = "modules/system/oagw/oagw-sdk" }
+tenant-resolver-sdk = { package = "cf-tenant-resolver-sdk", version = "0.2.15", path = "modules/system/tenant-resolver/tenant-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-authz-resolver-sdk", version = "0.2.16", path = "modules/system/authz-resolver/authz-resolver-sdk" }
+oagw-sdk = { package = "cf-oagw-sdk", version = "0.3.0", path = "modules/system/oagw/oagw-sdk" }
 
 # credstore
-credstore-sdk = { package = "cf-credstore-sdk", version = "0.1.14", path = "modules/credstore/credstore-sdk" }
+credstore-sdk = { package = "cf-credstore-sdk", version = "0.1.15", path = "modules/credstore/credstore-sdk" }
 
 # mini-chat
-mini-chat-sdk = { package = "cf-mini-chat-sdk", version = "0.8.0", path = "modules/mini-chat/mini-chat-sdk" }
+mini-chat-sdk = { package = "cf-mini-chat-sdk", version = "0.9.0", path = "modules/mini-chat/mini-chat-sdk" }
 
 # system modules
-grpc_hub = { package = "cf-grpc-hub", version = "0.1.17", path = "modules/system/grpc-hub" }
+grpc_hub = { package = "cf-grpc-hub", version = "0.1.18", path = "modules/system/grpc-hub" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

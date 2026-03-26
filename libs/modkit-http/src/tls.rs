@@ -63,7 +63,16 @@ pub fn native_root_certs() -> &'static [CertificateDer<'static>] {
 pub fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     rustls::crypto::CryptoProvider::get_default()
         .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .unwrap_or_else(|| {
+            #[cfg(feature = "fips")]
+            {
+                Arc::new(rustls::crypto::default_fips_provider())
+            }
+            #[cfg(not(feature = "fips"))]
+            {
+                Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+            }
+        })
 }
 
 /// Build a rustls `ClientConfig` using the cached native root certificates.
@@ -110,6 +119,13 @@ pub fn native_roots_client_config() -> Result<rustls::ClientConfig, String> {
         .map_err(|e| format!("failed to set TLS protocol versions: {e}"))?
         .with_root_certificates(root_store)
         .with_no_client_auth();
+
+    #[cfg(feature = "fips")]
+    assert!(
+        config.fips(),
+        "TLS ClientConfig is NOT in FIPS mode - this indicates the FIPS crypto provider \
+         was not installed before TLS configuration was created"
+    );
 
     Ok(config)
 }

@@ -2546,6 +2546,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 response_id: "resp-test".to_owned(),
                 content: full_text,
@@ -2575,6 +2578,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 response_id: "resp-test".to_owned(),
                 content: full_text,
@@ -2616,6 +2622,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 4096,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 partial_content: deltas.iter().copied().collect(),
             })));
@@ -2652,6 +2661,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 response_id: "resp-test".to_owned(),
                 content: "Hello".to_owned(),
@@ -2697,6 +2709,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 response_id: "resp-test".to_owned(),
                 content: "Hello".to_owned(),

@@ -1,7 +1,7 @@
 [package]
 name = "cf-mini-chat"
 description = "Mini-chat module: multi-tenant AI chat"
-version = "0.1.23"
+version = "0.1.24"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -26,7 +26,7 @@ k8s = ["dep:kube", "dep:k8s-openapi"]
 mini-chat-sdk = { workspace = true }
 
 # AuthN resolver for S2S client credentials exchange
-authn-resolver-sdk = { package = "cf-authn-resolver-sdk", version = "0.3.7", path = "../../system/authn-resolver/authn-resolver-sdk" }
+authn-resolver-sdk = { package = "cf-authn-resolver-sdk", version = "0.3.8", path = "../../system/authn-resolver/authn-resolver-sdk" }
 
 # AuthZ resolver for authorization (PEP flow)
 authz-resolver-sdk = { workspace = true }

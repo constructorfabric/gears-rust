@@ -54,6 +54,12 @@ jobs:
       - name: Validate module naming conventions
         run: python3 scripts/validate_module_names.py
 
+      - name: Install Go (required for aws-lc-fips-sys FIPS build)
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: 'stable'
+          cache: false
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@9bc92bc5598b4f3bec5d910d352094982cb0c3b9 # 1.92.0
 

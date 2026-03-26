@@ -76,6 +76,9 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         req: CreateUpstreamRequest,
     ) -> Result<Upstream, DomainError> {
         validate_endpoints(&req.server.endpoints)?;
+        if let Some(ref cors) = req.cors {
+            crate::domain::cors::validate_cors_config(cors)?;
+        }
 
         // Enforce alias derivation / explicit rules.
         let alias = enforce_alias_create(req.alias.as_deref(), &req.server.endpoints)?;
@@ -94,6 +97,7 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
                 auth: req.auth.as_ref(),
                 rate_limit: req.rate_limit.as_ref(),
                 plugins: req.plugins.as_ref(),
+                cors: req.cors.as_ref(),
             },
         )
         .await?;
@@ -109,6 +113,7 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             headers: req.headers,
             plugins: req.plugins,
             rate_limit: req.rate_limit,
+            cors: req.cors,
             tags: req.tags,
         };
 
@@ -193,9 +198,11 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         let effective_auth = req.auth.as_ref().or(existing.auth.as_ref());
         let effective_rate_limit = req.rate_limit.as_ref().or(existing.rate_limit.as_ref());
         let effective_plugins = req.plugins.as_ref().or(existing.plugins.as_ref());
+        let effective_cors = req.cors.as_ref().or(existing.cors.as_ref());
         let has_overrides = effective_auth.is_some()
             || effective_rate_limit.is_some()
-            || effective_plugins.is_some();
+            || effective_plugins.is_some()
+            || effective_cors.is_some();
 
         if has_overrides || endpoints_changed || req.alias.is_some() {
             let tenant_chain = self.build_tenant_chain(ctx).await?;
@@ -207,6 +214,7 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
                     auth: effective_auth,
                     rate_limit: effective_rate_limit,
                     plugins: effective_plugins,
+                    cors: effective_cors,
                 },
             )
             .await?;
@@ -223,6 +231,10 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         }
         if let Some(rate_limit) = req.rate_limit {
             existing.rate_limit = Some(rate_limit);
+        }
+        if let Some(cors) = req.cors {
+            crate::domain::cors::validate_cors_config(&cors)?;
+            existing.cors = Some(cors);
         }
         if let Some(tags) = req.tags {
             existing.tags = tags;
@@ -257,6 +269,10 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         ctx: &SecurityContext,
         req: CreateRouteRequest,
     ) -> Result<Route, DomainError> {
+        if let Some(ref cors) = req.cors {
+            crate::domain::cors::validate_cors_config(cors)?;
+        }
+
         let tenant_id = ctx.subject_tenant_id();
         // Validate that the upstream exists and belongs to this tenant.
         self.upstreams
@@ -276,6 +292,7 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             match_rules: req.match_rules,
             plugins: req.plugins,
             rate_limit: req.rate_limit,
+            cors: req.cors,
             tags: req.tags,
             priority: req.priority,
             enabled: req.enabled,
@@ -326,6 +343,10 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         }
         if let Some(rate_limit) = req.rate_limit {
             existing.rate_limit = Some(rate_limit);
+        }
+        if let Some(cors) = req.cors {
+            crate::domain::cors::validate_cors_config(&cors)?;
+            existing.cors = Some(cors);
         }
         if let Some(tags) = req.tags {
             existing.tags = tags;
@@ -963,6 +984,7 @@ struct BindOverrides<'a> {
     auth: Option<&'a crate::domain::model::AuthConfig>,
     rate_limit: Option<&'a crate::domain::model::RateLimitConfig>,
     plugins: Option<&'a crate::domain::model::PluginsConfig>,
+    cors: Option<&'a crate::domain::model::CorsConfig>,
 }
 
 /// Validate bind constraints when a descendant creates or updates an
@@ -1090,6 +1112,23 @@ async fn validate_bind_constraints(
         }
     }
 
+    // CORS sharing mode constraints (no override permission required).
+    if overrides.cors.is_some() {
+        match ancestor.cors.as_ref().map(|c| c.sharing) {
+            Some(SharingMode::Enforce) => {
+                return Err(DomainError::validation(
+                    "cannot override cors: ancestor upstream has sharing mode 'enforce'",
+                ));
+            }
+            Some(SharingMode::Private) => {
+                return Err(DomainError::validation(
+                    "cannot override cors: ancestor upstream field is private",
+                ));
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -1131,15 +1170,12 @@ async fn validate_secret_ref_accessible(
 ///
 /// Per `cpt-cf-oagw-algo-tenant-alias-shadow` step 2b, an ancestor upstream is
 /// visible if its own tenant matches the requester OR any per-field sharing flag
-/// (`auth`, `rate_limit`, `plugins`) is not `private`.
+/// (`auth`, `rate_limit`, `plugins`, `cors`) is not `private`.
 ///
 /// Returns `false` when all shareable fields are `None` — this is intentional.
-/// An upstream with no auth, rate_limit, or plugins has no configuration to
-/// share with descendants, so it is treated as invisible. Fields without a
+/// An upstream with no auth, rate_limit, plugins, or cors has no configuration
+/// to share with descendants, so it is treated as invisible. Fields without a
 /// sharing mode (e.g. `headers`) do not contribute to visibility.
-///
-/// TODO: when CORS sharing mode lands on the domain model, add `cors` to
-/// the visibility check per the spec (`cors_sharing` is listed in step 2b).
 fn is_visible_to_descendant(upstream: &Upstream) -> bool {
     use crate::domain::model::SharingMode;
 
@@ -1155,8 +1191,12 @@ fn is_visible_to_descendant(upstream: &Upstream) -> bool {
         .plugins
         .as_ref()
         .is_some_and(|p| p.sharing != SharingMode::Private);
+    let cors_shared = upstream
+        .cors
+        .as_ref()
+        .is_some_and(|c| c.sharing != SharingMode::Private);
 
-    auth_shared || rate_shared || plugins_shared
+    auth_shared || rate_shared || plugins_shared || cors_shared
 }
 
 /// Compute the effective upstream configuration by merging ancestor upstreams
@@ -1195,6 +1235,9 @@ pub(crate) fn compute_effective_config(
 
         // Plugins merge
         merge_plugins(&mut effective, layer);
+
+        // CORS merge
+        merge_cors(&mut effective, layer)?;
 
         // Tags: union (add-only)
         for tag in &layer.tags {
@@ -1245,6 +1288,35 @@ pub(crate) fn compute_effective_config(
                 _ => {
                     effective.rate_limit =
                         Some(min_rate_limit(effective.rate_limit.as_ref(), route_rl));
+                }
+            }
+        }
+
+        // Route CORS: follows same sharing semantics as upstream-level merge.
+        // Per inst-merge-3a5: private → skip; inherit → union origins;
+        // enforce → use upstream CORS (keep effective unchanged).
+        if let Some(ref route_cors) = route.cors {
+            let effective_is_enforced = effective
+                .cors
+                .as_ref()
+                .is_some_and(|c| c.sharing == SharingMode::Enforce);
+            if !effective_is_enforced {
+                match route_cors.sharing {
+                    SharingMode::Private | SharingMode::Enforce => {
+                        // Private → skip; Enforce → use upstream CORS.
+                    }
+                    SharingMode::Inherit => {
+                        let mut merged = route_cors.clone();
+                        if let Some(ref upstream_cors) = effective.cors {
+                            for origin in &upstream_cors.allowed_origins {
+                                if !merged.allowed_origins.contains(origin) {
+                                    merged.allowed_origins.push(origin.clone());
+                                }
+                            }
+                        }
+                        crate::domain::cors::validate_cors_config(&merged)?;
+                        effective.cors = Some(merged);
+                    }
                 }
             }
         }
@@ -1322,6 +1394,68 @@ fn merge_rate_limit(effective: &mut Upstream, layer: &Upstream) {
             }
         },
     }
+}
+
+/// Merge CORS config from a descendant layer onto the effective config.
+///
+/// Per `inst-merge-3a5` (feature 0005 — tenant hierarchy):
+/// - `Private`  → skip (do not modify effective).
+/// - Absent     → inherit from previous level; Private must not propagate.
+/// - `Inherit`  → descendant config wins, `allowed_origins` is the union
+///   of ancestor + descendant origins (deduped); Private ancestor origins
+///   are excluded from the union.
+/// - `Enforce`  → use ancestor CORS (keep effective unchanged).
+///
+/// Ancestor enforce is sticky: once effective is `Enforce`, no descendant
+/// can change it regardless of sharing mode.
+fn merge_cors(effective: &mut Upstream, layer: &Upstream) -> Result<(), DomainError> {
+    use crate::domain::model::SharingMode;
+
+    let effective_is_enforced = effective
+        .cors
+        .as_ref()
+        .is_some_and(|c| c.sharing == SharingMode::Enforce);
+
+    match &layer.cors {
+        None => {
+            // Absent → inherit from previous level, but Private must not propagate.
+            if effective
+                .cors
+                .as_ref()
+                .is_some_and(|c| c.sharing == SharingMode::Private)
+            {
+                effective.cors = None;
+            }
+        }
+        Some(_) if effective_is_enforced => {
+            // Ancestor enforced — no descendant can change it.
+        }
+        Some(descendant_cors) => match descendant_cors.sharing {
+            SharingMode::Private => {
+                // Per inst-merge-3a5: private → skip (do not modify effective).
+            }
+            SharingMode::Enforce => {
+                // Per inst-merge-3a5: enforce → use ancestor CORS (keep effective unchanged).
+            }
+            SharingMode::Inherit => {
+                // Union allowed_origins from ancestor + descendant, skipping Private ancestor.
+                let mut merged = descendant_cors.clone();
+                if let Some(ref ancestor) = effective.cors
+                    && ancestor.sharing != SharingMode::Private
+                {
+                    for origin in &ancestor.allowed_origins {
+                        if !merged.allowed_origins.contains(origin) {
+                            merged.allowed_origins.push(origin.clone());
+                        }
+                    }
+                }
+                crate::domain::cors::validate_cors_config(&merged)?;
+                effective.cors = Some(merged);
+            }
+        },
+    }
+
+    Ok(())
 }
 
 /// Return the stricter of two rate limit configs (lower rate wins).
@@ -1488,6 +1622,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         }
@@ -1509,6 +1644,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         }
@@ -1528,6 +1664,7 @@ mod tests {
             },
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             priority: 0,
             enabled: true,
@@ -1606,6 +1743,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         };
@@ -2364,8 +2502,8 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::domain::model::{
-        AuthConfig, PluginBinding, PluginsConfig, RateLimitAlgorithm, RateLimitConfig,
-        RateLimitScope, RateLimitStrategy, SharingMode, SustainedRate, Window,
+        AuthConfig, CorsConfig, CorsHttpMethod, PluginBinding, PluginsConfig, RateLimitAlgorithm,
+        RateLimitConfig, RateLimitScope, RateLimitStrategy, SharingMode, SustainedRate, Window,
     };
 
     fn make_upstream(
@@ -2393,6 +2531,7 @@ mod tests {
             headers: None,
             plugins,
             rate_limit,
+            cors: None,
             tags,
         }
     }
@@ -2625,6 +2764,7 @@ mod tests {
             },
             plugins: None,
             rate_limit: Some(make_rate_limit(SharingMode::Inherit, 50, Window::Minute)),
+            cors: None,
             tags: vec![],
             priority: 0,
             enabled: true,
@@ -2717,7 +2857,315 @@ mod tests {
         assert_eq!(effective.tenant_id, child_id);
     }
 
+    // -- CORS effective config merge tests --
+
+    fn make_cors(sharing: SharingMode, origins: Vec<&str>) -> CorsConfig {
+        CorsConfig {
+            sharing,
+            enabled: true,
+            allowed_origins: origins.into_iter().map(String::from).collect(),
+            allowed_methods: vec![CorsHttpMethod::Get, CorsHttpMethod::Post],
+            allowed_headers: vec!["content-type".into()],
+            expose_headers: vec![],
+            max_age: 3600,
+            allow_credentials: false,
+        }
+    }
+
+    #[test]
+    fn effective_config_cors_inherit_unions_origins() {
+        let t = Uuid::new_v4();
+        let mut root = make_upstream(t, "api", None, None, None, vec![]);
+        root.cors = Some(make_cors(SharingMode::Inherit, vec!["https://parent.com"]));
+        let mut child = make_upstream(t, "api", None, None, None, vec![]);
+        child.cors = Some(make_cors(SharingMode::Inherit, vec!["https://child.com"]));
+
+        let effective = compute_effective_config(&[root, child], None).unwrap();
+        let cors = effective.cors.unwrap();
+        assert!(cors.allowed_origins.contains(&"https://child.com".into()));
+        assert!(cors.allowed_origins.contains(&"https://parent.com".into()));
+    }
+
+    #[test]
+    fn effective_config_cors_private_descendant_skips() {
+        // Per inst-merge-3a5: private → skip (do not modify effective).
+        // When child has Private CORS, the ancestor's CORS is preserved.
+        let t = Uuid::new_v4();
+        let mut root = make_upstream(t, "api", None, None, None, vec![]);
+        root.cors = Some(make_cors(SharingMode::Inherit, vec!["https://parent.com"]));
+        let mut child = make_upstream(t, "api", None, None, None, vec![]);
+        child.cors = Some(make_cors(SharingMode::Private, vec!["https://child.com"]));
+
+        let effective = compute_effective_config(&[root, child], None).unwrap();
+        let cors = effective.cors.unwrap();
+        assert!(
+            cors.allowed_origins.contains(&"https://parent.com".into()),
+            "Private skip: ancestor CORS should be preserved"
+        );
+        assert!(
+            !cors.allowed_origins.contains(&"https://child.com".into()),
+            "Private skip: child origins should NOT appear in effective"
+        );
+    }
+
+    #[test]
+    fn effective_config_cors_enforce_blocks_descendant() {
+        let t = Uuid::new_v4();
+        let mut root = make_upstream(t, "api", None, None, None, vec![]);
+        root.cors = Some(make_cors(SharingMode::Enforce, vec!["https://locked.com"]));
+        let mut child = make_upstream(t, "api", None, None, None, vec![]);
+        child.cors = Some(make_cors(SharingMode::Inherit, vec!["https://child.com"]));
+
+        let effective = compute_effective_config(&[root, child], None).unwrap();
+        let cors = effective.cors.unwrap();
+        assert_eq!(cors.allowed_origins, vec!["https://locked.com"]);
+    }
+
+    #[test]
+    fn effective_config_route_cors_inherit_unions_with_upstream() {
+        let t = Uuid::new_v4();
+        let mut upstream = make_upstream(t, "api", None, None, None, vec![]);
+        upstream.cors = Some(make_cors(
+            SharingMode::Inherit,
+            vec!["https://upstream.com"],
+        ));
+
+        let route = Route {
+            id: Uuid::new_v4(),
+            tenant_id: t,
+            upstream_id: upstream.id,
+            match_rules: MatchRules {
+                http: Some(HttpMatch {
+                    methods: vec![HttpMethod::Get],
+                    path: "/v1".into(),
+                    query_allowlist: vec![],
+                    path_suffix_mode: PathSuffixMode::Append,
+                }),
+                grpc: None,
+            },
+            plugins: None,
+            rate_limit: None,
+            cors: Some(make_cors(SharingMode::Inherit, vec!["https://route.com"])),
+            tags: vec![],
+            priority: 0,
+            enabled: true,
+        };
+
+        let effective =
+            compute_effective_config(std::slice::from_ref(&upstream), Some(&route)).unwrap();
+        let cors = effective.cors.unwrap();
+        assert!(cors.allowed_origins.contains(&"https://route.com".into()));
+        assert!(
+            cors.allowed_origins
+                .contains(&"https://upstream.com".into())
+        );
+    }
+
+    #[test]
+    fn effective_config_cors_private_ancestor_not_inherited_when_absent() {
+        // When ancestor CORS is Private and child has no CORS, effective should be None.
+        let t = Uuid::new_v4();
+        let mut root = make_upstream(t, "api", None, None, None, vec![]);
+        root.cors = Some(make_cors(SharingMode::Private, vec!["https://root.com"]));
+        let child = make_upstream(t, "api", None, None, None, vec![]);
+
+        let effective = compute_effective_config(&[root, child], None).unwrap();
+        assert!(
+            effective.cors.is_none(),
+            "Private ancestor CORS must not propagate to descendants"
+        );
+    }
+
+    #[test]
+    fn effective_config_cors_inherit_skips_private_ancestor_origins() {
+        // When ancestor CORS is Private, its origins should not be unioned into Inherit descendant.
+        let t = Uuid::new_v4();
+        let mut root = make_upstream(t, "api", None, None, None, vec![]);
+        root.cors = Some(make_cors(SharingMode::Private, vec!["https://root.com"]));
+        let mut child = make_upstream(t, "api", None, None, None, vec![]);
+        child.cors = Some(make_cors(SharingMode::Inherit, vec!["https://child.com"]));
+
+        let effective = compute_effective_config(&[root, child], None).unwrap();
+        let cors = effective.cors.unwrap();
+        assert!(cors.allowed_origins.contains(&"https://child.com".into()));
+        assert!(
+            !cors.allowed_origins.contains(&"https://root.com".into()),
+            "Private ancestor origins must not be unioned"
+        );
+    }
+
+    #[test]
+    fn effective_config_cors_enforce_descendant_keeps_ancestor() {
+        // Per inst-merge-3a5: enforce → use ancestor CORS (keep effective unchanged).
+        let t = Uuid::new_v4();
+        let mut root = make_upstream(t, "api", None, None, None, vec![]);
+        root.cors = Some(make_cors(
+            SharingMode::Inherit,
+            vec!["https://ancestor.com"],
+        ));
+        let mut child = make_upstream(t, "api", None, None, None, vec![]);
+        child.cors = Some(make_cors(SharingMode::Enforce, vec!["https://child.com"]));
+
+        let effective = compute_effective_config(&[root, child], None).unwrap();
+        let cors = effective.cors.unwrap();
+        assert_eq!(
+            cors.allowed_origins,
+            vec!["https://ancestor.com"],
+            "Enforce descendant should keep ancestor CORS unchanged"
+        );
+    }
+
+    #[test]
+    fn effective_config_cors_merge_rejects_invalid_union() {
+        // Unioning origins can produce an invalid config (credentials + wildcard).
+        let t = Uuid::new_v4();
+        let mut root = make_upstream(t, "api", None, None, None, vec![]);
+        root.cors = Some(CorsConfig {
+            sharing: SharingMode::Inherit,
+            enabled: true,
+            allowed_origins: vec!["*".into()],
+            allowed_methods: vec![CorsHttpMethod::Get],
+            allowed_headers: vec![],
+            expose_headers: vec![],
+            max_age: 3600,
+            allow_credentials: false,
+        });
+        let mut child = make_upstream(t, "api", None, None, None, vec![]);
+        child.cors = Some(CorsConfig {
+            sharing: SharingMode::Inherit,
+            enabled: true,
+            allowed_origins: vec!["https://child.com".into()],
+            allowed_methods: vec![CorsHttpMethod::Get],
+            allowed_headers: vec![],
+            expose_headers: vec![],
+            max_age: 3600,
+            allow_credentials: true,
+        });
+
+        let result = compute_effective_config(&[root, child], None);
+        assert!(
+            result.is_err(),
+            "Merged CORS with credentials + wildcard must be rejected"
+        );
+    }
+
+    #[test]
+    fn effective_config_route_cors_merge_rejects_invalid_union() {
+        let t = Uuid::new_v4();
+        let mut upstream = make_upstream(t, "api", None, None, None, vec![]);
+        upstream.cors = Some(CorsConfig {
+            sharing: SharingMode::Inherit,
+            enabled: true,
+            allowed_origins: vec!["*".into()],
+            allowed_methods: vec![CorsHttpMethod::Get],
+            allowed_headers: vec![],
+            expose_headers: vec![],
+            max_age: 3600,
+            allow_credentials: false,
+        });
+
+        let route = Route {
+            id: Uuid::new_v4(),
+            tenant_id: t,
+            upstream_id: upstream.id,
+            match_rules: MatchRules {
+                http: Some(HttpMatch {
+                    methods: vec![HttpMethod::Get],
+                    path: "/v1".into(),
+                    query_allowlist: vec![],
+                    path_suffix_mode: PathSuffixMode::Append,
+                }),
+                grpc: None,
+            },
+            plugins: None,
+            rate_limit: None,
+            cors: Some(CorsConfig {
+                sharing: SharingMode::Inherit,
+                enabled: true,
+                allowed_origins: vec!["https://route.com".into()],
+                allowed_methods: vec![CorsHttpMethod::Get],
+                allowed_headers: vec![],
+                expose_headers: vec![],
+                max_age: 3600,
+                allow_credentials: true,
+            }),
+            tags: vec![],
+            priority: 0,
+            enabled: true,
+        };
+
+        let result = compute_effective_config(std::slice::from_ref(&upstream), Some(&route));
+        assert!(
+            result.is_err(),
+            "Route CORS merge with credentials + wildcard must be rejected"
+        );
+    }
+
     // -- Ancestor bind validation tests --
+
+    #[tokio::test]
+    async fn bind_rejects_cors_override_on_enforce() {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let resolver =
+            MockTenantResolverClient::with_hierarchy(vec![TenantId(root), TenantId(child)]);
+        let svc = make_service_with_resolver(resolver);
+
+        // Root upstream with enforced CORS.
+        let root_ctx = test_ctx(root);
+        let mut req = make_create_upstream_hostname();
+        req.cors = Some(CorsConfig {
+            sharing: SharingMode::Enforce,
+            enabled: true,
+            allowed_origins: vec!["https://locked.com".into()],
+            allowed_methods: vec![CorsHttpMethod::Get],
+            allowed_headers: vec![],
+            expose_headers: vec![],
+            max_age: 3600,
+            allow_credentials: false,
+        });
+        svc.create_upstream(&root_ctx, req).await.unwrap();
+
+        // Child attempts to override CORS → should fail.
+        let child_ctx = test_ctx(child);
+        let mut child_req = make_create_upstream_hostname();
+        child_req.cors = Some(make_cors(SharingMode::Inherit, vec!["https://child.com"]));
+        let result = svc.create_upstream(&child_ctx, child_req).await;
+        assert!(
+            result.is_err(),
+            "CORS override on enforce should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_cors_override_on_private() {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let resolver =
+            MockTenantResolverClient::with_hierarchy(vec![TenantId(root), TenantId(child)]);
+        let svc = make_service_with_resolver(resolver);
+
+        // Root upstream with private CORS but shared auth (so it's visible to descendants).
+        let root_ctx = test_ctx(root);
+        let mut req = make_create_upstream_hostname();
+        req.cors = Some(make_cors(SharingMode::Private, vec!["https://private.com"]));
+        req.auth = Some(AuthConfig {
+            sharing: SharingMode::Inherit,
+            plugin_type: "passthrough".into(),
+            config: None,
+        });
+        svc.create_upstream(&root_ctx, req).await.unwrap();
+
+        // Child attempts to override CORS → should fail (ancestor CORS is private).
+        let child_ctx = test_ctx(child);
+        let mut child_req = make_create_upstream_hostname();
+        child_req.cors = Some(make_cors(SharingMode::Inherit, vec!["https://child.com"]));
+        let result = svc.create_upstream(&child_ctx, child_req).await;
+        assert!(
+            result.is_err(),
+            "CORS override on private should be rejected"
+        );
+    }
 
     #[tokio::test]
     async fn bind_rejects_auth_override_on_enforce() {
@@ -3144,6 +3592,7 @@ mod tests {
             },
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             priority: 0,
             enabled: true,
@@ -3202,6 +3651,7 @@ mod tests {
             },
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             priority: 0,
             enabled: true,
@@ -3229,6 +3679,7 @@ mod tests {
             },
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             priority: 0,
             enabled: true,
@@ -3300,6 +3751,7 @@ mod tests {
                 }],
             }),
             rate_limit: None,
+            cors: None,
             tags: vec![],
             priority: 0,
             enabled: true,
@@ -3333,6 +3785,7 @@ mod tests {
             },
             plugins: None,
             rate_limit: Some(make_rate_limit(SharingMode::Private, 10, Window::Minute)),
+            cors: None,
             tags: vec![],
             priority: 0,
             enabled: true,
@@ -3772,6 +4225,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         };
@@ -3952,6 +4406,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         };
@@ -3987,6 +4442,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         };
@@ -4015,6 +4471,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         };
@@ -4054,6 +4511,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         };
@@ -4094,6 +4552,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
             enabled: true,
         };

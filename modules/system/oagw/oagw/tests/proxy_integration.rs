@@ -8,10 +8,10 @@ use oagw::test_support::{
 use oagw_sdk::Body;
 use oagw_sdk::api::ErrorSource;
 use oagw_sdk::{
-    BurstConfig, CreateRouteRequest, CreateUpstreamRequest, Endpoint, HeadersConfig, HttpMatch,
-    HttpMethod, MatchRules, PassthroughMode, PathSuffixMode, PluginBinding, PluginsConfig,
-    RateLimitAlgorithm, RateLimitConfig, RateLimitScope, RateLimitStrategy, RequestHeaderRules,
-    Scheme, Server, SharingMode, SustainedRate, Window,
+    BurstConfig, CorsConfig, CorsHttpMethod, CreateRouteRequest, CreateUpstreamRequest, Endpoint,
+    HeadersConfig, HttpMatch, HttpMethod, MatchRules, PassthroughMode, PathSuffixMode,
+    PluginBinding, PluginsConfig, RateLimitAlgorithm, RateLimitConfig, RateLimitScope,
+    RateLimitStrategy, RequestHeaderRules, Scheme, Server, SharingMode, SustainedRate, Window,
 };
 use serde_json::json;
 
@@ -2827,5 +2827,679 @@ async fn proxy_transform_error_continues_pipeline() {
         response.status(),
         StatusCode::OK,
         "pipeline should continue despite transform resolution failure"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CORS integration tests
+// ---------------------------------------------------------------------------
+
+fn test_cors_config() -> CorsConfig {
+    CorsConfig {
+        sharing: SharingMode::Private,
+        enabled: true,
+        allowed_origins: vec!["https://example.com".to_string()],
+        allowed_methods: vec![CorsHttpMethod::Get, CorsHttpMethod::Post],
+        allowed_headers: vec!["content-type".to_string(), "authorization".to_string()],
+        expose_headers: vec!["x-request-id".to_string()],
+        max_age: 3600,
+        allow_credentials: false,
+    }
+}
+
+/// Helper: create an upstream with CORS enabled and a single route pointing at the mock.
+async fn setup_cors_upstream(
+    h: &AppHarness,
+    guard: &MockGuard,
+    alias: &str,
+    cors: Option<CorsConfig>,
+) -> uuid::Uuid {
+    let ctx = h.security_context().clone();
+
+    let mut builder = CreateUpstreamRequest::builder(
+        Server {
+            endpoints: vec![Endpoint {
+                scheme: Scheme::Http,
+                host: "127.0.0.1".into(),
+                port: h.mock_port(),
+            }],
+        },
+        "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
+    )
+    .alias(alias);
+
+    if let Some(c) = cors {
+        builder = builder.cors(c);
+    }
+
+    let upstream = h
+        .facade()
+        .create_upstream(ctx.clone(), builder.build())
+        .await
+        .unwrap();
+
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get, HttpMethod::Post],
+                        path: guard.path("/api/data"),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    upstream.id
+}
+
+// CORS: Upstream Vary header is preserved alongside CORS Vary header.
+#[tokio::test]
+async fn cors_actual_request_preserves_upstream_vary() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/api/data",
+        MockResponse {
+            status: 200,
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("vary".into(), "Accept-Encoding".into()),
+            ],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    setup_cors_upstream(&h, &guard, "cors-vary", Some(test_cors_config())).await;
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-vary{}", guard.path("/api/data")))
+        .header("origin", "https://example.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let vary_values: Vec<&str> = response
+        .headers()
+        .get_all(http::header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+
+    assert!(
+        vary_values.iter().any(|v| v.contains("Accept-Encoding")),
+        "upstream Vary: Accept-Encoding must be preserved, got: {vary_values:?}"
+    );
+    assert!(
+        vary_values.iter().any(|v| v.contains("Origin")),
+        "CORS Vary: Origin must be present, got: {vary_values:?}"
+    );
+}
+
+// CORS: Actual request with allowed origin includes CORS headers.
+#[tokio::test]
+async fn cors_actual_request_includes_headers() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "POST",
+        "/api/data",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    setup_cors_upstream(&h, &guard, "cors-actual", Some(test_cors_config())).await;
+
+    let req = http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/cors-actual{}", guard.path("/api/data")))
+        .header("origin", "https://example.com")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"test": true}"#))
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let headers = response.headers();
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "https://example.com"
+    );
+    assert_eq!(
+        headers.get("access-control-expose-headers").unwrap(),
+        "x-request-id"
+    );
+    assert!(
+        headers.get(http::header::VARY).is_some(),
+        "Vary header must be present"
+    );
+}
+
+// CORS: Actual request with disallowed origin gets no CORS headers.
+#[tokio::test]
+async fn cors_actual_request_disallowed_origin_no_cors_headers() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/api/data",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    setup_cors_upstream(&h, &guard, "cors-bad-origin", Some(test_cors_config())).await;
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-bad-origin{}", guard.path("/api/data")))
+        .header("origin", "https://evil.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "disallowed origin should not receive CORS headers"
+    );
+}
+
+// CORS: Preflight with allowed origin/method returns 204 with CORS headers.
+#[tokio::test]
+async fn cors_preflight_allowed_returns_204() {
+    let guard = MockGuard::new();
+
+    let h = AppHarness::builder().build().await;
+    setup_cors_upstream(&h, &guard, "cors-preflight", Some(test_cors_config())).await;
+
+    let req = http::Request::builder()
+        .method(Method::OPTIONS)
+        .uri(format!("/cors-preflight{}", guard.path("/api/data")))
+        .header("origin", "https://example.com")
+        .header("access-control-request-method", "POST")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let headers = response.headers();
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "https://example.com"
+    );
+    assert!(
+        headers.get("access-control-allow-methods").is_some(),
+        "preflight must include allow-methods"
+    );
+    assert_eq!(headers.get("access-control-max-age").unwrap(), "3600");
+    assert!(
+        headers.get(http::header::VARY).is_some(),
+        "preflight must include Vary"
+    );
+}
+
+// CORS: Preflight with disallowed origin returns 403.
+#[tokio::test]
+async fn cors_preflight_rejected_origin_returns_403() {
+    let guard = MockGuard::new();
+
+    let h = AppHarness::builder().build().await;
+    setup_cors_upstream(&h, &guard, "cors-pf-bad-origin", Some(test_cors_config())).await;
+
+    let req = http::Request::builder()
+        .method(Method::OPTIONS)
+        .uri(format!("/cors-pf-bad-origin{}", guard.path("/api/data")))
+        .header("origin", "https://evil.com")
+        .header("access-control-request-method", "GET")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await;
+    assert!(response.is_err(), "rejected preflight should return error");
+}
+
+// CORS: Preflight with disallowed method returns 403.
+#[tokio::test]
+async fn cors_preflight_rejected_method_returns_403() {
+    let guard = MockGuard::new();
+
+    let h = AppHarness::builder().build().await;
+    setup_cors_upstream(&h, &guard, "cors-pf-bad-method", Some(test_cors_config())).await;
+
+    let req = http::Request::builder()
+        .method(Method::OPTIONS)
+        .uri(format!("/cors-pf-bad-method{}", guard.path("/api/data")))
+        .header("origin", "https://example.com")
+        .header("access-control-request-method", "DELETE")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await;
+    assert!(
+        response.is_err(),
+        "preflight with disallowed method should return error"
+    );
+}
+
+// CORS: No CORS config means no CORS headers in response.
+#[tokio::test]
+async fn cors_disabled_no_cors_headers() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/api/data",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    setup_cors_upstream(&h, &guard, "cors-disabled", None).await;
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-disabled{}", guard.path("/api/data")))
+        .header("origin", "https://example.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "no CORS config should produce no CORS headers"
+    );
+}
+
+// CORS: Upstream error (500) still includes CORS headers so browsers can read error details.
+#[tokio::test]
+async fn cors_headers_present_on_upstream_error_response() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/api/data",
+        MockResponse {
+            status: 500,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"error": "internal server error"})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    setup_cors_upstream(&h, &guard, "cors-err", Some(test_cors_config())).await;
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-err{}", guard.path("/api/data")))
+        .header("origin", "https://example.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "https://example.com",
+        "CORS headers must be present even on error responses"
+    );
+}
+
+// CORS: allow_credentials reflects origin and sets credentials header.
+#[tokio::test]
+async fn cors_credentials_reflects_origin() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/api/data",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    let cors = CorsConfig {
+        allow_credentials: true,
+        ..test_cors_config()
+    };
+    setup_cors_upstream(&h, &guard, "cors-creds", Some(cors)).await;
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-creds{}", guard.path("/api/data")))
+        .header("origin", "https://example.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let headers = response.headers();
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "https://example.com",
+        "credentials mode must reflect origin, not wildcard"
+    );
+    assert_eq!(
+        headers.get("access-control-allow-credentials").unwrap(),
+        "true"
+    );
+}
+
+// CORS: Wildcard origin returns literal "*".
+#[tokio::test]
+async fn cors_wildcard_origin_returns_star() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/api/data",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    let cors = CorsConfig {
+        allowed_origins: vec!["*".to_string()],
+        ..test_cors_config()
+    };
+    setup_cors_upstream(&h, &guard, "cors-wildcard", Some(cors)).await;
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-wildcard{}", guard.path("/api/data")))
+        .header("origin", "https://anything.example.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*",
+        "wildcard config must return literal '*'"
+    );
+}
+
+// CORS: Route-level CORS with Inherit merges origins from upstream.
+#[tokio::test]
+async fn cors_route_inherit_merges_origins() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/api/data",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+
+    // Upstream allows https://example.com
+    let upstream_cors = test_cors_config();
+    let mut builder = CreateUpstreamRequest::builder(
+        Server {
+            endpoints: vec![Endpoint {
+                scheme: Scheme::Http,
+                host: "127.0.0.1".into(),
+                port: h.mock_port(),
+            }],
+        },
+        "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
+    )
+    .alias("cors-route-inherit");
+    builder = builder.cors(upstream_cors);
+
+    let upstream = h
+        .facade()
+        .create_upstream(ctx.clone(), builder.build())
+        .await
+        .unwrap();
+
+    // Route adds https://other.com via Inherit sharing.
+    let route_cors = CorsConfig {
+        sharing: SharingMode::Inherit,
+        enabled: true,
+        allowed_origins: vec!["https://other.com".to_string()],
+        allowed_methods: vec![CorsHttpMethod::Get, CorsHttpMethod::Post],
+        allowed_headers: vec!["content-type".to_string(), "authorization".to_string()],
+        expose_headers: vec!["x-request-id".to_string()],
+        max_age: 3600,
+        allow_credentials: false,
+    };
+
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get, HttpMethod::Post],
+                        path: guard.path("/api/data"),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .cors(route_cors)
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    // Request from the route-added origin should be allowed.
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-route-inherit{}", guard.path("/api/data")))
+        .header("origin", "https://other.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h.facade().proxy_request(ctx.clone(), req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "https://other.com",
+        "route-level Inherit origin must be allowed"
+    );
+
+    // Request from the upstream origin should also still be allowed.
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-route-inherit{}", guard.path("/api/data")))
+        .header("origin", "https://example.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h.facade().proxy_request(ctx.clone(), req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "https://example.com",
+        "upstream origin must still be allowed after route Inherit merge"
+    );
+}
+
+// CORS: Preflight with disallowed request header returns error.
+#[tokio::test]
+async fn cors_preflight_rejected_header_returns_error() {
+    let guard = MockGuard::new();
+
+    let h = AppHarness::builder().build().await;
+    setup_cors_upstream(&h, &guard, "cors-pf-bad-hdr", Some(test_cors_config())).await;
+
+    let req = http::Request::builder()
+        .method(Method::OPTIONS)
+        .uri(format!("/cors-pf-bad-hdr{}", guard.path("/api/data")))
+        .header("origin", "https://example.com")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "x-custom-forbidden")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await;
+    assert!(
+        response.is_err(),
+        "preflight with disallowed request header should return error"
+    );
+}
+
+// CORS: Multiple specific origins — matching origin gets headers, non-matching doesn't.
+#[tokio::test]
+async fn cors_multiple_specific_origins() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/api/data",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    let cors = CorsConfig {
+        allowed_origins: vec![
+            "https://alpha.com".to_string(),
+            "https://beta.com".to_string(),
+        ],
+        ..test_cors_config()
+    };
+    setup_cors_upstream(&h, &guard, "cors-multi", Some(cors)).await;
+
+    // Matching origin gets CORS headers.
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-multi{}", guard.path("/api/data")))
+        .header("origin", "https://beta.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "https://beta.com"
+    );
+
+    // Non-matching origin gets no CORS headers.
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/cors-multi{}", guard.path("/api/data")))
+        .header("origin", "https://gamma.com")
+        .body(Body::Empty)
+        .unwrap();
+
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "non-matching origin should not get CORS headers"
     );
 }

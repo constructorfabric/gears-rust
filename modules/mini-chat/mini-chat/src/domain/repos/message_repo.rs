@@ -45,6 +45,9 @@ pub struct InsertAssistantMessageParams {
     pub content: String,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
     pub model: Option<String>,
     pub provider_response_id: Option<String>,
 }

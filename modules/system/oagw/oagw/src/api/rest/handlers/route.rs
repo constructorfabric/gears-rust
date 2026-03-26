@@ -20,6 +20,7 @@ fn to_response(r: Route) -> RouteResponse {
         match_rules: r.match_rules.into(),
         plugins: r.plugins.map(Into::into),
         rate_limit: r.rate_limit.map(Into::into),
+        cors: r.cors.map(Into::into),
         tags: r.tags,
         priority: r.priority,
         enabled: r.enabled,

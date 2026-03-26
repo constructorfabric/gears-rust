@@ -204,7 +204,17 @@ The project uses `aws-lc-rs` (via `rustls`) as its primary TLS cryptographic bac
 | JWT validation | `jsonwebtoken`, `aliri` | `sha2`, `hmac`, `ring` |
 | Database TLS | `sqlx` (`tls-rustls-aws-lc-rs`) | `aws-lc-rs` |
 
-**FIPS-140-3 status:** the current build **does not** enable FIPS mode. `aws-lc-rs` supports a `fips` feature flag that switches to the FIPS-validated AWS-LC module (`aws-lc-fips-sys`), providing a viable path to FIPS-140-3 compliance. Enabling it requires replacing `ring`-dependent libraries and building with CMake + Go toolchains. See [Opportunities for Improvement](#13-opportunities-for-improvement) for the roadmap.
+**FIPS-140-3 support:** the application can be built with FIPS-140-3 approved cryptography by enabling the `fips` feature flag:
+
+```sh
+cargo build -p hyperspot-server --features fips
+```
+
+This switches the underlying cryptographic module from `aws-lc-sys` to `aws-lc-fips-sys` — the FIPS-validated AWS-LC module (NIST Certificate #4816). At startup, the FIPS crypto provider is installed as the process-wide default before any TLS, database, JWT, or other cryptographic operations occur. Runtime assertions verify that TLS configurations are operating in FIPS mode; the application fails fast if FIPS mode is expected but not active.
+
+**Build requirements for FIPS:** CMake, Go, C compiler, C++ compiler. These are needed to build the AWS-LC FIPS module with its required integrity checks.
+
+**Important:** enabling the `fips` feature does not automatically make the entire application FIPS-140-3 compliant. Full compliance also depends on the deployment environment, operating system, and adherence to the AWS-LC security policy constraints. The `ring` crate remains in the dependency graph via `pingora-rustls` (certificate hashing only, not TLS crypto) and `aliri` (token lifecycle); these do not participate in TLS cryptographic operations.
 
 ## 8. Continuous Fuzzing
 
@@ -290,7 +300,7 @@ This ensures every new service or module repository starts with the same defense
 
 The following areas have been identified for future hardening:
 
-1. **FIPS-140-3 compliance** — enable the `aws-lc-rs` `fips` feature to switch TLS to the FIPS-validated AWS-LC module; replace `ring`-dependent libraries (`aliri`, `rustls-webpki`) with FIPS-capable alternatives; route JWT and hashing operations through `aws-lc-fips-sys`
+1. **FIPS-140-3 compliance (remaining work)** — the `fips` feature flag is implemented and enables FIPS-validated TLS via `aws-lc-fips-sys`. Remaining items: replace `ring`-dependent libraries (`aliri` for token lifecycle, `pingora-rustls` for certificate hashing) to fully eliminate `ring` from the dependency graph; route JWT and hashing operations through `aws-lc-fips-sys`
 2. **Security guidelines in spec templates** — add explicit security checklist sections to PRD and DESIGN templates (threat modeling, data classification, authentication requirements per feature)
 3. **Security-focused dylint lints** — extend the `DE07xx` series with additional rules, such as:
    - Detecting hardcoded secrets or API keys

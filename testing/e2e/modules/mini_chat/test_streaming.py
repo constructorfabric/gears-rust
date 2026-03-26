@@ -66,6 +66,11 @@ class TestStreamDoneEvent:
         assert usage is not None
         assert usage["input_tokens"] > 0
         assert usage["output_tokens"] > 0
+        # Token breakdown fields (cache_read/write, reasoning) are internal-only
+        # and not exposed in the SSE API.
+        assert "cache_read_input_tokens" not in usage
+        assert "cache_write_input_tokens" not in usage
+        assert "reasoning_tokens" not in usage
 
     def test_done_does_not_have_message_id(self, provider_chat):
         """message_id moved to stream_started; done should not carry it."""

@@ -24,6 +24,7 @@ fn to_response(u: Upstream) -> UpstreamResponse {
         headers: u.headers.map(Into::into),
         plugins: u.plugins.map(Into::into),
         rate_limit: u.rate_limit.map(Into::into),
+        cors: u.cors.map(Into::into),
         tags: u.tags,
     }
 }

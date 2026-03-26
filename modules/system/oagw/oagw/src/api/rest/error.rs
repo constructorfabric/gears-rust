@@ -32,6 +32,12 @@ pub(crate) const ERR_CONNECTION_TIMEOUT: &str =
     "gts.x.core.errors.err.v1~x.oagw.timeout.connection.v1";
 pub(crate) const ERR_REQUEST_TIMEOUT: &str = "gts.x.core.errors.err.v1~x.oagw.timeout.request.v1";
 pub(crate) const ERR_GUARD_REJECTED: &str = "gts.x.core.errors.err.v1~x.oagw.guard.rejected.v1";
+pub(crate) const ERR_CORS_ORIGIN_NOT_ALLOWED: &str =
+    "gts.x.core.errors.err.v1~x.oagw.cors.origin_not_allowed.v1";
+pub(crate) const ERR_CORS_METHOD_NOT_ALLOWED: &str =
+    "gts.x.core.errors.err.v1~x.oagw.cors.method_not_allowed.v1";
+pub(crate) const ERR_CORS_HEADER_NOT_ALLOWED: &str =
+    "gts.x.core.errors.err.v1~x.oagw.cors.header_not_allowed.v1";
 pub(crate) const ERR_FORBIDDEN: &str = "gts.x.core.errors.err.v1~x.oagw.authz.forbidden.v1";
 
 // ---------------------------------------------------------------------------
@@ -58,6 +64,9 @@ fn gts_type(err: &DomainError) -> &str {
         DomainError::ConnectionTimeout { .. } => ERR_CONNECTION_TIMEOUT,
         DomainError::RequestTimeout { .. } => ERR_REQUEST_TIMEOUT,
         DomainError::GuardRejected { .. } => ERR_GUARD_REJECTED,
+        DomainError::CorsOriginNotAllowed { .. } => ERR_CORS_ORIGIN_NOT_ALLOWED,
+        DomainError::CorsMethodNotAllowed { .. } => ERR_CORS_METHOD_NOT_ALLOWED,
+        DomainError::CorsHeaderNotAllowed { .. } => ERR_CORS_HEADER_NOT_ALLOWED,
         DomainError::Forbidden { .. } => ERR_FORBIDDEN,
     }
 }
@@ -87,6 +96,9 @@ fn http_status_code(err: &DomainError) -> StatusCode {
             .ok()
             .filter(|code| code.is_client_error() || code.is_server_error())
             .unwrap_or(StatusCode::BAD_REQUEST),
+        DomainError::CorsOriginNotAllowed { .. }
+        | DomainError::CorsMethodNotAllowed { .. }
+        | DomainError::CorsHeaderNotAllowed { .. } => StatusCode::FORBIDDEN,
         DomainError::Forbidden { .. } => StatusCode::FORBIDDEN,
     }
 }
@@ -109,6 +121,9 @@ fn error_title(err: &DomainError) -> &str {
         DomainError::ConnectionTimeout { .. } => "Connection Timeout",
         DomainError::RequestTimeout { .. } => "Request Timeout",
         DomainError::GuardRejected { .. } => "Guard Rejected",
+        DomainError::CorsOriginNotAllowed { .. } => "CORS Origin Not Allowed",
+        DomainError::CorsMethodNotAllowed { .. } => "CORS Method Not Allowed",
+        DomainError::CorsHeaderNotAllowed { .. } => "CORS Header Not Allowed",
         DomainError::Forbidden { .. } => "Forbidden",
     }
 }
@@ -127,7 +142,10 @@ fn error_instance(err: &DomainError) -> &str {
         | DomainError::ProtocolError { instance, .. }
         | DomainError::ConnectionTimeout { instance, .. }
         | DomainError::RequestTimeout { instance, .. }
-        | DomainError::GuardRejected { instance, .. } => instance,
+        | DomainError::GuardRejected { instance, .. }
+        | DomainError::CorsOriginNotAllowed { instance, .. }
+        | DomainError::CorsMethodNotAllowed { instance, .. }
+        | DomainError::CorsHeaderNotAllowed { instance, .. } => instance,
         DomainError::NotFound { .. }
         | DomainError::Conflict { .. }
         | DomainError::UpstreamDisabled { .. }
@@ -315,6 +333,18 @@ mod tests {
                 status: 400,
                 error_code: "MISSING_HEADER".into(),
                 detail: "test".into(),
+                instance: "/test".into(),
+            },
+            DomainError::CorsOriginNotAllowed {
+                origin: "https://evil.com".into(),
+                instance: "/test".into(),
+            },
+            DomainError::CorsMethodNotAllowed {
+                method: "DELETE".into(),
+                instance: "/test".into(),
+            },
+            DomainError::CorsHeaderNotAllowed {
+                header: "x-custom".into(),
                 instance: "/test".into(),
             },
             DomainError::Forbidden {
