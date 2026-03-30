@@ -1,3 +1,8 @@
+<!--
+Created: 2026-03-30 by Constructor Tech
+Updated: 2026-03-30 by Constructor Tech
+-->
+
 # Technical Design — CyberFabric Serverless SDK Core
 
 
@@ -24,6 +29,7 @@
   - [Relationship to the Serverless Runtime Design](#relationship-to-the-serverless-runtime-design)
   - [Known Technical Debt](#known-technical-debt)
   - [Crate Naming Convention](#crate-naming-convention)
+  - [Comparison with Similar Solutions](#comparison-with-similar-solutions)
 - [5. Non-Applicable Domains](#5-non-applicable-domains)
 - [6. Traceability](#6-traceability)
 
@@ -91,9 +97,9 @@ without requiring callers to annotate anything
 
 | Requirement | Design Response |
 |-------------|-----------------|
-| `cpt-cf-serverless-sdk-core-fr-handler-trait` | `Handler<I, O>` generic async trait in `handler.rs` |
+| `cpt-cf-serverless-sdk-core-fr-handler-trait` | `FunctionHandler<I, O>` generic async trait in `handler.rs` |
 | `cpt-cf-serverless-sdk-core-fr-handler-send-sync` | `Handler: Send + Sync + 'static` bound on the trait definition |
-| `cpt-cf-serverless-sdk-core-fr-workflow-handler-trait` | `WorkflowHandler<I, O>: Handler<I, O>` supertrait in `workflow.rs` |
+| `cpt-cf-serverless-sdk-core-fr-workflow-handler-trait` | `WorkflowHandler<I, O>: FunctionHandler<I, O>` supertrait in `workflow.rs` |
 | `cpt-cf-serverless-sdk-core-fr-compensation-input` | `CompensationInput` struct in `workflow.rs`, `#[non_exhaustive]` |
 | `cpt-cf-serverless-sdk-core-fr-context` | `Context` struct in `context.rs` with 9 fields from `InvocationRecord` |
 | `cpt-cf-serverless-sdk-core-fr-deadline-helpers` | `is_deadline_exceeded()` and `remaining_time()` on `Context` |
@@ -117,7 +123,7 @@ without requiring callers to annotate anything
 
 | ADR ID | Decision Summary |
 |--------|-----------------|
-| `cpt-cf-serverless-sdk-core-adr-async-trait` | Use `async-trait` over RPITIT for `Handler` and `WorkflowHandler` |
+| `cpt-cf-serverless-sdk-core-adr-async-trait` | Use `async-trait` over RPITIT for `FunctionHandler` and `WorkflowHandler` |
 | `cpt-cf-serverless-sdk-core-adr-sync-environment` | `Environment` interface is synchronous (adapter pre-fetch model) |
 | `cpt-cf-serverless-sdk-core-adr-compensation-input` | `CompensationInput` is a structured type, not a generic handler input |
 | `cpt-cf-serverless-sdk-core-adr-context-struct` | `Context` is a concrete struct, not a trait or generic parameter |
@@ -129,7 +135,7 @@ without requiring callers to annotate anything
 ```
 ╔══════════════════════════════════════════════════════╗
 ║  Function / Workflow Author                          ║
-║  implements Handler<I, O> or WorkflowHandler<I, O>   ║
+║  implements FunctionHandler<I, O> or WorkflowHandler<I, O>   ║
 ╚═══════════════════════╤══════════════════════════════╝
                         │ uses
 ╔═══════════════════════▼══════════════════════════════╗
@@ -150,7 +156,7 @@ without requiring callers to annotate anything
 
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
-| Handler Author | Implements `Handler<I, O>` / `WorkflowHandler<I, O>` | Rust + `async-trait` |
+| Handler Author | Implements `FunctionHandler<I, O>` / `WorkflowHandler<I, O>` | Rust + `async-trait` |
 | SDK Core (this crate) | Defines traits, types, error model, instrumentation | Rust stable, `serde`, `tracing` |
 | Adapter | Drives handlers, populates `Context` and `Environment`, emits spans | Out of scope (future adapter crates) |
 
@@ -443,17 +449,17 @@ assignment (adapter concern), retry logic (runtime concern).
 
 ##### Why this component exists
 
-`Handler<I, O>` is the base callable contract. Every serverless function — stateless or
-durable — is a `Handler`. This is the SDK expression of
+`FunctionHandler<I, O>` is the base callable contract. Every serverless function — stateless or
+durable — is a `FunctionHandler`. This is the SDK expression of
 `cpt-cf-serverless-runtime-principle-unified-function` and the GTS `function.v1~` base type.
 
 ##### Responsibility scope
 
-Owns: `Handler<I, O>` async trait with `call` method. Declares `I: DeserializeOwned + Send + 'static`
+Owns: `FunctionHandler<I, O>` async trait with `call` method. Declares `I: DeserializeOwned + Send + 'static`
 and `O: Serialize + Send + 'static` bounds. Requires `Self: Send + Sync + 'static`.
 
-The canonical adapter storage pattern is `Arc<dyn Handler<I, O> + Send + Sync>`: shared
-ownership across concurrent invocations on a multi-threaded async runtime. `Box<dyn Handler<I, O>>`
+The canonical adapter storage pattern is `Arc<dyn FunctionHandler<I, O> + Send + Sync>`: shared
+ownership across concurrent invocations on a multi-threaded async runtime. `Box<dyn FunctionHandler<I, O>>`
 is valid for single-owner dispatch but insufficient for shared registry storage.
 
 ##### Responsibility boundaries
@@ -472,13 +478,13 @@ to `InvocationRecord.result` (adapter concern), span emission (trace module conc
 ##### Why this component exists
 
 Durable workflows require compensation capability (saga pattern, BR-133). `WorkflowHandler`
-extends `Handler` with `compensate`, and `CompensationInput` provides the structured context
+extends `FunctionHandler` with `compensate`, and `CompensationInput` provides the structured context
 that compensation handlers receive — expressing the function-level compensation layer without
 coupling to executor-specific step-level APIs.
 
 ##### Responsibility scope
 
-Owns: `WorkflowHandler<I, O>` trait (extends `Handler<I, O>`) with `compensate` method.
+Owns: `WorkflowHandler<I, O>` trait (extends `FunctionHandler<I, O>`) with `compensate` method.
 Owns `CompensationInput` struct (11 fields, all `#[non_exhaustive]`), `FailedStepError` struct,
 and `CompensationTrigger`
 enum (`Failure`, `Cancellation`, `#[non_exhaustive]`).
@@ -548,7 +554,7 @@ known limitation and should be evaluated if SDK misuse is observed in practice.
 
 ### 3.3 API Contracts
 
-#### Handler<I, O> Trait Contract
+#### FunctionHandler<I, O> Trait Contract
 
 - [x] `p1` - **ID**: `cpt-cf-serverless-sdk-core-interface-handler-trait`
 
@@ -557,7 +563,7 @@ known limitation and should be evaluated if SDK misuse is observed in practice.
 - **Stability**: unstable (0.x)
 
 ```
-Handler<I, O>
+FunctionHandler<I, O>
   where I: DeserializeOwned + Send + 'static
         O: Serialize + Send + 'static
   Self: Send + Sync + 'static
@@ -582,11 +588,11 @@ Handler<I, O>
 
 - [x] `p1` - **ID**: `cpt-cf-serverless-sdk-core-interface-workflow-trait`
 
-- **Type**: Rust async trait (`#[async_trait]`), supertrait of `Handler<I, O>`
+- **Type**: Rust async trait (`#[async_trait]`), supertrait of `FunctionHandler<I, O>`
 - **Stability**: unstable (0.x)
 
 ```
-WorkflowHandler<I, O>: Handler<I, O>
+WorkflowHandler<I, O>: FunctionHandler<I, O>
   ─────────────────────────────────────────
   async fn compensate(
       &self,
@@ -605,10 +611,10 @@ WorkflowHandler<I, O>: Handler<I, O>
 
 | Dependency | Interface Used | Purpose |
 |------------|----------------|---------|
-| `serde` | `DeserializeOwned`, `Serialize` derives | Handler I/O type bounds |
+| `serde` | `DeserializeOwned`, `Serialize` derives | `FunctionHandler` I/O type bounds |
 | `serde_json` | `serde_json::Value` | Opaque JSON fields in `CompensationInput` |
 | `thiserror` | `#[derive(thiserror::Error)]` | `ServerlessSdkError` `Display + Error` impl |
-| `async-trait` | `#[async_trait]` | Stable async fn in `Handler` and `WorkflowHandler` |
+| `async-trait` | `#[async_trait]` | Stable async fn in `FunctionHandler` and `WorkflowHandler` |
 | `tracing` | `info_span!`, `info!`, `error!`, `Instrument` | Timeline event emission in `trace.rs` only |
 
 **Dependency Rules**:
@@ -623,7 +629,7 @@ All external integration happens through adapter crates that depend on this crat
 
 ### 3.6 Interactions & Sequences
 
-#### Handler Invocation Flow
+#### FunctionHandler Invocation Flow
 
 **ID**: `cpt-cf-serverless-sdk-core-seq-handler-call`
 
@@ -634,7 +640,7 @@ sequenceDiagram
     participant R as Serverless Runtime
     participant A as Adapter
     participant T as trace::call_instrumented
-    participant H as Handler<I,O> impl
+    participant H as FunctionHandler<I,O> impl
 
     R->>A: start_invocation(InvocationRecord)
     A->>A: populate Context from InvocationRecord
@@ -691,7 +697,7 @@ infrastructure.
 | Boundary | Test Double | Notes |
 |----------|-------------|-------|
 | `Environment` trait | Any `HashMap<String, String>`-backed impl | No credstore SDK, no async setup |
-| `Handler<I, O>` | Direct invocation: `handler.call(&ctx, &env, input).await` | No adapter, no spawned tasks |
+| `FunctionHandler<I, O>` | Direct invocation: `handler.call(&ctx, &env, input).await` | No adapter, no spawned tasks |
 | `WorkflowHandler<I, O>` | Direct invocation: `handler.compensate(&ctx, &env, input).await` | Test idempotency with identical `original_workflow_invocation_id` |
 | `Context` | Fully constructible in tests; set `deadline` to a past `Instant` to test expired-deadline paths | No runtime infrastructure |
 | `trace.rs` | Any `tracing::Subscriber` (e.g., `tracing-subscriber` with test collector) | No SDK-specific subscriber |
@@ -705,7 +711,7 @@ state across invocations. All SDK types are `Send + Sync`, compatible with paral
 | Level | Approach | Scope |
 |-------|----------|-------|
 | Unit | Per-module tests with HashMap-backed `Environment` mock and minimal `Context` | Trait compilation, error variant mapping, deadline helper behavior |
-| Integration | Compile-only test: `impl Handler` + `impl WorkflowHandler` without any adapter crate | Verifies API contract compiles on stable 1.92.0 |
+| Integration | Compile-only test: `impl FunctionHandler` + `impl WorkflowHandler` without any adapter crate | Verifies API contract compiles on stable 1.92.0 |
 | Performance | Criterion benchmark for `call_instrumented` round-trip overhead | Verifies `nfr-low-overhead` threshold (one `Box<dyn Future>` + one span) |
 
 ### Database schemas & tables
@@ -748,7 +754,7 @@ The mapping is documented in this design and enforced by adapters at runtime.
 
 | Solution | Handler model | Context model | Error model | Compensation |
 |----------|---------------|---------------|-------------|--------------|
-| **This crate** | `async trait Handler<I, O>` + `WorkflowHandler<I, O>: Handler<I, O>` | Concrete `Context` struct (platform-owned fields) | `#[non_exhaustive]` enum → `RuntimeErrorCategory` | `WorkflowHandler::compensate` (structured `CompensationInput`) |
+| **This crate** | `async trait FunctionHandler<I, O>` + `WorkflowHandler<I, O>: FunctionHandler<I, O>` | Concrete `Context` struct (platform-owned fields) | `#[non_exhaustive]` enum → `RuntimeErrorCategory` | `WorkflowHandler::compensate` (structured `CompensationInput`) |
 | AWS Lambda Rust Runtime | `fn handler(event: E, ctx: Context) -> Result<R, E>` free-function or `tower::Service` | Concrete `lambda_runtime::Context` struct | `Box<dyn Error>` — opaque, no retry category | None — compensation is application-level |
 | Temporal Rust SDK | `#[workflow]` proc-macro on async fn; activities as `#[activity]` async fn | `workflow::Context` injected via proc-macro | `ApplicationError` with explicit `non_retryable` flag | Step-level rollback via custom activity sequencing; no first-class saga trait |
 | Cloudflare Workers (Rust via wasm) | `#[event(fetch)]` on async fn; `Request`/`Response` types | `Env` struct for bindings | `worker::Error` enum | None |
@@ -768,7 +774,7 @@ The mapping is documented in this design and enforced by adapters at runtime.
   traits directly; no hidden code generation.
 - **Adapter-agnostic by construction**: Unlike Lambda's SDK (AWS-specific) or Workers
   (Cloudflare-specific), this crate has no runtime-specific dependency; the same
-  `Handler` implementation can run on any adapter without modification.
+  `FunctionHandler` implementation can run on any adapter without modification.
 
 ### Known Technical Debt
 

@@ -1,9 +1,10 @@
+<!--
+Created: 2026-03-30 by Constructor Tech
+Updated: 2026-03-30 by Constructor Tech
+-->
 ---
 status: proposed
 date: 2026-03-26
-owner: SDK architecture team
-scope: modules/serverless-sdk
-priority: p0
 ---
 <!--
 =============================================================================
@@ -35,7 +36,7 @@ STANDARDS ALIGNMENT:
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [Option A: Concrete struct `Context`](#option-a-concrete-struct-context)
   - [Option B: `trait InvocationContext`](#option-b-trait-invocationcontext)
-  - [Option C: Generic parameter `Handler<I, O, C: InvocationContext>`](#option-c-generic-parameter-handleri-o-c-invocationcontext)
+  - [Option C: Generic parameter `FunctionHandler<I, O, C: InvocationContext>`](#option-c-generic-parameter-functionhandleri-o-c-invocationcontext)
 - [More Information](#more-information)
 - [Non-Applicable Domains](#non-applicable-domains)
 - [Review Conditions](#review-conditions)
@@ -47,7 +48,7 @@ STANDARDS ALIGNMENT:
 
 ## Context and Problem Statement
 
-`Handler::call` and `WorkflowHandler::compensate` receive an invocation context
+`FunctionHandler::call` and `WorkflowHandler::compensate` receive an invocation context
 that carries identity and execution-constraint fields (`invocation_id`, `tenant_id`,
 `function_id`, `correlation_id`, `trace_id`, `span_id`, `function_version`,
 `attempt_number`, `deadline`). Three structural approaches exist for expressing
@@ -57,22 +58,22 @@ this context in the trait signatures:
    passed as `&Context`.
 2. **Trait** — an `InvocationContext` trait that adapters implement and handler authors
    receive as `&dyn InvocationContext` or `&impl InvocationContext`.
-3. **Generic parameter** — a third type parameter on `Handler`, e.g.
-   `Handler<I, O, C: InvocationContext>`, allowing adapters to supply any concrete type.
+3. **Generic parameter** — a third type parameter on `FunctionHandler`, e.g.
+   `FunctionHandler<I, O, C: InvocationContext>`, allowing adapters to supply any concrete type.
 
 Which approach should the SDK use for the invocation context?
 
 ## Decision Drivers
 
-* **[P1]** Handler implementations must be unit-testable without an adapter or runtime
+* **[P1]** FunctionHandler implementations must be unit-testable without an adapter or runtime
   infrastructure — `Context` must be fully constructible in test code from plain values
   (`cpt-cf-serverless-sdk-core-nfr-testability`).
 * **[P1]** The context fields passed to a handler are fully determined by the Serverless
   Runtime's `InvocationRecord`; the SDK projection is a fixed, documented mapping
   (DESIGN.md §3.1) — the set of fields is stable and platform-owned, not adapter-extensible.
-* **[P2]** Adding a type parameter for context to `Handler<I, O>` widens the trait's
+* **[P2]** Adding a type parameter for context to `FunctionHandler<I, O>` widens the trait's
   generic surface, which propagates to all downstream trait bounds, adapter code, and
-  type-erased `Box<dyn Handler<I, O>>` registries — complexity cost must be justified.
+  type-erased `Box<dyn FunctionHandler<I, O>>` registries — complexity cost must be justified.
 * **[P2]** The crate follows the principle of minimal trusted surface
   (`cpt-cf-serverless-sdk-core-principle-minimal-surface`): no type or abstraction is
   added unless directly required by a stated requirement.
@@ -85,8 +86,8 @@ Which approach should the SDK use for the invocation context?
   members; passed as `&Context` in both `call` and `compensate`.
 * **Option B**: `trait InvocationContext` — an abstract trait with accessor methods for
   each field; adapters implement the trait, handlers receive `&dyn InvocationContext`.
-* **Option C**: Generic parameter `Handler<I, O, C: InvocationContext>` — `Context` is a
-  generic type parameter on the `Handler` trait, bounded by an `InvocationContext` trait;
+* **Option C**: Generic parameter `FunctionHandler<I, O, C: InvocationContext>` — `Context` is a
+  generic type parameter on the `FunctionHandler` trait, bounded by an `InvocationContext` trait;
   adapters supply a concrete `C` and handlers are generic over it.
 
 ## Decision Outcome
@@ -96,7 +97,7 @@ is fully specified by the Serverless Runtime's `InvocationRecord` mapping and is
 platform-owned — there is no legitimate scenario where an adapter needs to supply a
 different context shape, only a different set of field *values*. A concrete struct is
 directly constructible in tests without any runtime infrastructure, which is essential
-for handler unit testing. Adding a third generic parameter to `Handler` or introducing a
+for handler unit testing. Adding a third generic parameter to `FunctionHandler` or introducing a
 trait for a fixed, non-polymorphic data bag would add complexity with no corresponding
 benefit, violating the minimal-surface principle.
 
@@ -115,12 +116,12 @@ benefit, violating the minimal-surface principle.
   workflow run ID). Such fields must be passed through other mechanisms (e.g., a
   separate adapter-specific context struct passed alongside `Context`, or accessed
   via `env: &dyn Environment`).
-* Handler tests construct `Context` directly with plain literals — no mock framework
+* FunctionHandler tests construct `Context` directly with plain literals — no mock framework
   or trait-implementing stub needed. This is the primary testability benefit.
 
 ### Confirmation
 
-* `Handler::call` and `WorkflowHandler::compensate` signatures use `&Context`, not
+* `FunctionHandler::call` and `WorkflowHandler::compensate` signatures use `&Context`, not
   `&dyn InvocationContext` or a generic `C` — verified by inspection of `handler.rs`
   and `workflow.rs`.
 * `Context` is constructible in `#[cfg(test)]` blocks using struct literal syntax —
@@ -131,13 +132,13 @@ benefit, violating the minimal-surface principle.
 
 ### Option A: Concrete struct `Context`
 
-A single `Context` struct with public fields; `Handler::call(&self, ctx: &Context, ...)`.
+A single `Context` struct with public fields; `FunctionHandler::call(&self, ctx: &Context, ...)`.
 
 * Good, because fully constructible in unit tests with no infrastructure.
 * Good, because field access is direct (`ctx.tenant_id`, not `ctx.tenant_id()`) —
   no boilerplate accessor calls.
-* Good, because no additional generic parameter on `Handler` — adapter type-erased
-  registries (`Box<dyn Handler<I, O>>`) work without extra bounds.
+* Good, because no additional generic parameter on `FunctionHandler` — adapter type-erased
+  registries (`Box<dyn FunctionHandler<I, O>>`) work without extra bounds.
 * Good, because the platform-owned field set is expressed once, in one place, with
   one type, owned by the SDK.
 * Neutral, because adapters cannot add fields — adapter-specific data must travel
@@ -165,17 +166,17 @@ An abstract trait; adapters implement it; handlers receive `&dyn InvocationConte
 * Bad, because it implies that the context is behaviorally polymorphic, which it is
   not — `InvocationRecord` has a fixed, well-specified shape.
 
-### Option C: Generic parameter `Handler<I, O, C: InvocationContext>`
+### Option C: Generic parameter `FunctionHandler<I, O, C: InvocationContext>`
 
-`Handler` gains a third generic parameter `C`; adapters supply their concrete type.
+`FunctionHandler` gains a third generic parameter `C`; adapters supply their concrete type.
 
 * Good, because zero-cost abstraction — no vtable, no runtime dispatch.
 * Good, because adapters can carry adapter-specific state in their `C` type without
   any SDK change.
-* Bad, because every use of `Handler` in adapter code, type registries, and wrapper
+* Bad, because every use of `FunctionHandler` in adapter code, type registries, and wrapper
   types now carries three type parameters instead of two — significant complexity
   propagation.
-* Bad, because `Box<dyn Handler<I, O, C>>` is not object-safe for varying `C` —
+* Bad, because `Box<dyn FunctionHandler<I, O, C>>` is not object-safe for varying `C` —
   adapters that store type-erased handlers must pin `C` to a concrete type, eliminating
   the polymorphism benefit.
 * Bad, because it violates the minimal-surface principle: a third generic is added

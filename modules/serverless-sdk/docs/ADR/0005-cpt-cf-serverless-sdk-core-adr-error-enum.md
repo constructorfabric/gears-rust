@@ -1,9 +1,10 @@
+<!--
+Created: 2026-03-30 by Constructor Tech
+Updated: 2026-03-30 by Constructor Tech
+-->
 ---
 status: proposed
 date: 2026-03-26
-owner: SDK architecture team
-scope: modules/serverless-sdk
-priority: p0
 ---
 <!--
 =============================================================================
@@ -33,7 +34,7 @@ STANDARDS ALIGNMENT:
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [Option A: `#[non_exhaustive]` enum with `thiserror`](#option-a-non_exhaustive-enum-with-thiserror)
+  - [Option A: Non-exhaustive enum with `thiserror`](#option-a-non-exhaustive-enum-with-thiserror)
   - [Option B: `Box<dyn Error + Send + Sync>`](#option-b-boxdyn-error--send--sync)
   - [Option C: `anyhow::Error`](#option-c-anyhowerror)
   - [Option D: Rich trait-based error hierarchy](#option-d-rich-trait-based-error-hierarchy)
@@ -48,7 +49,7 @@ STANDARDS ALIGNMENT:
 
 ## Context and Problem Statement
 
-`Handler::call` and `WorkflowHandler::compensate` return
+`FunctionHandler::call` and `WorkflowHandler::compensate` return
 `Result<O, ServerlessSdkError>`. The error type must satisfy two requirements that
 are in tension:
 
@@ -150,7 +151,7 @@ without over-engineering a hierarchy for a bounded error space.
 
 ## Pros and Cons of the Options
 
-### Option A: `#[non_exhaustive]` enum with `thiserror`
+### Option A: Non-exhaustive enum with `thiserror`
 
 Five named variants; each maps to a documented `RuntimeErrorCategory`.
 

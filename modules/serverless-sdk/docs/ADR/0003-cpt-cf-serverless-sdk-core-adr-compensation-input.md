@@ -1,9 +1,10 @@
+<!--
+Created: 2026-03-30 by Constructor Tech
+Updated: 2026-03-30 by Constructor Tech
+-->
 ---
 status: proposed
 date: 2026-03-23
-owner: SDK architecture team
-scope: modules/serverless-sdk
-priority: p2
 ---
 
 # ADR — CompensationInput as a Structured Type (Not a Generic Handler Input)
@@ -34,7 +35,7 @@ priority: p2
 
 ## Context and Problem Statement
 
-`WorkflowHandler<I, O>` extends `Handler<I, O>` with a `compensate` method. The runtime's
+`WorkflowHandler<I, O>` extends `FunctionHandler<I, O>` with a `compensate` method. The runtime's
 `CompensationContext` (`gts.x.core.serverless.compensation_context.v1~`) is passed to the
 compensation function as its `params` field — the same JSON slot used for normal handler
 input. This means two valid approaches exist for the `compensate` method signature:
@@ -156,7 +157,7 @@ Compensation is a standalone trait with a generic input `C` chosen by the author
 - Good, because the compensation input type can be versioned separately from `I`.
 - Bad, because it severs the explicit relationship between `WorkflowHandler` and compensation;
 adapters must check for two separate trait implementations.
-- Bad, because function registration must handle both `Handler<I, O>` and
+- Bad, because function registration must handle both `FunctionHandler<I, O>` and
 `CompensationHandler<C>` independently, complicating adapter discovery.
 - Bad, because the platform already owns the `CompensationContext` schema, so an
 author-controlled `C` provides no independent value while adding a third generic parameter

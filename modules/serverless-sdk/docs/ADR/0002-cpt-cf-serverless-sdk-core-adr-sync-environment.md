@@ -1,9 +1,10 @@
+<!--
+Created: 2026-03-30 by Constructor Tech
+Updated: 2026-03-30 by Constructor Tech
+-->
 ---
 status: proposed
 date: 2026-03-23
-owner: SDK architecture team
-scope: modules/serverless-sdk
-priority: p2
 ---
 <!--
  =============================================================================
@@ -41,7 +42,7 @@ priority: p2
 **ID**: `cpt-cf-serverless-sdk-core-adr-sync-environment`
 ## Context and Problem Statement
 
-`Handler::call` receives an `&dyn Environment` that provides access to configuration
+`FunctionHandler::call` receives an `&dyn Environment` that provides access to configuration
 values and secrets. The platform's secret resolution mechanism is inherently async —
 obtaining a secret requires an I/O call to a remote credential store. The `Environment`
 trait must decide whether `get_secret` (and `get_config`) are synchronous or asynchronous.
@@ -63,7 +64,7 @@ Which interface should the `Environment` trait expose?
 * **[P1]** The `Environment` trait is a testability boundary — unit tests must supply a
   simple `HashMap`-backed mock without any platform infrastructure — non-negotiable for
   developer experience and CI correctness.
-* **[P2]** Handler implementations must remain free of async fetching boilerplate inside
+* **[P2]** FunctionHandler implementations must remain free of async fetching boilerplate inside
   `call` (`cpt-cf-serverless-sdk-core-nfr-authoring-ergonomics`) — ergonomics requirement;
   reduces implementation errors and cognitive burden on function authors.
 * **[P3]** The platform design assumes that secret requirements are declared in the function
@@ -111,7 +112,7 @@ downcasting — a structural cost with no current requirement to justify it.
 ### Consequences
 
 * Adapters are responsible for resolving all configuration values and secrets declared by
-  the function definition before calling `Handler::call`. The expected caching granularity
+  the function definition before calling `FunctionHandler::call`. The expected caching granularity
   is **cold-start**: secrets are pre-fetched once at function cold-start and reused for
   the lifetime of that invocation; adapters MUST NOT re-fetch secrets on every invocation
   unless the platform's credential caching layer already guarantees in-process caching.

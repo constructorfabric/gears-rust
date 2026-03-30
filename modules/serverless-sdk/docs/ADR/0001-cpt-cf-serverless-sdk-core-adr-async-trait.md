@@ -1,9 +1,10 @@
+<!--
+Created: 2026-03-30 by Constructor Tech
+Updated: 2026-03-30 by Constructor Tech
+-->
 ---
 status: proposed
 date: 2026-03-23
-owner: SDK architecture team
-scope: modules/serverless-sdk
-priority: p2
 ---
 <!--
 =============================================================================
@@ -46,7 +47,7 @@ STANDARDS ALIGNMENT:
 **ID**: `cpt-cf-serverless-sdk-core-adr-async-trait`
 ## Context and Problem Statement
 
-`Handler<I, O>` and `WorkflowHandler<I, O>` define async methods (`call`, `compensate`)
+`FunctionHandler<I, O>` and `WorkflowHandler<I, O>` define async methods (`call`, `compensate`)
 so handler implementations can perform async work in their bodies. Adapters dispatch
 handler calls on multi-threaded tokio runtimes, which requires the `Future` returned
 from `call` and `compensate` to be `+ Send`. Rust stable does not provide automatic
@@ -72,9 +73,9 @@ compatible with stable Rust?
 
 * **Option A**: `async-trait` crate — `#[async_trait]` attribute on trait and impls,
   ergonomic `async fn` syntax, `Box<dyn Future + Send>` expansion under the hood;
-  `dyn Handler<I, O>` trait objects remain object-safe.
+  `dyn FunctionHandler<I, O>` trait objects remain object-safe.
 * **Option B**: RPITIT with explicit `Send` bound — `fn call<'a>(&'a self, ...) -> impl Future<Output = ...> + Send + 'a`
-  method signatures; no extra dependency; no boxing; trait objects (`dyn Handler<I, O>`)
+  method signatures; no extra dependency; no boxing; trait objects (`dyn FunctionHandler<I, O>`)
   are **not** object-safe with RPITIT methods.
 * **Option C**: `dynosaur` crate — proc-macro generates a vtable-based `DynHandler`
   wrapper that restores `dyn Trait` object safety for async traits; boxing of the
@@ -93,19 +94,19 @@ drivers simultaneously: it compiles on stable Rust 1.92.0
 (`cpt-cf-serverless-sdk-core-constraint-stable-rust`), the expanded
 `Pin<Box<dyn Future + Send>>` return type guarantees `+ Send` on every handler
 future without any per-impl annotation (`cpt-cf-serverless-sdk-core-nfr-authoring-ergonomics`),
-and `dyn Handler<I, O>` trait objects remain object-safe — which Option B (RPITIT)
+and `dyn FunctionHandler<I, O>` trait objects remain object-safe — which Option B (RPITIT)
 cannot provide. The one heap allocation per invocation is acceptable: a handler
 invocation is a coarse-grained unit of work, not a hot inner loop, and the cost is
 bounded by `cpt-cf-serverless-sdk-core-nfr-low-overhead`.
 
 ### Consequences
 
-* All `Handler<I, O>` and `WorkflowHandler<I, O>` implementors must annotate their `impl`
+* All `FunctionHandler<I, O>` and `WorkflowHandler<I, O>` implementors must annotate their `impl`
   blocks with `#[async_trait]`.
 * The returned `Future` from `call` and `compensate` is heap-allocated (`Box<dyn Future>`),
   adding one allocation per invocation. Acceptable because each invocation is a coarse
   unit of work, not a hot inner loop (`cpt-cf-serverless-sdk-core-nfr-low-overhead`).
-* Trait object dispatch (`dyn Handler<I, O>`) is possible without special ergonomics,
+* Trait object dispatch (`dyn FunctionHandler<I, O>`) is possible without special ergonomics,
   which simplifies adapter type-erased handler registries.
 
 ### Confirmation
@@ -126,7 +127,7 @@ Crate attribute expands `async fn` to `fn ... -> Pin<Box<dyn Future + Send>>`.
 
 * Good, because implementors write natural `async fn call(...)` — no lifetime annotations.
 * Good, because `Future + Send` is guaranteed automatically without per-impl constraints.
-* Good, because trait objects `dyn Handler<I, O>` work out of the box.
+* Good, because trait objects `dyn FunctionHandler<I, O>` work out of the box.
 * Neutral, because one heap allocation per invocation (acceptable for coarse-grained unit of work).
 * Bad, because implementors must remember `#[async_trait]` on every `impl` block.
 
@@ -144,20 +145,20 @@ fn call<'a>(
 * Good, because zero runtime overhead — no boxing.
 * Good, because no additional dependency.
 * Bad, because each method needs explicit lifetime and `+ Send + 'a` annotation — verbose.
-* Bad, because trait objects `dyn Handler<I, O>` are **not** object-safe with RPITIT methods,
-  preventing adapters from storing `Box<dyn Handler<I, O>>`.
+* Bad, because trait objects `dyn FunctionHandler<I, O>` are **not** object-safe with RPITIT methods,
+  preventing adapters from storing `Box<dyn FunctionHandler<I, O>>`.
 * Bad, because the explicit lifetime on the return position is non-obvious and error-prone
   for function authors unfamiliar with RPITIT semantics.
 
 ### Option C: `dynosaur` crate
 
-Proc-macro generates a vtable-based `DynHandler<dyn Handler<I, O>>` wrapper, restoring
+Proc-macro generates a vtable-based `DynHandler<dyn FunctionHandler<I, O>>` wrapper, restoring
 `dyn Trait` object safety for async traits. Boxing of the returned `Future` is shifted
 into the generated vtable rather than exposed at the call site, but a heap allocation
 still occurs per call.
 
-* Good, because `dyn Handler<I, O>` object safety is preserved (the exact weakness of
-  Option B), so adapters can store `Box<dyn Handler<I, O>>` without changes.
+* Good, because `dyn FunctionHandler<I, O>` object safety is preserved (the exact weakness of
+  Option B), so adapters can store `Box<dyn FunctionHandler<I, O>>` without changes.
 * Good, because handler authors still write `async fn call(...)` — ergonomics on par
   with Option A.
 * Bad, because a heap allocation still occurs per call — the boxing is internal to the
@@ -195,9 +196,9 @@ This ADR should be revisited when any of the following conditions is met:
 
 | Trigger | Action |
 |---------|--------|
-| `dyn Trait` object safety for `async fn` methods stabilises on stable Rust | Re-evaluate Option B; RPITIT itself is stable since Rust 1.75 (within our 1.92 baseline), but Option B is still blocked because RPITIT methods are not object-safe — `Box<dyn Handler<I, O>>` is not possible without `async-trait` or equivalent. Track the Rust `dyn async fn` object safety initiative; migration removes the `async-trait` dependency but requires updating all `impl` blocks and is a breaking change for downstream implementors |
+| `dyn Trait` object safety for `async fn` methods stabilises on stable Rust | Re-evaluate Option B; RPITIT itself is stable since Rust 1.75 (within our 1.92 baseline), but Option B is still blocked because RPITIT methods are not object-safe — `Box<dyn FunctionHandler<I, O>>` is not possible without `async-trait` or equivalent. Track the Rust `dyn async fn` object safety initiative; migration removes the `async-trait` dependency but requires updating all `impl` blocks and is a breaking change for downstream implementors |
 | `async-trait` crate is deprecated or unmaintained | Migrate to RPITIT or `dynosaur` (Option C) depending on object-safety requirements |
-| `dynosaur` reaches a stable 1.0 API and gains broad ecosystem adoption | Re-evaluate Option C as an alternative that preserves `dyn Handler<I, O>` object safety; assess whether its per-call allocation profile is meaningfully different from Option A in practice |
+| `dynosaur` reaches a stable 1.0 API and gains broad ecosystem adoption | Re-evaluate Option C as an alternative that preserves `dyn FunctionHandler<I, O>` object safety; assess whether its per-call allocation profile is meaningfully different from Option A in practice |
 | A handler use case emerges that cannot tolerate per-invocation heap allocation (hot inner loop) | Evaluate Option C (`dynosaur`) for that specific handler category; note that per-call allocation is not eliminated but may be restructured |
 
 ## Traceability
