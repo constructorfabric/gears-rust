@@ -3,6 +3,7 @@ status: proposed
 date: 2026-03-23
 owner: SDK architecture team
 scope: modules/serverless-sdk
+priority: p2
 ---
 
 # ADR — CompensationInput as a Structured Type (Not a Generic Handler Input)
@@ -29,23 +30,6 @@ scope: modules/serverless-sdk
 
 <!-- /toc -->
 
-- [Context and Problem Statement](#context-and-problem-statement)
-- [Decision Drivers](#decision-drivers)
-- [Considered Options](#considered-options)
-- [Decision Outcome](#decision-outcome)
-  - [Consequences](#consequences)
-  - [Confirmation](#confirmation)
-- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [Option A: Structured `CompensationInput](#option-a-structured-compensationinput)`
-  - [Option B: Generic input via `I](#option-b-generic-input-via-i)`
-  - [Option C: Separate `CompensationHandler<C>` trait](#option-c-separate-compensationhandlerc-trait)
-- [More Information](#more-information)
-- [Non-Applicable Domains](#non-applicable-domains)
-- [Review Conditions](#review-conditions)
-- [Traceability](#traceability)
-
-
-
 **ID**: `cpt-cf-serverless-sdk-core-adr-compensation-input`
 
 ## Context and Problem Statement
@@ -65,19 +49,21 @@ Which approach should the `compensate` method use?
 
 ## Decision Drivers
 
-- Compensation is a distinct platform concept (saga rollback), not a normal function
-invocation — its input carries different fields (`trigger`, `original_invocation_id`,
-`failed_step_id`, `workflow_state_snapshot`, etc.) than a business function's input `I`.
-- The adapter must construct `CompensationInput` from the runtime's JSON envelope
-regardless; the question is whether that struct is defined in this crate or by the
-function author.
-- Function authors should not need to re-declare a `CompensationContext`-compatible struct
-to implement compensation — the platform owns that envelope's shape.
-- The `WorkflowHandler` trait must express that compensation is a first-class concern of
-all durable workflows, not an optional extension.
-- Compensation idempotency guidance (check `original_invocation_id` before any side effect)
-is invariant across all handlers; it should be expressible in shared SDK documentation,
-not scattered across individual handler structs.
+- **[P1]** Compensation is a distinct platform concept (saga rollback), not a normal
+  function invocation — its input carries different fields (`trigger`,
+  `original_invocation_id`, `failed_step_id`, `workflow_state_snapshot`, etc.) than a
+  business function's input `I` — the type system must express this distinction; mixing
+  the two is a correctness hazard.
+- **[P2]** The adapter must construct `CompensationInput` from the runtime's JSON envelope
+  regardless; the question is whether that struct is defined in this crate or by the
+  function author — the platform owns the envelope's shape, so the SDK should own the type.
+- **[P2]** Function authors should not need to re-declare a `CompensationContext`-compatible
+  struct to implement compensation — reduces boilerplate and eliminates the risk of
+  incompatible author-defined structs.
+- **[P3]** Compensation idempotency guidance (check `original_invocation_id` before any
+  side effect) is invariant across all handlers; it should be expressible in shared SDK
+  documentation, not scattered across individual handler structs — documentation and
+  discoverability concern.
 
 ## Considered Options
 
@@ -96,8 +82,14 @@ a platform-owned, well-specified operation whose input envelope is defined by th
 compensation handler receives an identical, documented struct with guaranteed field presence,
 makes the idempotency contract (check `original_invocation_id`) discoverable at the type
 level, and eliminates the risk of authors inadvertently declaring an incompatible input type.
-The `WorkflowHandler` supertrait relationship expresses that compensation is inseparable
-from the durable execution contract.
+
+Option B was rejected because making `compensate` receive generic `I` forces authors to
+couple their business input type to the `CompensationContext` schema; incompatibility is
+only detectable at runtime via JSON deserialization failure, not at compile time.
+
+Option C was rejected because a standalone `CompensationHandler<C>` trait breaks the
+supertrait relationship established in `cpt-cf-serverless-sdk-core-adr-workflow-supertrait`,
+removing the compile-time guarantee that every workflow is also a callable function.
 
 ### Consequences
 
@@ -166,8 +158,9 @@ Compensation is a standalone trait with a generic input `C` chosen by the author
 adapters must check for two separate trait implementations.
 - Bad, because function registration must handle both `Handler<I, O>` and
 `CompensationHandler<C>` independently, complicating adapter discovery.
-- Bad, because it introduces a third generic parameter (`C`) to the workflow authoring surface
-without proportional benefit — `CompensationInput` is already sufficient.
+- Bad, because the platform already owns the `CompensationContext` schema, so an
+author-controlled `C` provides no independent value while adding a third generic parameter
+to every `WorkflowHandler` implementor.
 
 ## More Information
 
@@ -184,12 +177,14 @@ The following checklist domains are not applicable to this ADR and are explicitl
 
 | Domain | Disposition | Reasoning                                                                                                                                                                   |
 | ------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PERF   | N/A         | `CompensationInput` is a simple deserialization target; the per-invocation cost of deserialising a small JSON struct is negligible compared to the network I/O of a compensation call. Compensation is a low-frequency event (saga rollback on failure), not a hot inner loop. |
 | SEC    | N/A         | Decision concerns compensation input type design; `CompensationInput` carries saga-rollback metadata, not credentials or user PII                                           |
 | REL    | N/A         | No stateful data or SLO; library trait definition only                                                                                                                      |
 | DATA   | N/A         | `CompensationInput` is a deserialization target (no persistence, no schema ownership in this crate); the runtime's `CompensationContext` schema is the authoritative source |
 | OPS    | N/A         | Pure library; no deployment topology, monitoring, or operational concern                                                                                                    |
 | COMPL  | N/A         | Internal developer tooling; no regulatory, certification, or legal requirement                                                                                              |
 | UX     | N/A         | No end-user UI; developer ergonomics are addressed in Decision Outcome                                                                                                      |
+| BIZ    | N/A         | Internal Rust library crate; no business stakeholder buy-in, cost analysis, or time-to-market consideration applicable to a trait signature decision                        |
 
 
 ## Review Conditions
@@ -199,7 +194,8 @@ This ADR should be revisited when any of the following conditions is met:
 
 | Trigger                                                                                                                 | Action                                                                                                          |
 | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| The Serverless Runtime's `CompensationContext` schema adds or removes top-level fields                                  | Review `CompensationInput` field set and update struct; assess breaking-change impact given `#[non_exhaustive]` |
+| The Serverless Runtime's `CompensationContext` schema adds new top-level fields                                         | Review `CompensationInput` field set and update struct; additions are backward-safe given `#[non_exhaustive]` |
+| The Serverless Runtime's `CompensationContext` schema removes or renames an existing field                              | Assess breaking-change impact on all `CompensationInput` consumers; `#[non_exhaustive]` does NOT protect against removals/renames — SDK semver bump required |
 | A concrete requirement emerges for a workflow handler that needs different compensation input types per handler variant | Re-evaluate Option C (`CompensationHandler<C>` trait)                                                           |
 | The runtime introduces a second compensation envelope type (e.g., partial vs. full rollback)                            | Evaluate whether `CompensationInput` can be extended or whether a second type is needed                         |
 
@@ -214,6 +210,4 @@ This decision directly addresses the following requirements and design elements:
 - `cpt-cf-serverless-sdk-core-fr-workflow-handler-trait` — `compensate` method signature
 - `cpt-cf-serverless-sdk-core-fr-compensation-input` — `CompensationInput` struct definition
 - `cpt-cf-serverless-sdk-core-component-workflow` — responsibility scope of `workflow.rs`
-- Serverless Runtime DESIGN `cpt-cf-serverless-runtime-fr-advanced-patterns` BR-133 — two-layer
-compensation model; function-level compensation layer expressed via this trait
 

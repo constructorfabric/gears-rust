@@ -3,6 +3,7 @@ status: proposed
 date: 2026-03-23
 owner: SDK architecture team
 scope: modules/serverless-sdk
+priority: p2
 ---
 <!--
 =============================================================================
@@ -34,9 +35,10 @@ STANDARDS ALIGNMENT:
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [Option A: `async-trait`](#option-a-async-trait)
   - [Option B: RPITIT with explicit `Send` bound](#option-b-rpitit-with-explicit-send-bound)
-  - [Option C: `async fn` without `Send` bound](#option-c-async-fn-without-send-bound)
+  - [Option C: `dynosaur` crate](#option-c-dynosaur-crate)
 - [More Information](#more-information)
 - [Non-Applicable Domains](#non-applicable-domains)
+- [Review Conditions](#review-conditions)
 - [Traceability](#traceability)
 
 <!-- /toc -->
@@ -44,44 +46,57 @@ STANDARDS ALIGNMENT:
 **ID**: `cpt-cf-serverless-sdk-core-adr-async-trait`
 ## Context and Problem Statement
 
-`Handler<I, O>` and `WorkflowHandler<I, O>` require async methods (`call`, `compensate`)
-so handler implementations can perform async I/O (outbound HTTP, secret fetching, etc.).
-Rust stable does not allow `async fn` in trait definitions with automatic `+ Send` bounds
-on the returned `Future`. Two approaches exist on stable Rust 1.92: the `async-trait`
-crate (which boxes the returned `Future`) and Return-Position Impl Trait in Traits
-(RPITIT, stable since 1.75) which requires explicit `-> impl Future<...> + Send + '_`
-method signatures.
+`Handler<I, O>` and `WorkflowHandler<I, O>` define async methods (`call`, `compensate`)
+so handler implementations can perform async work in their bodies. Adapters dispatch
+handler calls on multi-threaded tokio runtimes, which requires the `Future` returned
+from `call` and `compensate` to be `+ Send`. Rust stable does not provide automatic
+`+ Send` bounds on `Future`s returned from `async fn` in traits.
 
-Which approach should be used for the async trait methods in this crate?
+Which approach should be used to define async trait methods with `+ Send` Future
+guarantees, while keeping the implementation ergonomic for function authors and
+compatible with stable Rust?
 
 ## Decision Drivers
 
-* Handler trait implementations must produce `Future` values that are `+ Send`, because
-  adapters dispatch handler calls across multi-threaded tokio runtimes.
-* The handler authoring experience must be as ergonomic as possible — function authors
-  should write `async fn call(...)` without boilerplate.
-* The crate must compile on stable Rust 1.92.0 with no nightly features
-  (`cpt-cf-serverless-sdk-core-constraint-stable-rust`).
-* `async-trait` is already a workspace dependency; RPITIT requires no additional
-  dependency but requires more verbose method signatures and explicit lifetime annotations.
+* **[P1]** The crate must compile on stable Rust 1.92.0 with no nightly features
+  (`cpt-cf-serverless-sdk-core-constraint-stable-rust`) — hard constraint; no option
+  that requires nightly is acceptable.
+* **[P1]** Handler trait implementations must produce `Future` values that are `+ Send`,
+  because adapters dispatch handler calls across multi-threaded tokio runtimes — correctness
+  requirement; a solution that does not satisfy `Send` is invalid.
+* **[P2]** Function authors should write `async fn call(...)` with no lifetime annotations
+  or boilerplate (`cpt-cf-serverless-sdk-core-nfr-authoring-ergonomics`) — the simpler
+  the authoring surface, the lower the barrier to implementing the trait correctly.
 
 ## Considered Options
 
 * **Option A**: `async-trait` crate — `#[async_trait]` attribute on trait and impls,
-  ergonomic `async fn` syntax, `Box<dyn Future + Send>` expansion under the hood.
-* **Option B**: RPITIT with explicit `Send` bound — `fn call<'a>(&'a self, ...) -> impl Future<Output = ...> + Send + 'a` method signatures, no extra dependency, no boxing.
-* **Option C**: `async fn` without Send bound — `async fn call(...)` with no `+ Send`
-  on the Future; callers must constrain via `where H: Handler<I,O>, H::Future: Send`.
-  (Not explored further: requires unstable associated type bounds in practice.)
+  ergonomic `async fn` syntax, `Box<dyn Future + Send>` expansion under the hood;
+  `dyn Handler<I, O>` trait objects remain object-safe.
+* **Option B**: RPITIT with explicit `Send` bound — `fn call<'a>(&'a self, ...) -> impl Future<Output = ...> + Send + 'a`
+  method signatures; no extra dependency; no boxing; trait objects (`dyn Handler<I, O>`)
+  are **not** object-safe with RPITIT methods.
+* **Option C**: `dynosaur` crate — proc-macro generates a vtable-based `DynHandler`
+  wrapper that restores `dyn Trait` object safety for async traits; boxing of the
+  returned `Future` is shifted into the generated vtable rather than the call site,
+  but a heap allocation still occurs per call.
+
+> Note: plain `async fn` in traits without a `+ Send` bound was considered and
+> immediately eliminated — without a named associated type for the returned `Future`,
+> callers cannot write a stable `where`-clause to constrain it to `Send`, which
+> violates the [P1] correctness requirement.
 
 ## Decision Outcome
 
-Chosen option: **Option A: `async-trait`**, because it gives `async fn call(...)` syntax
-in both the trait definition and all implementations — the exact ergonomic form function
-authors expect — while automatically ensuring `Future + Send` bounds without any
-annotation burden on implementors. The boxing overhead is negligible in a context where
-each `call` performs async I/O anyway, and `async-trait` is already a workspace
-dependency (`cpt-cf-serverless-sdk-core-constraint-stable-rust` is satisfied).
+Chosen option: **Option A: `async-trait`**, because it satisfies all three decision
+drivers simultaneously: it compiles on stable Rust 1.92.0
+(`cpt-cf-serverless-sdk-core-constraint-stable-rust`), the expanded
+`Pin<Box<dyn Future + Send>>` return type guarantees `+ Send` on every handler
+future without any per-impl annotation (`cpt-cf-serverless-sdk-core-nfr-authoring-ergonomics`),
+and `dyn Handler<I, O>` trait objects remain object-safe — which Option B (RPITIT)
+cannot provide. The one heap allocation per invocation is acceptable: a handler
+invocation is a coarse-grained unit of work, not a hot inner loop, and the cost is
+bounded by `cpt-cf-serverless-sdk-core-nfr-low-overhead`.
 
 ### Consequences
 
@@ -89,17 +104,17 @@ dependency (`cpt-cf-serverless-sdk-core-constraint-stable-rust` is satisfied).
   blocks with `#[async_trait]`.
 * The returned `Future` from `call` and `compensate` is heap-allocated (`Box<dyn Future>`),
   adding one allocation per invocation. Acceptable because each invocation is a coarse
-  unit of work, not a hot inner loop.
-* When RPITIT with `Send` bound gains full stable support with ergonomic syntax (likely Rust
-  2024 edition improvements), this decision should be revisited to remove the `async-trait`
-  dependency. The change would be backward-compatible at the trait level.
+  unit of work, not a hot inner loop (`cpt-cf-serverless-sdk-core-nfr-low-overhead`).
 * Trait object dispatch (`dyn Handler<I, O>`) is possible without special ergonomics,
   which simplifies adapter type-erased handler registries.
 
 ### Confirmation
 
-* `cargo check` on stable 1.92.0 must pass with `#[async_trait]` removed — confirm it fails
-  without the attribute (confirming the attribute is load-bearing, not accidental).
+* `cargo check` on stable 1.92.0 must succeed with `#[async_trait]` in place —
+  the primary acceptance criterion.
+* `cargo check` on stable 1.92.0 must fail when `#[async_trait]` is removed from
+  `handler.rs` and `workflow.rs` — confirming the attribute is load-bearing, not
+  accidental.
 * All handler impls in tests and examples must use `#[async_trait]`.
 * Code review: no `impl Future` / RPITIT syntax in `handler.rs` or `workflow.rs`.
 
@@ -108,13 +123,11 @@ dependency (`cpt-cf-serverless-sdk-core-constraint-stable-rust` is satisfied).
 ### Option A: `async-trait`
 
 Crate attribute expands `async fn` to `fn ... -> Pin<Box<dyn Future + Send>>`.
-Already a workspace dependency.
 
 * Good, because implementors write natural `async fn call(...)` — no lifetime annotations.
 * Good, because `Future + Send` is guaranteed automatically without per-impl constraints.
 * Good, because trait objects `dyn Handler<I, O>` work out of the box.
-* Good, because already a workspace dependency — zero new crate surface.
-* Neutral, because one heap allocation per invocation (acceptable for coarse-grained I/O work).
+* Neutral, because one heap allocation per invocation (acceptable for coarse-grained unit of work).
 * Bad, because implementors must remember `#[async_trait]` on every `impl` block.
 
 ### Option B: RPITIT with explicit `Send` bound
@@ -136,24 +149,31 @@ fn call<'a>(
 * Bad, because the explicit lifetime on the return position is non-obvious and error-prone
   for function authors unfamiliar with RPITIT semantics.
 
-### Option C: `async fn` without `Send` bound
+### Option C: `dynosaur` crate
 
-```rust
-async fn call(&self, ctx: &Context, env: &dyn Environment, input: I)
-    -> Result<O, ServerlessSdkError>;
-```
+Proc-macro generates a vtable-based `DynHandler<dyn Handler<I, O>>` wrapper, restoring
+`dyn Trait` object safety for async traits. Boxing of the returned `Future` is shifted
+into the generated vtable rather than exposed at the call site, but a heap allocation
+still occurs per call.
 
-* Good, because cleanest author-facing syntax.
-* Bad, because the returned `Future` is not `Send` without explicit bounds or workarounds.
-* Bad, because adapters running on multi-threaded tokio would need `where H::Future: Send`
-  constraints propagated everywhere — shifting burden to adapter code.
+* Good, because `dyn Handler<I, O>` object safety is preserved (the exact weakness of
+  Option B), so adapters can store `Box<dyn Handler<I, O>>` without changes.
+* Good, because handler authors still write `async fn call(...)` — ergonomics on par
+  with Option A.
+* Bad, because a heap allocation still occurs per call — the boxing is internal to the
+  generated vtable, not eliminated.
+* Bad, because `dynosaur` is a young crate (first stable release ~2024) with a smaller
+  adoption base than `async-trait`; API stability is not yet guaranteed.
+* Bad, because the generated `DynHandler` wrapper type leaks into adapter code that
+  stores type-erased handlers, making the indirection non-obvious to readers.
+* Bad, because `dynosaur`'s proc-macro output is harder to audit than `async-trait`'s
+  well-known `Box<dyn Future + Send>` expansion.
 
 ## More Information
 
-The `async-trait` crate was authored by David Tolnay and has been stable for multiple years
-with wide adoption in the Rust ecosystem. Its boxing behaviour is deterministic and
-well-understood. The Rust project has a tracking issue for native async fn in traits with
-object safety and `Send` bound support; when that stabilises, this ADR should be revisited.
+- [`async-trait` crate](https://crates.io/crates/async-trait) — crate documentation and changelog
+- Rust tracking issue for `async fn` in traits with object safety and `Send` bound support:
+  [rust-lang/rust#91611](https://github.com/rust-lang/rust/issues/91611)
 
 ## Non-Applicable Domains
 
@@ -167,6 +187,18 @@ The following checklist domains are not applicable to this ADR and are explicitl
 | OPS | N/A | Pure library; no deployment topology, monitoring, or infrastructure concern |
 | COMPL | N/A | Internal developer tooling; no regulatory, certification, or legal requirement |
 | UX | N/A | No end-user UI or user-facing strings; developer ergonomics addressed in Decision Outcome |
+| BIZ | N/A | Internal Rust library crate; no business stakeholder buy-in, cost analysis, or time-to-market consideration applicable to a trait mechanism decision |
+
+## Review Conditions
+
+This ADR should be revisited when any of the following conditions is met:
+
+| Trigger | Action |
+|---------|--------|
+| `dyn Trait` object safety for `async fn` methods stabilises on stable Rust | Re-evaluate Option B; RPITIT itself is stable since Rust 1.75 (within our 1.92 baseline), but Option B is still blocked because RPITIT methods are not object-safe — `Box<dyn Handler<I, O>>` is not possible without `async-trait` or equivalent. Track the Rust `dyn async fn` object safety initiative; migration removes the `async-trait` dependency but requires updating all `impl` blocks and is a breaking change for downstream implementors |
+| `async-trait` crate is deprecated or unmaintained | Migrate to RPITIT or `dynosaur` (Option C) depending on object-safety requirements |
+| `dynosaur` reaches a stable 1.0 API and gains broad ecosystem adoption | Re-evaluate Option C as an alternative that preserves `dyn Handler<I, O>` object safety; assess whether its per-call allocation profile is meaningfully different from Option A in practice |
+| A handler use case emerges that cannot tolerate per-invocation heap allocation (hot inner loop) | Evaluate Option C (`dynosaur`) for that specific handler category; note that per-call allocation is not eliminated but may be restructured |
 
 ## Traceability
 
@@ -179,5 +211,7 @@ This decision directly addresses the following requirements and design elements:
 * `cpt-cf-serverless-sdk-core-fr-handler-send-sync` — `Future + Send` guarantee on handler futures
 * `cpt-cf-serverless-sdk-core-fr-workflow-handler-trait` — async `compensate` method signature
 * `cpt-cf-serverless-sdk-core-constraint-stable-rust` — no nightly features required
+* `cpt-cf-serverless-sdk-core-nfr-authoring-ergonomics` — plain `async fn` syntax, no lifetime annotations on `impl` blocks
+* `cpt-cf-serverless-sdk-core-nfr-low-overhead` — one allocation per invocation; boxing cost bounded by this NFR
 * `cpt-cf-serverless-sdk-core-component-handler` — async trait implementation
 * `cpt-cf-serverless-sdk-core-component-workflow` — async supertrait implementation

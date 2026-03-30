@@ -3,6 +3,7 @@ status: proposed
 date: 2026-03-23
 owner: SDK architecture team
 scope: modules/serverless-sdk
+priority: p2
 ---
 <!--
  =============================================================================
@@ -32,6 +33,7 @@ scope: modules/serverless-sdk
   - [Option C: Sync with Optional Async Reload](#option-c-sync-with-optional-async-reload)
 - [More Information](#more-information)
 - [Non-Applicable Domains](#non-applicable-domains)
+- [Review Conditions](#review-conditions)
 - [Traceability](#traceability)
 
 <!-- /toc -->
@@ -40,56 +42,81 @@ scope: modules/serverless-sdk
 ## Context and Problem Statement
 
 `Handler::call` receives an `&dyn Environment` that provides access to configuration
-values and secrets. Secrets on the CyberFabric platform are managed by credstore, and
-resolving them requires an async call to the credstore SDK. The `Environment` trait
-must decide whether `get_secret` (and `get_config`) are synchronous or asynchronous.
+values and secrets. The platform's secret resolution mechanism is inherently async —
+obtaining a secret requires an I/O call to a remote credential store. The `Environment`
+trait must decide whether `get_secret` (and `get_config`) are synchronous or asynchronous.
 
-If sync: the adapter must pre-fetch all required values before calling the handler.
-If async: the handler can fetch on demand, but the trait becomes async and the
-`Environment` object must hold a live credstore client reference across the handler call.
+If sync: the adapter must pre-fetch all required values before calling the handler;
+`Environment` is a read-only snapshot at call time.
+If async: handlers fetch on demand, but `get_secret` must be declared `async` — which
+for `dyn Environment` requires `#[async_trait]` or equivalent machinery, and the
+`Environment` implementation must hold a live client reference across the entire
+handler call.
+
+Which interface should the `Environment` trait expose?
 
 ## Decision Drivers
 
-* Handler implementations must remain free of async infrastructure boilerplate
-  (no credstore imports, no async fetching setup inside `call`).
-* The `Environment` trait must satisfy `cpt-cf-serverless-sdk-core-principle-impl-agnostic`:
-  it cannot expose credstore SDK types or any engine-specific interface.
-* The `Environment` trait is a testability boundary — unit tests must supply a simple
-  `HashMap`-backed mock without any platform infrastructure.
-* Secrets needed by a function are declared in the function definition's deployment
-  configuration, so the set of secrets required for a given invocation is known before
-  the handler is called; eager loading is feasible.
-* Most functions require a small number of secrets (typically fewer than 10); eager loading
-  has negligible latency impact in the context of a network-bound handler invocation.
+* **[P1]** The `Environment` trait must satisfy `cpt-cf-serverless-sdk-core-principle-impl-agnostic`:
+  it cannot expose credstore SDK types or any engine-specific interface — hard architectural
+  constraint; violations break the SDK/adapter boundary.
+* **[P1]** The `Environment` trait is a testability boundary — unit tests must supply a
+  simple `HashMap`-backed mock without any platform infrastructure — non-negotiable for
+  developer experience and CI correctness.
+* **[P2]** Handler implementations must remain free of async fetching boilerplate inside
+  `call` (`cpt-cf-serverless-sdk-core-nfr-authoring-ergonomics`) — ergonomics requirement;
+  reduces implementation errors and cognitive burden on function authors.
+* **[P3]** The platform design assumes that secret requirements are declared in the function
+  definition's deployment configuration, making the full set of required secrets known
+  before the handler is called; eager loading is therefore feasible — validates Option A's
+  pre-fetch model. (Platform design assumption; see Serverless Runtime DESIGN.md §3.1.)
+* **[P3]** Pre-fetching a small, bounded set of secrets before the handler call is cheap
+  relative to total invocation cost — supporting evidence for Option A performance
+  acceptability.
 
 ## Considered Options
 
 * **Option A**: Synchronous `Environment` — adapter resolves all required values before
   calling the handler and provides them via a `HashMap`-backed implementation.
-* **Option B**: Async `Environment` — `get_secret` returns `impl Future<Output = Option<String>>`
-  or uses `async-trait`; the trait holds a live credstore client.
-* **Option C**: Sync `Environment` with async `reload` — `get_secret` is sync for normal use;
-  a separate `async fn reload(&mut self, keys: &[&str])` method allows mid-invocation refresh
-  for long-running workflows. The `reload` method is a separate optional trait extension.
+* **Option B**: Async `Environment` — `get_secret` is declared `async`; the implementing
+  struct holds a live client reference for on-demand resolution. Two sub-variants:
+  (B1) using `async-trait` — preserves `dyn Environment` object safety;
+  (B2) RPITIT `impl Future` return type — loses `dyn Environment` object safety,
+  the same constraint identified in `cpt-cf-serverless-sdk-core-adr-async-trait` Option B.
+* **Option C**: Sync `Environment` with async `reload` — `get_secret` and `get_config`
+  are sync; a separate `async fn reload(&mut self, keys: &[&str])` method on an optional
+  supertrait allows mid-invocation secret refresh for long-running workflows. Requires
+  `&mut dyn Environment` or a separate `Refreshable` supertrait with downcasting —
+  changes the handler signature from Option A's `&dyn Environment` baseline.
 
 ## Decision Outcome
 
-Chosen option: **Option A: Synchronous `Environment`**, because the handler authoring
-experience is cleanest when `get_secret` and `get_config` are simple `-> Option<&str>` calls
-with no async overhead or error handling. The pre-fetch model is workable: the function's
-required secrets are known ahead of time from its deployment configuration, and adapters
-already perform setup work before calling the handler. The testability benefit (simple
-`HashMap` mock, no async test harness) is significant. Option C was rejected as premature
-optimisation; the mid-invocation reload use case can be addressed if and when a concrete
-requirement for it exists.
+Chosen option: **Option A: Synchronous `Environment`**, because it satisfies all three
+P1 and P2 decision drivers simultaneously: `get_secret` and `get_config` are simple
+synchronous calls with no `await` or error propagation in the handler body
+(`cpt-cf-serverless-sdk-core-nfr-authoring-ergonomics`); the trait exposes no async
+infrastructure, satisfying `cpt-cf-serverless-sdk-core-principle-impl-agnostic`; and a
+`HashMap`-backed test double requires no async executor, keeping unit tests simple
+(P1 testability driver). The pre-fetch model is feasible given the platform design
+assumption that required secrets are declared in deployment configuration (P3).
+
+Option B was rejected because async methods in the `Environment` trait would require the
+implementing struct to hold a live client reference, violating the impl-agnostic principle
+and destroying the `HashMap`-backed testability boundary.
+
+Option C was rejected because `reload(&mut self)` would require changing the handler
+signature to `&mut dyn Environment` or introducing a `Refreshable` supertrait with
+downcasting — a structural cost with no current requirement to justify it.
 
 ### Consequences
 
 * Adapters are responsible for resolving all configuration values and secrets declared by
-  the function definition before calling `Handler::call`.
+  the function definition before calling `Handler::call`. The expected caching granularity
+  is **cold-start**: secrets are pre-fetched once at function cold-start and reused for
+  the lifetime of that invocation; adapters MUST NOT re-fetch secrets on every invocation
+  unless the platform's credential caching layer already guarantees in-process caching.
 * If a secret is unavailable at pre-fetch time, the adapter must fail the invocation before
-  the handler is called (returning a `RuntimeErrorPayload` with `NonRetryable` or `Retryable`
-  category as appropriate).
+  the handler is called, with an appropriate retryable or non-retryable error indicator.
 * Long-running workflows that need secrets to remain valid across a multi-day suspension
   must be handled by the adapter (e.g., refreshing secrets on resume). The `Environment`
   contract does not address this; it is an adapter concern.
@@ -103,8 +130,6 @@ requirement for it exists.
   attribute — verified by code inspection.
 * A `HashMap<String, String>`-backed `Environment` implementation compiles and satisfies
   the trait in unit tests without any platform infrastructure.
-* `get_config` and `get_secret` return `Option<&str>`, not `Option<String>`, to avoid
-  allocations on the hot path — verified in `environment.rs`.
 
 ## Pros and Cons of the Options
 
@@ -115,28 +140,29 @@ The adapter resolves config and secrets eagerly and provides a snapshot `Environ
 * Good, because handler code is the simplest possible: `env.get_secret("API_KEY")` with
   no `.await`, no error propagation, no async context required.
 * Good, because the trait is trivially testable — any `HashMap` satisfies it.
-* Good, because the trait definition has no async machinery, no credstore types, no
-  lifetime complexity from a held async client.
+* Good, because the trait definition has no async machinery, no async infrastructure types,
+  no lifetime complexity from a held async client.
 * Good, because the set of required secrets is known from the function definition, making
   eager loading deterministic.
-* Neutral, because adapters incur an extra round-trip to credstore before each invocation
-  (or per cold-start, depending on caching strategy). Acceptable: already in async context.
+* Neutral, because adapters incur a round-trip to the credential store at cold-start before
+  the first invocation. Acceptable: the cost is bounded and amortised across all invocations
+  for the lifetime of the function instance.
 * Bad, because secrets fetched at invocation start may expire mid-execution for very
   long-running workflows. This edge case requires adapter-level handling.
 
 ### Option B: Async Environment
 
-`get_secret` returns a `Future`; the `Environment` holds a live credstore client.
+`get_secret` returns a `Future`; the implementing struct holds a live credential store client.
 
 * Good, because secrets can be fetched lazily — unused secrets are never resolved.
 * Good, because secrets can be refreshed mid-invocation if they expire.
-* Bad, because the `Environment` trait must be async, adding `async-trait` complexity or
+* Bad, because `get_secret` must be declared `async`, adding `async-trait` complexity or
   RPITIT signature noise to a trait that is primarily used for simple key lookups.
 * Bad, because `env.get_secret("KEY").await?` in handler code requires handlers to import
   `async` plumbing — violates the goal of keeping handlers free of platform boilerplate.
-* Bad, because the trait must hold a reference to the credstore client, pulling a platform
-  infrastructure type into the trait's type signature or bounding `Self`.
-* Bad, because unit testing requires an async mock credstore client, not just a `HashMap`.
+* Bad, because the implementing struct must hold a live client reference, coupling a platform
+  infrastructure type into the implementation.
+* Bad, because unit testing requires an async mock credential store client, not just a `HashMap`.
 
 ### Option C: Sync with Optional Async Reload
 
@@ -145,8 +171,8 @@ The adapter resolves config and secrets eagerly and provides a snapshot `Environ
 * Good, because normal handler use is sync; the async path is opt-in.
 * Good, because it handles the mid-invocation expiry case without forcing async everywhere.
 * Bad, because it complicates the trait definition with an orthogonal async extension method.
-* Bad, because `reload` requires the `Environment` to hold a mutable async client internally,
-  reintroducing the credstore coupling in the trait's implementation surface.
+* Bad, because `reload` requires the implementing struct to hold a mutable async client
+  internally, reintroducing credential store coupling in the implementation surface.
 * Bad, because the need for mid-invocation secret refresh has no concrete requirement yet —
   adding this complexity is premature.
 
@@ -163,12 +189,23 @@ The following checklist domains are not applicable to this ADR and are explicitl
 
 | Domain | Disposition | Reasoning |
 |--------|-------------|-----------|
-| SEC | N/A | Decision concerns trait synchrony model; no credential storage in the SDK — credentials are opaque strings passed as `Option<&str>`; security of the underlying credstore is an adapter/platform concern |
+| SEC | N/A | Decision concerns trait synchrony model; no credential storage in the SDK — credentials are opaque strings passed as `Option<&str>`; security of the underlying credential store is an adapter/platform concern |
 | REL | N/A | No stateful data, SLO, or availability commitment at the SDK trait level |
 | DATA | N/A | No data schema, persistence, or lifecycle managed by the `Environment` trait |
 | OPS | N/A | Pure library; no deployment topology, monitoring infra, or operational concern |
 | COMPL | N/A | Internal developer tooling; no regulatory, certification, or legal requirement |
 | UX | N/A | No end-user UI; developer ergonomics are the primary driver and are addressed in Decision Outcome |
+| BIZ | N/A | Internal Rust library crate; no business stakeholder buy-in, cost analysis, or time-to-market consideration applicable to a trait synchrony decision |
+
+## Review Conditions
+
+This ADR should be revisited when any of the following conditions is met:
+
+| Trigger | Action |
+|---------|--------|
+| A concrete requirement emerges for mid-invocation secret refresh (e.g., a workflow suspended for days resumes and its secrets have expired) | Re-evaluate Option C (sync + async `reload` extension); introduce a separate `AsyncSecretProvider` in the adapter crate without modifying `Environment` |
+| The platform's credential resolution gains a synchronous in-process call path (no network round-trip) | Re-evaluate whether lazy async fetch becomes as cheap as eager sync pre-fetch, reducing the advantage of Option A |
+| The function definition model changes such that required secrets are no longer known statically at registration time | Re-evaluate the pre-fetch feasibility assumption; eager loading requires a known secret set |
 
 ## Traceability
 
@@ -178,5 +215,5 @@ The following checklist domains are not applicable to this ADR and are explicitl
 This decision directly addresses the following requirements and design elements:
 
 * `cpt-cf-serverless-sdk-core-fr-environment-trait` — `Environment` trait signature
-* `cpt-cf-serverless-sdk-core-principle-impl-agnostic` — no credstore types in the trait
+* `cpt-cf-serverless-sdk-core-principle-impl-agnostic` — no platform infrastructure types in the trait
 * `cpt-cf-serverless-sdk-core-component-environment` — responsibility boundary definition

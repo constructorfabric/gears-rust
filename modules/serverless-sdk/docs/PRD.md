@@ -333,6 +333,11 @@ and their documented `RuntimeErrorCategory` mappings:
 
 The enum MUST be `#[non_exhaustive]` to allow future variants without breaking downstream.
 
+Variant semantics: `InvalidInput` is for structural or type constraint violations (checked
+before side effects); `UserError` is for business-logic rejections (checked after domain
+rules are evaluated). Both map to `NonRetryable` — the distinction is for observability and
+caller-facing error messaging, not for retry behaviour.
+
 The runtime's `RuntimeErrorCategory` also defines `ResourceLimit` and `Canceled`. These are
 **adapter-only categories** — handlers never produce them. `ResourceLimit` is signalled by the
 adapter when tenant quotas or resource limits are exceeded before or during invocation.
@@ -438,6 +443,26 @@ purpose, usage, and any invariants or panics.
   implement the SDK contract from the documentation alone, without consulting DESIGN.md
   or engine internals. Aligns with UX-PRD-001 developer-experience target.
 - **Verification Method**: `cargo doc --no-deps` in CI; zero missing-doc warnings.
+
+#### Authoring Ergonomics
+
+- [ ] `p2` - **ID**: `cpt-cf-serverless-sdk-core-nfr-authoring-ergonomics`
+
+Function and workflow authors MUST be able to implement `Handler<I, O>` and
+`WorkflowHandler<I, O>` using plain `async fn` syntax with no explicit lifetime
+annotations, no manual `Pin<Box<dyn Future>>` return types, and no boilerplate beyond
+the `impl` block itself.
+
+- **Threshold**: Any `impl Handler` or `impl WorkflowHandler` block that requires
+  explicit lifetime parameters on the `call` or `compensate` method signature is a
+  violation of this NFR.
+- **Rationale**: The SDK's value proposition is that function authors focus on business
+  logic, not Rust async machinery. If implementing the handler trait requires knowledge
+  of RPITIT lifetime elision rules or manual `Future` pinning, the trait imposes an
+  unjustified cognitive burden on the primary audience.
+- **Verification Method**: SDK examples and integration tests must compile with
+  `async fn call(...)` / `async fn compensate(...)` syntax; CI fails if any handler
+  impl requires explicit `impl Future` or lifetime annotation on the method signature.
 
 ### 6.2 NFR Exclusions
 
@@ -616,14 +641,21 @@ requirements in these areas is deliberate, not an omission.
 
 ## 9. Acceptance Criteria
 
-- [ ] `cargo check` and `cargo clippy` pass on stable 1.92.0 with zero warnings.
-- [ ] `cargo deny check` reports zero engine-specific transitive dependencies.
 - [ ] A minimal `impl Handler` compiles and runs without referencing any adapter crate.
-- [ ] A minimal `impl WorkflowHandler` compiles and the `compensate` method receives
-      a correctly structured `CompensationInput`.
-- [ ] `trace::call_instrumented` emits the documented lifecycle span events (`started`,
-      `succeeded`, `failed`) for handler invocations without requiring any tracing
-      imports in the handler implementation.
+- [ ] A minimal `impl WorkflowHandler` compiles; the `compensate` method receives a
+      `CompensationInput` with all fields from the `CompensationContext → CompensationInput`
+      mapping table in DESIGN.md §3.1.
+- [ ] A `HashMap<String, String>`-backed `Environment` implementation satisfies the
+      `Environment` trait and is usable in handler unit tests without any platform
+      infrastructure or async executor.
+- [ ] Every `ServerlessSdkError` variant has a documented `RuntimeErrorCategory` mapping
+      in its `rustdoc`; `cargo doc --no-deps` produces zero missing-doc warnings.
+- [ ] `trace::call_instrumented` emits `started`, `succeeded`, and `failed` lifecycle
+      span events for handler invocations without any `tracing` import in the handler
+      implementation.
+- [ ] `trace::compensate_instrumented` emits `compensation_started`, `compensation_completed`,
+      and `compensation_failed` lifecycle span events without any `tracing` import in the
+      workflow handler implementation.
 
 ---
 
@@ -663,13 +695,6 @@ requirements in these areas is deliberate, not an omission.
 | `async-trait` boxing overhead at cold-path invocations | Low — per-invocation allocation in already-async context | Acceptable trade-off for stable ergonomics; revisit when RPITIT Send bound stabilises fully |
 
 ---
-
-## 13. Open Questions
-
-| # | Question | Owner | Target Resolution |
-|---|----------|-------|------------------|
-| OQ-1 | Should `Environment` eventually support async secret rotation (re-fetching secrets mid-invocation for long-running workflows)? Currently deferred: adapters pre-fetch. | SDK architecture team | Before v1.0 stabilisation planning |
-| OQ-2 | Should `Context` expose a `function_kind: FunctionKind` enum derived from the GTS chain, or should that remain an adapter concern? Currently deferred: `function_id` is opaque. | SDK architecture team | Before v1.0 stabilisation planning |
 
 ---
 

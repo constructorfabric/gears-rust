@@ -111,6 +111,7 @@ without requiring callers to annotate anything
 | `cpt-cf-serverless-sdk-core-nfr-no-unsafe` | Zero `unsafe` blocks | All modules | Workspace `unsafe_code = "forbid"` lint; no pointer manipulation | Lint enforced at compile time |
 | `cpt-cf-serverless-sdk-core-nfr-low-overhead` | No blocking I/O or extra heap allocs on hot path | `trace.rs`, `handler.rs` | `call_instrumented` introduces one `Box<dyn Future>` (async-trait) and one `tracing` span; no additional heap allocations on the hot path | Criterion benchmark in CI |
 | `cpt-cf-serverless-sdk-core-nfr-api-docs` | Zero missing-doc warnings; `#![deny(missing_docs)]` | All public items | All public types, traits, and functions documented with purpose, usage, and invariants | `cargo doc --no-deps` in CI |
+| `cpt-cf-serverless-sdk-core-nfr-authoring-ergonomics` | Plain `async fn` syntax; no lifetime annotations on handler impls | `handler.rs`, `workflow.rs` | `async-trait` expands `async fn` to `Pin<Box<dyn Future + Send>>` internally, keeping the `impl` surface annotation-free (`cpt-cf-serverless-sdk-core-adr-async-trait`) | SDK examples and integration tests compile with `async fn` syntax; CI fails on any explicit `impl Future` or lifetime annotation on method signatures |
 
 #### Key ADRs
 
@@ -119,6 +120,9 @@ without requiring callers to annotate anything
 | `cpt-cf-serverless-sdk-core-adr-async-trait` | Use `async-trait` over RPITIT for `Handler` and `WorkflowHandler` |
 | `cpt-cf-serverless-sdk-core-adr-sync-environment` | `Environment` interface is synchronous (adapter pre-fetch model) |
 | `cpt-cf-serverless-sdk-core-adr-compensation-input` | `CompensationInput` is a structured type, not a generic handler input |
+| `cpt-cf-serverless-sdk-core-adr-context-struct` | `Context` is a concrete struct, not a trait or generic parameter |
+| `cpt-cf-serverless-sdk-core-adr-error-enum` | `ServerlessSdkError` is a `#[non_exhaustive]` enum, not a trait object or opaque error |
+| `cpt-cf-serverless-sdk-core-adr-workflow-supertrait` | `WorkflowHandler<I,O>: Handler<I,O>` supertrait, not an independent trait |
 
 ### 1.3 Architecture Layers
 
@@ -198,6 +202,25 @@ This constraint is permanent: adding an engine dependency invalidates the adapte
 portability guarantee and breaks the implementation-agnostic principle.
 
 **ADRs**: `cpt-cf-serverless-sdk-core-adr-async-trait`
+
+#### SDK Trust Boundary — All Inputs Are Trusted
+
+- [x] `p1` - **ID**: `cpt-cf-serverless-sdk-core-constraint-trust-boundary`
+
+The SDK accepts all inputs it receives as trusted. Specifically:
+
+- `Context` fields (`tenant_id`, `invocation_id`, `correlation_id`, etc.) are populated
+  by the adapter from the runtime's `InvocationRecord`; the SDK does not validate them.
+- `input: I` is a value the adapter has already deserialised from the runtime's `params`
+  JSON; the SDK does not validate the deserialized value's business invariants.
+- `env: &dyn Environment` is a pre-populated snapshot provided by the adapter; the SDK
+  does not verify secret resolution or access control.
+
+Input validation (schema conformance, injection prevention, privilege constraints) is the
+responsibility of the Serverless Runtime API layer and adapter before the handler is called.
+Function authors are responsible for validating *business* invariants on `input: I`
+within their `call` implementation and returning `ServerlessSdkError::InvalidInput` if
+those invariants are violated.
 
 #### Stable Rust — No Nightly Features
 
@@ -279,12 +302,36 @@ Adapters use this mapping to produce the correct `RuntimeErrorPayload` from a
 | `NotSupported(msg)` | `NonRetryable` | adapter-defined |
 | `Internal(msg)` | `Retryable` | adapter-defined |
 
+**Variant semantics for function authors** — both `UserError` and `InvalidInput` are `NonRetryable`; the distinction is:
+- `InvalidInput` — the request violates a structural or type constraint that the handler checked (e.g., a required field is absent, a value is out of allowed range). Return this *before* any side effects.
+- `UserError` — the request is structurally valid but rejected by business logic (e.g., insufficient funds, duplicate resource, forbidden action for the caller's state). Return this after business rules are evaluated.
+
 **Adapter-only categories** (never produced by handler code):
 
 | `RuntimeErrorCategory` | Origin | Notes |
 |------------------------|--------|-------|
 | `ResourceLimit` | Adapter | Tenant quota or resource limit exceeded; adapter signals before or during invocation |
 | `Canceled` | Runtime | External cancellation; runtime applies this status, not the handler |
+
+#### API Stability: `#[non_exhaustive]` Surface Summary
+
+All public types in this crate that may gain fields or variants in future semver-compatible
+releases are declared `#[non_exhaustive]`. The table below is the authoritative reference
+for which types carry this attribute and what it means for each consumer role.
+
+| Type | `#[non_exhaustive]` | Impact on function authors | Impact on adapter authors |
+|------|---------------------|--------------------------|--------------------------|
+| `ServerlessSdkError` | Yes (enum) | `match` must include a `_` catch-all arm | `match` must include a `_` catch-all arm; no compile-time signal exists for new variants — adapter maintainers must consult DESIGN.md §3.1 when updating the SDK dependency |
+| `CompensationInput` | Yes (struct) | Field access by name is stable; struct literal construction outside the crate is forbidden | Adapter constructs `CompensationInput` via `CompensationInput::new(trigger, original_workflow_invocation_id, failed_step_id, failed_step_error, workflow_state_snapshot, timestamp, function_id, original_input, tenant_id, correlation_id, started_at)` — a `pub fn new(...)` constructor defined in the crate |
+| `FailedStepError` | Yes (struct) | Field access by name is stable; struct literal construction outside the crate is forbidden | Constructed via `FailedStepError::new(error_type, message, error_metadata)` |
+| `CompensationTrigger` | Yes (enum) | `match` must include a `_` catch-all arm | `match` must include a `_` catch-all arm |
+| `Context` | No | All 9 fields are stable; struct literal construction is used in tests | Adapter constructs `Context` via struct literal syntax; any field addition is a compile break at every adapter construction site — intentional, to force `InvocationRecord → Context` mapping updates |
+
+**Note on `Context`**: `Context` is not `#[non_exhaustive]` because adapters must
+construct it in struct literal form before calling handlers. If a new field is added to
+`Context`, adapter code that constructs it with `Context { field_a, field_b, .. }` will
+fail to compile, prompting the required update. This is the intended mechanism for
+keeping adapter-side `InvocationRecord → Context` mappings in sync.
 
 ### 3.2 Component Model
 
@@ -332,6 +379,9 @@ or any runtime internals.
 ##### Responsibility scope
 
 Owns: `Context` struct (9 fields), `is_deadline_exceeded()`, `remaining_time()` helpers.
+Derives: `Debug`, `Clone`. `deadline: Option<std::time::Instant>` is `Copy`, so `Context`
+is cheaply cloneable for test construction. `is_deadline_exceeded()` and `remaining_time()`
+are marked `#[must_use]` — ignoring the return value is a logic error.
 
 ##### Responsibility boundaries
 
@@ -376,7 +426,9 @@ unsupported operations, internal failures) in a way that unambiguously maps to
 ##### Responsibility scope
 
 Owns: `ServerlessSdkError` enum with 5 `#[non_exhaustive]` variants, each with documented
-`RuntimeErrorCategory` mapping. Implements `std::error::Error` via `thiserror`.
+`RuntimeErrorCategory` mapping. Derives: `Debug`. Implements `Display + std::error::Error`
+via `thiserror`. Does **not** derive `Clone` or `PartialEq` — error values are consumed at
+the adapter boundary and not compared or cloned in SDK code.
 
 ##### Responsibility boundaries
 
@@ -399,6 +451,10 @@ durable — is a `Handler`. This is the SDK expression of
 
 Owns: `Handler<I, O>` async trait with `call` method. Declares `I: DeserializeOwned + Send + 'static`
 and `O: Serialize + Send + 'static` bounds. Requires `Self: Send + Sync + 'static`.
+
+The canonical adapter storage pattern is `Arc<dyn Handler<I, O> + Send + Sync>`: shared
+ownership across concurrent invocations on a multi-threaded async runtime. `Box<dyn Handler<I, O>>`
+is valid for single-owner dispatch but insufficient for shared registry storage.
 
 ##### Responsibility boundaries
 
@@ -462,6 +518,18 @@ that map to `TimelineEventType` variants.
 Does not own: `tracing` subscriber setup (application/adapter concern), span export to
 OpenTelemetry (adapter/platform concern), structured log routing, metrics.
 
+##### Access control
+
+`trace.rs` is `pub` but is designated **adapter-only** by convention and documentation.
+No Rust visibility modifier prevents function authors from calling `call_instrumented` or
+`compensate_instrumented` directly; however, doing so would duplicate spans and emit
+incorrect lifecycle events (a second `started` event for an already-running invocation).
+
+The enforcement strategy is documentation and code review, not compiler enforcement.
+A future option is to gate `trace.rs` behind a `adapter` Cargo feature flag
+(disabled by default for function-author-facing builds); this is tracked as a
+known limitation and should be evaluated if SDK misuse is observed in practice.
+
 ##### Span fields emitted
 
 | Field | Source | Notes |
@@ -504,7 +572,9 @@ Handler<I, O>
 
 **Invariants**:
 - `ctx` is immutable for the duration of `call`.
-- `env` is populated before `call`; no async fetching inside.
+- `env` is populated before `call`; no async fetching inside. `get_config` and `get_secret`
+  return `Option<&str>` that borrows from `&self` — every `Environment` implementation must
+  own the string data (e.g., a `HashMap<String, String>`) and cannot lazily resolve values.
 - Returning `Ok(O)` maps to `InvocationStatus::Succeeded`.
 - Returning `Err(_)` maps to `InvocationStatus::Failed` (with retry if `Internal`).
 
@@ -673,6 +743,32 @@ This crate is a downstream consumer of the Serverless Runtime's domain model
 
 This crate does **not** depend on the `serverless-runtime` module at the Cargo level.
 The mapping is documented in this design and enforced by adapters at runtime.
+
+### Comparison with Similar Solutions
+
+| Solution | Handler model | Context model | Error model | Compensation |
+|----------|---------------|---------------|-------------|--------------|
+| **This crate** | `async trait Handler<I, O>` + `WorkflowHandler<I, O>: Handler<I, O>` | Concrete `Context` struct (platform-owned fields) | `#[non_exhaustive]` enum → `RuntimeErrorCategory` | `WorkflowHandler::compensate` (structured `CompensationInput`) |
+| AWS Lambda Rust Runtime | `fn handler(event: E, ctx: Context) -> Result<R, E>` free-function or `tower::Service` | Concrete `lambda_runtime::Context` struct | `Box<dyn Error>` — opaque, no retry category | None — compensation is application-level |
+| Temporal Rust SDK | `#[workflow]` proc-macro on async fn; activities as `#[activity]` async fn | `workflow::Context` injected via proc-macro | `ApplicationError` with explicit `non_retryable` flag | Step-level rollback via custom activity sequencing; no first-class saga trait |
+| Cloudflare Workers (Rust via wasm) | `#[event(fetch)]` on async fn; `Request`/`Response` types | `Env` struct for bindings | `worker::Error` enum | None |
+| Apache OpenWhisk Rust | Free function `fn main(args: Value) -> Value`; no trait | No context; caller metadata in args JSON | Return value discrimination (error key in JSON) | None |
+
+**Key differentiators of this crate:**
+
+- **Typed `RuntimeErrorCategory` mapping**: Unlike Lambda's opaque `Box<dyn Error>` or
+  OpenWhisk's JSON key convention, `ServerlessSdkError` variants map deterministically to
+  retry categories — the platform can make correct retry decisions without runtime inspection.
+- **First-class compensation trait**: Unlike Temporal's SDK (which handles saga rollback
+  via activity sequencing in the workflow body) or Lambda (no compensation concept),
+  `WorkflowHandler::compensate` is a first-class, compiler-enforced obligation on every
+  durable workflow.
+- **No proc-macros, no code generation**: Unlike Temporal's `#[workflow]` / `#[activity]`
+  macros, this crate uses plain traits and `#[async_trait]`. Function authors implement
+  traits directly; no hidden code generation.
+- **Adapter-agnostic by construction**: Unlike Lambda's SDK (AWS-specific) or Workers
+  (Cloudflare-specific), this crate has no runtime-specific dependency; the same
+  `Handler` implementation can run on any adapter without modification.
 
 ### Known Technical Debt
 
