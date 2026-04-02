@@ -6,6 +6,12 @@ pub struct PageInfo {
     pub next_cursor: Option<String>,
     pub prev_cursor: Option<String>,
     pub limit: u64,
+    /// Whether there is a next page of results.
+    #[serde(default = "PageInfo::_false")]
+    pub has_next_page: bool,
+    /// Whether there is a previous page of results.
+    #[serde(default = "PageInfo::_false")]
+    pub has_previous_page: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,6 +87,25 @@ where
     }
 }
 
+impl PageInfo {
+    fn _false() -> bool {
+        false
+    }
+
+    /// Create a new `PageInfo` with cursors and limit.
+    /// `has_next_page` and `has_previous_page` are derived from cursor presence.
+    #[must_use]
+    pub fn new(next_cursor: Option<String>, prev_cursor: Option<String>, limit: u64) -> Self {
+        Self {
+            has_next_page: next_cursor.is_some(),
+            has_previous_page: prev_cursor.is_some(),
+            next_cursor,
+            prev_cursor,
+            limit,
+        }
+    }
+}
+
 impl<T> Page<T> {
     /// Create a new page with items and page info
     #[must_use]
@@ -97,6 +122,8 @@ impl<T> Page<T> {
                 next_cursor: None,
                 prev_cursor: None,
                 limit,
+                has_next_page: false,
+                has_previous_page: false,
             },
         }
     }

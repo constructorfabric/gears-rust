@@ -374,11 +374,7 @@ mod tests {
                     name: "Bob".to_owned(),
                 },
             ],
-            PageInfo {
-                next_cursor: Some(encoded_cursor.clone()),
-                prev_cursor: None,
-                limit: 2,
-            },
+            PageInfo::new(Some(encoded_cursor.clone()), None, 2),
         );
 
         let page2 = Page::new(
@@ -392,11 +388,7 @@ mod tests {
                     name: "Diana".to_owned(),
                 },
             ],
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: Some(encoded_cursor),
-                limit: 2,
-            },
+            PageInfo::new(None, Some(encoded_cursor), 2),
         );
 
         let fetcher = FakeFetcher::new(vec![page1, page2]);
@@ -421,14 +413,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cursor_pager_empty_page() {
-        let page = Page::new(
-            vec![],
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit: 10,
-            },
-        );
+        let page = Page::new(vec![], PageInfo::new(None, None, 10));
 
         let fetcher = FakeFetcher::new(vec![page]);
         let query = ODataQuery::new().with_limit(10);
@@ -461,11 +446,7 @@ mod tests {
                 id: 1,
                 name: "Alice".to_owned(),
             }],
-            PageInfo {
-                next_cursor: Some(encoded_cursor),
-                prev_cursor: None,
-                limit: 1,
-            },
+            PageInfo::new(Some(encoded_cursor), None, 1),
         );
 
         let fetcher = FakeFetcher::new(vec![page1]);
@@ -514,11 +495,7 @@ mod tests {
                     name: "Bob".to_owned(),
                 },
             ],
-            PageInfo {
-                next_cursor: Some(encoded_cursor.clone()),
-                prev_cursor: None,
-                limit: 2,
-            },
+            PageInfo::new(Some(encoded_cursor.clone()), None, 2),
         );
 
         let page2 = Page::new(
@@ -526,11 +503,7 @@ mod tests {
                 id: 3,
                 name: "Charlie".to_owned(),
             }],
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: Some(encoded_cursor),
-                limit: 2,
-            },
+            PageInfo::new(None, Some(encoded_cursor), 2),
         );
 
         let fetcher = FakeFetcher::new(vec![page1.clone(), page2.clone()]);
@@ -560,11 +533,7 @@ mod tests {
                 id: 1,
                 name: "Alice".to_owned(),
             }],
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit: 10,
-            },
+            PageInfo::new(None, None, 10),
         );
 
         let fetcher = FakeFetcher::new(vec![page.clone()]);
@@ -588,11 +557,7 @@ mod tests {
                 id: 1,
                 name: "Alice".to_owned(),
             }],
-            PageInfo {
-                next_cursor: Some("invalid_cursor_string".to_owned()),
-                prev_cursor: None,
-                limit: 1,
-            },
+            PageInfo::new(Some("invalid_cursor_string".to_owned()), None, 1),
         );
 
         let fetcher = FakeFetcher::new(vec![page1]);
@@ -624,11 +589,7 @@ mod tests {
                 id: 1,
                 name: "Alice".to_owned(),
             }],
-            PageInfo {
-                next_cursor: Some("invalid_cursor_string".to_owned()),
-                prev_cursor: None,
-                limit: 1,
-            },
+            PageInfo::new(Some("invalid_cursor_string".to_owned()), None, 1),
         );
 
         let fetcher = FakeFetcher::new(vec![page1]);
@@ -671,11 +632,7 @@ mod tests {
                 id: 1,
                 name: "Alice".to_owned(),
             }],
-            PageInfo {
-                next_cursor: Some(encoded_cursor),
-                prev_cursor: None,
-                limit: 1,
-            },
+            PageInfo::new(Some(encoded_cursor), None, 1),
         );
 
         let fetcher = FakeFetcher::new(vec![page1]);

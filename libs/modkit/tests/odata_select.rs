@@ -471,11 +471,7 @@ fn test_page_to_projected_json() {
                 email: "jane@example.com".to_owned(),
             },
         ],
-        page_info: modkit_odata::PageInfo {
-            next_cursor: Some("abc123".to_owned()),
-            prev_cursor: None,
-            limit: 10,
-        },
+        page_info: modkit_odata::PageInfo::new(Some("abc123".to_owned()), None, 10),
     };
 
     let selected = vec!["id".to_owned(), "name".to_owned()];
@@ -527,11 +523,7 @@ fn test_page_to_projected_json_without_fields() {
             id: "1".to_owned(),
             name: "John".to_owned(),
         }],
-        page_info: modkit_odata::PageInfo {
-            next_cursor: None,
-            prev_cursor: None,
-            limit: 20,
-        },
+        page_info: modkit_odata::PageInfo::new(None, None, 20),
     };
 
     let result = page_to_projected_json(&page, None);

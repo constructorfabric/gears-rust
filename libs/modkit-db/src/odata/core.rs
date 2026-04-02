@@ -926,12 +926,17 @@ where
 
     let items = rows.into_iter().map(model_to_domain).collect();
 
+    let has_next_page = next_cursor.is_some();
+    let has_previous_page = prev_cursor.is_some();
+
     Ok(Page {
         items,
         page_info: PageInfo {
             next_cursor,
             prev_cursor,
             limit,
+            has_next_page,
+            has_previous_page,
         },
     })
 }
