@@ -1,0 +1,4 @@
+---
+exclude_paths:
+  - "testing/e2e/**"
+  - "modules/**/tests/**"

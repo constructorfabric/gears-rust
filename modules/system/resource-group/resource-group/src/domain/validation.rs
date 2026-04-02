@@ -88,11 +88,18 @@ pub async fn validate_metadata_via_gts(
 
     // Fetch the GTS entity — its content contains the resolved schema
     // including allOf composition and $ref resolution from types-registry.
-    let entity = types_registry.get(type_code).await.map_err(|e| {
-        DomainError::validation(format!(
-            "Failed to resolve GTS type '{type_code}' for metadata validation: {e}"
-        ))
-    })?;
+    let entity = match types_registry.get(type_code).await {
+        Ok(entity) => entity,
+        Err(e) if e.is_not_found() => {
+            // Type not registered in GTS registry — no schema constraints to enforce.
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(DomainError::validation(format!(
+                "Failed to resolve GTS type '{type_code}' for metadata validation: {e}"
+            )));
+        }
+    };
 
     // Extract metadata sub-schema from the GTS entity content.
     // The chained RG type schema defines a `metadata` property within

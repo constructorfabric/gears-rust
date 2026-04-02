@@ -1,3 +1,4 @@
+# Updated: 2026-04-16 by Constructor Tech
 """Mock LLM provider HTTP server — speaks OpenAI Responses API + Files API."""
 
 from __future__ import annotations
@@ -7,7 +8,7 @@ import queue
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .responses import Scenario, extract_last_user_message, match_scenario
 from .sse_builder import build_sse_stream
@@ -202,10 +203,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-class MockProviderServer(HTTPServer):
+class MockProviderServer(ThreadingHTTPServer):
     """Threaded mock LLM provider with per-test scenario override support."""
 
     name = "mock-provider"
+    daemon_threads = True
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), _Handler)
@@ -235,6 +237,14 @@ class MockProviderServer(HTTPServer):
         with self._capture_lock:
             self._captured_requests.clear()
 
+    def clear_override_scenarios(self) -> None:
+        """Drop any queued per-request overrides left by previous tests."""
+        while True:
+            try:
+                self._override_queue.get_nowait()
+            except queue.Empty:
+                return
+
     def set_next_scenario(self, scenario: Scenario) -> None:
         """Override the scenario for the next request (consumed once, thread-safe)."""
         self._override_queue.put(scenario)
@@ -263,6 +273,9 @@ class _DummyMockProvider:
         return None
 
     def clear_captured_requests(self) -> None:
+        pass
+
+    def clear_override_scenarios(self) -> None:
         pass
 
     def start(self) -> None:
