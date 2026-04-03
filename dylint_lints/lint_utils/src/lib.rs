@@ -74,9 +74,7 @@ pub fn is_temp_path(path: &str) -> bool {
         }
     }
     // Fallback patterns for known temp directory locations
-    path.contains("/tmp/")
-        || path.contains("/var/folders/")
-        || path.contains("\\Temp\\")
+    path.contains("/tmp/") || path.contains("/var/folders/") || path.contains("\\Temp\\")
 }
 
 /// Result of parsing a version suffix from a name like `FooClientV1` or `FooClient2`.
@@ -195,9 +193,7 @@ pub fn is_in_sdk_crate(cx: &rustc_lint::EarlyContext<'_>, span: Span) -> bool {
         return false;
     };
 
-    file_path.contains("-sdk/")
-        || file_path.contains("-sdk\\")
-        || is_temp_path(&file_path)
+    file_path.contains("-sdk/") || file_path.contains("-sdk\\") || is_temp_path(&file_path)
 }
 
 /// Check if span is within libs/modkit-db/ - the internal sqlx wrapper library

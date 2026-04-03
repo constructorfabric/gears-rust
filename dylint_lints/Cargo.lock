@@ -99,7 +99,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -110,7 +110,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit"
-version = "0.5.11"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-db"
-version = "0.5.11"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-db-macros"
-version = "0.5.11"
+version = "0.6.2"
 dependencies = [
  "heck 0.5.0",
  "proc-macro-error2",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-errors"
-version = "0.5.11"
+version = "0.6.2"
 dependencies = [
  "axum 0.8.8",
  "http",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-errors-macro"
-version = "0.5.11"
+version = "0.6.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-macros"
-version = "0.5.11"
+version = "0.6.2"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-odata"
-version = "0.5.11"
+version = "0.6.2"
 dependencies = [
  "base64",
  "bigdecimal",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-sdk"
-version = "0.5.11"
+version = "0.6.2"
 dependencies = [
  "cf-modkit-odata",
  "cf-modkit-security",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-security"
-version = "0.5.11"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "postcard",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-utils"
-version = "0.5.11"
+version = "0.6.2"
 dependencies = [
  "humantime",
  "regex",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "cf-system-sdk-directory"
-version = "0.1.30"
+version = "0.1.33"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "cf-system-sdks"
-version = "0.1.30"
+version = "0.1.33"
 dependencies = [
  "cf-system-sdk-directory",
 ]
@@ -730,24 +730,12 @@ dependencies = [
 
 [[package]]
 name = "chrono-tz"
-version = "0.9.0"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93698b29de5e97ad0ae26447b344c482a7284c737d9ddc5f9e52b74a336671bb"
+checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
 dependencies = [
  "chrono",
- "chrono-tz-build",
  "phf",
-]
-
-[[package]]
-name = "chrono-tz-build"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c088aee841df9c3041febbb73934cfc39708749bf96dc827e3359cd39ef11b1"
-dependencies = [
- "parse-zoneinfo",
- "phf",
- "phf_codegen",
 ]
 
 [[package]]
@@ -1092,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "de0503_plugin_client_suffix"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "clippy_utils",
@@ -1103,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "de0504_client_versioning"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "clippy_utils",
@@ -1196,6 +1184,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "de1101_tests_in_separate_files"
+version = "0.1.0"
+dependencies = [
+ "clippy_utils",
+ "dylint_linting",
+ "dylint_testing",
+ "lint_utils",
+]
+
+[[package]]
 name = "de1301_no_print_macros"
 version = "0.1.0"
 dependencies = [
@@ -1204,6 +1202,17 @@ dependencies = [
  "dylint_testing",
  "lint_utils",
  "tokio",
+]
+
+[[package]]
+name = "de1302_error_from_to_string"
+version = "0.1.0"
+dependencies = [
+ "clippy_utils",
+ "dylint_linting",
+ "dylint_testing",
+ "lint_utils",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1318,7 +1327,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1512,7 +1521,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2595,7 +2604,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2622,7 +2631,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2927,15 +2936,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "parse-zoneinfo"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f2a05b18d44e2957b88f96ba460715e295bc1d7510468a2f3d3b44535d26c24"
-dependencies = [
- "regex",
-]
-
-[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3017,38 +3017,18 @@ dependencies = [
 
 [[package]]
 name = "phf"
-version = "0.11.3"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
 dependencies = [
  "phf_shared",
-]
-
-[[package]]
-name = "phf_codegen"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
-dependencies = [
- "phf_generator",
- "phf_shared",
-]
-
-[[package]]
-name = "phf_generator"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
-dependencies = [
- "phf_shared",
- "rand 0.8.5",
 ]
 
 [[package]]
 name = "phf_shared"
-version = "0.11.3"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
 dependencies = [
  "siphasher",
 ]
@@ -3602,7 +3582,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4428,7 +4408,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5215,7 +5195,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

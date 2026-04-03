@@ -34,7 +34,7 @@ impl From<Error> for Problem {
             | CursorInvalidKeys
             | CursorInvalidFields
             | CursorInvalidDirection => {
-                ErrorCode::odata_errors_invalid_cursor_v1().as_problem(err.to_string())
+                ErrorCode::odata_errors_invalid_cursor_v1().as_problem(format!("{err}"))
             }
 
             // Pagination validation errors → 422

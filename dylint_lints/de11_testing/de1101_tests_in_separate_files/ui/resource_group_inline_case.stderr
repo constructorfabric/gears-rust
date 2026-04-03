@@ -1,0 +1,14 @@
+error: resource-group test code must be moved to a separate test file (DE1101)
+  --> $DIR/resource_group_inline_case.rs:4:1
+   |
+LL | / mod tests {
+LL | |     #[test]
+LL | |     fn inline_test() {}
+LL | | }
+   | |_^
+   |
+   = help: move the test into `tests/*.rs` or an out-of-line `*_test.rs`/`*_tests.rs` module
+   = note: `#[deny(de1101_tests_in_separate_files)]` on by default
+
+error: aborting due to 1 previous error
+

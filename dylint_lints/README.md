@@ -58,7 +58,7 @@ make gts-docs-test       # Run unit tests for GTS validator
 - TODO
 
 ### Testing (DE11xx)
-- TODO
+- ✅ DE1101: Resource-group tests must be in separate files for easier LOC filtering, easier navigation for humans and LLMs, and strict separation so tests never contain production logic
 
 ### Documentation (DE12xx)
 - TODO

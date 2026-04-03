@@ -1,0 +1,42 @@
+[package]
+name = "de1101_tests_in_separate_files"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Resource-group tests must live in separate files for LOC filtering, easier navigation for humans and LLMs, and strict separation so tests never contain production logic (DE1101)"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "resource_group_inline_case"
+path = "ui/resource_group_inline_case.rs"
+
+[[example]]
+name = "resource_group_out_of_line_test_module"
+path = "ui/resource_group_out_of_line_test_module.rs"
+
+[[example]]
+name = "resource_group_separate_test_file_tests"
+path = "ui/resource_group_separate_test_file_tests.rs"
+
+[[example]]
+name = "other_module_inline_tests"
+path = "ui/other_module_inline_tests.rs"
+
+[[example]]
+name = "resource_group_cfg_not_test"
+path = "ui/resource_group_cfg_not_test.rs"
+
+[dependencies]
+clippy_utils.workspace = true
+dylint_linting.workspace = true
+lint_utils.workspace = true
+
+[dev-dependencies]
+dylint_testing.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true
