@@ -28,11 +28,17 @@ Modkit will expect our module2, not any module with name "module2".
 Based on the previous example, the new API will be:
 
 ```rust
-// module1_sdk -> src/module.rs
+// module1_sdk
+pub trait Module1SDKInterfaceV1 {
+    fn do_something(&self) -> anyhow::Result<()>;
+}
 #[derive(Debug)]
 struct ModuleRef;
 
-// module2_sdk -> src/module.rs
+// module2_sdk
+pub trait Module2SDKInterfaceV4 {
+    fn work(&self) -> anyhow::Result<bool>;
+}
 #[derive(Debug)]
 struct ModuleRef;
 ```
@@ -42,10 +48,40 @@ struct ModuleRef;
 #[modkit_types::module(
     ref = module1_sdk::ModuleRef,
     capabilities = [system, rest],
-    deps = [module2_sdk::ModuleRef],
+    provides = [
+        provide_v1_interface,
+    ],
+    deps = [
+        module2_sdk::Module2SDKInterfaceV4,
+    ],
 )]
 struct Module1 {
     #[modkit_config] config: Module1Config, // optional
+}
+
+impl Module1 {
+    fn provide_v1_interface(
+        &self,
+        ctx: &modkit::ModuleCtx,
+    ) -> anyhow::Result<Box<module1_sdk::Module1SDKInterfaceV1>> {
+        // build the client using the context and the configuration
+    }
+}
+```
+
+```rust
+// module2 -> src/module.rs
+#[modkit_types::module(
+    ref = module2_sdk::ModuleRef,
+    capabilities = [system, rest],
+    provides = [provide_v4_interface],
+)]
+struct Module2;
+
+impl Module2 {
+    pub fn provide_v4_interface(&self, cx: &modkit::ModuleCtx) -> anyhow::Result<Box<dyn module2_sdk::Module2SDKInterfaceV4>> {
+        // build the client using the context and the configuration
+    }
 }
 ```
 
