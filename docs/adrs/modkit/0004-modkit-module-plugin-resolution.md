@@ -61,6 +61,13 @@ struct Plugin1 {
 }
 ```
 
+### Tradeoffs
+
+1. As we introduce a strong reference for the modules, SDK crates will require to be present at build time(for the
+   ModuleRef type reference). This reference, becomes tight to a rust path (module_sdk::ModuleRef).
+2. Changing providers requires a change in the implementation, as the ModuleRef will need to be changed. Example:
+   module1_sdk::ModuleRef → module2_sdk::ModuleRef
+
 ### Reduction of dependencies
 
 With this change, we can load programmatically the modules and plugins without depending on `inventory` crate.
