@@ -45,7 +45,7 @@ struct ModuleRef;
 
 ```rust
 // module1 -> src/module.rs
-#[modkit_types::module(
+#[modkit::module(
     ref = module1_sdk::ModuleRef,
     capabilities = [system, rest],
     provides = [
@@ -71,7 +71,7 @@ impl Module1 {
 
 ```rust
 // module2 -> src/module.rs
-#[modkit_types::module(
+#[modkit::module(
     ref = module2_sdk::ModuleRef,
     capabilities = [system, rest],
     provides = [provide_v4_interface],
@@ -87,7 +87,7 @@ impl Module2 {
 
 ```rust
 // plugin1 -> module1::src/.../plugin1.rs
-#[modkit_types::plugin(
+#[modkit::plugin(
     module = module1_sdk::ModuleRef,
     spec = Module1Plugin1SpecV1,
     instance_id = "cf.builtin.plugin1.plugin.v1", // just an example
@@ -104,19 +104,13 @@ struct Plugin1 {
 2. Changing providers requires a change in the implementation, as the ModuleRef will need to be changed. Example:
    module1_sdk::ModuleRef → module2_sdk::ModuleRef
 
-### Reduction of dependencies
-
-With this change, we can load programmatically the modules and plugins without depending on `inventory` crate.
-
-The new macro enforcing one module per crate in `src/module.rs` allow us to load the module by using that reference.
-
 ## Implementation
 
 The general idea is to implement it in phases without breaking compatibility, until we are ready to make the change:
 
 - Phase 1: Implement the two macros, `module`(module_v2) and `plugin`, in `cf-modkit-macros` crate.
-- Phase 2: Implement the new `cf-modkit-types` crate with the collection of current types + new macros.
-- Phase 3: Change the references from `cf-modkit` runtime types to a re-export of `cf-modkit-types`.
-- Phase 4: Migrate the modules to use `cf-modkit-types`
-- Phase 5: Remove the old types from `cf-modkit` crate.
-- Phase 6: Remove the old macros from `cf-modkit-macros` crate.
+- Phase 2: Implement the new `cf-modkit-runtime` crate with the runtime+bootstrap code from `cf-modkit` crate.
+- Phase 3: Change the references from `cf-modkit` runtime/bootstrap to a re-export of `cf-modkit-runtime` once it's
+  published and remove old runtime/bootstrap modules from `cf-modkit` crate. Put them under feature flag `runtime`
+- Phase 4: Migrate the modules to use the new types from `cf-modkit`.
+- Phase 5: Remove the old macros from `cf-modkit-macros` crate.
