@@ -7,7 +7,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-#[cfg(any(not(feature = "k8s"), test))]
+#[cfg(not(feature = "k8s"))]
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -75,10 +75,10 @@ pub trait LeaderElector: Send + Sync + std::fmt::Debug {
 ///
 /// Immediately delegates to the work function with the parent cancel token.
 #[derive(Debug)]
-#[cfg(any(not(feature = "k8s"), test))]
+#[cfg(not(feature = "k8s"))]
 pub struct NoopLeaderElector;
 
-#[cfg(any(not(feature = "k8s"), test))]
+#[cfg(not(feature = "k8s"))]
 #[async_trait]
 impl LeaderElector for NoopLeaderElector {
     async fn run_role(
@@ -92,70 +92,10 @@ impl LeaderElector for NoopLeaderElector {
 }
 
 /// Creates a [`NoopLeaderElector`] wrapped in an `Arc`.
-#[cfg(any(not(feature = "k8s"), test))]
+#[cfg(not(feature = "k8s"))]
 #[must_use]
 pub fn noop() -> Arc<dyn LeaderElector> {
     Arc::new(NoopLeaderElector)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[tokio::test]
-    async fn noop_runs_work_directly() {
-        let executed = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&executed);
-
-        let elector = NoopLeaderElector;
-        let cancel = CancellationToken::new();
-
-        let c = cancel.clone();
-        let result = tokio::spawn(async move {
-            elector
-                .run_role(
-                    "test",
-                    c,
-                    work_fn(move |_cancel| {
-                        let f = Arc::clone(&flag);
-                        async move {
-                            f.store(true, Ordering::SeqCst);
-                            Ok(())
-                        }
-                    }),
-                )
-                .await
-        })
-        .await;
-
-        assert!(result.is_ok());
-        assert!(executed.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn noop_respects_cancellation() {
-        let elector = NoopLeaderElector;
-        let cancel = CancellationToken::new();
-
-        let c = cancel.clone();
-        let handle = tokio::spawn(async move {
-            elector
-                .run_role(
-                    "test",
-                    c,
-                    work_fn(|cancel| async move {
-                        cancel.cancelled().await;
-                        Ok(())
-                    }),
-                )
-                .await
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        cancel.cancel();
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        assert!(result.is_ok());
-    }
-}
+#[path = "mod_tests.rs"]
+mod mod_tests;

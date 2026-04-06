@@ -1163,5 +1163,5 @@ impl<
 }
 
 #[cfg(test)]
-#[path = "attachment_service_test.rs"]
+#[path = "attachment_service_tests.rs"]
 mod tests;

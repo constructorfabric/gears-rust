@@ -66,12 +66,5 @@ impl TenantFilterProvider for SimpleTenantFilter {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_provider_trait_compiles() {
-        let scope = AccessScope::default();
-        assert!(scope.is_deny_all());
-    }
-}
+#[path = "provider_tests.rs"]
+mod tests;

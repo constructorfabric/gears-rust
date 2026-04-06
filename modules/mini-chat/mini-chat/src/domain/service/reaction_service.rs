@@ -164,5 +164,5 @@ impl<RR: ReactionRepository, MR: MessageRepository, CR: ChatRepository>
 }
 
 #[cfg(test)]
-#[path = "reaction_service_test.rs"]
+#[path = "reaction_service_tests.rs"]
 mod tests;

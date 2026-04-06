@@ -659,5 +659,5 @@ fn unwrap_mutation_err(e: modkit_db::DbError) -> MutationError {
 }
 
 #[cfg(test)]
-#[path = "turn_service_test.rs"]
+#[path = "turn_service_tests.rs"]
 mod tests;

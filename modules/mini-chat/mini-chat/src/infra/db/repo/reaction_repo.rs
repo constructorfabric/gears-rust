@@ -120,5 +120,5 @@ impl crate::domain::repos::ReactionRepository for ReactionRepository {
 }
 
 #[cfg(test)]
-#[path = "reaction_repo_test.rs"]
+#[path = "reaction_repo_tests.rs"]
 mod tests;

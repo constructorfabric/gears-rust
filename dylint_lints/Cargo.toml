@@ -26,7 +26,7 @@ members = [
     "de05_client_layer/de0504_client_versioning",
     "de07_security/de0707_drop_zeroize",
     "de13_common_patterns/de1301_no_print_macros",
-    "de13_common_patterns/de1302_error_from_to_string",
+    # "de13_common_patterns/de1302_error_from_to_string",
     "de13_common_patterns/de1303_no_primitive_type_alias",
 ]
 resolver = "3"

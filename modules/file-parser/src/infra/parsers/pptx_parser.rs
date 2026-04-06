@@ -234,18 +234,5 @@ fn convert_pptx_list(list: &ListElement) -> Vec<ParsedBlock> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parser_id() {
-        let parser = PptxParser::new();
-        assert_eq!(parser.id(), "pptx");
-    }
-
-    #[test]
-    fn test_supported_extensions() {
-        let parser = PptxParser::new();
-        assert_eq!(parser.supported_extensions(), &["pptx"]);
-    }
-}
+#[path = "pptx_parser_tests.rs"]
+mod tests;

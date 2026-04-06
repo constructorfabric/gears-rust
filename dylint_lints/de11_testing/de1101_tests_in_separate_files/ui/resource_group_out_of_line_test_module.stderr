@@ -1,0 +1,11 @@
+error: test module path `dto_tests.rs` must reference `resource_group_out_of_line_test_module_tests.rs` to match the source file (DE1101)
+  --> $DIR/resource_group_out_of_line_test_module.rs:5:1
+   |
+LL | mod tests;
+   | ^^^^^^^^^^
+   |
+   = help: use `#[path = "resource_group_out_of_line_test_module_tests.rs"]` or remove `#[path]` and use `mod resource_group_out_of_line_test_module_tests;`
+   = note: `#[deny(de1101_tests_in_separate_files)]` on by default
+
+error: aborting due to 1 previous error
+

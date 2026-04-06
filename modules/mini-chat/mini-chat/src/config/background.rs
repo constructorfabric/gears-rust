@@ -184,15 +184,6 @@ fn default_cleanup_batch_size() -> u32 {
 fn default_cleanup_max_attempts() -> u32 {
     5
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_worker_configs_are_valid() {
-        OrphanWatchdogConfig::default().validate().unwrap();
-        ThreadSummaryWorkerConfig::default().validate().unwrap();
-        CleanupWorkerConfig::default().validate().unwrap();
-    }
-}
+#[path = "background_tests.rs"]
+mod tests;

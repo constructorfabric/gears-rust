@@ -540,14 +540,5 @@ fn snake_to_upper_camel(s: &str) -> String {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_snake_to_upper_camel() {
-        assert_eq!(snake_to_upper_camel("tenant_id"), "TenantId");
-        assert_eq!(snake_to_upper_camel("id"), "Id");
-        assert_eq!(snake_to_upper_camel("owner_user_id"), "OwnerUserId");
-        assert_eq!(snake_to_upper_camel("custom_col"), "CustomCol");
-    }
-}
+#[path = "scopable_tests.rs"]
+mod tests;

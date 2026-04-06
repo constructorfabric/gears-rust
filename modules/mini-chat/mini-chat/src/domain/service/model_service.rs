@@ -90,5 +90,5 @@ impl ModelService {
 }
 
 #[cfg(test)]
-#[path = "model_service_test.rs"]
+#[path = "model_service_tests.rs"]
 mod tests;

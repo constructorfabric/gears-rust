@@ -1,0 +1,11 @@
+error: test module path `dto_tests.rs` must reference `naming_path_forbidden_tests.rs` to match the source file (DE1101)
+  --> $DIR/naming_path_forbidden.rs:5:1
+   |
+LL | mod tests;
+   | ^^^^^^^^^^
+   |
+   = help: use `#[path = "naming_path_forbidden_tests.rs"]` or remove `#[path]` and use `mod naming_path_forbidden_tests;`
+   = note: `#[deny(de1101_tests_in_separate_files)]` on by default
+
+error: aborting due to 1 previous error
+

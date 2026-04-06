@@ -360,5 +360,5 @@ fn validate_title(title: Option<&str>) -> Result<(), DomainError> {
 }
 
 #[cfg(test)]
-#[path = "chat_service_test.rs"]
+#[path = "chat_service_tests.rs"]
 mod tests;

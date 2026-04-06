@@ -24,24 +24,5 @@ pub type ApiResult<T = ()> = Result<T, Problem>;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_api_result_ok() {
-        let result: ApiResult<i32> = Ok(42);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_api_result_err() {
-        use http::StatusCode;
-
-        let result: ApiResult<i32> = Err(Problem::new(
-            StatusCode::BAD_REQUEST,
-            "Bad Request",
-            "Invalid input",
-        ));
-        assert!(result.is_err());
-    }
-}
+#[path = "result_tests.rs"]
+mod tests;

@@ -4,7 +4,7 @@ version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Resource-group tests must live in separate files for LOC filtering, easier navigation for humans and LLMs, and strict separation so tests never contain production logic (DE1101)"
+description = "Tests must live in separate files for LOC filtering, easier navigation for humans and LLMs, and strict separation so tests never contain production logic (DE1101)"
 publish = false
 
 [lib]
@@ -23,12 +23,28 @@ name = "resource_group_separate_test_file_tests"
 path = "ui/resource_group_separate_test_file_tests.rs"
 
 [[example]]
-name = "other_module_inline_tests"
-path = "ui/other_module_inline_tests.rs"
+name = "other_module_inline_case"
+path = "ui/other_module_inline_case.rs"
 
 [[example]]
 name = "resource_group_cfg_not_test"
 path = "ui/resource_group_cfg_not_test.rs"
+
+[[example]]
+name = "naming_correct_case"
+path = "ui/naming_correct_case.rs"
+
+[[example]]
+name = "naming_wrong_module"
+path = "ui/naming_wrong_module.rs"
+
+[[example]]
+name = "naming_path_forbidden"
+path = "ui/naming_path_forbidden.rs"
+
+[[example]]
+name = "naming_path_correct"
+path = "ui/naming_path_correct.rs"
 
 [dependencies]
 clippy_utils.workspace = true

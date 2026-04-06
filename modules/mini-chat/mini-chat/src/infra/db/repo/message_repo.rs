@@ -413,5 +413,5 @@ fn upper_bound_filter(b: SnapshotBoundary) -> Condition {
 }
 
 #[cfg(test)]
-#[path = "message_repo_test.rs"]
+#[path = "message_repo_tests.rs"]
 mod tests;

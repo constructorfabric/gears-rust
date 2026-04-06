@@ -6,6 +6,7 @@ pub mod harness;
 mod mock;
 pub mod request;
 pub mod response;
+pub mod routes;
 
 pub use body::{IntoBody, Json};
 pub use harness::{AppHarness, AppHarnessBuilder};

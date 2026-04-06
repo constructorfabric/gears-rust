@@ -9,7 +9,7 @@ use modkit_security::SecurityContext;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use uuid::Uuid;
 
-use crate::api::rest::routes::test_router;
+use crate::test_support::routes::test_router;
 
 use super::api_v1::ApiV1;
 use super::mock::shared_mock;

@@ -1,0 +1,11 @@
+error: test module `tests` must be named `naming_wrong_module_tests` to match the source file (DE1101)
+  --> $DIR/naming_wrong_module.rs:4:1
+   |
+LL | mod tests;
+   | ^^^^^^^^^^
+   |
+   = help: rename to `mod naming_wrong_module_tests;`
+   = note: `#[deny(de1101_tests_in_separate_files)]` on by default
+
+error: aborting due to 1 previous error
+
