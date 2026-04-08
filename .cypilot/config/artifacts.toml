@@ -34,16 +34,18 @@ reason = "Ignore module 'nodes-registry' (not SDLC-documented yet: missing requi
 patterns = ["modules/system/nodes-registry/*"]
 
 [[ignore]]
-reason = "Ignore oagw codebase — code traceability markers reverted, pending re-add. Docs still validated (DOCS-ONLY effective: all feature tasks unchecked)."
+reason = "Ignore oagw codebase and features — code traceability markers reverted, pending re-add. PRD/DESIGN/ADR/DECOMPOSITION still validated via autodetect."
 patterns = [
   "modules/system/oagw/oagw/src/*",
   "modules/system/oagw/oagw/tests/*",
   "modules/system/oagw/oagw-sdk/src/*",
+  "modules/system/oagw/docs/features/*",
 ]
 
 [[ignore]]
 reason = "Ignore legacy (pre-Cypilot) ADR files in oagw/docs root — converted copies live under docs/ADR/."
 patterns = ["modules/system/oagw/docs/adr-*.md"]
+
 
 [[ignore]]
 reason = "Ignore module 'tenant-resolver' (not SDLC-documented yet: missing required PRD/DESIGN)."

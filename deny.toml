@@ -35,8 +35,8 @@ yanked = "warn"
 # List of advisory IDs to ignore (RUSTSEC-YYYY-XXXX, etc.)
 ignore = [
   # "RUSTSEC-0000-0000",
-  "RUSTSEC-2023-0071", # we cannot replace rsa 0.9 as it's used by sqlx-mysql AND jsonwebtoken
   "RUSTSEC-2024-0437", # protobuf 2.28 stack overflow — transitive via pingora-core→prometheus 0.13; we never parse untrusted protobuf (prometheus metrics endpoint is unused)
+  "RUSTSEC-2026-0066", # astral-tokio-tar 0.5.6 PAX extension validation — transitive via testcontainers 0.27; dev-only dependency, no untrusted tar parsing
 ]
 
 # Note:
