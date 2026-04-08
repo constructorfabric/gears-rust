@@ -25,6 +25,14 @@ pub fn validate_type_code(code: &str) -> Result<(), DomainError> {
         return Err(DomainError::validation("Type code must not be empty"));
     }
     // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-1
+    // Length check first: avoids formatting a huge invalid code into the prefix error message.
+    // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-3
+    if code.chars().count() > 1024 {
+        return Err(DomainError::validation(
+            "Type code must not exceed 1024 characters",
+        ));
+    }
+    // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-3
     // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2
     if !code.starts_with(RG_TYPE_PREFIX) {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2a
@@ -34,13 +42,6 @@ pub fn validate_type_code(code: &str) -> Result<(), DomainError> {
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2a
     }
     // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2
-    // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-3
-    if code.chars().count() > 1024 {
-        return Err(DomainError::validation(
-            "Type code must not exceed 1024 characters",
-        ));
-    }
-    // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-3
     Ok(())
 }
 
@@ -107,6 +108,33 @@ pub async fn validate_metadata_via_gts(
     };
 
     let validator = jsonschema::validator_for(metadata_schema)
+        .map_err(|e| DomainError::validation(format!("Type metadata_schema is invalid: {e}")))?;
+
+    let errors: Vec<String> = validator
+        .iter_errors(metadata)
+        .map(|e| e.to_string())
+        .collect();
+    if !errors.is_empty() {
+        return Err(DomainError::validation(format!(
+            "Metadata does not match type schema: {}",
+            errors.join("; ")
+        )));
+    }
+    Ok(())
+}
+/// Validate a metadata value against a local JSON Schema directly.
+///
+/// Used internally by unit tests for direct schema validation without GTS overhead.
+/// Production code should use [`validate_metadata_via_gts`] instead.
+pub fn validate_metadata_against_schema(
+    metadata: Option<&serde_json::Value>,
+    schema: Option<&serde_json::Value>,
+) -> Result<(), DomainError> {
+    let (Some(metadata), Some(schema)) = (metadata, schema) else {
+        return Ok(());
+    };
+
+    let validator = jsonschema::validator_for(schema)
         .map_err(|e| DomainError::validation(format!("Type metadata_schema is invalid: {e}")))?;
 
     let errors: Vec<String> = validator
