@@ -1,0 +1,41 @@
+[package]
+name = "cf-resource-group-sdk"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for resource-group module: API trait, types, and error definitions"
+
+[lints]
+workspace = true
+
+[features]
+default = ["odata"]
+odata = [
+    "dep:modkit-odata-macros",
+    "dep:modkit-sdk",
+    "dep:modkit-odata",
+]
+
+[dependencies]
+# Core dependencies for API trait
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+# OData macros (for #[derive(ODataFilterable)])
+modkit-odata-macros = { workspace = true, optional = true }
+
+# UUID support
+uuid = { workspace = true }
+
+# Security context for API methods
+modkit-security = { workspace = true }
+
+# SDK utilities (typed OData queries)
+modkit-sdk = { workspace = true, optional = true }
+
+# OData support for pagination
+modkit-odata = { workspace = true, optional = true }

@@ -197,6 +197,12 @@ modules:
       #       prefix: ""
       #       secret_ref: "azure-openai-key-tenant-b"
 
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
+
   simple-user-settings:
     # Module-specific database configuration
     database:

@@ -52,6 +52,8 @@ static-authz-plugin = { package = "cf-static-authz-plugin", path = "../../module
 # Optional credstore plugins
 static-credstore-plugin = { package = "cf-static-credstore-plugin", path = "../../modules/credstore/plugins/static-credstore-plugin", optional = true }
 
+resource_group = { package = "cf-resource-group", path = "../../modules/system/resource-group/resource-group" }
+
 # user modules
 file_parser = { package = "cf-file-parser", path = "../../modules/file-parser" }
 nodes_registry = { package = "cf-nodes-registry", path = "../../modules/system/nodes-registry/nodes-registry" }
