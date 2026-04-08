@@ -172,18 +172,18 @@ Types define the structural rules for the resource group hierarchy — which par
 
 **Steps**:
 1. [x] - `p1` - Validate `schema_id` via GtsTypePath value object (format, length, non-empty) - `inst-val-input-1`
-2. [x] - `p1` - **IF** `schema_id` does not have RG type prefix `gts.x.system.rg.type.v1~` - `inst-val-input-2`
+2. [x] - `p1` - **IF** `schema_id` does not have RG type prefix `gts.cf.core.rg.type.v1~` - `inst-val-input-2`
    1. [x] - `p1` - **RETURN** Validation error: "Type schema_id must have RG type prefix" - `inst-val-input-2a`
 3. [x] - `p1` - Validate placement invariant: `can_be_root == true OR len(allowed_parents) >= 1` - `inst-val-input-3`
 4. [x] - `p1` - **IF** invariant violated - `inst-val-input-4`
    1. [x] - `p1` - **RETURN** Validation error: "Type must allow root placement or have at least one allowed parent" - `inst-val-input-4a`
 5. [x] - `p1` - **FOR EACH** parent_path in allowed_parents - `inst-val-input-5`
-   1. [x] - `p1` - Validate parent_path has RG type prefix `gts.x.system.rg.type.v1~` - `inst-val-input-5a`
+   1. [x] - `p1` - Validate parent_path has RG type prefix `gts.cf.core.rg.type.v1~` - `inst-val-input-5a`
    2. [x] - `p1` - Verify parent_path exists in gts_type table - `inst-val-input-5b`
 6. [x] - `p1` - **FOR EACH** membership_path in allowed_memberships - `inst-val-input-6`
    1. [x] - `p1` - Validate membership_path is a valid GtsTypePath (no RG prefix requirement) - `inst-val-input-6a`
    2. [x] - `p1` - Verify membership_path exists in gts_type table - `inst-val-input-6b`
-7. [x] - `p1` - **IF** metadata_schema provided, validate it is a valid JSON Schema via `jsonschema::validator_for()`. Returns validation error if the schema cannot be compiled. - `inst-val-input-7`
+7. [x] - `p1` - **IF** metadata_schema provided, validate it is a valid JSON Schema via `jsonschema::validator_for()` (compile-check). Runtime metadata validation against group instances uses `validate_metadata_via_gts()` through `TypesRegistryClient`. - `inst-val-input-7`
 8. [x] - `p1` - **RETURN** validated type definition - `inst-val-input-8`
 
 ### Hierarchy Safety Check for Type Update
@@ -359,12 +359,12 @@ Test setup: SQLite in-memory + TypeService + GroupService (for hierarchy safety 
 
 #### TC-TYP-02: Create type with non-existent allowed_parents [P1]
 - **Covers**: G4
-- **Setup**: Create type with `allowed_parents: ["gts.x.system.rg.type.v1~nonexistent.v1~"]`
+- **Setup**: Create type with `allowed_parents: ["gts.cf.core.rg.type.v1~nonexistent.v1~"]`
 - **Assert**: `DomainError::TypeNotFound` or `DomainError::Validation`
 
 #### TC-TYP-03: Create type with non-existent allowed_memberships [P1]
 - **Covers**: G5
-- **Setup**: Create type with `allowed_memberships: ["gts.x.system.rg.type.v1~nonexistent.v1~"]`
+- **Setup**: Create type with `allowed_memberships: ["gts.cf.core.rg.type.v1~nonexistent.v1~"]`
 - **Assert**: Error (type not found)
 
 #### TC-TYP-04: Placement invariant violation (can_be_root=false, no parents) [P1]
@@ -570,7 +570,7 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 - Create type, verify `resolve_id(code)` returns `Some(id)` where id is `i16`
 
 #### TC-GTS-02: resolve_id returns None for nonexistent path [P1]
-- `resolve_id("gts.x.system.rg.type.v1~nonexistent.v1~")` → `None`
+- `resolve_id("gts.cf.core.rg.type.v1~nonexistent.v1~")` → `None`
 
 #### TC-GTS-03: resolve_ids batch — all found [P1]
 - Create 3 types, `resolve_ids([code1, code2, code3])` → `Ok(vec![id1, id2, id3])`
@@ -592,12 +592,12 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 
 #### TC-GTS-08: load_allowed_parents resolves junction → IDs → paths [P1]
 - Create parent type P, child type C(allowed_parents=[P])
-- load_allowed_parents(C.id) → `vec!["gts.x...P..."]`
+- load_allowed_parents(C.id) → `vec!["gts.cf...P..."]`
 - **Assert**: returned path == P's code
 
 #### TC-GTS-09: load_allowed_memberships resolves junction → IDs → paths [P1]
 - Create member type M, group type G(allowed_memberships=[M])
-- load_allowed_memberships(G.id) → `vec!["gts.x...M..."]`
+- load_allowed_memberships(G.id) → `vec!["gts.cf...M..."]`
 
 #### can_be_root Derivation & Internal Key Handling
 

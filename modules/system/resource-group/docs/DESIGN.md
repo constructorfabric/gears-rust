@@ -180,7 +180,7 @@ Type rules are runtime-configurable through API/seed data with deterministic val
 
 **ADRs**: `cpt-cf-resource-group-adr-p1-gts-type-system`
 
-**Derived type fields — metadata object, JSONB storage (v1)**: Derived type fields (e.g. `barrier`, `custom_domain`, `category`) are nested inside a `metadata` object in API requests and responses. In the database, they are stored in a `metadata` JSONB column on `resource_group`. For chained types (e.g., `gts.x.core.rg.type.v1~y.core.tn.tenant.v1~`), the chained GTS schema defines `properties.metadata` with `additionalProperties: false` for field isolation. `metadata_schema` on the RG type definition is null for chained types — instance metadata is validated against the GTS schema. The `metadata_schema` field is reserved for optional RG-level schema overrides. Advanced validation (e.g., Starlark-based cross-field rules) is out of scope for v1.
+**Derived type fields — metadata object, JSONB storage (v1)**: Derived type fields (e.g. `barrier`, `custom_domain`, `category`) are nested inside a `metadata` object in API requests and responses. In the database, they are stored in a `metadata` JSONB column on `resource_group`. For chained types (e.g., `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~`), the chained GTS schema defines `properties.metadata` with `additionalProperties: false` for field isolation. `metadata_schema` on the RG type definition is null for chained types — instance metadata is validated against the GTS schema. The `metadata_schema` field is reserved for optional RG-level schema overrides. Advanced validation (e.g., Starlark-based cross-field rules) is out of scope for v1.
 
 #### Query Profile as Guardrail
 
@@ -250,11 +250,11 @@ SMALLINT surrogate IDs (`gts_type.id`, `gts_type_id` FK columns) are a **DB-inte
 - `allowed_memberships` in type create/update requests
 - `resource_type` in membership operations (`POST /memberships/...`)
 
-If a referenced type does not exist, the operation **MUST** return a validation error. Each chained type (e.g., `gts.x.system.rg.type.v1~y.system.tn.tenant.v1~`) is a distinct type that must be registered separately — chaining does not auto-create constituent types. Registration order matters: base/resource types first, then chained RG types that reference them. Base types (including `gts.x.system.rg.type.v1~`) must be created before use — via seeding, API calls, or manual DB administration.
+If a referenced type does not exist, the operation **MUST** return a validation error. Each chained type (e.g., `gts.cf.core.rg.type.v1~y.system.tn.tenant.v1~`) is a distinct type that must be registered separately — chaining does not auto-create constituent types. Registration order matters: base/resource types first, then chained RG types that reference them. Base types (including `gts.cf.core.rg.type.v1~`) must be created before use — via seeding, API calls, or manual DB administration.
 
-**RG type prefix requirement (`gts.x.system.rg.type.v1~`)**:
-- **`type` in group operations**: `POST /groups`, `PUT /groups/{id}` — **MUST** have `gts.x.system.rg.type.v1~` prefix. Rejected without it.
-- **`allowed_parents`**: **MUST** have `gts.x.system.rg.type.v1~` prefix — parent groups are always RG types.
+**RG type prefix requirement (`gts.cf.core.rg.type.v1~`)**:
+- **`type` in group operations**: `POST /groups`, `PUT /groups/{id}` — **MUST** have `gts.cf.core.rg.type.v1~` prefix. Rejected without it.
+- **`allowed_parents`**: **MUST** have `gts.cf.core.rg.type.v1~` prefix — parent groups are always RG types.
 - **`allowed_memberships`**: **NO prefix requirement** — membership resource types are external domain types (e.g., `gts.z.system.idp.user.v1~`, `gts.z.system.lms.course.v1~`) that do not need to be RG types.
 
 This ensures the hierarchy is always governed by the RG type contract (`can_be_root`, `allowed_parents`, `allowed_memberships`), while membership resources can be any registered GTS type.
@@ -807,7 +807,7 @@ sequenceDiagram
 
     CS->>PE: access_scope(ctx, COURSE, "list", None)
     PE->>AZ: evaluate(EvaluationRequest)
-    Note right of AZ: subject.properties.tenant_id = T1<br/>action.name = "list"<br/>resource.type = "gts.x.lms.course.v1~"<br/>context.require_constraints = true<br/>context.supported_properties = ["owner_tenant_id"]
+    Note right of AZ: subject.properties.tenant_id = T1<br/>action.name = "list"<br/>resource.type = "gts.cf.lms.course.v1~"<br/>context.require_constraints = true<br/>context.supported_properties = ["owner_tenant_id"]
 
     AZ->>RG: list_group_depth(system_ctx, T1, filter: "hierarchy/depth ge 0 and type eq 'tenant'")
     RG-->>AZ: [{T1, depth:0, metadata:{}}, {T7, depth:1, metadata:{barrier:true}}]
@@ -828,7 +828,7 @@ Step-by-step:
 
 2. **Domain service** — Courses handler receives the request with `SecurityContext`. Before querying the database, it calls `PolicyEnforcer.access_scope(&ctx, &COURSE_RESOURCE, "list", None)` to obtain row-level access constraints.
 
-3. **AuthZ evaluation** — `PolicyEnforcer` builds an `EvaluationRequest` (subject with `tenant_id = T1`, action `"list"`, resource type `"gts.x.lms.course.v1~"`, `require_constraints = true`, `supported_properties = ["owner_tenant_id"]`) and calls `AuthZResolverClient.evaluate()`.
+3. **AuthZ evaluation** — `PolicyEnforcer` builds an `EvaluationRequest` (subject with `tenant_id = T1`, action `"list"`, resource type `"gts.cf.lms.course.v1~"`, `require_constraints = true`, `supported_properties = ["owner_tenant_id"]`) and calls `AuthZResolverClient.evaluate()`.
 
 4. **Hierarchy resolution** — The AuthZ plugin calls `ResourceGroupReadHierarchy.list_group_depth()` with `tenant_id = T1` and a depth filter to resolve the tenant hierarchy. RG returns `[T1 (depth 0), T7 (depth 1)]` — the accessible tenant subtree. The plugin does NOT see `T9` because it is outside `T1`'s hierarchy.
 
@@ -1228,21 +1228,21 @@ RG relies on database-level performance rather than application-level caching:
 
 | Resource (`resource.type`) | Action (`action.name`) | REST Operation | Method | Path | Auth Mode |
 | -------------------------- | ---------------------- | -------------- | ------ | ---- | --------- |
-| `gts.x.core.rg.type.v1~` | `list` | `listTypes` | GET | `/api/types-registry/v1/types` | JWT |
-| `gts.x.core.rg.type.v1~` | `create` | `createType` | POST | `/api/types-registry/v1/types` | JWT |
-| `gts.x.core.rg.type.v1~` | `read` | `getType` | GET | `/api/types-registry/v1/types/{code}` | JWT |
-| `gts.x.core.rg.type.v1~` | `update` | `updateType` | PUT | `/api/types-registry/v1/types/{code}` | JWT |
-| `gts.x.core.rg.type.v1~` | `delete` | `deleteType` | DELETE | `/api/types-registry/v1/types/{code}` | JWT |
-| `gts.x.core.rg.group.v1~` | `list` | `listGroups` | GET | `/groups` | JWT |
-| `gts.x.core.rg.group.v1~` | `create` | `createGroup` | POST | `/groups` | JWT |
-| `gts.x.core.rg.group.v1~` | `read` | `getGroup` | GET | `/groups/{group_id}` | JWT |
-| `gts.x.core.rg.group.v1~` | `update` | `updateGroup` | PUT | `/groups/{group_id}` | JWT |
-| `gts.x.core.rg.group.v1~` | `delete` | `deleteGroup` | DELETE | `/groups/{group_id}` | JWT |
-| `gts.x.core.rg.group.v1~` | `read` | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | JWT |
+| `gts.cf.core.rg.type.v1~` | `list` | `listTypes` | GET | `/api/types-registry/v1/types` | JWT |
+| `gts.cf.core.rg.type.v1~` | `create` | `createType` | POST | `/api/types-registry/v1/types` | JWT |
+| `gts.cf.core.rg.type.v1~` | `read` | `getType` | GET | `/api/types-registry/v1/types/{code}` | JWT |
+| `gts.cf.core.rg.type.v1~` | `update` | `updateType` | PUT | `/api/types-registry/v1/types/{code}` | JWT |
+| `gts.cf.core.rg.type.v1~` | `delete` | `deleteType` | DELETE | `/api/types-registry/v1/types/{code}` | JWT |
+| `gts.cf.core.rg.group.v1~` | `list` | `listGroups` | GET | `/groups` | JWT |
+| `gts.cf.core.rg.group.v1~` | `create` | `createGroup` | POST | `/groups` | JWT |
+| `gts.cf.core.rg.group.v1~` | `read` | `getGroup` | GET | `/groups/{group_id}` | JWT |
+| `gts.cf.core.rg.group.v1~` | `update` | `updateGroup` | PUT | `/groups/{group_id}` | JWT |
+| `gts.cf.core.rg.group.v1~` | `delete` | `deleteGroup` | DELETE | `/groups/{group_id}` | JWT |
+| `gts.cf.core.rg.group.v1~` | `read` | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | JWT |
 | _(AuthZ bypassed)_ | — | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | MTLS |
-| `gts.x.core.rg.group_membership.v1~` | `list` | `listMemberships` | GET | `/memberships` | JWT |
-| `gts.x.core.rg.group_membership.v1~` | `create` | `addMembership` | POST | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
-| `gts.x.core.rg.group_membership.v1~` | `delete` | `deleteMembership` | DELETE | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
+| `gts.cf.core.rg.group_membership.v1~` | `list` | `listMemberships` | GET | `/memberships` | JWT |
+| `gts.cf.core.rg.group_membership.v1~` | `create` | `addMembership` | POST | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
+| `gts.cf.core.rg.group_membership.v1~` | `delete` | `deleteMembership` | DELETE | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
 
 Notes:
   - `resource.type` and `action.name` are illustrative names following CyberFabric AuthZ conventions. Actual GTS type paths and action names are configured in the AuthZ policy.

@@ -86,10 +86,10 @@ paths:
                   summary: Chained RG types
                   value:
                     items:
-                      - $id: "gts://gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                      - $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         $schema: "http://json-schema.org/draft-07/schema#"
                         allOf:
-                          - { $ref: "gts://gts.x.core.rg.type.v1~" }
+                          - { $ref: "gts://gts.cf.core.rg.type.v1~" }
                           - properties:
                               metadata:
                                 type: object
@@ -99,12 +99,12 @@ paths:
                                   barrier: { type: boolean, default: false }
                             x-gts-traits:
                               can_be_root: true
-                              allowed_parents: ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                              allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
                               allowed_memberships: ["gts.z.core.idp.user.v1~"]
-                      - $id: "gts://gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                      - $id: "gts://gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                         $schema: "http://json-schema.org/draft-07/schema#"
                         allOf:
-                          - { $ref: "gts://gts.x.core.rg.type.v1~" }
+                          - { $ref: "gts://gts.cf.core.rg.type.v1~" }
                           - properties:
                               metadata:
                                 type: object
@@ -114,12 +114,12 @@ paths:
                                   short_description: { type: string, maxLength: 500 }
                             x-gts-traits:
                               can_be_root: false
-                              allowed_parents: ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                              allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
                               allowed_memberships: ["gts.z.core.idp.user.v1~"]
-                      - $id: "gts://gts.x.core.rg.type.v1~x.core.rg.branch.v1~"
+                      - $id: "gts://gts.cf.core.rg.type.v1~x.core.rg.branch.v1~"
                         $schema: "http://json-schema.org/draft-07/schema#"
                         allOf:
-                          - { $ref: "gts://gts.x.core.rg.type.v1~" }
+                          - { $ref: "gts://gts.cf.core.rg.type.v1~" }
                           - properties:
                               metadata:
                                 type: object
@@ -128,7 +128,7 @@ paths:
                                   location: { type: string }
                             x-gts-traits:
                               can_be_root: false
-                              allowed_parents: ["gts.x.core.rg.type.v1~w.core.org.department.v1~"]
+                              allowed_parents: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
                               allowed_memberships: ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
                     page_info:
                       next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
@@ -155,7 +155,7 @@ paths:
               rg-base-contract:
                 summary: "Step 1a: RG base contract (x-gts-traits-schema)"
                 value:
-                  $id: "gts://gts.x.core.rg.type.v1~"
+                  $id: "gts://gts.cf.core.rg.type.v1~"
                   $schema: "http://json-schema.org/draft-07/schema#"
                   title: "Resource Group Type"
                   type: object
@@ -169,7 +169,7 @@ paths:
                         default: false
                       allowed_parents:
                         type: array
-                        items: { type: string, x-gts-ref: "gts.x.core.rg.type.v1~" }
+                        items: { type: string, x-gts-ref: "gts.cf.core.rg.type.v1~" }
                         description: "Well-known instances of allowed parent RG types."
                         default: []
                       allowed_memberships:
@@ -224,7 +224,7 @@ paths:
               branch-entity:
                 summary: "Step 2c: Branch entity type"
                 value:
-                  $id: "gts://gts.x.core.rg.branch.v1~"
+                  $id: "gts://gts.cf.core.rg.branch.v1~"
                   $schema: "http://json-schema.org/draft-07/schema#"
                   title: Branch
                   type: object
@@ -265,10 +265,10 @@ paths:
               tenant-rg-type:
                 summary: "Step 3a: Tenant as RG type (chained, x-gts-traits)"
                 value:
-                  $id: "gts://gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                  $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                   $schema: "http://json-schema.org/draft-07/schema#"
                   allOf:
-                    - { $ref: "gts://gts.x.core.rg.type.v1~" }
+                    - { $ref: "gts://gts.cf.core.rg.type.v1~" }
                     - properties:
                         metadata:
                           type: object
@@ -278,16 +278,16 @@ paths:
                             barrier: { type: boolean, default: false }
                       x-gts-traits:
                         can_be_root: true
-                        allowed_parents: ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                        allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
                         allowed_memberships: ["gts.z.core.idp.user.v1~"]
 
               department-rg-type:
                 summary: "Step 3b: Department as RG type (chained, x-gts-traits)"
                 value:
-                  $id: "gts://gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                  $id: "gts://gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                   $schema: "http://json-schema.org/draft-07/schema#"
                   allOf:
-                    - { $ref: "gts://gts.x.core.rg.type.v1~" }
+                    - { $ref: "gts://gts.cf.core.rg.type.v1~" }
                     - properties:
                         metadata:
                           type: object
@@ -297,16 +297,16 @@ paths:
                             short_description: { type: string, maxLength: 500 }
                       x-gts-traits:
                         can_be_root: false
-                        allowed_parents: ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                        allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
                         allowed_memberships: ["gts.z.core.idp.user.v1~"]
 
               branch-rg-type:
                 summary: "Step 3c: Branch as RG type (chained, x-gts-traits)"
                 value:
-                  $id: "gts://gts.x.core.rg.type.v1~x.core.rg.branch.v1~"
+                  $id: "gts://gts.cf.core.rg.type.v1~x.core.rg.branch.v1~"
                   $schema: "http://json-schema.org/draft-07/schema#"
                   allOf:
-                    - { $ref: "gts://gts.x.core.rg.type.v1~" }
+                    - { $ref: "gts://gts.cf.core.rg.type.v1~" }
                     - properties:
                         metadata:
                           type: object
@@ -315,7 +315,7 @@ paths:
                             location: { type: string }
                       x-gts-traits:
                         can_be_root: false
-                        allowed_parents: ["gts.x.core.rg.type.v1~w.core.org.department.v1~"]
+                        allowed_parents: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
                         allowed_memberships: ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
 
       responses:
@@ -329,7 +329,7 @@ paths:
                 rg-base-contract:
                   summary: "Base contract registered"
                   value:
-                    $id: "gts://gts.x.core.rg.type.v1~"
+                    $id: "gts://gts.cf.core.rg.type.v1~"
                     $schema: "http://json-schema.org/draft-07/schema#"
                     title: "Resource Group Type"
                     type: object
@@ -343,7 +343,7 @@ paths:
                           default: false
                         allowed_parents:
                           type: array
-                          items: { type: string, x-gts-ref: "gts.x.core.rg.type.v1~" }
+                          items: { type: string, x-gts-ref: "gts.cf.core.rg.type.v1~" }
                           description: "Well-known instances of allowed parent RG types."
                           default: []
                         allowed_memberships:
@@ -368,10 +368,10 @@ paths:
                 tenant-rg-type:
                   summary: "Chained tenant RG type registered"
                   value:
-                    $id: "gts://gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                    $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                     $schema: "http://json-schema.org/draft-07/schema#"
                     allOf:
-                      - { $ref: "gts://gts.x.core.rg.type.v1~" }
+                      - { $ref: "gts://gts.cf.core.rg.type.v1~" }
                       - properties:
                           metadata:
                             type: object
@@ -381,7 +381,7 @@ paths:
                               barrier: { type: boolean, default: false }
                         x-gts-traits:
                           can_be_root: true
-                          allowed_parents: ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                          allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
                           allowed_memberships: ["gts.z.core.idp.user.v1~"]
                 tenant-entity:
                   summary: "Entity type registered"
@@ -416,10 +416,10 @@ paths:
                 tenant-rg-type:
                   summary: "Chained: Tenant as RG type"
                   value:
-                    $id: "gts://gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                    $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                     $schema: "http://json-schema.org/draft-07/schema#"
                     allOf:
-                      - { $ref: "gts://gts.x.core.rg.type.v1~" }
+                      - { $ref: "gts://gts.cf.core.rg.type.v1~" }
                       - properties:
                           metadata:
                             type: object
@@ -429,7 +429,7 @@ paths:
                               barrier: { type: boolean, default: false }
                         x-gts-traits:
                           can_be_root: true
-                          allowed_parents: ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                          allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
                           allowed_memberships: ["gts.z.core.idp.user.v1~"]
                 tenant-entity:
                   summary: "Entity: Tenant"
@@ -447,7 +447,7 @@ paths:
                 rg-base-contract:
                   summary: "Base: RG contract"
                   value:
-                    $id: "gts://gts.x.core.rg.type.v1~"
+                    $id: "gts://gts.cf.core.rg.type.v1~"
                     $schema: "http://json-schema.org/draft-07/schema#"
                     title: "Resource Group Type"
                     type: object
@@ -536,12 +536,12 @@ paths:
                   value:
                     items:
                       - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T1
                         parent_id: null
                         tenant_id: 11111111-1111-1111-1111-111111111111
                       - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                         name: D2
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 11111111-1111-1111-1111-111111111111
@@ -549,14 +549,14 @@ paths:
                           category: "finance"
                           short_description: "Mega Department"
                       - id: 33333333-3333-3333-3333-333333333333
-                        type: "gts.x.core.rg.type.v1~x.core.rg.branch.v1~"
+                        type: "gts.cf.core.rg.type.v1~x.core.rg.branch.v1~"
                         name: B3
                         parent_id: 22222222-2222-2222-2222-222222222222
                         tenant_id: 11111111-1111-1111-1111-111111111111
                         metadata:
                           location: "Building A, Floor 3"
                       - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T7
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 77777777-7777-7777-7777-777777777777
@@ -571,12 +571,12 @@ paths:
                   value:
                     items:
                       - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T1
                         parent_id: null
                         tenant_id: 11111111-1111-1111-1111-111111111111
                       - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T7
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 77777777-7777-7777-7777-777777777777
@@ -592,7 +592,7 @@ paths:
                   value:
                     items:
                       - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                         name: D2
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 11111111-1111-1111-1111-111111111111
@@ -600,7 +600,7 @@ paths:
                           category: "finance"
                           short_description: "Mega Department"
                       - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T7
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 77777777-7777-7777-7777-777777777777
@@ -615,7 +615,7 @@ paths:
       tags: [groups]
       summary: Create a group
       description: |
-        `type` must be a chained GTS type with `gts.x.core.rg.type.v1~` prefix.
+        `type` must be a chained GTS type with `gts.cf.core.rg.type.v1~` prefix.
         Derived type fields (e.g. `category`) are sent inside `metadata` object.
       requestBody:
         required: true
@@ -628,12 +628,12 @@ paths:
                 summary: Create root tenant T1
                 value:
                   id: 11111111-1111-1111-1111-111111111111
-                  type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                  type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                   name: T1
               create-department:
                 summary: Create department D2 under T1
                 value:
-                  type: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                  type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                   name: D2
                   parent_id: 11111111-1111-1111-1111-111111111111
                   metadata:
@@ -642,7 +642,7 @@ paths:
               create-branch:
                 summary: Create branch B3 under D2
                 value:
-                  type: "gts.x.core.rg.type.v1~x.core.rg.branch.v1~"
+                  type: "gts.cf.core.rg.type.v1~x.core.rg.branch.v1~"
                   name: B3
                   parent_id: 22222222-2222-2222-2222-222222222222
                   metadata:
@@ -651,7 +651,7 @@ paths:
                 summary: Create nested tenant T7 (barrier) under T1
                 value:
                   id: 77777777-7777-7777-7777-777777777777
-                  type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                  type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                   name: T7
                   parent_id: 11111111-1111-1111-1111-111111111111
                   metadata:
@@ -659,7 +659,7 @@ paths:
               create-tenant-custom-domain:
                 summary: Create root tenant T9 (custom domain)
                 value:
-                  type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                  type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                   name: T9
                   metadata:
                     custom_domain: "t9.example.com"
@@ -675,7 +675,7 @@ paths:
                   summary: Tenant T1 response
                   value:
                     id: 11111111-1111-1111-1111-111111111111
-                    type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                    type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                     name: T1
                     parent_id: null
                     tenant_id: 11111111-1111-1111-1111-111111111111
@@ -683,7 +683,7 @@ paths:
                   summary: Department D2 response
                   value:
                     id: 22222222-2222-2222-2222-222222222222
-                    type: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                    type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                     name: D2
                     parent_id: 11111111-1111-1111-1111-111111111111
                     tenant_id: 11111111-1111-1111-1111-111111111111
@@ -694,7 +694,7 @@ paths:
                   summary: Branch B3 response
                   value:
                     id: 33333333-3333-3333-3333-333333333333
-                    type: "gts.x.core.rg.type.v1~x.core.rg.branch.v1~"
+                    type: "gts.cf.core.rg.type.v1~x.core.rg.branch.v1~"
                     name: B3
                     parent_id: 22222222-2222-2222-2222-222222222222
                     tenant_id: 11111111-1111-1111-1111-111111111111
@@ -713,7 +713,7 @@ paths:
                     type: https://api.example.com/errors/invalid-parent-type
                     title: Invalid parent type
                     status: 400
-                    detail: "Type 'gts.x.core.rg.type.v1~x.core.rg.branch.v1~' does not allow parent of type 'gts.x.core.rg.type.v1~y.core.tn.tenant.v1~'"
+                    detail: "Type 'gts.cf.core.rg.type.v1~x.core.rg.branch.v1~' does not allow parent of type 'gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~'"
                     trace_id: 01HXYZRGVALIDATION
                 root-not-allowed:
                   summary: Type cannot be root
@@ -721,7 +721,7 @@ paths:
                     type: https://api.example.com/errors/validation
                     title: Validation error
                     status: 400
-                    detail: "Type 'gts.x.core.rg.type.v1~w.core.org.department.v1~' cannot be root (can_be_root=false and no parent_id provided)"
+                    detail: "Type 'gts.cf.core.rg.type.v1~w.core.org.department.v1~' cannot be root (can_be_root=false and no parent_id provided)"
                     trace_id: 01HXYZRGNOROOT
         '409':
           description: Conflict
@@ -758,7 +758,7 @@ paths:
                   summary: Tenant T1
                   value:
                     id: 11111111-1111-1111-1111-111111111111
-                    type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                    type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                     name: T1
                     parent_id: null
                     tenant_id: 11111111-1111-1111-1111-111111111111
@@ -766,7 +766,7 @@ paths:
                   summary: Department D2
                   value:
                     id: 22222222-2222-2222-2222-222222222222
-                    type: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                    type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                     name: D2
                     parent_id: 11111111-1111-1111-1111-111111111111
                     tenant_id: 11111111-1111-1111-1111-111111111111
@@ -777,7 +777,7 @@ paths:
                   summary: Branch B3
                   value:
                     id: 33333333-3333-3333-3333-333333333333
-                    type: "gts.x.core.rg.type.v1~x.core.rg.branch.v1~"
+                    type: "gts.cf.core.rg.type.v1~x.core.rg.branch.v1~"
                     name: B3
                     parent_id: 22222222-2222-2222-2222-222222222222
                     tenant_id: 11111111-1111-1111-1111-111111111111
@@ -850,13 +850,13 @@ paths:
                   value:
                     items:
                       - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T1
                         parent_id: null
                         tenant_id: 11111111-1111-1111-1111-111111111111
                         depth: 0
                       - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                         name: D2
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 11111111-1111-1111-1111-111111111111
@@ -865,7 +865,7 @@ paths:
                           category: "finance"
                           short_description: "Mega Department"
                       - id: 33333333-3333-3333-3333-333333333333
-                        type: "gts.x.core.rg.type.v1~x.core.rg.branch.v1~"
+                        type: "gts.cf.core.rg.type.v1~x.core.rg.branch.v1~"
                         name: B3
                         parent_id: 22222222-2222-2222-2222-222222222222
                         tenant_id: 11111111-1111-1111-1111-111111111111
@@ -873,7 +873,7 @@ paths:
                         metadata:
                           location: "Building A, Floor 3"
                       - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T7
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 77777777-7777-7777-7777-777777777777
@@ -889,7 +889,7 @@ paths:
                   value:
                     items:
                       - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                         name: D2
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 11111111-1111-1111-1111-111111111111
@@ -898,7 +898,7 @@ paths:
                           category: "finance"
                           short_description: "Mega Department"
                       - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T7
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 77777777-7777-7777-7777-777777777777
@@ -914,13 +914,13 @@ paths:
                   value:
                     items:
                       - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T1
                         parent_id: null
                         tenant_id: 11111111-1111-1111-1111-111111111111
                         depth: -2
                       - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                         name: D2
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 11111111-1111-1111-1111-111111111111
@@ -937,13 +937,13 @@ paths:
                   value:
                     items:
                       - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
                         name: T1
                         parent_id: null
                         tenant_id: 11111111-1111-1111-1111-111111111111
                         depth: -1
                       - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                         name: D2
                         parent_id: 11111111-1111-1111-1111-111111111111
                         tenant_id: 11111111-1111-1111-1111-111111111111
@@ -952,7 +952,7 @@ paths:
                           category: "finance"
                           short_description: "Mega Department"
                       - id: 33333333-3333-3333-3333-333333333333
-                        type: "gts.x.core.rg.type.v1~x.core.rg.branch.v1~"
+                        type: "gts.cf.core.rg.type.v1~x.core.rg.branch.v1~"
                         name: B3
                         parent_id: 22222222-2222-2222-2222-222222222222
                         tenant_id: 11111111-1111-1111-1111-111111111111
@@ -1055,7 +1055,7 @@ components:
       description: "GTS type path (`$id` value without `gts://` prefix)."
       schema:
         type: string
-      example: "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"
+      example: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
 
     MembershipGroupId:
       name: group_id
@@ -1177,7 +1177,7 @@ components:
         type:
           type: string
           description: "GTS type identifier (chained type path, ends with `~`)."
-          example: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+          example: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
         name:
           type: string
           example: D2
@@ -1243,7 +1243,7 @@ components:
         type:
           type: string
           description: "GTS type identifier (chained type path, ends with `~`)."
-          example: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+          example: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
         name:
           type: string
           example: D2
@@ -1262,7 +1262,7 @@ components:
       properties:
         type:
           type: string
-          example: "gts.x.core.rg.type.v1~w.core.org.department.v1~"
+          example: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
         name:
           type: string
           example: D2

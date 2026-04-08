@@ -313,7 +313,7 @@ A type includes:
 - `schema_id` (unique GTS type path, case-insensitive)
 - `can_be_root` (boolean; `true` means the type permits root placement — no `parent_id`). Resolved from `x-gts-traits` in the registered GTS schema.
 - `allowed_parents` (allowed parent type codes; may be empty if the type is root-only). Invariant: `can_be_root OR len(allowed_parents) >= 1` — a type must have at least one valid placement
-- `allowed_memberships` (GTS type paths of resource types allowed as members of groups of this type, e.g. `["gts.x.system.idp.user.v1~"]`)
+- `allowed_memberships` (GTS type paths of resource types allowed as members of groups of this type, e.g. `["gts.cf.core.idp.user.v1~"]`)
 - `metadata_schema` (optional JSON Schema — defines the structure and validation rules for the `metadata` field on group instances of this type)
 
 #### Validate Type Code Format
@@ -390,7 +390,7 @@ The module **MUST** provide API operations for:
 Entity fields (GTS-aligned naming):
 
 - `id` (UUID) — group identifier
-- `type` (GTS chained type path, e.g. `gts.x.system.rg.type.v1~w.system.org.department.v1~`)
+- `type` (GTS chained type path, e.g. `gts.cf.core.rg.type.v1~w.system.org.department.v1~`)
 - `name` (1..255) — display name
 - `metadata` (object) — type-specific fields defined by the chained RG type schema. Examples: `metadata.barrier`, `metadata.custom_domain`, `metadata.category`. For types supporting barrier semantics, `metadata.barrier` (boolean) is included here.
 - `hierarchy` (object) — RG hierarchy context:

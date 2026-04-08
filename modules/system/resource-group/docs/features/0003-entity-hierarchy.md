@@ -472,7 +472,7 @@ The plan was originally based on a gap analysis against acceptance criteria defi
 | `authz_integration_test.rs` | 9 | PolicyEnforcer tenant scoping, deny-all, allow-all, resource_id passing, all CRUD actions, full chain list_groups/deny |
 | `domain_unit_test.rs` | 79 | `validate_type_code` (5 cases), `DomainError` construction (13 variants), `DomainError` → `ResourceGroupError` mapping, `DomainError` → `Problem` mapping, serialization failure detection, `EnforcerError` → `DomainError` conversions, `DbErr` → `DomainError`, ADR-001 hierarchy reproduction, GTS-specific logic, invalid/non-GTS input validation |
 | `group_service_test.rs` | 55 | TC-GRP-01..38: child creation + closure rows, 3-level hierarchy, incompatible parent type, can_be_root enforcement, move with closure rebuild, cycle detection, self-parent, type change validation, leaf/force delete, hierarchy depth traversal, max_depth/max_width enforcement, name validation, cross-tenant parent, simultaneous type+parent change, detach to root, metadata barrier tests |
-| `type_service_test.rs` | 45 | TC-TYP-01..16 + TC-META-01..11 + TC-META-ATK-01..11 + TC-GTS-01..15: create/update/delete types, placement invariant, hierarchy safety checks, metadata_schema round-trip (Object/Array/String/Number), `__can_be_root` derivation/fallback, internal key stripping, security attack vectors (privilege escalation, DoS, SQL injection), resolve_id/resolve_ids, allowed_parents/memberships resolution |
+| `type_service_test.rs` | 45 | TC-TYP-01..16 + TC-META-01..11 + TC-META-ATK-01..11 + TC-GTS-01..15: create/update/delete types, placement invariant, hierarchy safety checks, metadata_schema round-trip (Object/Array/String/Number), `can_be_root` resolution via TypesRegistry, internal key stripping, security attack vectors (privilege escalation, DoS, SQL injection), resolve_id/resolve_ids, allowed_parents/memberships resolution |
 | `membership_service_test.rs` | 15 | TC-MBR-01..15: add/remove membership, nonexistent group, duplicate, unregistered type, not in allowed_memberships, tenant incompatibility, multiple resource types, first-always-allowed tenant, empty resource_id |
 | `seeding_test.rs` | 12 | TC-SEED-01..12: seed_types (create/skip/update/idempotent), seed_groups (create with closure/skip/wrong order), seed_memberships (create/duplicate skip/tenant-incompatible skip/nonexistent group), empty list |
 | `tenant_filtering_db_test.rs` | 7 | Tenant isolation (list/get/hierarchy/update/delete cross-tenant), InGroup predicate, membership data storage |
@@ -754,7 +754,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 #### Type code / type_path — wrong GTS format:
 
 #### TC-NOGTS-01: Create type with valid GTS path but NOT RG prefix [P1]
-- `code: "gts.x.core.user.v1~"` — valid GTS format, but missing `system.rg.type.v1~` prefix
+- `code: "gts.cf.core.user.v1~"` — valid GTS format, but missing `system.rg.type.v1~` prefix
 - **Assert**: 400 Validation ("must start with prefix")
 
 #### TC-NOGTS-02: Create type with empty code [P1]
@@ -766,7 +766,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - **Assert**: 400 Validation (wrong prefix) — no SQL injection
 
 #### TC-NOGTS-04: Create group with non-RG type_path [P1]
-- `type: "gts.x.core.user.v1~"` — valid GTS but not RG type
+- `type: "gts.cf.core.user.v1~"` — valid GTS but not RG type
 - **Assert**: 400 Validation ("must start with prefix")
 
 #### TC-NOGTS-05: Create group with empty type_path [P1]
@@ -790,7 +790,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - **Assert**: 400/422
 
 #### TC-DESER-03: Create type with `can_be_root` missing [P1]
-- Body: `{"code": "gts.x.system.rg.type.v1~test.v1~"}`
+- Body: `{"code": "gts.cf.core.rg.type.v1~test.v1~"}`
 - **Assert**: 400/422 (required field missing — no `#[serde(default)]` on `can_be_root`)
 
 #### TC-DESER-04: Create group with `type` field missing [P1]
@@ -882,9 +882,7 @@ Per ADR-001, each chained RG type defines a `metadata_schema` with `additionalPr
 
 GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at schema registration time. These unit tests verify the **runtime** validation path: when a caller creates/updates a group, RG checks the `metadata` payload against the stored `metadata_schema` for the group's type.
 
-> **Note**: As of current implementation, this validation is **missing** in code — `group_service.rs` stores metadata as-is without validation. These tests will initially fail and serve as acceptance criteria for implementing the validation.
->
-> **Implementation**: Use `TypesRegistryClient` (types-registry-sdk, already used by `credstore` module) + `gts` crate (v0.8.4, already in workspace). The GTS type system validates instance data (including `metadata` sub-object) against the chained RG type schema registered in types-registry. RG module should resolve the group's GTS type via `TypesRegistryClient`, then validate the incoming metadata against the type's inline `metadata` schema (which includes `additionalProperties: false`, field types, `maxLength`). This follows the same pattern as `credstore` module which uses `TypesRegistryClient` from ClientHub for GTS-level validation. Do NOT use raw `jsonschema` crate directly — validation must go through the GTS layer to respect `x-gts-traits`, `allOf` composition, and the metadata sub-object schema.
+> **Implementation**: `validate_metadata_via_gts()` in `validation.rs` resolves the type's schema through `TypesRegistryClient` (types-registry-sdk, same pattern as `credstore` module) and validates metadata via `jsonschema` against the resolved schema. The GTS layer handles `$ref` resolution, `allOf` composition, and `x-gts-traits` — the resolved schema from `TypesRegistryClient::get()` already includes these. No fallback — `TypesRegistryClient` is always available at runtime (application does not start without types-registry).
 
 ##### Tenant metadata (`barrier: boolean`, `custom_domain: hostname`)
 
@@ -995,12 +993,12 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 
 #### TC-ADR-15: metadata_schema round-trip with ADR tenant schema [P1]
 - Create tenant RG type with metadata_schema from ADR (barrier: boolean, custom_domain: hostname)
-- Get type → metadata_schema returned correctly (no `__can_be_root`, no `__user_schema`)
+- Get type → metadata_schema returned correctly (no internal `__` keys in response)
 - **Assert**: metadata_schema matches input
 
 #### TC-ADR-16: Chained type path format in RG [P1]
-- ADR uses: `gts.x.core.rg.type.v1~y.core.tn.tenant.v1~` (multi-segment)
-- Code validates prefix: `gts.x.system.rg.type.v1~` (different namespace!)
+- ADR uses: `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` (multi-segment)
+- Code validates prefix: `gts.cf.core.rg.type.v1~` (different namespace!)
 - **Assert**: Verify which prefix the code actually requires. If `system` not `core` → document discrepancy with ADR.
 
 #### TC-ADR-17: Type response contains no SMALLINT IDs [P1]
@@ -1061,7 +1059,7 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
   - GET /groups/{random-uuid} → 404 Not Found
   - POST /types {duplicate code} → 409 Conflict
   - POST /types {invalid body} → 400 Bad Request
-  - POST /groups {type "gts.x.system.rg.type.v1~nonexistent.v1~"} → 404 (TypeNotFound)
+  - POST /groups {type "gts.cf.core.rg.type.v1~nonexistent.v1~"} → 404 (TypeNotFound)
 - **Assert per response**:
   - HTTP status code matches expected
   - `Content-Type` header contains `application/problem+json`
@@ -1352,3 +1350,30 @@ GET /groups/{root.id}                            → 404
 - [x] S5 verifies `depth` values on real PostgreSQL — not just "hierarchy returns items"
 - [x] S6 verifies child appears under new parent with correct depth after PG SERIALIZABLE move
 - [x] S7 verifies 204 + target returns 404 — PG FK cascade succeeds in correct deletion order
+
+### GTS Metadata Validation Test Requirements
+
+#### Unit tests (MUST)
+
+Unit tests MUST fully validate GTS metadata schema integration:
+
+- **Schema resolution**: `validate_metadata_via_gts()` resolves the type's schema through `TypesRegistryClient` and validates metadata against the resolved schema (including `allOf` composition, `$ref` resolution, `x-gts-traits`).
+- **Positive cases**: Valid metadata accepted for each type that defines a `metadata_schema` (tenant with `barrier: true`, department with `display_name`, etc.).
+- **Negative cases**: Invalid metadata rejected with field-level errors — wrong type (`barrier: "yes"` → 400), unknown fields (`additionalProperties: false`), missing required fields, length violations (`maxLength`).
+- **Round-trip**: `metadata_schema` stored in DB → loaded → used for validation produces the same result as the original schema. Non-object schemas (stored under `__user_schema`) round-trip correctly.
+
+Test files: `group_service_test.rs` (TC-ADR-09..TC-ADR-22), `type_service_test.rs` (TC-META-01..TC-META-11).
+
+Unit tests use a real `TypesRegistryClient` backed by `InMemoryGtsRepository` (same as `rg_gts_type_system_tests.rs`). RG type schemas are registered in the in-memory store before running group creation tests. No mocks needed — the types registry runs in-process with SQLite.
+
+#### E2E tests (MUST)
+
+E2E tests MUST verify the positive path of GTS metadata validation against a running server with real `TypesRegistryClient`:
+
+- Create a type with a `metadata_schema` that defines at least one typed field (e.g. `{"type": "object", "properties": {"label": {"type": "string"}}, "additionalProperties": false}`).
+- Create a group of that type with valid metadata matching the schema (e.g. `{"label": "test"}`).
+- **Assert**: 201 success, response contains the metadata as provided.
+
+E2E tests do NOT need to exhaustively test negative validation cases (wrong types, unknown fields, etc.) — those are covered by unit tests. The E2E test verifies the end-to-end wiring: type creation → schema storage → group creation → metadata validation → success.
+
+Modify existing E2E group creation tests (`test_integration_seams.py`) to use a type with `metadata_schema` instead of `metadata_schema: null`, and pass valid metadata in the group creation request.
