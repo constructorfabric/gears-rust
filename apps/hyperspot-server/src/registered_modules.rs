@@ -1,3 +1,4 @@
+// Updated: 2026-04-16 by Constructor Tech
 // This file is used to ensure that all modules are linked and registered via inventory
 // In future we can simply DX via build.rs which will collect all crates in ./modules and generate this file.
 // But for now we will manually maintain this file.
@@ -13,6 +14,7 @@ use file_parser as _;
 use grpc_hub as _;
 use module_orchestrator as _;
 use nodes_registry as _;
+use resource_group as _;
 #[cfg(not(feature = "oop-example"))]
 use simple_user_settings as _;
 use tenant_resolver as _;

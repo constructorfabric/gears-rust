@@ -5,14 +5,6 @@
 reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Cypilot SDLC artifact."
 patterns = ["modules/system/resource-group/docs/rust-traits.md"]
 
-[[ignore]]
-reason = "Ignore resource-group codebase and features — code traceability markers added incrementally across PR train. Remove after all PRs merged."
-patterns = [
-  "modules/system/resource-group/resource-group/src/*",
-  "modules/system/resource-group/resource-group/tests/*",
-  "modules/system/resource-group/resource-group-sdk/src/*",
-  "modules/system/resource-group/docs/features/*",
-]
 
 [[ignore]]
 reason = "Ignore 'modules/system' parent directory — not a module, only a grouping for system submodules."

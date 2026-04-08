@@ -3914,6 +3914,7 @@ dependencies = [
  "cf-module-orchestrator",
  "cf-nodes-registry",
  "cf-oagw",
+ "cf-resource-group",
  "cf-simple-user-settings",
  "cf-single-tenant-tr-plugin",
  "cf-static-authn-plugin",
