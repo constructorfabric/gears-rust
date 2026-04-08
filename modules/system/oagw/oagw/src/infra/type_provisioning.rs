@@ -198,11 +198,34 @@ struct RateLimitConfig {
     #[serde(default)]
     burst: Option<BurstConfig>,
     #[serde(default)]
+    budget: Option<BudgetConfig>,
+    #[serde(default)]
     scope: RateLimitScope,
     #[serde(default)]
     strategy: RateLimitStrategy,
     #[serde(default = "default_cost")]
     cost: u32,
+    #[serde(default = "default_true")]
+    response_headers: bool,
+}
+
+#[derive(Deserialize)]
+struct BudgetConfig {
+    #[serde(default)]
+    mode: BudgetMode,
+    #[serde(default)]
+    total: Option<u32>,
+    #[serde(default)]
+    overcommit_ratio: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum BudgetMode {
+    #[default]
+    Unlimited,
+    Allocated,
+    Shared,
 }
 
 #[derive(Deserialize)]
@@ -481,9 +504,32 @@ impl From<RateLimitConfig> for domain::RateLimitConfig {
             algorithm: v.algorithm.into(),
             sustained: v.sustained.into(),
             burst: v.burst.map(Into::into),
+            budget: v.budget.map(Into::into),
             scope: v.scope.into(),
             strategy: v.strategy.into(),
             cost: v.cost,
+            response_headers: v.response_headers,
+            pool_owner_id: None,
+        }
+    }
+}
+
+impl From<BudgetConfig> for domain::BudgetConfig {
+    fn from(v: BudgetConfig) -> Self {
+        Self {
+            mode: v.mode.into(),
+            total: v.total,
+            overcommit_ratio: v.overcommit_ratio,
+        }
+    }
+}
+
+impl From<BudgetMode> for domain::BudgetMode {
+    fn from(v: BudgetMode) -> Self {
+        match v {
+            BudgetMode::Unlimited => Self::Unlimited,
+            BudgetMode::Allocated => Self::Allocated,
+            BudgetMode::Shared => Self::Shared,
         }
     }
 }

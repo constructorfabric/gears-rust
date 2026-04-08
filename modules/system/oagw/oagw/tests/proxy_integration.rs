@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use http::{Method, StatusCode};
+use modkit_security::SecurityContext;
 use oagw::test_support::{
     APIKEY_AUTH_PLUGIN_ID, AppHarness, MockBody, MockGuard, MockResponse, MockUpstream,
     OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
@@ -407,6 +408,8 @@ async fn proxy_rate_limit_exceeded_returns_429() {
                 scope: RateLimitScope::Tenant,
                 strategy: RateLimitStrategy::Reject,
                 cost: 1,
+                response_headers: true,
+                budget: None,
             })
             .build(),
         )
@@ -455,6 +458,263 @@ async fn proxy_rate_limit_exceeded_returns_429() {
         )),
         Ok(_) => panic!("expected rate limit error"),
     }
+}
+
+// 18.3: Rate limit scope=user — different subjects within the same tenant get
+// separate buckets. Proves scope-aware keying works end-to-end.
+// Cross-tenant isolation is deferred to e2e tests requiring multi-tenant harness.
+#[tokio::test]
+async fn proxy_rate_limit_scope_user_isolates_by_subject() {
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+    let tenant_id = ctx.subject_tenant_id();
+
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
+            )
+            .alias("scope-user")
+            .rate_limit(RateLimitConfig {
+                sharing: SharingMode::Private,
+                algorithm: RateLimitAlgorithm::TokenBucket,
+                sustained: SustainedRate {
+                    rate: 1,
+                    window: Window::Minute,
+                },
+                burst: Some(BurstConfig { capacity: 1 }),
+                scope: RateLimitScope::User,
+                strategy: RateLimitStrategy::Reject,
+                cost: 1,
+                response_headers: true,
+                budget: None,
+            })
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get],
+                        path: "/v1/models".into(),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Append,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    // Two users in the same tenant.
+    let user_a = SecurityContext::builder()
+        .subject_tenant_id(tenant_id)
+        .subject_id(uuid::Uuid::new_v4())
+        .build()
+        .unwrap();
+    let user_b = SecurityContext::builder()
+        .subject_tenant_id(tenant_id)
+        .subject_id(uuid::Uuid::new_v4())
+        .build()
+        .unwrap();
+
+    // User A — allowed (own bucket).
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri("/scope-user/v1/models")
+        .body(Body::Empty)
+        .unwrap();
+    let resp = h.facade().proxy_request(user_a.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // User B — allowed (separate bucket).
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri("/scope-user/v1/models")
+        .body(Body::Empty)
+        .unwrap();
+    let resp = h.facade().proxy_request(user_b.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // User A again — rejected (own bucket exhausted).
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri("/scope-user/v1/models")
+        .body(Body::Empty)
+        .unwrap();
+    assert!(h.facade().proxy_request(user_a, req).await.is_err());
+
+    // User B again — rejected (own bucket exhausted).
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri("/scope-user/v1/models")
+        .body(Body::Empty)
+        .unwrap();
+    assert!(h.facade().proxy_request(user_b, req).await.is_err());
+}
+
+// 18.4: Rate limit scope=route — different routes on the same upstream get
+// separate buckets. Proves route-scoped keying isolates per route.
+#[tokio::test]
+async fn proxy_rate_limit_scope_route_isolates_by_route() {
+    // Register a dynamic mock for the second route path.
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/v1/embeddings",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"object": "list", "data": []})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
+            )
+            .alias("scope-route")
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    // Route A — rate limited with scope=Route (uses static /v1/models mock).
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get],
+                        path: "/v1/models".into(),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Append,
+                    }),
+                    grpc: None,
+                },
+            )
+            .rate_limit(RateLimitConfig {
+                sharing: SharingMode::Private,
+                algorithm: RateLimitAlgorithm::TokenBucket,
+                sustained: SustainedRate {
+                    rate: 1,
+                    window: Window::Minute,
+                },
+                burst: Some(BurstConfig { capacity: 1 }),
+                scope: RateLimitScope::Route,
+                strategy: RateLimitStrategy::Reject,
+                cost: 1,
+                response_headers: true,
+                budget: None,
+            })
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    // Route B — same upstream, different path, same rate limit config
+    // (uses dynamic mock registered via MockGuard).
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get],
+                        path: guard.path("/v1/embeddings"),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Append,
+                    }),
+                    grpc: None,
+                },
+            )
+            .rate_limit(RateLimitConfig {
+                sharing: SharingMode::Private,
+                algorithm: RateLimitAlgorithm::TokenBucket,
+                sustained: SustainedRate {
+                    rate: 1,
+                    window: Window::Minute,
+                },
+                burst: Some(BurstConfig { capacity: 1 }),
+                scope: RateLimitScope::Route,
+                strategy: RateLimitStrategy::Reject,
+                cost: 1,
+                response_headers: true,
+                budget: None,
+            })
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let route_b_path = format!("/scope-route{}", guard.path("/v1/embeddings"));
+
+    // Route A — allowed (own bucket).
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri("/scope-route/v1/models")
+        .body(Body::Empty)
+        .unwrap();
+    let resp = h.facade().proxy_request(ctx.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Route B — allowed (separate bucket).
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(&route_b_path)
+        .body(Body::Empty)
+        .unwrap();
+    let resp = h.facade().proxy_request(ctx.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Route A again — rejected (own bucket exhausted).
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri("/scope-route/v1/models")
+        .body(Body::Empty)
+        .unwrap();
+    assert!(h.facade().proxy_request(ctx.clone(), req).await.is_err());
+
+    // Route B again — rejected (own bucket exhausted).
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(&route_b_path)
+        .body(Body::Empty)
+        .unwrap();
+    assert!(h.facade().proxy_request(ctx, req).await.is_err());
 }
 
 // 6.16: Upstream timeout — proxy to gated mock that never responds, assert 504.
@@ -1775,6 +2035,8 @@ async fn proxy_websocket_rate_limit_on_handshake() {
                 scope: RateLimitScope::Tenant,
                 strategy: RateLimitStrategy::Reject,
                 cost: 1,
+                response_headers: true,
+                budget: None,
             })
             .build(),
         )

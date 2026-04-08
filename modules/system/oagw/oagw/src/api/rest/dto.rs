@@ -128,12 +128,16 @@ pub struct RateLimitConfig {
     pub sustained: SustainedRate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst: Option<BurstConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetConfig>,
     #[serde(default)]
     pub scope: RateLimitScope,
     #[serde(default)]
     pub strategy: RateLimitStrategy,
     #[serde(default = "default_cost")]
     pub cost: u32,
+    #[serde(default = "default_true")]
+    pub response_headers: bool,
 }
 
 fn default_cost() -> u32 {
@@ -168,6 +172,25 @@ pub enum Window {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BurstConfig {
     pub capacity: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BudgetConfig {
+    #[serde(default)]
+    pub mode: BudgetMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overcommit_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetMode {
+    #[default]
+    Unlimited,
+    Allocated,
+    Shared,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, utoipa::ToSchema)]
@@ -579,9 +602,32 @@ impl From<RateLimitConfig> for domain::RateLimitConfig {
             algorithm: v.algorithm.into(),
             sustained: v.sustained.into(),
             burst: v.burst.map(Into::into),
+            budget: v.budget.map(Into::into),
             scope: v.scope.into(),
             strategy: v.strategy.into(),
             cost: v.cost,
+            response_headers: v.response_headers,
+            pool_owner_id: None,
+        }
+    }
+}
+
+impl From<BudgetConfig> for domain::BudgetConfig {
+    fn from(v: BudgetConfig) -> Self {
+        Self {
+            mode: v.mode.into(),
+            total: v.total,
+            overcommit_ratio: v.overcommit_ratio,
+        }
+    }
+}
+
+impl From<BudgetMode> for domain::BudgetMode {
+    fn from(v: BudgetMode) -> Self {
+        match v {
+            BudgetMode::Unlimited => Self::Unlimited,
+            BudgetMode::Allocated => Self::Allocated,
+            BudgetMode::Shared => Self::Shared,
         }
     }
 }
@@ -842,9 +888,31 @@ impl From<domain::RateLimitConfig> for RateLimitConfig {
             algorithm: v.algorithm.into(),
             sustained: v.sustained.into(),
             burst: v.burst.map(Into::into),
+            budget: v.budget.map(Into::into),
             scope: v.scope.into(),
             strategy: v.strategy.into(),
             cost: v.cost,
+            response_headers: v.response_headers,
+        }
+    }
+}
+
+impl From<domain::BudgetConfig> for BudgetConfig {
+    fn from(v: domain::BudgetConfig) -> Self {
+        Self {
+            mode: v.mode.into(),
+            total: v.total,
+            overcommit_ratio: v.overcommit_ratio,
+        }
+    }
+}
+
+impl From<domain::BudgetMode> for BudgetMode {
+    fn from(v: domain::BudgetMode) -> Self {
+        match v {
+            domain::BudgetMode::Unlimited => Self::Unlimited,
+            domain::BudgetMode::Allocated => Self::Allocated,
+            domain::BudgetMode::Shared => Self::Shared,
         }
     }
 }

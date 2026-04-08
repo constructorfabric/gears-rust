@@ -216,11 +216,14 @@ pub(crate) fn domain_error_to_problem(err: DomainError, instance: &str) -> Probl
 /// Convert a `DomainError` into an axum `Response` with the
 /// `x-oagw-error-source: gateway` header. Used by the proxy handler.
 pub fn error_response(err: DomainError) -> Response {
-    let retry_after = match &err {
+    let rate_limit_meta = match &err {
         DomainError::RateLimitExceeded {
-            retry_after_secs: Some(secs),
+            retry_after_secs,
+            limit,
+            remaining,
+            reset_epoch,
             ..
-        } => Some(*secs),
+        } => Some((*retry_after_secs, *limit, *remaining, *reset_epoch)),
         _ => None,
     };
 
@@ -232,10 +235,27 @@ pub fn error_response(err: DomainError) -> Response {
         HeaderValue::from_static(ErrorSource::Gateway.as_str()),
     );
 
-    if let Some(secs) = retry_after
-        && let Ok(v) = secs.to_string().parse()
-    {
-        response.headers_mut().insert("retry-after", v);
+    if let Some((retry_after_secs, limit, remaining, reset_epoch)) = rate_limit_meta {
+        if let Some(secs) = retry_after_secs
+            && let Ok(v) = secs.to_string().parse()
+        {
+            response.headers_mut().insert("retry-after", v);
+        }
+        if let Some(l) = limit
+            && let Ok(v) = l.to_string().parse()
+        {
+            response.headers_mut().insert("x-ratelimit-limit", v);
+        }
+        if let Some(r) = remaining
+            && let Ok(v) = r.to_string().parse()
+        {
+            response.headers_mut().insert("x-ratelimit-remaining", v);
+        }
+        if let Some(re) = reset_epoch
+            && let Ok(v) = re.to_string().parse()
+        {
+            response.headers_mut().insert("x-ratelimit-reset", v);
+        }
     }
 
     response
@@ -276,6 +296,9 @@ mod tests {
             detail: "rate limit exceeded for upstream".into(),
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat/completions".into(),
             retry_after_secs: Some(30),
+            limit: Some(100),
+            remaining: Some(0),
+            reset_epoch: Some(1706626800),
         };
         let p: Problem = err.into();
         assert_eq!(p.status, StatusCode::TOO_MANY_REQUESTS);
@@ -329,6 +352,9 @@ mod tests {
                 detail: "test".into(),
                 instance: "/test".into(),
                 retry_after_secs: None,
+                limit: None,
+                remaining: None,
+                reset_epoch: None,
             },
             DomainError::SecretNotFound {
                 detail: "test".into(),

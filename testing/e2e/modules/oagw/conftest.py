@@ -35,6 +35,28 @@ def oagw_headers():
 
 
 # ---------------------------------------------------------------------------
+# Hierarchy tenant headers (for multi-tenant budget allocation tests)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def hierarchy_root_headers():
+    """Headers for hierarchy-root tenant (00000000-...001)."""
+    return {"Authorization": "Bearer e2e-token-hierarchy-root"}
+
+
+@pytest.fixture
+def hierarchy_l1a_headers():
+    """Headers for hierarchy-l1a tenant (00000000-...002), child of root."""
+    return {"Authorization": "Bearer e2e-token-hierarchy-l1a"}
+
+
+@pytest.fixture
+def hierarchy_l1b_headers():
+    """Headers for hierarchy-l1b tenant (00000000-...005), child of root."""
+    return {"Authorization": "Bearer e2e-token-hierarchy-l1b"}
+
+
+# ---------------------------------------------------------------------------
 # Session-scoped mock upstream server
 # ---------------------------------------------------------------------------
 

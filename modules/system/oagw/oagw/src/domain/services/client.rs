@@ -228,6 +228,7 @@ fn domain_err_to_sdk(err: DomainError) -> ServiceGatewayError {
             detail,
             instance,
             retry_after_secs,
+            ..
         } => ServiceGatewayError::RateLimitExceeded {
             detail,
             instance,
@@ -450,6 +451,15 @@ fn rate_limit_config_to_domain(v: oagw_sdk::RateLimitConfig) -> model::RateLimit
         burst: v.burst.map(|b| model::BurstConfig {
             capacity: b.capacity,
         }),
+        budget: v.budget.map(|b| model::BudgetConfig {
+            mode: match b.mode {
+                oagw_sdk::BudgetMode::Unlimited => model::BudgetMode::Unlimited,
+                oagw_sdk::BudgetMode::Allocated => model::BudgetMode::Allocated,
+                oagw_sdk::BudgetMode::Shared => model::BudgetMode::Shared,
+            },
+            total: b.total,
+            overcommit_ratio: b.overcommit_ratio,
+        }),
         scope: match v.scope {
             oagw_sdk::RateLimitScope::Global => model::RateLimitScope::Global,
             oagw_sdk::RateLimitScope::Tenant => model::RateLimitScope::Tenant,
@@ -463,6 +473,8 @@ fn rate_limit_config_to_domain(v: oagw_sdk::RateLimitConfig) -> model::RateLimit
             oagw_sdk::RateLimitStrategy::Degrade => model::RateLimitStrategy::Degrade,
         },
         cost: v.cost,
+        response_headers: v.response_headers,
+        pool_owner_id: None,
     }
 }
 
@@ -719,6 +731,15 @@ fn rate_limit_config_to_sdk(v: model::RateLimitConfig) -> oagw_sdk::RateLimitCon
         burst: v.burst.map(|b| oagw_sdk::BurstConfig {
             capacity: b.capacity,
         }),
+        budget: v.budget.map(|b| oagw_sdk::BudgetConfig {
+            mode: match b.mode {
+                model::BudgetMode::Unlimited => oagw_sdk::BudgetMode::Unlimited,
+                model::BudgetMode::Allocated => oagw_sdk::BudgetMode::Allocated,
+                model::BudgetMode::Shared => oagw_sdk::BudgetMode::Shared,
+            },
+            total: b.total,
+            overcommit_ratio: b.overcommit_ratio,
+        }),
         scope: match v.scope {
             model::RateLimitScope::Global => oagw_sdk::RateLimitScope::Global,
             model::RateLimitScope::Tenant => oagw_sdk::RateLimitScope::Tenant,
@@ -732,6 +753,7 @@ fn rate_limit_config_to_sdk(v: model::RateLimitConfig) -> oagw_sdk::RateLimitCon
             model::RateLimitStrategy::Degrade => oagw_sdk::RateLimitStrategy::Degrade,
         },
         cost: v.cost,
+        response_headers: v.response_headers,
     }
 }
 
@@ -839,6 +861,9 @@ mod tests {
             detail: "too fast".into(),
             instance: "/api".into(),
             retry_after_secs: Some(30),
+            limit: None,
+            remaining: None,
+            reset_epoch: None,
         };
         let sdk_err = domain_err_to_sdk(err);
         match sdk_err {

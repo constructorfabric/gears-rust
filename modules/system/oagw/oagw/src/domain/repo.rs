@@ -49,6 +49,10 @@ pub trait UpstreamRepository: Send + Sync {
 
     /// Delete an upstream. Returns NotFound if it does not exist.
     async fn delete(&self, tenant_id: Uuid, id: Uuid) -> Result<(), RepositoryError>;
+
+    /// List all upstreams with the given alias across all tenants.
+    /// Used for budget allocation validation (summing sibling allocations).
+    async fn list_by_alias(&self, alias: &str) -> Result<Vec<Upstream>, RepositoryError>;
 }
 
 /// Repository trait for route persistence.

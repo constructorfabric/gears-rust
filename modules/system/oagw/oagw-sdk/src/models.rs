@@ -135,9 +135,11 @@ pub struct RateLimitConfig {
     pub algorithm: RateLimitAlgorithm,
     pub sustained: SustainedRate,
     pub burst: Option<BurstConfig>,
+    pub budget: Option<BudgetConfig>,
     pub scope: RateLimitScope,
     pub strategy: RateLimitStrategy,
     pub cost: u32,
+    pub response_headers: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -169,6 +171,24 @@ pub enum Window {
 pub struct BurstConfig {
     /// Maximum burst size. Defaults to sustained.rate if not specified.
     pub capacity: u32,
+}
+
+/// Budget allocation configuration for hierarchical rate limit management.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetConfig {
+    pub mode: BudgetMode,
+    /// Total budget capacity. Required for `Allocated` and `Shared` modes.
+    pub total: Option<u32>,
+    /// Over-provisioning ratio (1.0–2.0, default 1.0). Only for `Allocated` mode.
+    pub overcommit_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetMode {
+    #[default]
+    Unlimited,
+    Allocated,
+    Shared,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

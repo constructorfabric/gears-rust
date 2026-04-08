@@ -87,15 +87,15 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 - Circuit breaker half-open probe fails — circuit re-opens
 
 **Steps**:
-1. [ ] - `p2` - Actor sends proxy request via `cpt-cf-oagw-flow-proxy-request` (alias resolution and route matching complete) - `inst-rl-1`
-2. [ ] - `p2` - Resolve effective rate limit config via `cpt-cf-oagw-algo-hierarchical-rate-limit-merge` for upstream and matched route - `inst-rl-2`
+1. [x] - `p2` - Actor sends proxy request via `cpt-cf-oagw-flow-proxy-request` (alias resolution and route matching complete) - `inst-rl-1`
+2. [x] - `p2` - Resolve effective rate limit config via `cpt-cf-oagw-algo-hierarchical-rate-limit-merge` for upstream and matched route - `inst-rl-2`
 3. [ ] - `p2` - Check circuit breaker state via `cpt-cf-oagw-algo-circuit-breaker-evaluation` - `inst-rl-3`
 4. [ ] - `p2` - **IF** circuit breaker is OPEN - `inst-rl-4`
    1. [ ] - `p2` - **RETURN** 503 CircuitBreakerOpen with `Retry-After` and `X-Circuit-State: OPEN` via `cpt-cf-oagw-algo-error-source-classification` - `inst-rl-4a`
-5. [ ] - `p2` - Check rate limit via `cpt-cf-oagw-algo-token-bucket-check` with effective rate config and request cost - `inst-rl-5`
-6. [ ] - `p2` - **IF** rate limit exceeded - `inst-rl-6`
-   1. [ ] - `p2` - **IF** strategy = `reject` - `inst-rl-6a`
-      1. [ ] - `p2` - **RETURN** 429 RateLimitExceeded with `X-RateLimit-*` headers and `Retry-After` - `inst-rl-6a1`
+5. [x] - `p2` - Check rate limit via `cpt-cf-oagw-algo-token-bucket-check` with effective rate config and request cost - `inst-rl-5`
+6. [x] - `p2` - **IF** rate limit exceeded - `inst-rl-6`
+   1. [x] - `p2` - **IF** strategy = `reject` - `inst-rl-6a`
+      1. [x] - `p2` - **RETURN** 429 RateLimitExceeded with `X-RateLimit-*` headers and `Retry-After` - `inst-rl-6a1`
    2. [ ] - `p2` - **IF** strategy = `queue` - `inst-rl-6b`
       1. [ ] - `p2` - Enqueue request via `cpt-cf-oagw-algo-backpressure-queue` - `inst-rl-6b1`
       2. [ ] - `p2` - **IF** queue full or timeout expires - `inst-rl-6b2`
@@ -106,11 +106,11 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
       1. [ ] - `p2` - **RETURN** 503 ConcurrencyLimitExceeded with `Retry-After` - `inst-rl-8a1`
    2. [ ] - `p2` - **IF** strategy = `queue` - `inst-rl-8b`
       1. [ ] - `p2` - Enqueue request via `cpt-cf-oagw-algo-backpressure-queue` - `inst-rl-8b1`
-9. [ ] - `p2` - Continue proxy flow (auth → guards → transform → upstream call) per `cpt-cf-oagw-flow-proxy-request` - `inst-rl-9`
+9. [x] - `p2` - Continue proxy flow (auth → guards → transform → upstream call) per `cpt-cf-oagw-flow-proxy-request` - `inst-rl-9`
 10. [ ] - `p2` - On upstream response: evaluate circuit breaker via `cpt-cf-oagw-algo-circuit-breaker-evaluation` (record success/failure) - `inst-rl-10`
 11. [ ] - `p2` - Concurrency permits auto-released via RAII Drop - `inst-rl-11`
-12. [ ] - `p2` - Include `X-RateLimit-*` response headers if `response_headers: true` in rate limit config - `inst-rl-12`
-13. [ ] - `p2` - **RETURN** upstream response to caller - `inst-rl-13`
+12. [x] - `p2` - Include `X-RateLimit-*` response headers if `response_headers: true` in rate limit config - `inst-rl-12`
+13. [x] - `p2` - **RETURN** upstream response to caller - `inst-rl-13`
 
 ### Configure Rate Limits
 
@@ -131,62 +131,62 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 - Invalid configuration values (400 ValidationError)
 
 **Steps**:
-1. [ ] - `p2` - Actor sends PUT /api/oagw/v1/upstreams/{id} or PUT /api/oagw/v1/routes/{id} with `rate_limit`, `circuit_breaker`, or `concurrency_limit` in request body - `inst-cfg-1`
-2. [ ] - `p2` - Validate rate limit config: `sustained.rate` > 0, `burst.capacity` ≥ 1, `scope` is valid enum, `strategy` is valid enum - `inst-cfg-2`
-3. [ ] - `p2` - **IF** `budget.mode` = `allocated` - `inst-cfg-3`
-   1. [ ] - `p2` - Validate sum of child allocations ≤ parent budget × `overcommit_ratio` - `inst-cfg-3a`
-   2. [ ] - `p2` - **IF** validation fails - `inst-cfg-3b`
-      1. [ ] - `p2` - **RETURN** 400 ValidationError with budget allocation details - `inst-cfg-3b1`
-4. [ ] - `p2` - **IF** ancestor has `sharing: enforce` on rate limit - `inst-cfg-4`
-   1. [ ] - `p2` - Validate descendant's limit does not exceed ancestor's enforced limit - `inst-cfg-4a`
+1. [x] - `p2` - Actor sends PUT /api/oagw/v1/upstreams/{id} or PUT /api/oagw/v1/routes/{id} with `rate_limit`, `circuit_breaker`, or `concurrency_limit` in request body - `inst-cfg-1`
+2. [x] - `p2` - Validate rate limit config: `sustained.rate` > 0, `burst.capacity` ≥ 1, `scope` is valid enum, `strategy` is valid enum - `inst-cfg-2`
+3. [x] - `p2` - **IF** `budget.mode` = `allocated` - `inst-cfg-3`
+   1. [x] - `p2` - Validate sum of child allocations ≤ parent budget × `overcommit_ratio` - `inst-cfg-3a`
+   2. [x] - `p2` - **IF** validation fails - `inst-cfg-3b`
+      1. [x] - `p2` - **RETURN** 400 ValidationError with budget allocation details - `inst-cfg-3b1`
+4. [x] - `p2` - **IF** ancestor has `sharing: enforce` on rate limit - `inst-cfg-4`
+   1. [x] - `p2` - Validate descendant's limit does not exceed ancestor's enforced limit - `inst-cfg-4a`
 5. [ ] - `p2` - Validate circuit breaker config: `failure_threshold` ≥ 1, `timeout_seconds` ≥ 1, `success_threshold` ≥ 1 - `inst-cfg-5`
 6. [ ] - `p2` - Validate concurrency limit config: `max_concurrent` > 0, `per_tenant_max` ≤ `max_concurrent` - `inst-cfg-6`
 7. [ ] - `p2` - **IF** `strategy` = `queue` on rate_limit or concurrency_limit - `inst-cfg-7`
    1. [ ] - `p2` - Validate queue config: `max_depth` (1–10,000), `timeout` (1–60s), `memory_limit` (1B–1GB), `overflow_strategy` is valid enum (`drop_newest`, `drop_oldest`, `reject`) - `inst-cfg-7a`
-8. [ ] - `p2` - Persist config to database via ControlPlaneService - `inst-cfg-8`
-9. [ ] - `p2` - **RETURN** updated resource - `inst-cfg-9`
+8. [x] - `p2` - Persist config to database via ControlPlaneService - `inst-cfg-8`
+9. [x] - `p2` - **RETURN** updated resource - `inst-cfg-9`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### Token Bucket Rate Check
 
-- [ ] `p2` - **ID**: `cpt-cf-oagw-algo-token-bucket-check`
+- [x] `p2` - **ID**: `cpt-cf-oagw-algo-token-bucket-check`
 
 **Input**: Rate limit config (algorithm, sustained rate, burst capacity, scope, cost), request context (tenant_id, user_id, IP, route_id)
 
 **Output**: Allow (with remaining tokens) or deny (with retry-after estimate)
 
 **Steps**:
-1. [ ] - `p2` - Determine counter key from scope: `oagw:ratelimit:{scope}:{identifier}:{window}` - `inst-tb-1`
-2. [ ] - `p2` - Load or create in-memory `TokenBucket` for key - `inst-tb-2`
-3. [ ] - `p2` - Refill tokens: `elapsed = now - last_update`, `new_tokens = elapsed_seconds × refill_rate`, `tokens = min(tokens + new_tokens, capacity)`, `last_update = now` - `inst-tb-3`
-4. [ ] - `p2` - **IF** `tokens >= cost` - `inst-tb-4`
-   1. [ ] - `p2` - Deduct: `tokens -= cost` - `inst-tb-4a`
-   2. [ ] - `p2` - **RETURN** Allow with `remaining = floor(tokens)`, `limit = capacity`, `reset = window_end_timestamp` - `inst-tb-4b`
-5. [ ] - `p2` - **ELSE** (insufficient tokens) - `inst-tb-5`
-   1. [ ] - `p2` - Calculate `retry_after = ceil((cost - tokens) / refill_rate)` - `inst-tb-5a`
-   2. [ ] - `p2` - **RETURN** Deny with `retry_after`, `limit = capacity`, `remaining = 0`, `reset = window_end_timestamp` - `inst-tb-5b`
+1. [x] - `p2` - Determine counter key from scope: `oagw:ratelimit:{resource_type}:{resource_id}:{scope}:{scope_id}:{window}` - `inst-tb-1`
+2. [x] - `p2` - Load or create in-memory `TokenBucket` for key - `inst-tb-2`
+3. [x] - `p2` - Refill tokens: `elapsed = now - last_update`, `new_tokens = elapsed_seconds × refill_rate`, `tokens = min(tokens + new_tokens, capacity)`, `last_update = now` - `inst-tb-3`
+4. [x] - `p2` - **IF** `tokens >= cost` - `inst-tb-4`
+   1. [x] - `p2` - Deduct: `tokens -= cost` - `inst-tb-4a`
+   2. [x] - `p2` - **RETURN** Allow with `remaining = floor(tokens)`, `limit = capacity`, `reset = now + ceil((capacity - tokens) / refill_rate)` (Unix epoch timestamp when bucket fully replenished; token buckets refill continuously so there is no discrete window boundary) - `inst-tb-4b`
+5. [x] - `p2` - **ELSE** (insufficient tokens) - `inst-tb-5`
+   1. [x] - `p2` - Calculate `retry_after = ceil((cost - tokens) / refill_rate)` - `inst-tb-5a`
+   2. [x] - `p2` - **RETURN** Deny with `retry_after`, `limit = capacity`, `remaining = 0`, `reset = now + retry_after` (Unix epoch timestamp) - `inst-tb-5b`
 
 ### Hierarchical Rate Limit Merge
 
-- [ ] `p2` - **ID**: `cpt-cf-oagw-algo-hierarchical-rate-limit-merge`
+- [x] `p2` - **ID**: `cpt-cf-oagw-algo-hierarchical-rate-limit-merge`
 
 **Input**: Upstream rate limit config, route rate limit config, tenant hierarchy (ancestor chain from root to current tenant)
 
 **Output**: Effective rate limit config (sustained rate, burst capacity, scope, strategy)
 
 **Steps**:
-1. [ ] - `p2` - Collect all rate limit configs from tenant hierarchy (root → current) for the upstream - `inst-merge-1`
-2. [ ] - `p2` - **FOR EACH** ancestor config from root to current - `inst-merge-2`
-   1. [ ] - `p2` - **IF** ancestor sharing = `enforce` - `inst-merge-2a`
-      1. [ ] - `p2` - Add to enforced limits list - `inst-merge-2a1`
-   2. [ ] - `p2` - **IF** ancestor sharing = `inherit` and descendant has no own config - `inst-merge-2b`
-      1. [ ] - `p2` - Use ancestor's config as base - `inst-merge-2b1`
-3. [ ] - `p2` - Compute effective sustained rate: `min(own_rate, all_enforced_ancestor_rates)` - `inst-merge-3`
-4. [ ] - `p2` - Compute effective burst capacity: `min(own_burst, all_enforced_ancestor_bursts)` - `inst-merge-4`
-5. [ ] - `p2` - **IF** route has own rate limit config - `inst-merge-5`
-   1. [ ] - `p2` - Apply route-level override: `effective = min(upstream_effective, route_config)` - `inst-merge-5a`
-6. [ ] - `p2` - **RETURN** effective rate limit config - `inst-merge-6`
+1. [x] - `p2` - Collect all rate limit configs from tenant hierarchy (root → current) for the upstream - `inst-merge-1`
+2. [x] - `p2` - **FOR EACH** ancestor config from root to current - `inst-merge-2`
+   1. [x] - `p2` - **IF** ancestor sharing = `enforce` - `inst-merge-2a`
+      1. [x] - `p2` - Add to enforced limits list - `inst-merge-2a1`
+   2. [x] - `p2` - **IF** ancestor sharing = `inherit` and descendant has no own config - `inst-merge-2b`
+      1. [x] - `p2` - Use ancestor's config as base - `inst-merge-2b1`
+3. [x] - `p2` - Compute effective sustained rate: `min(own_rate, all_enforced_ancestor_rates)` - `inst-merge-3`
+4. [x] - `p2` - Compute effective burst capacity: `min(own_burst, all_enforced_ancestor_bursts)` - `inst-merge-4`
+5. [x] - `p2` - **IF** route has own rate limit config - `inst-merge-5`
+   1. [x] - `p2` - Apply route-level override: `effective = min(upstream_effective, route_config)` - `inst-merge-5a`
+6. [x] - `p2` - **RETURN** effective rate limit config - `inst-merge-6`
 
 ### Circuit Breaker State Evaluation
 
@@ -323,7 +323,7 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 
 ### Implement Token Bucket Rate Limiter
 
-- [ ] `p2` - **ID**: `cpt-cf-oagw-dod-token-bucket`
+- [x] `p2` - **ID**: `cpt-cf-oagw-dod-token-bucket`
 
 The system **MUST** implement token bucket rate limiting with dual-rate configuration (sustained rate + burst capacity) per `cpt-cf-oagw-adr-rate-limiting`. Tokens **MUST** be refilled at `sustained.rate` per `sustained.window`. Burst **MUST** be capped at `burst.capacity`. Each request **MUST** consume `cost` tokens (default: 1). Counter scope **MUST** support: `global`, `tenant`, `user`, `ip`, `route`. When tokens insufficient and strategy = `reject`, the system **MUST** return 429 RateLimitExceeded with `Retry-After` header.
 
@@ -336,7 +336,7 @@ The system **MUST** implement token bucket rate limiting with dual-rate configur
 
 ### Implement Rate Limit Response Headers
 
-- [ ] `p2` - **ID**: `cpt-cf-oagw-dod-rate-limit-headers`
+- [x] `p2` - **ID**: `cpt-cf-oagw-dod-rate-limit-headers`
 
 The system **MUST** include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` response headers on all proxy responses when `response_headers: true` in rate limit config (default: true) per RFC 6585 / draft-ietf-httpapi-ratelimit-headers. On 429 responses, the system **MUST** include `Retry-After` header with the calculated wait time in seconds.
 
@@ -348,7 +348,7 @@ The system **MUST** include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X
 
 ### Implement Hierarchical Rate Limit Merge
 
-- [ ] `p2` - **ID**: `cpt-cf-oagw-dod-hierarchical-rate-merge`
+- [x] `p2` - **ID**: `cpt-cf-oagw-dod-hierarchical-rate-merge`
 
 The system **MUST** compute effective rate limits by walking the tenant hierarchy and applying `min(ancestor.enforced, descendant)` per `cpt-cf-oagw-adr-rate-limiting`. When ancestor sharing = `enforce`, descendant **MUST NOT** exceed ancestor's limit. When sharing = `inherit` and descendant has no config, ancestor's config **MUST** be used. Budget allocation **MUST** validate that sum of child allocations ≤ parent budget × `overcommit_ratio`. Route-level rate limits **MUST** apply as `min(upstream_effective, route_config)`.
 
@@ -402,17 +402,17 @@ The system **MUST** implement `reject` and `queue` strategies for handling overl
 
 ## 6. Acceptance Criteria
 
-- [ ] Token bucket rate limiter allows requests when tokens available and rejects with 429 when tokens exhausted
-- [ ] Rate limit config supports dual-rate: `sustained` (rate + window) and `burst` (capacity) independently
-- [ ] Counter scopes (`global`, `tenant`, `user`, `ip`, `route`) track and enforce limits independently
-- [ ] Cost-based rate limiting deducts `cost` tokens per request (configurable per route)
-- [ ] `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` headers included in all proxy responses when `response_headers: true`
-- [ ] 429 RateLimitExceeded responses include `Retry-After` header with calculated wait time
-- [ ] Hierarchical rate limit merge computes `effective = min(ancestor.enforced, descendant)` across tenant hierarchy
-- [ ] Ancestor with `sharing: enforce` prevents descendant from exceeding enforced limit
-- [ ] Ancestor with `sharing: inherit` provides default config when descendant has none
-- [ ] Budget allocation validates sum of child allocations ≤ parent budget × `overcommit_ratio`; rejects if exceeded
-- [ ] Route-level rate limit applies as `min(upstream_effective, route_config)`
+- [x] Token bucket rate limiter allows requests when tokens available and rejects with 429 when tokens exhausted
+- [x] Rate limit config supports dual-rate: `sustained` (rate + window) and `burst` (capacity) independently
+- [x] Counter scopes (`global`, `tenant`, `user`, `ip`, `route`) track and enforce limits independently
+- [x] Cost-based rate limiting deducts `cost` tokens per request (configurable per route)
+- [x] `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` headers included in all proxy responses when `response_headers: true`
+- [x] 429 RateLimitExceeded responses include `Retry-After` header with calculated wait time
+- [x] Hierarchical rate limit merge computes `effective = min(ancestor.enforced, descendant)` across tenant hierarchy
+- [x] Ancestor with `sharing: enforce` prevents descendant from exceeding enforced limit
+- [x] Ancestor with `sharing: inherit` provides default config when descendant has none
+- [x] Budget allocation validates sum of child allocations ≤ parent budget × `overcommit_ratio`; rejects if exceeded
+- [x] Route-level rate limit applies as `min(upstream_effective, route_config)`
 - [ ] Circuit breaker transitions CLOSED → OPEN when consecutive failures ≥ `failure_threshold`
 - [ ] Circuit breaker transitions OPEN → HALF_OPEN after `timeout_seconds` elapsed
 - [ ] Circuit breaker transitions HALF_OPEN → CLOSED after `success_threshold` consecutive probe successes
@@ -432,10 +432,10 @@ The system **MUST** implement `reject` and `queue` strategies for handling overl
 - [ ] Queue overflow handled per `overflow_strategy`: `drop_newest`, `drop_oldest`, or `reject`
 - [ ] Queue timeout returns 503 QueueTimeout with `queue_wait_seconds` and `Retry-After`
 - [ ] Queue does not accumulate requests when circuit breaker is OPEN
-- [ ] All gateway-originated errors include `X-OAGW-Error-Source: gateway` and use RFC 9457 Problem Details format
+- [x] All gateway-originated errors include `X-OAGW-Error-Source: gateway` and use RFC 9457 Problem Details format
 - [ ] Prometheus metrics emitted: `oagw_rate_limit_exceeded_total`, `oagw_rate_limit_usage_ratio`, `oagw_circuit_breaker_state`, `oagw_circuit_breaker_transitions_total`, `oagw_requests_in_flight`, `oagw_concurrency_limit_exceeded_total`, `oagw_queue_depth`, `oagw_queue_wait_duration_seconds`
-- [ ] Rate limit check latency < 1ms (in-memory token bucket) per `cpt-cf-oagw-nfr-low-latency`
-- [ ] No credentials or PII appear in rate limit / circuit breaker error responses or logs
+- [x] Rate limit check latency < 1ms (in-memory token bucket) per `cpt-cf-oagw-nfr-low-latency`
+- [x] No credentials or PII appear in rate limit / circuit breaker error responses or logs
 
 ## 7. Additional Context
 
@@ -445,7 +445,7 @@ Rate limiting and concurrency control are on the hot path for every proxy reques
 
 ### Distributed State
 
-MVP uses per-instance rate limiting and concurrency control (no distributed coordination). Distributed rate limiting via Redis (hybrid local + periodic sync per `cpt-cf-oagw-adr-rate-limiting`) and distributed circuit breaker state (Redis-backed per `cpt-cf-oagw-adr-circuit-breaker`) are production-grade capabilities. Redis key structure: `oagw:ratelimit:{scope}:{identifier}:{window}` for rate limits, `oagw:cb:{tenant_id}:{upstream_id}:*` for circuit breaker.
+MVP uses per-instance rate limiting and concurrency control (no distributed coordination). Distributed rate limiting via Redis (hybrid local + periodic sync per `cpt-cf-oagw-adr-rate-limiting`) and distributed circuit breaker state (Redis-backed per `cpt-cf-oagw-adr-circuit-breaker`) are production-grade capabilities. Redis key structure: `oagw:ratelimit:{resource_type}:{resource_id}:{scope}:{scope_id}:{window}` for rate limits, `oagw:cb:{tenant_id}:{upstream_id}:*` for circuit breaker.
 
 ### Deliberate Omissions
 

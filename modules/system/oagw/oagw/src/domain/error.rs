@@ -42,6 +42,9 @@ pub enum DomainError {
         detail: String,
         instance: String,
         retry_after_secs: Option<u64>,
+        limit: Option<u64>,
+        remaining: Option<u64>,
+        reset_epoch: Option<u64>,
     },
 
     #[error("{detail}")]

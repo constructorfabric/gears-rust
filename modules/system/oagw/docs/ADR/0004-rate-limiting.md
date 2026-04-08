@@ -363,9 +363,13 @@ Rate limiting executes in **Data Plane (DP)**. Configuration is resolved from Co
 **Redis key structure**:
 
 ```text
-oagw:ratelimit:{scope}:{identifier}:{window} = {count}
-oagw:ratelimit:tenant:uuid-123:minute:202601301530 = 4523
+oagw:ratelimit:{resource_type}:{resource_id}:{scope}:{scope_id}:{window} = {count}
+oagw:ratelimit:upstream:uuid-upstream:tenant:uuid-tenant:minute:202601301530 = 4523
 ```
+
+The `{resource_type}:{resource_id}` prefix ensures all keys for a given
+upstream or route share a common prefix, enabling efficient prefix-based
+cleanup (in-memory `retain` and Redis `SCAN`) when a resource is deleted.
 
 > **Note:** Minute-bucket keys must use **YYYYMMDDHHMM** (12 digits) to avoid
 > confusion with hour-level granularity and prevent incorrect aggregation.

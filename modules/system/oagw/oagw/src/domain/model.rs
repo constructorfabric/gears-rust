@@ -149,9 +149,15 @@ pub struct RateLimitConfig {
     pub algorithm: RateLimitAlgorithm,
     pub sustained: SustainedRate,
     pub burst: Option<BurstConfig>,
+    pub budget: Option<BudgetConfig>,
     pub scope: RateLimitScope,
     pub strategy: RateLimitStrategy,
     pub cost: u32,
+    pub response_headers: bool,
+    /// Upstream ID of the shared-pool owner. Populated during hierarchical merge
+    /// when `budget.mode == Shared` — causes all children to share one token
+    /// bucket keyed to the pool owner. Not user-facing (never serialized).
+    pub pool_owner_id: Option<Uuid>,
 }
 
 #[domain_model]
@@ -183,6 +189,28 @@ pub enum Window {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BurstConfig {
     pub capacity: u32,
+}
+
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetConfig {
+    pub mode: BudgetMode,
+    /// Total budget capacity. Required for `Allocated` and `Shared` modes.
+    pub total: Option<u32>,
+    /// Over-provisioning ratio (1.0–2.0, default 1.0). Only for `Allocated` mode.
+    pub overcommit_ratio: Option<f64>,
+}
+
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetMode {
+    /// No budget tracking (default for leaf tenants).
+    #[default]
+    Unlimited,
+    /// Parent allocates fixed budget to children.
+    Allocated,
+    /// Children share parent's budget (first-come-first-served).
+    Shared,
 }
 
 #[domain_model]

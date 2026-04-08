@@ -358,9 +358,13 @@ is typically distributed evenly by load balancer.
 **Redis key structure**:
 
 ```
-oagw:ratelimit:{scope}:{identifier}:{window} = {count}
-oagw:ratelimit:tenant:uuid-123:minute:2026013015 = 4523
+oagw:ratelimit:{resource_type}:{resource_id}:{scope}:{scope_id}:{window} = {count}
+oagw:ratelimit:upstream:uuid-upstream:tenant:uuid-tenant:minute:2026013015 = 4523
 ```
+
+The `{resource_type}:{resource_id}` prefix ensures all keys for a given
+upstream or route share a common prefix, enabling efficient prefix-based
+cleanup (in-memory `retain` and Redis `SCAN`) when a resource is deleted.
 
 **Response headers** (RFC 6585 / draft-ietf-httpapi-ratelimit-headers):
 

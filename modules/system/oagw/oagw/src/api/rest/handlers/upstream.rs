@@ -104,6 +104,6 @@ pub async fn delete_upstream(
         .await
         .map_err(|e| domain_error_to_problem(e, &instance))?;
     state.backend_selector.invalidate(uuid);
-    state.dp.remove_rate_limit_key(&format!("upstream:{uuid}"));
+    state.dp.remove_rate_limit_keys_for_upstream(uuid);
     Ok(StatusCode::NO_CONTENT)
 }

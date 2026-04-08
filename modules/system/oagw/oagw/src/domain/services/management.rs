@@ -78,6 +78,11 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         if let Some(ref cors) = req.cors {
             crate::domain::cors::validate_cors_config(cors)?;
         }
+        if let Some(ref rl) = req.rate_limit
+            && let Some(ref budget) = rl.budget
+        {
+            validate_budget_config(budget)?;
+        }
 
         // Enforce alias derivation / explicit rules.
         let alias = enforce_alias_create(req.alias.as_deref(), &req.server.endpoints)?;
@@ -100,6 +105,9 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             },
         )
         .await?;
+
+        self.validate_budget_allocation(&tenant_chain, &alias, req.rate_limit.as_ref())
+            .await?;
 
         let upstream = Upstream {
             id,
@@ -209,12 +217,26 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
                 },
             )
             .await?;
+
+            if req.rate_limit.is_some() {
+                self.validate_budget_allocation(
+                    &tenant_chain,
+                    &existing.alias,
+                    req.rate_limit.as_ref(),
+                )
+                .await?;
+            }
         }
 
         // Full replacement: directly assign all fields (None = unset).
         existing.auth = req.auth;
         existing.headers = req.headers;
         existing.plugins = req.plugins;
+        if let Some(ref rl) = req.rate_limit
+            && let Some(ref budget) = rl.budget
+        {
+            validate_budget_config(budget)?;
+        }
         existing.rate_limit = req.rate_limit;
         if let Some(ref cors) = req.cors {
             crate::domain::cors::validate_cors_config(cors)?;
@@ -478,6 +500,90 @@ impl ControlPlaneServiceImpl {
         Ok(())
     }
 
+    /// Validate that this child's rate limit allocation fits within the
+    /// ancestor's budget. Only runs when the closest ancestor with matching
+    /// alias has `budget.mode == Allocated`.
+    async fn validate_budget_allocation(
+        &self,
+        tenant_chain: &[Uuid],
+        alias: &str,
+        child_rate_limit: Option<&crate::domain::model::RateLimitConfig>,
+    ) -> Result<(), DomainError> {
+        use crate::domain::model::BudgetMode;
+
+        let requesting_tenant = tenant_chain[0];
+
+        // Find the closest ancestor with this alias.
+        let ancestor = {
+            let mut found = None;
+            for &ancestor_tid in &tenant_chain[1..] {
+                if let Ok(u) = self.upstreams.get_by_alias(ancestor_tid, alias).await {
+                    found = Some(u);
+                    break;
+                }
+            }
+            match found {
+                Some(a) => a,
+                None => return Ok(()), // No ancestor with this alias — nothing to validate.
+            }
+        };
+
+        let ancestor_budget = match ancestor
+            .rate_limit
+            .as_ref()
+            .and_then(|rl| rl.budget.as_ref())
+        {
+            Some(b) if b.mode == BudgetMode::Allocated => b,
+            _ => return Ok(()), // Not allocated mode — no budget validation.
+        };
+
+        let budget_total = match ancestor_budget.total {
+            Some(t) => t,
+            None => return Ok(()), // No total specified — nothing to enforce.
+        };
+        let ratio = ancestor_budget.overcommit_ratio.unwrap_or(1.0);
+
+        // Get all upstreams with this alias (across tenants) to sum sibling allocations.
+        let siblings = self.upstreams.list_by_alias(alias).await?;
+
+        let ancestor_rl = ancestor.rate_limit.as_ref().unwrap(); // safe: we checked above
+
+        let mut total_rps: f64 = 0.0;
+        for sibling in &siblings {
+            // Skip the ancestor itself and the requesting tenant (we'll add child_rate_limit separately).
+            if sibling.tenant_id == ancestor.tenant_id || sibling.tenant_id == requesting_tenant {
+                continue;
+            }
+            if let Some(ref rl) = sibling.rate_limit {
+                total_rps += rate_per_second(rl);
+            }
+        }
+
+        // Add this child's proposed rate.
+        if let Some(child_rl) = child_rate_limit {
+            total_rps += rate_per_second(child_rl);
+        }
+
+        let budget_rps = f64::from(budget_total)
+            / match ancestor_rl.sustained.window {
+                crate::domain::model::Window::Second => 1.0,
+                crate::domain::model::Window::Minute => 60.0,
+                crate::domain::model::Window::Hour => 3600.0,
+                crate::domain::model::Window::Day => 86400.0,
+            };
+        let allowed_rps = budget_rps * ratio;
+
+        if total_rps > allowed_rps {
+            return Err(DomainError::validation(format!(
+                "budget allocation exceeded: children total {total_rps:.2} req/s \
+                 exceeds ancestor budget {budget_rps:.2} req/s × {ratio} overcommit ratio \
+                 (allowed: {allowed_rps:.2} req/s)"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Build the ordered tenant chain `[self, parent, ..., root]`.
     ///
     /// Index 0 is always the requesting tenant. Callers that only need
@@ -660,6 +766,35 @@ fn validate_match_rules(rules: &MatchRules) -> Result<(), DomainError> {
         )),
         _ => Ok(()),
     }
+}
+
+/// Validate budget configuration field constraints per ADR 0004 schema.
+fn validate_budget_config(budget: &crate::domain::model::BudgetConfig) -> Result<(), DomainError> {
+    use crate::domain::model::BudgetMode;
+
+    match budget.mode {
+        BudgetMode::Allocated | BudgetMode::Shared => {
+            let total = budget.total.ok_or_else(|| {
+                DomainError::validation(
+                    "budget.total is required when budget.mode is 'allocated' or 'shared'",
+                )
+            })?;
+            if total < 1 {
+                return Err(DomainError::validation("budget.total must be at least 1"));
+            }
+        }
+        BudgetMode::Unlimited => {}
+    }
+
+    if let Some(ratio) = budget.overcommit_ratio
+        && !(1.0..=2.0).contains(&ratio)
+    {
+        return Err(DomainError::validation(
+            "budget.overcommit_ratio must be between 1.0 and 2.0",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Validate the endpoint list for a server configuration.
@@ -1413,8 +1548,21 @@ fn merge_auth(effective: &mut Upstream, layer: &Upstream) {
 /// descendant `Private` cannot drop it — `min()` is applied instead.
 /// This is defense-in-depth; `validate_bind_constraints` also guards
 /// this at create/update time.
+///
+/// When the effective rate limit has `budget.mode == Shared`, the
+/// `pool_owner_id` is set to the effective upstream's ID so all
+/// descendants share one token bucket at runtime.
 fn merge_rate_limit(effective: &mut Upstream, layer: &Upstream) {
-    use crate::domain::model::SharingMode;
+    use crate::domain::model::{BudgetMode, SharingMode};
+
+    // Capture shared-pool owner before merging (the ancestor that defines
+    // the shared budget is the pool owner).
+    let pool_owner = effective
+        .rate_limit
+        .as_ref()
+        .and_then(|rl| rl.budget.as_ref())
+        .filter(|b| b.mode == BudgetMode::Shared)
+        .map(|_| effective.id);
 
     let effective_is_enforced = effective
         .rate_limit
@@ -1437,6 +1585,14 @@ fn merge_rate_limit(effective: &mut Upstream, layer: &Upstream) {
                     Some(min_rate_limit(effective.rate_limit.as_ref(), descendant_rl));
             }
         },
+    }
+
+    // Propagate shared-pool owner to descendants so the proxy uses
+    // the parent's rate limit key.
+    if let Some(owner_id) = pool_owner
+        && let Some(ref mut rl) = effective.rate_limit
+    {
+        rl.pool_owner_id = Some(owner_id);
     }
 }
 
@@ -2600,9 +2756,12 @@ mod tests {
             algorithm: RateLimitAlgorithm::TokenBucket,
             sustained: SustainedRate { rate, window },
             burst: None,
+            budget: None,
             scope: RateLimitScope::Tenant,
             strategy: RateLimitStrategy::Reject,
             cost: 1,
+            response_headers: true,
+            pool_owner_id: None,
         }
     }
 
@@ -4895,6 +5054,401 @@ mod tests {
         assert!(
             matches!(err, DomainError::Conflict { .. }),
             "expected Conflict, got: {err:?}"
+        );
+    }
+
+    // -- validate_budget_config tests --
+
+    #[test]
+    fn budget_config_allocated_requires_total() {
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+        let budget = BudgetConfig {
+            mode: BudgetMode::Allocated,
+            total: None,
+            overcommit_ratio: None,
+        };
+        let err = validate_budget_config(&budget).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn budget_config_shared_requires_total() {
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+        let budget = BudgetConfig {
+            mode: BudgetMode::Shared,
+            total: None,
+            overcommit_ratio: None,
+        };
+        let err = validate_budget_config(&budget).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn budget_config_unlimited_skips_total_check() {
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+        let budget = BudgetConfig {
+            mode: BudgetMode::Unlimited,
+            total: None,
+            overcommit_ratio: None,
+        };
+        assert!(validate_budget_config(&budget).is_ok());
+    }
+
+    #[test]
+    fn budget_config_overcommit_ratio_must_be_in_range() {
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+        // Below range
+        let budget = BudgetConfig {
+            mode: BudgetMode::Unlimited,
+            total: None,
+            overcommit_ratio: Some(0.5),
+        };
+        assert!(validate_budget_config(&budget).is_err());
+
+        // Above range
+        let budget = BudgetConfig {
+            mode: BudgetMode::Unlimited,
+            total: None,
+            overcommit_ratio: Some(3.0),
+        };
+        assert!(validate_budget_config(&budget).is_err());
+
+        // Within range
+        let budget = BudgetConfig {
+            mode: BudgetMode::Allocated,
+            total: Some(100),
+            overcommit_ratio: Some(1.5),
+        };
+        assert!(validate_budget_config(&budget).is_ok());
+
+        // Boundaries
+        assert!(
+            validate_budget_config(&BudgetConfig {
+                mode: BudgetMode::Allocated,
+                total: Some(100),
+                overcommit_ratio: Some(1.0),
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_budget_config(&BudgetConfig {
+                mode: BudgetMode::Allocated,
+                total: Some(100),
+                overcommit_ratio: Some(2.0),
+            })
+            .is_ok()
+        );
+    }
+
+    // -- Budget allocation validation (ADR example) --
+
+    #[tokio::test]
+    async fn budget_allocated_rejects_over_allocation() {
+        // ADR example: Parent 5000/min, A=2000, B=1000, C requests 3000.
+        // Sum=6000 > 5000 → REJECT
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+
+        let root = Uuid::new_v4();
+        let child_a = Uuid::new_v4();
+        let child_b = Uuid::new_v4();
+        let child_c = Uuid::new_v4();
+
+        let resolver = MockTenantResolverClient::with_siblings(
+            TenantId(root),
+            vec![TenantId(child_a), TenantId(child_b), TenantId(child_c)],
+        );
+        let svc = make_service_with_resolver(resolver);
+
+        // Root creates upstream with allocated budget.
+        let root_ctx = test_ctx(root);
+        let mut root_req = make_create_upstream_hostname();
+        root_req.rate_limit = Some(RateLimitConfig {
+            sharing: SharingMode::Inherit,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            sustained: SustainedRate {
+                rate: 5000,
+                window: Window::Minute,
+            },
+            burst: None,
+            budget: Some(BudgetConfig {
+                mode: BudgetMode::Allocated,
+                total: Some(5000),
+                overcommit_ratio: Some(1.0),
+            }),
+            scope: RateLimitScope::Tenant,
+            strategy: RateLimitStrategy::Reject,
+            cost: 1,
+            response_headers: true,
+            pool_owner_id: None,
+        });
+        svc.create_upstream(&root_ctx, root_req).await.unwrap();
+
+        // Child A: 2000/min
+        let ctx_a = test_ctx(child_a);
+        let mut req_a = make_create_upstream_hostname();
+        req_a.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 2000, Window::Minute));
+        svc.create_upstream(&ctx_a, req_a).await.unwrap();
+
+        // Child B: 1000/min
+        let ctx_b = test_ctx(child_b);
+        let mut req_b = make_create_upstream_hostname();
+        req_b.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 1000, Window::Minute));
+        svc.create_upstream(&ctx_b, req_b).await.unwrap();
+
+        // Child C: 3000/min — sum = 6000 > 5000 → REJECT
+        let ctx_c = test_ctx(child_c);
+        let mut req_c = make_create_upstream_hostname();
+        req_c.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 3000, Window::Minute));
+        let err = svc.create_upstream(&ctx_c, req_c).await.unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "expected Validation error for budget exceeded, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_allocated_allows_within_overcommit_ratio() {
+        // ADR example: ratio=1.5, sum=6000 ≤ 5000*1.5=7500 → ALLOW
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+
+        let root = Uuid::new_v4();
+        let child_a = Uuid::new_v4();
+        let child_b = Uuid::new_v4();
+        let child_c = Uuid::new_v4();
+
+        let resolver = MockTenantResolverClient::with_siblings(
+            TenantId(root),
+            vec![TenantId(child_a), TenantId(child_b), TenantId(child_c)],
+        );
+        let svc = make_service_with_resolver(resolver);
+
+        let root_ctx = test_ctx(root);
+        let mut root_req = make_create_upstream_hostname();
+        root_req.rate_limit = Some(RateLimitConfig {
+            sharing: SharingMode::Inherit,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            sustained: SustainedRate {
+                rate: 5000,
+                window: Window::Minute,
+            },
+            burst: None,
+            budget: Some(BudgetConfig {
+                mode: BudgetMode::Allocated,
+                total: Some(5000),
+                overcommit_ratio: Some(1.5),
+            }),
+            scope: RateLimitScope::Tenant,
+            strategy: RateLimitStrategy::Reject,
+            cost: 1,
+            response_headers: true,
+            pool_owner_id: None,
+        });
+        svc.create_upstream(&root_ctx, root_req).await.unwrap();
+
+        // Children: 2000 + 1000 + 3000 = 6000 ≤ 7500 → all allowed.
+        let ctx_a = test_ctx(child_a);
+        let mut req_a = make_create_upstream_hostname();
+        req_a.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 2000, Window::Minute));
+        svc.create_upstream(&ctx_a, req_a).await.unwrap();
+
+        let ctx_b = test_ctx(child_b);
+        let mut req_b = make_create_upstream_hostname();
+        req_b.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 1000, Window::Minute));
+        svc.create_upstream(&ctx_b, req_b).await.unwrap();
+
+        let ctx_c = test_ctx(child_c);
+        let mut req_c = make_create_upstream_hostname();
+        req_c.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 3000, Window::Minute));
+        svc.create_upstream(&ctx_c, req_c).await.unwrap(); // Should succeed.
+    }
+
+    #[tokio::test]
+    async fn budget_unlimited_skips_allocation_validation() {
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+
+        let resolver =
+            MockTenantResolverClient::with_siblings(TenantId(root), vec![TenantId(child)]);
+        let svc = make_service_with_resolver(resolver);
+
+        let root_ctx = test_ctx(root);
+        let mut root_req = make_create_upstream_hostname();
+        root_req.rate_limit = Some(RateLimitConfig {
+            sharing: SharingMode::Inherit,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            sustained: SustainedRate {
+                rate: 100,
+                window: Window::Minute,
+            },
+            burst: None,
+            budget: Some(BudgetConfig {
+                mode: BudgetMode::Unlimited,
+                total: None,
+                overcommit_ratio: None,
+            }),
+            scope: RateLimitScope::Tenant,
+            strategy: RateLimitStrategy::Reject,
+            cost: 1,
+            response_headers: true,
+            pool_owner_id: None,
+        });
+        svc.create_upstream(&root_ctx, root_req).await.unwrap();
+
+        // Child can request any rate — no budget enforcement.
+        let ctx_c = test_ctx(child);
+        let mut req_c = make_create_upstream_hostname();
+        req_c.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 99999, Window::Minute));
+        svc.create_upstream(&ctx_c, req_c).await.unwrap(); // No budget rejection.
+    }
+
+    #[tokio::test]
+    async fn budget_shared_skips_allocation_validation() {
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+
+        let resolver =
+            MockTenantResolverClient::with_siblings(TenantId(root), vec![TenantId(child)]);
+        let svc = make_service_with_resolver(resolver);
+
+        let root_ctx = test_ctx(root);
+        let mut root_req = make_create_upstream_hostname();
+        root_req.rate_limit = Some(RateLimitConfig {
+            sharing: SharingMode::Inherit,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            sustained: SustainedRate {
+                rate: 100,
+                window: Window::Minute,
+            },
+            burst: None,
+            budget: Some(BudgetConfig {
+                mode: BudgetMode::Shared,
+                total: Some(100),
+                overcommit_ratio: None,
+            }),
+            scope: RateLimitScope::Tenant,
+            strategy: RateLimitStrategy::Reject,
+            cost: 1,
+            response_headers: true,
+            pool_owner_id: None,
+        });
+        svc.create_upstream(&root_ctx, root_req).await.unwrap();
+
+        // Child can create — shared mode doesn't validate allocations.
+        let ctx_c = test_ctx(child);
+        let mut req_c = make_create_upstream_hostname();
+        req_c.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 99999, Window::Minute));
+        svc.create_upstream(&ctx_c, req_c).await.unwrap();
+    }
+
+    // -- Shared-pool merge --
+
+    #[test]
+    fn merge_rate_limit_shared_sets_pool_owner_id() {
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+
+        let root_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+
+        let mut root = make_upstream(
+            root_id,
+            "openai",
+            None,
+            Some(RateLimitConfig {
+                sharing: SharingMode::Enforce,
+                algorithm: RateLimitAlgorithm::TokenBucket,
+                sustained: SustainedRate {
+                    rate: 1000,
+                    window: Window::Minute,
+                },
+                burst: None,
+                budget: Some(BudgetConfig {
+                    mode: BudgetMode::Shared,
+                    total: Some(1000),
+                    overcommit_ratio: None,
+                }),
+                scope: RateLimitScope::Tenant,
+                strategy: RateLimitStrategy::Reject,
+                cost: 1,
+                response_headers: true,
+                pool_owner_id: None,
+            }),
+            None,
+            vec![],
+        );
+
+        let child = make_upstream(
+            child_id,
+            "openai",
+            None,
+            Some(make_rate_limit(SharingMode::Inherit, 500, Window::Minute)),
+            None,
+            vec![],
+        );
+
+        let root_upstream_id = root.id;
+        merge_rate_limit(&mut root, &child);
+
+        let effective_rl = root.rate_limit.as_ref().unwrap();
+        assert_eq!(
+            effective_rl.pool_owner_id,
+            Some(root_upstream_id),
+            "pool_owner_id should be set to root upstream's ID for shared budget"
+        );
+    }
+
+    #[test]
+    fn merge_rate_limit_allocated_does_not_set_pool_owner_id() {
+        use crate::domain::model::{BudgetConfig, BudgetMode};
+
+        let root_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+
+        let mut root = make_upstream(
+            root_id,
+            "openai",
+            None,
+            Some(RateLimitConfig {
+                sharing: SharingMode::Enforce,
+                algorithm: RateLimitAlgorithm::TokenBucket,
+                sustained: SustainedRate {
+                    rate: 1000,
+                    window: Window::Minute,
+                },
+                burst: None,
+                budget: Some(BudgetConfig {
+                    mode: BudgetMode::Allocated,
+                    total: Some(1000),
+                    overcommit_ratio: Some(1.0),
+                }),
+                scope: RateLimitScope::Tenant,
+                strategy: RateLimitStrategy::Reject,
+                cost: 1,
+                response_headers: true,
+                pool_owner_id: None,
+            }),
+            None,
+            vec![],
+        );
+
+        let child = make_upstream(
+            child_id,
+            "openai",
+            None,
+            Some(make_rate_limit(SharingMode::Inherit, 500, Window::Minute)),
+            None,
+            vec![],
+        );
+
+        merge_rate_limit(&mut root, &child);
+
+        let effective_rl = root.rate_limit.as_ref().unwrap();
+        assert_eq!(
+            effective_rl.pool_owner_id, None,
+            "pool_owner_id should NOT be set for allocated budget"
         );
     }
 }

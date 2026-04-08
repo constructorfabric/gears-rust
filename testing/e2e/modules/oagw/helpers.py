@@ -160,6 +160,80 @@ async def create_upstream(
     return resp.json()
 
 
+async def create_upstream_raw(
+    client: httpx.AsyncClient,
+    base_url: str,
+    headers: dict,
+    mock_url: str,
+    alias: Optional[str] = None,
+    **kwargs,
+) -> httpx.Response:
+    """Create an upstream and return the raw Response (no raise_for_status).
+
+    Use this when testing error paths (e.g., validation failures returning 400).
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(mock_url)
+    host = parsed.hostname or "127.0.0.1"
+    scheme = parsed.scheme or "http"
+    port = parsed.port or (443 if scheme == "https" else 80)
+
+    body: dict = {
+        "server": {
+            "endpoints": [{"host": host, "port": port, "scheme": scheme}],
+        },
+        "protocol": HTTP_PROTOCOL_ID,
+        "enabled": True,
+        "tags": [],
+    }
+    if alias is not None:
+        body["alias"] = alias
+
+    body.update(kwargs)
+
+    return await client.post(
+        f"{base_url}/oagw/v1/upstreams",
+        headers={**headers, "content-type": "application/json"},
+        json=body,
+    )
+
+
+async def update_upstream_raw(
+    client: httpx.AsyncClient,
+    base_url: str,
+    headers: dict,
+    upstream_id: str,
+    mock_url: str,
+    alias: Optional[str] = None,
+    **kwargs,
+) -> httpx.Response:
+    """Replace an upstream via PUT and return the raw Response (no raise_for_status)."""
+    from urllib.parse import urlparse
+    parsed = urlparse(mock_url)
+    host = parsed.hostname or "127.0.0.1"
+    scheme = parsed.scheme or "http"
+    port = parsed.port or (443 if scheme == "https" else 80)
+
+    body: dict = {
+        "server": {
+            "endpoints": [{"host": host, "port": port, "scheme": scheme}],
+        },
+        "protocol": HTTP_PROTOCOL_ID,
+        "enabled": True,
+        "tags": [],
+    }
+    if alias is not None:
+        body["alias"] = alias
+
+    body.update(kwargs)
+
+    return await client.put(
+        f"{base_url}/oagw/v1/upstreams/{upstream_id}",
+        headers={**headers, "content-type": "application/json"},
+        json=body,
+    )
+
+
 async def create_route(
     client: httpx.AsyncClient,
     base_url: str,

@@ -152,6 +152,15 @@ impl UpstreamRepository for InMemoryUpstreamRepo {
         self.alias_index.remove(&(tenant_id, upstream.alias));
         Ok(())
     }
+
+    async fn list_by_alias(&self, alias: &str) -> Result<Vec<Upstream>, RepositoryError> {
+        Ok(self
+            .store
+            .iter()
+            .filter(|e| e.value().alias == alias)
+            .map(|e| e.value().clone())
+            .collect())
+    }
 }
 
 #[cfg(test)]
