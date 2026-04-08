@@ -265,7 +265,7 @@ let descendants = rg_hierarchy
 let group = rg
     .create_group(&ctx, CreateGroupRequest {
         id: None,
-        r#type: "gts.x.system.rg.type.v1~y.system.tn.tenant.v1~".into(),
+        r#type: "gts.cf.core.rg.type.v1~y.system.tn.tenant.v1~".into(),
         name: "Acme Corp".into(),
         parent_id: None,
         metadata: Default::default(),

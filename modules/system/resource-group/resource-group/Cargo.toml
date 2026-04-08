@@ -1,0 +1,70 @@
+# Created: 2026-04-16 by Constructor Tech
+[package]
+name = "cf-resource-group"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Resource Group module: hierarchical resource group management with GTS type system"
+
+[lints]
+workspace = true
+
+[features]
+default = ["odata"]
+odata = []
+
+[dependencies]
+# SDK - public API, models, and errors
+resource-group-sdk = { package = "cf-resource-group-sdk", path = "../resource-group-sdk", features = ["odata"] }
+
+# Core dependencies
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+inventory = { workspace = true }
+
+# Serde and JSON schema
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonschema = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
+
+# HTTP and REST
+axum = { workspace = true, features = ["macros"] }
+http = { workspace = true }
+
+# Time handling
+time = { workspace = true }
+
+# UUID support
+uuid = { workspace = true }
+
+# Database - SeaORM
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# AuthZ
+authz-resolver-sdk = { workspace = true }
+
+# GTS type system — types registry for schema resolution
+types-registry-sdk = { workspace = true }
+
+# Local dependencies
+modkit = { workspace = true }
+modkit-db = { workspace = true, features = ["sqlite", "pg"] }
+modkit-db-macros = { workspace = true }
+modkit-security = { workspace = true }
+modkit-odata = { workspace = true, features = ["with-utoipa"] }
+modkit-macros = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+modkit-db = { workspace = true, features = ["sqlite"] }
+tower = { workspace = true }
+http-body-util = { workspace = true }
