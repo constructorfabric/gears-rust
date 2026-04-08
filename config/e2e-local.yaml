@@ -1,3 +1,4 @@
+# Updated: 2026-04-16 by Constructor Tech
 # HyperSpot Server Configuration
 #
 # Database Architecture Overview:
@@ -128,6 +129,11 @@ modules:
           name: "e2e-root"
           parent_id: null
           status: active
+        # Tenant B for cross-tenant E2E tests
+        - id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+          name: "e2e-tenant-b"
+          parent_id: null
+          status: active
         # Hierarchy tenants
         - id: "00000000-0000-0000-0000-000000000001"
           name: "hierarchy-root"
@@ -228,6 +234,11 @@ modules:
             subject_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
             subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
             token_scopes: ["*"]
+        - token: "e2e-token-tenant-b"
+          identity:
+            subject_id: "22222222-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            token_scopes: ["*"]
         # Nil-tenant token: static-authz denies requests with the nil UUID
         # tenant, producing a clean 403 Forbidden. Used by
         # testing/e2e/modules/oagw/test_authz.py::test_proxy_authz_forbidden_nil_tenant
@@ -257,6 +268,12 @@ modules:
         client_id: "mini-chat"
         client_secret: "mini-chat-dev-secret"
 
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
 
   simple-user-settings:
     # Module-specific database configuration

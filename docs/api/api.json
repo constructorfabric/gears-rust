@@ -406,6 +406,35 @@
         ],
         "type": "object"
       },
+      "CreateGroupDto": {
+        "description": "REST DTO for creating a new resource group.",
+        "properties": {
+          "metadata": {
+            "description": "Type-specific metadata."
+          },
+          "name": {
+            "description": "Display name (1..255 characters).",
+            "type": "string"
+          },
+          "parent_id": {
+            "description": "Parent group ID (null for root groups).",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "description": "GTS chained type path. Must have prefix `gts.x.system.rg.type.v1~`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateRouteRequest": {
         "properties": {
           "cors": {
@@ -461,6 +490,41 @@
         "required": [
           "upstream_id",
           "match"
+        ],
+        "type": "object"
+      },
+      "CreateTypeDto": {
+        "description": "REST DTO for creating a new GTS type.",
+        "properties": {
+          "allowed_memberships": {
+            "description": "GTS type paths of allowed membership resource types.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowed_parents": {
+            "description": "GTS type paths of allowed parent types.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "can_be_root": {
+            "description": "Whether groups of this type can be root nodes.",
+            "type": "boolean"
+          },
+          "code": {
+            "description": "GTS type path. Must have prefix `gts.x.system.rg.type.v1~`.",
+            "type": "string"
+          },
+          "metadata_schema": {
+            "description": "Optional JSON Schema for instance metadata."
+          }
+        },
+        "required": [
+          "code",
+          "can_be_root"
         ],
         "type": "object"
       },
@@ -737,6 +801,70 @@
         ],
         "type": "object"
       },
+      "GroupDto": {
+        "description": "REST DTO for resource group representation.\n\nGroup responses do NOT include `created_at`/`updated_at` (per DESIGN).",
+        "properties": {
+          "hierarchy": {
+            "$ref": "#/components/schemas/HierarchyDto",
+            "description": "Hierarchy context."
+          },
+          "id": {
+            "description": "Group identifier.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "metadata": {
+            "description": "Type-specific metadata."
+          },
+          "name": {
+            "description": "Display name.",
+            "type": "string"
+          },
+          "type": {
+            "description": "GTS chained type path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "name",
+          "hierarchy"
+        ],
+        "type": "object"
+      },
+      "GroupWithDepthDto": {
+        "description": "REST DTO for resource group with depth (hierarchy queries).",
+        "properties": {
+          "hierarchy": {
+            "$ref": "#/components/schemas/HierarchyWithDepthDto",
+            "description": "Hierarchy context with depth."
+          },
+          "id": {
+            "description": "Group identifier.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "metadata": {
+            "description": "Type-specific metadata."
+          },
+          "name": {
+            "description": "Display name.",
+            "type": "string"
+          },
+          "type": {
+            "description": "GTS chained type path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "name",
+          "hierarchy"
+        ],
+        "type": "object"
+      },
       "GrpcMatch": {
         "properties": {
           "method": {
@@ -853,6 +981,56 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "HierarchyDto": {
+        "description": "REST DTO for hierarchy context in group responses.",
+        "properties": {
+          "parent_id": {
+            "description": "Parent group ID (null for root groups).",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "description": "Tenant scope.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "HierarchyWithDepthDto": {
+        "description": "REST DTO for hierarchy context with depth in group responses.",
+        "properties": {
+          "depth": {
+            "description": "Relative distance from reference group.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "parent_id": {
+            "description": "Parent group ID (null for root groups).",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "description": "Tenant scope.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "depth"
+        ],
         "type": "object"
       },
       "HostInfoDto": {
@@ -1084,6 +1262,30 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "MembershipDto": {
+        "description": "REST DTO for membership representation.\n\nMembership responses do NOT include `tenant_id` (derived from group).",
+        "properties": {
+          "group_id": {
+            "description": "Group identifier.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "resource_id": {
+            "description": "Resource identifier.",
+            "type": "string"
+          },
+          "resource_type": {
+            "description": "GTS type path of the resource type.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "group_id",
+          "resource_type",
+          "resource_id"
+        ],
         "type": "object"
       },
       "MemoryInfoDto": {
@@ -1487,11 +1689,83 @@
         ],
         "type": "object"
       },
+      "Page_GroupDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/GroupDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_GroupWithDepthDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/GroupWithDepthDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_MembershipDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MembershipDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_MessageDto": {
         "properties": {
           "items": {
             "items": {
               "$ref": "#/components/schemas/MessageDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_TypeDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TypeDto"
             },
             "type": "array"
           },
@@ -1889,6 +2163,26 @@
           "all"
         ],
         "type": "string"
+      },
+      "PatchGroupDto": {
+        "description": "REST DTO for patching a resource group (partial update via PATCH).",
+        "properties": {
+          "metadata": {},
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "PatchSimpleUserSettingsRequest": {
         "properties": {
@@ -2930,6 +3224,43 @@
         ],
         "type": "string"
       },
+      "TypeDto": {
+        "description": "REST DTO for GTS type representation.",
+        "properties": {
+          "allowed_memberships": {
+            "description": "GTS type paths of allowed membership resource types",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowed_parents": {
+            "description": "GTS type paths of allowed parent types",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "can_be_root": {
+            "description": "Whether groups of this type can be root nodes",
+            "type": "boolean"
+          },
+          "code": {
+            "description": "GTS type path",
+            "type": "string"
+          },
+          "metadata_schema": {
+            "description": "Optional JSON Schema for instance metadata"
+          }
+        },
+        "required": [
+          "code",
+          "can_be_root",
+          "allowed_parents",
+          "allowed_memberships"
+        ],
+        "type": "object"
+      },
       "UpdateChatReq": {
         "description": "Request DTO for updating a chat title.",
         "properties": {
@@ -2958,6 +3289,35 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateGroupDto": {
+        "description": "REST DTO for updating a resource group (full replacement via PUT).",
+        "properties": {
+          "metadata": {
+            "description": "Type-specific metadata."
+          },
+          "name": {
+            "description": "Display name (1..255 characters).",
+            "type": "string"
+          },
+          "parent_id": {
+            "description": "Parent group ID (null for root groups).",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "description": "GTS chained type path. Must have prefix `gts.x.system.rg.type.v1~`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "name"
+        ],
         "type": "object"
       },
       "UpdateRouteRequest": {
@@ -3029,6 +3389,36 @@
         "required": [
           "theme",
           "language"
+        ],
+        "type": "object"
+      },
+      "UpdateTypeDto": {
+        "description": "REST DTO for updating a GTS type (full replacement via PUT).",
+        "properties": {
+          "allowed_memberships": {
+            "description": "GTS type paths of allowed membership resource types.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowed_parents": {
+            "description": "GTS type paths of allowed parent types.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "can_be_root": {
+            "description": "Whether groups of this type can be root nodes.",
+            "type": "boolean"
+          },
+          "metadata_schema": {
+            "description": "Optional JSON Schema for instance metadata."
+          }
+        },
+        "required": [
+          "can_be_root"
         ],
         "type": "object"
       },
@@ -7835,6 +8225,883 @@
         ]
       }
     },
+    "/resource-group/v1/groups": {
+      "get": {
+        "description": "Retrieve a paginated list of resource groups with OData filtering",
+        "operationId": "resource_group.list_groups",
+        "parameters": [
+          {
+            "description": "Maximum number of groups to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- type: eq|ne|contains|startswith|endswith|in\n- hierarchy/parent_id: eq|ne|in\n- id: eq|ne|in\n- name: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_GroupDto"
+                }
+              }
+            },
+            "description": "Paginated list of resource groups"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List resource groups",
+        "tags": [
+          "Resource Groups"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "hierarchy/parent_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "name": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "type": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        }
+      },
+      "post": {
+        "description": "Create a new resource group with the provided type, name, and optional parent",
+        "operationId": "resource_group.create_group",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGroupDto"
+              }
+            }
+          },
+          "description": "Group creation data",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            },
+            "description": "Created resource group"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a new resource group",
+        "tags": [
+          "Resource Groups"
+        ]
+      }
+    },
+    "/resource-group/v1/groups/{group_id}": {
+      "delete": {
+        "description": "Delete a resource group. Use ?force=true to cascade delete subtree and memberships.",
+        "operationId": "resource_group.delete_group",
+        "parameters": [
+          {
+            "description": "Group UUID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Force cascade delete of subtree and memberships",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Group deleted successfully"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete resource group",
+        "tags": [
+          "Resource Groups"
+        ]
+      },
+      "get": {
+        "description": "Retrieve a specific resource group by its UUID",
+        "operationId": "resource_group.get_group",
+        "parameters": [
+          {
+            "description": "Group UUID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            },
+            "description": "Resource group found"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get resource group by ID",
+        "tags": [
+          "Resource Groups"
+        ]
+      },
+      "patch": {
+        "description": "Partially update a resource group (PATCH). Only provided fields are changed.",
+        "operationId": "resource_group.patch_group",
+        "parameters": [
+          {
+            "description": "Group UUID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchGroupDto"
+              }
+            }
+          },
+          "description": "Group patch data",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            },
+            "description": "Patched resource group"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Patch resource group",
+        "tags": [
+          "Resource Groups"
+        ]
+      },
+      "put": {
+        "description": "Update a resource group (full replacement via PUT, including parent move)",
+        "operationId": "resource_group.update_group",
+        "parameters": [
+          {
+            "description": "Group UUID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateGroupDto"
+              }
+            }
+          },
+          "description": "Group update data",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            },
+            "description": "Updated resource group"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update resource group",
+        "tags": [
+          "Resource Groups"
+        ]
+      }
+    },
+    "/resource-group/v1/groups/{group_id}/hierarchy": {
+      "get": {
+        "description": "Traverse hierarchy from a reference group with relative depth and OData filtering",
+        "operationId": "resource_group.list_group_hierarchy",
+        "parameters": [
+          {
+            "description": "Reference group UUID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of hierarchy entries to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- hierarchy/depth: eq|ne|gt|ge|lt|le|in\n- type: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_GroupWithDepthDto"
+                }
+              }
+            },
+            "description": "Paginated list of hierarchy entries with relative depth"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List group hierarchy",
+        "tags": [
+          "Resource Groups"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "hierarchy/depth": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "type": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        }
+      }
+    },
+    "/resource-group/v1/memberships": {
+      "get": {
+        "description": "Retrieve a paginated list of memberships with OData filtering on group_id, resource_type, resource_id",
+        "operationId": "resource_group.list_memberships",
+        "parameters": [
+          {
+            "description": "Maximum number of memberships to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- group_id: eq|ne|in\n- resource_type: eq|ne|gt|ge|lt|le|in\n- resource_id: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_MembershipDto"
+                }
+              }
+            },
+            "description": "Paginated list of memberships"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List memberships",
+        "tags": [
+          "Resource Group Memberships"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "group_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "resource_id": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "resource_type": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ]
+          }
+        }
+      }
+    },
+    "/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id}": {
+      "delete": {
+        "description": "Remove a membership link between a resource group and a resource",
+        "operationId": "resource_group.remove_membership",
+        "parameters": [
+          {
+            "description": "Group UUID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "GTS type path of the resource type",
+            "in": "path",
+            "name": "resource_type",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "resource_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Membership removed successfully"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove membership",
+        "tags": [
+          "Resource Group Memberships"
+        ]
+      },
+      "post": {
+        "description": "Add a membership link between a resource group and a resource",
+        "operationId": "resource_group.add_membership",
+        "parameters": [
+          {
+            "description": "Group UUID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "GTS type path of the resource type",
+            "in": "path",
+            "name": "resource_type",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "resource_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MembershipDto"
+                }
+              }
+            },
+            "description": "Membership created"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Add membership",
+        "tags": [
+          "Resource Group Memberships"
+        ]
+      }
+    },
     "/simple-user-settings/v1/settings": {
       "get": {
         "description": "Retrieve settings for the authenticated user",
@@ -8458,6 +9725,371 @@
         "summary": "Get GTS entity by ID",
         "tags": [
           "Types Registry"
+        ]
+      }
+    },
+    "/types-registry/v1/types": {
+      "get": {
+        "description": "Retrieve a list of GTS resource group type definitions with OData filtering",
+        "operationId": "resource_group.list_types",
+        "parameters": [
+          {
+            "description": "Maximum number of types to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- code: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_TypeDto"
+                }
+              }
+            },
+            "description": "List of GTS types"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List GTS types",
+        "tags": [
+          "Resource Group Types"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "code": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        }
+      },
+      "post": {
+        "description": "Create a new GTS resource group type definition",
+        "operationId": "resource_group.create_type",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTypeDto"
+              }
+            }
+          },
+          "description": "Type creation data",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TypeDto"
+                }
+              }
+            },
+            "description": "Created type"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a new GTS type",
+        "tags": [
+          "Resource Group Types"
+        ]
+      }
+    },
+    "/types-registry/v1/types/{code}": {
+      "delete": {
+        "description": "Delete a GTS resource group type definition",
+        "operationId": "resource_group.delete_type",
+        "parameters": [
+          {
+            "description": "GTS type path",
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Type deleted successfully"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete GTS type",
+        "tags": [
+          "Resource Group Types"
+        ]
+      },
+      "get": {
+        "description": "Retrieve a specific GTS type definition by its GTS type path",
+        "operationId": "resource_group.get_type",
+        "parameters": [
+          {
+            "description": "GTS type path",
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TypeDto"
+                }
+              }
+            },
+            "description": "Type found"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get GTS type by code",
+        "tags": [
+          "Resource Group Types"
+        ]
+      },
+      "put": {
+        "description": "Update a GTS resource group type definition (full replacement)",
+        "operationId": "resource_group.update_type",
+        "parameters": [
+          {
+            "description": "GTS type path",
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTypeDto"
+              }
+            }
+          },
+          "description": "Type update data",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TypeDto"
+                }
+              }
+            },
+            "description": "Updated type"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update GTS type",
+        "tags": [
+          "Resource Group Types"
         ]
       }
     },

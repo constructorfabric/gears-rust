@@ -54,6 +54,7 @@
   - [S6: `test_move_closure_rebuild_postgresql`](#s6-test_move_closure_rebuild_postgresql)
   - [S7: `test_force_delete_cascade_postgresql`](#s7-test_force_delete_cascade_postgresql)
   - [Acceptance Criteria (S5, S6, S7)](#acceptance-criteria-s5-s6-s7)
+  - [GTS Metadata Validation Test Requirements](#gts-metadata-validation-test-requirements)
 
 <!-- /toc -->
 
