@@ -1,5 +1,6 @@
 use crate::domain::model::{ListQuery, Upstream};
 use crate::domain::repo::{RepositoryError, UpstreamRepository};
+use async_trait::async_trait;
 use dashmap::DashMap;
 use modkit_macros::domain_model;
 use uuid::Uuid;
@@ -29,7 +30,7 @@ impl Default for InMemoryUpstreamRepo {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl UpstreamRepository for InMemoryUpstreamRepo {
     async fn create(&self, upstream: Upstream) -> Result<Upstream, RepositoryError> {
         let alias_key = (upstream.tenant_id, upstream.alias.clone());
@@ -112,22 +113,20 @@ impl UpstreamRepository for InMemoryUpstreamRepo {
                 id,
             })?;
 
-        // If alias changed, atomically swap in the alias index.
+        // If alias changed, swap in the alias index.
+        // Note: we avoid using entry() + remove() on the same DashMap because
+        // holding a shard lock from entry() while remove() tries to lock
+        // another key can deadlock if both keys hash to the same shard.
         if old.alias != upstream.alias {
             let new_alias_key = (tenant_id, upstream.alias.clone());
-            match self.alias_index.entry(new_alias_key) {
-                dashmap::mapref::entry::Entry::Occupied(_) => {
-                    return Err(RepositoryError::Conflict(format!(
-                        "alias '{}' already exists for tenant",
-                        upstream.alias
-                    )));
-                }
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    // Remove old alias, then insert new — while holding the entry lock.
-                    self.alias_index.remove(&(tenant_id, old.alias.clone()));
-                    entry.insert(id);
-                }
+            if self.alias_index.contains_key(&new_alias_key) {
+                return Err(RepositoryError::Conflict(format!(
+                    "alias '{}' already exists for tenant",
+                    upstream.alias
+                )));
             }
+            self.alias_index.remove(&(tenant_id, old.alias.clone()));
+            self.alias_index.insert(new_alias_key, id);
         }
 
         self.store.insert(id, upstream.clone());

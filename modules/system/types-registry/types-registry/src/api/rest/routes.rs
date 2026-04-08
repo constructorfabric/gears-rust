@@ -13,7 +13,7 @@ use super::dto::{
 use super::handlers;
 use crate::domain::service::TypesRegistryService;
 
-const TAG: &str = "types-registry";
+const API_TAG: &str = "Types Registry";
 
 struct License;
 
@@ -39,7 +39,7 @@ pub fn register_routes(
         .description(
             "Register one or more GTS entities (types or instances) in batch. Returns per-item results.",
         )
-        .tag(TAG)
+        .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
         .json_request::<RegisterEntitiesRequest>(openapi, "GTS entities to register")
@@ -59,7 +59,7 @@ pub fn register_routes(
         .description(
             "List registered GTS entities with optional filtering by pattern, kind, vendor, package, or namespace.",
         )
-        .tag(TAG)
+        .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
         .query_param("pattern", false, "Wildcard pattern for GTS ID matching (e.g., gts.acme.*)")
@@ -82,7 +82,7 @@ pub fn register_routes(
         .operation_id("types_registry.get")
         .summary("Get GTS entity by ID")
         .description("Retrieve a single GTS entity by its identifier.")
-        .tag(TAG)
+        .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
         .path_param(

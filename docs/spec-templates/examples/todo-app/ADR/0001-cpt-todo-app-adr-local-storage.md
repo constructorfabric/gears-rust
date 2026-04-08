@@ -1,5 +1,23 @@
 # ADR-0001: Use IndexedDB for Offline Storage
 
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [LocalStorage with JSON serialization](#localstorage-with-json-serialization)
+  - [IndexedDB with Dexie.js wrapper](#indexeddb-with-dexiejs-wrapper)
+  - [SQLite via WebAssembly (sql.js)](#sqlite-via-webassembly-sqljs)
+- [More Information](#more-information)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
 **Date**: 2024-01-15
 
 **Status**: Accepted

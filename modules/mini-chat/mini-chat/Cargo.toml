@@ -1,0 +1,94 @@
+[package]
+name = "cf-mini-chat"
+description = "Mini-chat module: multi-tenant AI chat"
+version = "0.1.21"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["cyberfabric", "cyberfabric-modules"]
+categories = ["artificial-intelligence"]
+
+[lib]
+name = "mini_chat"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Plugin SDK - policy plugin traits, models, and errors
+mini-chat-sdk = { workspace = true }
+
+# AuthN resolver for S2S client credentials exchange
+authn-resolver-sdk = { package = "cf-authn-resolver-sdk", version = "0.3.5", path = "../../system/authn-resolver/authn-resolver-sdk" }
+
+# AuthZ resolver for authorization (PEP flow)
+authz-resolver-sdk = { workspace = true }
+
+# OAGW SDK — proxy calls, SSE stream, gateway errors
+oagw-sdk = { workspace = true }
+
+# Types registry for plugin discovery
+types-registry-sdk = { workspace = true }
+
+# Core dependencies
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+inventory = { workspace = true }
+
+# Streaming / async utilities
+tokio-util = { workspace = true }
+pin-project-lite = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+regex = { workspace = true }
+multer = "3.1"
+
+# Encoding
+base64 = { workspace = true }
+
+# Serde and JSON
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
+
+# HTTP and REST
+axum = { workspace = true, features = ["macros", "multipart"] }
+http = { workspace = true }
+
+# Time handling
+time = { workspace = true }
+
+# UUID support
+uuid = { workspace = true }
+
+# Database - SeaORM (driver features come from modkit-db)
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Metrics / OpenTelemetry
+opentelemetry = { workspace = true }
+
+# Local dependencies
+modkit = { workspace = true }
+modkit-db = { workspace = true, features = ["sqlite", "pg", "preview-outbox"] }
+modkit-db-macros = { workspace = true }
+modkit-security = { workspace = true }
+modkit-macros = { workspace = true }
+modkit-odata = { workspace = true, features = ["with-utoipa"] }
+modkit-utils = { workspace = true }
+heck = { workspace = true }
+secrecy = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+

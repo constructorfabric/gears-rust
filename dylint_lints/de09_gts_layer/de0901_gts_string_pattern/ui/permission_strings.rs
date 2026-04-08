@@ -46,6 +46,19 @@ fn main() {
     let _perm2 = MockPermissionBuilder::default()
         .resource_pattern("gts.x.core.events.type.v1~*")
         .build();
+
+    // Should NOT trigger DE0901 - wildcards are allowed in resolve_to_uuids() calls
+    let _resolver = MockResolver::default();
+    _resolver.resolve_to_uuids(&["gts.acme.core.events.*".to_owned()]);
+}
+
+#[derive(Default)]
+struct MockResolver;
+
+impl MockResolver {
+    fn resolve_to_uuids(&self, _patterns: &[String]) -> Vec<String> {
+        vec![]
+    }
 }
 
 struct MockPermissionBuilder {

@@ -1,5 +1,22 @@
 # Module Layout and SDK Pattern
 
+## Module Naming Convention
+
+**All module names MUST use kebab-case** (lowercase with hyphens).
+
+- **Correct**: `file-parser`, `simple-user-settings`, `api-gateway`, `types-registry`
+- **Incorrect**: `file_parser` (snake_case), `FileParser` (PascalCase), `fileParser` (camelCase)
+
+This naming convention is **enforced at multiple levels**:
+1. **Folder names**: Validated by `make validate-module-names` (runs in CI, blocks compilation)
+2. **Module attribute**: Enforced by the `#[modkit::module]` macro at compile time
+
+Module names:
+- Must contain only lowercase letters (a-z), digits (0-9), and hyphens (-)
+- Must start with a lowercase letter
+- Must not end with a hyphen
+- Must not contain consecutive hyphens or underscores
+
 ## Canonical layout (DDD-light)
 
 Place each module under `modules/<name>/`:
@@ -40,6 +57,26 @@ modules/<name>/
 - For simple internal modules you may re-export domain models via the module crate `lib.rs`.
 - Module crates host local client adapters that implement SDK traits; consumers resolve them via `ClientHub`.
 - Infra uses SeaORM via the secure ORM layer (`SecureConn`) to enforce scoping. Modules cannot access raw database connections—they provide migration definitions that the runtime executes.
+
+## Data Types Naming Matrix
+
+Use the following naming matrix for data types across layers:
+
+| Operation              | DB Layer (SeaORM)<br/>`src/infra/storage/entity/` | Domain Layer (SDK)<br/>`<module>-sdk/src/models.rs` | API Request (in)<br/>`src/api/rest/dto.rs`      | API Response (out)<br/>`src/api/rest/dto.rs`                                                    |
+|------------------------|----------------------------------------------------------|-----------------------------------------------------------|-------------------------------------------------|-------------------------------------------------------------------------------------------------|
+| Create                 | ActiveModel                                              | NewUser                                                   | CreateUserRequest                               | UserResponse                                                                                    |
+| Read/Get by id         | UserEntity                                               | User                                                      | Path params (id)                                | UserResponse                                                                                    |
+| List/Query             | UserEntity (rows)                                        | User (Vec/iterator)                                       | ListUsersQuery (filter+page)                    | UserListResponse or Page\<UserView\>                                                            |
+| Update (PUT, full)     | UserEntity (update query)                                | UpdatedUser (optional)                                    | UpdateUserRequest                               | UserResponse                                                                                    |
+| Patch (PATCH, partial) | UserPatchEntity (optional)                               | UserPatch                                                 | PatchUserRequest                                | UserResponse                                                                                    |
+| Delete                 | (no payload)                                             | DeleteUser (optional command)                             | Path params (id)                                | NoContent (204) or DeleteUserResponse (rare)                                                    |
+| Search (text)          | UserSearchEntity (projection)                            | UserSearchHit                                             | SearchUsersQuery                                | SearchUsersResponse (hits + meta)                                                               |
+| Projection/View        | UserAggEntity / UserSummaryEntity                        | UserSummary                                               | (n/a)                                           | UserSummaryView                                                                                 |
+
+Notes:
+- Keep all transport-agnostic types in the SDK crate. Handlers and DTOs must not leak into the SDK.
+- SeaORM entities live in `src/infra/storage/entity/` folder (one file per entity). Repository implementation goes in `src/infra/storage/repo.rs`.
+- All REST DTOs live in `src/api/rest/dto.rs`; provide `From` conversions in `dto.rs` or an optional `mapper.rs`.
 
 ## SDK Crate (`<module>-sdk`)
 
@@ -359,6 +396,125 @@ pub struct Model {
 }
 ```
 
+## Local Client Implementation
+
+The local client adapter bridges the domain service to the SDK API trait. It implements the SDK trait and forwards calls to domain service methods.
+
+**Location:** `src/domain/local_client.rs` (or a `local_client/` subdirectory for multi-module clients).
+
+**Rules:**
+- Implements the SDK API trait (`<module>_sdk::api::YourModuleClient`)
+- Imports types from the SDK, not from a local `contract` module
+- Delegates all calls to the domain `Service`
+- Passes `SecurityContext` directly to service methods
+- Converts `DomainError` to SDK `<Module>Error` via `From` impl
+
+```rust
+// src/domain/local_client.rs
+use modkit_macros::domain_model;
+use async_trait::async_trait;
+use std::sync::Arc;
+use uuid::Uuid;
+
+use your_module_sdk::{
+    api::YourModuleClientV1,
+    errors::YourModuleError,
+    models::{NewUser, UpdateUserRequest, User},
+};
+use crate::domain::service::Service;
+use modkit_odata::{ODataQuery, Page};
+use modkit_security::SecurityContext;
+
+#[domain_model]
+pub struct YourModuleLocalClient {
+    service: Arc<Service>,
+}
+
+impl YourModuleLocalClient {
+    pub fn new(service: Arc<Service>) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait]
+impl YourModuleClientV1 for YourModuleLocalClient {
+    async fn get_user(&self, ctx: &SecurityContext, id: Uuid) -> Result<User, YourModuleError> {
+        self.service
+            .get_user(ctx, id)
+            .await
+            .map_err(Into::into) // DomainError -> YourModuleError via From impl
+    }
+
+    // ... other methods follow the same pattern
+}
+```
+
+## Module Registration in HyperSpot Server
+
+Every new module MUST be registered in **two places** to be discoverable at runtime:
+
+### 1. Add dependency in `apps/hyperspot-server/Cargo.toml`
+
+```toml
+[dependencies]
+# ... existing dependencies
+your_module = { package = "cf-your-module", path = "../../modules/your-module/your-module" }
+```
+
+### 2. Import module in `apps/hyperspot-server/src/registered_modules.rs`
+
+```rust
+#![allow(unused_imports)]
+
+use api_gateway as _;
+use your_module as _;  // ensures inventory discovers the module at link time
+```
+
+**Why this is required:**
+- The `inventory` crate discovers modules at link time
+- Without importing the module, it won't be linked into the binary
+- This results in missing API endpoints and the module won't be initialized
+
+After registration, rebuild and verify at `http://127.0.0.1:8087/docs`.
+
+## Module Documentation: QUICKSTART.md
+
+Every module with REST endpoints SHOULD include a `QUICKSTART.md` file with:
+
+1. **Module description** — brief explanation of what the module does
+2. **Features/capabilities** — bulleted list of key functionality
+3. **Link to /docs** — reference to full API documentation
+4. **1-2 minimal examples** — basic curl commands showing typical usage
+
+**Template:**
+
+````md
+# <Module Name> - Quickstart
+
+<2-3 sentence description of what the module does and its purpose.>
+
+**Features:**
+- Key capability 1
+- Key capability 2
+
+Full API documentation: <http://127.0.0.1:8087/docs>
+
+## Examples
+
+### List Resources
+
+```bash
+curl -s http://127.0.0.1:8087/<module>/v1/resource | python3 -m json.tool
+```
+
+For additional endpoints, see <http://127.0.0.1:8087/docs>.
+````
+
+**Key principles:**
+- Avoid duplication — `/docs` is auto-generated and always current
+- Show, don't list — 1-2 working examples, not comprehensive tables
+- Describe stable features — capabilities that won't change frequently
+
 ## Quick checklist
 
 - [ ] Create `<module>-sdk` crate with `api.rs`, `models.rs`, `errors.rs`, `lib.rs`.
@@ -370,3 +526,4 @@ pub struct Model {
 - [ ] Use `SecureConn` + `SecurityContext` for all DB operations.
 - [ ] Register client in `init()`: `ctx.client_hub().register::<dyn MyModuleApi>(api)`.
 - [ ] Export SDK types from module crate `lib.rs`.
+- [ ] Register module in `apps/hyperspot-server/Cargo.toml` and `registered_modules.rs`.

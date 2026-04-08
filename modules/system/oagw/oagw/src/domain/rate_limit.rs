@@ -82,12 +82,17 @@ impl RateLimiter {
     }
 
     /// Remove all entries whose keys are not in `active_keys`.
-    ///
-    // TODO: Wire into management service delete operations (upstream/route)
-    // so that stale rate-limit buckets are purged when entities are removed.
     #[allow(dead_code)]
     pub fn purge_keys(&self, active_keys: &HashSet<String>) {
         self.buckets.retain(|k, _| active_keys.contains(k));
+    }
+
+    /// Remove a single rate-limit bucket by key.
+    ///
+    /// Called when an upstream or route is deleted so the stale bucket
+    /// does not linger in memory.
+    pub fn remove_key(&self, key: &str) {
+        self.buckets.remove(key);
     }
 
     /// Try to consume tokens for the given key.
@@ -210,6 +215,29 @@ mod tests {
         assert!(limiter.buckets.contains_key("a"));
         assert!(!limiter.buckets.contains_key("b"));
         assert!(limiter.buckets.contains_key("c"));
+    }
+
+    #[test]
+    fn remove_key_deletes_single_bucket() {
+        let limiter = RateLimiter::new();
+        let config = make_config(10, Window::Second, None);
+        limiter
+            .try_consume("upstream:aaa", &config, "/test")
+            .unwrap();
+        limiter.try_consume("route:bbb", &config, "/test").unwrap();
+
+        limiter.remove_key("upstream:aaa");
+
+        assert!(!limiter.buckets.contains_key("upstream:aaa"));
+        assert!(limiter.buckets.contains_key("route:bbb"));
+    }
+
+    #[test]
+    fn remove_key_noop_for_missing_key() {
+        let limiter = RateLimiter::new();
+        // Should not panic.
+        limiter.remove_key("nonexistent");
+        assert!(limiter.buckets.is_empty());
     }
 
     #[test]

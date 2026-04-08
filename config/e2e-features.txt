@@ -1,0 +1,1 @@
+users-info-example,mini-chat,static-tenants,static-authn,static-authz,static-credstore

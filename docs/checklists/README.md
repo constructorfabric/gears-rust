@@ -138,7 +138,7 @@ These checklists are integrated with the Cypilot PR review workflow. When review
 - **ADR PRs**: Use `ADR.md` — covers decision significance, alternatives analysis, and overlap detection
 - **Code PRs**: Use `CODING.md` — covers Rust correctness, architecture (ModKit/SDK pattern), security (secure ORM), clippy/dylint compliance, testing, performance, etc.
 
-The checklist is auto-selected by the `/cypilot-pr-review` workflow based on the PR content. Configuration is in `.cypilot/.cypilot-config.json` under the `pr.prompts` key.
+The checklist is auto-selected by the `/cypilot-pr-review` workflow based on the PR content. Configuration is in `.cypilot/config/pr-review.toml` under the `[[prompts]]` entries.
 
 Example prompts:
 
@@ -154,10 +154,10 @@ review PR 42
 
 - Existing project docs (architecture docs, API specs, runbooks)
 - Source code and tests
-- Cypilot PR review config: `.cypilot-adapter/pr-review.json`
-- PR review workflow: `.cypilot/workflows/pr-review.md`
-- PR status workflow: `.cypilot/workflows/pr-status.md`
-- PR review prompts: `.cypilot/prompts/pr/`
-- PR review script: `.cypilot/skills/scripts/pr.py`
-- PR review templates: `.cypilot/templates/pr/`
+- Cypilot PR review config: `.cypilot/config/pr-review.toml`
+- PR review workflow: `.cypilot/config/kits/sdlc/workflows/pr-review.md`
+- PR status workflow: `.cypilot/config/kits/sdlc/workflows/pr-status.md`
+- PR review prompts: `.cypilot/config/kits/sdlc/scripts/prompts/pr/`
+- PR review script: `.cypilot/config/kits/sdlc/scripts/pr.py`
+- PR review templates: `.cypilot/config/kits/sdlc/artifacts/PR-CODE-REVIEW-TEMPLATE/`
 - PR review documentation: `docs/pr-review/`

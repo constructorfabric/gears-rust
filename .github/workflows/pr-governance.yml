@@ -14,7 +14,8 @@ permissions:
 
 jobs:
   unanswered-review-check:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Disabled to stop automated unresolved-comment reminders and Telegram notifications.
+    if: false
     runs-on: ubuntu-latest
 
     steps:

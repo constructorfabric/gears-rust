@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.response.error.v1",
+  "title": "ErrorResponse",
+  "description": "RFC 9457 Problem Details error response",
+  "type": "object",
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "URI reference identifying the problem type"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Short, human-readable summary of the problem type"
+    },
+    "status": {
+      "type": "integer",
+      "description": "HTTP status code"
+    },
+    "detail": {
+      "type": "string",
+      "description": "Human-readable explanation specific to this occurrence"
+    },
+    "instance": {
+      "type": "string",
+      "description": "URI reference identifying the specific occurrence"
+    },
+    "code": {
+      "$ref": "../common/ErrorCode.json"
+    },
+    "trace_id": {
+      "type": "string",
+      "description": "W3C trace ID for support correlation",
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "errors": {
+      "type": "array",
+      "description": "Field-level validation violations",
+      "items": {
+        "$ref": "../common/ValidationViolation.json"
+      }
+    }
+  },
+  "required": ["type", "title", "status"],
+  "additionalProperties": false
+}

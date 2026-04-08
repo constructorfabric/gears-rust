@@ -158,7 +158,7 @@ async fn test_body_limit_with_cors() {
 async fn test_default_body_limit() {
     let config = wrap_config(&serde_json::json!({
         "bind_addr": "127.0.0.1:0",
-        "auth_disabled": true
+        "auth_disabled": true,
     }));
 
     let hub = Arc::new(modkit::ClientHub::new());

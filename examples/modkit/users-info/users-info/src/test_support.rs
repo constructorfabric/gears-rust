@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::events::UserDomainEvent;
-use crate::domain::ports::{AuditPort, EventPublisher};
+use crate::domain::ports::{AuditPort, EventPublisher, UsersMetricsPort};
 use crate::domain::service::ServiceConfig;
 use crate::infra::storage::{OrmAddressesRepository, OrmCitiesRepository, OrmUsersRepository};
 use crate::module::ConcreteAppServices;
@@ -100,6 +100,11 @@ pub async fn seed_user(
 
 pub struct MockEventPublisher;
 pub struct MockAuditPort;
+pub struct MockUsersMetricsPort;
+
+impl UsersMetricsPort for MockUsersMetricsPort {
+    fn record_get_user(&self, _result: &str) {}
+}
 
 impl EventPublisher<UserDomainEvent> for MockEventPublisher {
     fn publish(&self, _event: &UserDomainEvent) {}
@@ -221,6 +226,7 @@ pub fn build_services_with_authz(
         Arc::new(MockAuditPort),
         authz,
         config,
+        Arc::new(MockUsersMetricsPort),
     ))
 }
 

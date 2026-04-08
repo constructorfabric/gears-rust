@@ -22,7 +22,7 @@ use opentelemetry_sdk::{
 };
 
 #[cfg(feature = "otel")]
-use super::config::TracingConfig;
+use super::config::{OpenTelemetryConfig, OpenTelemetryResource, TracingConfig};
 #[cfg(feature = "otel")]
 use crate::telemetry::config::ExporterKind;
 #[cfg(feature = "otel")]
@@ -32,12 +32,16 @@ use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 
 /// Build resource with service name and custom attributes
 #[cfg(feature = "otel")]
-fn build_resource(cfg: &TracingConfig) -> Resource {
-    let service_name = cfg.service_name.as_deref().unwrap_or("hyperspot");
+pub(crate) fn build_resource(cfg: &OpenTelemetryResource) -> Resource {
+    let service_name = cfg.service_name.as_deref().unwrap_or("unknown_service");
+    tracing::debug!(
+        "Building OpenTelemetry resource for service: {}",
+        service_name
+    );
     let mut attrs = vec![KeyValue::new("service.name", service_name.to_owned())];
 
-    if let Some(resource_map) = &cfg.resource {
-        for (k, v) in resource_map {
+    if let Some(attr_map) = &cfg.attributes {
+        for (k, v) in attr_map {
             attrs.push(KeyValue::new(k.clone(), v.clone()));
         }
     }
@@ -62,26 +66,21 @@ fn build_sampler(cfg: &TracingConfig) -> Sampler {
     }
 }
 
-/// Extract exporter kind and endpoint from configuration
+/// Extract exporter kind and endpoint from the resolved exporter.
 #[cfg(feature = "otel")]
-fn extract_exporter_config(
-    cfg: &TracingConfig,
+pub(crate) fn extract_exporter_config(
+    exporter: Option<&crate::telemetry::config::Exporter>,
 ) -> (ExporterKind, String, Option<std::time::Duration>) {
-    let (kind, endpoint) = cfg.exporter.as_ref().map_or_else(
-        || (ExporterKind::OtlpGrpc, "http://127.0.0.1:4317".into()),
-        |e| {
-            (
-                e.kind,
-                e.endpoint
-                    .clone()
-                    .unwrap_or_else(|| "http://127.0.0.1:4317".into()),
-            )
-        },
-    );
+    let kind = exporter.map_or(ExporterKind::OtlpGrpc, |e| e.kind);
+    let default_endpoint = match kind {
+        ExporterKind::OtlpHttp => "http://127.0.0.1:4318",
+        ExporterKind::OtlpGrpc => "http://127.0.0.1:4317",
+    };
+    let endpoint = exporter
+        .and_then(|e| e.endpoint.clone())
+        .unwrap_or_else(|| default_endpoint.into());
 
-    let timeout = cfg
-        .exporter
-        .as_ref()
+    let timeout = exporter
         .and_then(|e| e.timeout_ms)
         .map(std::time::Duration::from_millis);
 
@@ -91,7 +90,7 @@ fn extract_exporter_config(
 /// Build HTTP OTLP exporter
 #[cfg(feature = "otel")]
 fn build_http_exporter(
-    cfg: &TracingConfig,
+    exporter: Option<&crate::telemetry::config::Exporter>,
     endpoint: String,
     timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<opentelemetry_otlp::SpanExporter> {
@@ -102,7 +101,7 @@ fn build_http_exporter(
     if let Some(t) = timeout {
         b = b.with_timeout(t);
     }
-    if let Some(hmap) = build_headers_from_cfg_and_env(cfg) {
+    if let Some(hmap) = build_headers_from_cfg_and_env(exporter) {
         b = b.with_headers(hmap);
     }
     #[allow(clippy::expect_used)]
@@ -112,7 +111,7 @@ fn build_http_exporter(
 /// Build gRPC OTLP exporter
 #[cfg(feature = "otel")]
 fn build_grpc_exporter(
-    cfg: &TracingConfig,
+    exporter: Option<&crate::telemetry::config::Exporter>,
     endpoint: String,
     timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<opentelemetry_otlp::SpanExporter> {
@@ -122,7 +121,7 @@ fn build_grpc_exporter(
     if let Some(t) = timeout {
         b = b.with_timeout(t);
     }
-    if let Some(md) = build_metadata_from_cfg_and_env(cfg) {
+    if let Some(md) = build_metadata_from_cfg_and_env(exporter) {
         b = b.with_metadata(md);
     }
     b.build().context("build OTLP gRPC exporter")
@@ -135,13 +134,14 @@ fn build_grpc_exporter(
 /// Returns an error if the configuration is invalid or if the exporter fails to build.
 #[cfg(feature = "otel")]
 pub fn init_tracing(
-    cfg: &TracingConfig,
+    otel_cfg: &OpenTelemetryConfig,
 ) -> anyhow::Result<
     tracing_opentelemetry::OpenTelemetryLayer<
         tracing_subscriber::Registry,
         opentelemetry_sdk::trace::Tracer,
     >,
 > {
+    let cfg = &otel_cfg.tracing;
     if !cfg.enabled {
         return Err(anyhow::anyhow!("tracing is disabled"));
     }
@@ -149,21 +149,19 @@ pub fn init_tracing(
     // Set W3C propagator for trace-context propagation
     global::set_text_map_propagator(TraceContextPropagator::new());
 
-    let service_name = cfg.service_name.as_deref().unwrap_or("hyperspot");
-    tracing::info!("Building OpenTelemetry layer for service: {}", service_name);
-
     // Build resource, sampler, and extract exporter config
-    let resource = build_resource(cfg);
+    let resource = build_resource(&otel_cfg.resource);
     let sampler = build_sampler(cfg);
-    let (kind, endpoint, timeout) = extract_exporter_config(cfg);
+    let resolved_exporter = otel_cfg.tracing_exporter();
+    let (kind, endpoint, timeout) = extract_exporter_config(resolved_exporter);
 
     tracing::info!(kind = ?kind, %endpoint, "OTLP exporter config");
 
     // Build span exporter based on kind
     let exporter = if matches!(kind, ExporterKind::OtlpHttp) {
-        build_http_exporter(cfg, endpoint, timeout)
+        build_http_exporter(resolved_exporter, endpoint, timeout)
     } else {
-        build_grpc_exporter(cfg, endpoint, timeout)
+        build_grpc_exporter(resolved_exporter, endpoint, timeout)
     }?;
 
     // Build tracer provider with batch processor
@@ -177,22 +175,38 @@ pub fn init_tracing(
     global::set_tracer_provider(provider.clone());
 
     // Create tracer and layer
-    let tracer = provider.tracer("hyperspot");
+    let service_name = otel_cfg
+        .resource
+        .service_name
+        .clone()
+        .unwrap_or_else(|| "unknown_service".to_owned());
+    let tracer = provider.tracer(service_name);
     let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
 
     tracing::info!("OpenTelemetry layer created successfully");
     Ok(otel_layer)
 }
 
+/// No-op when the `otel` feature is disabled.
+///
+/// # Errors
+/// Always returns an error indicating the feature is disabled.
+#[cfg(not(feature = "otel"))]
+pub fn init_tracing(
+    _otel_cfg: &super::config::OpenTelemetryConfig,
+) -> anyhow::Result<crate::bootstrap::host::logging::OtelLayer> {
+    Err(anyhow::anyhow!("otel feature is disabled"))
+}
+
 #[cfg(feature = "otel")]
-fn build_headers_from_cfg_and_env(
-    cfg: &TracingConfig,
+pub(crate) fn build_headers_from_cfg_and_env(
+    exporter: Option<&crate::telemetry::config::Exporter>,
 ) -> Option<std::collections::HashMap<String, String>> {
     use std::collections::HashMap;
     let mut out: HashMap<String, String> = HashMap::new();
 
     // From config file
-    if let Some(exp) = &cfg.exporter
+    if let Some(exp) = exporter
         && let Some(hdrs) = &exp.headers
     {
         for (k, v) in hdrs {
@@ -213,8 +227,11 @@ fn build_headers_from_cfg_and_env(
 }
 
 #[cfg(feature = "otel")]
-fn extend_metadata_from_source<'a, I>(md: &mut MetadataMap, source: I, context: &'static str)
-where
+pub(crate) fn extend_metadata_from_source<'a, I>(
+    md: &mut MetadataMap,
+    source: I,
+    context: &'static str,
+) where
     I: Iterator<Item = (&'a str, &'a str)>,
 {
     for (k, v) in source {
@@ -235,11 +252,13 @@ where
 }
 
 #[cfg(feature = "otel")]
-fn build_metadata_from_cfg_and_env(cfg: &TracingConfig) -> Option<MetadataMap> {
+pub(crate) fn build_metadata_from_cfg_and_env(
+    exporter: Option<&crate::telemetry::config::Exporter>,
+) -> Option<MetadataMap> {
     let mut md = MetadataMap::new();
 
     // From config file
-    if let Some(exp) = &cfg.exporter
+    if let Some(exp) = exporter
         && let Some(hdrs) = &exp.headers
     {
         let iter = hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str()));
@@ -262,14 +281,6 @@ fn build_metadata_from_cfg_and_env(cfg: &TracingConfig) -> Option<MetadataMap> {
     if md.is_empty() { None } else { Some(md) }
 }
 
-// ===== init_tracing (feature disabled) ========================================
-
-#[cfg(not(feature = "otel"))]
-pub fn init_tracing(_cfg: &serde_json::Value) -> Option<()> {
-    tracing::info!("Tracing configuration provided but runtime feature is disabled");
-    None
-}
-
 // ===== shutdown_tracing =======================================================
 
 /// Gracefully shut down OpenTelemetry tracing.
@@ -286,6 +297,126 @@ pub fn shutdown_tracing() {
     tracing::info!("Tracing shutdown (no-op)");
 }
 
+/// Gracefully shut down OpenTelemetry metrics.
+/// In opentelemetry 0.31 there is no global `shutdown_meter_provider()`.
+/// Keep a handle to `SdkMeterProvider` in your app state and call `shutdown()`
+/// during graceful shutdown. This function remains a no-op for compatibility.
+#[cfg(feature = "otel")]
+pub fn shutdown_metrics() {
+    tracing::info!("Metrics shutdown: no-op (keep a provider handle to call `shutdown()`).");
+}
+
+#[cfg(not(feature = "otel"))]
+pub fn shutdown_metrics() {
+    tracing::info!("Metrics shutdown (no-op)");
+}
+
+// ===== init_metrics_provider ==================================================
+
+#[cfg(feature = "otel")]
+static METRICS_INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+
+/// Build a [`SdkMeterProvider`] from the resolved metrics exporter settings and
+/// register it as the global meter provider.
+///
+/// When `metrics.enabled` is `false` the function is a no-op: the global meter
+/// provider stays as the built-in [`NoopMeterProvider`] (zero overhead — all
+/// instruments obtained via `global::meter_with_scope()` become no-op).
+///
+/// Exporter resolution: `opentelemetry.metrics.exporter` overrides
+/// `opentelemetry.exporter` when present.
+///
+/// This function is guarded by [`OnceLock`] — the provider is built and
+/// registered at most once; subsequent calls return the cached result.
+///
+/// # Errors
+///
+/// The OTLP metric exporter cannot be constructed.
+#[cfg(feature = "otel")]
+pub fn init_metrics_provider(otel_cfg: &OpenTelemetryConfig) -> anyhow::Result<()> {
+    if !otel_cfg.metrics.enabled {
+        // Do NOT cache the disabled path in METRICS_INIT — a later call with
+        // metrics enabled must still be able to initialise the real provider.
+        tracing::info!(
+            "OpenTelemetry metrics disabled - global meter provider is \
+             the built-in NoopMeterProvider"
+        );
+        return Ok(());
+    }
+
+    METRICS_INIT
+        .get_or_init(|| do_init_metrics_provider(otel_cfg).map_err(|e| e.to_string()))
+        .clone()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(feature = "otel")]
+fn do_init_metrics_provider(otel_cfg: &OpenTelemetryConfig) -> anyhow::Result<()> {
+    let resolved_exporter = otel_cfg.metrics_exporter();
+
+    let (kind, endpoint, timeout) = extract_exporter_config(resolved_exporter);
+
+    // Build OTLP metric exporter matching the configured transport
+    let exporter = if matches!(kind, ExporterKind::OtlpHttp) {
+        let mut b = opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .with_endpoint(&endpoint);
+        if let Some(t) = timeout {
+            b = b.with_timeout(t);
+        }
+        if let Some(headers) = build_headers_from_cfg_and_env(resolved_exporter) {
+            b = b.with_headers(headers);
+        }
+        b.build().context("build OTLP HTTP metric exporter")?
+    } else {
+        let mut b = opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(&endpoint);
+        if let Some(t) = timeout {
+            b = b.with_timeout(t);
+        }
+        if let Some(md) = build_metadata_from_cfg_and_env(resolved_exporter) {
+            b = b.with_metadata(md);
+        }
+        b.build().context("build OTLP gRPC metric exporter")?
+    };
+
+    // Build resource with service name and attributes
+    let resource = build_resource(&otel_cfg.resource);
+
+    // Build the SdkMeterProvider with periodic exporter
+    let mut builder = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter)
+        .with_resource(resource);
+
+    // Apply a global cardinality limit when configured
+    if let Some(limit) = otel_cfg.metrics.cardinality_limit {
+        builder = builder.with_view(move |_: &opentelemetry_sdk::metrics::Instrument| {
+            opentelemetry_sdk::metrics::Stream::builder()
+                .with_cardinality_limit(limit)
+                .build()
+                .ok()
+        });
+    }
+
+    let provider = builder.build();
+
+    global::set_meter_provider(provider);
+    tracing::info!("OpenTelemetry metrics initialized successfully");
+
+    Ok(())
+}
+
+/// No-op when the `otel` feature is disabled.
+///
+/// # Errors
+/// Always returns an error indicating the feature is disabled.
+#[cfg(not(feature = "otel"))]
+pub fn init_metrics_provider(_otel_cfg: &super::config::OpenTelemetryConfig) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!("otel feature is disabled"))
+}
+
 // ===== connectivity probe =====================================================
 
 /// Build a tiny, separate OTLP pipeline and export a single span to verify connectivity.
@@ -294,30 +425,14 @@ pub fn shutdown_tracing() {
 /// # Errors
 /// Returns an error if the OTLP exporter cannot be built or the probe fails.
 #[cfg(feature = "otel")]
-pub fn otel_connectivity_probe(cfg: &super::config::TracingConfig) -> anyhow::Result<()> {
+pub fn otel_connectivity_probe(otel_cfg: &OpenTelemetryConfig) -> anyhow::Result<()> {
     use opentelemetry::trace::{Span, Tracer as _};
 
-    let service_name = cfg
-        .service_name
-        .clone()
-        .unwrap_or_else(|| "hyperspot".into());
+    let resolved_exporter = otel_cfg.tracing_exporter();
+    let (kind, endpoint, timeout) = extract_exporter_config(resolved_exporter);
 
-    let (kind, endpoint) = cfg.exporter.as_ref().map_or_else(
-        || (ExporterKind::OtlpGrpc, "http://127.0.0.1:4317".into()),
-        |e| {
-            (
-                e.kind,
-                e.endpoint
-                    .clone()
-                    .unwrap_or_else(|| "http://127.0.0.1:4317".into()),
-            )
-        },
-    );
-
-    // Resource
-    let resource = Resource::builder_empty()
-        .with_attributes([KeyValue::new("service.name", service_name)])
-        .build();
+    // Resource (reuse shared builder)
+    let resource = build_resource(&otel_cfg.resource);
 
     // Exporter (type-state branches again)
     let exporter = if matches!(kind, ExporterKind::OtlpHttp) {
@@ -325,7 +440,10 @@ pub fn otel_connectivity_probe(cfg: &super::config::TracingConfig) -> anyhow::Re
             .with_http()
             .with_protocol(Protocol::HttpBinary)
             .with_endpoint(endpoint);
-        if let Some(h) = build_headers_from_cfg_and_env(cfg) {
+        if let Some(t) = timeout {
+            b = b.with_timeout(t);
+        }
+        if let Some(h) = build_headers_from_cfg_and_env(resolved_exporter) {
             b = b.with_headers(h);
         }
         b.build()
@@ -334,7 +452,10 @@ pub fn otel_connectivity_probe(cfg: &super::config::TracingConfig) -> anyhow::Re
         let mut b = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint);
-        if let Some(md) = build_metadata_from_cfg_and_env(cfg) {
+        if let Some(t) = timeout {
+            b = b.with_timeout(t);
+        }
+        if let Some(md) = build_metadata_from_cfg_and_env(resolved_exporter) {
             b = b.with_metadata(md);
         }
         b.build()
@@ -370,7 +491,7 @@ pub fn otel_connectivity_probe(cfg: &super::config::TracingConfig) -> anyhow::Re
 /// # Errors
 /// This function always succeeds when the otel feature is disabled.
 #[cfg(not(feature = "otel"))]
-pub fn otel_connectivity_probe(_cfg: &serde_json::Value) -> anyhow::Result<()> {
+pub fn otel_connectivity_probe(_cfg: &super::config::OpenTelemetryConfig) -> anyhow::Result<()> {
     tracing::info!("OTLP connectivity probe skipped (otel feature disabled)");
     Ok(())
 }
@@ -381,31 +502,40 @@ pub fn otel_connectivity_probe(_cfg: &serde_json::Value) -> anyhow::Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::telemetry::config::{Exporter, ExporterKind, Sampler, TracingConfig};
-    use std::collections::HashMap;
+    use crate::telemetry::config::{
+        Exporter, ExporterKind, OpenTelemetryConfig, OpenTelemetryResource, Sampler, TracingConfig,
+    };
+    use std::collections::{BTreeMap, HashMap};
+
+    /// Helper to build an `OpenTelemetryConfig` with the given tracing config.
+    fn otel_with_tracing(tracing: TracingConfig) -> OpenTelemetryConfig {
+        OpenTelemetryConfig {
+            tracing,
+            ..Default::default()
+        }
+    }
 
     #[test]
     #[cfg(feature = "otel")]
     fn test_init_tracing_disabled() {
-        let cfg = TracingConfig {
+        let otel = otel_with_tracing(TracingConfig {
             enabled: false,
             ..Default::default()
-        };
+        });
 
-        let result = init_tracing(&cfg);
+        let result = init_tracing(&otel);
         assert!(result.is_err());
     }
 
     #[tokio::test]
     #[cfg(feature = "otel")]
     async fn test_init_tracing_enabled() {
-        let cfg = TracingConfig {
+        let otel = otel_with_tracing(TracingConfig {
             enabled: true,
-            service_name: Some("test-service".to_owned()),
             ..Default::default()
-        };
+        });
 
-        let result = init_tracing(&cfg);
+        let result = init_tracing(&otel);
         assert!(result.is_ok());
     }
 
@@ -415,18 +545,23 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
 
-        let mut resource_map = HashMap::new();
-        resource_map.insert("service.version".to_owned(), "1.0.0".to_owned());
-        resource_map.insert("deployment.environment".to_owned(), "test".to_owned());
+        let mut attrs = BTreeMap::new();
+        attrs.insert("service.version".to_owned(), "1.0.0".to_owned());
+        attrs.insert("deployment.environment".to_owned(), "test".to_owned());
 
-        let cfg = TracingConfig {
-            enabled: true,
-            service_name: Some("test-service".to_owned()),
-            resource: Some(resource_map),
+        let otel = OpenTelemetryConfig {
+            resource: OpenTelemetryResource {
+                service_name: Some("test-service".to_owned()),
+                attributes: Some(attrs),
+            },
+            tracing: TracingConfig {
+                enabled: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
-        let result = init_tracing(&cfg);
+        let result = init_tracing(&otel);
         assert!(result.is_ok());
     }
 
@@ -436,14 +571,13 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
 
-        let cfg = TracingConfig {
+        let otel = otel_with_tracing(TracingConfig {
             enabled: true,
-            service_name: Some("test-service".to_owned()),
             sampler: Some(Sampler::AlwaysOn {}),
             ..Default::default()
-        };
+        });
 
-        let result = init_tracing(&cfg);
+        let result = init_tracing(&otel);
         assert!(result.is_ok());
     }
 
@@ -453,14 +587,13 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
 
-        let cfg = TracingConfig {
+        let otel = otel_with_tracing(TracingConfig {
             enabled: true,
-            service_name: Some("test-service".to_owned()),
             sampler: Some(Sampler::AlwaysOff {}),
             ..Default::default()
-        };
+        });
 
-        let result = init_tracing(&cfg);
+        let result = init_tracing(&otel);
         assert!(result.is_ok());
     }
 
@@ -470,14 +603,13 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
 
-        let cfg = TracingConfig {
+        let otel = otel_with_tracing(TracingConfig {
             enabled: true,
-            service_name: Some("test-service".to_owned()),
             sampler: Some(Sampler::ParentBasedRatio { ratio: Some(0.5) }),
             ..Default::default()
-        };
+        });
 
-        let result = init_tracing(&cfg);
+        let result = init_tracing(&otel);
         assert!(result.is_ok());
     }
 
@@ -486,9 +618,8 @@ mod tests {
     fn test_init_tracing_with_http_exporter() {
         let _rt = tokio::runtime::Runtime::new().unwrap();
 
-        let cfg = TracingConfig {
+        let otel = otel_with_tracing(TracingConfig {
             enabled: true,
-            service_name: Some("test-service".to_owned()),
             exporter: Some(Exporter {
                 kind: ExporterKind::OtlpHttp,
                 endpoint: Some("http://localhost:4318".to_owned()),
@@ -496,9 +627,9 @@ mod tests {
                 timeout_ms: Some(5000),
             }),
             ..Default::default()
-        };
+        });
 
-        let result = init_tracing(&cfg);
+        let result = init_tracing(&otel);
         assert!(result.is_ok());
     }
 
@@ -508,9 +639,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
 
-        let cfg = TracingConfig {
+        let otel = otel_with_tracing(TracingConfig {
             enabled: true,
-            service_name: Some("test-service".to_owned()),
             exporter: Some(Exporter {
                 kind: ExporterKind::OtlpGrpc,
                 endpoint: Some("http://localhost:4317".to_owned()),
@@ -518,24 +648,27 @@ mod tests {
                 timeout_ms: Some(5000),
             }),
             ..Default::default()
-        };
+        });
 
-        let result = init_tracing(&cfg);
+        let result = init_tracing(&otel);
         assert!(result.is_ok());
     }
 
     #[test]
     #[cfg(feature = "otel")]
     fn test_build_headers_from_cfg_empty() {
-        let cfg = TracingConfig {
-            enabled: true,
-            ..Default::default()
-        };
+        temp_env::with_var_unset("OTEL_EXPORTER_OTLP_HEADERS", || {
+            let cfg = TracingConfig {
+                enabled: true,
+                ..Default::default()
+            };
 
-        let result = build_headers_from_cfg_and_env(&cfg);
-        // Should be None if no headers configured and no env var
-        // (unless OTEL_EXPORTER_OTLP_HEADERS is set, which we can't control in tests)
-        assert!(result.is_none() || result.is_some());
+            let result = build_headers_from_cfg_and_env(cfg.exporter.as_ref());
+            assert!(
+                result.is_none(),
+                "expected None when no headers configured and no env"
+            );
+        });
     }
 
     #[test]
@@ -555,7 +688,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = build_headers_from_cfg_and_env(&cfg);
+        let result = build_headers_from_cfg_and_env(cfg.exporter.as_ref());
         assert!(result.is_some());
         let result_headers = result.unwrap();
         assert_eq!(
@@ -567,14 +700,18 @@ mod tests {
     #[test]
     #[cfg(feature = "otel")]
     fn test_build_metadata_from_cfg_empty() {
-        let cfg = TracingConfig {
-            enabled: true,
-            ..Default::default()
-        };
+        temp_env::with_var_unset("OTEL_EXPORTER_OTLP_HEADERS", || {
+            let cfg = TracingConfig {
+                enabled: true,
+                ..Default::default()
+            };
 
-        let result = build_metadata_from_cfg_and_env(&cfg);
-        // Should be None if no headers configured and no env var
-        assert!(result.is_none() || result.is_some());
+            let result = build_metadata_from_cfg_and_env(cfg.exporter.as_ref());
+            assert!(
+                result.is_none(),
+                "expected None when no headers configured and no env"
+            );
+        });
     }
 
     #[test]
@@ -594,7 +731,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = build_metadata_from_cfg_and_env(&cfg);
+        let result = build_metadata_from_cfg_and_env(cfg.exporter.as_ref());
         assert!(result.is_some());
         let metadata = result.unwrap();
         assert!(!metadata.is_empty());
@@ -618,7 +755,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = build_metadata_from_cfg_and_env(&cfg);
+        let result = build_metadata_from_cfg_and_env(cfg.exporter.as_ref());
         assert!(result.is_some());
         let metadata = result.unwrap();
         assert_eq!(metadata.len(), 2);
@@ -642,7 +779,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = build_metadata_from_cfg_and_env(&cfg);
+        let result = build_metadata_from_cfg_and_env(cfg.exporter.as_ref());
         assert!(result.is_some());
         let metadata = result.unwrap();
         // Should only have the valid header
@@ -653,5 +790,20 @@ mod tests {
     fn test_shutdown_tracing_does_not_panic() {
         // Should not panic regardless of feature state
         shutdown_tracing();
+    }
+
+    #[test]
+    #[cfg(feature = "otel")]
+    fn test_init_metrics_provider_disabled() {
+        let otel = OpenTelemetryConfig {
+            metrics: crate::telemetry::config::MetricsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Disabled path returns Ok (noop — global provider stays NoopMeterProvider)
+        let result = init_metrics_provider(&otel);
+        assert!(result.is_ok());
     }
 }

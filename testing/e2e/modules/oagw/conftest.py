@@ -28,7 +28,7 @@ def mock_upstream_url():
 @pytest.fixture
 def tenant_id():
     """Fixed tenant UUID for test isolation."""
-    return "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    return "00000000-df51-5b42-9538-d2b56b7ee953"
 
 
 @pytest.fixture
@@ -69,10 +69,26 @@ def mock_upstream():
 
     yield server
 
+    async def _shutdown() -> None:
+        if server._server:
+            server._server.close()
+        current = asyncio.current_task()
+        pending = [
+            t for t in asyncio.all_tasks()
+            if t is not current and not t.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=2)
+
+    fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
+    try:
+        fut.result(timeout=5)
+    except (TimeoutError, Exception):
+        pass  # Best-effort; the daemon thread will die with the process.
     loop.call_soon_threadsafe(loop.stop)
     thread.join(timeout=5)
-    loop.run_until_complete(server.stop())
-    loop.close()
 
 
 # ---------------------------------------------------------------------------

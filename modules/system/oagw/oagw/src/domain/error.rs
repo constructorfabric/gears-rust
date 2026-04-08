@@ -58,6 +58,19 @@ pub enum DomainError {
 
     #[error("{detail}")]
     RequestTimeout { detail: String, instance: String },
+
+    /// A guard plugin rejected the request with a specific status and error code.
+    #[error("guard rejected: {detail}")]
+    GuardRejected {
+        status: u16,
+        error_code: String,
+        detail: String,
+        instance: String,
+    },
+
+    /// The request was denied by the authorization policy.
+    #[error("access forbidden: {detail}")]
+    Forbidden { detail: String },
 }
 
 impl DomainError {
@@ -94,6 +107,14 @@ impl DomainError {
             message: message.into(),
         }
     }
+
+    /// Construct a [`DomainError::Forbidden`] with the given detail message.
+    #[must_use]
+    pub fn forbidden(detail: impl Into<String>) -> Self {
+        Self::Forbidden {
+            detail: detail.into(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +127,65 @@ impl From<RepositoryError> for DomainError {
             RepositoryError::NotFound { entity, id } => Self::NotFound { entity, id },
             RepositoryError::Conflict(detail) => Self::Conflict { detail },
             RepositoryError::Internal(message) => Self::Internal { message },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From<TenantResolverError>
+// ---------------------------------------------------------------------------
+
+impl From<tenant_resolver_sdk::TenantResolverError> for DomainError {
+    fn from(e: tenant_resolver_sdk::TenantResolverError) -> Self {
+        use tenant_resolver_sdk::TenantResolverError;
+
+        match e {
+            TenantResolverError::TenantNotFound { tenant_id } => {
+                tracing::warn!(tenant_id = %tenant_id, "tenant not found during hierarchy resolution");
+                Self::NotFound {
+                    entity: "tenant",
+                    id: tenant_id.0,
+                }
+            }
+            TenantResolverError::Unauthorized => Self::Forbidden {
+                detail: "tenant resolver: unauthorized".to_string(),
+            },
+            TenantResolverError::NoPluginAvailable => Self::Internal {
+                message: "tenant resolver: no plugin available".to_string(),
+            },
+            TenantResolverError::ServiceUnavailable(msg) => Self::Internal {
+                message: format!("tenant resolver unavailable: {msg}"),
+            },
+            TenantResolverError::Internal(msg) => Self::Internal {
+                message: format!("tenant resolver internal error: {msg}"),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From<EnforcerError>
+// ---------------------------------------------------------------------------
+
+/// Convert an authorization enforcer error into a domain error.
+impl From<authz_resolver_sdk::EnforcerError> for DomainError {
+    fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
+        use authz_resolver_sdk::EnforcerError;
+
+        tracing::error!(error = %e, "OAGW authorization check failed");
+        match e {
+            EnforcerError::Denied { deny_reason } => {
+                let detail = deny_reason
+                    .map(|r| format!("{}: {}", r.error_code, r.details.unwrap_or_default()))
+                    .unwrap_or_else(|| "access denied by policy".to_string());
+                Self::Forbidden { detail }
+            }
+            EnforcerError::CompileFailed(_) => Self::Internal {
+                message: "authorization constraint compilation failed".to_string(),
+            },
+            EnforcerError::EvaluationFailed(_) => Self::Internal {
+                message: "authorization evaluation failed".to_string(),
+            },
         }
     }
 }

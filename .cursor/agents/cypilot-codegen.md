@@ -1,0 +1,8 @@
+---
+name: cypilot-codegen
+description: "Cypilot code generator. Use when requirements are fully specified and no clarification is needed. Takes a complete task description and implements it in an isolated context — no back-and-forth, just code."
+tools: grep, view, edit, bash
+model: inherit
+---
+
+ALWAYS open and follow `{cypilot_path}/.core/skills/cypilot/agents/cypilot-codegen.md`

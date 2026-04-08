@@ -55,7 +55,7 @@ impl From<modkit::plugins::ChoosePluginError> for DomainError {
             modkit::plugins::ChoosePluginError::InvalidPluginInstance { gts_id, reason } => {
                 Self::InvalidPluginInstance { gts_id, reason }
             }
-            modkit::plugins::ChoosePluginError::PluginNotFound { vendor } => {
+            modkit::plugins::ChoosePluginError::PluginNotFound { vendor, .. } => {
                 Self::PluginNotFound { vendor }
             }
         }
@@ -65,7 +65,9 @@ impl From<modkit::plugins::ChoosePluginError> for DomainError {
 impl From<TenantResolverError> for DomainError {
     fn from(e: TenantResolverError) -> Self {
         match e {
-            TenantResolverError::TenantNotFound { tenant_id } => Self::TenantNotFound { tenant_id },
+            TenantResolverError::TenantNotFound { tenant_id } => Self::TenantNotFound {
+                tenant_id: tenant_id.0,
+            },
             TenantResolverError::Unauthorized => Self::Unauthorized,
             TenantResolverError::NoPluginAvailable => Self::PluginNotFound {
                 vendor: "unknown".to_owned(),
@@ -89,7 +91,9 @@ impl From<DomainError> for TenantResolverError {
             DomainError::PluginUnavailable { gts_id, reason } => {
                 Self::ServiceUnavailable(format!("plugin not available for '{gts_id}': {reason}"))
             }
-            DomainError::TenantNotFound { tenant_id } => Self::TenantNotFound { tenant_id },
+            DomainError::TenantNotFound { tenant_id } => Self::TenantNotFound {
+                tenant_id: tenant_resolver_sdk::TenantId(tenant_id),
+            },
             DomainError::Unauthorized => Self::Unauthorized,
             DomainError::TypesRegistryUnavailable(reason) | DomainError::Internal(reason) => {
                 Self::Internal(reason)

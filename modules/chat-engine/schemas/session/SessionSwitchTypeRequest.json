@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.session.switch_type_request.v1",
+  "title": "SessionSwitchTypeRequest",
+  "description": "Request to switch a session to a different session type",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "$ref": "../common/GtsSessionId.json",
+      "description": "Session identifier"
+    },
+    "new_session_type_id": {
+      "$ref": "../common/GtsSessionTypeId.json",
+      "description": "New session type to switch to"
+    }
+  },
+  "required": ["session_id", "new_session_type_id"],
+  "additionalProperties": false
+}

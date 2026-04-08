@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.llm_gateway.message_new_response.v1",
+  "title": "LlmMessageNewResponse",
+  "description": "Webhook MessageNewResponse as sent by the LLM gateway plugin. Extends the base response with typed metadata including model used, finish reason, and LLM token usage.",
+  "allOf": [
+    { "$ref": "../webhook/MessageNewResponse.json" },
+    {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "$ref": "./LlmMessageMetadata.json"
+        }
+      }
+    }
+  ]
+}

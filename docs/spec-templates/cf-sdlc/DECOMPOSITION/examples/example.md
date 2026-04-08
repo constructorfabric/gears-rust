@@ -2,85 +2,138 @@
 
 - [ ] `p1` - **ID**: `cpt-examples-todo-app-status-overall`
 
+<!-- toc -->
+
+- [1. Overview](#1-overview)
+- [2. Entries](#2-entries)
+  - [2.1 Task CRUD ⏳ HIGH](#21-task-crud--high)
+  - [2.2 Notifications ⏳ MEDIUM](#22-notifications--medium)
+- [3. Feature Dependencies](#3-feature-dependencies)
+
+<!-- /toc -->
+
 ## 1. Overview
 
-**Overall Progress**: 67% complete (2 of 3 features completed)
+Todo App design is decomposed into features organized around core task management capabilities. The decomposition follows a dependency order where foundational CRUD operations enable higher-level features like notifications and reporting.
 
-**Status**: In Progress
-
-**Notes**: Core task management and organization features are complete. Real-time synchronization is pending implementation.
-
----
+**Decomposition Strategy**:
+- Features grouped by functional cohesion (related capabilities together)
+- Dependencies minimize coupling between features
+- Each feature covers specific components and sequences from DESIGN
+- 100% coverage of all DESIGN elements verified
 
 ## 2. Entries
 
-### Feature 1: Task Management Core
+### 2.1 [Task CRUD](feature-task-crud/) ⏳ HIGH
 
-- [x] `p1` - **ID**: `cpt-examples-todo-app-feature-core`
+- [ ] `p1` - **ID**: `cpt-ex-task-flow-feature-task-crud`
 
-**Feature**: [features/0001-cpt-todo-app-feature-core.md](./features/0001-cpt-todo-app-feature-core.md)
+- **Purpose**: Enable users to create, view, edit, and delete tasks with full lifecycle management.
 
-**Purpose**: Implement core CRUD operations for tasks including creation, reading, updating, and deletion.
+- **Depends On**: None
 
-**Design Coverage**:
-- Component: `cpt-examples-todo-app-component-react-ui` (task UI rendering)
-- Component: `cpt-examples-todo-app-component-task-service` (CRUD orchestration)
-- Component: `cpt-examples-todo-app-component-indexeddb` (local persistence)
-- Component: `cpt-examples-todo-app-component-rest-api` (server-side CRUD)
-- Component: `cpt-examples-todo-app-component-postgresql` (persistent storage)
-- Database: `cpt-examples-todo-app-design-db-tasks` (task persistence)
-- Principle: `cpt-examples-todo-app-principle-offline-first` (IndexedDB local storage)
-- Sequence: `cpt-examples-todo-app-seq-create-task-v1` (optimistic create flow)
+- **Scope**:
+  - Task creation with title, description, priority, due date
+  - Task assignment to team members
+  - Status transitions (BACKLOG → IN_PROGRESS → DONE)
+  - Task deletion with soft-delete
 
-**Dependencies**: None
+- **Out of scope**:
+  - Recurring tasks
+  - Task templates
 
-**Rationale**: Foundation for all other features — tasks must exist before they can be organized or synced.
+- **Requirements Covered**:
 
-**Status**: Completed
+  - [ ] `p1` - `cpt-ex-task-flow-fr-task-crud`
+  - [ ] `p2` - `cpt-ex-task-flow-nfr-performance-reliability`
 
----
+- **Design Principles Covered**:
 
-### Feature 2: Task Organization & Logic
+  - [ ] `p1` - `cpt-ex-task-flow-principle-realtime-first`
+  - [ ] `p2` - `cpt-ex-task-flow-principle-simplicity-over-features`
 
-- [x] `p2` - **ID**: `cpt-examples-todo-app-feature-logic`
+- **Design Constraints Covered**:
 
-**Feature**: [features/0002-cpt-todo-app-feature-logic.md](./features/0002-cpt-todo-app-feature-logic.md)
+  - [ ] `p1` - `cpt-ex-task-flow-constraint-supported-platforms`
 
-**Purpose**: Implement filtering, sorting, and display logic for task lists.
+- **Domain Model Entities**:
+  - Task
+  - User
 
-**Design Coverage**:
-- Principle: `cpt-examples-todo-app-principle-optimistic-updates` (immediate UI feedback)
+- **Design Components**:
 
-**Dependencies**: `cpt-examples-todo-app-feature-core` (requires tasks to exist)
+  - [ ] `p1` - `cpt-ex-task-flow-component-react-spa`
+  - [ ] `p1` - `cpt-ex-task-flow-component-api-server`
+  - [ ] `p1` - `cpt-ex-task-flow-component-postgresql`
+  - [ ] `p2` - `cpt-ex-task-flow-component-redis-pubsub`
 
-**Rationale**: Task organization helps users manage growing task lists efficiently. Builds on core CRUD to provide filtering by status, category, and priority.
+- **API**:
+  - POST /api/tasks
+  - GET /api/tasks
+  - PUT /api/tasks/{id}
+  - DELETE /api/tasks/{id}
 
-**Status**: Completed
+- **Sequences**:
 
----
+  - [ ] `p1` - `cpt-ex-task-flow-seq-task-creation`
 
-### Feature 3: Real-time Synchronization
+- **Data**:
 
-- [ ] `p2` - **ID**: `cpt-examples-todo-app-feature-sync`
+  - [ ] `p1` - `cpt-ex-task-flow-dbtable-tasks`
 
-**Feature**: [features/0003-cpt-todo-app-feature-sync.md](./features/0003-cpt-todo-app-feature-sync.md)
+### 2.2 [Notifications](feature-notifications/) ⏳ MEDIUM
 
-**Purpose**: Implement cross-device synchronization via WebSocket with fallback to polling.
+- [ ] `p2` - **ID**: `cpt-ex-task-flow-feature-notifications`
 
-**Design Coverage**:
-- Component: `cpt-examples-todo-app-component-sync-service` (sync orchestration)
-- Component: `cpt-examples-todo-app-component-websocket-server` (real-time notifications)
-- Interface: `cpt-examples-todo-app-interface-websocket` (WebSocket sync protocol)
-- Constraint: `cpt-examples-todo-app-constraint-browser-compat` (WebSocket availability check)
-- Principle: `cpt-examples-todo-app-principle-offline-first` (sync queue when offline)
+- **Purpose**: Notify users about task assignments, due dates, and status changes.
 
-**Dependencies**: `cpt-examples-todo-app-feature-core` (syncs task data created/modified by core operations)
+- **Depends On**: `cpt-ex-task-flow-feature-task-crud`
 
-**Rationale**: Enables cross-device experience essential for users who work across multiple devices. Can be built after core functionality is stable. Implements sync queue for offline changes that get pushed when connectivity resumes.
+- **Scope**:
+  - Push notifications for task assignments
+  - Email alerts for overdue tasks
+  - In-app notification center
 
-**Status**: Pending
+- **Out of scope**:
+  - SMS notifications
+  - Custom notification templates
 
----
+- **Requirements Covered**:
+
+  - [ ] `p2` - `cpt-ex-task-flow-fr-notifications`
+
+- **Design Principles Covered**:
+
+  - [ ] `p1` - `cpt-ex-task-flow-principle-realtime-first`
+  - [ ] `p2` - `cpt-ex-task-flow-principle-mobile-first`
+
+- **Design Constraints Covered**:
+
+  - [ ] `p1` - `cpt-ex-task-flow-constraint-supported-platforms`
+
+- **Domain Model Entities**:
+  - Task
+  - User
+  - Notification
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-ex-task-flow-component-react-spa`
+  - [ ] `p1` - `cpt-ex-task-flow-component-api-server`
+  - [ ] `p2` - `cpt-ex-task-flow-component-redis-pubsub`
+
+- **API**:
+  - POST /api/notifications
+  - GET /api/notifications
+  - PUT /api/notifications/{id}/read
+
+- **Sequences**:
+
+  - [ ] `p2` - `cpt-ex-task-flow-seq-notification-delivery`
+
+- **Data**:
+
+  - [ ] `p2` - `cpt-ex-task-flow-dbtable-notifications`
 
 ## 3. Feature Dependencies
 

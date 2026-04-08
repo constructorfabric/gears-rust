@@ -1,5 +1,22 @@
 # ADR-0003: Browser Support Policy
 
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Support only Chrome](#support-only-chrome)
+  - [Support latest 2 versions of major browsers](#support-latest-2-versions-of-major-browsers)
+  - [Support long-tail legacy browsers](#support-long-tail-legacy-browsers)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
 **Date**: 2026-02-07
 
 **Status**: Accepted

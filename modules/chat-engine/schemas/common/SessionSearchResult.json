@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.common.session_search_result.v1",
+  "title": "SessionSearchResult",
+  "description": "Search result for a session with matched messages",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "$ref": "./GtsSessionId.json",
+      "description": "Session identifier"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Session metadata",
+      "additionalProperties": true
+    },
+    "matched_messages": {
+      "type": "array",
+      "items": { "$ref": "./SearchResult.json" },
+      "description": "Messages that matched the search query"
+    },
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Overall relevance score for this session"
+    }
+  },
+  "required": ["session_id", "matched_messages"],
+  "additionalProperties": false
+}

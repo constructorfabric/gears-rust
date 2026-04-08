@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.common.memory_strategy.v1",
+  "title": "MemoryStrategy",
+  "description": "Conversation memory management strategy controlling which messages are forwarded as history to the webhook backend",
+  "type": "string",
+  "enum": ["full", "sliding_window", "ai_summarized"],
+  "x-enum-descriptions": {
+    "full": "Complete message history sent to backend on every request",
+    "sliding_window": "Only the most recent N messages sent, controlled by session_type configuration",
+    "ai_summarized": "Older turns replaced by AI-generated summary; session intelligence feature required"
+  }
+}

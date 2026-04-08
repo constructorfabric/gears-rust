@@ -86,3 +86,10 @@ def pytest_configure(config):
     )
 
 
+# ── Module test environment orchestration ─────────────────────────────────
+# Re-export fixtures from lib.orchestrator so all modules can use them.
+# Modules override `module_test_env` in their own conftest for custom needs.
+
+from lib.orchestrator import test_env, module_test_env  # noqa: F401, E402
+
+

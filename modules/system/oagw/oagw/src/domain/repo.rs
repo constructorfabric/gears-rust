@@ -1,4 +1,5 @@
 use crate::domain::model::{ListQuery, Route, Upstream};
+use async_trait::async_trait;
 use modkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -24,7 +25,7 @@ pub enum RepositoryError {
 // ---------------------------------------------------------------------------
 
 /// Repository trait for upstream persistence.
-#[async_trait::async_trait]
+#[async_trait]
 pub trait UpstreamRepository: Send + Sync {
     /// Insert a new upstream. Returns Conflict if alias is taken for the tenant.
     async fn create(&self, upstream: Upstream) -> Result<Upstream, RepositoryError>;
@@ -51,7 +52,7 @@ pub trait UpstreamRepository: Send + Sync {
 }
 
 /// Repository trait for route persistence.
-#[async_trait::async_trait]
+#[async_trait]
 pub trait RouteRepository: Send + Sync {
     /// Insert a new route.
     async fn create(&self, route: Route) -> Result<Route, RepositoryError>;

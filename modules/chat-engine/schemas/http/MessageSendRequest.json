@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.http.message_send_request.v1",
+  "title": "MessageSendRequest",
+  "description": "HTTP POST request to send a message with streaming response",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "$ref": "../common/GtsSessionId.json",
+      "description": "Session identifier"
+    },
+    "content": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Message content (text)"
+    },
+    "file_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "description": "Array of file UUIDs attached to this message"
+    },
+    "parent_message_id": {
+      "$ref": "../common/GtsMessageId.json",
+      "description": "Parent message ID for branching"
+    },
+    "enabled_capabilities": {
+      "type": "array",
+      "items": { "$ref": "../common/CapabilityValue.json" },
+      "description": "Capability values to apply for this message"
+    }
+  },
+  "required": ["session_id", "content"],
+  "additionalProperties": false
+}

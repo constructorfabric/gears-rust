@@ -7,14 +7,28 @@ mod dump;
 use anyhow::{Context, Result, ensure};
 // Use DB config types from modkit-db
 pub use modkit_db::{DbConnConfig, GlobalDatabaseConfig, PoolCfg};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::Level;
 
 use crate::ConfigProvider;
-use crate::telemetry::TracingConfig;
+use crate::telemetry::OpenTelemetryConfig;
 use url::Url;
+
+/// Error type for vendor configuration access.
+#[derive(thiserror::Error, Debug)]
+pub enum VendorConfigError {
+    #[error("vendor '{vendor}' not found in configuration")]
+    NotFound { vendor: String },
+    #[error("invalid config for vendor '{vendor}': {source}")]
+    InvalidConfig {
+        vendor: String,
+        #[source]
+        source: serde_json::Error,
+    },
+}
 
 // Re-export dump functions
 pub use dump::{
@@ -65,7 +79,7 @@ pub struct ExecutionConfig {
 }
 
 /// Module runtime kind.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeKind {
     #[default]
@@ -82,16 +96,37 @@ pub struct AppConfig {
     pub server: ServerConfig,
     /// New typed database configuration (optional).
     pub database: Option<GlobalDatabaseConfig>,
-    /// Logging configuration (optional, uses defaults if None).
-    pub logging: Option<LoggingConfig>,
-    /// Tracing configuration (optional, disabled if None).
-    pub tracing: Option<TracingConfig>,
+    /// Logging configuration
+    #[serde(default = "default_logging_config")]
+    pub logging: LoggingConfig,
+    /// OpenTelemetry configuration (resource, tracing, metrics).
+    #[serde(default)]
+    pub opentelemetry: OpenTelemetryConfig,
     /// Directory containing per-module YAML files (optional).
     #[serde(default)]
     pub modules_dir: Option<String>,
     /// Per-module configuration bag: `module_name` → arbitrary JSON/YAML value.
     #[serde(default)]
     pub modules: HashMap<String, serde_json::Value>,
+    /// Per-vendor configuration bag: `vendor_name` → arbitrary JSON/YAML value.
+    /// Allows vendors to add their own typed configuration sections.
+    #[serde(default)]
+    pub vendor: VendorConfig,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        let server = ServerConfig::default();
+        Self {
+            server,
+            database: None,
+            logging: default_logging_config(),
+            opentelemetry: OpenTelemetryConfig::default(),
+            modules_dir: None,
+            modules: HashMap::new(),
+            vendor: VendorConfig::new(),
+        }
+    }
 }
 
 impl ConfigProvider for AppConfig {
@@ -109,7 +144,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            home_dir: super::host::paths::default_home_dir().join(".hyperspot"),
+            home_dir: super::host::paths::default_home_dir().join(".cyberfabric"),
         }
     }
 }
@@ -143,6 +178,11 @@ pub enum ConsoleFormat {
 /// Logging configuration - maps subsystem names to their logging settings.
 /// Key "default" is the catch-all for logs that don't match explicit subsystems.
 pub type LoggingConfig = HashMap<String, Section>;
+
+/// Per-vendor configuration bag: vendor name → arbitrary JSON/YAML value.
+/// Each vendor's section can be deserialized into a typed struct via
+/// [`AppConfig::vendor_config`] or [`AppConfig::vendor_config_or_default`].
+pub type VendorConfig = HashMap<String, serde_json::Value>;
 
 // ================= Custom serde module for optional Level (supports "off") =================
 mod optional_level_serde {
@@ -183,25 +223,46 @@ mod optional_level_serde {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Section {
-    #[serde(
-        default = "optional_level_serde::default",
-        with = "optional_level_serde"
-    )]
-    pub console_level: Option<Level>,
-    #[serde(default)]
-    pub console_format: ConsoleFormat,
-    pub file: String, // "logs/api.log"
+pub struct SectionFile {
+    pub file: String,
     #[serde(
         default = "optional_level_serde::default",
         with = "optional_level_serde"
     )]
     pub file_level: Option<Level>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Section {
+    #[serde(default)]
+    pub console_format: ConsoleFormat,
+    #[serde(
+        default = "optional_level_serde::default",
+        with = "optional_level_serde"
+    )]
+    pub console_level: Option<Level>,
+    #[serde(flatten)]
+    pub section_file: Option<SectionFile>,
     pub max_age_days: Option<u32>, // Not implemented yet
     #[serde(default)]
     pub max_backups: Option<usize>, // How many files to keep
     #[serde(default)]
     pub max_size_mb: Option<u64>, // Max size of the file in MB
+}
+
+impl Section {
+    #[must_use]
+    pub fn file(&self) -> Option<&str> {
+        self.section_file
+            .as_ref()
+            .map(|f| f.file.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    #[must_use]
+    pub fn file_level(&self) -> Option<Level> {
+        self.section_file.as_ref().and_then(|f| f.file_level)
+    }
 }
 
 /// Create a default logging configuration.
@@ -212,32 +273,17 @@ pub fn default_logging_config() -> LoggingConfig {
         "default".to_owned(),
         Section {
             console_level: Some(Level::INFO),
+            section_file: Some(SectionFile {
+                file: "logs/cyberfabric.log".to_owned(),
+                file_level: Some(Level::DEBUG),
+            }),
             console_format: ConsoleFormat::default(),
-            file: "logs/hyperspot.log".to_owned(),
-            file_level: Some(Level::DEBUG),
             max_age_days: Some(7),
             max_backups: Some(3),
             max_size_mb: Some(100),
         },
     );
     logging
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        let server = ServerConfig::default();
-        Self {
-            server,
-            database: Some(GlobalDatabaseConfig {
-                servers: HashMap::new(),
-                auto_provision: None,
-            }),
-            logging: Some(default_logging_config()),
-            tracing: None, // Disabled by default
-            modules_dir: None,
-            modules: HashMap::new(),
-        }
-    }
 }
 
 impl AppConfig {
@@ -249,23 +295,15 @@ impl AppConfig {
     pub fn load_layered(config_path: &PathBuf) -> Result<Self> {
         use figment::{
             Figment,
-            providers::{Env, Format, Serialized, Yaml},
+            providers::{Env, Format, Serialized},
         };
 
-        // For layered loading, start from a minimal base where optional sections are None,
-        // so they remain None unless explicitly provided by YAML/ENV.
-        let base = AppConfig {
-            server: ServerConfig::default(),
-            database: None,
-            logging: None,
-            tracing: None,
-            modules_dir: None,
-            modules: HashMap::new(),
-        };
-
+        // For layered loading, start from AppConfig::default() which provides logging
+        // defaults (via default_logging_config()); other optional sections (database,
+        // tracing, modules_dir) remain None unless overridden by YAML/ENV.
         let figment = Figment::new()
-            .merge(Serialized::defaults(base))
-            .merge(Yaml::file(config_path))
+            .merge(Serialized::defaults(AppConfig::default()))
+            .merge(StrictYaml::file(config_path))
             // Example: APP__SERVER__PORT=8087 maps to server.port
             .merge(Env::prefixed("APP__").split("__"));
 
@@ -317,11 +355,49 @@ impl AppConfig {
         serde_saphyr::to_string(self).context("Failed to serialize config to YAML")
     }
 
+    /// Deserialize a vendor configuration section into a typed struct.
+    ///
+    /// # Errors
+    /// Returns `VendorConfigError::NotFound` if the vendor is not present,
+    /// or `VendorConfigError::InvalidConfig` if deserialization fails.
+    pub fn vendor_config<T: DeserializeOwned>(
+        &self,
+        vendor_name: &str,
+    ) -> Result<T, VendorConfigError> {
+        let raw = self
+            .vendor
+            .get(vendor_name)
+            .ok_or_else(|| VendorConfigError::NotFound {
+                vendor: vendor_name.to_owned(),
+            })?;
+        T::deserialize(raw).map_err(|e| VendorConfigError::InvalidConfig {
+            vendor: vendor_name.to_owned(),
+            source: e,
+        })
+    }
+
+    /// Deserialize a vendor configuration section, returning `T::default()` if absent.
+    ///
+    /// # Errors
+    /// Returns `VendorConfigError::InvalidConfig` if the section exists but cannot be
+    /// deserialized into `T`.
+    pub fn vendor_config_or_default<T: DeserializeOwned + Default>(
+        &self,
+        vendor_name: &str,
+    ) -> Result<T, VendorConfigError> {
+        let Some(raw) = self.vendor.get(vendor_name) else {
+            return Ok(T::default());
+        };
+        T::deserialize(raw).map_err(|e| VendorConfigError::InvalidConfig {
+            vendor: vendor_name.to_owned(),
+            source: e,
+        })
+    }
+
     /// Apply overrides from command line arguments.
     pub fn apply_cli_overrides(&mut self, verbose: u8) {
         // Set logging level based on verbose flags for "default" section.
-        let logging = self.logging.get_or_insert_with(default_logging_config);
-        if let Some(default_section) = logging.get_mut("default") {
+        if let Some(default_section) = self.logging.get_mut("default") {
             default_section.console_level = match verbose {
                 0 => default_section.console_level, // keep
                 1 => Some(Level::DEBUG),
@@ -338,6 +414,32 @@ pub struct CliArgs {
     pub print_config: bool,
     pub verbose: u8,
     pub mock: bool,
+}
+
+/// Parse YAML with duplicate-key rejection.
+fn strict_yaml_parse<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, serde_saphyr::Error> {
+    let opts = serde_saphyr::Options {
+        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
+        ..serde_saphyr::Options::default()
+    };
+    serde_saphyr::from_str_with_options(s, opts)
+}
+
+/// YAML [`Format`](figment::providers::Format) provider that rejects duplicate
+/// mapping keys instead of silently keeping the last value.
+///
+/// Drop-in replacement for figment's built-in `Yaml` — use
+/// `StrictYaml::file(path)` wherever you would use `Yaml::file(path)`.
+struct StrictYaml;
+
+impl figment::providers::Format for StrictYaml {
+    type Error = serde_saphyr::Error;
+
+    const NAME: &'static str = "YAML";
+
+    fn from_str<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, Self::Error> {
+        strict_yaml_parse(s)
+    }
 }
 
 fn merge_module_files(
@@ -369,7 +471,8 @@ fn merge_module_files(
             .unwrap_or("")
             .to_owned();
         let raw = fs::read_to_string(&path)?;
-        let json: serde_json::Value = serde_saphyr::from_str(&raw)?;
+        let json: serde_json::Value = strict_yaml_parse(&raw)
+            .with_context(|| format!("failed to parse module file: {}", path.display()))?;
         bag.insert(name, json);
     }
     Ok(())
@@ -383,23 +486,7 @@ fn merge_module_files(
 /// # Errors
 /// Returns an error if any referenced env var is missing.
 pub fn expand_env_in_dsn(dsn: &str) -> Result<String> {
-    use std::env;
-
-    let mut result = dsn.to_owned();
-    // TODO: Think about other way
-    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)}")?;
-
-    for cap in re.captures_iter(dsn) {
-        let full_match = &cap[0];
-        let var_name = &cap[1];
-
-        let value = env::var(var_name)
-            .with_context(|| format!("Environment variable '{var_name}' not found in DSN"))?;
-
-        result = result.replace(full_match, &value);
-    }
-
-    Ok(result)
+    modkit_utils::var_expand::expand_env_vars(dsn).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Resolves password: if it contains ${VAR}, expands from environment variable; otherwise returns as-is.
@@ -996,7 +1083,7 @@ impl RenderedDbConfig {
 /// - Database configuration (structured, for field-by-field merge in `OoP`)
 /// - Module config section
 /// - Logging configuration (for key-by-key merge in `OoP`)
-/// - Tracing configuration for OTEL
+/// - OpenTelemetry configuration (resource, tracing, metrics)
 ///
 /// The runtime section is excluded as it's only relevant for the master host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1012,9 +1099,9 @@ pub struct RenderedModuleConfig {
     /// `OoP` module will merge this with local --config (local keys override master keys).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingConfig>,
-    /// Tracing configuration from master host for OTEL initialization
+    /// OpenTelemetry configuration from master host (resource, tracing, metrics).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tracing: Option<TracingConfig>,
+    pub opentelemetry: Option<OpenTelemetryConfig>,
 }
 
 impl RenderedModuleConfig {
@@ -1080,14 +1167,18 @@ pub fn render_module_config_for_oop(
     // Pass logging config from master host so OoP modules can merge with their local config
     let logging = app.logging.clone();
 
-    // Pass tracing config from master host so OoP modules use the same OTEL settings
-    let tracing = app.tracing.clone();
+    // Pass OpenTelemetry config from master host so OoP modules use the same settings
+    let opentelemetry = if app.opentelemetry.tracing.enabled || app.opentelemetry.metrics.enabled {
+        Some(app.opentelemetry.clone())
+    } else {
+        None
+    };
 
     Ok(RenderedModuleConfig {
         database,
         config,
-        logging,
-        tracing,
+        logging: Some(logging),
+        opentelemetry,
     })
 }
 
@@ -1230,7 +1321,7 @@ mod tests {
 
     /// Helper: platform default subdirectory name.
     fn default_subdir() -> &'static str {
-        ".hyperspot"
+        ".cyberfabric"
     }
 
     #[test]
@@ -1238,19 +1329,15 @@ mod tests {
         let config = AppConfig::default();
 
         // Database defaults (simplified structure)
-        assert!(config.database.is_some());
-        let db = config.database.as_ref().unwrap();
-        assert!(db.servers.is_empty()); // Default config has no servers defined
-        assert_eq!(db.auto_provision, None);
+        assert!(config.database.is_none());
 
         // Logging defaults
-        assert!(config.logging.is_some());
-        let logging = config.logging.as_ref().unwrap();
+        let logging = config.logging;
         assert!(logging.contains_key("default"));
 
         let default_section = &logging["default"];
         assert_eq!(default_section.console_level, Some(Level::INFO));
-        assert_eq!(default_section.file, "logs/hyperspot.log");
+        assert_eq!(default_section.file().unwrap(), "logs/cyberfabric.log");
 
         // Modules bag is empty by default
         assert!(config.modules.is_empty());
@@ -1291,10 +1378,10 @@ logging:
         // let db = config.database.as_ref().unwrap();
 
         // logging parsed
-        let logging = config.logging.as_ref().unwrap();
+        let logging = &config.logging;
         let def = &logging["default"];
         assert_eq!(def.console_level, Some(Level::DEBUG));
-        assert_eq!(def.file, "logs/default.log");
+        assert_eq!(def.section_file.as_ref().unwrap().file, "logs/default.log");
     }
 
     #[test]
@@ -1333,7 +1420,6 @@ server:
 
         // Optional sections default to None
         assert!(config.database.is_none());
-        assert!(config.logging.is_none());
         assert!(config.modules.is_empty());
     }
 
@@ -1353,7 +1439,7 @@ server:
         // Port override
 
         // Verbose override affects logging
-        let logging = config.logging.as_ref().unwrap();
+        let logging = &config.logging;
         let default_section = &logging["default"];
         assert_eq!(default_section.console_level, Some(Level::TRACE));
     }
@@ -1376,7 +1462,7 @@ server:
 
             config.apply_cli_overrides(args.verbose);
 
-            let logging = config.logging.as_ref().unwrap();
+            let logging = &config.logging;
             let default_section = &logging["default"];
 
             if verbose_level == 0 {
@@ -1453,13 +1539,12 @@ logging:
         fs::write(&cfg_path, yaml).unwrap();
 
         let config = AppConfig::load_layered(&cfg_path).unwrap();
-        assert!(config.logging.is_some());
-        let logging = config.logging.as_ref().unwrap();
+        let logging = &config.logging;
         assert!(logging.contains_key("default"));
 
         let default_section = &logging["default"];
         assert_eq!(default_section.console_level, Some(Level::DEBUG));
-        assert_eq!(default_section.file_level, Some(Level::INFO));
+        assert_eq!(default_section.file_level(), Some(Level::INFO));
         // not calling init to avoid side effects in tests
     }
 
@@ -2690,6 +2775,352 @@ logging:
         assert!(modules.contains_key("module_a"));
         assert!(modules.contains_key("module_b"));
         assert!(modules.contains_key("module_c"));
+    }
+
+    // ========== Vendor configuration tests ==========
+
+    #[derive(Debug, Deserialize, Default, PartialEq)]
+    struct TestVendorConfig {
+        #[serde(default)]
+        api_token: String,
+        #[serde(default)]
+        api_url: String,
+    }
+
+    #[test]
+    fn test_vendor_section_parses_from_yaml() {
+        let yaml = r#"
+server:
+  home_dir: "~/.test_vendor"
+vendor:
+  acme:
+    api_token: "acme-token-123"
+    api_url: "https://acme.example.com"
+  other_corp:
+    api_token: "other-token-789"
+    api_url: "https://other.example.com"
+"#;
+        let config: AppConfig = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(config.vendor.len(), 2);
+        assert!(config.vendor.contains_key("acme"));
+        assert!(config.vendor.contains_key("other_corp"));
+
+        let acme: TestVendorConfig = config.vendor_config("acme").unwrap();
+        assert_eq!(acme.api_token, "acme-token-123");
+        assert_eq!(acme.api_url, "https://acme.example.com");
+
+        let other: TestVendorConfig = config.vendor_config("other_corp").unwrap();
+        assert_eq!(other.api_token, "other-token-789");
+        assert_eq!(other.api_url, "https://other.example.com");
+    }
+
+    #[test]
+    fn test_vendor_section_defaults_to_empty() {
+        let config = AppConfig::default();
+        assert!(config.vendor.is_empty());
+    }
+
+    #[test]
+    fn test_vendor_config_typed_access() {
+        let mut config = AppConfig::default();
+        config.vendor.insert(
+            "acme".to_owned(),
+            serde_json::json!({
+                "api_token": "acme-token-123",
+                "api_url": "https://acme.example.com"
+            }),
+        );
+
+        let acme: TestVendorConfig = config.vendor_config("acme").unwrap();
+        assert_eq!(acme.api_token, "acme-token-123");
+        assert_eq!(acme.api_url, "https://acme.example.com");
+    }
+
+    #[test]
+    fn test_vendor_config_not_found() {
+        let config = AppConfig::default();
+        let result: Result<TestVendorConfig, _> = config.vendor_config("nonexistent");
+        assert!(matches!(
+            result,
+            Err(VendorConfigError::NotFound { ref vendor }) if vendor == "nonexistent"
+        ));
+    }
+
+    #[test]
+    fn test_vendor_config_invalid_structure() {
+        let mut config = AppConfig::default();
+        config
+            .vendor
+            .insert("bad".to_owned(), serde_json::json!("not an object"));
+
+        let result: Result<TestVendorConfig, _> = config.vendor_config("bad");
+        assert!(matches!(
+            result,
+            Err(VendorConfigError::InvalidConfig { ref vendor, .. }) if vendor == "bad"
+        ));
+    }
+
+    #[test]
+    fn test_vendor_config_or_default_missing() {
+        let config = AppConfig::default();
+        let acme: TestVendorConfig = config.vendor_config_or_default("acme").unwrap();
+        assert_eq!(acme, TestVendorConfig::default());
+    }
+
+    #[test]
+    fn test_vendor_config_or_default_present() {
+        let mut config = AppConfig::default();
+        config.vendor.insert(
+            "acme".to_owned(),
+            serde_json::json!({ "api_token": "acme-token-123" }),
+        );
+
+        let acme: TestVendorConfig = config.vendor_config_or_default("acme").unwrap();
+        assert_eq!(acme.api_token, "acme-token-123");
+    }
+
+    #[test]
+    fn test_vendor_config_env_override() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_vendor"
+vendor:
+  env_test_vendor:
+    api_token: "from_yaml"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        with_var(
+            "APP__VENDOR__ENV_TEST_VENDOR__API_TOKEN",
+            Some("from_env"),
+            || {
+                let config = AppConfig::load_layered(&cfg_path).unwrap();
+                let v: TestVendorConfig = config.vendor_config("env_test_vendor").unwrap();
+                assert_eq!(v.api_token, "from_env");
+            },
+        );
+    }
+
+    #[test]
+    fn test_vendor_multiple_vendors_typed_access() {
+        let mut config = AppConfig::default();
+        config.vendor.insert(
+            "acme".to_owned(),
+            serde_json::json!({ "api_token": "acme-token", "api_url": "https://acme.com" }),
+        );
+        config.vendor.insert(
+            "other_corp".to_owned(),
+            serde_json::json!({ "api_token": "other-token", "api_url": "https://other.com" }),
+        );
+
+        let acme: TestVendorConfig = config.vendor_config("acme").unwrap();
+        let other: TestVendorConfig = config.vendor_config("other_corp").unwrap();
+
+        assert_eq!(acme.api_token, "acme-token");
+        assert_eq!(other.api_token, "other-token");
+        assert_eq!(acme.api_url, "https://acme.com");
+        assert_eq!(other.api_url, "https://other.com");
+    }
+
+    #[test]
+    fn test_vendor_nested_config() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct NestedVendorConfig {
+            api_url: String,
+            feature_flags: FeatureFlags,
+        }
+
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct FeatureFlags {
+            beta_mode: bool,
+            max_retries: u32,
+        }
+
+        let mut config = AppConfig::default();
+        config.vendor.insert(
+            "acme".to_owned(),
+            serde_json::json!({
+                "api_url": "https://acme.com",
+                "feature_flags": {
+                    "beta_mode": true,
+                    "max_retries": 3
+                }
+            }),
+        );
+
+        let acme: NestedVendorConfig = config.vendor_config("acme").unwrap();
+        assert_eq!(acme.api_url, "https://acme.com");
+        assert!(acme.feature_flags.beta_mode);
+        assert_eq!(acme.feature_flags.max_retries, 3);
+    }
+
+    #[test]
+    fn test_vendor_config_or_default_invalid_returns_error() {
+        let mut config = AppConfig::default();
+        config
+            .vendor
+            .insert("bad".to_owned(), serde_json::json!("not an object"));
+
+        let result: Result<TestVendorConfig, _> = config.vendor_config_or_default("bad");
+        assert!(matches!(
+            result,
+            Err(VendorConfigError::InvalidConfig { ref vendor, .. }) if vendor == "bad"
+        ));
+    }
+
+    #[test]
+    fn test_vendor_config_yaml_roundtrip() {
+        let mut config = AppConfig::default();
+        config.vendor.insert(
+            "acme".to_owned(),
+            serde_json::json!({ "api_token": "acme-token-123" }),
+        );
+
+        let yaml = config.to_yaml().unwrap();
+        assert!(yaml.contains("vendor"));
+        assert!(yaml.contains("acme"));
+        assert!(yaml.contains("acme-token-123"));
+    }
+
+    #[test]
+    fn test_vendor_coexists_with_modules() {
+        let mut config = AppConfig::default();
+        config.modules.insert(
+            "my_module".to_owned(),
+            serde_json::json!({ "config": { "some_setting": true } }),
+        );
+        config.vendor.insert(
+            "acme".to_owned(),
+            serde_json::json!({ "api_token": "acme-token-123" }),
+        );
+
+        assert!(config.modules.contains_key("my_module"));
+        assert!(config.vendor.contains_key("acme"));
+
+        let acme: TestVendorConfig = config.vendor_config("acme").unwrap();
+        assert_eq!(acme.api_token, "acme-token-123");
+    }
+
+    #[test]
+    fn test_vendor_error_display_messages() {
+        let not_found = VendorConfigError::NotFound {
+            vendor: "acme".to_owned(),
+        };
+        assert_eq!(
+            not_found.to_string(),
+            "vendor 'acme' not found in configuration"
+        );
+
+        let invalid = VendorConfigError::InvalidConfig {
+            vendor: "bad".to_owned(),
+            source: serde_json::from_str::<TestVendorConfig>("invalid").unwrap_err(),
+        };
+        let msg = invalid.to_string();
+        assert!(msg.starts_with("invalid config for vendor 'bad':"));
+    }
+
+    #[test]
+    fn test_vendor_empty_object_in_yaml() {
+        let yaml = r#"
+server:
+  home_dir: "~/.test_vendor"
+vendor: {}
+"#;
+        let config: AppConfig = serde_saphyr::from_str(yaml).unwrap();
+        assert!(config.vendor.is_empty());
+    }
+
+    // ========== Duplicate YAML key rejection tests ==========
+
+    #[test]
+    fn test_reject_duplicate_module_names() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_dup"
+modules:
+  module1:
+    config: {}
+  module2:
+    config: {}
+  module1:
+    config: {}
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        let result = AppConfig::load_layered(&cfg_path);
+        assert!(result.is_err(), "duplicate module names should be rejected");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("duplicate") || msg.contains("Duplicate"),
+            "error should mention duplicates: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_reject_duplicate_keys_in_module_file() {
+        let tmp = tempdir().unwrap();
+        let modules_dir = tmp.path().join("modules.d");
+        fs::create_dir_all(&modules_dir).unwrap();
+
+        // Module file with duplicate "config:" key
+        let module_yaml = r#"
+config:
+  key1: "value1"
+config:
+  key2: "value2"
+"#;
+        fs::write(modules_dir.join("bad_module.yaml"), module_yaml).unwrap();
+
+        let cfg_yaml = format!(
+            r#"
+server:
+  home_dir: "~/.test_dup_modfile"
+modules_dir: "{}"
+"#,
+            modules_dir.display()
+        );
+        let cfg_path = tmp.path().join("cfg.yaml");
+        fs::write(&cfg_path, cfg_yaml).unwrap();
+
+        let result = AppConfig::load_layered(&cfg_path);
+        assert!(
+            result.is_err(),
+            "duplicate keys in a module file should be rejected"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("duplicate") || msg.contains("Duplicate"),
+            "error should mention duplicates: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_no_false_positive_on_unique_modules() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_ok"
+modules:
+  module1:
+    config: {}
+  module2:
+    config: {}
+  module3:
+    config: {}
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        let result = AppConfig::load_layered(&cfg_path);
+        assert!(
+            result.is_ok(),
+            "unique module names should be accepted: {:?}",
+            result.unwrap_err()
+        );
     }
 }
 

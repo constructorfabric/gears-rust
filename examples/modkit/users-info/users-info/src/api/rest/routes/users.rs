@@ -4,13 +4,15 @@ use modkit::api::OpenApiRegistry;
 use modkit::api::operation_builder::{OperationBuilder, OperationBuilderODataExt};
 use users_info_sdk::odata::UserFilterField;
 
+const API_TAG: &str = "Users Info";
+
 pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     // GET /users-info/v1/users - List users with cursor-based pagination
     router = OperationBuilder::get("/users-info/v1/users")
         .operation_id("users_info.list_users")
         .summary("List users with cursor pagination")
         .description("Retrieve a paginated list of users using cursor-based pagination")
-        .tag("users")
+        .tag(API_TAG)
         .authenticated()
         .query_param_typed(
             "limit",
@@ -40,7 +42,7 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .require_license_features::<License>([])
         .summary("Get user by ID")
         .description("Retrieve a specific user by their UUID")
-        .tag("users")
+        .tag(API_TAG)
         .path_param("id", "User UUID")
         .handler(handlers::get_user)
         .with_odata_select()
@@ -58,7 +60,7 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .require_license_features::<License>([])
         .summary("Create a new user")
         .description("Create a new user with the provided information")
-        .tag("users")
+        .tag(API_TAG)
         .json_request::<dto::CreateUserReq>(openapi, "User creation data")
         .handler(handlers::create_user)
         .json_response_with_schema::<dto::UserDto>(
@@ -80,7 +82,7 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .require_license_features::<License>([])
         .summary("Update user")
         .description("Partially update a user with the provided fields")
-        .tag("users")
+        .tag(API_TAG)
         .path_param("id", "User UUID")
         .json_request::<dto::UpdateUserReq>(openapi, "User update data")
         .handler(handlers::update_user)
@@ -100,7 +102,7 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .require_license_features::<License>([])
         .summary("Delete user")
         .description("Delete a user by their UUID")
-        .tag("users")
+        .tag(API_TAG)
         .path_param("id", "User UUID")
         .handler(handlers::delete_user)
         .json_response(http::StatusCode::NO_CONTENT, "User deleted successfully")

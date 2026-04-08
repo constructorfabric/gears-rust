@@ -3,6 +3,8 @@ pub mod builder;
 pub mod errors;
 pub mod filter;
 pub mod limits;
+pub(crate) mod odata_filters;
+mod odata_parse;
 pub mod page;
 pub mod pagination;
 pub mod problem_mapping;
@@ -543,12 +545,13 @@ impl From<Option<ast::Expr>> for ODataQuery {
     }
 }
 
+#[cfg(test)]
+mod odata_parse_tests;
 mod tests;
 
-#[cfg(feature = "with-odata-params")]
-mod convert_odata_params {
+mod convert_odata_filters {
     use super::ast::{CompareOperator, Expr, Value};
-    use odata_params::filters as od;
+    use crate::odata_filters as od;
 
     impl From<od::CompareOperator> for CompareOperator {
         fn from(op: od::CompareOperator) -> Self {
@@ -632,12 +635,10 @@ impl ParsedFilter {
 
 /// Parse a raw $filter string into internal AST with complexity metadata.
 ///
-/// This function encapsulates the parsing logic and node counting,
-/// abstracting away the underlying `odata_params` dependency.
+/// This function encapsulates the parsing logic and node counting.
 ///
 /// # Errors
 /// - `Error::InvalidFilter` if the filter string is malformed or parsing fails
-/// - `Error::ParsingUnavailable` if the `with-odata-params` feature is disabled
 ///
 /// # Example
 /// ```ignore
@@ -646,11 +647,10 @@ impl ParsedFilter {
 ///     return Err(Error::InvalidFilter("too complex".into()));
 /// }
 /// ```
-#[cfg(feature = "with-odata-params")]
 pub fn parse_filter_string(raw: &str) -> Result<ParsedFilter, Error> {
-    use odata_params::filters as od;
+    use crate::odata_filters as od;
 
-    /// Count nodes in `odata_params` AST for complexity budget enforcement.
+    /// Count nodes in AST for complexity budget enforcement.
     fn count_ast_nodes(e: &od::Expr) -> usize {
         use od::Expr::{And, Compare, Function, Identifier, In, Not, Or, Value};
         match e {
@@ -662,25 +662,10 @@ pub fn parse_filter_string(raw: &str) -> Result<ParsedFilter, Error> {
         }
     }
 
-    let ast_src = od::parse_str(raw).map_err(|e| Error::InvalidFilter(format!("{e:?}")))?;
+    let ast_src = od::parse_str(raw).map_err(|e| Error::InvalidFilter(format!("{e}")))?;
 
     let node_count = count_ast_nodes(&ast_src);
     let expr: ast::Expr = ast_src.into();
 
     Ok(ParsedFilter { expr, node_count })
-}
-
-/// Parse `OData` filter string.
-///
-/// This stub is compiled when the `with-odata-params` feature is disabled.
-///
-/// # Errors
-///
-/// Always returns `Error::ParsingUnavailable` because `OData` parsing
-/// support is not enabled in this build.
-#[cfg(not(feature = "with-odata-params"))]
-pub fn parse_filter_string(_raw: &str) -> Result<ParsedFilter, Error> {
-    Err(Error::ParsingUnavailable(
-        "OData filter parsing requires 'with-odata-params' feature",
-    ))
 }

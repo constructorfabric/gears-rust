@@ -17,6 +17,11 @@ pub enum AuthNResolverError {
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
+    /// Client credentials exchange failed (e.g., invalid credentials,
+    /// `IdP` unreachable, token endpoint error).
+    #[error("token acquisition failed: {0}")]
+    TokenAcquisitionFailed(String),
+
     /// An internal error occurred.
     #[error("internal error: {0}")]
     Internal(String),

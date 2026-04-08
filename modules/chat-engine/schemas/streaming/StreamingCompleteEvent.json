@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.core.events.event.v1~x.chat_engine.streaming.complete_event.v1~",
+  "title": "StreamingCompleteEvent",
+  "description": "Event emitted when message streaming completes successfully. Sent via HTTP chunked response as newline-delimited JSON (NDJSON).",
+  "type": "object",
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "complete",
+      "description": "Event type identifier"
+    },
+    "message_id": {
+      "$ref": "../common/GtsMessageId.json",
+      "description": "Completed message identifier"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Message metadata (usage statistics, etc.)",
+      "properties": {
+        "usage": {
+          "oneOf": [
+            { "$ref": "../common/Usage.json" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "required": ["type", "message_id"],
+  "additionalProperties": false
+}

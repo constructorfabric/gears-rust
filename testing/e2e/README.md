@@ -4,65 +4,75 @@ This directory contains end-to-end tests for the Hyperspot server.
 
 ## Prerequisites
 
+- Python **3.9+** is required.
+- E2E tests must run on Python **3.9 and above**.
+
 Install Python dependencies:
 
 ```bash
-pip install -r e2e/requirements.txt
+pip install -r testing/e2e/requirements.txt
 ```
 
 ## Running E2E Tests
 
 The `scripts/ci.py` Python script supports two modes: **local** (default) and **Docker**.
 
-### Option 1: Local Mode (Default - Faster for Development)
-
-This approach runs tests against a locally running hyperspot-server:
-
-```bash
-# First, start the server in a separate terminal
-make example
-# OR
-cargo run --bin hyperspot-server --features users-info-example -- --config config/quickstart.yaml
-
-# Then, in another terminal, run the tests
-make e2e          # or make e2e-local
-# Or directly
-python3 scripts/ci.py e2e
-```
-
-### Option 2: Docker Mode (Recommended for CI)
+### Option 1: Docker Mode (Default, Recommended for CI)
 
 This approach builds a Docker image and runs tests in an isolated environment:
 
 ```bash
 # Using make
-make e2e-docker
+make e2e-docker  # all tests
+make e2e-docker-smoke  # smoke only tests (annotated with @pytest.mark.smoke)
 
 # Or directly
-python3 scripts/ci.py e2e --docker
+python3 scripts/ci.py e2e-docker
 ```
 
-## Configuration
+### Option 2: Local Mode (Faster for Development, advanced usage)
 
-### Environment Variables
-
-- **`E2E_BASE_URL`**: Base URL for the API (default: `http://localhost:8087`) - only used in local mode
-- **`E2E_AUTH_TOKEN`**: Optional authentication token for protected endpoints
-
-Examples:
+This approach runs tests against a locally running hyperspot-server.
+`scripts/ci.py e2e-local` will build and start the local server automatically.
 
 ```bash
-# Test against a different port (local mode)
-E2E_BASE_URL=http://localhost:9000 make e2e
+# Run local E2E (builds release artifacts and starts server automatically)
+make e2e-local  # all tests
+make e2e-local-smoke  # smoke only tests (annotated with @pytest.mark.smoke)
 
-# Test with authentication
-E2E_AUTH_TOKEN=your-token-here make e2e
+# Or directly
+python3 scripts/ci.py e2e-local
+```
 
-# Combine both
-E2E_BASE_URL=http://localhost:9000 E2E_AUTH_TOKEN=your-token python3 scripts/ci.py e2e
+#### Advanced Usage
 
-# Run in Docker mode with different base URL
-python3 scripts/ci.py e2e --docker
+Environment Variables:
+
+- **`E2E_BASE_URL`**: Base URL for the API (default: `http://localhost:8086`) - only used in local mode
+- **`E2E_AUTH_TOKEN`**: Optional authentication token for protected endpoints
+
+Why local E2E defaults to `8086`:
+
+- Local E2E uses `config/e2e-local.yaml` and a dedicated E2E-oriented build/run path, which may differ from the usual development default (`8087` via `quickstart`).
+- Keeping a stable, dedicated E2E port makes lifecycle management deterministic: `scripts/ci.py` can reliably start, health-check, and stop the service it launched.
+- This also makes it safer to kill/restart only the E2E-owned process during test runs, without interfering with another manually started server.
+
+#### Running Individual Tests Against a Running Service locally (w/o Docker)
+
+```bash
+# Run the server in one terminal:
+make quickstart
+
+# Run the tests in another terminal:
+E2E_BASE_URL=http://localhost:8087 python3 -m pytest testing/e2e/modules/nodes_registry
+# or for smoke tests only:
+E2E_BASE_URL=http://localhost:8087 python3 -m pytest testing/e2e/modules/nodes_registry -m smoke
+```
+
+#### Using auth token
+
+```bash
+E2E_BASE_URL=http://localhost:8087 E2E_AUTH_TOKEN=your-token python3 -m pytest testing/e2e/
 ```
 
 ### Command Line Options
@@ -70,77 +80,8 @@ python3 scripts/ci.py e2e --docker
 The `scripts/ci.py` Python script accepts the following options:
 
 - `--docker`: Run tests in Docker environment (default is local mode)
+- `--smoke`: Run only tests marked with `@pytest.mark.smoke`
 - `--help`: Show help message
-
-## Types Registry Test Suite
-
-The types-registry module has comprehensive E2E test coverage for GTS entity management:
-
-### Test Files
-
-- **`modules/types_registry/test_types_registry_register.py`**: Tests the `POST /types-registry/v1/entities` endpoint
-  - Single and batch entity registration
-  - Type and instance registration
-  - Invalid entity handling
-  - Mixed valid/invalid batch processing
-  
-- **`modules/types_registry/test_types_registry_list.py`**: Tests the `GET /types-registry/v1/entities` endpoint
-  - List all entities
-  - Filter by kind (type/instance)
-  - Filter by vendor, package, namespace
-  - Wildcard pattern matching
-  - Combined filters
-  
-- **`modules/types_registry/test_types_registry_get.py`**: Tests the `GET /types-registry/v1/entities/{gts_id}` endpoint
-  - Get entity by GTS ID
-  - 404 for non-existent entities
-  - Response structure validation
-  - UUID format verification
-  
-- **`modules/types_registry/test_types_registry_validation.py`**: Tests schema validation behavior
-  - Instance validation against type schemas
-  - Missing required fields
-  - Wrong field types
-  - Nested schema validation
-  
-- **`modules/types_registry/test_types_registry_error_handling.py`**: Tests error handling and edge cases
-  - RFC-9457 error response format
-  - Malformed requests
-  - Large batch handling
-  - Unicode content
-  - Deeply nested schemas
-
-## File Parser Test Suite
-
-The file-parser module has comprehensive E2E test coverage including golden-reference Markdown comparison:
-
-### Test Files
-
-- **`modules/file_parser/test_file_parser_info.py`**: Tests the `/file-parser/v1/info` endpoint
-- **`modules/file_parser/test_file_parser_upload.py`**: Tests the `/file-parser/v1/upload` endpoint (binary upload)
-- **`modules/file_parser/test_file_parser_upload_markdown.py`**: Tests the `/file-parser/v1/upload/markdown` endpoint (
-  multipart)
-- **`modules/file_parser/test_file_parser_parse_local.py`**: Tests the `/file-parser/v1/parse-local*` endpoints
-
-### Golden Markdown Generation
-
-Before running file-parser tests, you need to generate golden Markdown reference files:
-
-```bash
-# Make sure the server is running first
-make example
-
-# Generate golden markdown files
-python -m e2e.modules.file_parser.generate_file_parser_golden
-```
-
-This will:
-
-1. Scan `e2e/testdata/` for input files (PDFs, DOCX, etc.)
-2. Upload each file to the API with `render_markdown=true`
-3. Save the markdown responses to `e2e/testdata/md/<filename>.md`
-
-The tests will then compare API responses against these golden files.
 
 ## Writing Tests
 
@@ -173,11 +114,14 @@ async def test_my_endpoint(base_url, auth_headers):
 
 | Command                              | Mode   | Description                              |
 |--------------------------------------|--------|------------------------------------------|
-| `make e2e`                           | Local  | Default: Run tests against local server  |
-| `make e2e-local`                     | Local  | Explicit local mode (same as `make e2e`) |
+| `make e2e`                           | Docker | Default: Run tests in Docker              |
 | `make e2e-docker`                    | Docker | Run tests in Docker environment          |
-| `python3 scripts/ci.py e2e`          | Local  | Direct script execution (local)          |
-| `python3 scripts/ci.py e2e --docker` | Docker | Direct script execution (Docker)         |
+| `make e2e-docker-smoke`              | Docker | Run only smoke tests in Docker            |
+| `make e2e-local`                     | Local  | Run tests against auto-started local server |
+| `make e2e-local-smoke`               | Local  | Run only smoke tests locally              |
+| `python3 scripts/ci.py e2e-local`    | Local  | Direct script execution (local)          |
+| `python3 scripts/ci.py e2e-local --smoke` | Local | Direct script execution (smoke only) |
+| `python3 scripts/ci.py e2e-docker`   | Docker | Direct script execution (Docker)         |
 
 ## Troubleshooting
 
@@ -185,17 +129,18 @@ async def test_my_endpoint(base_url, auth_headers):
 
 If you see "Server not responding" when running local tests:
 
-1. Make sure hyperspot-server is running
-2. Check that it's listening on the correct port (default: 8087)
-3. Verify the health endpoint: `curl http://localhost:8087/healthz`
-4. Or use Docker mode: `make e2e-docker`
+1. Check build/startup logs in `logs/hyperspot-e2e.log` and `logs/hyperspot-e2e-error.log`
+2. Check that the API is reachable on the configured port (default: 8086)
+3. Verify the health endpoint: `curl http://localhost:8086/healthz`
+4. Rebuild release artifacts: `make build`
+5. Or use Docker mode: `make e2e-docker`
 
 ### pytest not found
 
 Install the required dependencies:
 
 ```bash
-pip install -r e2e/requirements.txt
+pip install -r testing/e2e/requirements.txt
 ```
 
 ### Docker build fails

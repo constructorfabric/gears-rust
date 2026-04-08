@@ -6,4 +6,4 @@ user-invocable: true
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep, Task
 ---
 
-ALWAYS open and follow `../../../.cypilot/workflows/generate.md`
+ALWAYS open and follow `{cypilot_path}/.core/workflows/generate.md`

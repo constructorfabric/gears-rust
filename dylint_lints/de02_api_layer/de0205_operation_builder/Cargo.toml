@@ -1,0 +1,35 @@
+[package]
+name = "de0205_operation_builder"
+version = "0.1.0"
+authors = ["Cyber Fabric"]
+description = "Requires operation builders to have tag and summary (DE0205)"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "missing_tag"
+path = "ui/missing_tag.rs"
+
+[[example]]
+name = "invalid_tag_format"
+path = "ui/invalid_tag_format.rs"
+
+[[example]]
+name = "valid_operation"
+path = "ui/valid_operation.rs"
+
+[dependencies]
+clippy_utils.workspace = true
+dylint_linting.workspace = true
+lint_utils.workspace = true
+
+[dev-dependencies]
+dylint_testing.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+modkit = { workspace = true }
+
+[package.metadata.rust-analyzer]
+rustc_private = true

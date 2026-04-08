@@ -21,9 +21,6 @@ workspace = true
 default = []
 # OpenTelemetry integration for distributed tracing
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
-# Allow insecure HTTP in release builds (for integration testing only)
-# By default, allow_insecure_http() is only available in debug builds
-allow-insecure-http = []
 
 [dependencies]
 # Core dependencies
@@ -36,7 +33,7 @@ serde_json = { workspace = true }
 # HTTP stack
 hyper = { workspace = true, features = ["client", "http1", "http2"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy", "http1", "http2", "tokio"] }
-hyper-rustls = { workspace = true, features = ["http1", "http2", "tls12", "native-tokio", "webpki-tokio"] }
+hyper-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pki-types = { workspace = true }

@@ -140,6 +140,9 @@ pub(crate) struct SharedState {
     recorded: Mutex<VecDeque<RecordedRequest>>,
     max_recorded: usize,
     dynamic_routes: DashMap<RouteKey, MockResponse>,
+    /// Sequential responses: pop the front on each request, fall back to
+    /// `dynamic_routes` (or 404) once the queue is empty.
+    dynamic_sequences: DashMap<RouteKey, Arc<Mutex<VecDeque<MockResponse>>>>,
 }
 
 impl SharedState {
@@ -148,6 +151,7 @@ impl SharedState {
             recorded: Mutex::new(VecDeque::new()),
             max_recorded,
             dynamic_routes: DashMap::new(),
+            dynamic_sequences: DashMap::new(),
         }
     }
 
@@ -196,10 +200,15 @@ impl Drop for MockUpstream {
 impl MockUpstream {
     /// Start the mock server on `127.0.0.1:0` (random port).
     pub async fn start() -> Self {
+        Self::start_on("127.0.0.1:0").await
+    }
+
+    /// Start the mock server on a caller-chosen `addr` (e.g. `"127.0.0.2:0"`).
+    pub async fn start_on(addr: &str) -> Self {
         let state = Arc::new(SharedState::new(200));
         let app = Self::router(Arc::clone(&state));
 
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind(addr)
             .await
             .expect("failed to bind mock upstream");
         let addr = listener.local_addr().expect("failed to get local addr");
@@ -321,6 +330,7 @@ impl MockHandle {
 pub struct MockGuard {
     test_prefix: String,
     registered_keys: Vec<RouteKey>,
+    registered_sequence_keys: Vec<RouteKey>,
     state: Arc<SharedState>,
 }
 
@@ -331,6 +341,7 @@ impl MockGuard {
         Self {
             test_prefix,
             registered_keys: Vec::new(),
+            registered_sequence_keys: Vec::new(),
             state: shared_mock().shared_state(),
         }
     }
@@ -382,6 +393,29 @@ impl MockGuard {
         tx
     }
 
+    /// Register a sequence of mock responses for this test.
+    ///
+    /// Each request pops the front response from the queue. Once the queue
+    /// is exhausted, subsequent requests fall through to `dynamic_routes`
+    /// (or 404 if none is registered).
+    pub fn mock_sequence(
+        &mut self,
+        method: &str,
+        path: &str,
+        responses: Vec<MockResponse>,
+    ) -> &mut Self {
+        let full_path = self.path(path);
+        let key = RouteKey {
+            method: method.to_uppercase(),
+            path: full_path,
+        };
+        self.state
+            .dynamic_sequences
+            .insert(key.clone(), Arc::new(Mutex::new(VecDeque::from(responses))));
+        self.registered_sequence_keys.push(key);
+        self
+    }
+
     /// Get recorded requests matching this test's prefix.
     pub async fn recorded_requests(&self) -> Vec<RecordedRequest> {
         self.state
@@ -406,6 +440,9 @@ impl Drop for MockGuard {
         // Clean up all registered routes
         for key in &self.registered_keys {
             self.state.dynamic_routes.remove(key);
+        }
+        for key in &self.registered_sequence_keys {
+            self.state.dynamic_sequences.remove(key);
         }
     }
 }
@@ -661,6 +698,23 @@ fn abort_response() -> axum::response::Response {
         .expect("response builder should not fail")
 }
 
+/// Wait for a `MockBody::Channel` gate (if present) and convert to an axum response.
+///
+/// Shared by both the `dynamic_sequences` and `dynamic_routes` code paths so
+/// that gated responses are honoured regardless of registration method.
+async fn wait_gate_and_respond(response: MockResponse) -> axum::response::Response {
+    if let MockBody::Channel { ref gate, .. } = response.body {
+        let receiver = gate.lock().await.take();
+        if let Some(rx) = receiver {
+            match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
+                Ok(Ok(())) => {} // Gate opened — deliver inner body
+                Ok(Err(_)) | Err(_) => return abort_response(),
+            }
+        }
+    }
+    response.into_axum_response()
+}
+
 async fn dynamic_handler(
     State(state): State<Arc<SharedState>>,
     method: Method,
@@ -678,23 +732,24 @@ async fn dynamic_handler(
         path: path.clone(),
     };
 
+    // Check sequential responses first — pop the front of the queue.
+    // Clone the Arc out and drop the DashMap ref so the shard lock is not
+    // held across the `.lock().await` (mirrors the MockBody::Channel pattern).
+    if let Some(seq_entry) = state.dynamic_sequences.get(&key) {
+        let seq_arc = seq_entry.value().clone();
+        drop(seq_entry);
+        let mut queue = seq_arc.lock().await;
+        if let Some(response) = queue.pop_front() {
+            drop(queue);
+            return wait_gate_and_respond(response).await;
+        }
+    }
+
     // Check dynamic registry for exact match
     if let Some(entry) = state.dynamic_routes.get(&key) {
         let response = entry.value().clone();
         drop(entry); // Release the lock before async operations
-
-        // Handle channel-gated responses
-        if let MockBody::Channel { gate, .. } = &response.body {
-            let receiver = gate.lock().await.take();
-            if let Some(rx) = receiver {
-                match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
-                    Ok(Ok(())) => {} // Gate opened — deliver inner body
-                    Ok(Err(_)) | Err(_) => return abort_response(),
-                }
-            }
-        }
-
-        return response.into_axum_response();
+        return wait_gate_and_respond(response).await;
     }
 
     // No match in dynamic registry - return 404

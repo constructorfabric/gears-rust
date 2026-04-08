@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.cyberfabric.platform.entities.tenant_id.v1",
+  "title": "GTS Tenant ID",
+  "description": "GTS ID for a platform tenant entity (extracted from JWT tenant_id claim)",
+  "type": "string",
+  "pattern": "^gts\\.cyberfabric\\.platform\\.entities\\.tenant\\.v[0-9]+~[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+  "examples": [
+    "gts.cyberfabric.platform.entities.tenant.v1~123e4567-e89b-12d3-a456-426614174000"
+  ]
+}

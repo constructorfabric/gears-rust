@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.core.events.event.v1~cyberfabric.chat_engine.webhook.session_hard_deleted_event.v1~",
+  "title": "Session Hard Deleted Event",
+  "description": "Webhook event fired when a session is permanently deleted",
+  "type": "object",
+  "properties": {
+    "event": {
+      "type": "string",
+      "const": "session.hard_deleted",
+      "description": "Event type identifier"
+    },
+    "session_id": {
+      "$ref": "../common/GtsSessionId.json",
+      "description": "Session that was permanently deleted"
+    },
+    "tenant_id": {
+      "$ref": "../common/GtsTenantId.json",
+      "description": "Owning tenant"
+    },
+    "user_id": {
+      "$ref": "../common/GtsUserId.json",
+      "description": "Owning user"
+    },
+    "client_id": {
+      "$ref": "../common/GtsClientId.json",
+      "description": "Calling application identifier"
+    },
+    "deleted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timestamp when session was permanently deleted"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Event generation timestamp"
+    }
+  },
+  "required": ["event", "session_id", "tenant_id", "user_id", "deleted_at", "timestamp"],
+  "additionalProperties": false
+}

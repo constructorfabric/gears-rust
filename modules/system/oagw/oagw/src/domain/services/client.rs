@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use modkit_macros::domain_model;
 use modkit_security::SecurityContext;
 use oagw_sdk::api::ServiceGatewayClientV1;
@@ -25,7 +26,7 @@ impl ServiceGatewayClientV1Facade {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
     async fn create_upstream(
         &self,
@@ -157,29 +158,17 @@ impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
             .map_err(domain_err_to_sdk)
     }
 
-    async fn resolve_upstream(
+    async fn resolve_proxy_target(
         &self,
         ctx: SecurityContext,
         alias: &str,
-    ) -> Result<oagw_sdk::Upstream, ServiceGatewayError> {
-        self.cp
-            .resolve_upstream(&ctx, alias)
-            .await
-            .map(upstream_to_sdk)
-            .map_err(domain_err_to_sdk)
-    }
-
-    async fn resolve_route(
-        &self,
-        ctx: SecurityContext,
-        upstream_id: Uuid,
         method: &str,
         path: &str,
-    ) -> Result<oagw_sdk::Route, ServiceGatewayError> {
+    ) -> Result<(oagw_sdk::Upstream, oagw_sdk::Route), ServiceGatewayError> {
         self.cp
-            .resolve_route(&ctx, upstream_id, method, path)
+            .resolve_proxy_target(&ctx, alias, method, path)
             .await
-            .map(route_to_sdk)
+            .map(|(u, r)| (upstream_to_sdk(u), route_to_sdk(r)))
             .map_err(domain_err_to_sdk)
     }
 
@@ -259,6 +248,18 @@ fn domain_err_to_sdk(err: DomainError) -> ServiceGatewayError {
         DomainError::RequestTimeout { detail, instance } => {
             ServiceGatewayError::RequestTimeout { detail, instance }
         }
+        DomainError::GuardRejected {
+            status,
+            error_code,
+            detail,
+            instance,
+        } => ServiceGatewayError::GuardRejected {
+            status,
+            error_code,
+            detail,
+            instance,
+        },
+        DomainError::Forbidden { detail } => ServiceGatewayError::Forbidden { detail },
     }
 }
 
@@ -437,10 +438,17 @@ fn rate_limit_config_to_domain(v: oagw_sdk::RateLimitConfig) -> model::RateLimit
     }
 }
 
+fn plugin_binding_to_domain(v: oagw_sdk::PluginBinding) -> model::PluginBinding {
+    model::PluginBinding {
+        plugin_ref: v.plugin_ref,
+        config: v.config,
+    }
+}
+
 fn plugins_config_to_domain(v: oagw_sdk::PluginsConfig) -> model::PluginsConfig {
     model::PluginsConfig {
         sharing: sharing_mode_to_domain(v.sharing),
-        items: v.items,
+        items: v.items.into_iter().map(plugin_binding_to_domain).collect(),
     }
 }
 
@@ -546,7 +554,14 @@ fn upstream_to_sdk(u: model::Upstream) -> oagw_sdk::Upstream {
         }),
         plugins: u.plugins.map(|p| oagw_sdk::PluginsConfig {
             sharing: sharing_mode_to_sdk(p.sharing),
-            items: p.items,
+            items: p
+                .items
+                .into_iter()
+                .map(|b| oagw_sdk::PluginBinding {
+                    plugin_ref: b.plugin_ref,
+                    config: b.config,
+                })
+                .collect(),
         }),
         rate_limit: u.rate_limit.map(rate_limit_config_to_sdk),
         tags: u.tags,
@@ -585,7 +600,14 @@ fn route_to_sdk(r: model::Route) -> oagw_sdk::Route {
         },
         plugins: r.plugins.map(|p| oagw_sdk::PluginsConfig {
             sharing: sharing_mode_to_sdk(p.sharing),
-            items: p.items,
+            items: p
+                .items
+                .into_iter()
+                .map(|b| oagw_sdk::PluginBinding {
+                    plugin_ref: b.plugin_ref,
+                    config: b.config,
+                })
+                .collect(),
         }),
         rate_limit: r.rate_limit.map(rate_limit_config_to_sdk),
         tags: r.tags,

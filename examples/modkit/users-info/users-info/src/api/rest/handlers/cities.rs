@@ -1,6 +1,11 @@
+use axum::Extension;
+use axum::extract::Path;
 use axum::http::Uri;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
+use tracing::field::Empty;
 use uuid::Uuid;
+
+use modkit::api::odata::OData;
 
 use super::{
     ApiResult, CityDto, CreateCityReq, Json, JsonBody, JsonPage, SecurityContext, UpdateCityReq,
@@ -8,10 +13,19 @@ use super::{
 };
 use crate::module::ConcreteAppServices;
 
-pub(super) async fn list_cities(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    query: modkit::api::odata::ODataQuery,
+/// List cities with cursor-based pagination and optional field projection via $select
+#[tracing::instrument(
+    skip(svc, query, ctx),
+    fields(
+        limit = query.limit,
+        request_id = Empty,
+        user.id = %ctx.subject_id()
+    )
+)]
+pub async fn list_cities(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    OData(query): OData,
 ) -> ApiResult<JsonPage<serde_json::Value>> {
     info!(
         user_id = %ctx.subject_id(),
@@ -24,11 +38,20 @@ pub(super) async fn list_cities(
     Ok(Json(page_to_projected_json(&page, query.selected_fields())))
 }
 
-pub(super) async fn get_city(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    id: Uuid,
-    query: modkit::api::odata::ODataQuery,
+/// Get a specific city by ID with optional field projection via $select
+#[tracing::instrument(
+    skip(svc, ctx),
+    fields(
+        city.id = %id,
+        request_id = Empty,
+        requester.id = %ctx.subject_id()
+    )
+)]
+pub async fn get_city(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Path(id): Path<Uuid>,
+    OData(query): OData,
 ) -> ApiResult<JsonBody<serde_json::Value>> {
     info!(
         city_id = %id,
@@ -44,12 +67,23 @@ pub(super) async fn get_city(
     Ok(Json(projected))
 }
 
-pub(super) async fn create_city(
+/// Create a new city
+#[tracing::instrument(
+    skip(svc, req_body, ctx, uri),
+    fields(
+        city.name = %req_body.name,
+        city.country = %req_body.country,
+        city.tenant_id = %req_body.tenant_id,
+        request_id = Empty,
+        creator.id = %ctx.subject_id()
+    )
+)]
+pub async fn create_city(
     uri: Uri,
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    req_body: CreateCityReq,
-) -> ApiResult<Response> {
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Json(req_body): Json<CreateCityReq>,
+) -> ApiResult<impl IntoResponse> {
     info!(
         name = %req_body.name,
         country = %req_body.country,
@@ -64,11 +98,20 @@ pub(super) async fn create_city(
     Ok(created_json(CityDto::from(city), &uri, &id_str).into_response())
 }
 
-pub(super) async fn update_city(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    id: Uuid,
-    req_body: UpdateCityReq,
+/// Update an existing city
+#[tracing::instrument(
+    skip(svc, req_body, ctx),
+    fields(
+        city.id = %id,
+        request_id = Empty,
+        updater.id = %ctx.subject_id()
+    )
+)]
+pub async fn update_city(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Path(id): Path<Uuid>,
+    Json(req_body): Json<UpdateCityReq>,
 ) -> ApiResult<JsonBody<CityDto>> {
     info!(
         city_id = %id,
@@ -81,11 +124,20 @@ pub(super) async fn update_city(
     Ok(Json(CityDto::from(city)))
 }
 
-pub(super) async fn delete_city(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    id: Uuid,
-) -> ApiResult<Response> {
+/// Delete a city by ID
+#[tracing::instrument(
+    skip(svc, ctx),
+    fields(
+        city.id = %id,
+        request_id = Empty,
+        deleter.id = %ctx.subject_id()
+    )
+)]
+pub async fn delete_city(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
     info!(
         city_id = %id,
         deleter_id = %ctx.subject_id(),

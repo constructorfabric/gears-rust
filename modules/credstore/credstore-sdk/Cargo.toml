@@ -1,0 +1,38 @@
+[package]
+name = "cf-credstore-sdk"
+description = "SDK for credstore module: API traits, models, and error definitions"
+version = "0.1.12"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["cyberfabric", "cyberfabric-system"]
+categories = ["security"]
+
+[lib]
+name = "credstore_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+# GTS types
+gts = { workspace = true }
+gts-macros = { workspace = true }
+
+# ModKit dependencies
+modkit = { workspace = true }
+modkit-security = { workspace = true }
+
+# Domain types owned by tenant-resolver
+tenant-resolver-sdk = { workspace = true }

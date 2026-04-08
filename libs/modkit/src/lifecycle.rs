@@ -76,7 +76,9 @@ pub struct ReadySignal(oneshot::Sender<()>);
 impl ReadySignal {
     #[inline]
     pub fn notify(self) {
-        _ = self.0.send(());
+        if self.0.send(()).is_err() {
+            tracing::debug!("ReadySignal::notify: receiver already dropped");
+        }
     }
     /// Construct a `ReadySignal` from a oneshot sender (used by macro-generated shims).
     #[inline]

@@ -8,7 +8,7 @@ use schemars;
 #[struct_to_gts_schema(
     dir_path = "schemas",
     base = true,
-    schema_id = "gts.x.test.plugin.v1~",
+    schema_id = "gts.x.core.test.plugin.v1~",
     description = "Test plugin specification",
     properties = "id,vendor"
 )]

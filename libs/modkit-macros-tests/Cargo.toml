@@ -28,4 +28,5 @@ inventory = { workspace = true }
 modkit = { workspace = true }
 modkit-security = { workspace = true }
 modkit-transport-grpc = { workspace = true }
+serde = { workspace = true }
 tonic = { workspace = true }

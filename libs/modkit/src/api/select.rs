@@ -96,10 +96,16 @@ pub fn apply_select<T: serde::Serialize>(value: T, selected_fields: Option<&[Str
             let fields_set: HashSet<String> = fields.iter().map(|f| f.to_lowercase()).collect();
             match serde_json::to_value(value) {
                 Ok(v) => project_json(&v, &fields_set),
-                Err(_) => json!({}),
+                Err(e) => {
+                    tracing::warn!(error = %e, "DTO serialization failed in apply_select; returning empty object");
+                    json!({})
+                }
             }
         }
-        _ => serde_json::to_value(value).unwrap_or_else(|_| json!({})),
+        _ => serde_json::to_value(value).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "DTO serialization failed in apply_select; returning empty object");
+            json!({})
+        }),
     }
 }
 

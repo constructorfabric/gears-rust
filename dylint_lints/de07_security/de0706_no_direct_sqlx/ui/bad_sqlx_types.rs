@@ -9,7 +9,7 @@ struct Database {
 }
 
 // Should trigger DE0706 - sqlx
-fn handle_error(err: &sqlx::Error) {}
+fn handle_error(_err: &sqlx::Error) {}
 
 // Should trigger DE0706 - sqlx
 type DbError = sqlx::Error;

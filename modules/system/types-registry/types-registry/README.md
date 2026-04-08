@@ -7,7 +7,7 @@ GTS entity registration, storage, validation, and REST API endpoints for CyberFa
 The `types-registry` module provides:
 
 - **Two-phase registration**: Configuration phase (no validation) → Production phase (full validation)
-- **GTS entity storage**: In-memory storage using `gts-rust` for Phase 1.1
+- **GTS entity storage**: In-memory storage using `gts-rust` (Phase 1–2). Phase 3: own DB-backed persistent storage with saga coordination with RG for hierarchy rules (see [RG DESIGN.md](../../resource-group/docs/DESIGN.md#architecture-evolution-rg-as-persistent-storage-for-types-registry))
 - **REST API**: Endpoints for registering, listing, and retrieving GTS entities
 - **ClientHub integration**: Other modules access via `hub.get::<dyn TypesRegistryClient>()?`
 

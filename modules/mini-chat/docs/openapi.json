@@ -1,0 +1,2496 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Mini Chat API",
+    "version": "1.0.0",
+    "description": "Multi-tenant AI chat module. Provides conversational AI with streaming responses, document and image upload, file search, per-user quota enforcement, and audit event emission. All endpoints require authentication and tenant license verification (ai_chat feature)."
+  },
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "servers": [],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "chats",
+      "description": "Chat lifecycle: create, list, get, update title, delete."
+    },
+    {
+      "name": "messages",
+      "description": "Send messages and receive streamed AI responses (SSE)."
+    },
+    {
+      "name": "attachments",
+      "description": "Upload documents and images to a chat."
+    },
+    {
+      "name": "turns",
+      "description": "Turn status query and tail-only mutations (retry, edit, delete)."
+    },
+    {
+      "name": "reactions",
+      "description": "Binary like/dislike reactions on assistant messages."
+    },
+    {
+      "name": "models",
+      "description": "Read-only model catalog visible to the authenticated user."
+    },
+    {
+      "name": "quota",
+      "description": "Per-user quota status queries."
+    }
+  ],
+  "paths": {
+    "/v1/chats": {
+      "post": {
+        "operationId": "createChat",
+        "tags": ["chats"],
+        "summary": "Create a new chat",
+        "description": "Creates a chat for the authenticated user. The optional `model` field selects a model from the deployment model catalog; if omitted, the default model is resolved: the is_default premium model, or the first enabled premium model, or the first enabled standard model. The model is locked for the chat lifetime.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateChatRequest"
+              },
+              "example": {
+                "title": "Q3 Financial Analysis",
+                "model": "gpt-5.2"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Chat created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Chat"
+                },
+                "example": {
+                  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                  "model": "gpt-5.2",
+                  "title": "Q3 Financial Analysis",
+                  "is_temporary": false,
+                  "created_at": "2025-06-15T10:30:00Z",
+                  "updated_at": "2025-06-15T10:30:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (e.g. unknown model name). Code: `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "description": "Internal server error while creating the chat.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "listChats",
+        "tags": ["chats"],
+        "summary": "List chats for the current user",
+        "description": "Returns chats for the authenticated user ordered by most recent activity (`updated_at` DESC, `id` DESC tiebreaker). Supports cursor-based pagination via `limit` and `cursor` parameters.\n\n**OData support**:\n- `$filter`: `title` — string functions `contains(title, '...')`, `startswith(title, '...')`, `endswith(title, '...')`; comparison operators `eq`, `ne`. Also supports `updated_at` (eq, ne, gt, ge, lt, le) and `id` (eq, ne).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PaginationLimit"
+          },
+          {
+            "$ref": "#/components/parameters/PaginationCursor"
+          },
+          {
+            "$ref": "#/components/parameters/ODataFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of chat objects.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatsPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request, for example an invalid pagination or OData query.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "description": "Internal server error while listing chats.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chats/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ChatId"
+        }
+      ],
+      "get": {
+        "operationId": "getChat",
+        "tags": ["chats"],
+        "summary": "Get chat metadata",
+        "description": "Returns chat metadata (including selected model) and message_count. Does NOT embed messages; use `GET /v1/chats/{id}/messages` to load conversation history with cursor pagination.",
+        "responses": {
+          "200": {
+            "description": "Chat metadata with message count.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatDetail"
+                },
+                "example": {
+                  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                  "model": "gpt-5.2",
+                  "title": "Q3 Financial Analysis",
+                  "is_temporary": false,
+                  "message_count": 12,
+                  "created_at": "2025-06-15T10:30:00Z",
+                  "updated_at": "2025-06-15T10:36:30Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, for example an invalid `id` path parameter format.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "description": "Internal server error while fetching the chat.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteChat",
+        "tags": ["chats"],
+        "summary": "Delete a chat",
+        "description": "Soft-deletes the chat and marks attachments for asynchronous cleanup. External provider resources (files, chat vector stores) are removed by a background cleanup worker with idempotent retries.",
+        "responses": {
+          "204": {
+            "description": "Chat deleted. Cleanup of external resources is asynchronous."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "description": "Internal server error while deleting the chat.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateChatTitle",
+        "tags": ["chats"],
+        "summary": "Update chat title",
+        "description": "Partial update — P1 allows updating only the `title` field. The title is trimmed; strings consisting entirely of whitespace are rejected. On success, `updated_at` is set to the current time. Does not affect messages, attachments, model, or is_temporary.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateChatTitleRequest"
+              },
+              "example": {
+                "title": "Renamed Chat"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Chat title updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatDetail"
+                },
+                "example": {
+                  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                  "model": "gpt-5.2",
+                  "title": "Renamed Chat",
+                  "is_temporary": false,
+                  "message_count": 12,
+                  "created_at": "2025-06-15T10:30:00Z",
+                  "updated_at": "2025-06-15T11:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (e.g. missing title, empty after trim, exceeds max length).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "description": "Internal server error while updating the chat title.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chats/{id}/messages:stream": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ChatId"
+        }
+      ],
+      "post": {
+        "operationId": "sendMessage",
+        "tags": ["messages"],
+        "summary": "Send message and receive streamed AI response",
+        "description": "Sends a user message and opens an SSE stream for the assistant response. If `request_id` matches an active generation, returns 409 Conflict (JSON, no SSE). If `request_id` matches a completed generation, replays the response as SSE (side-effect-free: no new quota reserve, no billing events).\n\nThe optional `web_search` parameter enables web search for this turn (disabled by default, backward compatible).\n\n**Attachment fields**: `attachment_ids` identifies attachments explicitly attached to this message (persisted into `message_attachments`, returned in message `attachments[]`; images included in multimodal input for the current turn). In P1, retrieval always covers all documents in the chat vector store — `attachment_ids` does not scope or filter retrieval. `file_search` is only included when the chat has at least one ready document attachment.\n\n**SSE event ordering**: `stream_started ping* (delta | tool)* citations? (done | error)`. `delta` and `tool` may interleave; at most one `citations` event, emitted after all `delta` events and before the terminal event.\n\nExactly one terminal event (`done` or `error`) ends the stream.\n\n**SSE event types and payloads**:\n- `event: stream_started` — first event, carries `request_id`, assistant `message_id`, and `is_new_turn` flag. Payload: `SseStreamStartedEvent`.\n- `event: ping` — keepalive, payload: `{}`. Clients MUST ignore.\n- `event: delta` — incremental text. Payload: `SseDeltaEvent`.\n- `event: tool` — tool activity (file_search, web_search at P1). Payload: `SseToolEvent`.\n- `event: citations` — source references (file and web). Payload: `SseCitationsEvent`.\n- `event: done` — terminal success with usage and quota_decision. Emitted for both full completions and truncated-but-successful completions (provider `response.incomplete`). Payload: `SseDoneEvent`.\n- `event: error` — terminal failure. Payload: `SseErrorEvent`.\n\nSee component schemas for payload definitions.\n\n**Pre-stream errors**: If validation, authorization, or quota preflight fails before streaming, a JSON error response with the appropriate HTTP status is returned and no SSE stream is opened.\n\n**Cancellation**: If the client disconnects mid-stream, the server cancels the in-flight provider request and applies a bounded best-effort debit for quota. No SSE error event is emitted (the stream is already broken). The Turn Status API is authoritative for final state after disconnect.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              },
+              "examples": {
+                "document_question": {
+                  "summary": "Question answered via chat-scoped document retrieval",
+                  "value": {
+                    "content": "What does the document say about Q3 revenue?",
+                    "request_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+                  }
+                },
+                "image_with_document_attachment": {
+                  "summary": "Image in multimodal input + document attached to message",
+                  "value": {
+                    "content": "Compare this chart with the annual report highlights.",
+                    "request_id": "a1b2c3d4-5678-4def-9012-abcdef345678",
+                    "attachment_ids": [
+                      "aaaa1111-2222-4333-8444-555566667777",
+                      "bbbb1111-2222-4333-8444-555566667777"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE stream opened. Events delivered as `text/event-stream`. HTTP 200 does NOT guarantee success — terminal failures after streaming starts are delivered as SSE `event: error` (payload: SseErrorEvent) while the HTTP status remains 200. Non-200 JSON error responses (4xx/5xx below) occur only when the failure is detected before the SSE stream is opened. The server closes the connection immediately after the terminal event (done or error); no further events are sent. See operation description for event types and payload schemas.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "Server-Sent Events stream. Each line is `event: <type>\\ndata: <JSON>\\n\\n`. Event ordering: `stream_started ping* (delta | tool)* citations? (done | error)`. Exactly one terminal event ends the stream.",
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/SseStreamStartedEvent" },
+                    { "$ref": "#/components/schemas/SseDeltaEvent" },
+                    { "$ref": "#/components/schemas/SseToolEvent" },
+                    { "$ref": "#/components/schemas/SseCitationsEvent" },
+                    { "$ref": "#/components/schemas/SseDoneEvent" },
+                    { "$ref": "#/components/schemas/SseErrorEvent" }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-cache"
+                }
+              },
+              "Connection": {
+                "schema": {
+                  "type": "string",
+                  "const": "keep-alive"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request detected before the SSE stream opens. Possible causes include empty message content, invalid model resolution, invalid attachment references, or `web_search_disabled`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Conflict: either (a) a generation is already running for this chat (one running turn per chat policy), or (b) the same `(chat_id, request_id)` is already in a non-replayable state (`running`, `failed`, or `cancelled`). Code: `generation_in_progress` or `request_id_conflict`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Context budget exceeded before generation starts. Code: `context_budget_exceeded`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Image bytes exceeded per-turn limit. Code: `image_bytes_exceeded`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Effective model does not support multimodal input. Code: `unsupported_media`. Defensive: under the P1 catalog invariant (all enabled models include VISION_INPUT) this response is not expected; it activates if a future catalog introduces a non-vision model or on catalog misconfiguration.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Quota or rate limit exceeded. Runtime responses use the Problem format. In current handlers, `title` is typically `quota_exceeded` for user quota exhaustion (always pre-stream) or `rate_limited` for upstream provider throttling after OAGW retry exhaustion. `rate_limited` may also appear as a terminal SSE `event: error` if the provider returns 429 mid-stream (HTTP status remains 200 in that case). `quota_scope` is tracked internally but is not currently included in the response body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error before the SSE stream opens. Problem title is typically `internal_server_error`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "LLM provider error. Code: `provider_error`. Returned as JSON response if failure occurs before SSE stream is opened. If failure occurs after streaming begins, delivered as terminal SSE `event: error` while HTTP status remains 200.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "LLM provider timeout. Code: `provider_timeout`. Returned as JSON response if failure occurs before SSE stream is opened. If failure occurs after streaming begins, delivered as terminal SSE `event: error` while HTTP status remains 200.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chats/{id}/attachments": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ChatId"
+        }
+      ],
+      "post": {
+        "operationId": "uploadAttachment",
+        "tags": ["attachments"],
+        "summary": "Upload a document or image to a chat",
+        "description": "Uploads a file as an attachment. MIME type determines `kind`: `image/png`, `image/jpeg`, `image/webp` produce `image` attachments; all other supported types produce `document` attachments. Documents are indexed in the chat's dedicated vector store and optionally summarized. Images are stored via the provider Files API but NOT indexed in vector stores. Returns immediately with `status: pending`; transitions to `ready` or `failed` asynchronously.\n\n**MIME inference**: When the browser sends `application/octet-stream` (common for `.md` and other text files), the server infers the actual MIME type from the file extension. Supported extensions include `.pdf`, `.md`, `.txt`, `.html`, `.docx`, `.pptx`, `.json`, `.csv`, and others.\n\n**CSV support**: `text/csv` files are accepted and internally remapped to `text/plain` for indexing compatibility. This behavior is controlled by server configuration (`allow_csv_upload`, default: true).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "The file to upload."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Attachment created. Processing is asynchronous; poll `GET /v1/chats/{id}/attachments/{attachment_id}` for status transitions (pending -> ready or pending -> failed). `doc_summary` is server-generated and null until background processing completes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Attachment"
+                },
+                "example": {
+                  "id": "c3d4e5f6-7890-4abc-def1-234567890abc",
+                  "status": "pending",
+                  "kind": "document",
+                  "filename": "Q3_Report.pdf",
+                  "content_type": "application/pdf",
+                  "size_bytes": 245000,
+                  "doc_summary": null,
+                  "img_thumbnail": null,
+                  "created_at": "2025-06-15T10:35:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request, for example malformed multipart data, missing `file` field, missing file bytes, or other request validation failures.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "413": {
+            "description": "File exceeds the configured upload size limit. Code: `file_too_large`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "File type not supported. Code: `unsupported_file_type`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Daily upload quota exceeded. Runtime responses use the Problem format; `title` is typically `quota_exceeded`. Upload quota scope is enforced internally and is not currently included in the response body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error while uploading the attachment.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Provider file upload failed. Code: `provider_error`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chats/{id}/messages": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ChatId"
+        }
+      ],
+      "get": {
+        "operationId": "listMessages",
+        "tags": ["messages"],
+        "summary": "List messages with cursor pagination",
+        "description": "Returns paginated messages for a chat using cursor-based pagination with OData query support. Default ordering is `created_at asc` (chronological). Use `$orderby` and `$filter` for advanced queries.\n\n**OData support**:\n- `$orderby`: `created_at asc|desc`, `id asc|desc`\n- `$filter`: `created_at` (eq, ne, gt, ge, lt, le), `role` (eq, ne, in), `id` (eq, ne, in)",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PaginationLimit"
+          },
+          {
+            "$ref": "#/components/parameters/PaginationCursor"
+          },
+          {
+            "$ref": "#/components/parameters/ODataOrderBy"
+          },
+          {
+            "$ref": "#/components/parameters/ODataFilter"
+          }
+        ],
+        "x-odata-orderby": {
+          "supported_fields": ["created_at", "id"],
+          "supported_directions": ["asc", "desc"],
+          "default": "created_at asc"
+        },
+        "x-odata-filter": {
+          "supported_fields": {
+            "created_at": ["eq", "ne", "gt", "ge", "lt", "le"],
+            "role": ["eq", "ne", "in"],
+            "id": ["eq", "ne", "in"]
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Paginated list of messages.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessagesPage"
+                },
+                "example": {
+                  "items": [
+                    {
+                      "id": "e5f6a7b8-9012-4cde-f123-456789abcdef",
+                      "role": "user",
+                      "content": "What does the document say about Q3 revenue?",
+                      "request_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+                      "model": null,
+                      "input_tokens": null,
+                      "output_tokens": null,
+                      "attachments": [
+                        {
+                          "attachment_id": "c3d4e5f6-7890-4abc-def1-234567890abc",
+                          "kind": "document",
+                          "filename": "Q3_Report.pdf",
+                          "status": "ready",
+                          "img_thumbnail": null
+                        }
+                      ],
+                      "my_reaction": null,
+                      "created_at": "2025-06-15T10:35:30Z"
+                    },
+                    {
+                      "id": "d4e5f6a7-8901-4bcd-ef12-3456789abcde",
+                      "role": "assistant",
+                      "content": "Based on the Q3 report, revenue grew 15%...",
+                      "request_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+                      "model": "gpt-5.2",
+                      "input_tokens": 500,
+                      "output_tokens": 120,
+                      "attachments": [],
+                      "my_reaction": "like",
+                      "created_at": "2025-06-15T10:35:45Z"
+                    }
+                  ],
+                  "page_info": {
+                    "limit": 20,
+                    "next_cursor": "eyJjcmVhdGVkX2F0IjoiMjAyNS0wNi0xNVQxMDozNTo0NVoiLCJpZCI6ImQ0ZTVmNmE3In0=",
+                    "prev_cursor": null
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request, for example an invalid pagination or OData query.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "description": "Internal server error while listing messages.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chats/{id}/attachments/{attachment_id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ChatId"
+        },
+        {
+          "$ref": "#/components/parameters/AttachmentId"
+        }
+      ],
+      "get": {
+        "operationId": "getAttachment",
+        "tags": ["attachments"],
+        "summary": "Get attachment status and metadata",
+        "description": "Returns the current status and metadata of an attachment. Use this endpoint to poll for processing completion after upload (status transitions: `pending` -> `ready` or `pending` -> `failed`). The `doc_summary` field is populated asynchronously by a server background task and is null until processing completes (always null for images).",
+        "responses": {
+          "200": {
+            "description": "Attachment metadata and status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Attachment"
+                },
+                "examples": {
+                  "document_attachment": {
+                    "summary": "Document attachment (ready, with summary)",
+                    "value": {
+                      "id": "c3d4e5f6-7890-4abc-def1-234567890abc",
+                      "status": "ready",
+                      "kind": "document",
+                      "filename": "Q3_Report.pdf",
+                      "content_type": "application/pdf",
+                      "size_bytes": 245000,
+                      "doc_summary": "Q3 financial report showing 15% revenue growth and expanded margins.",
+                      "img_thumbnail": null,
+                      "error_code": null,
+                      "summary_updated_at": "2025-06-15T10:35:30Z",
+                      "created_at": "2025-06-15T10:35:00Z"
+                    }
+                  },
+                  "image_attachment": {
+                    "summary": "Image attachment (ready, with thumbnail preview)",
+                    "value": {
+                      "id": "d4e5f6a7-8901-4abc-def1-234567890abd",
+                      "status": "ready",
+                      "kind": "image",
+                      "filename": "architecture_diagram.png",
+                      "content_type": "image/png",
+                      "size_bytes": 1048576,
+                      "doc_summary": null,
+                      "img_thumbnail": {
+                        "content_type": "image/webp",
+                        "width": 128,
+                        "height": 96,
+                        "data_base64": "UklGRlYAAABXRUJQVlA4IEoAAADQAQCdASoIAAYAAkA..."
+                      },
+                      "error_code": null,
+                      "summary_updated_at": null,
+                      "created_at": "2025-06-15T10:36:00Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "description": "Internal server error while fetching the attachment.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteAttachment",
+        "tags": ["attachments"],
+        "summary": "Delete an attachment from the chat",
+        "description": "Deletes an attachment if it is not referenced by any submitted message. If the attachment is referenced by a submitted message, the operation is rejected with 409 Conflict (attachment_locked). For eligible attachments, the attachment is soft-deleted locally and immediately removed from future retrieval and chat metadata. Provider-side file deletion and vector-store cleanup are performed asynchronously via background workers and are not required to complete before the API returns 204 No Content. Re-deleting an already-deleted attachment is idempotent and returns 204.",
+        "responses": {
+          "204": {
+            "description": "Attachment deleted successfully. No content returned."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Attachment cannot be deleted because it is referenced by a submitted message. Code: `attachment_locked`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error while deleting the attachment.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chats/{id}/turns/{request_id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ChatId"
+        },
+        {
+          "$ref": "#/components/parameters/RequestId"
+        }
+      ],
+      "get": {
+        "operationId": "getTurnStatus",
+        "tags": ["turns"],
+        "summary": "Get authoritative turn status",
+        "description": "Returns the authoritative server-side turn state for a given request_id. Used by the UI for disconnect recovery. Internal states map to API states: running->running, completed->done, failed->error, cancelled->cancelled. Includes error_code (when state is 'error') and assistant_message_id (when state is 'done') so clients can resolve lifecycle uncertainty after disconnect without listing or scanning message history. Retrieving the assistant message content itself may require one follow-up request. Billing outcome and provider internals are not exposed.",
+        "responses": {
+          "200": {
+            "description": "Turn status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnStatus"
+                },
+                "example": {
+                  "request_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+                  "state": "done",
+                  "error_code": null,
+                  "assistant_message_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+                  "updated_at": "2025-06-15T10:36:30Z"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "description": "Internal server error while fetching the turn status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "editTurn",
+        "tags": ["turns"],
+        "summary": "Edit the last user turn and regenerate response",
+        "description": "Replaces the content of the last user message and generates a new assistant response via SSE. The previous turn is soft-deleted with `replaced_by_request_id` set. The server generates a new `request_id` for the new turn; the old `request_id` becomes replay-only (a completed `request_id` always returns the previously stored result). Original attachment associations from `attachment_ids` are preserved (copied to the new user message via `message_attachments`). Retrieval for the edited turn operates over the entire chat vector store (P1). Only the most recent non-deleted turn in a terminal state may be edited.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditTurnRequest"
+              },
+              "example": {
+                "content": "What about Q3 profit margins?"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE stream with new assistant response. Same event contract as sendMessage.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "Server-Sent Events stream. Each line is `event: <type>\\ndata: <JSON>\\n\\n`. Event ordering: `stream_started ping* (delta | tool)* citations? (done | error)`. Exactly one terminal event ends the stream.",
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/SseStreamStartedEvent" },
+                    { "$ref": "#/components/schemas/SseDeltaEvent" },
+                    { "$ref": "#/components/schemas/SseToolEvent" },
+                    { "$ref": "#/components/schemas/SseCitationsEvent" },
+                    { "$ref": "#/components/schemas/SseDoneEvent" },
+                    { "$ref": "#/components/schemas/SseErrorEvent" }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Possible causes include empty edited content, invalid turn state, invalid model resolution, or invalid attachment validation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Conflict. Codes: `not_latest_turn` (target request_id is not the most recent turn) or `generation_in_progress` (another turn is already running for this chat, including concurrent edit race).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Context budget exceeded before regeneration starts. Code: `context_budget_exceeded`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Quota or rate limit exceeded for regeneration. Runtime responses use the Problem format; `title` is typically `quota_exceeded` for user quota exhaustion (always pre-stream) or `rate_limited` for upstream provider throttling. `quota_scope` is tracked internally but is not currently included in the response body. Same semantics as sendMessage.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error before the regeneration SSE stream opens. Titles may be `Internal Error` or a generic initialization failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteTurn",
+        "tags": ["turns"],
+        "summary": "Delete the last turn",
+        "description": "Soft-deletes the most recent turn (user message + assistant response). Only the latest non-deleted turn in a terminal state may be deleted. No replacement turn is created.",
+        "responses": {
+          "204": {
+            "description": "Turn deleted."
+          },
+          "400": {
+            "description": "Turn not in terminal state. Code: `invalid_turn_state`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Conflict. Codes: `not_latest_turn` (target request_id is not the most recent turn) or `generation_in_progress` (another turn is already running for this chat).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error while deleting the turn.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chats/{id}/turns/{request_id}/retry": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ChatId"
+        },
+        {
+          "$ref": "#/components/parameters/RequestId"
+        }
+      ],
+      "post": {
+        "operationId": "retryTurn",
+        "tags": ["turns"],
+        "summary": "Retry the last turn",
+        "description": "Soft-deletes the previous turn and re-submits the original user message (including any attachment associations from `attachment_ids`, copied to the new user message via `message_attachments`) for a new assistant response via SSE. The server generates a new `request_id` for the new turn; the old `request_id` becomes replay-only (a completed `request_id` always returns the previously stored result). Retrieval for the retried turn operates over the entire chat vector store (P1). Only the most recent non-deleted turn in a terminal state may be retried. No request body is required; the original user message content and attachment associations are reused automatically.",
+        "requestBody": {
+          "description": "No request body. The server automatically reuses the original user message content and attachment associations.",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "description": "SSE stream with new assistant response. Same event contract as sendMessage.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "Server-Sent Events stream. Each line is `event: <type>\\ndata: <JSON>\\n\\n`. Event ordering: `stream_started ping* (delta | tool)* citations? (done | error)`. Exactly one terminal event ends the stream.",
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/SseStreamStartedEvent" },
+                    { "$ref": "#/components/schemas/SseDeltaEvent" },
+                    { "$ref": "#/components/schemas/SseToolEvent" },
+                    { "$ref": "#/components/schemas/SseCitationsEvent" },
+                    { "$ref": "#/components/schemas/SseDoneEvent" },
+                    { "$ref": "#/components/schemas/SseErrorEvent" }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request before the SSE stream opens. Possible causes include `invalid_turn_state` or model resolution failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Conflict. Codes: `not_latest_turn` (target request_id is not the most recent turn) or `generation_in_progress` (another turn is already running for this chat, including concurrent retry race).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Context budget exceeded before regeneration starts. Code: `context_budget_exceeded`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Quota or rate limit exceeded for regeneration. Runtime responses use the Problem format; `title` is typically `quota_exceeded` for user quota exhaustion (always pre-stream) or `rate_limited` for upstream provider throttling. `quota_scope` is tracked internally but is not currently included in the response body. Same semantics as sendMessage.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error before the retry SSE stream opens. Titles may be `Internal Error` or a generic initialization failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chats/{id}/messages/{msg_id}/reaction": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ChatId"
+        },
+        {
+          "$ref": "#/components/parameters/MessageId"
+        }
+      ],
+      "put": {
+        "operationId": "setReaction",
+        "tags": ["reactions"],
+        "summary": "Set like/dislike on an assistant message",
+        "description": "Upserts a binary reaction on an assistant message. Only assistant messages may receive reactions. Idempotent: replaces any existing reaction for this user on this message.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetReactionRequest"
+              },
+              "example": {
+                "reaction": "like"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reaction set.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReactionResponse"
+                },
+                "example": {
+                  "message_id": "d4e5f6a7-8901-4bcd-ef12-3456789abcde",
+                  "reaction": "like",
+                  "created_at": "2025-06-15T10:37:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid reaction value or invalid reaction target. Examples: unsupported reaction value validation failure or code `invalid_reaction_target`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "Chat or message not found. Code: `chat_not_found` or `message_not_found`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error while setting the reaction.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "removeReaction",
+        "tags": ["reactions"],
+        "summary": "Remove reaction from an assistant message",
+        "description": "Removes the current user's reaction from an assistant message. Idempotent: returns 204 whether or not a reaction existed.",
+        "responses": {
+          "204": {
+            "description": "Reaction removed (or was already absent)."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "Chat or message not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error while removing the reaction.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "operationId": "listModels",
+        "tags": ["models"],
+        "summary": "List models visible to the current user",
+        "description": "Returns all models that are globally enabled in the policy catalog AND user-enabled for this user (allow-by-default semantics). Disabled models are never returned. The catalog is sourced from `minichat-policy-plugin` and cached in memory.",
+        "responses": {
+          "200": {
+            "description": "List of visible models.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "description": "Internal server error while listing models.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models/{model_id}": {
+      "get": {
+        "operationId": "getModel",
+        "tags": ["models"],
+        "summary": "Get a single model by ID",
+        "description": "Returns the model only if it is visible to the current user (globally enabled AND user-enabled). Returns 404 if the model is globally disabled, user-disabled, or does not exist — to avoid leaking catalog details.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ModelId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Model details.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Model"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/ModelNotFound"
+          },
+          "500": {
+            "description": "Internal server error while fetching model details.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/quota/status": {
+      "get": {
+        "operationId": "getQuotaStatus",
+        "tags": ["quota"],
+        "summary": "Get quota status for the authenticated user",
+        "description": "Returns per-tier, per-period quota usage, remaining credits, warning flags, and the configured warning threshold. Useful for at-rest quota queries outside of a streaming turn.",
+        "responses": {
+          "200": {
+            "description": "Quota status with remaining percentages and warning flags.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaStatusResponse"
+                },
+                "example": {
+                  "tiers": [
+                    {
+                      "tier": "premium",
+                      "periods": [
+                        {
+                          "period": "daily",
+                          "limit_credits_micro": 5000000,
+                          "used_credits_micro": 4200000,
+                          "remaining_credits_micro": 800000,
+                          "remaining_percentage": 16,
+                          "next_reset": "2025-06-16T00:00:00Z",
+                          "warning": true,
+                          "exhausted": false
+                        },
+                        {
+                          "period": "monthly",
+                          "limit_credits_micro": 100000000,
+                          "used_credits_micro": 35000000,
+                          "remaining_credits_micro": 65000000,
+                          "remaining_percentage": 65,
+                          "next_reset": "2025-07-01T00:00:00Z",
+                          "warning": false,
+                          "exhausted": false
+                        }
+                      ]
+                    },
+                    {
+                      "tier": "total",
+                      "periods": [
+                        {
+                          "period": "daily",
+                          "limit_credits_micro": 10000000,
+                          "used_credits_micro": 4800000,
+                          "remaining_credits_micro": 5200000,
+                          "remaining_percentage": 52,
+                          "next_reset": "2025-06-16T00:00:00Z",
+                          "warning": false,
+                          "exhausted": false
+                        },
+                        {
+                          "period": "monthly",
+                          "limit_credits_micro": 200000000,
+                          "used_credits_micro": 42000000,
+                          "remaining_credits_micro": 158000000,
+                          "remaining_percentage": 79,
+                          "next_reset": "2025-07-01T00:00:00Z",
+                          "warning": false,
+                          "exhausted": false
+                        }
+                      ]
+                    }
+                  ],
+                  "warning_threshold_pct": 80
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "description": "Internal server error while fetching quota status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Platform AuthN JWT or opaque token. Extracts user_id and tenant_id into the request security context."
+      }
+    },
+    "parameters": {
+      "ChatId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Chat UUID.",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "RequestId": {
+        "name": "request_id",
+        "in": "path",
+        "required": true,
+        "description": "Client-generated idempotency key UUID identifying a turn.",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "MessageId": {
+        "name": "msg_id",
+        "in": "path",
+        "required": true,
+        "description": "Message UUID.",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "AttachmentId": {
+        "name": "attachment_id",
+        "in": "path",
+        "required": true,
+        "description": "Attachment UUID.",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "ModelId": {
+        "name": "model_id",
+        "in": "path",
+        "required": true,
+        "description": "Stable internal model identifier (e.g., \"gpt-5.2\").",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "PaginationLimit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Maximum number of items to return.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 20
+        }
+      },
+      "PaginationCursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "Opaque cursor for fetching the next or previous page.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "ODataOrderBy": {
+        "name": "$orderby",
+        "in": "query",
+        "required": false,
+        "description": "OData v4 ordering expression. Restricted to supported fields and directions.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "ODataFilter": {
+        "name": "$filter",
+        "in": "query",
+        "required": false,
+        "description": "OData v4 filter expression. Restricted to supported fields and operators.",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "Forbidden": {
+        "description": "Tenant lacks `ai_chat` license (code: `feature_not_licensed`) or subject lacks permission (code: `insufficient_permissions`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found or not accessible under current authorization constraints. Code: `chat_not_found` or `message_not_found`. AuthZ fail-closed: denied requests with a concrete resource ID return 404.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Authentication required. The request lacks valid credentials or the bearer token is expired/invalid.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "ModelNotFound": {
+        "description": "Model does not exist in the catalog or is not visible to the user (globally disabled or user-disabled). Code: `model_not_found`.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["type", "title", "status", "detail", "instance", "code"],
+        "description": "Problem Details error envelope returned by mini-chat JSON errors and SSE terminal error events. Matches the runtime `Problem` serialization. In current handlers, the stable application error token is often carried in `title`; `code` may be an empty string unless explicitly populated. Error text MUST NOT contain provider-scoped identifiers (provider_file_id, vector_store_id, deployment names, upstream error bodies).",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Problem type URI. Current handlers typically return `about:blank`."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short problem summary. In current mini-chat handlers this often carries the application error token, for example `invalid_attachment`, `quota_exceeded`, or `web_search_disabled`."
+          },
+          "status": {
+            "type": "integer",
+            "description": "HTTP status code for this occurrence of the problem."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Human-readable explanation specific to this occurrence of the problem."
+          },
+          "instance": {
+            "type": "string",
+            "description": "Problem instance URI. Current handlers typically return an empty string."
+          },
+          "code": {
+            "type": "string",
+            "description": "Machine-readable application code. Always present in the payload; may be an empty string when the handler does not populate it explicitly."
+          },
+          "trace_id": {
+            "type": ["string", "null"],
+            "description": "Trace identifier useful for correlating server logs."
+          },
+          "errors": {
+            "type": ["array", "null"],
+            "description": "Optional list of validation violations for validation-style errors.",
+            "items": {
+              "$ref": "#/components/schemas/ValidationViolation"
+            }
+          }
+        }
+      },
+      "ValidationViolation": {
+        "type": "object",
+        "required": ["field", "message"],
+        "description": "Single validation violation entry included in `ErrorResponse.errors` when field-level validation details are available.",
+        "properties": {
+          "field": {
+            "type": "string",
+            "description": "Field path, for example `email` or `user.email`."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable message describing the validation error."
+          },
+          "code": {
+            "type": ["string", "null"],
+            "description": "Optional machine-readable validation code for this violation."
+          }
+        }
+      },
+      "Chat": {
+        "type": "object",
+        "required": ["id", "model", "is_temporary", "created_at", "updated_at"],
+        "description": "Chat metadata. Returned by create, list, and as part of chat detail.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model identifier from the deployment model catalog. Locked at creation for the chat lifetime."
+          },
+          "title": {
+            "type": ["string", "null"],
+            "maxLength": 255
+          },
+          "is_temporary": {
+            "type": "boolean",
+            "default": false,
+            "description": "P2 feature. Schema column reserved; always false at P1."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ChatDetail": {
+        "description": "Chat metadata with message count. Returned by getChat. Does NOT embed messages; use `GET /v1/chats/{id}/messages` for paginated conversation history.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Chat"
+          },
+          {
+            "type": "object",
+            "required": ["message_count"],
+            "properties": {
+              "message_count": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Total number of non-deleted messages in this chat. UI uses this to decide whether to fetch history via GET /v1/chats/{id}/messages."
+              }
+            }
+          }
+        ]
+      },
+      "Message": {
+        "type": "object",
+        "required": ["id", "request_id", "role", "content", "attachments", "my_reaction", "created_at"],
+        "description": "A single message in a chat (user, assistant, or system).",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Turn correlation key (doubles as idempotency key). Within a normal turn the user message and the assistant response share the same request_id. Client-generated, or server-generated UUID v4 when the client omits it. System/background messages (e.g. doc_summary) carry an independently server-generated UUID v4. Always non-null in API responses. Note: The database schema permits NULL for internal use cases, but all messages exposed through this API are guaranteed to have a request_id."
+          },
+          "role": {
+            "type": "string",
+            "enum": ["user", "assistant", "system"]
+          },
+          "content": {
+            "type": "string"
+          },
+          "model": {
+            "type": ["string", "null"],
+            "description": "Effective model used. Present on assistant messages; null on user/system messages."
+          },
+          "input_tokens": {
+            "type": ["integer", "null"],
+            "description": "Actual input tokens. Present on assistant messages."
+          },
+          "output_tokens": {
+            "type": ["integer", "null"],
+            "description": "Actual output tokens. Present on assistant messages."
+          },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentSummary"
+            },
+            "description": "Always-present list of attachment summaries associated with this message. Contains lightweight metadata sufficient for UI rendering (kind, filename, status, thumbnail). Empty array when no attachments. Full attachment details (doc_summary, size_bytes, content_type, error_code) are available via GET /v1/chats/{id}/attachments/{attachment_id}."
+          },
+          "my_reaction": {
+            "type": ["string", "null"],
+            "enum": ["like", "dislike", null],
+            "description": "The requesting user's reaction on this message. Null when no reaction exists or when the message role is not assistant (only assistant messages support reactions)."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Attachment": {
+        "type": "object",
+        "required": ["id", "status", "kind", "filename", "content_type", "size_bytes", "created_at"],
+        "description": "File attachment (document or image) on a chat.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Attachment UUID."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "ready", "failed"],
+            "description": "Processing status. Transitions: pending -> ready or pending -> failed."
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["document", "image"],
+            "description": "Derived from MIME type. image/png, image/jpeg, image/webp -> image; all other supported types -> document."
+          },
+          "filename": {
+            "type": "string",
+            "maxLength": 255
+          },
+          "content_type": {
+            "type": "string",
+            "description": "MIME type of the uploaded file."
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "doc_summary": {
+            "type": ["string", "null"],
+            "description": "Server-generated document summary (asynchronous background task). Null until processing completes; always null for images. Never provided by the client."
+          },
+          "img_thumbnail": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/ImgThumbnail" },
+              { "type": "null" }
+            ],
+            "description": "Server-generated preview thumbnail for image attachments. Null when kind is 'document', when kind is 'image' but thumbnail generation failed or was skipped, or when status is not 'ready'. Maximum decoded size (raw bytes before base64): 128 KiB by default (configurable via `thumbnail_max_bytes`). Stored internally in Mini Chat database only; never uploaded to provider. No provider identifiers. Never provided by the client."
+          },
+          "error_code": {
+            "type": ["string", "null"],
+            "description": "Stable internal error code when status is 'failed' (e.g. 'index_failed', 'provider_upload_failed'). Null when status is 'pending' or 'ready'. No provider identifiers in this field."
+          },
+          "summary_updated_at": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "Timestamp of summary generation."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TurnStatus": {
+        "type": "object",
+        "required": ["request_id", "state", "updated_at"],
+        "description": "Authoritative server-side turn state for lifecycle resolution and disconnect recovery. Internal-to-API state mapping: running->running, completed->done, failed->error, cancelled->cancelled. Terminal states (done, error, cancelled) are immutable — once reached, the state never changes. Exactly one terminal outcome exists per (chat_id, request_id) pair. All terminal states indicate that quota settlement has been finalized atomically with the state transition. A state of 'done' guarantees that the full assistant message content is durably persisted and available for idempotent replay. Optional fields (error_code, assistant_message_id) provide actionable context so clients can resolve lifecycle uncertainty after disconnect without listing or scanning message history; retrieving the assistant message content may require one follow-up request. Billing outcome and provider internals are not exposed. chat_id is not included in the response body because it is already present in the URL path.",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "state": {
+            "type": "string",
+            "enum": ["running", "done", "error", "cancelled"],
+            "description": "Turn state. 'done', 'error', 'cancelled' are terminal and immutable. 'error' indicates the turn failed — check error_code to determine if it was a provider failure (provider_error, provider_timeout) or a system timeout (orphan_timeout). 'cancelled' indicates client disconnect or internal abort — no SSE error event was emitted. Use this endpoint to resolve state after disconnect. IMPORTANT: error_code='orphan_timeout' means stream ended without provider terminal event (system timeout, NOT provider error); display 'Request timed out' to users, NOT 'Provider error'."
+          },
+          "error_code": {
+            "type": "string",
+            "nullable": true,
+            "description": "Terminal error code when state is 'error'. Disambiguates failure cause. Common values: 'provider_error' (LLM provider returned terminal error), 'provider_timeout' (provider request timed out), 'orphan_timeout' (turn stuck beyond watchdog timeout — system timeout, NOT provider failure; stream ended without provider terminal event), 'context_budget_exceeded' (preflight rejection), 'quota_overshoot_exceeded' (actual usage exceeded overshoot tolerance). Null for non-error terminal states and while running. CRITICAL: 'orphan_timeout' indicates a SYSTEM timeout (pod crash, network partition, orphan watchdog cleanup), not a provider-side error. UX SHOULD display 'Request timed out. Please try again.' for orphan_timeout, NOT 'Provider error.' Support and analytics: orphan_timeout metrics should be tracked separately from provider_error to distinguish infrastructure issues from LLM provider issues. Mapped from internal chat_turns.error_code. Provider identifiers and billing outcome are not exposed."
+          },
+          "assistant_message_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Persisted assistant message ID when state is 'done'. Null while running, on error, or on cancellation. Clients can use this to fetch the assistant message via `GET /v1/chats/{id}/messages?$filter=id eq '{assistant_message_id}'` without scanning full history."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ReactionResponse": {
+        "type": "object",
+        "required": ["message_id", "reaction", "created_at"],
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reaction": {
+            "type": "string",
+            "enum": ["like", "dislike"]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CreateChatRequest": {
+        "type": "object",
+        "description": "Request body for creating a new chat.",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "Optional chat title."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model from the deployment model catalog. If omitted, the default model is resolved: the is_default premium model, then the first enabled premium model, then the first enabled standard model."
+          }
+        }
+      },
+      "UpdateChatTitleRequest": {
+        "type": "object",
+        "required": ["title"],
+        "description": "Request body for updating a chat title. Only `title` is updatable in P1.",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "New chat title. Trimmed by the server; a string consisting entirely of whitespace is rejected with 400 invalid_request."
+          }
+        }
+      },
+      "SendMessageRequest": {
+        "type": "object",
+        "required": ["content"],
+        "description": "Request body for sending a message. Opens an SSE stream on success. `attachment_ids` identifies attachments explicitly attached to this message (persisted, returned in message attachments array). In P1, retrieval always covers all documents in the chat vector store — `attachment_ids` does not scope or filter retrieval.",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "User message text."
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Client-generated idempotency key. The server returns 409 Conflict if (a) any turn in this chat is already running (one running turn per chat), or (b) the same (chat_id, request_id) is in a non-replayable state (running, failed, or cancelled). If a completed turn exists for the same (chat_id, request_id), the server replays the durably stored response without any quota reserve or billing side effects."
+          },
+          "attachment_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "uniqueItems": true,
+            "maxItems": 20,
+            "description": "Attachment IDs (images or documents) explicitly attached/referenced on the current user message. Persisted into `message_attachments` and returned in the message `attachments` array. Images are turn-local multimodal input only; uploaded images are not implicitly reused on later turns. In P1, `attachment_ids` does not scope or filter retrieval — retrieval always covers all documents in the chat vector store. IDs MUST be unique within the array; duplicates are rejected with 400. Attachments must belong to this chat, must have status=ready, and are validated before any provider call or quota reserve. Per-turn image input limit: configurable (default: 4); per-user daily image input limit: configurable (default: 50). Requests exceeding either limit are rejected as a whole."
+          },
+          "web_search": {
+            "$ref": "#/components/schemas/WebSearchOption"
+          }
+        }
+      },
+      "EditTurnRequest": {
+        "type": "object",
+        "required": ["content"],
+        "description": "Request body for editing the last user turn. Original attachment associations from `attachment_ids` are preserved automatically (copied via message_attachments). Retrieval for the edited turn operates over the entire chat vector store (P1).",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "Replacement user message text."
+          }
+        }
+      },
+      "SetReactionRequest": {
+        "type": "object",
+        "required": ["reaction"],
+        "properties": {
+          "reaction": {
+            "type": "string",
+            "enum": ["like", "dislike"]
+          }
+        }
+      },
+      "SseStreamStartedEvent": {
+        "type": "object",
+        "required": ["request_id", "message_id", "is_new_turn"],
+        "description": "SSE `event: stream_started` payload. First event in every SSE stream (both new generations and replays). Carries the server-assigned request_id, assistant message_id, and is_new_turn flag.",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Server-assigned request ID for this turn."
+          },
+          "message_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Assistant message ID. Pre-allocated for new generations; persisted ID for replays. Allows clients to reference the assistant message before the stream completes."
+          },
+          "is_new_turn": {
+            "type": "boolean",
+            "description": "true for a live generation (new turn); false when the stream replays an already-completed turn (idempotent replay)."
+          }
+        }
+      },
+      "SseDeltaEvent": {
+        "type": "object",
+        "required": ["type", "content"],
+        "description": "SSE `event: delta` payload. Streams incremental assistant text output.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Content type. P1: always \"text\". Reserved for future: \"markdown\", \"structured\".",
+            "enum": ["text"]
+          },
+          "content": {
+            "type": "string",
+            "description": "Incremental text fragment."
+          }
+        }
+      },
+      "SseToolEvent": {
+        "type": "object",
+        "required": ["phase", "name"],
+        "description": "SSE `event: tool` payload. Reports tool call activity (P1: file_search, web_search).",
+        "properties": {
+          "phase": {
+            "type": "string",
+            "enum": ["start", "progress", "done"]
+          },
+          "name": {
+            "type": "string",
+            "description": "Tool name. P1: \"file_search\", \"web_search\"."
+          },
+          "details": {
+            "type": "object",
+            "description": "Tool-specific non-sensitive details.",
+            "properties": {
+              "files_searched": {
+                "type": "integer",
+                "description": "Number of files searched. Present in phase=done."
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "SseCitationsEvent": {
+        "type": "object",
+        "required": ["items"],
+        "description": "SSE `event: citations` payload. Delivers source references used in the answer. MAY include items from file_search (source=file) and/or web_search (source=web). Image inputs do not produce citations. Emitted at most once near stream completion before the terminal event (P1).",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CitationItem"
+            }
+          }
+        }
+      },
+      "CitationItem": {
+        "type": "object",
+        "required": ["source", "title", "snippet"],
+        "description": "A single citation reference. When source=\"file\", attachment_id is required. When source=\"web\", url is required.",
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": ["file", "web"],
+            "description": "Citation source type. P1: \"file\" and \"web\" (when web search is enabled)."
+          },
+          "title": {
+            "type": "string",
+            "description": "Citation title. For file citations (source=\"file\"), contains the original uploaded filename (e.g. \"Q3_Report.pdf\"). For web citations (source=\"web\"), contains the page title."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL for web sources. Required when source=\"web\"."
+          },
+          "attachment_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Internal attachment ID. Required when source=\"file\". The only file identifier exposed to clients."
+          },
+          "span": {
+            "type": "object",
+            "description": "Reserved for mapping citations to character positions in final assistant text.",
+            "properties": {
+              "start": { "type": "integer" },
+              "end": { "type": "integer" }
+            }
+          },
+          "snippet": {
+            "type": "string",
+            "description": "Relevant excerpt from the source."
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Relevance score."
+          }
+        },
+        "if": {
+          "properties": { "source": { "const": "file" } }
+        },
+        "then": {
+          "required": ["attachment_id"]
+        },
+        "else": {
+          "required": ["url"]
+        }
+      },
+      "SseDoneEvent": {
+        "type": "object",
+        "required": ["usage", "effective_model", "selected_model", "quota_decision"],
+        "description": "SSE `event: done` payload. Terminal event finalizing the stream with usage and model selection metadata. Used for both full completions and truncated-but-successful completions (provider `response.incomplete`). The assistant message_id is provided in the preceding `stream_started` event.",
+        "properties": {
+          "usage": {
+            "nullable": true,
+            "description": "Token usage for this turn. Null when usage is unavailable (e.g. provider error before any tokens were consumed).",
+            "allOf": [{ "$ref": "#/components/schemas/SseUsage" }]
+          },
+          "effective_model": {
+            "type": "string",
+            "description": "Model actually used for this turn after quota and policy evaluation. Always present."
+          },
+          "selected_model": {
+            "type": "string",
+            "description": "Model chosen at chat creation (chats.model). Always present. Equals effective_model when no downgrade occurred."
+          },
+          "quota_decision": {
+            "type": "string",
+            "enum": ["allow", "downgrade"],
+            "description": "Indicates whether the selected model was used as-is (allow) or a quota-driven downgrade occurred (downgrade). Always present."
+          },
+          "downgrade_from": {
+            "type": "string",
+            "description": "Always equals selected_model when present. The model from which the quota-driven downgrade occurred. Present only when quota_decision=\"downgrade\"."
+          },
+          "downgrade_reason": {
+            "type": "string",
+            "enum": ["premium_quota_exhausted", "force_standard_tier", "disable_premium_tier", "model_disabled"],
+            "description": "Why downgrade occurred. Present only when quota_decision=\"downgrade\". Values: premium_quota_exhausted (user quota exhausted); force_standard_tier (operator kill switch: premium tier forcibly disabled for this tenant); disable_premium_tier (operator kill switch: premium tier globally disabled); model_disabled (operator kill switch: selected model global_enabled=false)."
+          },
+          "quota_warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuotaWarning"
+            },
+            "description": "Per-tier, per-period quota warning entries. Present on CAS-winning completed/incomplete turns. Absent on error, cancelled, replay, and CAS-loser paths. May be an empty array when all periods are healthy.",
+            "example": [
+              {
+                "tier": "premium",
+                "period": "daily",
+                "remaining_percentage": 12,
+                "warning": true,
+                "exhausted": false
+              }
+            ]
+          },
+          "completion_signal": {
+            "type": ["object", "null"],
+            "description": "Non-fatal completion signal. Null for normal completion. For truncated responses (provider `response.incomplete`) contains the truncation reason. Not an error indicator — the turn outcome is still `completed`.",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["incomplete"]
+              },
+              "reason": {
+                "type": "string",
+                "description": "Truncation reason from the canonical CompletionSignalReason enum (e.g. \"max_tokens\", \"content_filter\")."
+              }
+            },
+            "required": ["kind"]
+          }
+        },
+        "if": {
+          "properties": { "quota_decision": { "const": "downgrade" } }
+        },
+        "then": {
+          "required": ["downgrade_from", "downgrade_reason"]
+        }
+      },
+      "SseUsage": {
+        "type": "object",
+        "required": ["input_tokens", "output_tokens", "model"],
+        "description": "Token usage reported in the terminal done event.",
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "description": "Actual input tokens (includes image token costs if applicable)."
+          },
+          "output_tokens": {
+            "type": "integer",
+            "description": "Actual output tokens."
+          },
+          "model": {
+            "type": "string",
+            "description": "Effective model used for generation. May differ from the chat's locked model if a quota-driven downgrade occurred; see quota_decision on the done event."
+          }
+        }
+      },
+      "SseErrorEvent": {
+        "description": "SSE `event: error` payload. Terminal event indicating a failure after the stream has started. Uses the same Problem Details envelope as JSON error responses.",
+        "$ref": "#/components/schemas/ErrorResponse"
+      },
+      "WebSearchOption": {
+        "type": "object",
+        "description": "Controls web search for this turn. Defaults to disabled when omitted (backward compatible).",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the web_search tool is included in the provider request. The provider decides whether to invoke the tool. If the global disable_web_search kill switch is active, the request is rejected with web_search_disabled (400)."
+          }
+        }
+      },
+      "PageInfo": {
+        "type": "object",
+        "required": ["limit"],
+        "description": "Cursor-based pagination metadata following the platform OData-style convention.",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "description": "The limit that was applied for this page."
+          },
+          "next_cursor": {
+            "type": ["string", "null"],
+            "description": "Opaque cursor for fetching the next page. Null when there are no more results."
+          },
+          "prev_cursor": {
+            "type": ["string", "null"],
+            "description": "Opaque cursor for fetching the previous page. Null on the first page."
+          }
+        }
+      },
+      "ChatsPage": {
+        "type": "object",
+        "required": ["items", "page_info"],
+        "description": "Paginated list of chats following the platform Page + PageInfo convention. Default ordering: `updated_at desc`, `id desc` (tiebreaker).",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatDetail"
+            }
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "MessagesPage": {
+        "type": "object",
+        "required": ["items", "page_info"],
+        "description": "Paginated list of messages following the platform Page + PageInfo convention.",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            }
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "AttachmentSummary": {
+        "type": "object",
+        "required": ["attachment_id", "kind", "filename", "status"],
+        "description": "Lightweight attachment metadata embedded in Message objects. Contains only the fields needed for UI rendering of message history. Full details (doc_summary, size_bytes, content_type, error_code, etc.) are available via GET /v1/chats/{id}/attachments/{attachment_id}.",
+        "properties": {
+          "attachment_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["document", "image"],
+            "description": "Attachment type. Derived from MIME type on upload."
+          },
+          "filename": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "Original filename."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "ready", "failed"],
+            "description": "Processing status."
+          },
+          "img_thumbnail": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/ImgThumbnail" },
+              { "type": "null" }
+            ],
+            "description": "Server-generated preview thumbnail. Present only when kind=image and status=ready. Null for documents and when thumbnail generation failed or was skipped."
+          }
+        }
+      },
+      "ImgThumbnail": {
+        "type": "object",
+        "required": ["content_type", "width", "height", "data_base64"],
+        "description": "Server-generated preview thumbnail for an image attachment. Produced during image upload processing using the Rust `image` crate. The thumbnail fits inside configured WxH dimensions (aspect ratio preserved, no cropping). Maximum decoded size (raw bytes before base64): 128 KiB by default (configurable via `thumbnail_max_bytes`). Stored internally in Mini Chat database only; never uploaded to provider Files API or external storage. No provider identifiers.",
+        "properties": {
+          "content_type": {
+            "type": "string",
+            "enum": ["image/webp"],
+            "description": "MIME type of the thumbnail image. P1: always image/webp."
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1,
+            "description": "Thumbnail width in pixels."
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1,
+            "description": "Thumbnail height in pixels."
+          },
+          "data_base64": {
+            "type": "string",
+            "description": "Base64-encoded raw bytes of the thumbnail image. The enforced size limit (default 128 KiB, configurable via `thumbnail_max_bytes`) applies to the decoded binary bytes, not the base64 string."
+          }
+        }
+      },
+      "QuotaDecision": {
+        "type": "string",
+        "enum": ["allow", "downgrade"],
+        "description": "Deprecated as standalone schema — fields are now inlined on SseDoneEvent. Retained for backward reference only."
+      },
+      "MultimodalCapability": {
+        "type": "string",
+        "description": "Model capability flag. P1 known values: VISION_INPUT (supports image inputs), RAG (supports file_search tool / retrieval grounding). Future values may be added without a version bump. Clients MUST ignore unknown values."
+      },
+      "Model": {
+        "type": "object",
+        "required": ["model_id", "display_name", "tier", "multiplier_display", "multimodal_capabilities", "context_window"],
+        "description": "A model visible to the current user. Does NOT expose provider, provider deployment IDs, credit multipliers, policy_version, max_output, or is_default.",
+        "properties": {
+          "model_id": {
+            "type": "string",
+            "description": "Stable internal model identifier (e.g., \"gpt-5.2\"). Same value used in POST /v1/chats and chats.model."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "User-facing name for the model selector UI."
+          },
+          "tier": {
+            "type": "string",
+            "enum": ["standard", "premium"],
+            "description": "Rate-limit tier."
+          },
+          "multiplier_display": {
+            "type": "string",
+            "description": "Human-readable credit multiplier (e.g., \"1x\", \"2x\"). Informational only — does not expose credits_micro or numeric multiplier internals."
+          },
+          "description": {
+            "type": "string",
+            "description": "User-facing help text."
+          },
+          "multimodal_capabilities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MultimodalCapability"
+            },
+            "description": "Capability flags supported by this model."
+          },
+          "context_window": {
+            "type": "integer",
+            "description": "Maximum context window in tokens."
+          }
+        }
+      },
+      "ModelList": {
+        "type": "object",
+        "required": ["items"],
+        "description": "List of models visible to the current user.",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Model"
+            }
+          }
+        }
+      },
+      "QuotaStatusResponse": {
+        "type": "object",
+        "required": ["tiers", "warning_threshold_pct"],
+        "description": "Full quota status for the authenticated user, broken down by tier and period.",
+        "properties": {
+          "tiers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuotaTierStatus"
+            },
+            "description": "Quota breakdown per tier (premium, total)."
+          },
+          "warning_threshold_pct": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Configured warning threshold percentage. Periods with remaining_percentage at or below this value have warning=true."
+          }
+        }
+      },
+      "QuotaTierStatus": {
+        "type": "object",
+        "required": ["tier", "periods"],
+        "description": "Quota status for a single tier.",
+        "properties": {
+          "tier": {
+            "$ref": "#/components/schemas/QuotaTier"
+          },
+          "periods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuotaPeriodStatus"
+            },
+            "description": "Quota details per period within this tier."
+          }
+        }
+      },
+      "QuotaPeriodStatus": {
+        "type": "object",
+        "required": ["period", "limit_credits_micro", "used_credits_micro", "remaining_credits_micro", "remaining_percentage", "next_reset", "warning", "exhausted"],
+        "description": "Quota details for a single period within a tier.",
+        "properties": {
+          "period": {
+            "$ref": "#/components/schemas/QuotaPeriod"
+          },
+          "limit_credits_micro": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total credit limit for this period in micro-credits."
+          },
+          "used_credits_micro": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Credits consumed so far in this period in micro-credits."
+          },
+          "remaining_credits_micro": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Credits remaining in this period in micro-credits."
+          },
+          "remaining_percentage": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Percentage of quota remaining (0–100)."
+          },
+          "next_reset": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 timestamp of next period reset."
+          },
+          "warning": {
+            "type": "boolean",
+            "description": "True when remaining_percentage is at or below warning_threshold_pct."
+          },
+          "exhausted": {
+            "type": "boolean",
+            "description": "True when remaining_percentage is 0."
+          }
+        }
+      },
+      "QuotaTier": {
+        "type": "string",
+        "enum": ["premium", "total"],
+        "description": "Quota tier classification."
+      },
+      "QuotaPeriod": {
+        "type": "string",
+        "enum": ["daily", "monthly"],
+        "description": "Quota period classification."
+      },
+      "QuotaWarning": {
+        "type": "object",
+        "required": ["tier", "period", "remaining_percentage", "warning", "exhausted"],
+        "description": "Per-tier, per-period quota warning entry included in the SSE done event.",
+        "properties": {
+          "tier": {
+            "$ref": "#/components/schemas/QuotaTier"
+          },
+          "period": {
+            "$ref": "#/components/schemas/QuotaPeriod"
+          },
+          "remaining_percentage": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Percentage of quota remaining (0–100)."
+          },
+          "warning": {
+            "type": "boolean",
+            "description": "True when remaining_percentage is at or below the configured warning threshold."
+          },
+          "exhausted": {
+            "type": "boolean",
+            "description": "True when remaining_percentage is 0."
+          }
+        },
+        "example": {
+          "tier": "premium",
+          "period": "daily",
+          "remaining_percentage": 8,
+          "warning": true,
+          "exhausted": false
+        }
+      }
+    }
+  }
+}

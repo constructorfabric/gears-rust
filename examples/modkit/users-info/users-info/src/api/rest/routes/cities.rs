@@ -4,13 +4,15 @@ use modkit::api::OpenApiRegistry;
 use modkit::api::operation_builder::{OperationBuilder, OperationBuilderODataExt};
 use users_info_sdk::odata::CityFilterField;
 
+const API_TAG: &str = "Users Info Cities";
+
 pub(super) fn register_city_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     // GET /users-info/v1/cities - List cities with cursor-based pagination
     router = OperationBuilder::get("/users-info/v1/cities")
         .operation_id("users_info.list_cities")
         .summary("List cities with cursor pagination")
         .description("Retrieve a paginated list of cities using cursor-based pagination")
-        .tag("cities")
+        .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
         .query_param_typed(
@@ -40,7 +42,7 @@ pub(super) fn register_city_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .require_license_features::<License>([])
         .summary("Get city by ID")
         .description("Retrieve a specific city by UUID")
-        .tag("cities")
+        .tag(API_TAG)
         .path_param("id", "City UUID")
         .handler(handlers::get_city)
         .with_odata_select()
@@ -58,7 +60,7 @@ pub(super) fn register_city_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .require_license_features::<License>([])
         .summary("Create a new city")
         .description("Create a new city with the provided information")
-        .tag("cities")
+        .tag(API_TAG)
         .json_request::<dto::CreateCityReq>(openapi, "City creation data")
         .handler(handlers::create_city)
         .json_response_with_schema::<dto::CityDto>(
@@ -80,7 +82,7 @@ pub(super) fn register_city_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .require_license_features::<License>([])
         .summary("Update city")
         .description("Partially update a city with the provided fields")
-        .tag("cities")
+        .tag(API_TAG)
         .path_param("id", "City UUID")
         .json_request::<dto::UpdateCityReq>(openapi, "City update data")
         .handler(handlers::update_city)
@@ -100,7 +102,7 @@ pub(super) fn register_city_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .require_license_features::<License>([])
         .summary("Delete city")
         .description("Delete a city by UUID")
-        .tag("cities")
+        .tag(API_TAG)
         .path_param("id", "City UUID")
         .handler(handlers::delete_city)
         .json_response(http::StatusCode::NO_CONTENT, "City deleted successfully")

@@ -191,15 +191,22 @@ pub enum RateLimitStrategy {
 }
 
 // ---------------------------------------------------------------------------
-// PluginsConfig
+// PluginBinding / PluginsConfig
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PluginBinding {
+    pub plugin_ref: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub config: HashMap<String, String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 pub struct PluginsConfig {
     #[serde(default)]
     pub sharing: SharingMode,
     #[serde(default)]
-    pub items: Vec<String>,
+    pub items: Vec<PluginBinding>,
 }
 
 // ---------------------------------------------------------------------------
@@ -541,11 +548,20 @@ impl From<RateLimitConfig> for domain::RateLimitConfig {
     }
 }
 
+impl From<PluginBinding> for domain::PluginBinding {
+    fn from(v: PluginBinding) -> Self {
+        Self {
+            plugin_ref: v.plugin_ref,
+            config: v.config,
+        }
+    }
+}
+
 impl From<PluginsConfig> for domain::PluginsConfig {
     fn from(v: PluginsConfig) -> Self {
         Self {
             sharing: v.sharing.into(),
-            items: v.items,
+            items: v.items.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -768,11 +784,20 @@ impl From<domain::RateLimitConfig> for RateLimitConfig {
     }
 }
 
+impl From<domain::PluginBinding> for PluginBinding {
+    fn from(v: domain::PluginBinding) -> Self {
+        Self {
+            plugin_ref: v.plugin_ref,
+            config: v.config,
+        }
+    }
+}
+
 impl From<domain::PluginsConfig> for PluginsConfig {
     fn from(v: domain::PluginsConfig) -> Self {
         Self {
             sharing: v.sharing.into(),
-            items: v.items,
+            items: v.items.into_iter().map(Into::into).collect(),
         }
     }
 }

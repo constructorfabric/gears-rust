@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use authn_resolver_sdk::{
     AuthNResolverPluginClient, AuthNResolverPluginSpecV1, AuthenticationResult,
+    ClientCredentialsRequest,
 };
 use modkit::client_hub::{ClientHub, ClientScope};
 use modkit::plugins::{GtsPluginSelector, choose_plugin_instance};
@@ -112,6 +113,24 @@ impl Service {
         let plugin = self.get_plugin().await?;
         plugin
             .authenticate(bearer_token)
+            .await
+            .map_err(DomainError::from)
+    }
+
+    /// Exchange client credentials for a `SecurityContext` via the selected plugin.
+    ///
+    /// # Errors
+    ///
+    /// - `TokenAcquisitionFailed` if credentials are invalid
+    /// - Plugin resolution errors
+    #[tracing::instrument(skip_all, fields(client_id = %request.client_id))]
+    pub async fn exchange_client_credentials(
+        &self,
+        request: &ClientCredentialsRequest,
+    ) -> Result<AuthenticationResult, DomainError> {
+        let plugin = self.get_plugin().await?;
+        plugin
+            .exchange_client_credentials(request)
             .await
             .map_err(DomainError::from)
     }

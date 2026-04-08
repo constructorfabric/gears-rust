@@ -1,5 +1,4 @@
 use crate::domain::error::DomainError;
-use crate::infra::proxy::headers;
 use axum::body::Body;
 use axum::extract::{Extension, Request};
 use axum::response::Response;
@@ -105,17 +104,13 @@ pub async fn proxy_handler(
         .extensions
         .get::<ErrorSource>()
         .copied()
-        .unwrap_or(ErrorSource::Upstream);
-
-    // Sanitize upstream response headers: strip hop-by-hop and x-oagw-*.
-    let mut resp_headers = resp_parts.headers;
-    headers::sanitize_response_headers(&mut resp_headers);
+        .unwrap_or(ErrorSource::Gateway);
 
     // Build axum response.
+    // Response headers are already sanitized by the DP service layer.
     let mut builder = Response::builder().status(resp_parts.status);
 
-    // Copy sanitized upstream response headers.
-    for (name, value) in &resp_headers {
+    for (name, value) in &resp_parts.headers {
         builder = builder.header(name, value);
     }
 

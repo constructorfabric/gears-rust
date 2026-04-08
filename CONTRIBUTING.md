@@ -73,7 +73,7 @@ Follow the coding standards and guidelines:
 
 1. See common [RUST.md](./guidelines/DNA/languages/RUST.md) guideline
 2. When develop new REST API use [API.md](./guidelines/DNA/REST/API.md), [STATUS_CODES](./guidelines/DNA/REST/STATUS_CODES.md)
-3. When develop new Module use [NEW_MODULE.md](./guidelines/NEW_MODULE.md)
+3. When develop new Module use [ModKit Unified System](./docs/modkit_unified_system/README.md)
 4. Security policy [SECURITY.md](./SECURITY.md) and secure coding [guidelines/SECURITY.md](./guidelines/SECURITY.md)
 5. ModKit architecture and invariants [docs/modkit_unified_system/README.md](./docs/modkit_unified_system/README.md)
 
@@ -139,9 +139,6 @@ Helpful environment variables:
 export RUST_LOG=debug
 
 # Show backtraces on panic
-export RUST_BACKTRACE=1
-
-# Show full backtrace details
 export RUST_BACKTRACE=full
 ```
 
@@ -292,7 +289,7 @@ before requesting human review:
 cypilot review PR <number>
 ```
 
-Use any supported IDE agent (Windsurf, Cursor, Claude, Copilot) — each redirects to the canonical workflows in `.cypilot/workflows/`.
+Use any supported IDE agent (Windsurf, Cursor, Claude, Copilot) — each redirects to the canonical workflows via `/cypilot-pr-review` and `/cypilot-pr-status` commands.
 
 You can also check the PR status (unreplied comments, severity, etc.):
 

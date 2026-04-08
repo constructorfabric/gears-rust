@@ -2,7 +2,6 @@ use std::future::Future;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
 use crate::gts::BaseModkitPluginV1;
@@ -30,6 +29,18 @@ impl GtsPluginSelector {
     pub fn new() -> Self {
         Self {
             cached: RwLock::new(None),
+            resolve_lock: Mutex::new(()),
+        }
+    }
+
+    /// Create a selector with `value` already cached, skipping resolution entirely.
+    ///
+    /// Useful in tests to pre-warm the selector with a known instance ID or
+    /// an empty-string sentinel (meaning "no plugin configured").
+    #[must_use]
+    pub fn pre_cached(value: String) -> Self {
+        Self {
+            cached: RwLock::new(Some(Arc::from(value))),
             resolve_lock: Mutex::new(()),
         }
     }
@@ -101,8 +112,10 @@ pub enum ChoosePluginError {
     },
 
     /// No plugin instance matched the requested vendor.
-    #[error("no plugin instances found for vendor '{vendor}'")]
+    #[error("no plugin instances found for schema '{schema_id}', vendor '{vendor}'")]
     PluginNotFound {
+        /// GTS schema ID of the plugin type being resolved.
+        schema_id: String,
         /// The vendor that was requested.
         vendor: String,
     },
@@ -139,7 +152,7 @@ pub fn choose_plugin_instance<'a, P>(
     instances: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
 ) -> Result<String, ChoosePluginError>
 where
-    P: DeserializeOwned + gts::GtsSchema,
+    P: for<'de> gts::GtsDeserialize<'de> + gts::GtsSchema,
 {
     let mut best: Option<(&str, i16)> = None;
     let mut count: usize = 0;
@@ -187,6 +200,7 @@ where
 
     best.map(|(gts_id, _)| gts_id.to_owned())
         .ok_or_else(|| ChoosePluginError::PluginNotFound {
+            schema_id: P::SCHEMA_ID.to_owned(),
             vendor: vendor.to_owned(),
         })
 }

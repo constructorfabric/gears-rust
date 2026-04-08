@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 
 use crate::error::AuthNResolverError;
-use crate::models::AuthenticationResult;
+use crate::models::{AuthenticationResult, ClientCredentialsRequest};
 
 /// Plugin API trait for `AuthN` resolver implementations.
 ///
@@ -31,5 +31,26 @@ pub trait AuthNResolverPluginClient: Send + Sync {
     async fn authenticate(
         &self,
         bearer_token: &str,
+    ) -> Result<AuthenticationResult, AuthNResolverError>;
+
+    /// Exchange client credentials for an `AuthenticationResult`.
+    ///
+    /// The plugin performs the actual `OAuth2` `client_credentials` flow
+    /// (or static credential lookup) and returns an `AuthenticationResult`
+    /// containing the validated `SecurityContext`.
+    ///
+    /// # Scopes
+    ///
+    /// Production plugins forward `scopes` to the `IdP` as-is in the
+    /// `OAuth2` `scope` parameter. Plugins that do not interact with an
+    /// `IdP` (e.g., static dev plugins) may ignore this field.
+    ///
+    /// # Errors
+    ///
+    /// - `TokenAcquisitionFailed` if credentials are invalid or `IdP` is unreachable
+    /// - `Internal` for unexpected errors
+    async fn exchange_client_credentials(
+        &self,
+        request: &ClientCredentialsRequest,
     ) -> Result<AuthenticationResult, AuthNResolverError>;
 }

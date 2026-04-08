@@ -283,11 +283,7 @@ mod tests {
     use serde_json::json;
 
     fn test_client() -> HttpClient {
-        HttpClientBuilder::new()
-            .allow_insecure_http()
-            .retry(None)
-            .build()
-            .unwrap()
+        HttpClientBuilder::new().retry(None).build().unwrap()
     }
 
     #[tokio::test]
@@ -377,7 +373,6 @@ mod tests {
         });
 
         let client = HttpClientBuilder::new()
-            .allow_insecure_http()
             .retry(None)
             .max_body_size(1024) // 1KB limit
             .build()
@@ -400,7 +395,6 @@ mod tests {
         });
 
         let client = HttpClientBuilder::new()
-            .allow_insecure_http()
             .retry(None)
             .user_agent("custom/1.0")
             .build()
@@ -656,7 +650,6 @@ mod tests {
         });
 
         let client = HttpClientBuilder::new()
-            .allow_insecure_http()
             .retry(None)
             .max_body_size(1024 * 1024) // 1MB limit
             .build()
@@ -1282,7 +1275,6 @@ mod tests {
 
         // Create client with 10KB body limit - smaller than decompressed size
         let client = HttpClientBuilder::new()
-            .allow_insecure_http()
             .retry(None)
             .max_body_size(10 * 1024) // 10KB limit
             .build()
@@ -1890,20 +1882,14 @@ mod tests {
     // URL Scheme Validation Tests
     // ==========================================================================
 
-    /// Test: http:// URL rejected when transport security is `TlsOnly` (default)
+    /// Test: http:// URL rejected when transport security is `TlsOnly`
     #[tokio::test]
     async fn test_url_scheme_http_rejected_with_tls_only() {
-        use crate::config::HttpClientConfig;
-
-        // Default config has TlsOnly transport security
-        let config = HttpClientConfig {
-            retry: None,
-            rate_limit: None,
-            ..Default::default()
-        };
-        assert_eq!(config.transport, crate::config::TransportSecurity::TlsOnly);
-
-        let client = HttpClientBuilder::with_config(config).build().unwrap();
+        let client = HttpClientBuilder::new()
+            .transport(crate::config::TransportSecurity::TlsOnly)
+            .retry(None)
+            .build()
+            .unwrap();
 
         // Try to send a request to http:// URL
         let result = client.get("http://example.com/test").send().await;
@@ -1932,7 +1918,7 @@ mod tests {
         });
 
         let client = HttpClientBuilder::new()
-            .allow_insecure_http()
+            .transport(crate::config::TransportSecurity::AllowInsecureHttp)
             .retry(None)
             .build()
             .unwrap();
@@ -1948,7 +1934,11 @@ mod tests {
     async fn test_url_scheme_https_always_allowed() {
         // Note: We can't actually test HTTPS without a real server,
         // but we can verify the validation passes and fails later on connection
-        let client = HttpClientBuilder::new().retry(None).build().unwrap();
+        let client = HttpClientBuilder::new()
+            .transport(crate::config::TransportSecurity::TlsOnly)
+            .retry(None)
+            .build()
+            .unwrap();
 
         // The scheme validation should pass (not InvalidScheme)
         // but the actual connection will fail because example.com won't respond
@@ -1965,7 +1955,7 @@ mod tests {
     #[tokio::test]
     async fn test_url_scheme_invalid_rejected() {
         let client = HttpClientBuilder::new()
-            .allow_insecure_http() // Even with insecure allowed
+            .transport(crate::config::TransportSecurity::AllowInsecureHttp)
             .retry(None)
             .build()
             .unwrap();
@@ -1989,7 +1979,7 @@ mod tests {
     #[tokio::test]
     async fn test_url_scheme_missing_rejected() {
         let client = HttpClientBuilder::new()
-            .allow_insecure_http()
+            .transport(crate::config::TransportSecurity::AllowInsecureHttp)
             .retry(None)
             .build()
             .unwrap();

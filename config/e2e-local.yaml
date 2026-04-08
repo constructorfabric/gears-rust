@@ -94,7 +94,7 @@ modules:
   api-gateway:
     # No database needed for api-gateway
     config:
-      bind_addr: "127.0.0.1:8086"
+      bind_addr: "0.0.0.0:8086"
       enable_docs: true
       cors_enabled: false
 
@@ -118,48 +118,64 @@ modules:
   types-registry:
     config: {}
 
-  contoso-tr-plugin:
+  static-tr-plugin:
     config:
-      vendor: "Contoso"
-      priority: 10
-
-  fabrikam-tr-plugin:
-    config:
-      vendor: "Fabrikam"
+      vendor: "hyperspot"
       priority: 20
       tenants:
-        # Root
-        - id: "00000000000000000000000000000001"
+        # Root tenant used by oagw + credstore e2e tests
+        - id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          name: "e2e-root"
           parent_id: null
-          status: ACTIVE
-          is_accessible_by_parent: true
-        # Level 1
-        - id: "00000000000000000000000000000002"
-          parent_id: "00000000000000000000000000000001"
-          status: ACTIVE
-          is_accessible_by_parent: true
-        - id: "00000000000000000000000000000005"
-          parent_id: "00000000000000000000000000000001"
-          status: ACTIVE
-          is_accessible_by_parent: true
-        # Level 2 under 000...02
-        - id: "00000000000000000000000000000003"
-          parent_id: "00000000000000000000000000000002"
-          status: SOFT_DELETED
-          is_accessible_by_parent: false
-        - id: "00000000000000000000000000000004"
-          parent_id: "00000000000000000000000000000002"
-          status: ACTIVE
-          is_accessible_by_parent: true
-        # Level 2 under 000...05
-        - id: "00000000000000000000000000000006"
-          parent_id: "00000000000000000000000000000005"
-          status: ACTIVE
-          is_accessible_by_parent: true
+          status: active
+        # Hierarchy tenants
+        - id: "00000000-0000-0000-0000-000000000001"
+          name: "hierarchy-root"
+          parent_id: null
+          status: active
+        - id: "00000000-0000-0000-0000-000000000002"
+          name: "hierarchy-l1a"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000005"
+          name: "hierarchy-l1b"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000003"
+          name: "hierarchy-l2a-deleted"
+          parent_id: "00000000-0000-0000-0000-000000000002"
+          status: deleted
+        - id: "00000000-0000-0000-0000-000000000004"
+          name: "hierarchy-l2b"
+          parent_id: "00000000-0000-0000-0000-000000000002"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000006"
+          name: "hierarchy-l2c"
+          parent_id: "00000000-0000-0000-0000-000000000005"
+          status: active
 
   tenant-resolver:
     config:
-      vendor: "Fabrikam"
+      vendor: "hyperspot"
+
+  static-credstore-plugin:
+    config:
+      secrets:
+        # Test-only fake client ID, not a real credential
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          owner_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+          key: "openai-key"
+          value: "sk-test-e2e-fake-key"
+        # Test-only fake credentials for OAuth2 client ID and secret
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          owner_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+          key: "test-oauth2-client-id"
+          value: "test-client-id"
+        # Test-only fake client secret, not a real credential
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          owner_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+          key: "test-oauth2-client-secret"
+          value: "test-client-secret"
 
   grpc-hub:
     config:
@@ -197,6 +213,37 @@ modules:
       default_page_size: 5
       max_page_size: 100
 
+  authz-resolver:
+    config:
+      vendor: "hyperspot"
+  
+  static-authn-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+      mode: accept_all
+      s2s_credentials:
+        - client_id: "mini-chat"
+          client_secret: "mini-chat-dev-secret"
+
+  static-authz-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+  
+  mini-chat:
+    # Module-specific database configuration
+    database:
+      server: "sqlite_users"
+      file: "mini_chat.db"
+    config:
+      # S2S credentials for obtaining SecurityContext
+      # that will be used for communication with other modules.
+      client_credentials:
+        client_id: "mini-chat"
+        client_secret: "mini-chat-dev-secret"
+
+
   simple-user-settings:
     # Module-specific database configuration
     database:
@@ -204,51 +251,67 @@ modules:
       file: "settings.db"
     config: {}
 
+  file-parser:
+    config:
+      allowed_local_base_dir: /tmp
+
   oagw:
     config:
       proxy_timeout_secs: 2
-      credentials:
-        "cred://openai-key": "sk-test-e2e-fake-key"  # Test-only fake key, not a real credential
+      allow_http_upstream: true # Only for testing - do not enable in production without proper security controls
 
-# OpenTelemetry tracing configuration
-tracing:
-  enabled: false
-  service_name: "hyperspot-api"
+# OpenTelemetry configuration (resource identity, tracing, metrics)
+opentelemetry:
+  # Shared resource identity (attached to all traces and metrics)
+  resource:
+    service_name: "hyperspot-api"
+    attributes:
+      service.version: "1.3.7"
+      deployment.environment: "dev"
+      service.namespace: "hyperspot"
 
-  # OTLP exporter configuration
+  # Default exporter shared by tracing and metrics.
+  # Per-signal `exporter` fields override this when present.
   exporter:
     kind: "otlp_grpc"  # or "otlp_http"
-    endpoint: "http://127.0.0.1:14317"  # Jaeger OTLP gRPC endpoint
-    # For HTTP: endpoint: "http://127.0.0.1:4318/v1/traces"
+    endpoint: "http://127.0.0.1:4317"
     headers:
       # Add any required headers, e.g., for authentication
       # authorization: "Bearer your-token"
       uptrace-dsn: "http://project1_secret@localhost:14318?grpc=14317"
     timeout_ms: 5000
 
-  # Sampling configuration
-  sampler:
-    parent_based_ratio: # parent_based_always_on | parent_based_ratio | always_on | always_off
-      ratio: 1.0  # Sample 20% of traces (only used with ratio strategies)
+  # Tracing configuration
+  tracing:
+    enabled: false
 
-  # Propagation configuration
-  propagation:
-    w3c_trace_context: true  # Enable W3C Trace Context propagation
+    # Per-signal exporter override (fully replaces the shared exporter)
+    exporter:
+      kind: "otlp_grpc"
+      endpoint: "http://127.0.0.1:14317"  # Jaeger OTLP gRPC endpoint
 
-  # Resource attributes (added to all spans)
-  resource:
-    service.version: "1.3.7"
-    deployment.environment: "dev"
-    service.namespace: "hyperspot"
+    # Sampling configuration
+    sampler:
+      parent_based_ratio: # parent_based_always_on | parent_based_ratio | always_on | always_off
+        ratio: 1.0  # Sample 100% of traces
 
-  # HTTP-specific options
-  http:
-    inject_request_id_header: "x-request-id"
-    record_headers: [ "user-agent", "x-forwarded-for", "authorization" ]
+    # Propagation configuration
+    propagation:
+      w3c_trace_context: true  # Enable W3C Trace Context propagation
 
-  # Log correlation (future feature)
-  logs_correlation:
-    inject_trace_ids_into_logs: true
+    # HTTP-specific options
+    http:
+      inject_request_id_header: "x-request-id"
+      # WARNING: "authorization" sends bearer tokens to the trace collector — dev/test only
+      record_headers: [ "user-agent", "x-forwarded-for", "authorization" ]
+
+    # Log correlation (future feature)
+    logs_correlation:
+      inject_trace_ids_into_logs: true
+
+  # Metrics configuration
+  metrics:
+    enabled: false
 
 # Example configurations for different database scenarios:
 #

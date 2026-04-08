@@ -1,5 +1,36 @@
 # PRD
 
+
+<!-- toc -->
+
+- [1. Overview](#1-overview)
+  - [1.1 Purpose](#11-purpose)
+  - [1.2 Background / Problem Statement](#12-background--problem-statement)
+  - [1.3 Goals (Business Outcomes)](#13-goals-business-outcomes)
+  - [1.4 Glossary](#14-glossary)
+- [2. Actors](#2-actors)
+  - [2.1 Human Actors](#21-human-actors)
+  - [2.2 System Actors](#22-system-actors)
+- [3. Operational Concept & Environment](#3-operational-concept--environment)
+- [4. Scope](#4-scope)
+  - [4.1 In Scope](#41-in-scope)
+  - [4.2 Out of Scope](#42-out-of-scope)
+- [5. Functional Requirements](#5-functional-requirements)
+  - [P1 — Core](#p1--core)
+  - [P2 — Reliability & Governance](#p2--reliability--governance)
+  - [P3 — Optimization](#p3--optimization)
+  - [P4 — Enterprise](#p4--enterprise)
+- [6. Non-Functional Requirements](#6-non-functional-requirements)
+  - [Scalability](#scalability)
+- [7. Public Library Interfaces](#7-public-library-interfaces)
+- [8. Use Cases](#8-use-cases)
+- [9. Acceptance Criteria](#9-acceptance-criteria)
+- [10. Dependencies](#10-dependencies)
+- [11. Assumptions](#11-assumptions)
+- [12. Risks](#12-risks)
+
+<!-- /toc -->
+
 ## 1. Overview
 
 ### 1.1 Purpose

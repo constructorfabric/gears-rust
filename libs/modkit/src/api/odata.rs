@@ -148,10 +148,9 @@ pub async fn extract_odata_query<S>(
 where
     S: Send + Sync,
 {
-    // Parse query; default if missing
     let Query(params) = Query::<ODataParams>::from_request_parts(parts, state)
         .await
-        .unwrap_or_else(|_| Query(ODataParams::default()));
+        .map_err(|e| crate::api::bad_request(format!("Invalid query parameters: {e}")))?;
 
     let mut query = ODataQuery::new();
 

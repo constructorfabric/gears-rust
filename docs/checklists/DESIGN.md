@@ -5,6 +5,36 @@
 **Last Updated**: 2026-02-03
 **Purpose**: Comprehensive quality checklist for Overall Design artifacts
 
+## Table of Contents
+
+1. [Referenced Standards](#referenced-standards)
+2. [Review Scope Selection](#review-scope-selection)
+3. [Prerequisites](#prerequisites)
+4. [Evidence Requirements (STRICT mode)](#evidence-requirements-strict-mode)
+5. [Applicability Context](#applicability-context)
+6. [Severity Dictionary](#severity-dictionary)
+7. [MUST HAVE](#must-have)
+   - [🏗️ ARCHITECTURE Expertise (ARCH)](#architecture-expertise-arch)
+   - [Semantic Alignment (SEM)](#semantic-alignment-sem)
+   - [⚡ PERFORMANCE Expertise (PERF)](#performance-expertise-perf)
+   - [🔒 SECURITY Expertise (SEC)](#security-expertise-sec)
+   - [🛡️ RELIABILITY Expertise (REL)](#reliability-expertise-rel)
+   - [📊 DATA Expertise (DATA)](#data-expertise-data)
+   - [🔌 INTEGRATION Expertise (INT)](#integration-expertise-int)
+   - [🖥️ OPERATIONS Expertise (OPS)](#operations-expertise-ops)
+   - [🔧 MAINTAINABILITY Expertise (MAINT)](#maintainability-expertise-maint)
+   - [🧪 TESTING Expertise (TEST)](#testing-expertise-test)
+   - [📜 COMPLIANCE Expertise (COMPL)](#compliance-expertise-compl)
+   - [👤 USABILITY Expertise (UX)](#usability-expertise-ux)
+   - [🏢 BUSINESS Expertise (BIZ)](#business-expertise-biz)
+   - [DOC (DOC)](#doc-doc)
+8. [MUST NOT HAVE](#must-not-have)
+9. [Validation Summary](#validation-summary)
+   - [Final Checklist](#final-checklist)
+   - [Reporting Readiness Checklist](#reporting-readiness-checklist)
+   - [Reporting](#reporting)
+   - [Reporting Commitment](#reporting-commitment)
+
 ---
 
 ## Referenced Standards
@@ -19,36 +49,6 @@ This checklist validates system design artifacts based on the following internat
 | [ISO/IEC/IEEE 29148:2018](https://www.iso.org/standard/72089.html) | **Requirements Traceability** | Bidirectional traceability, requirements-to-design mapping |
 | [OWASP ASVS 5.0](https://owasp.org/www-project-application-security-verification-standard/) | **Security Architecture** | Authentication, authorization, cryptography, data protection |
 | [ISO/IEC 27001:2022](https://www.iso.org/standard/27001) | **Information Security** | ISMS controls, security management framework |
-
----
-
-## Table of Contents
-
-1. [Review Scope Selection](#review-scope-selection)
-2. [Prerequisites](#prerequisites)
-3. [Evidence Requirements (STRICT mode)](#evidence-requirements-strict-mode)
-4. [Applicability Context](#applicability-context)
-5. [Severity Dictionary](#severity-dictionary)
-6. [MUST HAVE](#must-have)
-   - [ARCHITECTURE Expertise (ARCH)](#️-architecture-expertise-arch)
-   - [PERFORMANCE Expertise (PERF)](#-performance-expertise-perf)
-   - [SECURITY Expertise (SEC)](#-security-expertise-sec)
-   - [RELIABILITY Expertise (REL)](#️-reliability-expertise-rel)
-   - [DATA Expertise (DATA)](#-data-expertise-data)
-   - [INTEGRATION Expertise (INT)](#-integration-expertise-int)
-   - [OPERATIONS Expertise (OPS)](#️-operations-expertise-ops)
-   - [MAINTAINABILITY Expertise (MAINT)](#-maintainability-expertise-maint)
-   - [TESTING Expertise (TEST)](#-testing-expertise-test)
-   - [COMPLIANCE Expertise (COMPL)](#-compliance-expertise-compl)
-   - [USABILITY Expertise (UX)](#-usability-expertise-ux)
-   - [BUSINESS Expertise (BIZ)](#-business-expertise-biz)
-   - [Semantic Alignment (SEM)](#semantic-alignment-sem)
-   - [Deliberate Omissions](#deliberate-omissions)
-7. [MUST NOT HAVE](#must-not-have)
-8. [Validation Summary](#validation-summary)
-   - [Final Checklist](#final-checklist)
-   - [Reporting Readiness Checklist](#reporting-readiness-checklist)
-   - [Reporting](#reporting)
 
 ---
 
@@ -102,7 +102,7 @@ Before starting the review, confirm:
 
 ## Evidence Requirements (STRICT mode)
 
-**When Rules Mode = STRICT** (per `agent-compliance.md`):
+**When Rules Mode = STRICT** (per `{cypilot_path}/.core/requirements/agent-compliance.md`):
 
 ### For Each Checklist Category
 
@@ -283,6 +283,24 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Coupling between components minimized
 - [ ] Cohesion within components maximized
 
+### ARCH-DESIGN-009: Technology Stack Alignment
+**Severity**: MEDIUM
+
+- [ ] Technology choices documented (if applicable)
+- [ ] Choices align with constraints
+- [ ] Choices align with team capabilities
+- [ ] Choices support NFRs
+- [ ] Choices are maintainable long-term
+- [ ] Technology risks identified
+
+### ARCH-DESIGN-010: Capacity and Cost Budgets
+**Severity**: HIGH
+
+- [ ] Capacity planning approach documented
+- [ ] Cost estimation approach documented
+- [ ] Budget allocation strategy documented
+- [ ] Cost optimization patterns documented
+
 ---
 
 ## Semantic Alignment (SEM)
@@ -321,24 +339,6 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] ADR links include a clear trace to PRD context or requirement IDs
 - [ ] Design references to ADRs are complete and do not omit critical decisions
 - [ ] Any deviation from ADR decisions is explicitly justified and approved
-
-### ARCH-DESIGN-009: Technology Stack Alignment
-**Severity**: MEDIUM
-
-- [ ] Technology choices documented (if applicable)
-- [ ] Choices align with constraints
-- [ ] Choices align with team capabilities
-- [ ] Choices support NFRs
-- [ ] Choices are maintainable long-term
-- [ ] Technology risks identified
-
-### ARCH-DESIGN-010: Capacity and Cost Budgets
-**Severity**: HIGH
-
-- [ ] Capacity planning approach documented
-- [ ] Cost estimation approach documented
-- [ ] Budget allocation strategy documented
-- [ ] Cost optimization patterns documented
 
 ---
 
@@ -773,7 +773,7 @@ Before evaluating each checklist item, the expert MUST:
 
 ---
 
-## Deliberate Omissions
+## Deliberate Omissions (DOC)
 
 ### DOC-DESIGN-001: Explicit Non-Applicability
 **Severity**: CRITICAL
@@ -786,9 +786,7 @@ Before evaluating each checklist item, the expert MUST:
 
 # MUST NOT HAVE
 
----
-
-## ❌ ARCH-DESIGN-NO-001: No Spec-Level Details
+### ARCH-DESIGN-NO-001: No Spec-Level Details
 **Severity**: CRITICAL
 
 **What to check**:
@@ -800,10 +798,9 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: `Spec DESIGN`
 
----
-
-## ❌ ARCH-DESIGN-NO-002: No Decision Debates
+### ARCH-DESIGN-NO-002: No Decision Debates
 **Severity**: HIGH
+
 **What to check**:
 - [ ] No "we considered X vs Y" discussions
 - [ ] No pros/cons analysis of alternatives
@@ -813,9 +810,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: `ADR` (Architecture Decision Records)
 
----
-
-## ❌ BIZ-DESIGN-NO-003: No Product Requirements
+### BIZ-DESIGN-NO-003: No Product Requirements
 **Severity**: HIGH
 
 **What to check**:
@@ -827,9 +822,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: `PRD`
 
----
-
-## ❌ BIZ-DESIGN-NO-004: No Implementation Tasks
+### BIZ-DESIGN-NO-004: No Implementation Tasks
 **Severity**: HIGH
 
 **What to check**:
@@ -842,9 +835,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Project management tools or Spec DESIGN
 
----
-
-## ❌ DATA-DESIGN-NO-001: No Code-Level Schema Definitions
+### DATA-DESIGN-NO-001: No Code-Level Schema Definitions
 **Severity**: MEDIUM
 
 **What to check**:
@@ -855,10 +846,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Source code repository and/or schema repository, referenced from the design documentation
 
-
----
-
-## ❌ INT-DESIGN-NO-001: No Complete API Specifications
+### INT-DESIGN-NO-001: No Complete API Specifications
 **Severity**: MEDIUM
 
 **What to check**:
@@ -869,9 +857,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: API contract files (e.g., OpenAPI/GraphQL/proto), referenced from the design documentation
 
----
-
-## ❌ OPS-DESIGN-NO-001: No Infrastructure Code
+### OPS-DESIGN-NO-001: No Infrastructure Code
 **Severity**: MEDIUM
 
 **What to check**:
@@ -883,9 +869,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Infrastructure code repository or `infra/` directory
 
----
-
-## ❌ TEST-DESIGN-NO-001: No Test Code
+### TEST-DESIGN-NO-001: No Test Code
 **Severity**: MEDIUM
 
 **What to check**:
@@ -896,9 +880,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Test directories in source code
 
----
-
-## ❌ MAINT-DESIGN-NO-001: No Code Snippets
+### MAINT-DESIGN-NO-001: No Code Snippets
 **Severity**: HIGH
 
 **What to check**:
@@ -909,9 +891,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Source code, with links from documentation
 
----
-
-## ❌ SEC-DESIGN-NO-001: No Security Secrets
+### SEC-DESIGN-NO-001: No Security Secrets
 **Severity**: CRITICAL
 
 **What to check**:
@@ -940,7 +920,7 @@ Confirm before reporting results:
 
 ### Explicit Handling Verification
 
-For each major checklist category (ARCH, PERF, SEC, REL, DATA, INT, OPS, MAINT, TEST, COMPL, UX, BIZ), confirm:
+For each major checklist category (ARCH, SEM, PERF, SEC, REL, DATA, INT, OPS, MAINT, TEST, COMPL, UX, BIZ, DOC), confirm:
 
 - [ ] Category is addressed in the document, OR
 - [ ] Category is explicitly marked "Not applicable" with reasoning in the document, OR
@@ -969,7 +949,7 @@ Report **only** problems (do not list what is OK).
 
 For each issue include:
 
-- **Why Applicable**: Explain why this requirement applies to this specific DESIGN's context (e.g., "This DESIGN describes a web service architecture, therefore security architecture is required")
+- **Why Applicable**: Explain why this requirement applies to this artifact's context
 - **Issue**: What is wrong (requirement missing or incomplete)
 - **Evidence**: Quote the exact text or describe the exact location in the artifact (or note "No mention found")
 - **Why it matters**: Impact (risk, cost, user harm, compliance)
@@ -988,7 +968,7 @@ For each issue include:
 
 #### Why Applicable
 
-{Explain why this requirement applies to this DESIGN's context. E.g., "This DESIGN describes a distributed system architecture, therefore reliability architecture is required."}
+{Explain why this requirement applies to this artifact's context}
 
 #### Issue
 
@@ -1020,11 +1000,10 @@ For quick reviews, use this condensed table format:
 ## DESIGN Review Summary
 
 | ID | Severity | Issue | Proposal |
-|----|----------|-------|----------|
-| ARCH-DESIGN-001 | HIGH | Missing context diagram | Add system context diagram to Section A |
-| ARCH-DESIGN-005 | MEDIUM | No schema location | Add path to domain types in Section C.1 |
+|-----|----------|-------|----------|
+| {ID} | HIGH | Missing required element | Add element to Section X |
 
-**Applicability**: {System type} — checked {N} priority domains, {M} marked N/A
+**Applicability**: checked {N} priority domains, {M} marked N/A
 ```
 
 ---

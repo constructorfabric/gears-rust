@@ -9,6 +9,7 @@
 //! # Features
 //! - `pg`, `mysql`, `sqlite`: enable `SQLx` backends
 //! - `sea-orm`: add `SeaORM` integration for type-safe operations
+//! - `preview-outbox`: enable the transactional outbox pipeline (experimental — API may change)
 //!
 //! # New Architecture
 //! The crate now supports:
@@ -75,11 +76,14 @@ pub use sea_orm_migration;
 // Core modules
 pub mod advisory_locks;
 pub mod config;
+pub mod deadlock;
 pub mod manager;
 pub mod migration_runner;
 pub mod odata;
 pub mod options;
 
+#[cfg(feature = "preview-outbox")]
+pub mod outbox;
 pub mod secure;
 
 mod db_provider;
@@ -181,8 +185,11 @@ pub enum DbError {
     #[error("SQLite pragma error: {0}")]
     SqlitePragma(String),
 
-    #[error("Environment variable error: {0}")]
-    EnvVar(#[from] std::env::VarError),
+    #[error("Environment variable '{name}': {source}")]
+    EnvVar {
+        name: String,
+        source: std::env::VarError,
+    },
 
     #[error("URL parsing error: {0}")]
     UrlParse(#[from] url::ParseError),
@@ -230,6 +237,17 @@ pub enum DbError {
     /// ```
     #[error("Cannot create non-transactional connection inside an active transaction")]
     ConnRequestedInsideTx,
+}
+
+impl From<modkit_utils::var_expand::ExpandVarsError> for DbError {
+    fn from(err: modkit_utils::var_expand::ExpandVarsError) -> Self {
+        match err {
+            modkit_utils::var_expand::ExpandVarsError::Var { name, source } => {
+                Self::EnvVar { name, source }
+            }
+            modkit_utils::var_expand::ExpandVarsError::Regex(msg) => Self::InvalidParameter(msg),
+        }
+    }
 }
 
 impl From<crate::secure::ScopeError> for DbError {

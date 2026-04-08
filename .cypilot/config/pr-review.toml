@@ -1,0 +1,36 @@
+# PR Review Configuration
+# Paths are relative to project root.
+
+data_dir = ".prs"
+
+[[prompts]]
+name = "Code Review"
+description = "Review for PRs that change source code. Covers correctness, style, performance, security, and test coverage."
+prompt_file = ".cypilot/config/kits/sdlc/scripts/prompts/pr/code-review.md"
+checklist = "docs/checklists/CODING.md"
+coding_guidelines = "guidelines/DNA/languages/RUST.md"
+security_guidelines = "guidelines/SECURITY.md"
+
+[[prompts]]
+name = "Design Review"
+description = "Review for PRs that add or change design documents (DESIGN.md). Evaluates architecture, trade-offs, API contracts, industry alignment, and antipatterns."
+prompt_file = ".cypilot/config/kits/sdlc/scripts/prompts/pr/design-review.md"
+checklist = "docs/checklists/DESIGN.md"
+template = "docs/spec-templates/cf-sdlc/DESIGN/template.md"
+architecture = "docs/ARCHITECTURE_MANIFEST.md"
+
+[[prompts]]
+name = "ADR Review"
+description = "Review for PRs that add or change Architecture Decision Records. Checks problem scoping, template compliance, and overlap with existing ADRs."
+prompt_file = ".cypilot/config/kits/sdlc/scripts/prompts/pr/adr-review.md"
+checklist = "docs/checklists/ADR.md"
+template = "docs/spec-templates/cf-sdlc/ADR/template.md"
+existing_artifacts = "docs/adrs/"
+
+[[prompts]]
+name = "PRD Review"
+description = "Review for PRs that add or change PRD/requirements documents. Evaluates completeness, testability, traceability, and industry alignment."
+prompt_file = ".cypilot/config/kits/sdlc/scripts/prompts/pr/prd-review.md"
+checklist = "docs/checklists/PRD.md"
+template = "docs/spec-templates/cf-sdlc/PRD/template.md"
+project_domain = "docs/ARCHITECTURE_MANIFEST.md"

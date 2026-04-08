@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.llm_gateway.plugin_config.v1",
+  "title": "LlmPluginConfig",
+  "description": "LLM gateway plugin configuration stored in PluginConfig.config. Forwarded to the plugin in every call context as plugin_config.",
+  "type": "object",
+  "properties": {
+    "summarization_settings": {
+      "oneOf": [
+        { "$ref": "./LlmSummarizationSettings.json" },
+        { "type": "null" }
+      ],
+      "description": "Configuration for automatic context overflow summarization. When null, summarization is disabled and context_overflow errors propagate to the client."
+    }
+  },
+  "additionalProperties": false
+}

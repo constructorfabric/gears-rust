@@ -1,5 +1,41 @@
 # PRD — CredStore
 
+
+<!-- toc -->
+
+- [1. Overview](#1-overview)
+  - [1.1 Purpose](#11-purpose)
+  - [1.2 Background / Problem Statement](#12-background--problem-statement)
+  - [1.3 Goals (Business Outcomes)](#13-goals-business-outcomes)
+  - [1.4 Glossary](#14-glossary)
+- [2. Actors](#2-actors)
+  - [2.1 Human Actors](#21-human-actors)
+  - [2.2 System Actors](#22-system-actors)
+- [3. Operational Concept & Environment](#3-operational-concept--environment)
+  - [3.1 Module-Specific Environment Constraints](#31-module-specific-environment-constraints)
+- [4. Scope](#4-scope)
+  - [4.1 In Scope](#41-in-scope)
+  - [4.2 Out of Scope](#42-out-of-scope)
+- [5. Functional Requirements](#5-functional-requirements)
+  - [5.1 P1 — Core Operations](#51-p1--core-operations)
+  - [5.2 P1 — Hierarchical Sharing](#52-p1--hierarchical-sharing)
+  - [5.3 P1 — Authorization](#53-p1--authorization)
+  - [5.4 P2 — Planned](#54-p2--planned)
+- [6. Non-Functional Requirements](#6-non-functional-requirements)
+  - [6.1 Module-Specific NFRs](#61-module-specific-nfrs)
+- [7. Public Library Interfaces](#7-public-library-interfaces)
+  - [7.1 Public API Surface](#71-public-api-surface)
+  - [7.2 External Integration Contracts](#72-external-integration-contracts)
+- [8. Use Cases](#8-use-cases)
+- [9. Acceptance Criteria](#9-acceptance-criteria)
+- [10. Dependencies](#10-dependencies)
+- [11. Assumptions](#11-assumptions)
+- [12. Risks](#12-risks)
+- [13. Open Questions](#13-open-questions)
+- [14. Traceability](#14-traceability)
+
+<!-- /toc -->
+
 <!--
 =============================================================================
 PRODUCT REQUIREMENTS DOCUMENT (PRD)
@@ -336,7 +372,7 @@ Secret values **MUST NOT** appear in logs, error messages, or debug output at an
 
 ### 7.1 Public API Surface
 
-#### CredStoreClient
+#### CredStoreClientV1
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-interface-client`
 
@@ -347,7 +383,7 @@ Secret values **MUST NOT** appear in logs, error messages, or debug output at an
 **Breaking Change Policy**: Major version bump required
 <!-- cpt-cf-id-content -->
 
-#### CredStorePluginClient
+#### CredStorePluginClientV1
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-interface-plugin-client`
 
@@ -367,7 +403,7 @@ Secret values **MUST NOT** appear in logs, error messages, or debug output at an
 <!-- cpt-cf-id-content -->
 **Direction**: provided by library
 **Protocol/Format**: HTTP/REST, JSON
-**Compatibility**: Versioned URL path (`/api/credstore/v1/...`), backward-compatible within major version
+**Compatibility**: Versioned URL path (`/credstore/v1/...`), backward-compatible within major version
 <!-- cpt-cf-id-content -->
 
 #### VendorA Credstore REST
@@ -603,9 +639,6 @@ Secret values **MUST NOT** appear in logs, error messages, or debug output at an
 
 ## 13. Open Questions
 
-- ~~What is the exact error response when a secret exists in the hierarchy but is private — 403 (access denied) or 404 (not found)?~~ **RESOLVED**: Always return `404 NotFound` for all inaccessible secrets (whether missing, owner-mismatch, or private/tenant scope mismatch). This prevents enumeration attacks and avoids leaking secret existence information. Use `403 AccessDenied` only for permission failures (`Secrets:Read` or `Secrets:Write` missing).
-- ~~Can parent tenants access child tenant secrets?~~ **RESOLVED**: No. Hierarchical resolution is **downward-only** (parent → child → grandchild). A parent tenant **cannot** access a child's secrets, even if the child's secret is marked as `shared`. The `shared` mode allows descendants to access ancestor secrets, not the reverse. This enforces the principle of least privilege: child tenants can override parent credentials (shadowing) without exposing their own secrets upward.
-- Should `resolve` support batch retrieval (multiple references in one call) for OAGW efficiency?
 - **P2/Future - Human vs Service Access**: Should human users (tenant admins via UI) be restricted from retrieving raw secret values for inherited shared secrets, while service accounts (OAGW) can retrieve them? Constructor pattern: tenant admins can see metadata (reference, sharing mode, owner) but cannot get the decrypted value for shared secrets. This would require distinguishing human vs service authentication in SecurityCtx and different authorization rules.
 - **P2/Future - Audit Trails**: All credential operations (create, read, update, delete, access) should leave audit trails with timestamps, actor, tenant, and outcome. Audit entries must never contain plaintext secret values. Audit logs should be tamper-evident and stored securely.
 - **P2/Future - Schema Validation**: Should Constructor-managed secrets support JSON schema validation (using GTS)? On create/update, validate secret structure against registered schema. Useful for complex credentials (SMTP config, OAuth client credentials) where multiple fields must be present and correctly formatted. Schema can also specify raw string values for simple secrets.

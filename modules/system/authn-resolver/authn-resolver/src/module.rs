@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverPluginSpecV1};
 use modkit::Module;
 use modkit::context::ModuleCtx;
+use modkit::contracts::SystemCapability;
 use tracing::info;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
@@ -24,7 +25,7 @@ use crate::domain::{AuthNResolverLocalClient, Service};
 #[modkit::module(
     name = "authn-resolver",
     deps = ["types-registry"],
-    capabilities = []
+    capabilities = [system]
 )]
 pub(crate) struct AuthNResolver {
     service: OnceLock<Arc<Service>>,
@@ -38,18 +39,33 @@ impl Default for AuthNResolver {
     }
 }
 
+// Marked as `system` so that init() runs in the system-module phase.
+// This ensures the AuthNResolver client is available in ClientHub before
+// other system modules that depend on it.
+impl SystemCapability for AuthNResolver {}
+
 #[async_trait]
 impl Module for AuthNResolver {
     #[tracing::instrument(skip_all, fields(vendor))]
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
         let cfg: AuthNResolverConfig = ctx.config()?;
         tracing::Span::current().record("vendor", cfg.vendor.as_str());
-        info!(vendor = %cfg.vendor, "Initializing {} module", Self::MODULE_NAME);
+        info!(vendor = %cfg.vendor);
 
         // Register plugin schema in types-registry
         let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
         let schema_str = AuthNResolverPluginSpecV1::gts_schema_with_refs_as_string();
-        let schema_json: serde_json::Value = serde_json::from_str(&schema_str)?;
+        let mut schema_json: serde_json::Value = serde_json::from_str(&schema_str)?;
+        // Workaround for a bug in gts-macros: derived (child) schemas generated via
+        // gts_schema_with_refs_allof() omit "additionalProperties": false at the top level,
+        // even when the base schema declares it. The types-registry rejects this as loosening
+        // the base constraint. Patch it here until gts-macros is fixed upstream.
+        if let Some(obj) = schema_json.as_object_mut() {
+            obj.insert(
+                "additionalProperties".to_owned(),
+                serde_json::Value::Bool(false),
+            );
+        }
         let results = registry.register(vec![schema_json]).await?;
         RegisterResult::ensure_all_ok(&results)?;
         info!(
@@ -67,8 +83,6 @@ impl Module for AuthNResolver {
         // Register client in ClientHub
         let api: Arc<dyn AuthNResolverClient> = Arc::new(AuthNResolverLocalClient::new(svc));
         ctx.client_hub().register::<dyn AuthNResolverClient>(api);
-
-        info!("{} module initialized successfully", Self::MODULE_NAME);
 
         Ok(())
     }

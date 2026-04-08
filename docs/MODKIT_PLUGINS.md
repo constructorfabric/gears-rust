@@ -890,5 +890,5 @@ This ensures:
 
 - [docs/modkit_unified_system/03_clienthub_and_plugins.md](./modkit_unified_system/03_clienthub_and_plugins.md) — Typed ClientHub and plugin architecture
 - [docs/modkit_unified_system/04_rest_operation_builder.md](./modkit_unified_system/04_rest_operation_builder.md) — REST wiring with OperationBuilder
-- [NEW_MODULE.md](../guidelines/NEW_MODULE.md) — Step-by-step module creation guide
+- [ModKit Unified System](./modkit_unified_system/README.md) — Module creation and development guide
 - [ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md) — HyperSpot architecture overview

@@ -26,7 +26,9 @@ impl<T: Clone + Send + 'static> SseBroadcaster<T> {
     /// Broadcast a single message to current subscribers.
     /// Errors are ignored to keep the hot path cheap (e.g., no active subscribers).
     pub fn send(&self, value: T) {
-        _ = self.tx.send(value);
+        if self.tx.send(value).is_err() {
+            tracing::trace!("SSE broadcast: no active receivers");
+        }
     }
 
     /// Subscribe to a typed stream of messages; lag/drop errors are filtered out.

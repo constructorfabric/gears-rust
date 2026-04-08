@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.llm_gateway.usage.v1",
+  "title": "LlmUsage",
+  "description": "Token usage statistics for an LLM response. Stored as a dict inside Message.metadata (JSONB) by the LLM gateway plugin.",
+  "type": "object",
+  "properties": {
+    "prompt_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of tokens in the input prompt"
+    },
+    "completion_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of tokens generated in the response"
+    },
+    "total_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total tokens consumed (prompt + completion)"
+    },
+    "cached_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of prompt tokens served from cache (e.g., OpenAI prompt caching)"
+    }
+  },
+  "required": ["prompt_tokens", "completion_tokens", "total_tokens"],
+  "additionalProperties": false
+}

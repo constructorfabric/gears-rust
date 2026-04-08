@@ -1,21 +1,78 @@
-//! OpenTelemetry tracing configuration types
+//! OpenTelemetry tracing and metrics configuration types
 //!
-//! These types define the configuration structure for OpenTelemetry distributed tracing.
+//! These types define the configuration structure for OpenTelemetry distributed
+//! tracing and metrics.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// Top-level OpenTelemetry configuration grouping resource identity,
+/// a shared default exporter, tracing settings and metrics settings.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct OpenTelemetryConfig {
+    #[serde(default)]
+    pub resource: OpenTelemetryResource,
+    /// Default exporter shared by tracing and metrics. Per-signal `exporter`
+    /// fields override this when present.
+    pub exporter: Option<Exporter>,
+    #[serde(default)]
+    pub tracing: TracingConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+impl OpenTelemetryConfig {
+    /// Resolve the effective exporter for tracing (per-signal or shared fallback).
+    #[must_use]
+    pub fn tracing_exporter(&self) -> Option<&Exporter> {
+        self.tracing.exporter.as_ref().or(self.exporter.as_ref())
+    }
+    /// Resolve the effective exporter for metrics (per-signal or shared fallback).
+    #[must_use]
+    pub fn metrics_exporter(&self) -> Option<&Exporter> {
+        self.metrics.exporter.as_ref().or(self.exporter.as_ref())
+    }
+}
+
+/// OpenTelemetry resource identity — attached to all traces and metrics.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct OpenTelemetryResource {
+    /// Logical service name.
+    /// Fallback defaults (e.g. `"hyperspot"`) are applied by the application during telemetry initialization.
+    pub service_name: Option<String>,
+    /// Extra resource attributes added to every span and metric data point.
+    pub attributes: Option<BTreeMap<String, String>>,
+}
 
 /// Tracing configuration for OpenTelemetry distributed tracing
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TracingConfig {
     pub enabled: bool,
-    pub service_name: Option<String>,
+    /// Per-signal exporter override. When `None`, the shared
+    /// [`OpenTelemetryConfig::exporter`] is used instead.
     pub exporter: Option<Exporter>,
     pub sampler: Option<Sampler>,
     pub propagation: Option<Propagation>,
-    pub resource: Option<HashMap<String, String>>,
     pub http: Option<HttpOpts>,
     pub logs_correlation: Option<LogsCorrelation>,
+}
+
+/// Metrics configuration for OpenTelemetry metrics collection
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    /// Per-signal exporter override. When `None`, the shared
+    /// [`OpenTelemetryConfig::exporter`] is used instead.
+    pub exporter: Option<Exporter>,
+    /// Maximum number of distinct attribute combinations per instrument.
+    /// When the limit is reached, new combinations are folded into an
+    /// overflow data point.  `None` means the SDK default is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cardinality_limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq, Copy)]

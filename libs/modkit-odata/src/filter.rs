@@ -154,30 +154,18 @@ pub enum FilterError {
 
 pub type FilterResult<T> = Result<T, FilterError>;
 
-#[allow(unexpected_cfgs)]
 /// Parse an `OData` filter string into a typed `FilterNode`.
 ///
 /// # Errors
 ///
-/// Returns `FilterError::InvalidExpression` if parsing fails, the required feature is disabled,
+/// Returns `FilterError::InvalidExpression` if parsing fails
 /// or the expression cannot be converted into a typed filter node.
 pub fn parse_odata_filter<F: FilterField>(raw: &str) -> FilterResult<FilterNode<F>> {
-    #[cfg(feature = "with-odata-params")]
-    {
-        use odata_params::filters::parse_str;
+    use crate::odata_filters::parse_str;
 
-        let ast = parse_str(raw).map_err(|e| FilterError::InvalidExpression(format!("{e:?}")))?;
-        let ast: odata_ast::Expr = ast.into();
-        convert_expr_to_filter_node::<F>(&ast)
-    }
-
-    #[cfg(not(feature = "with-odata-params"))]
-    {
-        let _ = raw;
-        Err(FilterError::InvalidExpression(
-            "OData filter parsing requires 'with-odata-params' feature".to_owned(),
-        ))
-    }
+    let ast = parse_str(raw).map_err(|e| FilterError::InvalidExpression(format!("{e:?}")))?;
+    let ast: odata_ast::Expr = ast.into();
+    convert_expr_to_filter_node::<F>(&ast)
 }
 
 /// Convert a parsed `OData` AST expression into a typed `FilterNode`.

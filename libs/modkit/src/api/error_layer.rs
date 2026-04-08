@@ -103,6 +103,21 @@ pub fn map_error_to_problem(error: &dyn Any, instance: &str, trace_id: Option<St
             )
             .with_code("CONFIG_INVALID")
             .with_type("https://errors.example.com/CONFIG_INVALID"),
+
+            ConfigError::VarExpand { module, source } => {
+                tracing::error!(
+                    module = %module,
+                    error = %source,
+                    "Environment variable expansion failed in module config"
+                );
+                Problem::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Configuration Error",
+                    format!("Module '{module}' has invalid environment-backed configuration"),
+                )
+                .with_code("CONFIG_ENV_EXPAND")
+                .with_type("https://errors.example.com/CONFIG_ENV_EXPAND")
+            }
         };
 
         problem = problem.with_instance(instance);
@@ -211,6 +226,42 @@ mod tests {
         assert_eq!(problem.code, "INTERNAL_ERROR");
         assert_eq!(problem.instance, "/tests/v1/test");
         assert_eq!(problem.trace_id, Some("trace456".to_owned()));
+    }
+
+    #[test]
+    fn test_config_var_expand_error_sanitizes_detail() {
+        let source = modkit_utils::var_expand::ExpandVarsError::Var {
+            name: "SECRET_API_KEY".to_owned(),
+            source: std::env::VarError::NotPresent,
+        };
+        let error = ConfigError::VarExpand {
+            module: "my_mod".to_owned(),
+            source,
+        };
+        let problem = error.into_problem("/tests/v1/test", Some("trace789".to_owned()));
+
+        assert_eq!(problem.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.code, "CONFIG_ENV_EXPAND");
+        assert_eq!(
+            problem.type_url,
+            "https://errors.example.com/CONFIG_ENV_EXPAND"
+        );
+        assert_eq!(problem.instance, "/tests/v1/test");
+        assert_eq!(problem.trace_id, Some("trace789".to_owned()));
+
+        // Detail MUST NOT leak the env var name or the underlying error message.
+        assert!(
+            !problem.detail.contains("SECRET_API_KEY"),
+            "detail must not contain env var name, got: {}",
+            problem.detail,
+        );
+        assert!(
+            !problem.detail.contains("not present"),
+            "detail must not contain source error text, got: {}",
+            problem.detail,
+        );
+        // It should still mention the module name (non-sensitive).
+        assert!(problem.detail.contains("my_mod"));
     }
 
     #[test]

@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   check-reviewers:
+    # Disabled to stop automated PR comments and Telegram notifications.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Check reviewers and notify

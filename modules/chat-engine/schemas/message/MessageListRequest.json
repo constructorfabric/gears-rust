@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.message.list_request.v1",
+  "title": "MessageListRequest",
+  "description": "Request to list messages in a session",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "$ref": "../common/GtsSessionId.json",
+      "description": "Session identifier"
+    },
+    "parent_message_id": {
+      "oneOf": [
+        { "$ref": "../common/GtsMessageId.json" },
+        { "type": "null" }
+      ],
+      "description": "Filter by parent message ID (for specific branch)"
+    }
+  },
+  "required": ["session_id"],
+  "additionalProperties": false
+}

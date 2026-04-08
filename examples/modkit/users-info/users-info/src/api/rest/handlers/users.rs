@@ -1,17 +1,32 @@
+use axum::Extension;
+use axum::extract::Path;
 use axum::http::Uri;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
+use tracing::field::Empty;
 use uuid::Uuid;
+
+use modkit::api::odata::OData;
 
 use super::{
     ApiResult, Json, JsonBody, JsonPage, SecurityContext, UpdateUserReq, UserDto, UserFullDto,
     apply_select, created_json, info, no_content, page_to_projected_json,
 };
+use crate::api::rest::dto::CreateUserReq;
 use crate::module::ConcreteAppServices;
 
-pub(super) async fn list_users(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    query: modkit::api::odata::ODataQuery,
+/// List users with cursor-based pagination and optional field projection via $select
+#[tracing::instrument(
+    skip(svc, query, ctx),
+    fields(
+        limit = query.limit,
+        request_id = Empty,
+        user.id = %ctx.subject_id()
+    )
+)]
+pub async fn list_users(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    OData(query): OData,
 ) -> ApiResult<JsonPage<serde_json::Value>> {
     info!(
         user_id = %ctx.subject_id(),
@@ -24,11 +39,20 @@ pub(super) async fn list_users(
     Ok(Json(page_to_projected_json(&page, query.selected_fields())))
 }
 
-pub(super) async fn get_user(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    id: Uuid,
-    query: modkit::api::odata::ODataQuery,
+/// Get a specific user by ID with optional field projection via $select
+#[tracing::instrument(
+    skip(svc, ctx),
+    fields(
+        user.id = %id,
+        request_id = Empty,
+        requester.id = %ctx.subject_id()
+    )
+)]
+pub async fn get_user(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Path(id): Path<Uuid>,
+    OData(query): OData,
 ) -> ApiResult<JsonBody<serde_json::Value>> {
     info!(
         user_id = %id,
@@ -42,22 +66,64 @@ pub(super) async fn get_user(
     Ok(Json(projected))
 }
 
-pub(super) async fn create_user(
+/// Create a new user
+#[tracing::instrument(
+    skip(svc, req_body, ctx, uri),
+    fields(
+        user.email = %req_body.email,
+        user.display_name = %req_body.display_name,
+        user.tenant_id = %req_body.tenant_id,
+        request_id = Empty,
+        creator.id = %ctx.subject_id()
+    )
+)]
+pub async fn create_user(
     uri: Uri,
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    new_user: users_info_sdk::NewUser,
-) -> ApiResult<Response> {
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Json(req_body): Json<CreateUserReq>,
+) -> ApiResult<impl IntoResponse> {
+    info!(
+        email = %req_body.email,
+        display_name = %req_body.display_name,
+        tenant_id = %req_body.tenant_id,
+        creator_id = %ctx.subject_id(),
+        "Creating new user"
+    );
+
+    let CreateUserReq {
+        id,
+        tenant_id,
+        email,
+        display_name,
+    } = req_body;
+
+    let new_user = users_info_sdk::NewUser {
+        id,
+        tenant_id,
+        email,
+        display_name,
+    };
+
     let user = svc.users.create_user(&ctx, new_user).await?;
     let id_str = user.id.to_string();
     Ok(created_json(UserDto::from(user), &uri, &id_str).into_response())
 }
 
-pub(super) async fn update_user(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    id: Uuid,
-    req_body: UpdateUserReq,
+/// Update an existing user
+#[tracing::instrument(
+    skip(svc, req_body, ctx),
+    fields(
+        user.id = %id,
+        request_id = Empty,
+        updater.id = %ctx.subject_id()
+    )
+)]
+pub async fn update_user(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Path(id): Path<Uuid>,
+    Json(req_body): Json<UpdateUserReq>,
 ) -> ApiResult<JsonBody<UserDto>> {
     info!(
         user_id = %id,
@@ -70,11 +136,20 @@ pub(super) async fn update_user(
     Ok(Json(UserDto::from(user)))
 }
 
-pub(super) async fn delete_user(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    id: Uuid,
-) -> ApiResult<Response> {
+/// Delete a user by ID
+#[tracing::instrument(
+    skip(svc, ctx),
+    fields(
+        user.id = %id,
+        request_id = Empty,
+        deleter.id = %ctx.subject_id()
+    )
+)]
+pub async fn delete_user(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
     info!(
         user_id = %id,
         deleter_id = %ctx.subject_id(),

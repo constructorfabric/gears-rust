@@ -33,18 +33,13 @@ serde_json = { workspace = true }
 utoipa = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 uuid = { workspace = true }
-sea-orm = { workspace = true, features = [
-    "sqlx-sqlite",
-    "runtime-tokio-rustls",
-    "macros",
-    "with-time",
-    "with-uuid",
-] }
+# Database - SeaORM (driver features come from modkit-db)
+sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 thiserror = { workspace = true }
 
 modkit = { workspace = true }
-modkit-db = { workspace = true }
+modkit-db = { workspace = true, features = ["sqlite"] }
 modkit-db-macros = { workspace = true }
 modkit-errors = { workspace = true }
 modkit-errors-macro = { workspace = true }
@@ -53,4 +48,3 @@ modkit-macros = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
-modkit-db = { workspace = true, features = ["sqlite"] }

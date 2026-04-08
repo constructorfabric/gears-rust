@@ -1,0 +1,1913 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Chat Engine HTTP REST API",
+    "description": "RESTful HTTP API for Chat Engine client operations. Used for CRUD operations, queries, control operations, and streaming responses via HTTP chunked transfer encoding (newline-delimited JSON).",
+    "version": "1.0.0",
+    "contact": {
+      "name": "Chat Engine Team"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://chat-engine/api/v1",
+      "description": "Production server"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/sessions": {
+      "post": {
+        "summary": "Create new session",
+        "operationId": "createSession",
+        "tags": [
+          "Session Management"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Session created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionCreateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}": {
+      "get": {
+        "summary": "Get session details",
+        "operationId": "getSession",
+        "tags": [
+          "Session Management"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete session",
+        "description": "Delete a session (soft by default, hard if requested). Soft delete is recoverable.",
+        "operationId": "deleteSession",
+        "tags": [
+          "Session Management"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          },
+          {
+            "name": "deletion_type",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "soft",
+                "hard"
+              ],
+              "default": "soft"
+            },
+            "description": "Type of deletion: soft (recoverable) or hard (permanent)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/soft-delete": {
+      "post": {
+        "summary": "Soft delete session",
+        "description": "Mark session as soft-deleted (recoverable within retention period)",
+        "operationId": "softDeleteSession",
+        "tags": [
+          "Session Management"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionSoftDeleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session soft-deleted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSoftDeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Conflict - session already deleted"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/restore": {
+      "post": {
+        "summary": "Restore soft-deleted session",
+        "description": "Restore a session from soft-deleted state back to active",
+        "operationId": "restoreSession",
+        "tags": [
+          "Session Management"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionRestoreRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session restored successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRestoreResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Conflict - session not in soft-deleted state"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/type": {
+      "patch": {
+        "summary": "Switch session type",
+        "operationId": "switchSessionType",
+        "tags": [
+          "Session Management"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "new_session_type_id"
+                ],
+                "properties": {
+                  "new_session_type_id": {
+                    "$ref": "../schemas/common/GtsSessionTypeId.json"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session type switched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "session_id": {
+                      "$ref": "../schemas/common/GtsSessionId.json"
+                    },
+                    "session_type_id": {
+                      "$ref": "../schemas/common/GtsSessionTypeId.json"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/export": {
+      "post": {
+        "summary": "Export session",
+        "operationId": "exportSession",
+        "tags": [
+          "Session Management"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "format",
+                  "scope"
+                ],
+                "properties": {
+                  "format": {
+                    "type": "string",
+                    "enum": [
+                      "json",
+                      "markdown",
+                      "txt"
+                    ]
+                  },
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "all"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Export ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "download_url": {
+                      "type": "string"
+                    },
+                    "expires_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/share": {
+      "post": {
+        "summary": "Generate share link",
+        "operationId": "shareSession",
+        "tags": [
+          "Session Management"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "expires_at": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Share link created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "share_token": {
+                      "type": "string"
+                    },
+                    "share_url": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/share/{token}": {
+      "get": {
+        "summary": "Access shared session",
+        "operationId": "accessSharedSession",
+        "tags": [
+          "Session Management"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Shared session data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "session_id": {
+                      "$ref": "../schemas/common/GtsSessionId.json"
+                    },
+                    "messages": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Message"
+                      }
+                    },
+                    "read_only": {
+                      "type": "boolean"
+                    },
+                    "metadata": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/search": {
+      "get": {
+        "summary": "Search within session",
+        "operationId": "searchSession",
+        "tags": [
+          "Search Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "maximum": 100
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResults"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/search": {
+      "get": {
+        "summary": "Search across all sessions",
+        "operationId": "searchAllSessions",
+        "tags": [
+          "Search Operations"
+        ],
+        "parameters": [
+          {
+            "name": "query",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "maximum": 100
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSearchResults"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/messages/send": {
+      "post": {
+        "summary": "Send message with streaming response",
+        "operationId": "sendMessage",
+        "tags": [
+          "Message Operations"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MessageSendRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Streaming response (newline-delimited JSON)",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/StreamingStartEvent"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StreamingChunkEvent"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StreamingCompleteEvent"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StreamingErrorEvent"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/messages/{id}/recreate": {
+      "post": {
+        "summary": "Recreate message with streaming response",
+        "operationId": "recreateMessage",
+        "tags": [
+          "Message Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MessageId"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MessageRecreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Streaming response (newline-delimited JSON)",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/StreamingStartEvent"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StreamingChunkEvent"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StreamingCompleteEvent"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StreamingErrorEvent"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/summarize": {
+      "post": {
+        "summary": "Generate session summary with streaming response",
+        "operationId": "summarizeSession",
+        "tags": [
+          "Session Management"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionSummarizeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Streaming response (newline-delimited JSON)",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/StreamingStartEvent"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StreamingChunkEvent"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StreamingCompleteEvent"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StreamingErrorEvent"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/messages": {
+      "get": {
+        "summary": "List messages in session",
+        "operationId": "listMessages",
+        "tags": [
+          "Message Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          },
+          {
+            "name": "parent_message_id",
+            "in": "query",
+            "schema": {
+              "$ref": "../schemas/common/GtsMessageId.json"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "messages": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Message"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/messages/{id}": {
+      "get": {
+        "summary": "Get message details",
+        "operationId": "getMessage",
+        "tags": [
+          "Message Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MessageId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/messages/{id}/reaction": {
+      "post": {
+        "summary": "Add or update message reaction",
+        "operationId": "reactToMessage",
+        "tags": [
+          "Message Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MessageId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MessageReactionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reaction applied successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageReactionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/messages/{id}/variants": {
+      "get": {
+        "summary": "Get message variants",
+        "operationId": "getMessageVariants",
+        "tags": [
+          "Message Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MessageId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message variants",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "variants": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MessageVariant"
+                      }
+                    },
+                    "current_index": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/messages/{message_id}": {
+      "delete": {
+        "summary": "Delete message",
+        "description": "Permanently delete a message and cascade delete all associated reactions. Validates session ownership via JWT identity before deletion.",
+        "operationId": "deleteMessage",
+        "tags": [
+          "Message Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          },
+          {
+            "$ref": "#/components/parameters/MessageItemId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message deleted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageDeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "parameters": {
+      "SessionId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "../schemas/common/GtsSessionId.json"
+        }
+      },
+      "MessageId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "../schemas/common/GtsMessageId.json"
+        }
+      },
+      "MessageItemId": {
+        "name": "message_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "../schemas/common/GtsMessageId.json"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Bad request",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Unauthorized",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Forbidden - authenticated but not authorized",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "InternalServerError": {
+        "description": "Internal server error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "SessionCreateRequest": {
+        "type": "object",
+        "required": [
+          "session_type_id"
+        ],
+        "properties": {
+          "session_type_id": {
+            "$ref": "../schemas/common/GtsSessionTypeId.json"
+          }
+        },
+        "description": "Request to create a new chat session. tenant_id, user_id, and client_id are extracted from JWT."
+      },
+      "SessionCreateResponse": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "$ref": "../schemas/common/GtsSessionId.json"
+          },
+          "enabled_capabilities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Capability"
+            }
+          }
+        }
+      },
+      "Session": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "$ref": "../schemas/common/GtsSessionId.json"
+          },
+          "client_id": {
+            "$ref": "../schemas/common/GtsClientId.json",
+            "description": "Calling application identifier"
+          },
+          "session_type_id": {
+            "$ref": "../schemas/common/GtsSessionTypeId.json"
+          },
+          "enabled_capabilities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Capability"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "$ref": "../schemas/common/GtsMessageId.json"
+          },
+          "session_id": {
+            "$ref": "../schemas/common/GtsSessionId.json"
+          },
+          "parent_message_id": {
+            "oneOf": [
+              {
+                "$ref": "../schemas/common/GtsMessageId.json"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant",
+              "system"
+            ]
+          },
+          "content": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContentPart"
+            }
+          },
+          "file_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Array of file UUIDs (stable identifiers from File Storage Service). Clients must implement separate integration with File Storage Service to display files."
+          },
+          "variant_index": {
+            "type": "integer"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "is_complete": {
+            "type": "boolean"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "MessageVariant": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "$ref": "../schemas/common/GtsMessageId.json"
+          },
+          "variant_index": {
+            "type": "integer"
+          },
+          "content": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContentPart"
+            }
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ContentPart": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TextContent"
+          },
+          {
+            "$ref": "#/components/schemas/CodeContent"
+          },
+          {
+            "$ref": "#/components/schemas/ImageContent"
+          },
+          {
+            "$ref": "#/components/schemas/AudioContent"
+          },
+          {
+            "$ref": "#/components/schemas/VideoContent"
+          },
+          {
+            "$ref": "#/components/schemas/DocumentContent"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "text": "#/components/schemas/TextContent",
+            "code": "#/components/schemas/CodeContent",
+            "image": "#/components/schemas/ImageContent",
+            "audio": "#/components/schemas/AudioContent",
+            "video": "#/components/schemas/VideoContent",
+            "document": "#/components/schemas/DocumentContent"
+          }
+        }
+      },
+      "TextContent": {
+        "type": "object",
+        "required": [
+          "type",
+          "text"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "text"
+          },
+          "text": {
+            "type": "string",
+            "description": "The text content"
+          }
+        }
+      },
+      "CodeContent": {
+        "type": "object",
+        "required": [
+          "type",
+          "code"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "code"
+          },
+          "code": {
+            "type": "string",
+            "description": "The code content"
+          },
+          "language": {
+            "type": "string",
+            "description": "Programming language identifier"
+          }
+        }
+      },
+      "ImageContent": {
+        "type": "object",
+        "required": [
+          "type",
+          "image_url"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "image"
+          },
+          "image_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL to the image resource"
+          },
+          "alt_text": {
+            "type": "string",
+            "description": "Alternative text for accessibility"
+          }
+        }
+      },
+      "AudioContent": {
+        "type": "object",
+        "required": [
+          "type",
+          "audio_url"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "audio"
+          },
+          "audio_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL to the audio resource"
+          },
+          "duration": {
+            "type": "number",
+            "description": "Duration in seconds"
+          }
+        }
+      },
+      "VideoContent": {
+        "type": "object",
+        "required": [
+          "type",
+          "video_url"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "video"
+          },
+          "video_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL to the video resource"
+          },
+          "duration": {
+            "type": "number",
+            "description": "Duration in seconds"
+          }
+        }
+      },
+      "DocumentContent": {
+        "type": "object",
+        "required": [
+          "type",
+          "document_url"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "document"
+          },
+          "document_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL to the document resource"
+          },
+          "filename": {
+            "type": "string",
+            "description": "Original filename"
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "MIME type of the document"
+          }
+        }
+      },
+      "Capability": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "config": {
+            "type": "object"
+          },
+          "metadata": {
+            "type": "object"
+          }
+        }
+      },
+      "SearchResults": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "message_id": {
+                  "$ref": "../schemas/common/GtsMessageId.json"
+                },
+                "content": {
+                  "type": "string"
+                },
+                "context": {
+                  "type": "string"
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            }
+          },
+          "total": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          }
+        }
+      },
+      "SessionSearchResults": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "session_id": {
+                  "$ref": "../schemas/common/GtsSessionId.json"
+                },
+                "metadata": {
+                  "type": "object"
+                },
+                "matched_messages": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "message_id": {
+                        "$ref": "../schemas/common/GtsMessageId.json"
+                      },
+                      "content": {
+                        "type": "string"
+                      },
+                      "context": {
+                        "type": "string"
+                      },
+                      "created_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "total": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "type",
+          "title",
+          "status"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "URI reference identifying the problem type"
+          },
+          "title": {
+            "type": "string",
+            "description": "Short, human-readable summary of the problem type"
+          },
+          "status": {
+            "type": "integer",
+            "description": "HTTP status code"
+          },
+          "detail": {
+            "type": "string",
+            "description": "Human-readable explanation specific to this occurrence"
+          },
+          "instance": {
+            "type": "string",
+            "description": "URI reference identifying the specific occurrence"
+          },
+          "code": {
+            "$ref": "../schemas/common/ErrorCode.json"
+          },
+          "trace_id": {
+            "type": "string",
+            "description": "W3C trace ID for support correlation"
+          },
+          "errors": {
+            "type": "array",
+            "description": "Field-level validation violations",
+            "items": {
+              "$ref": "../schemas/common/ValidationViolation.json"
+            }
+          }
+        }
+      },
+      "MessageReactionRequest": {
+        "type": "object",
+        "required": [
+          "reaction_type"
+        ],
+        "properties": {
+          "reaction_type": {
+            "type": "string",
+            "enum": [
+              "like",
+              "dislike",
+              "none"
+            ]
+          }
+        }
+      },
+      "MessageReactionResponse": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "reaction_type",
+          "applied"
+        ],
+        "properties": {
+          "message_id": {
+            "$ref": "../schemas/common/GtsMessageId.json"
+          },
+          "reaction_type": {
+            "type": "string",
+            "enum": [
+              "like",
+              "dislike",
+              "none"
+            ]
+          },
+          "applied": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MessageSendRequest": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "content"
+        ],
+        "properties": {
+          "session_id": {
+            "$ref": "../schemas/common/GtsSessionId.json"
+          },
+          "content": {
+            "type": "string"
+          },
+          "file_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "maxItems": 10,
+            "description": "Array of file UUIDs attached to this message (stable identifiers from File Storage Service)"
+          },
+          "parent_message_id": {
+            "$ref": "../schemas/common/GtsMessageId.json"
+          },
+          "enabled_capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "MessageRecreateRequest": {
+        "type": "object",
+        "properties": {
+          "enabled_capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "MessageDeleteResponse": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "deleted"
+        ],
+        "properties": {
+          "message_id": {
+            "$ref": "../schemas/common/GtsMessageId.json",
+            "description": "ID of the deleted message"
+          },
+          "deleted": {
+            "type": "boolean",
+            "const": true,
+            "description": "Confirmation that the message was deleted"
+          },
+          "deleted_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp when the deletion occurred"
+          }
+        }
+      },
+      "SessionSummarizeRequest": {
+        "type": "object",
+        "properties": {
+          "enabled_capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "StreamingStartEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "message_id"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "start"
+          },
+          "message_id": {
+            "$ref": "../schemas/common/GtsMessageId.json"
+          }
+        }
+      },
+      "StreamingChunkEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "message_id",
+          "chunk"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "chunk"
+          },
+          "message_id": {
+            "$ref": "../schemas/common/GtsMessageId.json"
+          },
+          "chunk": {
+            "type": "object",
+            "required": [
+              "type",
+              "content"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text",
+                  "code",
+                  "image",
+                  "audio",
+                  "video",
+                  "document"
+                ]
+              },
+              "content": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "StreamingCompleteEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "message_id"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "complete"
+          },
+          "message_id": {
+            "$ref": "../schemas/common/GtsMessageId.json"
+          },
+          "metadata": {
+            "type": "object",
+            "properties": {
+              "usage": {
+                "type": "object",
+                "properties": {
+                  "input_units": {
+                    "type": "integer"
+                  },
+                  "output_units": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "StreamingErrorEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "message_id",
+          "code",
+          "detail"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "error"
+          },
+          "message_id": {
+            "$ref": "../schemas/common/GtsMessageId.json"
+          },
+          "code": {
+            "$ref": "../schemas/common/ErrorCode.json"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "SessionDeleteResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "deleted",
+          "deletion_type",
+          "deleted_at"
+        ],
+        "properties": {
+          "session_id": {
+            "$ref": "../schemas/common/GtsSessionId.json"
+          },
+          "deleted": {
+            "type": "boolean",
+            "const": true
+          },
+          "deletion_type": {
+            "type": "string",
+            "enum": [
+              "soft",
+              "hard"
+            ]
+          },
+          "deleted_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "scheduled_hard_delete_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When soft deleted, shows scheduled permanent deletion time"
+          }
+        }
+      },
+      "SessionSoftDeleteRequest": {
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "properties": {
+          "session_id": {
+            "$ref": "../schemas/common/GtsSessionId.json"
+          }
+        }
+      },
+      "SessionSoftDeleteResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "lifecycle_state",
+          "deleted_at",
+          "scheduled_hard_delete_at"
+        ],
+        "properties": {
+          "session_id": {
+            "$ref": "../schemas/common/GtsSessionId.json"
+          },
+          "lifecycle_state": {
+            "type": "string",
+            "enum": [
+              "active",
+              "archived",
+              "soft_deleted",
+              "hard_deleted"
+            ]
+          },
+          "deleted_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "scheduled_hard_delete_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SessionRestoreRequest": {
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "properties": {
+          "session_id": {
+            "$ref": "../schemas/common/GtsSessionId.json"
+          }
+        }
+      },
+      "SessionRestoreResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "lifecycle_state",
+          "restored_at"
+        ],
+        "properties": {
+          "session_id": {
+            "$ref": "../schemas/common/GtsSessionId.json"
+          },
+          "lifecycle_state": {
+            "type": "string",
+            "enum": [
+              "active",
+              "archived",
+              "soft_deleted",
+              "hard_deleted"
+            ]
+          },
+          "restored_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Session Management",
+      "description": "Session CRUD operations and configuration"
+    },
+    {
+      "name": "Message Operations",
+      "description": "Message retrieval and control operations"
+    },
+    {
+      "name": "Search Operations",
+      "description": "Search messages within sessions and across sessions"
+    }
+  ]
+}

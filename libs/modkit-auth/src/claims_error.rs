@@ -36,23 +36,8 @@ pub enum ClaimsError {
     #[error("Invalid claim format: {field} - {reason}")]
     InvalidClaimFormat { field: String, reason: String },
 
-    #[error("No matching plugin found for token")]
-    NoMatchingPlugin,
-
-    #[error("No key provider could validate this token")]
-    NoValidatingKey,
-
-    #[error("No matching key provider")]
-    NoMatchingProvider,
-
     #[error("Unknown key ID after refresh")]
     UnknownKidAfterRefresh,
-
-    #[error("Introspection denied")]
-    IntrospectionDenied,
-
-    #[error("Invalid configuration: {0}")]
-    ConfigError(String),
 
     #[error("JWT decode failed: {0}")]
     DecodeFailed(String),

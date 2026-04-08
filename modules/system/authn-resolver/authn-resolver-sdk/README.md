@@ -66,7 +66,10 @@ Implement `AuthNResolverPluginClient` and register with a GTS instance ID:
 
 ```rust
 use async_trait::async_trait;
-use authn_resolver_sdk::{AuthNResolverPluginClient, AuthenticationResult, AuthNResolverError};
+use authn_resolver_sdk::{
+    AuthNResolverPluginClient, AuthenticationResult, AuthNResolverError,
+    ClientCredentialsRequest,
+};
 
 struct MyOidcPlugin { /* ... */ }
 
@@ -75,6 +78,11 @@ impl AuthNResolverPluginClient for MyOidcPlugin {
     async fn authenticate(&self, bearer_token: &str)
         -> Result<AuthenticationResult, AuthNResolverError> {
         // Validate token, extract claims, build SecurityContext
+    }
+
+    async fn exchange_client_credentials(&self, request: &ClientCredentialsRequest)
+        -> Result<AuthenticationResult, AuthNResolverError> {
+        // OAuth2 client_credentials flow → SecurityContext
     }
 }
 ```

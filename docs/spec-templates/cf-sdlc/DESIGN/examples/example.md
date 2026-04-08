@@ -1,14 +1,36 @@
-# Technical Design — Todo App
+# Technical Design: TaskFlow
+
+<!-- toc -->
+
+- [1. Architecture Overview](#1-architecture-overview)
+  - [1.1 Architectural Vision](#11-architectural-vision)
+  - [1.2 Architecture Drivers](#12-architecture-drivers)
+  - [1.3 Architecture Layers](#13-architecture-layers)
+- [2. Principles & Constraints](#2-principles--constraints)
+  - [2.1 Design Principles](#21-design-principles)
+  - [2.2 Constraints](#22-constraints)
+- [3. Technical Architecture](#3-technical-architecture)
+  - [3.1 Domain Model](#31-domain-model)
+  - [3.2 Component Model](#32-component-model)
+  - [3.3 API Contracts](#33-api-contracts)
+  - [3.4 Internal Dependencies](#34-internal-dependencies)
+  - [3.5 External Dependencies](#35-external-dependencies)
+  - [3.6 Interactions & Sequences](#36-interactions--sequences)
+  - [3.7 Database schemas & tables](#37-database-schemas--tables)
+  - [3.6: Topology (optional)](#36-topology-optional)
+  - [3.7: Tech stack (optional)](#37-tech-stack-optional)
+- [4. Additional Context](#4-additional-context)
+- [5. Traceability](#5-traceability)
+
+<!-- /toc -->
 
 ## 1. Architecture Overview
 
 ### 1.1 Architectural Vision
 
-The Todo App follows a clean architecture approach with clear separation between presentation, business logic, and data layers. The frontend is built as a single-page application (SPA) communicating with a RESTful backend API.
+TaskFlow uses a layered architecture with clear separation of concerns: React SPA frontend, Node.js REST API, and PostgreSQL database. WebSocket connections enable real-time updates for collaborative task management.
 
-The system prioritizes offline-first capabilities using local storage with background synchronization. This ensures users can work without interruption regardless of network conditions.
-
-Event-driven architecture is employed for real-time updates and cross-device synchronization via WebSockets.
+The architecture prioritizes simplicity and developer productivity while supporting real-time collaboration. System boundaries are clearly defined between presentation, business logic, and data persistence layers.
 
 ### 1.2 Architecture Drivers
 
@@ -279,32 +301,45 @@ sequenceDiagram
 
 ### 3.7 Database schemas & tables
 
-#### Table: tasks
+#### Table tasks
 
-**ID**: `cpt-examples-todo-app-design-db-tasks`
+- [ ] `p1` - **ID**: `cpt-ex-task-flow-dbtable-tasks`
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | UUID | PK | Primary key |
-| user_id | UUID | FK, NOT NULL | Foreign key to users |
-| title | VARCHAR(255) | NOT NULL | Task title |
-| description | TEXT | | Optional description |
-| status | ENUM | NOT NULL, DEFAULT 'active' | 'active', 'completed' |
-| priority | ENUM | NOT NULL | 'low', 'medium', 'high' |
-| category_id | UUID | FK | Optional foreign key to categories |
-| due_date | TIMESTAMP | | Optional due date |
-| created_at | TIMESTAMP | NOT NULL | Creation timestamp |
-| updated_at | TIMESTAMP | NOT NULL | Last update timestamp |
+Schema
 
-**Indexes**: user_id, status, due_date
+| Column | Type | Description |
+|--------|------|-------------|
+| id | uuid | Task ID (PK) |
+| title | text | Task title (required) |
+| description | text | Task description |
+| status | enum | TODO, IN_PROGRESS, DONE |
+| assignee_id | uuid | FK to users.id |
 
-**Notes**: status defaults to 'active' on insert
+PK: `id`
+
+Constraints: `status IN ('TODO', 'IN_PROGRESS', 'DONE')`, `assignee_id REFERENCES users(id)`
+
+Example
+
+| id | title | status |
+|----|-------|--------|
+| 550e8400... | Implement login | IN_PROGRESS |
+
+### 3.6: Topology (optional)
+
+- [ ] **ID**: `cpt-ex-task-flow-topology-local`
+
+Local development: React SPA (port 3000) + API server (port 4000) + PostgreSQL (port 5432) + Redis (port 6379) on single machine. Production: Kubernetes deployment with horizontal scaling of API pods.
+
+### 3.7: Tech stack (optional)
+
+**Status**: Accepted
+
+Backend: Node.js 18 LTS, TypeScript 5.x, Express 4.x, pg-pool for PostgreSQL, ioredis for Redis. Frontend: React 18, TypeScript, Vite build tool. Testing: Jest, React Testing Library. Rationale: Team familiarity, mature ecosystem, strong TypeScript support.
 
 ## 4. Additional Context
 
-**ID**: `cpt-examples-todo-app-design-context-decisions`
-
-The choice of React over other frameworks was driven by team expertise and ecosystem maturity. PostgreSQL was selected for its reliability and JSON support for flexible task metadata.
+TaskFlow prioritizes real-time collaboration and predictable REST semantics. Future considerations include mobile app support and Slack integration. Trade-offs accepted: PostgreSQL requires operational overhead vs SQLite simplicity.
 
 ## 5. Traceability
 

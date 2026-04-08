@@ -10,6 +10,7 @@ mod manager;
 mod options;
 mod pooling_tests;
 mod secure_insert_tenant_validation;
+mod secure_select_project_all;
 mod secure_update_tenant_safety;
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod sqlite_tests;

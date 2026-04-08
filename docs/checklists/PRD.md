@@ -5,6 +5,36 @@
 **Last Updated**: 2026-02-03
 **Purpose**: Comprehensive quality checklist for PRD artifacts
 
+## Table of Contents
+
+1. [Referenced Standards](#referenced-standards)
+2. [Prerequisites](#prerequisites)
+3. [Applicability Context](#applicability-context)
+4. [Severity Dictionary](#severity-dictionary)
+5. [Applicability Determination](#applicability-determination)
+6. [Checkpointing (Long Reviews)](#checkpointing-long-reviews)
+7. [MUST HAVE](#must-have)
+   - [BUSINESS Expertise (BIZ)](#business-expertise-biz)
+   - [ARCHITECTURE Expertise (ARCH)](#architecture-expertise-arch)
+   - [🔒 SECURITY Expertise (SEC)](#security-expertise-sec)
+   - [🛡️ SAFETY Expertise (SAFE)](#safety-expertise-safe)
+   - [⚡ PERFORMANCE Expertise (PERF)](#performance-expertise-perf)
+   - [🛡️ RELIABILITY Expertise (REL)](#reliability-expertise-rel)
+   - [👤 USABILITY Expertise (UX)](#usability-expertise-ux)
+   - [🔧 MAINTAINABILITY Expertise (MAINT)](#maintainability-expertise-maint)
+   - [📜 COMPLIANCE Expertise (COMPL)](#compliance-expertise-compl)
+   - [📊 DATA Expertise (DATA)](#data-expertise-data)
+   - [🔌 INTEGRATION Expertise (INT)](#integration-expertise-int)
+   - [🖥️ OPERATIONS Expertise (OPS)](#operations-expertise-ops)
+   - [🧪 TESTING Expertise (TEST)](#testing-expertise-test)
+   - [DOC (DOC)](#doc-doc)
+8. [MUST NOT HAVE](#must-not-have)
+9. [Validation Summary](#validation-summary)
+   - [Final Checklist](#final-checklist)
+   - [Reporting Readiness Checklist](#reporting-readiness-checklist)
+   - [Reporting](#reporting)
+   - [Reporting Commitment](#reporting-commitment)
+
 ---
 
 ## Referenced Standards
@@ -27,48 +57,6 @@ This checklist incorporates requirements and best practices from the following i
 | [HIPAA](https://www.hhs.gov/hipaa/for-professionals/security/laws-regulations/index.html) | Healthcare Privacy | Health information privacy and security |
 | [PCI DSS 4.0.1](https://blog.pcisecuritystandards.org/pci-dss-v4-0-resource-hub) | Payment Security | Payment card data security |
 | [SOC 2 TSC](https://www.aicpa-cima.com/resources/download/2017-trust-services-criteria-with-revised-points-of-focus-2022) | Trust Services | Security, availability, confidentiality, processing integrity, privacy |
-
----
-
-## Table of Contents
-
-1. [Referenced Standards](#referenced-standards)
-2. [Prerequisites](#prerequisites)
-3. [Applicability Context](#applicability-context)
-4. [Severity Dictionary](#severity-dictionary)
-5. [Applicability Determination](#applicability-determination) — criteria for "(if applicable)" items
-6. [Checkpointing](#checkpointing-long-reviews) — for long reviews / context limits
-7. **MUST HAVE** (check in priority order):
-   - [BIZ: Business](#business-expertise-biz) — Vision, Stakeholders, Requirements, Use Cases ⭐ Start here
-   - [ARCH: Architecture](#architecture-expertise-arch) — Scope, Modularity, Scalability, Compatibility
-   - [SEC: Security](#-security-expertise-sec) — Auth, Authorization, Data Classification, Privacy by Design
-   - [SAFE: Safety](#-safety-expertise-safe) — Operational Safety, Hazard Prevention *(ISO 25010:2023)*
-   - [TEST: Testing](#-testing-expertise-test) — Acceptance Criteria, Testability
-   - [PERF: Performance](#-performance-expertise-perf) — Response Time, Throughput
-   - [REL: Reliability](#️-reliability-expertise-rel) — Availability, Recovery
-   - [UX: Usability](#-usability-expertise-ux) — UX Goals, Accessibility, Inclusivity
-   - [DATA: Data](#-data-expertise-data) — Ownership, Quality, Lifecycle
-   - [INT: Integration](#-integration-expertise-int) — External Systems, APIs
-   - [COMPL: Compliance](#-compliance-expertise-compl) — Regulatory, Legal
-   - [MAINT: Maintainability](#-maintainability-expertise-maint) — Documentation, Support
-   - [OPS: Operations](#️-operations-expertise-ops) — Deployment, Monitoring
-   - [Deliberate Omissions](#deliberate-omissions) — DOC-PRD-001
-8. **MUST NOT HAVE**:
-   - [No Technical Implementation](#-arch-prd-no-001-no-technical-implementation-details)
-   - [No Architectural Decisions](#-arch-prd-no-002-no-architectural-decisions)
-   - [No Implementation Tasks](#-biz-prd-no-001-no-implementation-tasks)
-   - [No Spec-Level Design](#-biz-prd-no-002-no-spec-level-design)
-   - [No Data Schema](#-data-prd-no-001-no-data-schema-definitions)
-   - [No API Specs](#-int-prd-no-001-no-api-specifications)
-   - [No Test Cases](#-test-prd-no-001-no-test-cases)
-   - [No Infrastructure Specs](#-ops-prd-no-001-no-infrastructure-specifications)
-   - [No Security Implementation](#-sec-prd-no-001-no-security-implementation-details)
-   - [No Code-Level Docs](#-maint-prd-no-001-no-code-level-documentation)
-9. [Validation Summary](#validation-summary)
-10. [Reporting](#reporting)
-
-**Review Priority**: BIZ → ARCH → SEC → TEST → (others as applicable)
-
 ---
 
 ## Prerequisites
@@ -700,7 +688,7 @@ Mark review as "PARTIAL" if not all domains completed.
 
 ---
 
-## Deliberate Omissions
+## Deliberate Omissions (DOC)
 
 ### DOC-PRD-001: Explicit Non-Applicability
 **Severity**: CRITICAL
@@ -903,7 +891,7 @@ For each issue include:
 - **Why it matters**: Impact (risk, cost, user harm, compliance)
 - **Proposal**: Concrete fix (what to change/add/remove) with clear acceptance criteria
 
-Recommended output format for chat:
+### Full Report Format (Standard/Full Reviews)
 
 ```markdown
 ## Review Report (Issues Only)
@@ -937,22 +925,20 @@ Recommended output format for chat:
 ---
 
 ### 2. {Short issue title}
+```
 
-**Checklist Item**: `{CHECKLIST-ID}` — {Checklist item title}
+### Compact Report Format (Quick Reviews)
 
-**Severity**: CRITICAL|HIGH|MEDIUM|LOW
+For quick reviews, use this condensed table format:
 
-#### Why Applicable
+```markdown
+## PRD Review Summary
 
-{...}
+| ID | Severity | Issue | Proposal |
+|-----|----------|-------|----------|
+| {ID} | HIGH | Missing required element | Add element to Section X |
 
-#### Issue
-
-{...}
-
----
-
-...
+**Applicability**: checked {N} priority domains, {M} marked N/A
 ```
 
 ---

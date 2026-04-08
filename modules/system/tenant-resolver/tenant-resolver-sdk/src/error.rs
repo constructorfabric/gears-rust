@@ -1,7 +1,8 @@
 //! Error types for the tenant resolver module.
 
 use thiserror::Error;
-use uuid::Uuid;
+
+use crate::TenantId;
 
 /// Errors that can occur when using the tenant resolver API.
 #[derive(Debug, Error)]
@@ -10,7 +11,7 @@ pub enum TenantResolverError {
     #[error("tenant not found: {tenant_id}")]
     TenantNotFound {
         /// The tenant ID that was not found.
-        tenant_id: Uuid,
+        tenant_id: TenantId,
     },
 
     /// The request is not authorized.

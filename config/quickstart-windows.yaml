@@ -2,7 +2,7 @@
 #
 # Database Architecture Overview:
 # ===============================
-# 
+#
 # HyperSpot uses a centralized DbManager that:
 # 1. Loads global database server templates from `database.servers`
 # 2. For each module, merges server template with module-specific overrides
@@ -16,19 +16,19 @@
 # - Environment variables are expanded (${VAR_NAME})
 # - All paths are resolved relative to server.home_dir
 
-# Core server configuration (global section)  
+# Core server configuration (global section)
 server:
   home_dir: "~/.hyperspot"
 
 # Database configuration (DbManager architecture)
-# 
+#
 # The database config has two levels:
 # 1. Global "servers" - shared connection templates that modules can reference
 # 2. Per-module configs - specific database settings for each module
 #
 # Configuration precedence (highest to lowest):
 # - Module `params` map (highest priority)
-# - Module DSN query params 
+# - Module DSN query params
 # - Module fields (host, port, user, etc.)
 # - Module DSN base
 # - Server `params` map
@@ -54,7 +54,7 @@ database:
       pool:
         max_conns: 5             # Maximum 5 concurrent connections
         acquire_timeout: "30s"   # Timeout when acquiring connection from pool
-  
+
   # Global database options
   # auto_provision: true       # (default) Create directories automatically for SQLite files
   # auto_provision: false      # Fail if directories don't exist
@@ -96,13 +96,13 @@ modules:
       bind_addr: "0.0.0.0:8087"
       enable_docs: true
       cors_enabled: false
-      
+
       # OpenAPI Documentation Configuration
       openapi:
         title: "HyperSpot API"
         version: "0.1.0"
         description: "HyperSpot Server API Documentation"
-      
+
       # Authentication Configuration
       auth_disabled: true
       require_auth_by_default: true
@@ -139,28 +139,28 @@ modules:
     database:
       # Reference to global server template defined above
       server: "sqlite_users"               # Inherits params and pool settings from sqlite_users
-      
+
       # Module-specific database file (required for SQLite modules)
       file: "users_info.db"                # Creates: ~/.hyperspot/users_info/users_info.db
-      
+
       # Module can override server settings:
       # params:
       #   synchronous: "FULL"              # Would override server's "NORMAL" setting
       #   custom_pragma: "value"           # Would add new PRAGMA setting
       # pool:
       #   max_conns: 10                    # Would override server's max_conns: 5
-      
+
       # Alternative ways to specify database location:
       # path: "/absolute/path/to/db.sqlite" # Use absolute path instead of file
       # dsn: "sqlite://custom.db?WAL=false" # Complete DSN override (ignores server)
-      
+
       # For other database types (PostgreSQL, MySQL):
       # host: "localhost"                  # Override server host
-      # port: 5432                         # Override server port  
+      # port: 5432                         # Override server port
       # user: "app_user"                   # Override server user
       # password: "${DB_PASSWORD}"         # Environment variable expansion
       # dbname: "users_db"                 # Override server database name
-    
+
     # Module-specific application configuration
     config:
       default_page_size: 5
@@ -168,94 +168,114 @@ modules:
 
   tenant-resolver:
     config:
-      vendor: "Fabrikam"
-  contoso-tr-plugin:
-    config: {}
-  fabrikam-tr-plugin:
+      vendor: "hyperspot"
+  static-tr-plugin:
     config:
-      vendor: "Fabrikam"
+      vendor: "hyperspot"
       priority: 20
       # Tenant tree configuration (example: company with 2 divisions, each with departments)
       tenants:
         # Root tenant (company level)
-        - id: "00000000000000000000000000000001"
-          status: ACTIVE
-          is_accessible_by_parent: true
+        - id: "00000000-0000-0000-0000-000000000001"
+          name: "company-root"
+          parent_id: null
+          status: active
 
         # Division 1: Engineering
-        - id: "00000000000000000000000000000010"
-          parent_id: "00000000000000000000000000000001"
-          status: ACTIVE
-          is_accessible_by_parent: true
+        - id: "00000000-0000-0000-0000-000000000010"
+          name: "engineering"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
 
         # Division 2: Sales
-        - id: "00000000000000000000000000000011"
-          parent_id: "00000000000000000000000000000001"
-          status: ACTIVE
-          is_accessible_by_parent: true
+        - id: "00000000-0000-0000-0000-000000000011"
+          name: "sales"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
 
         # Department under Engineering: Backend
-        - id: "00000000000000000000000000000100"
-          parent_id: "00000000000000000000000000000010"
-          status: ACTIVE
-          is_accessible_by_parent: true
+        - id: "00000000-0000-0000-0000-000000000100"
+          name: "backend"
+          parent_id: "00000000-0000-0000-0000-000000000010"
+          status: active
 
-        # Department under Engineering: Frontend (soft-deleted, not accessible)
-        - id: "00000000000000000000000000000101"
-          parent_id: "00000000000000000000000000000010"
-          status: SOFT_DELETED
-          is_accessible_by_parent: false
+        # Department under Engineering: Frontend (soft-deleted)
+        - id: "00000000-0000-0000-0000-000000000101"
+          name: "frontend"
+          parent_id: "00000000-0000-0000-0000-000000000010"
+          status: deleted
 
         # Department under Sales: Enterprise
-        - id: "00000000000000000000000000000110"
-          parent_id: "00000000000000000000000000000011"
-          status: ACTIVE
-          is_accessible_by_parent: true
+        - id: "00000000-0000-0000-0000-000000000110"
+          name: "enterprise"
+          parent_id: "00000000-0000-0000-0000-000000000011"
+          status: active
+
+  static-credstore-plugin:
+    config:
+      secrets:
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          owner_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          key: "openai-key"
+          value: "sk-test-e2e-fake-key"
 
   # File parser module configuration (no database needed)
   file-parser:
     config:
       allowed_local_base_dir: "C:\\Temp"
 
-# OpenTelemetry tracing configuration
-tracing:
-  enabled: false
-  service_name: "hyperspot-api"
+# OpenTelemetry configuration (resource identity, tracing, metrics)
+opentelemetry:
+  # Shared resource identity (attached to all traces and metrics)
+  resource:
+    service_name: "hyperspot-api"
+    attributes:
+      service.version: "1.3.7"
+      deployment.environment: "dev"
+      service.namespace: "hyperspot"
 
-  # OTLP exporter configuration
+  # Default exporter shared by tracing and metrics.
+  # Per-signal `exporter` fields override this when present.
   exporter:
     kind: "otlp_grpc"  # or "otlp_http"
-    endpoint: "http://127.0.0.1:14317"  # Jaeger OTLP gRPC endpoint
-    # For HTTP: endpoint: "http://127.0.0.1:4318/v1/traces"
+    endpoint: "http://127.0.0.1:4317"
     headers:
       # Add any required headers, e.g., for authentication
       # authorization: "Bearer your-token"
       uptrace-dsn: "http://project1_secret@localhost:14318?grpc=14317"
     timeout_ms: 5000
 
-  # Sampling configuration
-  sampler:
-    parent_based_ratio: # parentbased_always_on | parent_based_ratio | always_on | always_off
-      ratio: 1.0  # Sample 20% of traces (only used with ratio strategies)
+  # Tracing configuration
+  tracing:
+    enabled: false
 
-  # Propagation configuration
-  propagation:
-    w3c_trace_context: true  # Enable W3C Trace Context propagation
+    # Per-signal exporter override (fully replaces the shared exporter)
+    exporter:
+      kind: "otlp_grpc"
+      endpoint: "http://127.0.0.1:14317"  # Jaeger OTLP gRPC endpoint
 
-  # Resource attributes (added to all spans)
-  resource:
-    service.version: "1.3.7"
-    deployment.environment: "dev"
-    service.namespace: "hyperspot"
+    # Sampling configuration
+    sampler:
+      parent_based_ratio: # parent_based_always_on | parent_based_ratio | always_on | always_off
+        ratio: 1.0  # Sample 100% of traces
 
-  # HTTP-specific options
-  http:
-    inject_request_id_header: "x-request-id"
-    record_headers: [ "user-agent", "x-forwarded-for", "authorization" ]
+    # Propagation configuration
+    propagation:
+      w3c_trace_context: true  # Enable W3C Trace Context propagation
 
-  # Log correlation (future feature)
-  logs_correlation:
-    inject_trace_ids_into_logs: true
+    # HTTP-specific options
+    http:
+      inject_request_id_header: "x-request-id"
+      # WARNING: "authorization" sends bearer tokens to the trace collector — dev/test only
+      record_headers: [ "user-agent", "x-forwarded-for", "authorization" ]
+
+    # Log correlation (future feature)
+    logs_correlation:
+      inject_trace_ids_into_logs: true
+
+  # Metrics configuration
+  metrics:
+    enabled: false
 
 # Example configurations for different database scenarios:
 #
@@ -318,4 +338,3 @@ tracing:
 #     # No database section - module won't get database access
 #     config:
 #       static_dir: "/var/www/static"
-

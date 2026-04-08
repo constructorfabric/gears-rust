@@ -1,5 +1,28 @@
 # Technical Design — Todo App
 
+
+<!-- toc -->
+
+- [1. Architecture Overview](#1-architecture-overview)
+  - [1.1 Architectural Vision](#11-architectural-vision)
+  - [1.2 Architecture Drivers](#12-architecture-drivers)
+  - [1.3 Architecture Layers](#13-architecture-layers)
+- [2. Principles & Constraints](#2-principles--constraints)
+  - [2.1 Design Principles](#21-design-principles)
+  - [2.2 Constraints](#22-constraints)
+- [3. Technical Architecture](#3-technical-architecture)
+  - [3.1 Domain Model](#31-domain-model)
+  - [3.2 Component Model](#32-component-model)
+  - [3.3 API Contracts](#33-api-contracts)
+  - [3.4 Internal Dependencies](#34-internal-dependencies)
+  - [3.5 External Dependencies](#35-external-dependencies)
+  - [3.6 Interactions & Sequences](#36-interactions--sequences)
+  - [3.7 Database schemas & tables](#37-database-schemas--tables)
+- [4. Additional Context](#4-additional-context)
+- [5. Traceability](#5-traceability)
+
+<!-- /toc -->
+
 ## 1. Architecture Overview
 
 ### 1.1 Architectural Vision

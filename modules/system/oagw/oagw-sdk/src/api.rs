@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use modkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -42,7 +43,7 @@ impl ErrorSource {
 /// ```ignore
 /// let gw = hub.get::<dyn ServiceGatewayClientV1>()?;
 /// ```
-#[async_trait::async_trait]
+#[async_trait]
 pub trait ServiceGatewayClientV1: Send + Sync {
     // -- Upstream CRUD --
 
@@ -107,21 +108,20 @@ pub trait ServiceGatewayClientV1: Send + Sync {
 
     // -- Resolution --
 
-    /// Resolve an upstream by alias. Returns UpstreamDisabled if the upstream exists but is disabled.
-    async fn resolve_upstream(
+    /// Resolve the effective (hierarchy-merged) upstream and matched route for
+    /// the given alias, HTTP method, and path — without executing the proxy
+    /// pipeline (no auth, rate-limiting, or forwarding).
+    ///
+    /// Performs a single tenant hierarchy walk, applies alias shadowing, and
+    /// returns the merged configuration. Useful for startup validation,
+    /// diagnostics, and config preview.
+    async fn resolve_proxy_target(
         &self,
         ctx: SecurityContext,
         alias: &str,
-    ) -> Result<Upstream, ServiceGatewayError>;
-
-    /// Find the best matching route for the given method and path under an upstream.
-    async fn resolve_route(
-        &self,
-        ctx: SecurityContext,
-        upstream_id: Uuid,
         method: &str,
         path: &str,
-    ) -> Result<Route, ServiceGatewayError>;
+    ) -> Result<(Upstream, Route), ServiceGatewayError>;
 
     // -- Proxy --
 

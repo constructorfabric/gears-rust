@@ -30,8 +30,6 @@ impl Default for NodesRegistry {
 #[async_trait]
 impl Module for NodesRegistry {
     async fn init(&self, ctx: &ModuleCtx) -> Result<()> {
-        tracing::info!("Initializing {} module", Self::MODULE_NAME);
-
         // Create the service
         let service = Arc::new(Service::new());
         self.service
@@ -42,7 +40,6 @@ impl Module for NodesRegistry {
         let api: Arc<dyn NodesRegistryClient> = Arc::new(NodesRegistryLocalClient::new(service));
         ctx.client_hub().register::<dyn NodesRegistryClient>(api);
 
-        tracing::info!("{} module initialized successfully", Self::MODULE_NAME);
         Ok(())
     }
 }

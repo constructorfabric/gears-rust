@@ -283,7 +283,7 @@
     - Location: `DESIGN.md` → OData list query parameters (lines 1964-1973)
     - Issue: Design lists OData options but doesn't specify validation rules (length/field count/duplicates) required by `case-25.2`
     - Impact: DoS vector via very long `$select`, inconsistent errors
-    - Recommendation: Reference `docs/ODATA_SELECT.md` explicitly, define shared validator
+    - Recommendation: Reference `docs/modkit_unified_system/07_odata_pagination_select_filter.md` explicitly, define shared validator
 
 - [ ] 5.5 **[Medium]** Rate Limit Merge Incomplete (Cascade)
     - Location: `DESIGN.md` → Merge Strategies (lines 660-668)

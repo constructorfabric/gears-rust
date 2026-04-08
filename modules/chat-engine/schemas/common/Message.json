@@ -1,0 +1,88 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.common.message.v1",
+  "title": "Message",
+  "description": "Chat message entity containing content and metadata",
+  "type": "object",
+  "properties": {
+    "message_id": {
+      "$ref": "./GtsMessageId.json",
+      "description": "Unique message identifier"
+    },
+    "session_id": {
+      "$ref": "./GtsSessionId.json",
+      "description": "Session this message belongs to"
+    },
+    "role": {
+      "$ref": "./Role.json"
+    },
+    "content": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "description": "Simple text content"
+        },
+        {
+          "type": "array",
+          "items": { "$ref": "./ContentPart.json" },
+          "minItems": 1,
+          "description": "Multipart content (text, code, images, etc.)"
+        }
+      ]
+    },
+    "file_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "description": "Attached file UUIDs"
+    },
+    "parent_message_id": {
+      "oneOf": [
+        { "$ref": "./GtsMessageId.json" },
+        { "type": "null" }
+      ],
+      "description": "Parent message in the conversation tree"
+    },
+    "variant_info": {
+      "oneOf": [
+        { "$ref": "./VariantInfo.json" },
+        { "type": "null" }
+      ],
+      "description": "Variant information if this message has siblings"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Optional message metadata",
+      "properties": {
+        "usage": {
+          "oneOf": [
+            { "$ref": "./Usage.json" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Message creation timestamp",
+      "examples": ["2024-01-15T10:30:00Z"]
+    },
+    "lifecycle_state": {
+      "$ref": "./LifecycleState.json",
+      "description": "Current lifecycle state (inherited from session)"
+    },
+    "deleted_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Timestamp when message was deleted (cascaded from session)"
+    }
+  },
+  "required": ["message_id", "session_id", "role", "content", "lifecycle_state", "created_at"],
+  "additionalProperties": false
+}

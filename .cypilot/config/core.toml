@@ -1,0 +1,105 @@
+# Cypilot project configuration
+
+version = "1.0"
+project_root = ".."
+
+[kits]
+[kits.sdlc]
+format = "Cypilot"
+path = "config/kits/sdlc"
+source = "github:cyberfabric/cyber-pilot-kit-sdlc"
+version = "1.2.0"
+
+[kits.sdlc.resources]
+[kits.sdlc.resources.adr_template]
+path = "../docs/spec-templates/cf-sdlc/ADR/template.md"
+
+[kits.sdlc.resources.adr_rules]
+path = "config/kits/sdlc/artifacts/ADR/rules.md"
+
+[kits.sdlc.resources.adr_checklist]
+path = "../docs/checklists/ADR.md"
+
+[kits.sdlc.resources.adr_example]
+path = "../docs/spec-templates/cf-sdlc/ADR/examples"
+
+[kits.sdlc.resources.decomposition_template]
+path = "../docs/spec-templates/cf-sdlc/DECOMPOSITION/template.md"
+
+[kits.sdlc.resources.decomposition_rules]
+path = "config/kits/sdlc/artifacts/DECOMPOSITION/rules.md"
+
+[kits.sdlc.resources.decomposition_checklist]
+path = "../docs/checklists/DECOMPOSITION.md"
+
+[kits.sdlc.resources.decomposition_example]
+path = "../docs/spec-templates/cf-sdlc/DECOMPOSITION/examples"
+
+[kits.sdlc.resources.design_template]
+path = "../docs/spec-templates/cf-sdlc/DESIGN/template.md"
+
+[kits.sdlc.resources.design_rules]
+path = "config/kits/sdlc/artifacts/DESIGN/rules.md"
+
+[kits.sdlc.resources.design_checklist]
+path = "../docs/checklists/DESIGN.md"
+
+[kits.sdlc.resources.design_example]
+path = "../docs/spec-templates/cf-sdlc/DESIGN/examples"
+
+[kits.sdlc.resources.feature_template]
+path = "../docs/spec-templates/cf-sdlc/FEATURE/template.md"
+
+[kits.sdlc.resources.feature_rules]
+path = "config/kits/sdlc/artifacts/FEATURE/rules.md"
+
+[kits.sdlc.resources.feature_checklist]
+path = "../docs/checklists/FEATURE.md"
+
+[kits.sdlc.resources.feature_example]
+path = "../docs/spec-templates/cf-sdlc/FEATURE/examples"
+
+[kits.sdlc.resources.prd_template]
+path = "../docs/spec-templates/cf-sdlc/PRD/template.md"
+
+[kits.sdlc.resources.prd_rules]
+path = "config/kits/sdlc/artifacts/PRD/rules.md"
+
+[kits.sdlc.resources.prd_checklist]
+path = "../docs/checklists/PRD.md"
+
+[kits.sdlc.resources.prd_example]
+path = "../docs/spec-templates/cf-sdlc/PRD/examples"
+
+[kits.sdlc.resources.pr_code_review_template]
+path = "config/kits/sdlc/artifacts/PR-CODE-REVIEW-TEMPLATE/template.md"
+
+[kits.sdlc.resources.pr_status_report_template]
+path = "config/kits/sdlc/artifacts/PR-STATUS-REPORT-TEMPLATE/template.md"
+
+[kits.sdlc.resources.codebase_rules]
+path = "config/kits/sdlc/codebase/rules.md"
+
+[kits.sdlc.resources.codebase_checklist]
+path = "../docs/checklists/CODING.md"
+
+[kits.sdlc.resources.workflow_pr_review]
+path = "config/kits/sdlc/workflows/pr-review.md"
+
+[kits.sdlc.resources.workflow_pr_status]
+path = "config/kits/sdlc/workflows/pr-status.md"
+
+[kits.sdlc.resources.scripts]
+path = "config/kits/sdlc/scripts"
+
+[kits.sdlc.resources.constraints]
+path = "config/kits/sdlc/constraints.toml"
+
+[kits.sdlc.resources.skill]
+path = "config/kits/sdlc/SKILL.md"
+
+[kits.sdlc.resources.agents]
+path = "config/kits/sdlc/AGENTS.md"
+
+[kits.sdlc.resources.workflow_migrate_openspec]
+path = "config/kits/sdlc/workflows/migrate-openspec.md"

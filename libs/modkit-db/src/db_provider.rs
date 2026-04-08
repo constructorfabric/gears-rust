@@ -41,6 +41,15 @@ where
         }
     }
 
+    /// Returns a clone of the inner [`Db`] handle.
+    ///
+    /// Cheap (clones an inner `Arc`). Useful when the caller needs the raw
+    /// `Db` — e.g. to pass to [`Outbox::builder`](crate::outbox::Outbox::builder).
+    #[must_use]
+    pub fn db(&self) -> Db {
+        (*self.db).clone()
+    }
+
     /// Create a non-transactional database runner.
     ///
     /// # Errors

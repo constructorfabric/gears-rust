@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.llm_gateway.message_get_response.v1",
+  "title": "LlmMessageGetResponse",
+  "description": "MessageGetResponse as returned for LLM gateway sessions. Extends the base response with typed metadata containing LLM response facts.",
+  "allOf": [
+    { "$ref": "../message/MessageGetResponse.json" },
+    {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "$ref": "./LlmMessageMetadata.json"
+        }
+      }
+    }
+  ]
+}

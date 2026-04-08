@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.core.events.event.v1~x.chat_engine.webhook.session_deleted_event.v1~",
+  "title": "SessionDeletedEvent",
+  "description": "Webhook event sent when a session is deleted",
+  "type": "object",
+  "properties": {
+    "event": {
+      "type": "string",
+      "const": "session.deleted",
+      "description": "Event type identifier"
+    },
+    "session_id": {
+      "$ref": "../common/GtsSessionId.json"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Event timestamp",
+      "examples": ["2024-01-15T10:30:00Z"]
+    }
+  },
+  "required": ["event", "session_id", "timestamp"],
+  "additionalProperties": false
+}

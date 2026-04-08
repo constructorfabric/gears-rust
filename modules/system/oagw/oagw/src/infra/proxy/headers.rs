@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use crate::domain::model::{PassthroughMode, RequestHeaderRules};
 use http::{HeaderMap, HeaderName, HeaderValue};
+use oagw_sdk::api::ErrorSource;
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -96,6 +99,22 @@ pub fn strip_internal_headers(headers: &mut HeaderMap) {
     }
 }
 
+/// Extract `ErrorSource` from the `x-oagw-error-source` response header.
+///
+/// Must be called **before** [`sanitize_response_headers`] which strips all
+/// `x-oagw-*` headers. Returns `ErrorSource::Upstream` when the header is
+/// absent or has an unrecognised value (upstream responses never carry the
+/// header, so absence ⇒ upstream).
+pub fn extract_error_source(headers: &HeaderMap) -> ErrorSource {
+    match headers
+        .get("x-oagw-error-source")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("gateway") => ErrorSource::Gateway,
+        _ => ErrorSource::Upstream,
+    }
+}
+
 /// Sanitize upstream response headers before forwarding to the client.
 /// Strips hop-by-hop headers and `x-oagw-*` internal headers.
 pub fn sanitize_response_headers(headers: &mut HeaderMap) {
@@ -143,10 +162,88 @@ pub fn set_host_header(headers: &mut HeaderMap, host: &str, port: u16) {
     }
 }
 
+/// Convert an HTTP `HeaderMap` to a `HashMap<String, String>` for plugin contexts.
+///
+/// Non-UTF-8 header values are silently dropped (they cannot be represented as
+/// `String` and are rare in practice).
+pub fn header_map_to_hash_map(headers: &HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_string(), s.to_string()))
+        })
+        .collect()
+}
+
+/// Convert an HTTP `HeaderMap` to a `Vec<(String, String)>` preserving multi-valued headers.
+///
+/// Non-UTF-8 header values are silently dropped (they cannot be represented as
+/// `String` and are rare in practice).
+pub fn header_map_to_vec(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_string(), s.to_string()))
+        })
+        .collect()
+}
+
+/// Convert a `Vec<(String, String)>` back to an HTTP `HeaderMap`, preserving multi-values.
+///
+/// Entries with invalid header names or values are logged at `debug` level and
+/// dropped — this can happen when a plugin injects malformed headers.
+pub fn vec_to_header_map(headers: &[(String, String)]) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (k, v) in headers {
+        match (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            (Ok(name), Ok(val)) => {
+                out.append(name, val);
+            }
+            _ => {
+                tracing::debug!(
+                    header_name = %k,
+                    "plugin-mutated header dropped: invalid name or value"
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Convert a `HashMap<String, String>` back to an HTTP `HeaderMap`.
+///
+/// Entries with invalid header names or values are logged at `debug` level and
+/// dropped — this can happen when a plugin injects malformed headers.
+pub fn hash_map_to_header_map(headers: &HashMap<String, String>) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (k, v) in headers {
+        match (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            (Ok(name), Ok(val)) => {
+                out.insert(name, val);
+            }
+            _ => {
+                tracing::debug!(
+                    header_name = %k,
+                    "plugin-mutated header dropped: invalid name or value"
+                );
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
 
     #[test]
@@ -249,6 +346,39 @@ mod tests {
         assert!(headers.get("x-oagw-target-host").is_none());
         assert!(headers.get("x-oagw-trace-id").is_none());
         assert_eq!(headers.get("x-custom").unwrap(), "keep");
+    }
+
+    /// Client-supplied internal headers (including x-oagw-internal-resolved-addr)
+    /// must be stripped before service.rs injects its own values.
+    /// This prevents a malicious client from influencing upstream routing.
+    #[test]
+    fn strip_removes_spoofed_internal_context_headers() {
+        let mut headers = HeaderMap::new();
+        // Simulate a malicious client injecting all internal context headers.
+        headers.insert("x-oagw-internal-endpoint-host", "evil.com".parse().unwrap());
+        headers.insert("x-oagw-internal-endpoint-port", "9999".parse().unwrap());
+        headers.insert("x-oagw-internal-endpoint-scheme", "http".parse().unwrap());
+        headers.insert(
+            "x-oagw-internal-resolved-addr",
+            "1.2.3.4:443".parse().unwrap(),
+        );
+        headers.insert("x-oagw-internal-instance-uri", "/pwned".parse().unwrap());
+        headers.insert(
+            "x-oagw-internal-upstream-id",
+            "00000000-0000-0000-0000-000000000000".parse().unwrap(),
+        );
+        // Legitimate header that should survive.
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+
+        strip_internal_headers(&mut headers);
+
+        assert!(headers.get("x-oagw-internal-endpoint-host").is_none());
+        assert!(headers.get("x-oagw-internal-endpoint-port").is_none());
+        assert!(headers.get("x-oagw-internal-endpoint-scheme").is_none());
+        assert!(headers.get("x-oagw-internal-resolved-addr").is_none());
+        assert!(headers.get("x-oagw-internal-instance-uri").is_none());
+        assert!(headers.get("x-oagw-internal-upstream-id").is_none());
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer token");
     }
 
     #[test]
@@ -373,6 +503,33 @@ mod tests {
         assert!(out.get(http::header::AUTHORIZATION).is_none());
         assert!(out.get("cookie").is_none());
         assert_eq!(out.get("x-custom").unwrap(), "keep");
+    }
+
+    #[test]
+    fn extract_error_source_gateway() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-oagw-error-source", "gateway".parse().unwrap());
+        assert_eq!(extract_error_source(&headers), ErrorSource::Gateway);
+    }
+
+    #[test]
+    fn extract_error_source_absent_defaults_to_upstream() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_error_source(&headers), ErrorSource::Upstream);
+    }
+
+    #[test]
+    fn extract_error_source_unrecognised_defaults_to_upstream() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-oagw-error-source", "unknown".parse().unwrap());
+        assert_eq!(extract_error_source(&headers), ErrorSource::Upstream);
+    }
+
+    #[test]
+    fn extract_error_source_upstream_explicit() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-oagw-error-source", "upstream".parse().unwrap());
+        assert_eq!(extract_error_source(&headers), ErrorSource::Upstream);
     }
 
     #[test]

@@ -1,5 +1,23 @@
 # Feature Context: Real-time Synchronization
 
+
+<!-- toc -->
+
+- [1. Feature Context](#1-feature-context)
+  - [1.1 Overview](#11-overview)
+  - [1.2 Purpose](#12-purpose)
+  - [1.3 Actors](#13-actors)
+  - [1.4 References](#14-references)
+- [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
+- [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
+- [4. States (CDSL)](#4-states-cdsl)
+- [5. Definitions of Done](#5-definitions-of-done)
+  - [Sync Implementation Complete](#sync-implementation-complete)
+- [6. Acceptance Criteria](#6-acceptance-criteria)
+- [7. Additional Context (optional)](#7-additional-context-optional)
+
+<!-- /toc -->
+
 - [ ] `p2` - **ID**: `cpt-examples-todo-app-featstatus-sync`
 
 - [ ] `p2` - `cpt-examples-todo-app-feature-sync`

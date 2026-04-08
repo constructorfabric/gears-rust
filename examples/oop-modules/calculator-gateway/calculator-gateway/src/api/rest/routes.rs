@@ -30,7 +30,7 @@ pub fn register_routes(
         .description(
             "Accepts a JSON body with `a` and `b`, returns their sum via calculator service",
         )
-        .tag("calculator")
+        .tag("Calculator")
         .public() // No auth required for this example
         .json_request::<AddRequest>(openapi, "Addition request with a and b operands")
         .handler(handlers::handle_add)

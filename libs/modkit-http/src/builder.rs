@@ -95,38 +95,25 @@ impl HttpClientBuilder {
 
     /// Set transport security mode
     ///
-    /// Use `TransportSecurity::AllowInsecureHttp` only for testing with mock servers.
+    /// Use `TransportSecurity::TlsOnly` to enforce HTTPS for all connections.
     #[must_use]
     pub fn transport(mut self, transport: TransportSecurity) -> Self {
         self.config.transport = transport;
         self
     }
 
-    /// Allow insecure HTTP connections (for testing only)
+    /// Deny insecure HTTP connections, enforcing TLS for all traffic
     ///
-    /// Equivalent to `.transport(TransportSecurity::AllowInsecureHttp)`.
+    /// Equivalent to `.transport(TransportSecurity::TlsOnly)`.
     ///
-    /// **WARNING**: This should only be used for local testing with mock servers.
-    /// Never use in production as it exposes traffic to interception.
-    ///
-    /// # Compile-time Safety
-    ///
-    /// This method is only available in debug builds or when the `allow-insecure-http`
-    /// feature is explicitly enabled. This prevents accidental use in production.
-    ///
-    /// To use in release builds (e.g., for integration tests), add:
-    /// ```toml
-    /// [features]
-    /// allow-insecure-http = []
-    /// ```
+    /// Use this when TLS enforcement is required (e.g., production environments).
     #[must_use]
-    #[cfg(any(debug_assertions, feature = "allow-insecure-http"))]
-    pub fn allow_insecure_http(mut self) -> Self {
-        tracing::warn!(
+    pub fn deny_insecure_http(mut self) -> Self {
+        tracing::debug!(
             target: "modkit_http::security",
-            "allow_insecure_http() called - HTTP traffic will NOT be encrypted"
+            "deny_insecure_http() called - enforcing TLS for all connections"
         );
-        self.config.transport = TransportSecurity::AllowInsecureHttp;
+        self.config.transport = TransportSecurity::TlsOnly;
         self
     }
 
@@ -241,14 +228,6 @@ impl HttpClientBuilder {
     /// # Errors
     /// Returns an error if TLS initialization fails or configuration is invalid
     pub fn build(self) -> Result<crate::HttpClient, HttpError> {
-        // Warn if insecure HTTP is enabled (should only be used for testing)
-        if self.config.transport == TransportSecurity::AllowInsecureHttp {
-            tracing::warn!(
-                "insecure HTTP enabled (TransportSecurity::AllowInsecureHttp); \
-                 use only for testing with mock servers"
-            );
-        }
-
         let timeout = self.config.request_timeout;
         let total_timeout = self.config.total_timeout;
 
@@ -546,20 +525,17 @@ mod tests {
 
     #[test]
     fn test_builder_transport_security() {
-        let builder = HttpClientBuilder::new().transport(TransportSecurity::AllowInsecureHttp);
-        assert_eq!(
-            builder.config.transport,
-            TransportSecurity::AllowInsecureHttp
-        );
+        let builder = HttpClientBuilder::new().transport(TransportSecurity::TlsOnly);
+        assert_eq!(builder.config.transport, TransportSecurity::TlsOnly);
 
-        let builder = HttpClientBuilder::new().allow_insecure_http();
-        assert_eq!(
-            builder.config.transport,
-            TransportSecurity::AllowInsecureHttp
-        );
+        let builder = HttpClientBuilder::new().deny_insecure_http();
+        assert_eq!(builder.config.transport, TransportSecurity::TlsOnly);
 
         let builder = HttpClientBuilder::new();
-        assert_eq!(builder.config.transport, TransportSecurity::TlsOnly);
+        assert_eq!(
+            builder.config.transport,
+            TransportSecurity::AllowInsecureHttp
+        );
     }
 
     #[test]
@@ -610,7 +586,6 @@ mod tests {
     #[tokio::test]
     async fn test_builder_with_auth_layer() {
         let client = HttpClientBuilder::new()
-            .allow_insecure_http()
             .with_auth_layer(|svc| svc) // identity transform
             .build();
         assert!(client.is_ok());
@@ -623,8 +598,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_build_with_insecure_http() {
-        let client = HttpClientBuilder::new().allow_insecure_http().build();
+    async fn test_builder_build_with_deny_insecure_http() {
+        let client = HttpClientBuilder::new().deny_insecure_http().build();
         assert!(client.is_ok());
     }
 
@@ -700,8 +675,8 @@ mod tests {
     /// The hyper client uses `http2_only(false)` to allow both protocols.
     #[tokio::test]
     async fn test_http2_enabled_for_all_configurations() {
-        // Test WebPki with AllowInsecureHttp
-        let client = HttpClientBuilder::new().allow_insecure_http().build();
+        // Test WebPki with AllowInsecureHttp (default)
+        let client = HttpClientBuilder::new().build();
         assert!(
             client.is_ok(),
             "WebPki + AllowInsecureHttp should build with HTTP/2 enabled"
@@ -834,123 +809,6 @@ mod tests {
         assert!(
             matches!(err, HttpError::Overloaded),
             "Expected Overloaded error, got: {err:?}"
-        );
-    }
-
-    /// Test that `AllowInsecureHttp` emits a warning during `build()`
-    #[tokio::test]
-    async fn test_insecure_http_warning_emitted() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        // Custom layer to capture warning events
-        #[derive(Clone, Default)]
-        struct WarningCapture {
-            warnings: Arc<Mutex<Vec<String>>>,
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningCapture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if *event.metadata().level() == tracing::Level::WARN {
-                    let mut visitor = MessageVisitor(String::new());
-                    event.record(&mut visitor);
-                    self.warnings.lock().unwrap().push(visitor.0);
-                }
-            }
-        }
-
-        struct MessageVisitor(String);
-        impl tracing::field::Visit for MessageVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{value:?}");
-                }
-            }
-        }
-
-        let capture = WarningCapture::default();
-        let warnings = capture.warnings.clone();
-
-        let subscriber = tracing_subscriber::registry().with(capture);
-
-        // Build with `AllowInsecureHttp` under the capturing subscriber
-        tracing::subscriber::with_default(subscriber, || {
-            _ = HttpClientBuilder::new().allow_insecure_http().build();
-        });
-
-        let captured = warnings.lock().unwrap();
-        // Two warnings: one from allow_insecure_http() and one from build()
-        assert!(
-            !captured.is_empty(),
-            "expected at least one warning, got: {:?}",
-            *captured
-        );
-        assert!(
-            captured
-                .iter()
-                .any(|w| w.contains("insecure HTTP") || w.contains("HTTP traffic")),
-            "warning should mention insecure HTTP: {:?}",
-            *captured
-        );
-    }
-
-    /// Test that `TlsOnly` does NOT emit an insecure HTTP warning
-    #[tokio::test]
-    async fn test_tls_only_no_warning() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Clone, Default)]
-        struct WarningCapture {
-            warnings: Arc<Mutex<Vec<String>>>,
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningCapture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if *event.metadata().level() == tracing::Level::WARN {
-                    let mut visitor = MessageVisitor(String::new());
-                    event.record(&mut visitor);
-                    if visitor.0.contains("insecure HTTP") {
-                        self.warnings.lock().unwrap().push(visitor.0);
-                    }
-                }
-            }
-        }
-
-        struct MessageVisitor(String);
-        impl tracing::field::Visit for MessageVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{value:?}");
-                }
-            }
-        }
-
-        let capture = WarningCapture::default();
-        let warnings = capture.warnings.clone();
-
-        let subscriber = tracing_subscriber::registry().with(capture);
-
-        // Build with `TlsOnly`
-        tracing::subscriber::with_default(subscriber, || {
-            _ = HttpClientBuilder::new()
-                .transport(TransportSecurity::TlsOnly)
-                .build();
-        });
-
-        let captured = warnings.lock().unwrap();
-        assert!(
-            captured.is_empty(),
-            "no insecure HTTP warning expected, got: {:?}",
-            *captured
         );
     }
 

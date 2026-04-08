@@ -33,5 +33,5 @@ pub mod plugin_api;
 pub use api::AuthNResolverClient;
 pub use error::AuthNResolverError;
 pub use gts::AuthNResolverPluginSpecV1;
-pub use models::AuthenticationResult;
+pub use models::{AuthenticationResult, ClientCredentialsRequest};
 pub use plugin_api::AuthNResolverPluginClient;

@@ -9,10 +9,10 @@ LL |     err: sqlx::Error,
    = note: `#[deny(de0706_no_direct_sqlx)]` on by default
 
 error: direct sqlx type usage detected: `sqlx::Error` (DE0706)
-  --> $DIR/bad_sqlx_types.rs:12:23
+  --> $DIR/bad_sqlx_types.rs:12:24
    |
-LL | fn handle_error(err: &sqlx::Error) {}
-   |                       ^^^^^^^^^^^
+LL | fn handle_error(_err: &sqlx::Error) {}
+   |                        ^^^^^^^^^^^
    |
    = help: use Sea-ORM EntityTrait or SecORM abstractions instead
    = note: sqlx bypasses security enforcement and architectural patterns

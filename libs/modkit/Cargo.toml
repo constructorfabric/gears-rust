@@ -34,6 +34,9 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:tonic",
 ]
+# Transactional outbox pipeline (preview — API may change)
+preview-outbox = ["db", "modkit-db/preview-outbox"]
+
 bootstrap = [
     "db",
     "dep:serde-saphyr",
@@ -42,7 +45,6 @@ bootstrap = [
     "dep:file-rotate",
     "dep:tracing-log",
     "dep:chrono",
-    "dep:regex",
     "dep:url",
     "dep:dsn",
     "dep:supports-color",
@@ -55,7 +57,7 @@ modkit-macros = { workspace = true }
 modkit-errors = { workspace = true, features = ["utoipa", "axum"] }
 modkit-db = { workspace = true, optional = true }
 sea-orm-migration = { workspace = true, optional = true }
-modkit-odata = { workspace = true, features = ["with-odata-params"] }
+modkit-odata = { workspace = true }
 modkit-sdk = { workspace = true }
 cf-system-sdks = { workspace = true, features = ["directory"] }
 
@@ -69,7 +71,7 @@ file-rotate = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 dsn = { workspace = true, optional = true }
-regex = { workspace = true, optional = true }
+modkit-utils = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -129,3 +131,5 @@ httpmock = { workspace = true }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
 modkit-db = { workspace = true, features = ["sqlite"] }
+tracing-subscriber = { workspace = true }
+tokio-metrics = { workspace = true }

@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.llm_gateway.session_summary_event.v1",
+  "title": "LlmSessionSummaryEvent",
+  "description": "Input for the LLM gateway plugin on_session_summary call. Chat Engine passes the full visible message history. The plugin decides which messages to summarize based on its summarization_settings in PluginConfig.config.",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "$ref": "../common/GtsSessionId.json"
+    },
+    "enabled_capabilities": {
+      "type": "array",
+      "items": { "$ref": "../common/CapabilityValue.json" },
+      "description": "Capability values active for this summarization"
+    },
+    "messages": {
+      "type": "array",
+      "items": { "$ref": "../common/Message.json" },
+      "minItems": 1,
+      "description": "Full visible message history (is_hidden_from_backend = false). During re-summarization, includes the previous summary message. The plugin splits this list into to_summarize and to_keep based on summarization_settings in its PluginConfig."
+    }
+  },
+  "required": ["session_id", "enabled_capabilities", "messages"],
+  "additionalProperties": false
+}

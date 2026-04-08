@@ -41,8 +41,6 @@ impl Default for StaticTrPlugin {
 #[async_trait]
 impl Module for StaticTrPlugin {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
-        info!("Initializing {} module", Self::MODULE_NAME);
-
         // Load configuration
         let cfg: StaticTrPluginConfig = ctx.config()?;
         info!(
@@ -84,7 +82,7 @@ impl Module for StaticTrPlugin {
                 api,
             );
 
-        info!(instance_id = %instance_id, "{} module initialized successfully", Self::MODULE_NAME);
+        info!(instance_id = %instance_id);
         Ok(())
     }
 }

@@ -15,6 +15,7 @@
   - [Capabilities -> Predicate Matrix](#capabilities---predicate-matrix)
   - [Table Schemas (Local Projections)](#table-schemas-local-projections)
   - [Usage Scenarios](#usage-scenarios)
+- [S2S Authentication (Service-to-Service)](#s2s-authentication-service-to-service)
 - [Open Questions](#open-questions)
 - [References](#references)
 
@@ -45,17 +46,38 @@ In Cyber Fabric's architecture:
 ### Core Terms
 
 - **Access Token** - Credential presented by the client to authenticate requests. Format is not restricted — can be opaque token (validated via introspection) or self-contained JWT. The key requirement: it must enable authentication and subject identification.
-- **Subject / Principal** - Actor initiating the request (user or API client), identified via access token
-- **Tenant** - Domain of ownership/responsibility and policy (billing, security, data isolation). See [TENANT_MODEL.md](./TENANT_MODEL.md)
-- **Subject Owner Tenant** - Tenant the subject belongs to (owning tenant of the subject)
-- **Context Tenant** - Tenant scope root for the operation (may differ from subject owner tenant in cross-tenant scenarios)
-- **Resource Owner Tenant** - Actual tenant owning the resource (`owner_tenant_id`)
-- **Resource** - Object with owner tenant identifier
-- **Resource Group** - Optional container for resources, used for access control. See [RESOURCE_GROUP_MODEL.md](./RESOURCE_GROUP_MODEL.md)
-- **Permission** - `{ resource_type, action }` - allowed operation identifier
+- **Subject** - Authenticated caller identity (user or API client) initiating the request, identified via access token (`sub` claim in OIDC/JWT terminology). *Note:* Some systems (e.g., AWS IAM) use the term **principal** for the same concept.
+- **Tenant** - Domain of ownership/responsibility and policy (billing, security, data isolation). See [TENANT_MODEL.md](./TENANT_MODEL.md).
+- **Subject Tenant** - Tenant the subject belongs to (home tenant).
+- **Context Tenant** - Tenant scope root for the operation (may differ from subject tenant in cross-tenant scenarios)
+- **Resource Tenant** - Tenant that owns the resource (data partition / isolation boundary).
+- **Resource Owner Subject** - Optional subject bound to a resource instance for per-subject scoping (e.g., "my tasks"). Relationship semantics are domain-specific (creator, assignee, etc.) and do not imply administrative control.
+- **Resource** - Object being accessed. Every resource belongs to a tenant and may optionally have a subject owner. Identified by type (GTS ID) and instance ID.
+- **Resource Group** - Optional container for resources, used for access control. See [RESOURCE_GROUP_MODEL.md](./RESOURCE_GROUP_MODEL.md).
+- **Permission** - `{ resource_type, action }` - allowed operation identifier.
 - **Access Constraints** - Structured predicates returned by the PDP for query-time enforcement. NOT policies (stored vendor-side) or "grants" (OAuth flows, Zanzibar tuples), but compiled, time-bound enforcement artifacts computed at evaluation time.
 - **Security Context** - Result of successful authentication containing subject identity, tenant information, and optionally the original bearer token. Flows from authentication to authorization. Required fields: `subject_id`, `subject_tenant_id`, `token_scopes`. Optional fields: `subject_type`, `bearer_token`.
 - **Token Scopes** - Capability restrictions extracted from the access token. Act as a "ceiling" on what an application can do, regardless of user's actual permissions. See [Token Scopes](#token-scopes).
+
+#### Ownership Model
+
+In a multi-tenant system, resource access is defined along **two orthogonal dimensions**:
+
+**Tenancy (mandatory, isolation boundary)**  
+Every resource belongs to exactly one tenant (`owner_tenant_id`). This is the primary data boundary.
+PEP MUST always enforce a tenant predicate in queries to prevent cross-tenant data leakage, regardless of policy decisions.
+
+**Subject scoping (optional, per-subject filtering)**  
+A resource may optionally be associated with a specific subject within the tenant via `owner_id`.
+This enables "my resources" views (e.g., "show only my tasks"). Tenant-level shared objects may have empty `owner_id`. It aligns with AuthZEN's `resource.properties.ownerID` resource property convention (see [AuthZEN interop spec](https://authzen-interop.net/docs/scenarios/todo-1.1/)).
+
+**Important semantics**
+- `owner_tenant_id` is the isolation / partition key; `owner_id` is a nullable scoping attribute.
+- `owner_id` MUST refer to a subject that belongs to the same tenant as `owner_tenant_id`.
+- "Owner" here does **not** imply administrative control; it is used for scoping in policies/constraints.
+
+**Policy usage**
+PDP policies may rely on tenancy only (tenant-wide access) or combine it with subject scoping (owner-only access). If a domain requires multiple subject relationships (e.g., creator vs assignee), model them as separate resource properties (e.g., `creator_id`, `assignee_id`) and express policies/constraints on those properties instead of overloading `owner_id`.
 
 ### Request Flow
 
@@ -292,13 +314,13 @@ AuthN Resolver plugin is responsible for:
 
 ```rust
 SecurityContext {
-    subject_id: "user-123",
+    subject_id: "user123-uuid",                                  // required
     subject_type: Some("gts.x.core.security.subject_user.v1~"),  // optional
-    subject_tenant_id: "tenant-456",                             // required
+    subject_tenant_id: "tenant456-uuid",                         // required
     bearer_token: Some(Secret::new("eyJ...".into())),            // optional, Secret<String>
-    token_scopes: ["*"],  // first-party: full access
+    token_scopes: ["*"],                                         // first-party: full access
     // OR
-    token_scopes: ["read:events", "write:tasks"],  // third-party: limited
+    token_scopes: ["read:events", "write:tasks"],                // third-party: limited
 }
 ```
 
@@ -367,17 +389,12 @@ Authentication is handled by the **AuthN Resolver** — a module with plugins an
 #[async_trait]
 pub trait AuthNResolverClient: Send + Sync {
     /// Authenticate a bearer token and return the authentication result.
-    ///
-    /// # Errors
-    ///
-    /// - `Unauthorized` if the token is malformed/invalid/expired or authentication fails
-    /// - `ServiceUnavailable` if the IdP is unreachable
-    /// - `NoPluginAvailable` if no plugin is configured
-    ///
-    /// # Arguments
-    ///
-    /// * `bearer_token` - The bearer token from the Authorization header
     async fn authenticate(&self, bearer_token: &str) -> Result<AuthenticationResult, AuthNResolverError>;
+
+    /// Exchange OAuth2 client credentials for a SecurityContext (S2S authentication).
+    /// See [S2S Authentication](#s2s-authentication-service-to-service) for details.
+    async fn exchange_client_credentials(&self, request: &ClientCredentialsRequest)
+        -> Result<AuthenticationResult, AuthNResolverError>;
 }
 ```
 
@@ -387,14 +404,12 @@ pub trait AuthNResolverClient: Send + Sync {
 #[async_trait]
 pub trait AuthNResolverPluginClient: Send + Sync {
     /// Authenticate a bearer token using vendor-specific validation logic.
-    ///
-    /// Plugins implement this method with their validation strategy
-    /// (JWT local validation, token introspection, custom protocols, etc.).
-    ///
-    /// # Arguments
-    ///
-    /// * `bearer_token` - The bearer token to validate
     async fn authenticate(&self, bearer_token: &str) -> Result<AuthenticationResult, AuthNResolverError>;
+
+    /// Exchange client credentials for a SecurityContext (S2S authentication).
+    /// See [S2S Authentication](#s2s-authentication-service-to-service) for details.
+    async fn exchange_client_credentials(&self, request: &ClientCredentialsRequest)
+        -> Result<AuthenticationResult, AuthNResolverError>;
 }
 ```
 
@@ -450,7 +465,7 @@ use secrecy::Secret;
 SecurityContext {
     subject_id: String,                    // required - from `sub` claim or IdP response
     subject_type: Option<GtsTypeId>,       // optional - vendor-specific subject type
-    subject_tenant_id: TenantId,           // required - Subject Owner Tenant
+    subject_tenant_id: TenantId,           // required - Subject Tenant
     token_scopes: Vec<String>,             // required - capability restrictions (["*"] for first-party)
     bearer_token: Option<Secret<String>>,  // optional - original token for forwarding to PDP
 }
@@ -462,7 +477,7 @@ SecurityContext {
 |-------|----------|-------------|---------|
 | `subject_id` | Yes | Unique identifier for the subject | All authorization decisions |
 | `subject_type` | No | GTS type identifier (e.g., `gts.x.core.security.subject_user.v1~`) | PDP for role/permission mapping |
-| `subject_tenant_id` | Yes | Subject Owner Tenant — tenant the subject belongs to. Used as default `owner_tenant_id` for CREATE when the API has no explicit tenant field (see S06 in [AUTHZ_USAGE_SCENARIOS.md](./AUTHZ_USAGE_SCENARIOS.md)) | PDP for tenant context, PEP for resource ownership |
+| `subject_tenant_id` | Yes | Subject Tenant — tenant the subject belongs to. Used as default `owner_tenant_id` for CREATE when the API has no explicit tenant field (see S06 in [AUTHZ_USAGE_SCENARIOS.md](./AUTHZ_USAGE_SCENARIOS.md)) | PDP for tenant context, PEP for resource ownership |
 | `token_scopes` | Yes | Capability restrictions from token (see [Token Scopes](#token-scopes)) | PDP for scope narrowing |
 | `bearer_token` | No | Original bearer token (wrapped in `Secret` from [secrecy](https://crates.io/crates/secrecy) crate) | PDP validation, external API calls |
 
@@ -483,6 +498,7 @@ The AuthN Resolver plugin bridges Cyber Fabric to the vendor's IdP. Plugin respo
 3. **Claim Enrichment** — If IdP doesn't include required claims (`subject_type`, `subject_tenant_id`), fetch from vendor services
 4. **Token Scope Detection** — Determine first-party vs third-party apps and set `token_scopes` accordingly (see [Token Scopes](#token-scopes))
 5. **Response Mapping** — Convert vendor-specific responses to `AuthenticationResult` (containing `SecurityContext`)
+6. **S2S Credential Exchange** — Implement `exchange_client_credentials()` for service-to-service authentication (see [S2S Authentication](#s2s-authentication-service-to-service))
 
 ### Rationale: Minimalist Interface
 
@@ -575,13 +591,13 @@ We extend AuthZEN's evaluation response with optional `context.constraints`. Ins
     "constraints": [
       {
         "predicates": [
-          { "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", "root_tenant_id": "tenant-123", "barrier_mode": "all" }
+          { "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", "root_tenant_id": "tenant123-uuid", "barrier_mode": "all" }
         ]
       }
     ]
   }
 }
-// PEP compiles to: WHERE owner_tenant_id IN (SELECT descendant_id FROM tenant_closure WHERE ancestor_id = 'tenant-123' AND barrier = 0)
+// PEP compiles to: WHERE owner_tenant_id IN (SELECT descendant_id FROM tenant_closure WHERE ancestor_id = 'tenant123-uuid' AND barrier = 0)
 // Result: SELECT * FROM events WHERE (constraints) LIMIT 10 — correct pagination!
 ```
 
@@ -646,13 +662,25 @@ The PEP MUST:
 Constraints are designed for **data-scoping policies** — policies that can be expressed as SQL WHERE predicates. This includes:
 
 - **Tenant isolation** — `owner_tenant_id = :tenant` or subtree membership
+- **Subject scoping** — `owner_id = :subject_id` (resource belongs to a specific subject)
 - **Resource group membership** — resource belongs to specific groups
-- **Ownership** — `created_by = :subject_id`
 - **Attribute-based filtering** — equality/IN checks on resource properties
 
 Some policies cannot be expressed as SQL constraints (e.g., time-based access, IP restrictions, rate limiting, external data dependencies). For these, PDP returns `decision: false` or enforcement happens at a different layer (API Gateway, middleware).
 
 **Design rationale:** Constraints solve the specific problem of efficient, paginated queries with authorization. Other policy types are orthogonal and handled at appropriate layers in the stack.
+
+#### Scope Determination
+
+No protocol-level differentiator is needed to tell PDP whether to apply subject scoping (`owner_id`) vs tenant-only scoping. PDP determines this from its own policy using information already present in the request:
+- `subject` — identity and attributes for role/permission lookup
+- `action.name` — semantic operation (e.g., `list`, `read`, `update`)
+- `resource.type` — resource-specific policy rules
+- `context.supported_properties` — declares that PEP **can** enforce `owner_id`, not that it **wants** to; this is a capability signal, not an intent signal
+
+Adding a scope hint (e.g., `"scope_mode": "owner"`) would leak authorization logic into PEP, violating PDP/PEP separation. The PEP declares what it can enforce; the PDP decides what to enforce.
+
+For "my resources" endpoints (e.g., `GET /tasks/my`), PEP can either use a semantic `action.name` that PDP policies recognize (e.g., `list_own`), or apply `owner_id` as an application-level filter on top of authorization constraints — this is a UI filter, not an authorization decision.
 
 ---
 
@@ -705,6 +733,24 @@ PDP returns `decision` plus optional `constraints` for each evaluation.
 6. **OR/AND semantics** - Multiple constraints are OR'd (alternative access paths), predicates within constraint are AND'd
 7. **Token passthrough** - Original bearer token optionally included in `context.bearer_token` for PDP validation and external service calls (MUST NOT be logged)
 8. **Property schema contract** - PEP declares supported properties; PDP validates constraints use only supported properties
+
+#### ID Conventions
+
+All **core entity identifiers** in the authorization API are **UUIDs**:
+
+| ID | Type | Description |
+|----|------|-------------|
+| `subject.id` | UUID | Subject (user or API client) identifier |
+| `subject.properties.tenant_id` | UUID | Subject's home tenant |
+| `resource.id` | UUID | Resource instance identifier |
+| `owner_tenant_id` | UUID | Tenant that owns a resource (resource property) |
+| `owner_id` | UUID | Subject that owns a resource (resource property, nullable) |
+| `group_id` | UUID | Resource group identifier |
+| `tenant_closure` keys | UUID | `ancestor_id`, `descendant_id` |
+| `resource_group_closure` keys | UUID | `ancestor_id`, `descendant_id` |
+| `resource_group_membership` keys | UUID | `resource_id`, `group_id` |
+
+**Domain-specific identifiers** (e.g., `topic_id`) are **exceptions** — they are structured string identifiers from the Global Type System (e.g., `gts.x.core.events.topic.v1~`), not UUIDs. How a domain module stores GTS IDs internally is up to the module: either as a string as-is, or as a deterministic UUIDv5 computed from the GTS ID string. PDP may return GTS IDs in constraint values (e.g., `topic_id`); PEP is responsible for mapping them to the storage format used by the module.
 
 #### Request / Response Example
 
@@ -760,7 +806,7 @@ Content-Type: application/json
     "token_scopes": ["read:events", "write:tasks"],  // SecurityContext.token_scopes
     "require_constraints": true,   // handler config: LIST requires constraints
     "capabilities": ["tenant_hierarchy"],  // module config: has tenant_closure table
-    "supported_properties": ["owner_tenant_id", "topic_id", "id"],  // handler config: properties PEP can map to SQL
+    "supported_properties": ["owner_tenant_id", "topic_id", "id", "owner_id"],  // handler config: properties PEP can map to SQL
     "bearer_token": "eyJhbGciOiJSUzI1NiIs..."  // SecurityContext.bearer_token: Secret<String> (optional, see notes below)
   }
 }
@@ -819,7 +865,7 @@ The response contains a `decision` and, when `decision: true`, optional `context
 }
 ```
 
-**Note on `bearer_token`:** The `context.bearer_token` field is optional. Include it when PDP needs to: (1) validate token independently (defense-in-depth in OoP deployments), (2) call external vendor APIs requiring authentication, or (3) extract token-embedded policies/scopes. Omit it if PDP fully trusts PEP's claim extraction. Security: `bearer_token` is a credential — PDP MUST NOT log it or persist it. In Rust code, use `Secret<String>` from the `secrecy` crate (serializes to plain string in JSON).
+**Note on `bearer_token`:** The `context.bearer_token` field is optional. Include it when PDP needs to: (1) validate token independently (defense-in-depth in OoP deployments), (2) call external vendor APIs requiring authentication, or (3) extract token-embedded policies/scopes. Omit it if PDP fully trusts PEP's claim extraction. Security: `bearer_token` is a credential — PDP MUST NOT log it or persist it. In Rust code, use `Secret<String>` from the `secrecy` crate. Note: `Secret<String>` (secrecy v0.10 / `SecretBox<T>`) does **not** implement `Serialize` by default — calling `serde_json::to_string()` on it will fail at compile time unless the inner type implements `SerializableSecret` (or a custom serializer is provided via `serde_secrecy`). When serialization is required (e.g., for PDP communication), explicitly call `expose_secret()` at the call site.
 
 **Note on `tenant_context`:** The `context.tenant_context` object is optional. It defines the tenant context for the operation:
 
@@ -852,7 +898,7 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
   "action": { "name": "create" },
   "resource": {
     "type": "gts.x.core.events.event.v1~",
-    "properties": { "owner_tenant_id": "tenant-B", "topic_id": "..." }
+    "properties": { "owner_tenant_id": "tenantB-uuid", "topic_id": "..." }
   },
   "context": { "require_constraints": true }
   // ... subject, tenant_context
@@ -863,7 +909,7 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
   "decision": true,
   "context": {
     "constraints": [
-      { "predicates": [{ "type": "eq", "resource_property": "owner_tenant_id", "value": "tenant-B" }] }
+      { "predicates": [{ "type": "eq", "resource_property": "owner_tenant_id", "value": "tenantB-uuid" }] }
     ]
   }
 }
@@ -888,7 +934,7 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
     "constraints": [
       {
         "predicates": [
-          { "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", "root_tenant_id": "tenant-A", "barrier_mode": "all" }
+          { "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", "root_tenant_id": "tenantA-uuid", "barrier_mode": "all" }
         ]
       }
     ]
@@ -903,7 +949,7 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
 // PEP -> PDP
 {
   "action": { "name": "read" },
-  "resource": { "type": "gts.x.core.events.event.v1~", "id": "evt-123" }
+  "resource": { "type": "gts.x.core.events.event.v1~", "id": "evt123-uuid" }
   // ... subject, context
 }
 
@@ -914,7 +960,7 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
     "constraints": [
       {
         "predicates": [
-          { "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", "root_tenant_id": "tenant-A", "barrier_mode": "all" }
+          { "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", "root_tenant_id": "tenantA-uuid", "barrier_mode": "all" }
         ]
       }
     ]
@@ -938,14 +984,14 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
             // Tenant subtree predicate
             "type": "in_tenant_subtree",
             "resource_property": "owner_tenant_id",
-            "root_tenant_id": "tenant-A",
+            "root_tenant_id": "tenantA-uuid",
             "barrier_mode": "all"  // default: "all"
           },
           {
             // Group subtree predicate - uses resource_group_membership + resource_group_closure tables
             "type": "in_group_subtree",
             "resource_property": "id",
-            "root_group_id": "project-root-group"
+            "root_group_id": "project-root-group-uuid"
           }
         ]
       }
@@ -1031,8 +1077,8 @@ Compares resource property to a single value.
 - `value` (required): Single value to compare
 
 ```jsonc
-{ "type": "eq", "resource_property": "topic_id", "value": "uuid-123" }
-// SQL: topic_id = 'uuid-123'
+{ "type": "eq", "resource_property": "topic_id", "value": "uuid123-uuid" }
+// SQL: topic_id = 'uuid123-uuid'
 ```
 
 #### 2. IN Predicate (`type: "in"`)
@@ -1045,8 +1091,8 @@ Compares resource property to a list of values.
 - `values` (required): Array of values
 
 ```jsonc
-{ "type": "in", "resource_property": "owner_tenant_id", "values": ["tenant-1", "tenant-2"] }
-// SQL: owner_tenant_id IN ('tenant-1', 'tenant-2')
+{ "type": "in", "resource_property": "owner_tenant_id", "values": ["tenant1-uuid", "tenant2-uuid"] }
+// SQL: owner_tenant_id IN ('tenant1-uuid', 'tenant2-uuid')
 
 { "type": "in", "resource_property": "status", "values": ["active", "pending"] }
 // SQL: status IN ('active', 'pending')
@@ -1067,13 +1113,13 @@ Filters resources by tenant subtree using the closure table. The `resource_prope
 {
   "type": "in_tenant_subtree",
   "resource_property": "owner_tenant_id",
-  "root_tenant_id": "tenant-A",
+  "root_tenant_id": "tenantA-uuid",
   "barrier_mode": "all",  // default: "all"
   "tenant_status": ["active", "suspended"]
 }
 // SQL: owner_tenant_id IN (
 //   SELECT descendant_id FROM tenant_closure
-//   WHERE ancestor_id = 'tenant-A'
+//   WHERE ancestor_id = 'tenantA-uuid'
 //     AND barrier = 0  -- barrier_mode: "all"
 //     AND descendant_status IN ('active', 'suspended')
 // )
@@ -1101,10 +1147,10 @@ Filters resources by explicit group membership. The `resource_property` specifie
 - `group_ids` (required): Array of group IDs
 
 ```jsonc
-{ "type": "in_group", "resource_property": "id", "group_ids": ["group-1", "group-2"] }
+{ "type": "in_group", "resource_property": "id", "group_ids": ["group1-uuid", "group2-uuid"] }
 // SQL: id IN (
 //   SELECT resource_id FROM resource_group_membership
-//   WHERE group_id IN ('group-1', 'group-2')
+//   WHERE group_id IN ('group1-uuid', 'group2-uuid')
 // )
 ```
 
@@ -1118,12 +1164,12 @@ Filters resources by group subtree using the closure table. The `resource_proper
 - `root_group_id` (required): Root of group subtree
 
 ```jsonc
-{ "type": "in_group_subtree", "resource_property": "id", "root_group_id": "root-group" }
+{ "type": "in_group_subtree", "resource_property": "id", "root_group_id": "rootgroup-uuid" }
 // SQL: id IN (
 //   SELECT resource_id FROM resource_group_membership
 //   WHERE group_id IN (
 //     SELECT descendant_id FROM resource_group_closure
-//     WHERE ancestor_id = 'root-group'
+//     WHERE ancestor_id = 'rootgroup-uuid'
 //   )
 // )
 ```
@@ -1151,27 +1197,41 @@ The PEP declares its supported properties in every authorization request via `co
 
 The `resource_property` in predicates corresponds to `resource.properties` in the request. Each module (PEP) defines a mapping from property names to physical SQL columns. PDP uses property names — **it doesn't know the database schema**.
 
-**Example mapping for Event Manager:**
+#### Standard Properties
+
+The authorization model defines three well-known resource properties with reserved names. These align with common authorization patterns: `owner_tenant_id` for multi-tenancy isolation, `id` for row-level access, and `owner_id` for per-subject ownership.
+
+PEP maps these to entity columns via the `#[secure(...)]` macro:
+
+| Property | Purpose | Macro Attribute | Required |
+|----------|---------|-----------------|----------|
+| `owner_tenant_id` | Tenant that owns the resource (multi-tenancy isolation) | `tenant_col = "column"` | Yes (or `no_tenant`) |
+| `id` | Resource primary key (row-level access) | `resource_col = "column"` | Yes (or `no_resource`) |
+| `owner_id` | Subject who owns the resource (e.g. per-user filtering) | `owner_col = "column"` | Yes (or `no_owner`) |
+
+Modules may also declare custom properties via `pep_prop(property_name = "column")`.
+
+#### Example: Event Manager
+
+**Property mapping:**
 
 | Resource Property | SQL Column |
 |-------------------|------------|
 | `owner_tenant_id` | `events.tenant_id` |
-| `topic_id` | `events.topic_id` |
+| `owner_id` | `events.creator_id` |
 | `id` | `events.id` |
+| `topic_id` | `events.topic_id` |
 
 **How PEP compiles predicates to SQL:**
 
 | Predicate | SQL |
 |-----------|-----|
 | `{ "type": "eq", "resource_property": "topic_id", "value": "v" }` | `events.topic_id = 'v'` |
-| `{ "type": "in", "resource_property": "owner_tenant_id", "values": ["t1", "t2"] }` | `events.tenant_id IN ('t1', 't2')` |
+| `{ "type": "eq", "resource_property": "owner_id", "value": "user123-uuid" }` | `events.creator_id = 'user123-uuid'` |
+| `{ "type": "in", "resource_property": "owner_tenant_id", "values": ["t1-uuid", "t2-uuid"] }` | `events.tenant_id IN ('t1-uuid', 't2-uuid')` |
 | `{ "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", ... }` | `events.tenant_id IN (SELECT descendant_id FROM tenant_closure WHERE ...)` |
-| `{ "type": "in_group", "resource_property": "id", "group_ids": ["g1", "g2"] }` | `events.id IN (SELECT resource_id FROM resource_group_membership WHERE ...)` |
-| `{ "type": "in_group_subtree", "resource_property": "id", "root_group_id": "g1" }` | `events.id IN (SELECT ... FROM resource_group_membership WHERE group_id IN (SELECT ... FROM resource_group_closure ...))` |
-
-**Conventions:**
-- All IDs are UUIDs
-- PDP may return GTS IDs (e.g., `gts.x.core.events.topic.v1~...`), PEP converts to UUIDv5
+| `{ "type": "in_group", "resource_property": "id", "group_ids": ["g1-uuid", "g2-uuid"] }` | `events.id IN (SELECT resource_id FROM resource_group_membership WHERE ...)` |
+| `{ "type": "in_group_subtree", "resource_property": "id", "root_group_id": "g1-uuid" }` | `events.id IN (SELECT ... FROM resource_group_membership WHERE group_id IN (SELECT ... FROM resource_group_closure ...))` |
 
 ---
 
@@ -1190,7 +1250,7 @@ The `require_constraints` field (separate from capabilities array) controls PEP 
 
 **Usage:**
 - For LIST operations: typically `true` (constraints needed for SQL WHERE)
-- For CREATE operations: typically `false` (no query, just permission check), but can be `true` if PEP wants to enforce constraints locally
+- For CREATE operations: typically `true` (PEP validates INSERT against constraints — tenant isolation, ownership). It can be `false` if PEP trusts the PDP decision alone and skips local constraint validation (see S12 in [AUTHZ_USAGE_SCENARIOS.md](./AUTHZ_USAGE_SCENARIOS.md)).
 - For GET/UPDATE/DELETE: depends on whether PEP wants SQL-level enforcement or trusts PDP decision
 
 #### Capabilities Array
@@ -1302,6 +1362,54 @@ For concrete examples demonstrating the authorization model in practice, see [AU
 
 ---
 
+## S2S Authentication (Service-to-Service)
+
+### Overview
+
+Platform modules communicate with each other outside the context of an HTTP request — inter-module calls, background processing, scheduled tasks. These interactions require a `SecurityContext` to pass through AuthZ. AuthN Resolver provides S2S authentication via the [OAuth 2.0 Client Credentials Grant (RFC 6749 §4.4)](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4) pattern.
+
+A module presents its OAuth2 credentials (`client_id`, `client_secret`, optional `scopes`) to AuthN Resolver. The AuthN plugin exchanges them with the vendor's IdP and returns a validated `SecurityContext` — the same `AuthenticationResult` that `authenticate()` returns for bearer tokens.
+
+### How It Works
+
+```mermaid
+sequenceDiagram
+    participant Module as Calling Module
+    participant AuthN as AuthN Resolver
+    participant Plugin as AuthN Plugin
+    participant IdP as Vendor's IdP
+
+    Module->>AuthN: exchange_client_credentials(client_id, client_secret, scopes)
+    AuthN->>Plugin: exchange_client_credentials(request)
+    Plugin->>IdP: POST /token (client_credentials grant)
+    IdP-->>Plugin: access_token + claims
+    Plugin->>Plugin: Map IdP response → SecurityContext
+    Plugin-->>AuthN: AuthenticationResult
+    AuthN-->>Module: SecurityContext
+    Module->>Module: Use SecurityContext for inter-module calls
+```
+
+The calling module knows only its credentials. The plugin owns the token endpoint URL, OAuth2 flow, and identity mapping — analogous to how `authenticate()` accepts only the bearer token while JWKS URL is configured in the plugin or obtained from the IdP's `.well-known` endpoint for the issuer (it's up to the plugin to determine the correct endpoint).
+
+The returned `SecurityContext` contains the same fields as for bearer token authentication.
+
+### Relationship to AuthZ
+
+S2S `SecurityContext` flows through the standard AuthZ pipeline unchanged. The target module's PEP evaluates authorization with the S2S subject, PDP applies policies (potentially using `subject_type` for service-specific rules), and constraints are compiled to `AccessScope` as usual. No changes to AuthZ Resolver or PEP are required.
+
+### Key Principles
+
+- **AuthN Resolver is the single owner of `SecurityContext`.** Modules do not construct `SecurityContext` directly. All identity mapping and OAuth2 logic is encapsulated in the plugin.
+- **The platform does not issue tokens.** The plugin delegates to an external IdP and maps the response.
+- **Credentials and endpoints are separated.** Module configuration contains credentials; plugin configuration contains token endpoint / issuer URL.
+
+### Future Extensions
+
+- **Token lifetime propagation** — Plugin communicates token expiry to enable caller-side caching with proper TTL
+- **Cached SecurityContext provider** — A wrapper that caches the `SecurityContext` and automatically refreshes it on expiry, so modules don't need to manage token lifecycle themselves
+
+---
+
 ## Open Questions
 
 These questions require further design work.
@@ -1325,10 +1433,7 @@ These questions require further design work.
    - **Migration protocol** — When closure table schema changes, how do PEPs discover and adapt? Is there a capabilities negotiation mechanism?
    - **Backward compatibility** — Can old PEPs work with new schema, or is coordinated upgrade required? What's the compatibility matrix?
 
-9. **S2S token issuance** — Should AuthN Resolver support token issuance for service-to-service communication, or is it sufficient to rely on standard [OAuth 2.0 Client Credentials Grant](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4)? Open questions:
-   - **Scope** — Is token issuance AuthN Resolver's responsibility, or should services obtain tokens directly from the IdP?
-   - **Use cases** — What S2S scenarios require Cyber Fabric involvement vs. direct IdP integration?
-   - **Token types** — Should S2S tokens differ from user tokens (e.g., different scopes, shorter TTL)?
+9. ~~**S2S token issuance**~~ — **Resolved.** See [S2S Authentication (Service-to-Service)](#s2s-authentication-service-to-service).
 
 10. **Multi-Factor Authentication (MFA) support** — How should Cyber Fabric handle MFA across both AuthN and AuthZ layers? Industry standards and best practices to study:
     - **AuthN side:**
@@ -1345,12 +1450,20 @@ These questions require further design work.
       - How do industry multi-tenant platforms (Azure AD Conditional Access, AWS IAM, Google Cloud IAP) handle MFA in the context of delegated authorization?
       - What is the interaction between MFA and token scopes? Should third-party apps be able to request MFA-elevated scopes?
 
+11. **S2S SecurityContext caching** — Modules may call `exchange_client_credentials()` frequently (on every background task iteration, on every inter-module call). Open questions:
+    - **TTL strategy** — What default TTL for cached `SecurityContext`? Static plugin has no token expiry (effectively infinite), production plugins depend on OAuth2 token TTL. Proposal: default 5 min, configurable.
+    - **`AuthenticationResult.expires_at`** — Should `AuthenticationResult` include an `expires_at: Option<DateTime>` field so the plugin can communicate token lifetime to the caller? This enables smart caller-side caching without hardcoded TTLs.
+    - **`S2sSecurityContextProvider`** — Should there be a standard cached wrapper in the SDK (`authn-resolver-sdk`) that modules use instead of calling `exchange_client_credentials()` directly? Design: ArcSwap-based cache with TTL from `expires_at`, automatic refresh on expiry.
+    - **Plugin-level caching** — Production plugins can reuse `modkit-auth::oauth2::Token` handles with auto-refresh internally. Should this be a requirement or recommendation for plugin implementors?
+    - **Cache invalidation** — When credentials are rotated, how does the cached `SecurityContext` get invalidated? Is TTL-based expiry sufficient, or do we need explicit invalidation?
+
 ---
 
 ## References
 
 ### Authentication
 - [AUTHN_JWT_OIDC_PLUGIN.md](./AUTHN_JWT_OIDC_PLUGIN.md) — JWT + OIDC plugin reference implementation
+- [RFC 6749: OAuth 2.0 Authorization Framework](https://datatracker.ietf.org/doc/html/rfc6749) (§4.4 Client Credentials Grant — S2S authentication)
 - [RFC 7519: JSON Web Token (JWT)](https://datatracker.ietf.org/doc/html/rfc7519)
 - [RFC 7662: OAuth 2.0 Token Introspection](https://datatracker.ietf.org/doc/html/rfc7662)
 - [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html)

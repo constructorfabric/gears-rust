@@ -1,20 +1,19 @@
 //! Test case: schema_for! on GTS-wrapped struct should trigger DE0110
 
 use gts_macros::struct_to_gts_schema;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars;
 
 /// A GTS-wrapped struct (has struct_to_gts_schema attribute)
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone)]
 #[struct_to_gts_schema(
     dir_path = "schemas",
     base = true,
-    schema_id = "gts.x.test.plugin.v1~",
+    schema_id = "gts.x.core.test.plugin.v1~",
     description = "Test plugin specification",
     properties = "id,vendor"
 )]
 pub struct MyGtsPluginSpecV1 {
-    pub id: String,
+    pub id: gts::GtsInstanceId,
     pub vendor: String,
 }
 

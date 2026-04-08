@@ -404,3 +404,20 @@ modules:
           verify_cert: true
         urls:
           - "https://api.openai.com"
+
+# OpenTelemetry configuration (resource identity, tracing, metrics)
+opentelemetry:
+  resource:
+    service_name: "hyperspot-api"
+
+  # Default exporter shared by tracing and metrics
+  exporter:
+    kind: "otlp_grpc"  # or "otlp_http"
+    endpoint: "http://127.0.0.1:4317"
+    timeout_ms: 5000
+
+  tracing:
+    enabled: false
+
+  metrics:
+    enabled: false

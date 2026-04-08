@@ -1,5 +1,22 @@
 # ADR-0002: Optimistic UI Updates
 
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Always wait for server confirmation](#always-wait-for-server-confirmation)
+  - [Optimistically update UI and reconcile in background](#optimistically-update-ui-and-reconcile-in-background)
+  - [Hybrid approach per action type](#hybrid-approach-per-action-type)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
 **Date**: 2026-02-07
 
 **Status**: Accepted

@@ -1,23 +1,9 @@
-use crate::{
-    auth_mode::{AuthModeConfig, PluginRegistry},
-    config_error::ConfigError,
-    dispatcher::AuthDispatcher,
-    plugins::{GenericOidcPlugin, KeycloakClaimsPlugin},
-    providers::JwksKeyProvider,
-    validation::ValidationConfig,
-};
+use crate::validation::ValidationConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 
 /// Main authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// Plugin to use (single mode only)
-    #[serde(flatten)]
-    pub mode: AuthModeConfig,
-
     /// Leeway in seconds for time-based validations (exp, nbf)
     #[serde(default = "default_leeway")]
     pub leeway_seconds: i64,
@@ -30,42 +16,44 @@ pub struct AuthConfig {
     #[serde(default)]
     pub audiences: Vec<String>,
 
+    /// Whether the `exp` claim is required (default: `true`).
+    /// Set to `false` to allow tokens without an expiration claim.
+    #[serde(default = "default_require_exp")]
+    pub require_exp: bool,
+
     /// JWKS configuration
     #[serde(default)]
     pub jwks: Option<JwksConfig>,
-
-    /// Available plugins (named configurations)
-    #[serde(default)]
-    pub plugins: HashMap<String, PluginConfig>,
 }
 
 fn default_leeway() -> i64 {
     60
 }
 
+fn default_require_exp() -> bool {
+    true
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            mode: AuthModeConfig::default(),
-            leeway_seconds: 60,
+            leeway_seconds: default_leeway(),
             issuers: Vec::new(),
             audiences: Vec::new(),
+            require_exp: default_require_exp(),
             jwks: None,
-            plugins: HashMap::default(),
         }
     }
 }
 
-impl AuthConfig {
-    /// Validate the configuration for consistency.
-    ///
-    /// # Errors
-    /// Returns `ConfigError::UnknownPlugin` if the configured provider is not registered.
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if !self.plugins.contains_key(&self.mode.provider) {
-            return Err(ConfigError::UnknownPlugin(self.mode.provider.clone()));
+impl From<&AuthConfig> for ValidationConfig {
+    fn from(config: &AuthConfig) -> Self {
+        Self {
+            allowed_issuers: config.issuers.clone(),
+            allowed_audiences: config.audiences.clone(),
+            leeway_seconds: config.leeway_seconds,
+            require_exp: config.require_exp,
         }
-        Ok(())
     }
 }
 
@@ -92,108 +80,6 @@ fn default_max_backoff() -> u64 {
     3600
 }
 
-/// Plugin-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum PluginConfig {
-    Keycloak {
-        /// Tenant claim field name
-        #[serde(default = "default_tenant_claim")]
-        tenant_claim: String,
-
-        /// Client ID for `resource_access` roles
-        client_roles: Option<String>,
-
-        /// Role prefix to add to all roles
-        role_prefix: Option<String>,
-    },
-    Oidc {
-        /// Tenant claim field name
-        #[serde(default = "default_tenant_claim")]
-        tenant_claim: String,
-
-        /// Roles claim field name
-        #[serde(default = "default_roles_claim")]
-        roles_claim: String,
-    },
-}
-
-fn default_tenant_claim() -> String {
-    "tenants".to_owned()
-}
-
-fn default_roles_claim() -> String {
-    "roles".to_owned()
-}
-
-/// Build an `AuthDispatcher` from configuration.
-///
-/// # Errors
-/// Returns `ConfigError` if the configuration is invalid or plugin initialization fails.
-pub fn build_auth_dispatcher(config: &AuthConfig) -> Result<AuthDispatcher, ConfigError> {
-    config.validate()?;
-
-    let validation_config = ValidationConfig {
-        allowed_issuers: config.issuers.clone(),
-        allowed_audiences: config.audiences.clone(),
-        leeway_seconds: config.leeway_seconds,
-        require_uuid_subject: true,
-        require_uuid_tenants: true,
-    };
-
-    let registry = config
-        .plugins
-        .iter()
-        .map(|(name, plugin_config)| {
-            let plugin: Arc<dyn crate::plugin_traits::ClaimsPlugin> = match plugin_config {
-                PluginConfig::Keycloak {
-                    tenant_claim,
-                    client_roles,
-                    role_prefix,
-                } => Arc::new(KeycloakClaimsPlugin::new(
-                    tenant_claim,
-                    client_roles.clone(),
-                    role_prefix.clone(),
-                )),
-                PluginConfig::Oidc {
-                    tenant_claim,
-                    roles_claim,
-                } => Arc::new(GenericOidcPlugin::new(tenant_claim, roles_claim)),
-            };
-
-            tracing::debug!(
-                plugin_name = %name,
-                plugin_type = ?plugin_config,
-                "Registered claims plugin"
-            );
-
-            (name, plugin)
-        })
-        .fold(PluginRegistry::default(), |mut registry, (name, plugin)| {
-            registry.register(name, plugin);
-            registry
-        });
-
-    let dispatcher = AuthDispatcher::new(validation_config, config, &registry)?;
-
-    let dispatcher = if let Some(jwks_config) = &config.jwks {
-        let provider = JwksKeyProvider::new(&jwks_config.uri)?
-            .with_refresh_interval(Duration::from_secs(jwks_config.refresh_interval_seconds))
-            .with_max_backoff(Duration::from_secs(jwks_config.max_backoff_seconds));
-
-        dispatcher.with_key_provider(Arc::new(provider))
-    } else {
-        dispatcher
-    };
-
-    tracing::info!(
-        plugin = %config.mode.provider,
-        "Authentication dispatcher initialized (single mode)"
-    );
-
-    Ok(dispatcher)
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -205,115 +91,92 @@ mod tests {
         assert_eq!(config.leeway_seconds, 60);
         assert!(config.issuers.is_empty());
         assert!(config.audiences.is_empty());
+        assert!(config.require_exp);
+        assert!(config.jwks.is_none());
     }
 
     #[test]
-    fn test_single_mode_config() {
-        let mut plugins = HashMap::new();
-        plugins.insert(
-            "keycloak".to_owned(),
-            PluginConfig::Keycloak {
-                tenant_claim: "tenants".to_owned(),
-                client_roles: Some("modkit-api".to_owned()),
-                role_prefix: None,
-            },
-        );
-
+    fn test_auth_config_serialization() {
         let config = AuthConfig {
-            mode: AuthModeConfig {
-                provider: "keycloak".to_owned(),
-            },
-            leeway_seconds: 60,
-            issuers: vec!["https://auth.example.com".to_owned()],
-            audiences: vec!["api".to_owned()],
-            jwks: None,
-            plugins,
-        };
-
-        // Should validate successfully
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_single_mode_unknown_plugin() {
-        let config = AuthConfig {
-            mode: AuthModeConfig {
-                provider: "unknown".to_owned(),
-            },
-            plugins: HashMap::new(),
-            ..Default::default()
-        };
-
-        // Should fail validation
-        let result = config.validate();
-        assert!(matches!(result, Err(ConfigError::UnknownPlugin(_))));
-    }
-
-    #[test]
-    fn test_config_serialization() {
-        let mut plugins = HashMap::new();
-        plugins.insert(
-            "keycloak".to_owned(),
-            PluginConfig::Keycloak {
-                tenant_claim: "tenants".to_owned(),
-                client_roles: Some("modkit-api".to_owned()),
-                role_prefix: Some("kc".to_owned()),
-            },
-        );
-
-        let config = AuthConfig {
-            mode: AuthModeConfig {
-                provider: "keycloak".to_owned(),
-            },
             leeway_seconds: 120,
             issuers: vec!["https://auth.example.com".to_owned()],
             audiences: vec!["api".to_owned()],
+            require_exp: true,
             jwks: Some(JwksConfig {
                 uri: "https://auth.example.com/.well-known/jwks.json".to_owned(),
                 refresh_interval_seconds: 300,
                 max_backoff_seconds: 3600,
             }),
-            plugins,
         };
 
         let json = serde_json::to_string_pretty(&config).unwrap();
-        println!("{json}");
-
         let deserialized: AuthConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.leeway_seconds, 120);
-        assert_eq!(deserialized.issuers.len(), 1);
+        assert_eq!(deserialized.issuers, vec!["https://auth.example.com"]);
+        assert_eq!(deserialized.audiences, vec!["api"]);
+        assert!(deserialized.require_exp);
+        let jwks = deserialized.jwks.expect("jwks should be present");
+        assert_eq!(jwks.uri, "https://auth.example.com/.well-known/jwks.json");
+        assert_eq!(jwks.refresh_interval_seconds, 300);
+        assert_eq!(jwks.max_backoff_seconds, 3600);
     }
 
-    #[tokio::test]
-    async fn test_build_dispatcher_with_jwks() {
-        let mut plugins = HashMap::new();
-        plugins.insert(
-            "oidc".to_owned(),
-            PluginConfig::Oidc {
-                tenant_claim: "tenants".to_owned(),
-                roles_claim: "roles".to_owned(),
-            },
-        );
-
-        let config = AuthConfig {
-            mode: AuthModeConfig {
-                provider: "oidc".to_owned(),
-            },
-            leeway_seconds: 60,
-            issuers: vec!["https://auth.example.com".to_owned()],
-            audiences: vec!["api".to_owned()],
-            jwks: Some(JwksConfig {
-                uri: "https://auth.example.com/.well-known/jwks.json".to_owned(),
-                refresh_interval_seconds: 300,
-                max_backoff_seconds: 3600,
-            }),
-            plugins,
+    #[test]
+    fn test_jwks_config_serialization() {
+        let config = JwksConfig {
+            uri: "https://auth.example.com/.well-known/jwks.json".to_owned(),
+            refresh_interval_seconds: 300,
+            max_backoff_seconds: 3600,
         };
 
-        let dispatcher = build_auth_dispatcher(&config).unwrap();
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let deserialized: JwksConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.uri, config.uri);
         assert_eq!(
-            dispatcher.validation_config().allowed_issuers,
-            vec!["https://auth.example.com"]
+            deserialized.refresh_interval_seconds,
+            config.refresh_interval_seconds
         );
+        assert_eq!(deserialized.max_backoff_seconds, config.max_backoff_seconds);
+    }
+
+    #[test]
+    fn test_auth_config_to_validation_config() {
+        let auth_config = AuthConfig {
+            leeway_seconds: 30,
+            issuers: vec!["https://auth.example.com".to_owned()],
+            audiences: vec!["api".to_owned()],
+            require_exp: true,
+            jwks: None,
+        };
+        let validation_config = ValidationConfig::from(&auth_config);
+        assert_eq!(validation_config.allowed_issuers, auth_config.issuers);
+        assert_eq!(validation_config.allowed_audiences, auth_config.audiences);
+        assert_eq!(validation_config.leeway_seconds, auth_config.leeway_seconds);
+        assert!(validation_config.require_exp);
+    }
+
+    #[test]
+    fn test_require_exp_defaults_true_when_omitted() {
+        let json = r#"{"leeway_seconds": 60}"#;
+        let config: AuthConfig = serde_json::from_str(json).unwrap();
+        assert!(config.require_exp);
+    }
+
+    #[test]
+    fn test_require_exp_false_propagates_to_validation_config() {
+        let auth_config = AuthConfig {
+            require_exp: false,
+            ..Default::default()
+        };
+        let validation_config = ValidationConfig::from(&auth_config);
+        assert!(!validation_config.require_exp);
+    }
+
+    #[test]
+    fn test_jwks_config_defaults() {
+        let json = r#"{"uri": "https://example.com/jwks"}"#;
+        let config: JwksConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.refresh_interval_seconds, 300);
+        assert_eq!(config.max_backoff_seconds, 3600);
     }
 }

@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.common.capability_value.v1",
+  "title": "CapabilityValue",
+  "description": "A capability with its current value — used per-message to pass capability settings from client to backend.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Capability identifier"
+    },
+    "value": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "string" },
+        { "type": "integer" }
+      ],
+      "description": "Current value; must match the type declared in the corresponding Capability definition"
+    }
+  },
+  "required": ["id", "value"],
+  "additionalProperties": false
+}

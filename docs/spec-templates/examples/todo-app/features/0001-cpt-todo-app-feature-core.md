@@ -1,5 +1,28 @@
 # Feature Context: Task Management Core
 
+
+<!-- toc -->
+
+- [1. Feature Context](#1-feature-context)
+  - [1.1 Overview](#11-overview)
+  - [1.2 Purpose](#12-purpose)
+  - [1.3 Actors](#13-actors)
+  - [1.4 References](#14-references)
+- [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
+  - [Create Task Flow](#create-task-flow)
+  - [Delete Task Flow](#delete-task-flow)
+- [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
+  - [Task Validation Algorithm](#task-validation-algorithm)
+- [4. States (CDSL)](#4-states-cdsl)
+  - [Task State Machine](#task-state-machine)
+- [5. Definitions of Done](#5-definitions-of-done)
+  - [Implement Task CRUD Operations](#implement-task-crud-operations)
+- [6. Acceptance Criteria](#6-acceptance-criteria)
+- [7. Additional Context (optional)](#7-additional-context-optional)
+  - [Performance Considerations](#performance-considerations)
+
+<!-- /toc -->
+
 - [ ] `p2` - **ID**: `cpt-examples-todo-app-featstatus-core`
 
 - [x] `p1` - `cpt-examples-todo-app-feature-core`

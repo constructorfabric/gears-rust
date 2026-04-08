@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.message.recreate_request.v1",
+  "title": "MessageRecreateRequest",
+  "description": "Request to regenerate an assistant message (returns streaming response)",
+  "type": "object",
+  "properties": {
+    "message_id": {
+      "$ref": "../common/GtsMessageId.json",
+      "description": "Message identifier to recreate"
+    },
+    "enabled_capabilities": {
+      "type": "array",
+      "items": { "$ref": "../common/CapabilityValue.json" },
+      "description": "Capability values to apply for this recreation"
+    }
+  },
+  "required": ["message_id", "enabled_capabilities"],
+  "additionalProperties": false
+}

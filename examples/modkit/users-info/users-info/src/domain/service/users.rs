@@ -5,7 +5,7 @@ use tracing::instrument;
 
 use crate::domain::error::DomainError;
 use crate::domain::events::UserDomainEvent;
-use crate::domain::ports::{AuditPort, EventPublisher};
+use crate::domain::ports::{AuditPort, EventPublisher, UsersMetricsPort};
 use crate::domain::repos::{AddressesRepository, CitiesRepository, UsersRepository};
 use crate::domain::service::DbProvider;
 use crate::domain::service::{AddressesService, CitiesService, ServiceConfig};
@@ -41,6 +41,7 @@ pub struct UsersService<R: UsersRepository + 'static, CR: CitiesRepository, AR: 
     config: ServiceConfig,
     cities: Arc<CitiesService<CR>>,
     addresses: Arc<AddressesService<AR, R>>,
+    metrics: Arc<dyn UsersMetricsPort>,
 }
 
 impl<R: UsersRepository + 'static, CR: CitiesRepository, AR: AddressesRepository>
@@ -56,6 +57,7 @@ impl<R: UsersRepository + 'static, CR: CitiesRepository, AR: AddressesRepository
         config: ServiceConfig,
         cities: Arc<CitiesService<CR>>,
         addresses: Arc<AddressesService<AR, R>>,
+        metrics: Arc<dyn UsersMetricsPort>,
     ) -> Self {
         Self {
             db,
@@ -66,6 +68,7 @@ impl<R: UsersRepository + 'static, CR: CitiesRepository, AR: AddressesRepository
             config,
             cities,
             addresses,
+            metrics,
         }
     }
 }
@@ -129,6 +132,7 @@ impl<R: UsersRepository + 'static, CR: CitiesRepository, AR: AddressesRepository
                 .ok_or_else(|| DomainError::user_not_found(id))?
         };
 
+        self.metrics.record_get_user("success");
         tracing::debug!("Successfully retrieved user");
         Ok(user)
     }

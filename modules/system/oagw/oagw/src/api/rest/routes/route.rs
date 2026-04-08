@@ -6,13 +6,15 @@ use super::super::dto;
 use super::super::handlers;
 use super::License;
 
+const API_TAG: &str = "OAGW Routes";
+
 pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     // POST /oagw/v1/routes — Create route
     router = OperationBuilder::post("/oagw/v1/routes")
         .operation_id("oagw.create_route")
         .summary("Create route")
         .description("Create a new route mapping for an upstream service")
-        .tag("routes")
+        .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
         .json_request::<dto::CreateRouteRequest>(openapi, "Route configuration")
@@ -30,7 +32,7 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("oagw.get_route")
         .summary("Get route by ID")
         .description("Retrieve a specific route by its GTS identifier")
-        .tag("routes")
+        .tag(API_TAG)
         .path_param("id", "Route GTS identifier")
         .authenticated()
         .require_license_features::<License>([])
@@ -48,7 +50,7 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("oagw.update_route")
         .summary("Update route")
         .description("Partially update an existing route configuration")
-        .tag("routes")
+        .tag(API_TAG)
         .path_param("id", "Route GTS identifier")
         .authenticated()
         .require_license_features::<License>([])
@@ -67,7 +69,7 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("oagw.delete_route")
         .summary("Delete route")
         .description("Delete a route by its GTS identifier")
-        .tag("routes")
+        .tag(API_TAG)
         .path_param("id", "Route GTS identifier")
         .authenticated()
         .require_license_features::<License>([])
@@ -81,7 +83,7 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("oagw.list_routes")
         .summary("List routes by upstream")
         .description("Retrieve routes belonging to a specific upstream")
-        .tag("routes")
+        .tag(API_TAG)
         .path_param("upstream_id", "Upstream GTS identifier")
         .query_param_typed(
             "limit",

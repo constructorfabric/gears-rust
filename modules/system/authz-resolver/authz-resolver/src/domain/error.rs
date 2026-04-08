@@ -47,7 +47,7 @@ impl From<modkit::plugins::ChoosePluginError> for DomainError {
             modkit::plugins::ChoosePluginError::InvalidPluginInstance { gts_id, reason } => {
                 Self::InvalidPluginInstance { gts_id, reason }
             }
-            modkit::plugins::ChoosePluginError::PluginNotFound { vendor } => {
+            modkit::plugins::ChoosePluginError::PluginNotFound { vendor, .. } => {
                 Self::PluginNotFound { vendor }
             }
         }

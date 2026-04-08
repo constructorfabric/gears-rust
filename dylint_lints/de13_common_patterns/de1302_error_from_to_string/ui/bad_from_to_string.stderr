@@ -1,0 +1,12 @@
+error: `.to_string()` in `From` impl destroys the error chain (DE1302)
+  --> $DIR/bad_from_to_string.rs:30:18
+   |
+LL |         AppError(e.to_string())
+   |                  ^^^^^^^^^^^^^
+   |
+   = help: store the source error directly, use an enum variant, or use `#[from]` with thiserror
+   = note: `.to_string()` discards the original error type: `.source()` returns None and the error cannot be downcast
+   = note: `#[deny(de1302_error_from_to_string)]` on by default
+
+error: aborting due to 1 previous error
+

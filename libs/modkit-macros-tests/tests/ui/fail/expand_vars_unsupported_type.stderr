@@ -1,0 +1,7 @@
+error[E0599]: no method named `expand_vars` found for type `u32` in the current scope
+ --> tests/ui/fail/expand_vars_unsupported_type.rs:3:10
+  |
+3 | #[derive(ExpandVars)]
+  |          ^^^^^^^^^^ method not found in `u32`
+  |
+  = note: this error originates in the derive macro `ExpandVars` (in Nightly builds, run with -Z macro-backtrace for more info)

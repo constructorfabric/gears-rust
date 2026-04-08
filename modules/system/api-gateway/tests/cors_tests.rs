@@ -178,7 +178,7 @@ async fn test_cors_disabled() {
     let config = wrap_config(&serde_json::json!({
         "bind_addr": "127.0.0.1:0",
         "cors_enabled": false,
-        "auth_disabled": true
+        "auth_disabled": true,
     }));
 
     let hub = Arc::new(modkit::ClientHub::new());

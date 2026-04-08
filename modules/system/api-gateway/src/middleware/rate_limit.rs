@@ -14,6 +14,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+use crate::middleware::common;
+
 type RateLimitKey = (Method, String);
 type BucketMap = Arc<HashMap<RateLimitKey, Arc<BucketMapEntry>>>;
 type InflightMap = Arc<HashMap<RateLimitKey, Arc<Semaphore>>>;
@@ -66,6 +68,7 @@ impl RateLimiterMap {
                 ),
                 |r| (r.rps, r.burst, r.in_flight),
             );
+
             let key = (spec.method.clone(), spec.path.clone());
             buckets.insert(
                 key.clone(),
@@ -91,6 +94,9 @@ pub async fn rate_limit_middleware(map: RateLimiterMap, mut req: Request, next: 
         .extensions()
         .get::<axum::extract::MatchedPath>()
         .map_or_else(|| req.uri().path().to_owned(), |p| p.as_str().to_owned());
+
+    let path = common::resolve_path(&req, path.as_str());
+
     let key = (method, path);
 
     if let Some(bucker_map_entry) = map.buckets.get(&key) {

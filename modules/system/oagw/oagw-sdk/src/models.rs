@@ -190,15 +190,22 @@ pub enum RateLimitStrategy {
 }
 
 // ---------------------------------------------------------------------------
-// PluginsConfig
+// PluginBinding / PluginsConfig
 // ---------------------------------------------------------------------------
+
+/// A single plugin binding: reference + optional per-plugin config.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginBinding {
+    pub plugin_ref: String,
+    pub config: HashMap<String, String>,
+}
 
 /// Plugin chain configuration.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PluginsConfig {
     pub sharing: SharingMode,
-    /// Plugin references: GTS identifiers (builtin) or UUIDs (custom).
-    pub items: Vec<String>,
+    /// Plugin bindings: GTS identifiers (builtin) or UUIDs (custom) with optional config.
+    pub items: Vec<PluginBinding>,
 }
 
 // ---------------------------------------------------------------------------

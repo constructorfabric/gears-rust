@@ -11,11 +11,17 @@ use super::model::{CreateRouteRequest, CreateUpstreamRequest};
 use uuid::Uuid;
 
 /// An upstream definition read from the types-registry.
+///
+/// `gts_instance_id` is the UUID parsed from the GTS entity identifier
+/// (e.g. the `<uuid>` part of `gts.x.core.oagw.upstream.v1~<uuid>`).
+/// Used by `post_init()` to map GTS-level references in route entities
+/// to OAGW-assigned upstream UUIDs.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ProvisionedUpstream {
     pub tenant_id: Uuid,
     pub request: CreateUpstreamRequest,
+    pub gts_instance_id: Option<Uuid>,
 }
 
 /// A route definition read from the types-registry.

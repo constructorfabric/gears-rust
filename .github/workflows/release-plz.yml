@@ -30,7 +30,7 @@ jobs:
   release-pr:
     name: Create release PR
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' || github.event.inputs.mode == 'release-pr' }}
+    if: ${{ github.repository == 'cyberfabric/cyberfabric-core' && (github.event_name == 'push' || github.event.inputs.mode == 'release-pr') }}
     permissions:
       contents: write
       pull-requests: write
@@ -56,16 +56,18 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       ${{
-        (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
-        || (
-          github.event_name == 'pull_request'
-          && github.event.pull_request.merged == true
-          && contains(join(github.event.pull_request.labels.*.name, ','), 'release-plz')
+        github.repository == 'cyberfabric/cyberfabric-core'
+        && (
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
+          || (
+            github.event_name == 'pull_request'
+            && github.event.pull_request.merged == true
+            && contains(join(github.event.pull_request.labels.*.name, ','), 'release-plz')
+          )
         )
       }}
     permissions:
       actions: write
-      contents: read
     steps:
       - name: Delete PR rust caches
         env:
@@ -125,11 +127,14 @@ jobs:
     # - when a release PR (labeled `release-plz`) is merged into main.
     if: >-
       ${{
-        (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
-        || (
-          github.event_name == 'pull_request'
-          && github.event.pull_request.merged == true
-          && contains(join(github.event.pull_request.labels.*.name, ','), 'release-plz')
+        github.repository == 'cyberfabric/cyberfabric-core'
+        && (
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
+          || (
+            github.event_name == 'pull_request'
+            && github.event.pull_request.merged == true
+            && contains(join(github.event.pull_request.labels.*.name, ','), 'release-plz')
+          )
         )
       }}
     permissions:
@@ -176,6 +181,9 @@ jobs:
       - name: cargo test (workspace)
         run: make test-no-macros
 
+      - name: Clear cargo registry index (workaround gix slotmap overflow)
+        run: rm -rf ~/.cargo/registry/index
+
       - name: release-plz release
         uses: release-plz/action@52440b50d383aa252927de395c8b2c1e0a9cf8e9 # v0.3.155
         with:
@@ -183,6 +191,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
       - name: Disk report (post-mortem)
         if: always()

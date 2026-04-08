@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.message.get_request.v1",
+  "title": "MessageGetRequest",
+  "description": "Request to retrieve a specific message",
+  "type": "object",
+  "properties": {
+    "message_id": {
+      "$ref": "../common/GtsMessageId.json",
+      "description": "Message identifier"
+    }
+  },
+  "required": ["message_id"],
+  "additionalProperties": false
+}

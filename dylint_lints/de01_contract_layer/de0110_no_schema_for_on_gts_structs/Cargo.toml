@@ -10,11 +10,11 @@ publish = false
 crate-type = ["cdylib"]
 
 [[example]]
-name = "gts_struct_schema_for"
+name = "contract_gts_struct_schema_for"
 path = "ui/gts_struct_schema_for.rs"
 
 [[example]]
-name = "non_gts_struct_schema_for"
+name = "contract_non_gts_struct_schema_for"
 path = "ui/non_gts_struct_schema_for.rs"
 
 [dependencies]
@@ -24,7 +24,7 @@ lint_utils.workspace = true
 
 [dev-dependencies]
 dylint_testing.workspace = true
-schemars = { version = "0.8", features = ["derive"] }
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 gts-macros.workspace = true

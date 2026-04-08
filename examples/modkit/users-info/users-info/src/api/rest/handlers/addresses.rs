@@ -1,4 +1,7 @@
-use axum::response::{IntoResponse, Response};
+use axum::Extension;
+use axum::extract::Path;
+use axum::response::IntoResponse;
+use tracing::field::Empty;
 use uuid::Uuid;
 
 use super::{
@@ -6,10 +9,19 @@ use super::{
 };
 use crate::module::ConcreteAppServices;
 
-pub(super) async fn get_user_address(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    user_id: Uuid,
+/// Get address for a specific user
+#[tracing::instrument(
+    skip(svc, ctx),
+    fields(
+        user.id = %user_id,
+        request_id = Empty,
+        requester.id = %ctx.subject_id()
+    )
+)]
+pub async fn get_user_address(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Path(user_id): Path<Uuid>,
 ) -> ApiResult<JsonBody<AddressDto>> {
     info!(
         user_id = %user_id,
@@ -25,12 +37,21 @@ pub(super) async fn get_user_address(
     Ok(Json(AddressDto::from(address)))
 }
 
-pub(super) async fn put_user_address(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    user_id: Uuid,
-    req_body: PutAddressReq,
-) -> ApiResult<Response> {
+/// Upsert address for a specific user (PUT = create or replace)
+#[tracing::instrument(
+    skip(svc, req_body, ctx),
+    fields(
+        user.id = %user_id,
+        request_id = Empty,
+        updater.id = %ctx.subject_id()
+    )
+)]
+pub async fn put_user_address(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Path(user_id): Path<Uuid>,
+    Json(req_body): Json<PutAddressReq>,
+) -> ApiResult<impl IntoResponse> {
     info!(
         user_id = %user_id,
         updater_id = %ctx.subject_id(),
@@ -46,11 +67,20 @@ pub(super) async fn put_user_address(
     Ok(Json(AddressDto::from(address)).into_response())
 }
 
-pub(super) async fn delete_user_address(
-    ctx: SecurityContext,
-    svc: std::sync::Arc<ConcreteAppServices>,
-    user_id: Uuid,
-) -> ApiResult<Response> {
+/// Delete address for a specific user
+#[tracing::instrument(
+    skip(svc, ctx),
+    fields(
+        user.id = %user_id,
+        request_id = Empty,
+        deleter.id = %ctx.subject_id()
+    )
+)]
+pub async fn delete_user_address(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Path(user_id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
     info!(
         user_id = %user_id,
         deleter_id = %ctx.subject_id(),

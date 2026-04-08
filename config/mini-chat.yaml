@@ -1,0 +1,376 @@
+# Mini-Chat development configuration
+#
+# Minimal config for developing/testing the mini-chat module.
+# Based on quickstart.yaml but stripped to essentials.
+#
+# Usage:
+#   cargo run --bin hyperspot-server --features mini-chat,static-authn,static-authz,single-tenant,static-credstore -- --config config/mini-chat.yaml run
+
+server:
+  home_dir: "~/.hyperspot"
+
+database:
+  servers:
+    sqlite_mini_chat:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/hyperspot.log"
+    file_level: info
+  sqlx:
+    console_level: debug
+    file: "logs/sql.log"
+    file_level: debug
+  api-gateway:
+    console_level: debug
+    file: "logs/api.log"
+    file_level: debug
+  mini_chat:
+    console_level: debug
+    file: "logs/mini-chat.log"
+    file_level: debug
+
+modules:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      openapi:
+        title: "Mini-Chat Dev API"
+        version: "0.1.0"
+        description: "Mini-Chat development server"
+      defaults:
+        body_limit_bytes: 64000000
+        rate_limit:
+          rps: 1000
+          burst: 200
+          in_flight: 64
+      auth_disabled: true
+
+  module-orchestrator:
+    config: {}
+
+  grpc-hub:
+    config:
+      listen_addr: "uds:///tmp/hyperspot-grpc"
+
+  authn-resolver:
+    config:
+      vendor: "hyperspot"
+
+  authz-resolver:
+    config:
+      vendor: "hyperspot"
+
+  static-authn-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+      mode: accept_all
+      s2s_credentials:
+        - client_id: "mini-chat"
+          client_secret: "mini-chat-dev-secret"
+
+  static-authz-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+
+  tenant-resolver:
+    config:
+      vendor: "hyperspot"
+
+  single-tenant-tr-plugin:
+    config: {}
+
+  simple-user-settings:
+    database:
+      server: "sqlite_mini_chat"
+      file: "settings.db"
+    config:
+      max_field_length: 100
+
+  static-credstore-plugin:
+    config:
+      secrets:
+        - key: "azure-openai-key"
+          value: "${AZURE_OPENAI_API_KEY}"
+
+  file-parser:
+    config:
+      allowed_local_base_dir: /tmp
+
+  mini-chat:
+    database:
+      server: "sqlite_mini_chat"
+      file: "mini_chat.db"
+    config:
+      # S2S credentials for obtaining SecurityContext
+      # that will be used for communication with other modules.
+      client_credentials:
+        client_id: "mini-chat"
+        client_secret: "mini-chat-dev-secret"
+      # Provider registry. Key = provider_id (matches ModelCatalogEntry.provider_id).
+      # `upstream_alias` is optional — defaults to `host` when omitted.
+      providers:
+        azure_openai:
+          kind: openai_responses
+          storage_kind: azure
+          host: "${AZURE_OPENAI_API_HOST}"
+          api_path: "/openai/v1/responses"
+          api_version: "2025-03-01-preview"
+          auth_plugin_type: "gts.x.core.oagw.auth_plugin.v1~x.core.oagw.apikey.v1"
+          auth_config:
+            header: "api-key"
+            prefix: ""
+            secret_ref: "azure-openai-key"
+
+      # ── Azure OpenAI example (uncomment and set your endpoint) ──────────
+      #   azure_openai:
+      #     kind: openai_responses
+      #     host: "<your-resource>.openai.azure.com"       # Azure endpoint
+      #     # upstream_alias: "custom-alias"               # optional, defaults to host
+      #     api_path: "/openai/v1/responses"
+      #     auth_plugin_type: "gts.x.core.oagw.auth_plugin.v1~x.core.oagw.apikey.v1"
+      #     auth_config:
+      #       header: "api-key"
+      #       prefix: ""
+      #       secret_ref: "azure-openai-key"
+      #
+      # ── Per-tenant Azure example (each tenant gets its own endpoint/auth) ─
+      # Tenant overrides share the root provider's adapter kind and api_path.
+      # Only host and/or auth fields need to differ. Omitted fields inherit
+      # from the root entry. Key = tenant ID (UUID string).
+      #
+      #   azure_openai:
+      #     kind: openai_responses
+      #     host: "default.openai.azure.com"
+      #     api_path: "/openai/v1/responses"
+      #     auth_plugin_type: "gts.x.core.oagw.auth_plugin.v1~x.core.oagw.apikey.v1"
+      #     auth_config:
+      #       header: "api-key"
+      #       prefix: ""
+      #       secret_ref: "azure-openai-key"
+      #     tenant_overrides:
+      #       "tenant-a-uuid":
+      #         host: "tenant-a.openai.azure.com"
+      #         auth_config:
+      #           header: "api-key"
+      #           prefix: ""
+      #           secret_ref: "azure-openai-key-tenant-a"
+      #       "tenant-b-uuid":
+      #         host: "tenant-b.openai.azure.com"
+      #         auth_config:
+      #           header: "api-key"
+      #           prefix: ""
+      #           secret_ref: "azure-openai-key-tenant-b"
+      #     # NOTE: tenant secret_ref values need matching entries under
+      #     # modules.static-credstore-plugin.config.secrets
+
+  static-mini-chat-audit-plugin:
+    config:
+      enabled: true
+
+  static-mini-chat-model-policy-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+      model_catalog:
+        # ── GPT-4.1 (Premium) ──
+        - model_id: "gpt-4.1"
+          provider_model_id: "gpt-4.1"
+          display_name: "GPT-4.1"
+          description: "Most capable model"
+          version: "4.1"
+          provider_id: "azure_openai"
+          provider_display_name: "Azure OpenAI"
+          icon: ""
+          tier: Premium
+          enabled: true
+          # System prompt sent as `instructions` in every LLM request for this model.
+          # Omit or leave empty for no system instructions.
+          system_prompt: "You are a helpful, concise assistant. Answer clearly and directly."
+          # Prompt template for thread summary generation (future use).
+          # thread_summary_prompt: "Summarize the key points of this conversation."
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 1047576
+          max_output_tokens: 32768
+          max_input_tokens: 1047576
+          input_tokens_credit_multiplier_micro: 3000000
+          output_tokens_credit_multiplier_micro: 15000000
+          multiplier_display: "3x"
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_retrieved_chunks_per_turn: 5
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            tier: "premium"
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              function_calling: true
+              structured_output: true
+              fine_tuning: false
+              distillation: false
+              fim_completion: false
+              chat_prefix_completion: false
+            input_type:
+              text: true
+              image: true
+              audio: false
+              video: false
+            tool_support:
+              web_search: true
+              file_search: true
+              image_generation: false
+              code_interpreter: true
+              computer_use: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              realtime: false
+              assistants: false
+              batch_api: false
+              fine_tuning: false
+              embeddings: false
+              videos: false
+              image_generation: false
+              image_edit: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+              moderations: false
+              completions: false
+            token_policy:
+              input_tokens_credit_multiplier: 3.0
+              output_tokens_credit_multiplier: 15.0
+            performance:
+              response_latency_ms: 800
+              speed_tokens_per_second: 75
+          preference:
+            is_default: true
+            sort_order: 0
+
+        # ── GPT-4.1 Mini (Standard) ──
+        - model_id: "gpt-4.1-mini"
+          provider_model_id: "gpt-4.1-mini"
+          display_name: "GPT-4.1 Mini"
+          description: "Fast and efficient model"
+          version: "4.1"
+          provider_id: "azure_openai"
+          provider_display_name: "Azure OpenAI"
+          icon: ""
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful, concise assistant. Answer clearly and directly."
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 1047576
+          max_output_tokens: 32768
+          max_input_tokens: 1047576
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 3000000
+          multiplier_display: "1x"
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_retrieved_chunks_per_turn: 5
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            tier: "standard"
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              function_calling: true
+              structured_output: true
+              fine_tuning: false
+              distillation: false
+              fim_completion: false
+              chat_prefix_completion: false
+            input_type:
+              text: true
+              image: true
+              audio: false
+              video: false
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: true
+              computer_use: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              realtime: false
+              assistants: false
+              batch_api: false
+              fine_tuning: false
+              embeddings: false
+              videos: false
+              image_generation: false
+              image_edit: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+              moderations: false
+              completions: false
+            token_policy:
+              input_tokens_credit_multiplier: 1.0
+              output_tokens_credit_multiplier: 3.0
+            performance:
+              response_latency_ms: 400
+              speed_tokens_per_second: 150
+          preference:
+            is_default: false
+            sort_order: 1
+
+  oagw:
+    config:
+      proxy_timeout_secs: 60
+
+# OpenTelemetry configuration (resource identity, tracing, metrics)
+opentelemetry:
+  tracing:
+    enabled: false
+  metrics:
+    enabled: false

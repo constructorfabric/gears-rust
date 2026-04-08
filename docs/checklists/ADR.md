@@ -4,6 +4,34 @@
 **Version**: 2.0
 **Purpose**: Comprehensive quality checklist for ADR artifacts
 
+## Table of Contents
+
+1. [Referenced Standards](#referenced-standards)
+2. [Prerequisites](#prerequisites)
+3. [Applicability Context](#applicability-context)
+4. [Severity Dictionary](#severity-dictionary)
+5. [Review Scope Selection](#review-scope-selection)
+6. [MUST HAVE](#must-have)
+   - [🏗️ ARCHITECTURE Expertise (ARCH)](#architecture-expertise-arch)
+   - [⚡ PERFORMANCE Expertise (PERF)](#performance-expertise-perf)
+   - [🔒 SECURITY Expertise (SEC)](#security-expertise-sec)
+   - [🛡️ RELIABILITY Expertise (REL)](#reliability-expertise-rel)
+   - [📊 DATA Expertise (DATA)](#data-expertise-data)
+   - [🔌 INTEGRATION Expertise (INT)](#integration-expertise-int)
+   - [🖥️ OPERATIONS Expertise (OPS)](#operations-expertise-ops)
+   - [🔧 MAINTAINABILITY Expertise (MAINT)](#maintainability-expertise-maint)
+   - [🧪 TESTING Expertise (TEST)](#testing-expertise-test)
+   - [📜 COMPLIANCE Expertise (COMPL)](#compliance-expertise-compl)
+   - [👤 USABILITY Expertise (UX)](#usability-expertise-ux)
+   - [🏢 BUSINESS Expertise (BIZ)](#business-expertise-biz)
+7. [MUST NOT HAVE](#must-not-have)
+8. [ADR-Specific Quality Checks](#adr-specific-quality-checks)
+9. [Validation Summary](#validation-summary)
+   - [Final Checklist](#final-checklist)
+   - [Reporting Readiness Checklist](#reporting-readiness-checklist)
+   - [Reporting](#reporting)
+   - [Reporting Commitment](#reporting-commitment)
+
 ---
 
 ## Referenced Standards
@@ -19,33 +47,6 @@ This checklist incorporates requirements and best practices from:
 | **OWASP ASVS 5.0** | Application Security Verification | V1.2 Architecture, V2 Authentication, V5 Validation |
 | **ISO/IEC 27001:2022** | Information Security Management | Annex A controls, risk assessment |
 | **ISO/IEC/IEEE 29119-3:2021** | Test Documentation | Test specification, acceptance criteria |
-
----
-
-## Table of Contents
-
-1. [Prerequisites](#prerequisites)
-2. [Applicability Context](#applicability-context)
-3. [Severity Dictionary](#severity-dictionary)
-4. [Review Scope Selection](#review-scope-selection)
-5. **MUST HAVE**
-   - [Architecture (ARCH)](#️-architecture-expertise-arch) — Core ADR quality
-   - [Performance (PERF)](#-performance-expertise-perf) — If applicable
-   - [Security (SEC)](#-security-expertise-sec) — If applicable
-   - [Reliability (REL)](#️-reliability-expertise-rel) — If applicable
-   - [Data (DATA)](#-data-expertise-data) — If applicable
-   - [Integration (INT)](#-integration-expertise-int) — If applicable
-   - [Operations (OPS)](#️-operations-expertise-ops) — If applicable
-   - [Maintainability (MAINT)](#-maintainability-expertise-maint) — If applicable
-   - [Testing (TEST)](#-testing-expertise-test) — If applicable
-   - [Compliance (COMPL)](#-compliance-expertise-compl) — If applicable
-   - [Usability (UX)](#-usability-expertise-ux) — If applicable
-   - [Business (BIZ)](#-business-expertise-biz) — If applicable
-6. **MUST NOT HAVE**
-7. [ADR-Specific Quality Checks](#adr-specific-quality-checks)
-8. [Validation Summary](#validation-summary)
-9. [Reporting](#reporting)
-
 ---
 
 ## Prerequisites
@@ -225,36 +226,17 @@ For architectural decisions with broad impact, check ALL applicable domains.
 - [ ] Links to impacted feature specifications are provided (when applicable)
 - [ ] Each link has a short explanation of relevance
 - [ ] Scope of impact is explicitly stated (what changes, what does not)
-- [ ] ADR `adr` ID is referenced in DESIGN under `### Architecture Drivers` (coverage: **required**)
-- [ ] PRD does NOT backtick-reference this ADR ID (coverage: **prohibited**)
 
 ### ARCH-ADR-006: ADR Metadata Quality
 **Severity**: CRITICAL
 **Ref**: Michael Nygard ADR Template — Title, Status, Date fields
 
-- [ ] YAML frontmatter present with `status` and `date` fields
-- [ ] `status` uses consistent vocabulary: `proposed`, `accepted`, `deprecated`, `superseded`
-- [ ] `date` is in ISO 8601 format (YYYY-MM-DD)
 - [ ] Title is descriptive and action-oriented
-- [ ] `adr` ID defined in plain `**ID**:` form (task/priority prohibited — no checkbox)
+- [ ] Date is present and unambiguous
+- [ ] Status is present and uses a consistent vocabulary (e.g., Proposed, Accepted, Rejected, Deprecated, Superseded)
 - [ ] Decision owner/approver is identified (person/team)
 - [ ] Scope / affected systems are stated
 - [ ] If this record supersedes another decision record, the superseded record is linked
-
-### ARCH-ADR-006b: Required Headings (cf-sdlc)
-**Severity**: HIGH
-**Ref**: constraints.json — ADR headings
-
-- [ ] `## Context and Problem Statement` present (required)
-- [ ] `## Decision Drivers` present (required)
-- [ ] `## Considered Options` present (required)
-- [ ] `## Decision Outcome` present (required)
-- [ ] `### Consequences` present under Decision Outcome (required)
-- [ ] `### Confirmation` present under Decision Outcome (required)
-- [ ] `## Pros and Cons of the Options` present (required)
-- [ ] One `### {Option Name}` per considered option under Pros and Cons (optional, multiple allowed)
-- [ ] `## More Information` present (optional)
-- [ ] `## Traceability` present (optional)
 
 ### ARCH-ADR-007: Decision Drivers (if present)
 **Severity**: MEDIUM
@@ -560,9 +542,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 # MUST NOT HAVE
 
----
-
-## ❌ ARCH-ADR-NO-001: No Complete Architecture Description
+### ARCH-ADR-NO-001: No Complete Architecture Description
 **Severity**: CRITICAL
 
 **What to check**:
@@ -574,9 +554,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: System/Architecture design documentation
 
----
-
-## ❌ ARCH-ADR-NO-002: No Spec Implementation Details
+### ARCH-ADR-NO-002: No Spec Implementation Details
 **Severity**: HIGH
 
 **What to check**:
@@ -588,9 +566,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Spec specification / implementation design documentation
 
----
-
-## ❌ BIZ-ADR-NO-001: No Product Requirements
+### BIZ-ADR-NO-001: No Product Requirements
 **Severity**: HIGH
 
 **What to check**:
@@ -602,9 +578,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Requirements / Product specification document
 
----
-
-## ❌ BIZ-ADR-NO-002: No Implementation Tasks
+### BIZ-ADR-NO-002: No Implementation Tasks
 **Severity**: HIGH
 
 **What to check**:
@@ -616,9 +590,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Project management tools
 
----
-
-## ❌ DATA-ADR-NO-001: No Complete Schema Definitions
+### DATA-ADR-NO-001: No Complete Schema Definitions
 **Severity**: MEDIUM
 
 **What to check**:
@@ -629,9 +601,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Source code repository or architecture documentation
 
----
-
-## ❌ MAINT-ADR-NO-001: No Code Implementation
+### MAINT-ADR-NO-001: No Code Implementation
 **Severity**: HIGH
 
 **What to check**:
@@ -643,9 +613,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Source code repository
 
----
-
-## ❌ SEC-ADR-NO-001: No Security Secrets
+### SEC-ADR-NO-001: No Security Secrets
 **Severity**: CRITICAL
 
 **What to check**:
@@ -657,9 +625,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Secret management system
 
----
-
-## ❌ TEST-ADR-NO-001: No Test Implementation
+### TEST-ADR-NO-001: No Test Implementation
 **Severity**: MEDIUM
 
 **What to check**:
@@ -670,9 +636,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Test documentation or test code
 
----
-
-## ❌ OPS-ADR-NO-001: No Operational Procedures
+### OPS-ADR-NO-001: No Operational Procedures
 **Severity**: MEDIUM
 
 **What to check**:
@@ -683,9 +647,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Operations documentation or runbooks
 
----
-
-## ❌ ARCH-ADR-NO-003: No Trivial Decisions
+### ARCH-ADR-NO-003: No Trivial Decisions
 **Severity**: MEDIUM
 
 **What to check**:
@@ -697,9 +659,7 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Team conventions, coding standards, or not documented at all
 
----
-
-## ❌ ARCH-ADR-NO-004: No Incomplete Decisions
+### ARCH-ADR-NO-004: No Incomplete Decisions
 **Severity**: HIGH
 
 **What to check**:
@@ -714,12 +674,6 @@ For architectural decisions with broad impact, check ALL applicable domains.
 ---
 
 # ADR-Specific Quality Checks
-
----
-
-## ADR Writing Quality
-
-**Standards**: Michael Nygard ADR Template — writing style guidance
 
 ### QUALITY-001: Neutrality
 **Severity**: MEDIUM
@@ -804,40 +758,15 @@ For each major checklist category (ARCH, PERF, SEC, REL, DATA, INT, OPS, MAINT, 
 
 Report **only** problems (do not list what is OK).
 
-### Format Selection
-
-| Review Mode | Report Format |
-|-------------|---------------|
-| Quick | Compact (table) |
-| Standard | Compact or Full |
-| Full | Full (detailed) |
-
-### Compact Format (for Quick/Standard reviews)
-
-```markdown
-## ADR Review: {title}
-
-| # | ID | Sev | Issue | Fix |
-|---|-----|-----|-------|-----|
-| 1 | ARCH-002 | CRIT | Missing problem statement | Add 2+ sentences describing the problem |
-| 2 | ARCH-003 | HIGH | Only 1 option listed | Add at least 1 viable alternative |
-
-**Review mode**: Quick (ARCH core only)
-**Domains checked**: ARCH
-**Domains N/A**: PERF, SEC, REL, DATA, INT, OPS (methodology ADR)
-```
-
-### Full Format (for detailed reviews)
-
 For each issue include:
 
-- **Why Applicable**: Explain why this requirement applies to this specific ADR's context (e.g., "This ADR describes a web service architecture, therefore security impact analysis is required")
+- **Why Applicable**: Explain why this requirement applies to this artifact's context
 - **Issue**: What is wrong (requirement missing or incomplete)
 - **Evidence**: Quote the exact text or describe the exact location in the artifact (or note "No mention found")
 - **Why it matters**: Impact (risk, cost, user harm, compliance)
 - **Proposal**: Concrete fix (what to change/add/remove) with clear acceptance criteria
 
-Full output format:
+### Full Report Format (Standard/Full Reviews)
 
 ```markdown
 ## Review Report (Issues Only)
@@ -850,7 +779,7 @@ Full output format:
 
 #### Why Applicable
 
-{Explain why this requirement applies to this ADR's context. E.g., "This ADR describes a distributed system architecture, therefore reliability impact analysis is required."}
+{Explain why this requirement applies to this artifact's context}
 
 #### Issue
 
@@ -871,22 +800,21 @@ Full output format:
 ---
 
 ### 2. {Short issue title}
-
-**Checklist Item**: `{CHECKLIST-ID}` — {Checklist item title}
-
-**Severity**: CRITICAL|HIGH|MEDIUM|LOW
-
-#### Why Applicable
-
-{...}
-
-#### Issue
-
-{...}
-
----
-
 ...
+```
+
+### Compact Report Format (Quick Reviews)
+
+For quick reviews, use this condensed table format:
+
+```markdown
+## ADR Review Summary
+
+| ID | Severity | Issue | Proposal |
+|-----|----------|-------|----------|
+| {ID} | HIGH | Missing required element | Add element to Section X |
+
+**Applicability**: checked {N} priority domains, {M} marked N/A
 ```
 
 ---

@@ -1,9 +1,10 @@
 use crate::domain::plugin::{AuthContext, AuthPlugin, PluginError};
+use async_trait::async_trait;
 
 /// Auth plugin that does nothing — used for upstreams requiring no authentication.
 pub struct NoopAuthPlugin;
 
-#[async_trait::async_trait]
+#[async_trait]
 impl AuthPlugin for NoopAuthPlugin {
     async fn authenticate(&self, _ctx: &mut AuthContext) -> Result<(), PluginError> {
         Ok(())
@@ -13,6 +14,9 @@ impl AuthPlugin for NoopAuthPlugin {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use modkit_security::SecurityContext;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -25,6 +29,11 @@ mod tests {
         let mut ctx = AuthContext {
             headers: headers.clone(),
             config: HashMap::new(),
+            security_context: SecurityContext::builder()
+                .subject_tenant_id(Uuid::nil())
+                .subject_id(Uuid::nil())
+                .build()
+                .unwrap(),
         };
 
         plugin.authenticate(&mut ctx).await.unwrap();

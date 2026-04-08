@@ -7,7 +7,7 @@ ModKit provides a type-safe operation builder that prevents half-wired routes at
 - **Rule**: Strictly follow the API guideline (`guidelines/DNA/REST/API.md`).
 - **Rule**: Do NOT implement a REST host. `api-gateway` owns the Axum server and OpenAPI. Modules only register routes via `register_routes(...)`.
 - **Rule**: Use `Extension<Arc<Service>>` for dependency injection and attach the service ONCE after all routes are registered: `router = router.layer(Extension(service.clone()));`.
-- **Rule**: Use `Authz(ctx): Authz` extractor for authorization — it extracts `SecurityContext` from the request.
+- **Rule**: Use `Extension(ctx): Extension<SecurityContext>` extractor — the gateway injects `SecurityContext` as an Axum extension.
 - **Rule**: Follow the `<crate>.<resource>.<action>` convention for `operation_id` naming.
 - **Rule**: Use `modkit::api::prelude::*` for ergonomic handler types (ApiResult, created_json, no_content).
 - **Rule**: Always return RFC 9457 Problem Details for all 4xx/5xx errors via `Problem` (implements `IntoResponse`).
@@ -30,7 +30,7 @@ pub fn register_routes(
 ) -> Router {
     let router = OperationBuilder::get("/users-info/v1/users")
         .operation_id("users_info.list_users")
-        .require_auth(&Resource::Users, &Action::Read)
+        .authenticated()
         .require_license_features::<License>([])
         .handler(handlers::list_users)
         .json_response_with_schema::<modkit_odata::Page<dto::UserDto>>(
@@ -56,7 +56,8 @@ pub fn register_routes(
 ```rust
 OperationBuilder::post("/users-info/v1/users")
     .operation_id("users_info.create_user")
-    .require_auth(&Resource::Users, &Action::Write)
+    .authenticated()
+    .require_license_features::<License>([])
     .handler(handlers::create_user)
     .json_response_with_schema::<dto::UserDto>(openapi, StatusCode::CREATED, "User created")
     .standard_errors(openapi)
@@ -79,7 +80,7 @@ OperationBuilder::get("/users-info/v1/health")
 ```rust
 OperationBuilder::get("/users-info/v1/premium")
     .operation_id("users_info.premium")
-    .require_auth(&Resource::Users, &Action::Read)
+    .authenticated()
     .require_license_features::<License>([License::Premium])
     .handler(handlers::premium)
     .json_response_with_schema::<dto::PremiumDto>(openapi, StatusCode::OK, "Premium content")
@@ -138,7 +139,8 @@ OperationBuilder::post("/users-info/v1/export")
 ```rust
 OperationBuilder::get("/users-info/v1/users/events")
     .operation_id("users_info.user_events")
-    .require_auth(&Resource::Users, &Action::Read)
+    .authenticated()
+    .require_license_features::<License>([])
     .sse_json::<dto::UserEvent>(openapi, "Real-time user events")
     .handler(handlers::user_events)
     .register(router, openapi);
@@ -148,7 +150,7 @@ Handler example:
 
 ```rust
 pub async fn user_events(
-    Authz(ctx): Authz,
+    Extension(ctx): Extension<SecurityContext>,
     Extension(broadcaster): Extension<Arc<SseBroadcaster<UserEvent>>>,
 ) -> impl IntoResponse {
     let stream = broadcaster.subscribe();
@@ -184,7 +186,7 @@ use crate::domain::error::DomainError;
 
 // DomainError auto-converts to Problem via From impl
 pub async fn create_user(
-    Authz(ctx): Authz,
+    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<Service>>,
     Json(req): Json<CreateUserReq>,
 ) -> ApiResult<impl IntoResponse> {
@@ -201,7 +203,8 @@ pub async fn create_user(
 ```rust
 OperationBuilder::get("/users-info/v1/users")
     .operation_id("users_info.list_users")
-    .require_auth(&Resource::Users, &Action::Read)
+    .authenticated()
+    .require_license_features::<License>([])
     .handler(handlers::list_users)
     .json_response_with_schema::<modkit_odata::Page<dto::UserDto>>(
         openapi,
@@ -219,7 +222,7 @@ Handler with OData:
 
 ```rust
 pub async fn list_users(
-    Authz(ctx): Authz,
+    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<Service>>,
     OData(query): OData,
 ) -> ApiResult<JsonPage<serde_json::Value>> {
@@ -269,11 +272,11 @@ pub async fn list_users(
 ## Quick checklist
 
 - [ ] Use `OperationBuilder` for every route.
-- [ ] Add `.require_auth()` for protected endpoints.
+- [ ] Add `.authenticated()` + `.require_license_features::<License>([])` for protected endpoints.
 - [ ] Add `.standard_errors(openapi)` or specific errors.
 - [ ] Use `.json_response_with_schema()` for typed responses.
 - [ ] Use `Extension<Arc<Service>>` and attach once after all routes.
-- [ ] Use `Authz(ctx): Authz` to get `SecurityContext`.
+- [ ] Use `Extension(ctx): Extension<SecurityContext>` to get `SecurityContext`.
 - [ ] Use `ApiResult<T>` and `?` for error propagation.
 - [ ] For OData: add `.with_odata_*()` helpers and use `OData(query)` extractor.
 - [ ] For SSE: use `.sse_json()` and `SseBroadcaster`.

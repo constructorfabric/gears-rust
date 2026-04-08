@@ -1,5 +1,31 @@
 # Feature: Task Filtering and Logic
 
+
+<!-- toc -->
+
+- [1. Feature Context](#1-feature-context)
+  - [1.1 Overview](#11-overview)
+  - [1.2 Purpose](#12-purpose)
+  - [1.3 Actors](#13-actors)
+  - [1.4 References](#14-references)
+- [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
+  - [Filter Tasks Flow](#filter-tasks-flow)
+  - [Search Tasks Flow](#search-tasks-flow)
+- [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
+  - [Task Sorting Algorithm](#task-sorting-algorithm)
+  - [Overdue Detection Algorithm](#overdue-detection-algorithm)
+- [4. States (CDSL)](#4-states-cdsl)
+  - [Filter State Machine](#filter-state-machine)
+- [5. Definitions of Done](#5-definitions-of-done)
+  - [Implement Task Filtering](#implement-task-filtering)
+  - [Implement Task Search](#implement-task-search)
+  - [Implement Task Sorting](#implement-task-sorting)
+- [6. Acceptance Criteria](#6-acceptance-criteria)
+- [7. Additional Context (optional)](#7-additional-context-optional)
+  - [UX Considerations](#ux-considerations)
+
+<!-- /toc -->
+
 - [ ] `p2` - **ID**: `cpt-examples-todo-app-featstatus-logic`
 
 - [x] `p2` - `cpt-examples-todo-app-feature-logic`

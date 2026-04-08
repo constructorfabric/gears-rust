@@ -39,8 +39,6 @@ impl Default for SingleTenantTrPlugin {
 #[async_trait]
 impl Module for SingleTenantTrPlugin {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
-        info!("Initializing {} module", Self::MODULE_NAME);
-
         // Generate plugin instance ID
         let instance_id = TenantResolverPluginSpecV1::gts_make_instance_id(
             "hyperspot.builtin.single_tenant_resolver.plugin.v1",
@@ -71,8 +69,7 @@ impl Module for SingleTenantTrPlugin {
         info!(
             instance_id = %instance_id,
             vendor = VENDOR,
-            priority = PRIORITY,
-            "{} module initialized successfully", Self::MODULE_NAME
+            priority = PRIORITY
         );
         Ok(())
     }

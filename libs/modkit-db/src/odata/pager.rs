@@ -95,7 +95,7 @@
 //! `OPager` automatically enforces tenant isolation and access control:
 //! - Security scope is applied before any filters
 //! - Empty scopes result in deny-all (no data returned)
-//! - All queries are scoped by the `SecurityCtx` provided
+//! - All queries are scoped by the `SecurityContext` provided
 //!
 //! # Performance
 //!

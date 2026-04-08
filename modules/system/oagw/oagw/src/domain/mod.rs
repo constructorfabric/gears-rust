@@ -1,4 +1,3 @@
-pub(crate) mod credential;
 pub(crate) mod error;
 pub(crate) mod gts_helpers;
 pub(crate) mod model;

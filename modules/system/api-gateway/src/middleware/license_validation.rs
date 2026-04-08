@@ -4,9 +4,10 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use http::Method;
+use modkit::api::{OperationSpec, Problem};
 use std::sync::Arc;
 
-use modkit::api::{OperationSpec, Problem};
+use crate::middleware::common;
 
 const BASE_FEATURE: &str = "gts.x.core.lic.feat.v1~x.core.global.base.v1";
 
@@ -53,6 +54,8 @@ pub async fn license_validation_middleware(
         .extensions()
         .get::<axum::extract::MatchedPath>()
         .map_or_else(|| req.uri().path().to_owned(), |p| p.as_str().to_owned());
+
+    let path = common::resolve_path(&req, path.as_str());
 
     let Some(required) = map.get(&method, &path) else {
         return next.run(req).await;

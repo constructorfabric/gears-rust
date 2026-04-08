@@ -1,0 +1,57 @@
+error: `pub type TenantId = Uuid` is a transparent alias with no type safety (DE1303)
+  --> $DIR/bad_uuid_type_alias.rs:7:1
+   |
+LL | pub type TenantId = Uuid;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: wrap Uuid in a newtype: `pub struct TenantId(pub Uuid);` or `pub struct TenantId(Uuid);`
+   = note: transparent aliases provide no compile-time separation; use a newtype for distinct semantic types
+   = note: `#[deny(de1303_no_primitive_type_alias)]` on by default
+
+error: `pub type UserId = Uuid` is a transparent alias with no type safety (DE1303)
+  --> $DIR/bad_uuid_type_alias.rs:10:1
+   |
+LL | pub type UserId = Uuid;
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: wrap Uuid in a newtype: `pub struct UserId(pub Uuid);` or `pub struct UserId(Uuid);`
+   = note: transparent aliases provide no compile-time separation; use a newtype for distinct semantic types
+
+error: `pub type GtsId = String` is a transparent alias with no type safety (DE1303)
+  --> $DIR/bad_uuid_type_alias.rs:13:1
+   |
+LL | pub type GtsId = String;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: wrap String in a newtype: `pub struct GtsId(pub String);` or `pub struct GtsId(String);`
+   = note: transparent aliases provide no compile-time separation; use a newtype for distinct semantic types
+
+error: `pub type Port = u16` is a transparent alias with no type safety (DE1303)
+  --> $DIR/bad_uuid_type_alias.rs:16:1
+   |
+LL | pub type Port = u16;
+   | ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: wrap u16 in a newtype: `pub struct Port(pub u16);` or `pub struct Port(u16);`
+   = note: transparent aliases provide no compile-time separation; use a newtype for distinct semantic types
+
+error: `pub type CorrelationId = Uuid` is a transparent alias with no type safety (DE1303)
+  --> $DIR/bad_uuid_type_alias.rs:19:1
+   |
+LL | pub type CorrelationId = uuid::Uuid;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: wrap Uuid in a newtype: `pub struct CorrelationId(pub Uuid);` or `pub struct CorrelationId(Uuid);`
+   = note: transparent aliases provide no compile-time separation; use a newtype for distinct semantic types
+
+error: `pub type Count = i32` is a transparent alias with no type safety (DE1303)
+  --> $DIR/bad_uuid_type_alias.rs:22:1
+   |
+LL | pub type Count = i32;
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: wrap i32 in a newtype: `pub struct Count(pub i32);` or `pub struct Count(i32);`
+   = note: transparent aliases provide no compile-time separation; use a newtype for distinct semantic types
+
+error: aborting due to 6 previous errors
+

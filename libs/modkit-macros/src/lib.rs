@@ -11,6 +11,7 @@ use syn::{
 
 mod api_dto;
 mod domain_model;
+mod expand_vars;
 mod grpc_client;
 mod utils;
 
@@ -1236,4 +1237,26 @@ pub fn api_dto(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn domain_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     TokenStream::from(domain_model::expand_domain_model(&input))
+}
+
+/// Derive macro that implements [`modkit::var_expand::ExpandVars`].
+///
+/// Mark individual `String` or `Option<String>` fields with `#[expand_vars]`
+/// to have `${VAR}` placeholders expanded from environment variables when
+/// `expand_vars()` is called.
+///
+/// ```ignore
+/// #[derive(Deserialize, Default, ExpandVars)]
+/// pub struct MyConfig {
+///     #[expand_vars]
+///     pub api_key: String,
+///     #[expand_vars]
+///     pub endpoint: Option<String>,
+///     pub retries: u32, // not expanded
+/// }
+/// ```
+#[proc_macro_derive(ExpandVars, attributes(expand_vars))]
+pub fn derive_expand_vars(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    TokenStream::from(expand_vars::derive(&input))
 }

@@ -26,6 +26,7 @@ utoipa = { workspace = true }
 
 # Async & concurrency
 async-trait = { workspace = true }
+tokio = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.llm_gateway.message.v1",
+  "title": "LlmMessage",
+  "description": "Message entity as returned by the LLM gateway plugin. Extends the base Message schema with typed metadata containing LLM response facts (model used, finish reason, token usage).",
+  "allOf": [
+    { "$ref": "../common/Message.json" },
+    {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "$ref": "./LlmMessageMetadata.json"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+# This workflow checks for CRLF line endings in the repository. It runs on pull requests and can also be triggered manually.
+# It intentionally is run on the whole repository to catch any CRLFs, even in files that may not be directly edited in a PR. It excludes .bat and .ps1 files which may legitimately use CRLF.
+name: CRLF Line Ending Check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-files:
+    name: Check for CRLF line endings
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable Git autocrlf
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Find CRLF
+        run: |
+          set -euo pipefail
+          # Check for CRLF in committed files using git ls-files --eol
+          # This checks the actual committed line endings, not the working directory
+          if git ls-files --eol -- . ':(exclude)*.bat' ':(exclude)*.ps1' | grep 'i/crlf'; then
+            echo "::error title=CRLF line endings found::CRLF (\\r\\n) line endings detected in committed files. Convert files to LF using .gitattributes and recommit."
+            git ls-files --eol -- . ':(exclude)*.bat' ':(exclude)*.ps1' | grep 'i/crlf'
+            exit 1
+          fi
+
+      - name: Success
+        run: echo "No CRLF line endings detected."

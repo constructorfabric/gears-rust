@@ -40,12 +40,36 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// Whether this endpoint's port is the standard port for its scheme.
+    ///
+    /// Standard ports (omitted from derived aliases):
+    /// - HTTP: 80
+    /// - HTTPS / WSS / WT / gRPC: 443
+    #[must_use]
+    pub fn is_standard_port(&self) -> bool {
+        match self.scheme {
+            Scheme::Http => self.port == 80,
+            Scheme::Https | Scheme::Wss | Scheme::Wt | Scheme::Grpc => self.port == 443,
+        }
+    }
+
+    /// The normalized host for alias derivation: lowercased, trailing dots stripped.
+    #[must_use]
+    pub fn normalized_host(&self) -> String {
+        self.host
+            .to_ascii_lowercase()
+            .trim_end_matches('.')
+            .to_string()
+    }
+
+    /// Single-endpoint alias contribution: `host` if standard port, `host:port` otherwise.
     #[must_use]
     pub fn alias_contribution(&self) -> String {
-        if self.port == 443 || self.port == 80 {
-            self.host.clone()
+        let host = self.normalized_host();
+        if self.is_standard_port() {
+            host
         } else {
-            format!("{}:{}", self.host, self.port)
+            format!("{host}:{}", self.port)
         }
     }
 }
@@ -174,14 +198,21 @@ pub enum RateLimitStrategy {
 }
 
 // ---------------------------------------------------------------------------
-// PluginsConfig
+// PluginBinding / PluginsConfig
 // ---------------------------------------------------------------------------
+
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginBinding {
+    pub plugin_ref: String,
+    pub config: HashMap<String, String>,
+}
 
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PluginsConfig {
     pub sharing: SharingMode,
-    pub items: Vec<String>,
+    pub items: Vec<PluginBinding>,
 }
 
 // ---------------------------------------------------------------------------

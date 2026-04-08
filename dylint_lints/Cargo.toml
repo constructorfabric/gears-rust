@@ -1,15 +1,17 @@
+# Updated: 2026-03-13 by Constructor Tech
 [workspace]
 members = [
     "lint_utils",
-    # "de01_contract_layer/de0101_no_serde_in_contract",
-    # "de01_contract_layer/de0102_no_toschema_in_contract",
-    # "de01_contract_layer/de0103_no_http_types_in_contract",
-    # "de01_contract_layer/de0104_no_api_dto_in_contract",
-    # "de01_contract_layer/de0110_no_schema_for_on_gts_structs",
+    "de01_contract_layer/de0101_no_serde_in_contract",
+    "de01_contract_layer/de0102_no_toschema_in_contract",
+    "de01_contract_layer/de0103_no_http_types_in_contract",
+    "de01_contract_layer/de0104_no_api_dto_in_contract",
+    "de01_contract_layer/de0110_no_schema_for_on_gts_structs",
     "de02_api_layer/de0201_dtos_only_in_api_rest",
     "de02_api_layer/de0202_dtos_not_referenced_outside_api",
     "de02_api_layer/de0203_dtos_must_use_api_dto",
     "de02_api_layer/de0204_dtos_must_have_toschema_derive",
+    "de02_api_layer/de0205_operation_builder",
     "de03_domain_layer/de0301_no_infra_in_domain",
     "de03_domain_layer/de0308_no_http_in_domain",
     "de05_client_layer/de0503_plugin_client_suffix",
@@ -21,7 +23,10 @@ members = [
     "de09_gts_layer/de0902_no_schema_for_on_gts_structs",
     "de03_domain_layer/de0309_must_have_domain_model",
     "de05_client_layer/de0504_client_versioning",
+    "de07_security/de0707_drop_zeroize",
     "de13_common_patterns/de1301_no_print_macros",
+    # "de13_common_patterns/de1302_error_from_to_string",
+    "de13_common_patterns/de1303_no_primitive_type_alias",
 ]
 resolver = "3"
 
@@ -54,10 +59,12 @@ tokio = { version = "1.44", features = ["macros", "rt"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 utoipa = "5.2"
-modkit-macros = { package = "cf-modkit-macros", version = "0.2.0", path = "../libs/modkit-macros" }
-modkit = { package = "cf-modkit", version = "0.2.0", path = "../libs/modkit" }
-gts = "0.7.8"
-gts-macros = "0.7.8"
+modkit-macros = { package = "cf-modkit-macros", path = "../libs/modkit-macros" }
+modkit = { package = "cf-modkit", path = "../libs/modkit" }
+gts-id = "0.8.4"
+gts = "0.8.4"
+gts-macros = "0.8.4"
+schemars = { version = "1.2", features = ["derive"] }
 
 # Dev dependencies for lint tests
 sea-orm = "1.0"

@@ -11,5 +11,7 @@ COPY ../e2e/helpers/run_mock_server.py /app/run_mock_server.py
 EXPOSE 8080
 
 # Run the mock server
+RUN useradd -U -u 1000 appuser && \
+    chown -R 1000:1000 /app
+USER 1000
 CMD ["python", "-u", "/app/run_mock_server.py"]
-

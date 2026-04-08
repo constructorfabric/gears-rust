@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.webhook.session_summary_response.v1",
+  "title": "SessionSummaryResponse",
+  "description": "Webhook response with generated session summary",
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Generated session summary text"
+    },
+    "summarized_message_ids": {
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" },
+      "description": "IDs of messages that were summarized. Returned by plugins that own the summarization split logic (e.g., context overflow flow). Chat Engine marks these messages as is_hidden_from_backend."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Summary metadata",
+      "additionalProperties": true
+    }
+  },
+  "required": ["summary"],
+  "additionalProperties": false
+}

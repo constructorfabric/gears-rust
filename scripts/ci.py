@@ -5,8 +5,20 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
+
+# Add scripts/ to sys.path so lib.platform is importable
+sys.path.insert(0, os.path.dirname(__file__))
+
+from lib.platform import (
+    find_binary,
+    kill_port_holder,
+    popen_new_group,
+    read_e2e_features,
+    stop_process_tree,
+)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYTHON = sys.executable or "python"
@@ -226,12 +238,44 @@ def cmd_quickstart(_args):
     )
 
 
-def wait_for_health(base_url, timeout_secs=30):
+def _print_log_file(path, label):
+    if not path or not os.path.isfile(path):
+        return
+    print(f"\n--- {label}: {path} ---")
+    try:
+        if "../" in path or "..\\" in path:
+            raise Exception("Invalid file path")
+        with open(path) as f:
+            content = f.read()
+            if content:
+                print(content, end="" if content.endswith("\n") else "\n")
+            else:
+                print("(empty)")
+    except OSError as e:
+        print(f"(failed to read log: {e})")
+    print(f"--- end of {label} ---\n")
+
+
+def wait_for_health(
+    base_url, timeout_secs=30, server_process=None, error_log=None, output_log=None
+):
     url = f"{base_url.rstrip('/')}/healthz"
     step(f"Waiting for API to be ready at {url}")
     start = time.time()
     attempt = 0
     while True:
+        # Check if the server process crashed before we even connect
+        if server_process is not None:
+            ret = server_process.poll()
+            if ret is not None:
+                print(f"\nERROR: Server process exited with code {ret}")
+                _print_log_file(output_log, "server stdout")
+                _print_log_file(error_log, "server stderr")
+                print("Fix the error above, rebuild with:")
+                print("  make build")
+                print("Then re-run: make e2e-local")
+                sys.exit(1)
+
         try:
             attempt += 1
             with urlopen(url, timeout=1) as resp:
@@ -245,6 +289,8 @@ def wait_for_health(base_url, timeout_secs=30):
 
         if time.time() - start > timeout_secs:
             print(f"ERROR: The API readiness check timed out after {attempt} attempts")
+            _print_log_file(output_log, "server stdout")
+            _print_log_file(error_log, "server stderr")
             sys.exit(1)
         time.sleep(1)
 
@@ -267,27 +313,13 @@ def check_pytest():
 
 
 def kill_existing_server(port):
-    """Kill any existing server process on the specified port"""
-    try:
-        # Find process using the port
-        if sys.platform == "darwin":  # macOS
-            result = run_cmd_allow_fail(["lsof", "-ti", f":{port}"])
-        else:  # Linux and others
-            result = run_cmd_allow_fail(["fuser", "-k", f"{port}/tcp"])
-
-        if result.returncode == 0 and result.stdout:
-            pids = result.stdout.strip().split()
-            for pid in pids:
-                print(f"Killing existing server process {pid} on port {port}")
-                run_cmd_allow_fail(["kill", "-9", pid])
-                time.sleep(1)  # Give it time to die
-    except Exception:
-        # If we can't find or kill the process, continue anyway
-        pass
+    """Kill any existing server process on the specified port."""
+    kill_port_holder(int(port))
 
 
 def cmd_e2e(args):
     base_url = os.environ.get("E2E_BASE_URL", "http://localhost:8086")
+
     check_pytest()
 
     # Kill any existing server on the port before starting
@@ -329,6 +361,20 @@ def cmd_e2e(args):
         build_cmd.append(".")
         run_cmd(build_cmd)
 
+        # Rebuild only the mock service so Python mock server changes are picked up
+        # without overwriting the prebuilt API image (which was built with features).
+        step("Rebuilding docker-compose mock service")
+        run_cmd(
+            [
+                "docker",
+                "compose",
+                "-f",
+                "testing/docker/docker-compose.yml",
+                "build",
+                "mock",
+            ]
+        )
+
         # Start environment
         step("Starting E2E docker-compose environment")
         run_cmd(
@@ -348,62 +394,83 @@ def cmd_e2e(args):
         wait_for_health(base_url)
     else:
         step("Running E2E tests in local mode")
-        # Start local server automatically
         server_process = None
-        try:
-            wait_for_health(base_url, timeout_secs=5)
-        except SystemExit:
-            print("Server not running, starting hyperspot-server...")
-            # Create logs directory if it doesn't exist
+        print("Starting hyperspot-server for local E2E...")
+
+        # Build all required modules and binaries using project build orchestration
+        step("Building release artifacts for local E2E")
+        run_cmd(["make", "build"])
+
+        # Use the release binary produced by build
+        release_bin = str(find_binary(
+            Path(PROJECT_ROOT) / "target", "release", "hyperspot-server"
+        ))
+
+        if not os.path.isfile(release_bin):
+            print(f"\nERROR: Release binary not found at: {release_bin}")
+            print("Build it first with:")
+            print("  make build")
+            sys.exit(1)
+
+        # Create logs directory if it doesn't exist
+        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+            logs_dir = os.path.join(PROJECT_ROOT, "tmp", "e2e-logs")
+        else:
             logs_dir = os.path.join(PROJECT_ROOT, "logs")
-            os.makedirs(logs_dir, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
 
-            # Start server in background with logs redirected to files
-            server_cmd = [
-                "cargo",
-                "run",
-                "--bin",
-                "hyperspot-server",
-                "--features",
-                "users-info-example,tenant-resolver-example",
-                "--",
-                "--config",
-                "config/e2e-local.yaml",
-            ]
+        data_dir = os.path.join(PROJECT_ROOT, "data")
+        os.makedirs(data_dir, exist_ok=True)
 
-            # Redirect stdout and stderr to log files
-            server_log_file = os.path.join(
-                logs_dir, "hyperspot-e2e.log"
-            )
-            server_error_file = os.path.join(
-                logs_dir, "hyperspot-e2e-error.log"
-            )
+        # Start server in background with logs redirected to files
+        server_cmd = [
+            release_bin,
+            "--config",
+            "config/e2e-local.yaml",
+        ]
 
-            with open(server_log_file, "w") as out_file, open(
-                server_error_file, "w"
-            ) as err_file:
-                # Set RUST_LOG to enable debug logging for types_registry module
-                server_env = os.environ.copy()
-                server_env["RUST_LOG"] = "types_registry=debug,info"
-                server_process = subprocess.Popen(
+        server_log_file = os.path.join(logs_dir, "hyperspot-e2e.log")
+        server_error_file = os.path.join(logs_dir, "hyperspot-e2e-error.log")
+
+        with open(server_log_file, "w") as out_file, open(
+            server_error_file, "w"
+        ) as err_file:
+            # Set RUST_LOG to enable debug logging for types_registry module
+            server_env = os.environ.copy()
+            server_env["RUST_LOG"] = "types_registry=debug,info"
+            try:
+                server_process = popen_new_group(
                     server_cmd,
                     stdout=out_file,
                     stderr=err_file,
                     env=server_env,
                 )
+            except OSError as e:
+                print(f"ERROR: Failed to start hyperspot-server: {e}")
+                _print_log_file(server_error_file, "server stderr")
+                sys.exit(1)
 
-            print("Server logs redirected to:")
-            print(f"  - stdout: {server_log_file}")
-            print(f"  - stderr: {server_error_file}")
-            print(
-                "  - application logs: "
-                f"{os.path.join(logs_dir, 'hyperspot-e2e.log')}"
-            )
-            print(f"  - SQL logs: {os.path.join(logs_dir, 'sql.log')}")
-            print(f"  - API logs: {os.path.join(logs_dir, 'api.log')}")
+        print(f"Started hyperspot-server (pid={server_process.pid})")
 
-            # Wait for server to be ready
-            wait_for_health(base_url, timeout_secs=30)
+        print("Server logs redirected to:")
+        print(f"  - stdout: {server_log_file}")
+        print(f"  - stderr: {server_error_file}")
+        print(
+            "  - application logs: "
+            f"{os.path.join(logs_dir, 'hyperspot-e2e.log')}"
+        )
+        print(f"  - SQL logs: {os.path.join(logs_dir, 'sql.log')}")
+        print(f"  - API logs: {os.path.join(logs_dir, 'api.log')}")
+
+        # Wait for server to be ready, checking for early crash
+        wait_for_health(
+            base_url,
+            timeout_secs=60,
+            server_process=server_process,
+            error_log=server_error_file,
+            output_log=server_log_file,
+        )
+        print("Server started successfully and passed health check")
 
     # Run pytest
     step("Running pytest")
@@ -413,8 +480,11 @@ def cmd_e2e(args):
     # Set E2E_DOCKER_MODE flag for the tests to know which mode they're in
     if args.docker:
         env["E2E_DOCKER_MODE"] = "1"
+        env.setdefault("E2E_MOCK_UPSTREAM_URL", "http://mock:8080")
 
     pytest_cmd = [PYTHON, "-m", "pytest", "testing/e2e", "-vv"]
+    if args.smoke:
+        pytest_cmd.extend(["-m", "smoke"])
     if args.pytest_args:
         # argparse.REMAINDER includes the '--' separator if used
         # We need to strip it so pytest doesn't treat following flags as files
@@ -442,12 +512,7 @@ def cmd_e2e(args):
     # Stop server if we started it
     if server_process is not None:
         step("Stopping hyperspot-server")
-        server_process.terminate()
-        try:
-            server_process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server_process.kill()
-            server_process.wait()
+        stop_process_tree(server_process, timeout=10)
 
     print("")
     if exit_code == 0:
@@ -456,6 +521,16 @@ def cmd_e2e(args):
         print("E2E tests failed")
 
     sys.exit(exit_code)
+
+
+def cmd_e2e_local(args):
+    args.docker = False
+    cmd_e2e(args)
+
+
+def cmd_e2e_docker(args):
+    args.docker = True
+    cmd_e2e(args)
 
 
 def cmd_dylint(_args):
@@ -720,7 +795,7 @@ def cmd_all(args):
     step("Building release (stable)")
     run_cmd(["cargo", "+stable", "build", "--release"])
     step("Running e2e-local")
-    cmd_e2e(argparse.Namespace(docker=False, pytest_args=[]))
+    cmd_e2e(argparse.Namespace(docker=False, smoke=False, pytest_args=[]))
     print("All (full pipeline) completed")
 
 
@@ -766,24 +841,46 @@ def build_parser():
     p_qs = subparsers.add_parser("quickstart", help="Start server in quickstart mode")
     p_qs.set_defaults(func=cmd_quickstart)
 
-    # e2e
-    p_e2e = subparsers.add_parser("e2e", help="Run end-to-end tests")
-    p_e2e.add_argument(
-        "--docker",
-        action="store_true",
-        help="Run tests in Docker environment instead of local server",
-    )
-    p_e2e.add_argument(
+    # e2e-local
+    p_e2e_local = subparsers.add_parser("e2e-local", help="Run end-to-end tests in local mode")
+    p_e2e_local.add_argument(
         "--features",
         default="users-info-example",
-        help="Cargo features to enable for Docker build (default: users-info-example)",
+        help="Ignored in local mode (kept for CLI parity)",
     )
-    p_e2e.add_argument(
+    p_e2e_local.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run only tests marked with @pytest.mark.smoke",
+    )
+    p_e2e_local.add_argument(
         "pytest_args",
         nargs=argparse.REMAINDER,
         help="Extra arguments passed to pytest (use -- to separate)",
     )
-    p_e2e.set_defaults(func=cmd_e2e)
+    p_e2e_local.set_defaults(func=cmd_e2e_local)
+
+    # e2e-docker
+    p_e2e_docker = subparsers.add_parser("e2e-docker", help="Run end-to-end tests in Docker mode")
+    p_e2e_docker.add_argument(
+        "--features",
+        default=read_e2e_features(Path(PROJECT_ROOT)),
+        help=(
+            "Cargo features to enable for Docker build "
+            "(default: from config/e2e-features.txt)"
+        ),
+    )
+    p_e2e_docker.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run only tests marked with @pytest.mark.smoke",
+    )
+    p_e2e_docker.add_argument(
+        "pytest_args",
+        nargs=argparse.REMAINDER,
+        help="Extra arguments passed to pytest (use -- to separate)",
+    )
+    p_e2e_docker.set_defaults(func=cmd_e2e_docker)
 
     # dylint
     p_dylint = subparsers.add_parser("dylint", help="Build and run dylint lints")

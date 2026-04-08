@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.common.capability.v1",
+  "title": "Capability",
+  "description": "A typed feature that a backend plugin can provide. Used in `SessionType.available_capabilities` (advertised max set) and `Session.enabled_capabilities` (runtime-confirmed set).",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique capability identifier",
+      "examples": ["web_search", "image_generation", "response_style", "max_response_length"]
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable capability name"
+    },
+    "description": {
+      "type": "string",
+      "description": "Detailed capability description"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["bool", "enum", "str", "int"],
+      "description": "Value type of the capability"
+    },
+    "default_value": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "string" },
+        { "type": "integer" }
+      ],
+      "description": "Default value; type must match the capability type"
+    },
+    "enum_values": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 2,
+      "description": "Allowed values — required when type is \"enum\""
+    }
+  },
+  "required": ["id", "name", "type", "default_value"],
+  "additionalProperties": false
+}

@@ -8,8 +8,6 @@ use std::{
 pub enum HomeDirError {
     #[error("HOME environment variable is not set")]
     HomeMissing,
-    #[error("relative paths with directory separators are not allowed: {0}")]
-    RelativePathNotAllowed(String),
     #[error("failed to get executable path: {0}")]
     ExecutablePathError(String),
     #[error("IO error: {0}")]
@@ -72,8 +70,7 @@ pub fn expand_tilde(raw: &str) -> Result<PathBuf, HomeDirError> {
 /// Rules:
 /// - `~` prefix: expand to user home directory
 /// - Absolute path: use as-is
-/// - Filename only (no path separators): prepend directory where executable of current process lives
-/// - Relative path with separators: error (ambiguous)
+/// - Other: prepend CWD
 ///
 /// # Errors
 /// Returns `HomeDirError` if path normalization fails.
@@ -86,21 +83,9 @@ pub fn normalize_path(raw: &str) -> Result<PathBuf, HomeDirError> {
         return Ok(expanded);
     }
 
-    // Check if it's just a filename (no path separators)
-    let has_separator = raw.contains('/') || raw.contains('\\');
-
-    if has_separator {
-        // Relative path with separators - not allowed
-        Err(HomeDirError::RelativePathNotAllowed(raw.to_owned()))
-    } else {
-        // Filename only - prepend directory where main executable lives
-        let exe_path =
-            env::current_exe().map_err(|e| HomeDirError::ExecutablePathError(e.to_string()))?;
-        let exe_dir = exe_path.parent().ok_or_else(|| {
-            HomeDirError::ExecutablePathError("executable has no parent directory".to_owned())
-        })?;
-        Ok(exe_dir.join(&expanded))
-    }
+    std::path::absolute(raw).map_err(|err| {
+        HomeDirError::ExecutablePathError(format!("path '{raw}' is invalid due to: {err}"))
+    })
 }
 
 #[cfg(test)]
@@ -132,14 +117,14 @@ mod tests {
         let tmp_path = tmp.path().to_str().unwrap();
 
         temp_env::with_var("HOME", Some(tmp_path), || {
-            let result = super::expand_tilde("~").unwrap();
+            let result = expand_tilde("~").unwrap();
             assert_eq!(result, tmp.path());
         });
     }
 
     #[test]
     fn expand_tilde_no_tilde() {
-        let result = super::expand_tilde("/usr/bin/app").unwrap();
+        let result = expand_tilde("/usr/bin/app").unwrap();
         assert_eq!(result, PathBuf::from("/usr/bin/app"));
     }
 
@@ -150,7 +135,7 @@ mod tests {
         let tmp_path = tmp.path().to_str().unwrap();
 
         temp_env::with_var("USERPROFILE", Some(tmp_path), || {
-            let result = super::expand_tilde("~/bin/app").unwrap();
+            let result = expand_tilde("~/bin/app").unwrap();
             assert!(result.is_absolute());
             assert!(result.ends_with("bin\\app") || result.ends_with("bin/app"));
         });
@@ -161,62 +146,52 @@ mod tests {
     // -------------------------
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn normalize_exec_absolute_path() {
-        let result = super::normalize_path("/usr/bin/myapp").unwrap();
+    fn normalize_absolute_path() {
+        let result = normalize_path("/usr/bin/myapp").unwrap();
         assert_eq!(result, PathBuf::from("/usr/bin/myapp"));
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_normalize_exec_absolute_path() {
-        let result = super::normalize_path("C:\\bin\\myapp.exe").unwrap();
+    fn windows_normalize_absolute_path() {
+        let result = normalize_path("C:\\bin\\myapp.exe").unwrap();
         assert_eq!(result, PathBuf::from("C:\\bin\\myapp.exe"));
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn normalize_exec_tilde_path() {
+    fn normalize_tilde_path() {
         let tmp = tempdir().unwrap();
         let tmp_path = tmp.path().to_str().unwrap();
 
         temp_env::with_var("HOME", Some(tmp_path), || {
-            let result = super::normalize_path("~/bin/myapp").unwrap();
+            let result = normalize_path("~/bin/myapp").unwrap();
             assert!(result.is_absolute());
+            assert!(result.starts_with(tmp_path));
             assert!(result.ends_with("bin/myapp"));
         });
     }
 
     #[test]
-    fn normalize_exec_filename_only() {
-        // A bare filename should be prepended with the executable's directory
-        let result = super::normalize_path("myapp.exe").unwrap();
-        let exe_dir = env::current_exe().unwrap().parent().unwrap().to_path_buf();
-        assert_eq!(result, exe_dir.join("myapp.exe"));
+    fn normalize_filename_only() {
+        let result = normalize_path("myapp.exe").unwrap();
+        let cwd = env::current_dir().unwrap();
+        assert_eq!(result, cwd.join("myapp.exe"));
     }
 
     #[test]
     #[cfg(not(target_os = "windows"))]
-    fn normalize_exec_relative_path_error() {
-        // Relative paths with separators should error
-        let err = super::normalize_path("./bin/myapp").unwrap_err();
-        match err {
-            HomeDirError::RelativePathNotAllowed(s) => {
-                assert!(s.contains("./bin/myapp"));
-            }
-            _ => panic!("Expected RelativePathNotAllowed, got {err:?}"),
-        }
+    fn normalize_relative_path_resolves_to_absolute() {
+        let err = normalize_path("./bin/myapp").unwrap();
+        assert!(err.is_absolute());
+        assert!(err.ends_with("bin/myapp"));
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_normalize_exec_relative_path_error() {
-        // Relative paths with separators should error
-        let err = super::normalize_path(".\\bin\\myapp").unwrap_err();
-        match err {
-            HomeDirError::RelativePathNotAllowed(s) => {
-                assert!(s.contains(".\\bin\\myapp"));
-            }
-            _ => panic!("Expected RelativePathNotAllowed, got {err:?}"),
-        }
+    fn windows_normalize_relative_path_resolves_to_absolute() {
+        let err = normalize_path(".\\bin\\myapp").unwrap();
+        assert!(err.is_absolute());
+        assert!(err.ends_with("bin\\myapp"));
     }
 }

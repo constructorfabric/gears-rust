@@ -1,6 +1,7 @@
 # Cyber Fabric
 ![Badge](./.github/badgeHN.svg)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cyberfabric/cyberfabric-core/badge)](https://scorecard.dev/viewer/?uri=github.com/cyberfabric/cyberfabric-core)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12050/badge)](https://www.bestpractices.dev/projects/12050)
 
 **Cyber Fabric** is a modular, high-performance platform for building modern enterprise-grade SaaS services in Rust. It provides a comprehensive framework for building scalable AI-powered applications with automatic REST API generation, comprehensive OpenAPI documentation, and a extremely flexible modular architecture.
 
@@ -18,6 +19,8 @@
 - **Keep Monorepo while possible**: Keep core modules and contracts in one place to enable atomic refactors, consistent tooling/CI, and realistic local build + end-to-end testing; split only when scale forces it.
 
 See the full architecture [MANIFEST](docs/ARCHITECTURE_MANIFEST.md) for more details, including rationales behind Rust and Monorepo choice.
+
+See also [REPO_PLAYBOOK](docs/REPO_PLAYBOOK.md) with the registry of repository-wide artifacts (guidelines, rules, conventions, etc).
 
 ## Quick Start
 
@@ -108,14 +111,20 @@ modules:
 
 ### Creating Your First Module
 
-See [NEW_MODULE.md](guidelines/NEW_MODULE.md), but also [MODKIT UNIFIED SYSTEM](docs/modkit_unified_system/README.md) and [MODKIT_PLUGINS.md](docs/MODKIT_PLUGINS.md) for more details.
+See [MODKIT UNIFIED SYSTEM](docs/modkit_unified_system/README.md) and [MODKIT_PLUGINS.md](docs/MODKIT_PLUGINS.md) for details.
 
 ## Documentation
 
 - **[Architecture manifest](docs/ARCHITECTURE_MANIFEST.md)** - High-level overview of the architecture
 - **[Modules](docs/MODULES.md)** - List of all modules and their roles
-- **[NEW_MODULE.md](guidelines/NEW_MODULE.md), [MODKIT UNIFIED SYSTEM](docs/modkit_unified_system/README.md) and [MODKIT_PLUGINS.md](docs/MODKIT_PLUGINS.md)** - how to add new modules.
+- **[MODKIT UNIFIED SYSTEM](docs/modkit_unified_system/README.md) and [MODKIT_PLUGINS.md](docs/MODKIT_PLUGINS.md)** - how to add new modules.
 - **[Contributing](CONTRIBUTING.md)** - Development workflow and coding standards
+
+## Security
+
+Cyber Fabric applies defense-in-depth security across the entire development lifecycle — from Rust's compile-time safety guarantees and custom architectural lints, through compile-time tenant isolation and PDP/PEP authorization enforcement, to continuous fuzzing, dependency auditing, and automated security scanning in CI.
+
+See **[Security Overview](docs/security/SECURITY.md)** for the full breakdown, including: Secure ORM with compile-time tenant scoping, authentication/authorization architecture (NIST SP 800-162 PDP/PEP model), 90+ Clippy deny-level rules, custom dylint architectural lints, cargo-deny advisory checks, ClusterFuzzLite continuous fuzzing, CodeQL/Scorecard/Snyk/Aikido scanners, and AI-powered PR review bots.
 
 ## Specification Templates
 
@@ -190,92 +199,30 @@ export HYPERSPOT_LOGGING_DEFAULT_CONSOLE_LEVEL="debug"
 ## Testing
 
 ```bash
-# Run all tests
-make test
-# or
-cargo test
-
-# Run specific module tests
-cargo test -p api_gateway
-cargo test -p modkit
-
-# Integration tests with database
-cargo test --test integration
-
-# Unit tests code coverage
-make coverage-unit
+make check           # full quality gate (fmt + clippy + test + security)
 ```
 
-### Fuzzing
-
-Cyber Fabric uses continuous fuzzing to find bugs and security issues:
+Other tests:
 
 ```bash
-# Run fuzzing smoke tests
-make fuzz
-
-# Fuzz specific component
-make fuzz-run FUZZ_TARGET=fuzz_odata_filter FUZZ_SECONDS=300
-
-# See all available targets
-make fuzz-list
+make test            # unit tests (workspace)
+make test-sqlite     # integration tests (SQLite, no external DB required)
+make e2e-local       # end-to-end tests (builds + starts server automatically)
+make e2e-docker      # end-to-end tests (builds + starts server in Docker)
+make coverage-unit   # unit test code coverage
+make fuzz            # fuzz smoke tests (30 s per target)
 ```
 
-Fuzzing runs automatically in CI via ClusterFuzzLite. See `fuzz/README.md` for details.
-
-### CI / Development Commands
-
-
-Cyber Fabric uses a unified, cross-platform Python CI script. Ensure you have Python 3.9+ installed.
+On **Windows** (no `make`), use the cross-platform CI script directly:
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd cyberfabric-core
-
-# All code must pass these checks before merging
-python scripts/ci.py all          # Build and run all the checks
-# Run individual checks
-python scripts/ci.py check        # Full CI suite: fmt, clippy, test, audit, deny
-python scripts/ci.py fmt          # Check formatting
-python scripts/ci.py fmt --fix    # Auto-format code
-python scripts/ci.py clippy       # Run linter
-python scripts/ci.py clippy --fix # Attempt to fix warnings
-python scripts/ci.py dylint       # runs custom project compliance lints on the workspace
-python scripts/ci.py audit        # Security audit
-python scripts/ci.py deny         # License & dependency checks
+python scripts/ci.py check          # full CI suite
+python scripts/ci.py e2e-local      # end-to-end tests
+python scripts/ci.py fuzz --seconds 60  # fuzz smoke run
 ```
 
-On Unix/Linux/macOS, the Makefile provides shortcuts:
-
-```bash
-# All code must pass these checks before merging
-make all    # Build and run all the checks
-# Run individual checks
-make check  # Full check suite as defined in Makefile
-make fmt    # formatting (cargo fmt --all -- --check)
-make dev-fmt # auto-format code (cargo fmt --all)
-make clippy # linting (cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::perf)
-make lint   # compilation with warnings denied (RUSTFLAGS="-D warnings" cargo check ...)
-make dylint # runs custom project compliance lints on the workspace
-make deny   # dependency license and policy checks (cargo deny check)
-make kani   # optional deep safety verification (Kani verifier)
-```
-
-### E2E Tests
-
-E2E tests require Python dependencies and pytest:
-
-```bash
-pip install -r testing/requirements.txt
-```
-
-```bash
-make e2e-local  # Run e2e tests locally against a running server
-make e2e-docker # Run e2e tests in a Docker container
-make coverage-e2e # Run e2e tests with code coverage
-make coverage # Run both unit and e2e tests with code coverage
-```
+For the complete test strategy, coverage policy, CI pipeline details, and all
+available commands see **[docs/TESTING.md](docs/TESTING.md)**.
 
 ## Contributing
 

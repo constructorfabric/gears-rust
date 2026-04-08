@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.core.events.event.v1~x.chat_engine.webhook.session_created_event.v1~",
+  "title": "SessionCreatedEvent",
+  "description": "Webhook event sent when a new session is created",
+  "type": "object",
+  "properties": {
+    "event": {
+      "type": "string",
+      "const": "session.created",
+      "description": "Event type identifier"
+    },
+    "session_id": {
+      "$ref": "../common/GtsSessionId.json"
+    },
+    "session_type_id": {
+      "$ref": "../common/GtsSessionTypeId.json"
+    },
+    "tenant_id": {
+      "$ref": "../common/GtsTenantId.json",
+      "description": "Owning tenant"
+    },
+    "user_id": {
+      "$ref": "../common/GtsUserId.json",
+      "description": "Owning user"
+    },
+    "client_id": {
+      "$ref": "../common/GtsClientId.json",
+      "description": "Calling application identifier"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Event timestamp",
+      "examples": ["2024-01-15T10:30:00Z"]
+    }
+  },
+  "required": ["event", "session_id", "session_type_id", "tenant_id", "user_id", "timestamp"],
+  "additionalProperties": false
+}

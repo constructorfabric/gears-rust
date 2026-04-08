@@ -25,7 +25,7 @@ async def test_all_oagw_schemas_registered(oagw_base_url, oagw_headers):
 
 @pytest.mark.asyncio
 async def test_all_oagw_instances_registered(oagw_base_url, oagw_headers):
-    """After platform startup, all 13 builtin instances should be present in types-registry."""
+    """After platform startup, all 14 builtin instances should be present in types-registry."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         entities = await list_oagw_types(client, oagw_base_url, oagw_headers)
         registered_ids = {e["gts_id"] for e in entities}
@@ -38,14 +38,14 @@ async def test_all_oagw_instances_registered(oagw_base_url, oagw_headers):
 
 @pytest.mark.asyncio
 async def test_oagw_entity_count(oagw_base_url, oagw_headers):
-    """Types-registry should contain at least 20 OAGW entities (7 schemas + 13 instances)."""
+    """Types-registry should contain at least 21 OAGW entities (7 schemas + 14 instances)."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         entities = await list_oagw_types(client, oagw_base_url, oagw_headers)
         registered_ids = {e["gts_id"] for e in entities}
 
         oagw_ids = registered_ids & set(ALL_OAGW_GTS_IDS)
-        assert len(oagw_ids) == 20, (
-            f"Expected 20 OAGW entities, found {len(oagw_ids)}. "
+        assert len(oagw_ids) == 21, (
+            f"Expected 21 OAGW entities, found {len(oagw_ids)}. "
             f"Missing: {set(ALL_OAGW_GTS_IDS) - registered_ids}"
         )
 

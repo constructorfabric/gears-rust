@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.common.validation_violation.v1",
+  "title": "ValidationViolation",
+  "description": "Single field-level validation error",
+  "type": "object",
+  "properties": {
+    "field": {
+      "type": "string",
+      "description": "Field path (e.g., 'content', 'session_type_id')"
+    },
+    "message": {
+      "type": "string",
+      "description": "Human-readable validation message"
+    },
+    "code": {
+      "type": "string",
+      "description": "Machine-readable validation code"
+    }
+  },
+  "required": ["field", "message"],
+  "additionalProperties": false
+}

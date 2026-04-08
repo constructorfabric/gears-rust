@@ -175,7 +175,7 @@ mod tests {
         let ctx = ctx_for_tenant(TENANT_A);
 
         let result = service
-            .get_tenant(&ctx, Uuid::parse_str(TENANT_A).unwrap())
+            .get_tenant(&ctx, TenantId(Uuid::parse_str(TENANT_A).unwrap()))
             .await;
 
         assert!(result.is_ok());
@@ -192,7 +192,7 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
         let ctx = ctx_for_tenant(TENANT_A);
-        let nonexistent_id = Uuid::parse_str(NONEXISTENT).unwrap();
+        let nonexistent_id = TenantId(Uuid::parse_str(NONEXISTENT).unwrap());
 
         let result = service.get_tenant(&ctx, nonexistent_id).await;
 
@@ -221,8 +221,8 @@ mod tests {
         let ctx = ctx_for_tenant(TENANT_A);
 
         let ids = vec![
-            Uuid::parse_str(TENANT_A).unwrap(),
-            Uuid::parse_str(TENANT_B).unwrap(),
+            TenantId(Uuid::parse_str(TENANT_A).unwrap()),
+            TenantId(Uuid::parse_str(TENANT_B).unwrap()),
         ];
 
         let result = service
@@ -243,8 +243,8 @@ mod tests {
         let ctx = ctx_for_tenant(TENANT_A);
 
         let ids = vec![
-            Uuid::parse_str(TENANT_A).unwrap(),
-            Uuid::parse_str(NONEXISTENT).unwrap(), // This one doesn't exist
+            TenantId(Uuid::parse_str(TENANT_A).unwrap()),
+            TenantId(Uuid::parse_str(NONEXISTENT).unwrap()), // This one doesn't exist
         ];
 
         let result = service
@@ -254,7 +254,7 @@ mod tests {
         let tenants = result.unwrap();
         // Only found tenant is returned, missing is silently skipped
         assert_eq!(tenants.len(), 1);
-        assert_eq!(tenants[0].id, Uuid::parse_str(TENANT_A).unwrap());
+        assert_eq!(tenants[0].id, TenantId(Uuid::parse_str(TENANT_A).unwrap()));
     }
 
     #[tokio::test]
@@ -270,8 +270,8 @@ mod tests {
         let ctx = ctx_for_tenant(TENANT_A);
 
         let ids = vec![
-            Uuid::parse_str(TENANT_A).unwrap(),
-            Uuid::parse_str(TENANT_B).unwrap(),
+            TenantId(Uuid::parse_str(TENANT_A).unwrap()),
+            TenantId(Uuid::parse_str(TENANT_B).unwrap()),
         ];
 
         let opts = GetTenantsOptions {
@@ -282,7 +282,7 @@ mod tests {
         let tenants = result.unwrap();
         // Only active tenant is returned
         assert_eq!(tenants.len(), 1);
-        assert_eq!(tenants[0].id, Uuid::parse_str(TENANT_A).unwrap());
+        assert_eq!(tenants[0].id, TenantId(Uuid::parse_str(TENANT_A).unwrap()));
     }
 
     // ==================== get_ancestors tests ====================
@@ -299,14 +299,17 @@ mod tests {
         let result = service
             .get_ancestors(
                 &ctx,
-                Uuid::parse_str(TENANT_A).unwrap(),
+                TenantId(Uuid::parse_str(TENANT_A).unwrap()),
                 &GetAncestorsOptions::default(),
             )
             .await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response.tenant.id, Uuid::parse_str(TENANT_A).unwrap());
+        assert_eq!(
+            response.tenant.id,
+            TenantId(Uuid::parse_str(TENANT_A).unwrap())
+        );
         assert!(response.ancestors.is_empty());
     }
 
@@ -327,17 +330,26 @@ mod tests {
         let result = service
             .get_ancestors(
                 &ctx,
-                Uuid::parse_str(TENANT_C).unwrap(),
+                TenantId(Uuid::parse_str(TENANT_C).unwrap()),
                 &GetAncestorsOptions::default(),
             )
             .await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response.tenant.id, Uuid::parse_str(TENANT_C).unwrap());
+        assert_eq!(
+            response.tenant.id,
+            TenantId(Uuid::parse_str(TENANT_C).unwrap())
+        );
         assert_eq!(response.ancestors.len(), 2);
-        assert_eq!(response.ancestors[0].id, Uuid::parse_str(TENANT_B).unwrap());
-        assert_eq!(response.ancestors[1].id, Uuid::parse_str(TENANT_A).unwrap());
+        assert_eq!(
+            response.ancestors[0].id,
+            TenantId(Uuid::parse_str(TENANT_B).unwrap())
+        );
+        assert_eq!(
+            response.ancestors[1].id,
+            TenantId(Uuid::parse_str(TENANT_A).unwrap())
+        );
     }
 
     #[tokio::test]
@@ -358,7 +370,7 @@ mod tests {
         let result = service
             .get_ancestors(
                 &ctx,
-                Uuid::parse_str(TENANT_C).unwrap(),
+                TenantId(Uuid::parse_str(TENANT_C).unwrap()),
                 &GetAncestorsOptions::default(),
             )
             .await;
@@ -366,14 +378,17 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.ancestors.len(), 1);
-        assert_eq!(response.ancestors[0].id, Uuid::parse_str(TENANT_B).unwrap());
+        assert_eq!(
+            response.ancestors[0].id,
+            TenantId(Uuid::parse_str(TENANT_B).unwrap())
+        );
 
         // BarrierMode::Ignore - traverses through
         let req = GetAncestorsOptions {
             barrier_mode: BarrierMode::Ignore,
         };
         let result = service
-            .get_ancestors(&ctx, Uuid::parse_str(TENANT_C).unwrap(), &req)
+            .get_ancestors(&ctx, TenantId(Uuid::parse_str(TENANT_C).unwrap()), &req)
             .await;
 
         assert!(result.is_ok());
@@ -390,7 +405,7 @@ mod tests {
         let result = service
             .get_ancestors(
                 &ctx,
-                Uuid::parse_str(NONEXISTENT).unwrap(),
+                TenantId(Uuid::parse_str(NONEXISTENT).unwrap()),
                 &GetAncestorsOptions::default(),
             )
             .await;
@@ -420,14 +435,17 @@ mod tests {
         let result = service
             .get_ancestors(
                 &ctx,
-                Uuid::parse_str(TENANT_B).unwrap(),
+                TenantId(Uuid::parse_str(TENANT_B).unwrap()),
                 &GetAncestorsOptions::default(),
             )
             .await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response.tenant.id, Uuid::parse_str(TENANT_B).unwrap());
+        assert_eq!(
+            response.tenant.id,
+            TenantId(Uuid::parse_str(TENANT_B).unwrap())
+        );
         assert!(response.ancestors.is_empty());
 
         // BarrierMode::Ignore - B can see A
@@ -435,13 +453,16 @@ mod tests {
             barrier_mode: BarrierMode::Ignore,
         };
         let result = service
-            .get_ancestors(&ctx, Uuid::parse_str(TENANT_B).unwrap(), &req)
+            .get_ancestors(&ctx, TenantId(Uuid::parse_str(TENANT_B).unwrap()), &req)
             .await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.ancestors.len(), 1);
-        assert_eq!(response.ancestors[0].id, Uuid::parse_str(TENANT_A).unwrap());
+        assert_eq!(
+            response.ancestors[0].id,
+            TenantId(Uuid::parse_str(TENANT_A).unwrap())
+        );
     }
 
     // ==================== get_descendants tests ====================
@@ -458,14 +479,17 @@ mod tests {
         let result = service
             .get_descendants(
                 &ctx,
-                Uuid::parse_str(TENANT_A).unwrap(),
+                TenantId(Uuid::parse_str(TENANT_A).unwrap()),
                 &GetDescendantsOptions::default(),
             )
             .await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response.tenant.id, Uuid::parse_str(TENANT_A).unwrap());
+        assert_eq!(
+            response.tenant.id,
+            TenantId(Uuid::parse_str(TENANT_A).unwrap())
+        );
         assert!(response.descendants.is_empty());
     }
 
@@ -487,14 +511,17 @@ mod tests {
         let result = service
             .get_descendants(
                 &ctx,
-                Uuid::parse_str(TENANT_A).unwrap(),
+                TenantId(Uuid::parse_str(TENANT_A).unwrap()),
                 &GetDescendantsOptions::default(),
             )
             .await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response.tenant.id, Uuid::parse_str(TENANT_A).unwrap());
+        assert_eq!(
+            response.tenant.id,
+            TenantId(Uuid::parse_str(TENANT_A).unwrap())
+        );
         assert_eq!(response.descendants.len(), 2);
 
         // Depth 1 only
@@ -503,7 +530,7 @@ mod tests {
             ..Default::default()
         };
         let result = service
-            .get_descendants(&ctx, Uuid::parse_str(TENANT_A).unwrap(), &req)
+            .get_descendants(&ctx, TenantId(Uuid::parse_str(TENANT_A).unwrap()), &req)
             .await;
 
         assert!(result.is_ok());
@@ -511,7 +538,7 @@ mod tests {
         assert_eq!(response.descendants.len(), 1);
         assert_eq!(
             response.descendants[0].id,
-            Uuid::parse_str(TENANT_B).unwrap()
+            TenantId(Uuid::parse_str(TENANT_B).unwrap())
         );
     }
 
@@ -535,7 +562,7 @@ mod tests {
         let result = service
             .get_descendants(
                 &ctx,
-                Uuid::parse_str(TENANT_A).unwrap(),
+                TenantId(Uuid::parse_str(TENANT_A).unwrap()),
                 &GetDescendantsOptions::default(),
             )
             .await;
@@ -545,7 +572,7 @@ mod tests {
         assert_eq!(response.descendants.len(), 1);
         assert_eq!(
             response.descendants[0].id,
-            Uuid::parse_str(TENANT_D).unwrap()
+            TenantId(Uuid::parse_str(TENANT_D).unwrap())
         );
 
         // BarrierMode::Ignore - all descendants visible
@@ -554,7 +581,7 @@ mod tests {
             ..Default::default()
         };
         let result = service
-            .get_descendants(&ctx, Uuid::parse_str(TENANT_A).unwrap(), &req)
+            .get_descendants(&ctx, TenantId(Uuid::parse_str(TENANT_A).unwrap()), &req)
             .await;
 
         assert!(result.is_ok());
@@ -571,7 +598,7 @@ mod tests {
         let result = service
             .get_descendants(
                 &ctx,
-                Uuid::parse_str(NONEXISTENT).unwrap(),
+                TenantId(Uuid::parse_str(NONEXISTENT).unwrap()),
                 &GetDescendantsOptions::default(),
             )
             .await;
@@ -609,7 +636,7 @@ mod tests {
         let result = service
             .get_descendants(
                 &ctx,
-                Uuid::parse_str(TENANT_A).unwrap(),
+                TenantId(Uuid::parse_str(TENANT_A).unwrap()),
                 &GetDescendantsOptions::default(),
             )
             .await
@@ -622,12 +649,15 @@ mod tests {
             ..Default::default()
         };
         let result = service
-            .get_descendants(&ctx, Uuid::parse_str(TENANT_A).unwrap(), &req)
+            .get_descendants(&ctx, TenantId(Uuid::parse_str(TENANT_A).unwrap()), &req)
             .await
             .unwrap();
 
         assert_eq!(result.descendants.len(), 1);
-        assert_eq!(result.descendants[0].id, Uuid::parse_str(TENANT_D).unwrap());
+        assert_eq!(
+            result.descendants[0].id,
+            TenantId(Uuid::parse_str(TENANT_D).unwrap())
+        );
     }
 
     #[tokio::test]
@@ -650,7 +680,7 @@ mod tests {
         let result = service
             .get_descendants(
                 &ctx,
-                Uuid::parse_str(TENANT_A).unwrap(),
+                TenantId(Uuid::parse_str(TENANT_A).unwrap()),
                 &GetDescendantsOptions::default(),
             )
             .await
@@ -658,8 +688,14 @@ mod tests {
 
         assert_eq!(result.descendants.len(), 2);
         // Pre-order guarantee: B comes before C (parent before child)
-        assert_eq!(result.descendants[0].id, Uuid::parse_str(TENANT_B).unwrap());
-        assert_eq!(result.descendants[1].id, Uuid::parse_str(TENANT_C).unwrap());
+        assert_eq!(
+            result.descendants[0].id,
+            TenantId(Uuid::parse_str(TENANT_B).unwrap())
+        );
+        assert_eq!(
+            result.descendants[1].id,
+            TenantId(Uuid::parse_str(TENANT_C).unwrap())
+        );
     }
 
     // ==================== is_ancestor tests ====================
@@ -672,7 +708,7 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
         let ctx = ctx_for_tenant(TENANT_A);
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
 
         let result = service
             .is_ancestor(&ctx, a_id, a_id, &IsAncestorOptions::default())
@@ -693,8 +729,8 @@ mod tests {
         let service = Service::from_config(&cfg);
         let ctx = ctx_for_tenant(TENANT_A);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
 
         // A is ancestor of B
         let result = service
@@ -725,9 +761,9 @@ mod tests {
         let service = Service::from_config(&cfg);
         let ctx = ctx_for_tenant(TENANT_A);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
-        let c_id = Uuid::parse_str(TENANT_C).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
+        let c_id = TenantId(Uuid::parse_str(TENANT_C).unwrap());
 
         // B is direct parent of C - allowed
         let result = service
@@ -763,8 +799,8 @@ mod tests {
         let service = Service::from_config(&cfg);
         let ctx = ctx_for_tenant(TENANT_A);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
 
         // A is NOT ancestor of B when B is a barrier (default BarrierMode::Respect)
         let result = service
@@ -789,8 +825,8 @@ mod tests {
         let service = Service::from_config(&cfg);
         let ctx = ctx_for_tenant(TENANT_A);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let nonexistent = Uuid::parse_str(NONEXISTENT).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let nonexistent = TenantId(Uuid::parse_str(NONEXISTENT).unwrap());
 
         // Nonexistent ancestor
         let result = service

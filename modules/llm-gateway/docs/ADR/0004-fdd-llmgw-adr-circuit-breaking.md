@@ -1,5 +1,22 @@
 # ADR-0004: Circuit Breaking vs Health-Based Routing
 
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Circuit Breaking (Outbound API Gateway)](#circuit-breaking-outbound-api-gateway)
+  - [Health-Based Routing (LLM Gateway)](#health-based-routing-llm-gateway)
+  - [How They Work Together](#how-they-work-together)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+- [Related Design Elements](#related-design-elements)
+
+<!-- /toc -->
+
 **Date**: 2026-02-03
 
 **Status**: Accepted

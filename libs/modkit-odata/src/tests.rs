@@ -382,4 +382,15 @@ mod tests {
             "unsupported $orderby field: unknown_field"
         );
     }
+
+    #[test]
+    fn test_parse_filter_string_error_contains_position() {
+        let err = crate::parse_filter_string("name eq AND broken").unwrap_err();
+        let msg = err.to_string();
+        // The error must include PEG position info, not just "Parsing"
+        assert!(
+            msg.contains("error at") && msg.contains("expected"),
+            "InvalidFilter should contain position and expectation info, got: {msg}"
+        );
+    }
 }

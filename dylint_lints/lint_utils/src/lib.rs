@@ -544,7 +544,7 @@ fn get_path_str_from_session(source_map: &SourceMap, span: Span) -> Option<Strin
 /// Only checks files in temporary directories to avoid unnecessary file I/O in production.
 fn extract_simulated_dir(path_str: &str) -> Option<String> {
     // Only check for simulated_dir in temporary paths (tests run in temp directories)
-    let is_temp = path_str.contains("/tmp/") 
+    let is_temp = path_str.contains("/tmp/")
         || path_str.contains("/var/folders/")  // macOS temp
         || path_str.contains("\\Temp\\")        // Windows temp
         || path_str.contains(".tmp"); // dylint test temp dirs

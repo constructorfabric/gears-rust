@@ -18,7 +18,7 @@ token source and establishes patterns that must be followed:
 | Background refresh | `run_jwks_refresh_task` + `CancellationToken` | `aliri_tokens` watcher |
 | Backoff | Manual exponential in `calculate_backoff()` | Delegated to `aliri_tokens` |
 | Error mapping | `map_http_error(HttpError) -> ClaimsError` | Extract shared `map_http_error` or create parallel `map_http_error(HttpError) -> TokenError` |
-| Test scaffold | `httpmock` + `allow_insecure_http()` | Same pattern |
+| Test scaffold | `httpmock` | Same pattern |
 
 Key reuse points:
 
@@ -34,8 +34,7 @@ Key reuse points:
    `HttpClientConfig::token_endpoint()` instead (retries are appropriate for
    token acquisition).
 4. **Test pattern** — `jwks.rs:482-499` (`test_provider_with_http`) shows
-   how to build a test `HttpClient` with `allow_insecure_http()` for
-   `httpmock`. Reuse the same approach.
+   how to build a test `HttpClient` for `httpmock`. Reuse the same approach.
 5. **Dependencies already available** — `modkit-auth/Cargo.toml` already has
    `arc-swap`, `modkit-http`, `tokio-util`, `httpmock` (dev). Only
    `aliri_tokens` needs to be added.
@@ -361,7 +360,7 @@ Check every item:
 
 8. COMPILATION: `cargo check -p modkit-auth` succeeds.
 
-9. TESTS (use httpmock + allow_insecure_http, same pattern as
+9. TESTS (use httpmock, same pattern as
    jwks.rs test_provider_with_http at line 482):
    - Mock server returns valid token response → assert access_token + lifetime.
    - Mock returns response without expires_in → assert default_ttl used.
@@ -784,7 +783,7 @@ Check every item:
 
 7. COMPILATION: `cargo check -p modkit-auth` succeeds.
 
-8. TESTS (httpmock + allow_insecure_http, same pattern as JWKS tests):
+8. TESTS (httpmock, same pattern as JWKS tests):
    - Integration: mock OIDC discovery + mock token endpoint → Token::get()
      returns expected token.
    - Unit: discover_token_endpoint with valid response.

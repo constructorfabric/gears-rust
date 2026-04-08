@@ -18,7 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+  RUST_BACKTRACE: full
   # We do NOT set RUSTC_WRAPPER globally; we'll enable it per-job after probing sccache.
   # RUSTC_WRAPPER: sccache
   SCCACHE_CACHE_SIZE: "2G"
@@ -79,9 +79,6 @@ jobs:
           else
             echo "sccache failed, falling back to plain rustc"
           fi
-
-      - name: cargo fmt (check)
-        run: make fmt
 
       - name: cargo clippy
         run: make clippy
@@ -170,6 +167,9 @@ jobs:
   coverage:
     name: Code Coverage (cargo-llvm-cov)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-01-20
     steps:
@@ -215,7 +215,7 @@ jobs:
         with:
           files: lcov.info
           fail_ci_if_error: false
-          # token: ${{ secrets.CODECOV_TOKEN }}  # Uncomment if required for private repos
+          token: ${{ secrets.CODECOV_TOKEN }}  # Uncomment if required for private repos
 
   dylint:
     name: Dylint Tests

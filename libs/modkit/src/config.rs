@@ -27,6 +27,12 @@ pub enum ConfigError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("variable expansion failed for module '{module}': {source}")]
+    VarExpand {
+        module: String,
+        #[source]
+        source: modkit_utils::var_expand::ExpandVarsError,
+    },
 }
 
 /// Provider of module-specific configuration (raw JSON sections only).

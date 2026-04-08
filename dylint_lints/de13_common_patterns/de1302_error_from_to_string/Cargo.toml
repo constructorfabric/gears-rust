@@ -1,0 +1,32 @@
+# Created: 2026-03-13 by Constructor Tech
+# Updated: 2026-03-16 by Constructor Tech
+[package]
+name = "de1302_error_from_to_string"
+version = "0.1.0"
+authors = ["Cyber Fabric"]
+description = "Calling .to_string() in From<XxxError> impls destroys the error chain (DE1302)"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "bad_from_to_string"
+path = "ui/bad_from_to_string.rs"
+
+[[example]]
+name = "good_from_preserve"
+path = "ui/good_from_preserve.rs"
+
+[dependencies]
+clippy_utils.workspace = true
+dylint_linting.workspace = true
+lint_utils.workspace = true
+
+[dev-dependencies]
+dylint_testing.workspace = true
+thiserror.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true

@@ -36,15 +36,12 @@ impl Default for CalculatorGateway {
 #[async_trait]
 impl modkit::Module for CalculatorGateway {
     async fn init(&self, ctx: &ModuleCtx) -> Result<()> {
-        tracing::info!("Initializing {} module", Self::MODULE_NAME);
-
         // Create domain service with ClientHub for dependency resolution
         let service = Arc::new(Service::new(ctx.client_hub()));
 
         // Register Service in ClientHub for SDK's wire_client() to access
         ctx.client_hub().register::<Service>(service);
 
-        tracing::info!("{} module initialized successfully", Self::MODULE_NAME);
         Ok(())
     }
 }

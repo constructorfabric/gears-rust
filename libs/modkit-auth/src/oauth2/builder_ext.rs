@@ -103,7 +103,6 @@ mod tests {
         let token = Token::new(token_config(&oauth_server)).await.unwrap();
 
         let client = modkit_http::HttpClientBuilder::new()
-            .allow_insecure_http()
             .with_bearer_auth(token)
             .build()
             .unwrap();
@@ -141,7 +140,6 @@ mod tests {
         let custom = HeaderName::from_static("x-api-key");
 
         let client = modkit_http::HttpClientBuilder::new()
-            .allow_insecure_http()
             .with_bearer_auth_header(token, custom)
             .build()
             .unwrap();
@@ -173,10 +171,7 @@ mod tests {
             then.status(200).body("no-auth");
         });
 
-        let client = modkit_http::HttpClientBuilder::new()
-            .allow_insecure_http()
-            .build()
-            .unwrap();
+        let client = modkit_http::HttpClientBuilder::new().build().unwrap();
 
         let _resp = client
             .get(&format!("http://localhost:{}/api/data", api_server.port()))

@@ -10,7 +10,9 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError, AuthenticationResult};
+use authn_resolver_sdk::{
+    AuthNResolverClient, AuthNResolverError, AuthenticationResult, ClientCredentialsRequest,
+};
 use axum::{
     Extension, Json, Router,
     body::Body,
@@ -297,8 +299,100 @@ async fn test_public_routes_accessible() {
 }
 
 #[tokio::test]
+async fn test_public_routes_with_prefix_accessible() {
+    // Create api-gateway with auth disabled and test prefixed public routes
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "enable_docs": true,
+                "cors_enabled": false,
+                "auth_disabled": true, // Using disabled for simplicity in test
+                "prefix_path": "/cf",
+            }
+        }
+    });
+
+    let api_ctx = create_api_gateway_ctx(config);
+    let test_ctx = create_test_module_ctx();
+
+    let api_gateway = api_gateway::ApiGateway::default();
+    api_gateway.init(&api_ctx).await.expect("Failed to init");
+
+    // First call rest_prepare to add built-in routes
+    let router = Router::new();
+    let router = api_gateway
+        .rest_prepare(&api_ctx, router)
+        .expect("Failed to prepare");
+
+    // Then register test module routes
+    let test_module = TestAuthModule;
+    let router = test_module
+        .register_rest(&test_ctx, router, &api_gateway)
+        .expect("Failed to register routes");
+
+    // Finally finalize
+    let router = api_gateway
+        .rest_finalize(&api_ctx, router)
+        .expect("Failed to finalize");
+
+    // Test built-in health endpoints
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Health endpoint should be accessible"
+    );
+
+    // Test OpenAPI endpoint
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/cf/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "OpenAPI endpoint should be accessible"
+    );
+
+    // Test OpenAPI endpoint
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "OpenAPI endpoint should be inaccessible without prefix"
+    );
+}
+
+#[tokio::test]
 async fn test_middleware_always_inserts_security_ctx() {
-    // This test verifies that SecurityCtx is always available in handlers
+    // This test verifies that SecurityContext is always available in handlers
     let config = json!({
         "api-gateway": {
             "config": {
@@ -316,9 +410,9 @@ async fn test_middleware_always_inserts_security_ctx() {
     let api_gateway = api_gateway::ApiGateway::default();
     api_gateway.init(&api_ctx).await.expect("Failed to init");
 
-    let router = Router::new();
+    let mut router: Router = Router::new();
     let test_module = TestAuthModule;
-    let router = test_module
+    router = test_module
         .register_rest(&test_ctx, router, &api_gateway)
         .expect("Failed to register routes");
 
@@ -337,11 +431,11 @@ async fn test_middleware_always_inserts_security_ctx() {
         .await
         .expect("Request failed");
 
-    // Should NOT get 500 error about missing SecurityCtx
+    // Should NOT get 500 error about missing SecurityContext
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "Handler should receive SecurityCtx from middleware"
+        "Handler should receive SecurityContext from middleware"
     );
 }
 
@@ -409,7 +503,7 @@ async fn test_openapi_includes_security_metadata() {
 #[tokio::test]
 async fn test_route_pattern_matching_with_path_params() {
     // This test verifies that routes with path parameters (e.g., /users/{id})
-    // are properly matched and authorization is enforced
+    // are properly matched under a configured prefix (auth disabled in this test)
     let config = json!({
         "api-gateway": {
             "config": {
@@ -427,9 +521,9 @@ async fn test_route_pattern_matching_with_path_params() {
     let api_gateway = api_gateway::ApiGateway::default();
     api_gateway.init(&api_ctx).await.expect("Failed to init");
 
-    let router = Router::new();
+    let mut router = Router::new();
     let test_module = TestAuthModule;
-    let router = test_module
+    router = test_module
         .register_rest(&test_ctx, router, &api_gateway)
         .expect("Failed to register routes");
 
@@ -473,6 +567,74 @@ async fn test_route_pattern_matching_with_path_params() {
     );
 }
 
+#[tokio::test]
+async fn test_route_pattern_matching_with_prefix_path_params() {
+    // This test verifies that routes with path parameters (e.g., /users/{id})
+    // are properly matched and authorization is enforced
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "enable_docs": false,
+                "cors_enabled": false,
+                "auth_disabled": true, // Disabled for test simplicity
+                "prefix_path": "/cf",
+            }
+        }
+    });
+
+    let api_ctx = create_api_gateway_ctx(config);
+    let test_ctx = create_test_module_ctx();
+
+    let api_gateway = api_gateway::ApiGateway::default();
+    api_gateway.init(&api_ctx).await.expect("Failed to init");
+
+    let mut router = Router::new();
+    let test_module = TestAuthModule;
+    router = test_module
+        .register_rest(&test_ctx, router, &api_gateway)
+        .expect("Failed to register routes");
+
+    let router = api_gateway
+        .rest_finalize(&api_ctx, router)
+        .expect("Failed to finalize");
+
+    // Test that /tests/v1/api/users/123 is accessible (matches /tests/v1/api/users/{id})
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/cf/tests/v1/api/users/123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Route with path parameter should be accessible and matched correctly"
+    );
+
+    // Test that /tests/v1/api/users/abc-def-456 is also accessible
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/cf/tests/v1/api/users/abc-def-456")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Route with different path parameter value should also be accessible"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Auth-enabled tests: verify the actual authn_middleware with a mock AuthN client
 // ---------------------------------------------------------------------------
@@ -493,6 +655,15 @@ impl AuthNResolverClient for MockAuthNResolverClient {
         bearer_token: &str,
     ) -> Result<AuthenticationResult, AuthNResolverError> {
         (self.handler)(bearer_token)
+    }
+
+    async fn exchange_client_credentials(
+        &self,
+        _request: &ClientCredentialsRequest,
+    ) -> Result<AuthenticationResult, AuthNResolverError> {
+        Err(AuthNResolverError::Internal(
+            "not implemented in mock".to_owned(),
+        ))
     }
 }
 
@@ -541,19 +712,7 @@ impl RestApiCapability for TestAuthEnabledModule {
     }
 }
 
-/// Create a finalized router with auth **enabled** and the given mock `AuthN` client.
-async fn create_auth_enabled_router(mock: MockAuthNResolverClient, cors_enabled: bool) -> Router {
-    let config = json!({
-        "api-gateway": {
-            "config": {
-                "bind_addr": "0.0.0.0:8080",
-                "enable_docs": false,
-                "cors_enabled": cors_enabled,
-                "auth_disabled": false,
-            }
-        }
-    });
-
+async fn create_router(config: serde_json::Value, mock: MockAuthNResolverClient) -> Router {
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn AuthNResolverClient>(Arc::new(mock));
 
@@ -570,15 +729,50 @@ async fn create_auth_enabled_router(mock: MockAuthNResolverClient, cors_enabled:
     let api_gateway = api_gateway::ApiGateway::default();
     api_gateway.init(&api_ctx).await.expect("Failed to init");
 
-    let router = Router::new();
+    let mut router = Router::new();
     let test_module = TestAuthEnabledModule;
-    let router = test_module
+    router = test_module
         .register_rest(&test_ctx, router, &api_gateway)
         .expect("Failed to register routes");
 
     api_gateway
         .rest_finalize(&api_ctx, router)
         .expect("Failed to finalize")
+}
+
+/// Create a finalized router with auth **enabled** and the given mock `AuthN` client.
+async fn create_auth_enabled_router(mock: MockAuthNResolverClient, cors_enabled: bool) -> Router {
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "enable_docs": false,
+                "cors_enabled": cors_enabled,
+                "auth_disabled": false,
+            }
+        }
+    });
+
+    create_router(config, mock).await
+}
+
+async fn create_auth_enabled_with_prefix_router(
+    mock: MockAuthNResolverClient,
+    cors_enabled: bool,
+) -> Router {
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "enable_docs": false,
+                "cors_enabled": cors_enabled,
+                "auth_disabled": false,
+                "prefix_path": "/cf",
+            }
+        }
+    });
+
+    create_router(config, mock).await
 }
 
 /// Build a mock that accepts a specific token and returns a `SecurityContext` with known IDs.
@@ -790,6 +984,59 @@ async fn test_public_route_with_auth_enabled() {
         json["user_id"],
         Uuid::default().to_string(),
         "Public route should receive anonymous SecurityContext"
+    );
+}
+
+#[tokio::test]
+async fn test_public_route_with_prefix_auth_enabled() {
+    // Mock that would reject any token — proves it is never called for public routes
+    let mock =
+        mock_returning_error(|| AuthNResolverError::Internal("should not be called".to_owned()));
+    let router = create_auth_enabled_with_prefix_router(mock, false).await;
+
+    // No Authorization header on a public route
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/cf/tests/v1/api/public-ctx")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Public route should return 200 even with auth enabled and no token"
+    );
+
+    // Verify the handler received an anonymous SecurityContext (subject_id = Uuid::default)
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["user_id"],
+        Uuid::default().to_string(),
+        "Public route should receive anonymous SecurityContext"
+    );
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/tests/v1/api/public-ctx")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "Public route should return 404 for unknown paths"
     );
 }
 

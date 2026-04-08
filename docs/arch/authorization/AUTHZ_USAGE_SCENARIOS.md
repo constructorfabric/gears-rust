@@ -6,7 +6,8 @@ Each scenario shows the full flow: HTTP request → PDP evaluation → SQL execu
 For the core authorization design, see [DESIGN.md](./DESIGN.md).
 
 All examples use a Task Management domain:
-- **Resource:** `tasks` table with `id`, `owner_tenant_id`, `title`, `status`
+- **Resource:** `tasks` table with `id`, `owner_tenant_id`, `owner_id`, `title`, `status`
+- **Owner:** `owner_id` references the subject (user) who owns/is assigned the task
 - **Resource Groups:** Projects (tasks belong to projects)
 - **Tenant Model:** Hierarchical multi-tenancy — see [TENANT_MODEL.md](./TENANT_MODEL.md) for details on topology, barriers, and closure tables
 
@@ -53,6 +54,12 @@ All examples use a Task Management domain:
       - [S21: LIST, tenant subtree and group subtree](#s21-list-tenant-subtree-and-group-subtree)
       - [S22: LIST, multiple access paths (OR)](#s22-list-multiple-access-paths-or)
       - [S23: Access denied](#s23-access-denied)
+    - [Subject Owner-Based Access](#subject-owner-based-access)
+      - [S24: LIST, owner-only access](#s24-list-owner-only-access)
+      - [S25: GET, owner-only access](#s25-get-owner-only-access)
+      - [S26: UPDATE, owner-only mutation](#s26-update-owner-only-mutation)
+      - [S27: DELETE, owner-only mutation](#s27-delete-owner-only-mutation)
+      - [S28: CREATE, owner-only](#s28-create-owner-only)
   - [TOCTOU Analysis](#toctou-analysis)
     - [When TOCTOU Matters](#when-toctou-matters)
     - [How Each Scenario Handles TOCTOU](#how-each-scenario-handles-toctou)
@@ -181,15 +188,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.tasks.task.v1~" },
   "context": {
     "tenant_context": {
       "mode": "subtree",
-      "root_id": "T1",
+      "root_id": "T1-uuid",
       "barrier_mode": "all"
     },
     "require_constraints": true,
@@ -210,7 +217,7 @@ Authorization: Bearer <token>
           {
             "type": "in_tenant_subtree",
             "resource_property": "owner_tenant_id",
-            "root_tenant_id": "T1",
+            "root_tenant_id": "T1-uuid",
             "barrier_mode": "all"
           }
         ]
@@ -225,7 +232,7 @@ Authorization: Bearer <token>
 SELECT * FROM tasks
 WHERE owner_tenant_id IN (
   SELECT descendant_id FROM tenant_closure
-  WHERE ancestor_id = 'T1'
+  WHERE ancestor_id = 'T1-uuid'
     AND barrier = 0
 )
 ```
@@ -240,7 +247,7 @@ User requests a specific task; PEP enforces tenant subtree access at query level
 
 **Request:**
 ```http
-GET /tasks/task-456?tenant_subtree=true
+GET /tasks/task456-uuid?tenant_subtree=true
 Authorization: Bearer <token>
 ```
 
@@ -249,18 +256,18 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "read" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
-    "id": "task-456"
+    "id": "task456-uuid"
   },
   "context": {
     "tenant_context": {
       "mode": "subtree",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
@@ -280,7 +287,7 @@ Authorization: Bearer <token>
           {
             "type": "in_tenant_subtree",
             "resource_property": "owner_tenant_id",
-            "root_tenant_id": "T1"
+            "root_tenant_id": "T1-uuid"
           }
         ]
       }
@@ -292,10 +299,10 @@ Authorization: Bearer <token>
 **SQL:**
 ```sql
 SELECT * FROM tasks
-WHERE id = 'task-456'
+WHERE id = 'task456-uuid'
   AND owner_tenant_id IN (
     SELECT descendant_id FROM tenant_closure
-    WHERE ancestor_id = 'T1'
+    WHERE ancestor_id = 'T1-uuid'
       AND barrier = 0  -- barrier_mode defaults to "all"
   )
 ```
@@ -314,7 +321,7 @@ User updates a task; constraint ensures atomic authorization check.
 
 **Request:**
 ```http
-PUT /tasks/task-456?tenant_subtree=true
+PUT /tasks/task456-uuid?tenant_subtree=true
 Authorization: Bearer <token>
 Content-Type: application/json
 
@@ -326,18 +333,18 @@ Content-Type: application/json
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "update" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
-    "id": "task-456"
+    "id": "task456-uuid"
   },
   "context": {
     "tenant_context": {
       "mode": "subtree",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
@@ -357,7 +364,7 @@ Content-Type: application/json
           {
             "type": "in_tenant_subtree",
             "resource_property": "owner_tenant_id",
-            "root_tenant_id": "T1"
+            "root_tenant_id": "T1-uuid"
           }
         ]
       }
@@ -370,10 +377,10 @@ Content-Type: application/json
 ```sql
 UPDATE tasks
 SET status = 'completed'
-WHERE id = 'task-456'
+WHERE id = 'task456-uuid'
   AND owner_tenant_id IN (
     SELECT descendant_id FROM tenant_closure
-    WHERE ancestor_id = 'T1'
+    WHERE ancestor_id = 'T1-uuid'
       AND barrier = 0  -- barrier_mode defaults to "all"
   )
 ```
@@ -393,10 +400,10 @@ DELETE follows the same pattern as UPDATE (S03). PDP returns `in_tenant_subtree`
 **SQL:**
 ```sql
 DELETE FROM tasks
-WHERE id = 'task-456'
+WHERE id = 'task456-uuid'
   AND owner_tenant_id IN (
     SELECT descendant_id FROM tenant_closure
-    WHERE ancestor_id = 'T1'
+    WHERE ancestor_id = 'T1-uuid'
       AND barrier = 0  -- barrier_mode defaults to "all"
   )
 ```
@@ -419,7 +426,7 @@ POST /tasks
 Authorization: Bearer <token>
 Content-Type: application/json
 
-{"title": "New Task", "owner_tenant_id": "T2"}
+{"title": "New Task", "owner_tenant_id": "T2-uuid"}
 ```
 
 **PEP → PDP Request:**
@@ -427,20 +434,20 @@ Content-Type: application/json
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "create" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
     "properties": {
-      "owner_tenant_id": "T2"
+      "owner_tenant_id": "T2-uuid"
     }
   },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T2"
+      "root_id": "T2-uuid"
     },
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
@@ -460,7 +467,7 @@ Content-Type: application/json
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T2"
+            "value": "T2-uuid"
           }
         ]
       }
@@ -474,7 +481,7 @@ Content-Type: application/json
 **SQL:**
 ```sql
 INSERT INTO tasks (id, owner_tenant_id, title, status)
-VALUES ('task-new', 'T2', 'New Task', 'pending')
+VALUES ('tasknew-uuid', 'T2-uuid', 'New Task', 'pending')
 ```
 
 **Note:** PDP returns constraints for CREATE using the same flow as other operations. PEP validates that the INSERT's `owner_tenant_id` (or other resource properties in case of RBAC) matches the constraint. This prevents the caller from creating resources in tenants the PDP didn't authorize.
@@ -498,27 +505,27 @@ Content-Type: application/json
 
 **PEP resolves tenant from SecurityContext:**
 
-The PEP reads `subject_tenant_id` (T1) from the `SecurityContext` produced by AuthN Resolver. This is the subject's home tenant — the natural owner for the new resource when no explicit tenant is provided in the API.
+The PEP reads `subject_tenant_id` (T1-uuid) from the `SecurityContext` produced by AuthN Resolver. This is the subject's home tenant — the natural owner for the new resource when no explicit tenant is provided in the API.
 
 **PEP → PDP Request:**
 ```json
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "create" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
     "properties": {
-      "owner_tenant_id": "T1"
+      "owner_tenant_id": "T1-uuid"
     }
   },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
@@ -538,7 +545,7 @@ The PEP reads `subject_tenant_id` (T1) from the `SecurityContext` produced by Au
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           }
         ]
       }
@@ -552,7 +559,7 @@ The PEP reads `subject_tenant_id` (T1) from the `SecurityContext` produced by Au
 **SQL:**
 ```sql
 INSERT INTO tasks (id, owner_tenant_id, title, status)
-VALUES ('task-new', 'T1', 'New Task', 'pending')
+VALUES ('tasknew-uuid', 'T1-uuid', 'New Task', 'pending')
 ```
 
 **Difference from S05:** In S05, PEP knows the target tenant from the request body (explicit `owner_tenant_id` field). Here, the API has no tenant field — PEP uses `SecurityContext.subject_tenant_id` instead. Both scenarios follow the same PDP validation flow.
@@ -568,7 +575,7 @@ VALUES ('task-new', 'T1', 'New Task', 'pending')
 Billing service needs usage data from all tenants in subtree, including self-managed tenants (barriers ignored). This is a cross-barrier operation for administrative purposes.
 
 **Tenant hierarchy:**
-```
+```text
 T1 (parent)
 ├── T2 (self_managed=true)  ← barrier (ignored for billing)
 │   └── T3
@@ -586,15 +593,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.billing.usage.v1~" },
   "context": {
     "tenant_context": {
       "mode": "subtree",
-      "root_id": "T1",
+      "root_id": "T1-uuid",
       "barrier_mode": "none"
     },
     "require_constraints": true,
@@ -615,7 +622,7 @@ Authorization: Bearer <token>
           {
             "type": "in_tenant_subtree",
             "resource_property": "owner_tenant_id",
-            "root_tenant_id": "T1",
+            "root_tenant_id": "T1-uuid",
             "barrier_mode": "none"
           }
         ]
@@ -630,7 +637,7 @@ Authorization: Bearer <token>
 SELECT * FROM billing_usage
 WHERE owner_tenant_id IN (
   SELECT descendant_id FROM tenant_closure
-  WHERE ancestor_id = 'T1'
+  WHERE ancestor_id = 'T1-uuid'
   -- no barrier clause because barrier_mode = "none"
 )
 ```
@@ -641,12 +648,12 @@ WHERE owner_tenant_id IN (
 
 | ancestor_id | descendant_id | barrier |
 |-------------|---------------|---------|
-| T1 | T1 | 0 |
-| T1 | T2 | 1 |
-| T1 | T3 | 1 |
-| T1 | T4 | 0 |
-| T2 | T2 | 0 |
-| T2 | T3 | 0 |
+| T1-uuid | T1-uuid | 0 |
+| T1-uuid | T2-uuid | 1 |
+| T1-uuid | T3-uuid | 1 |
+| T1-uuid | T4-uuid | 0 |
+| T2-uuid | T2-uuid | 0 |
+| T2-uuid | T3-uuid | 0 |
 
 When querying from T1 with `barrier_mode=all`, only rows where `barrier = 0` match → T1, T4.
 
@@ -677,15 +684,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.tasks.task.v1~" },
   "context": {
     "tenant_context": {
       "mode": "subtree",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": [],
@@ -708,7 +715,7 @@ PDP resolves the subtree internally and returns explicit IDs:
           {
             "type": "in",
             "resource_property": "owner_tenant_id",
-            "values": ["T1", "T2", "T3"]
+            "values": ["T1-uuid", "T2-uuid", "T3-uuid"]
           }
         ]
       }
@@ -720,7 +727,7 @@ PDP resolves the subtree internally and returns explicit IDs:
 **SQL:**
 ```sql
 SELECT * FROM tasks
-WHERE owner_tenant_id IN ('T1', 'T2', 'T3')
+WHERE owner_tenant_id IN ('T1-uuid', 'T2-uuid', 'T3-uuid')
 ```
 
 **Trade-off:** PDP must know the tenant hierarchy and resolve it. Works well for small tenant counts; may not scale for thousands of tenants.
@@ -737,36 +744,36 @@ If the PDP returns `decision: true` **without** constraints, PEP returns the pre
 
 **Request:**
 ```http
-GET /tasks/task-456?tenant_subtree=true
+GET /tasks/task456-uuid?tenant_subtree=true
 Authorization: Bearer <token>
 ```
 
 **Step 1 — PEP prefetches resource:**
 ```sql
-SELECT * FROM tasks WHERE id = 'task-456'
+SELECT * FROM tasks WHERE id = 'task456-uuid'
 ```
-Result: full task record with `owner_tenant_id = 'T2'`
+Result: full task record with `owner_tenant_id = 'T2-uuid'`
 
 **Step 2 — PEP → PDP Request (with resource properties, `require_constraints: false`):**
 ```json
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "read" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
-    "id": "task-456",
+    "id": "task456-uuid",
     "properties": {
-      "owner_tenant_id": "T2"
+      "owner_tenant_id": "T2-uuid"
     }
   },
   "context": {
     "tenant_context": {
       "mode": "subtree",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": false,
     "capabilities": [],
@@ -788,13 +795,13 @@ PDP validates that T2 is in T1's subtree. Since `require_constraints: false`, PD
 }
 ```
 
-Alternatively, PDP may still return constraints (e.g., `eq(owner_tenant_id, T2)`) — the PEP handles both cases.
+Alternatively, PDP may still return constraints (e.g., `eq(owner_tenant_id, T2-uuid)`) — the PEP handles both cases.
 
 **Step 3 — Enforce and return result:**
 
 PEP compiles the response into `AccessScope`:
 - **No constraints** (`scope.is_unconstrained()`) → return the prefetched entity directly. No second SQL query needed.
-- **Constraints returned** → compile to `AccessScope` and perform a scoped re-read (`SELECT ... WHERE id = 'task-456' AND owner_tenant_id = 'T2'`).
+- **Constraints returned** → compile to `AccessScope` and perform a scoped re-read (`SELECT ... WHERE id = 'task456-uuid' AND owner_tenant_id = 'T2-uuid'`).
 - Resource not found in Step 1 → **404 Not Found**.
 - `decision: false` → **404 Not Found** (hides resource existence from unauthorized callers).
 
@@ -810,7 +817,7 @@ Unlike S09 (GET), mutations require TOCTOU protection. PEP prefetches `owner_ten
 
 **Request:**
 ```http
-PUT /tasks/task-456?tenant_subtree=true
+PUT /tasks/task456-uuid?tenant_subtree=true
 Authorization: Bearer <token>
 Content-Type: application/json
 
@@ -819,30 +826,30 @@ Content-Type: application/json
 
 **Step 1 — PEP prefetches:**
 ```sql
-SELECT owner_tenant_id FROM tasks WHERE id = 'task-456'
+SELECT owner_tenant_id FROM tasks WHERE id = 'task456-uuid'
 ```
-Result: `owner_tenant_id = 'T2'`
+Result: `owner_tenant_id = 'T2-uuid'`
 
 **Step 2 — PEP → PDP Request:**
 ```json
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "update" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
-    "id": "task-456",
+    "id": "task456-uuid",
     "properties": {
-      "owner_tenant_id": "T2"
+      "owner_tenant_id": "T2-uuid"
     }
   },
   "context": {
     "tenant_context": {
       "mode": "subtree",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": [],
@@ -862,7 +869,7 @@ Result: `owner_tenant_id = 'T2'`
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T2"
+            "value": "T2-uuid"
           }
         ]
       }
@@ -875,8 +882,8 @@ Result: `owner_tenant_id = 'T2'`
 ```sql
 UPDATE tasks
 SET status = 'completed'
-WHERE id = 'task-456'
-  AND owner_tenant_id = 'T2'
+WHERE id = 'task456-uuid'
+  AND owner_tenant_id = 'T2-uuid'
 ```
 
 **TOCTOU protection:** If another request changed `owner_tenant_id` between prefetch and UPDATE, the WHERE clause won't match → 0 rows affected → **404**. This prevents unauthorized modification even in a race condition.
@@ -892,8 +899,8 @@ DELETE follows the same pattern as UPDATE (S10). PEP prefetches `owner_tenant_id
 **SQL:**
 ```sql
 DELETE FROM tasks
-WHERE id = 'task-456'
-  AND owner_tenant_id = 'T2'
+WHERE id = 'task456-uuid'
+  AND owner_tenant_id = 'T2-uuid'
 ```
 
 TOCTOU protection is identical to S10: if `owner_tenant_id` changed between prefetch and DELETE, the WHERE clause won't match → 0 rows → **404**.
@@ -916,7 +923,7 @@ Simplest case — access limited to context tenant only, no subtree traversal. U
 
 **Request:**
 ```http
-GET /tasks/task-456
+GET /tasks/task456-uuid
 Authorization: Bearer <token>
 ```
 
@@ -925,18 +932,18 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "read" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
-    "id": "task-456"
+    "id": "task456-uuid"
   },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": [],
@@ -956,7 +963,7 @@ Authorization: Bearer <token>
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           }
         ]
       }
@@ -968,8 +975,8 @@ Authorization: Bearer <token>
 **SQL:**
 ```sql
 SELECT * FROM tasks
-WHERE id = 'task-456'
-  AND owner_tenant_id = 'T1'
+WHERE id = 'task456-uuid'
+  AND owner_tenant_id = 'T1-uuid'
 ```
 
 **Note:** No prefetch needed, no closure table required. PDP returns direct `eq` constraint based on context tenant. This pattern applies when the endpoint operates within a single-tenant context, regardless of whether the overall tenant model is hierarchical.
@@ -1001,15 +1008,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.tasks.task.v1~" },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["group_membership"],
@@ -1032,12 +1039,12 @@ Tenant constraint is always included — groups don't bypass tenant isolation:
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           },
           {
             "type": "in_group",
             "resource_property": "id",
-            "group_ids": ["ProjectA", "ProjectB"]
+            "group_ids": ["ProjectA-uuid", "ProjectB-uuid"]
           }
         ]
       }
@@ -1049,10 +1056,10 @@ Tenant constraint is always included — groups don't bypass tenant isolation:
 **SQL:**
 ```sql
 SELECT * FROM tasks
-WHERE owner_tenant_id = 'T1'
+WHERE owner_tenant_id = 'T1-uuid'
   AND id IN (
     SELECT resource_id FROM resource_group_membership
-    WHERE group_id IN ('ProjectA', 'ProjectB')
+    WHERE group_id IN ('ProjectA-uuid', 'ProjectB-uuid')
   )
 ```
 
@@ -1075,15 +1082,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.tasks.task.v1~" },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["group_hierarchy"],
@@ -1106,12 +1113,12 @@ Tenant constraint is always included:
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           },
           {
             "type": "in_group_subtree",
             "resource_property": "id",
-            "root_group_id": "FolderA"
+            "root_group_id": "FolderA-uuid"
           }
         ]
       }
@@ -1123,12 +1130,12 @@ Tenant constraint is always included:
 **SQL:**
 ```sql
 SELECT * FROM tasks
-WHERE owner_tenant_id = 'T1'
+WHERE owner_tenant_id = 'T1-uuid'
   AND id IN (
     SELECT resource_id FROM resource_group_membership
     WHERE group_id IN (
       SELECT descendant_id FROM resource_group_closure
-      WHERE ancestor_id = 'FolderA'
+      WHERE ancestor_id = 'FolderA-uuid'
   )
 )
 ```
@@ -1143,7 +1150,7 @@ User updates a task; PEP has resource_group_membership table. Similar to tenant-
 
 **Request:**
 ```http
-PUT /tasks/task-456
+PUT /tasks/task456-uuid
 Authorization: Bearer <token>
 Content-Type: application/json
 
@@ -1155,18 +1162,18 @@ Content-Type: application/json
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "update" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
-    "id": "task-456"
+    "id": "task456-uuid"
   },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["group_membership"],
@@ -1189,12 +1196,12 @@ Tenant constraint is always included:
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           },
           {
             "type": "in_group",
             "resource_property": "id",
-            "group_ids": ["ProjectA", "ProjectB"]
+            "group_ids": ["ProjectA-uuid", "ProjectB-uuid"]
           }
         ]
       }
@@ -1207,11 +1214,11 @@ Tenant constraint is always included:
 ```sql
 UPDATE tasks
 SET status = 'completed'
-WHERE id = 'task-456'
-  AND owner_tenant_id = 'T1'
+WHERE id = 'task456-uuid'
+  AND owner_tenant_id = 'T1-uuid'
   AND id IN (
     SELECT resource_id FROM resource_group_membership
-    WHERE group_id IN ('ProjectA', 'ProjectB')
+    WHERE group_id IN ('ProjectA-uuid', 'ProjectB-uuid')
   )
 ```
 
@@ -1229,7 +1236,7 @@ User updates a task; PEP has both resource_group_membership and resource_group_c
 
 **Request:**
 ```http
-PUT /tasks/task-456
+PUT /tasks/task456-uuid
 Authorization: Bearer <token>
 Content-Type: application/json
 
@@ -1241,18 +1248,18 @@ Content-Type: application/json
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "update" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
-    "id": "task-456"
+    "id": "task456-uuid"
   },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["group_hierarchy"],
@@ -1275,12 +1282,12 @@ Tenant constraint is always included:
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           },
           {
             "type": "in_group_subtree",
             "resource_property": "id",
-            "root_group_id": "FolderA"
+            "root_group_id": "FolderA-uuid"
           }
         ]
       }
@@ -1293,13 +1300,13 @@ Tenant constraint is always included:
 ```sql
 UPDATE tasks
 SET status = 'completed'
-WHERE id = 'task-456'
-  AND owner_tenant_id = 'T1'
+WHERE id = 'task456-uuid'
+  AND owner_tenant_id = 'T1-uuid'
   AND id IN (
     SELECT resource_id FROM resource_group_membership
     WHERE group_id IN (
       SELECT descendant_id FROM resource_group_closure
-      WHERE ancestor_id = 'FolderA'
+      WHERE ancestor_id = 'FolderA-uuid'
     )
   )
 ```
@@ -1314,7 +1321,7 @@ PEP doesn't have resource_group_membership table. PDP resolves group membership 
 
 **Request:**
 ```http
-GET /tasks/task-456
+GET /tasks/task456-uuid
 Authorization: Bearer <token>
 ```
 
@@ -1323,18 +1330,18 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "read" },
   "resource": {
     "type": "gts.x.core.tasks.task.v1~",
-    "id": "task-456"
+    "id": "task456-uuid"
   },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": [],
@@ -1362,7 +1369,7 @@ PDP returns tenant constraint as defense in depth (group check already done):
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           }
         ]
       }
@@ -1374,8 +1381,8 @@ PDP returns tenant constraint as defense in depth (group check already done):
 **Step 2 — SQL with constraint:**
 ```sql
 SELECT * FROM tasks
-WHERE id = 'task-456'
-  AND owner_tenant_id = 'T1'
+WHERE id = 'task456-uuid'
+  AND owner_tenant_id = 'T1-uuid'
 ```
 
 **Result interpretation:**
@@ -1403,15 +1410,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.tasks.task.v1~" },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["group_membership"],
@@ -1436,12 +1443,12 @@ PDP knows user has access to FolderA and its subfolders. Since PEP can't handle 
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           },
           {
             "type": "in_group",
             "resource_property": "id",
-            "group_ids": ["FolderA", "FolderA-Sub1", "FolderA-Sub2", "FolderA-Sub1-Deep"]
+            "group_ids": ["FolderA-uuid", "FolderASub1-uuid", "FolderASub2-uuid", "FolderASub1Deep-uuid"]
           }
         ]
       }
@@ -1453,10 +1460,10 @@ PDP knows user has access to FolderA and its subfolders. Since PEP can't handle 
 **SQL:**
 ```sql
 SELECT * FROM tasks
-WHERE owner_tenant_id = 'T1'
+WHERE owner_tenant_id = 'T1-uuid'
   AND id IN (
     SELECT resource_id FROM resource_group_membership
-    WHERE group_id IN ('FolderA', 'FolderA-Sub1', 'FolderA-Sub2', 'FolderA-Sub1-Deep')
+    WHERE group_id IN ('FolderA-uuid', 'FolderASub1-uuid', 'FolderASub2-uuid', 'FolderASub1Deep-uuid')
   )
 ```
 
@@ -1485,15 +1492,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.tasks.task.v1~" },
   "context": {
     "tenant_context": {
       "mode": "subtree",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy", "group_membership"],
@@ -1516,12 +1523,12 @@ Single constraint with multiple predicates (AND semantics):
           {
             "type": "in_tenant_subtree",
             "resource_property": "owner_tenant_id",
-            "root_tenant_id": "T1"
+            "root_tenant_id": "T1-uuid"
           },
           {
             "type": "in_group",
             "resource_property": "id",
-            "group_ids": ["ProjectA"]
+            "group_ids": ["ProjectA-uuid"]
           }
         ]
       }
@@ -1535,12 +1542,12 @@ Single constraint with multiple predicates (AND semantics):
 SELECT * FROM tasks
 WHERE owner_tenant_id IN (
     SELECT descendant_id FROM tenant_closure
-    WHERE ancestor_id = 'T1'
+    WHERE ancestor_id = 'T1-uuid'
       AND barrier = 0  -- barrier_mode defaults to "all"
   )
   AND id IN (
     SELECT resource_id FROM resource_group_membership
-    WHERE group_id = 'ProjectA'
+    WHERE group_id = 'ProjectA-uuid'
   )
 ```
 
@@ -1565,15 +1572,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.tasks.task.v1~" },
   "context": {
     "tenant_context": {
       "mode": "subtree",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy", "group_hierarchy"],
@@ -1596,12 +1603,12 @@ Single constraint with two predicates (AND semantics):
           {
             "type": "in_tenant_subtree",
             "resource_property": "owner_tenant_id",
-            "root_tenant_id": "T1"
+            "root_tenant_id": "T1-uuid"
           },
           {
             "type": "in_group_subtree",
             "resource_property": "id",
-            "root_group_id": "FolderA"
+            "root_group_id": "FolderA-uuid"
           }
         ]
       }
@@ -1615,14 +1622,14 @@ Single constraint with two predicates (AND semantics):
 SELECT * FROM tasks
 WHERE owner_tenant_id IN (
     SELECT descendant_id FROM tenant_closure
-    WHERE ancestor_id = 'T1'
+    WHERE ancestor_id = 'T1-uuid'
       AND barrier = 0
   )
   AND id IN (
     SELECT resource_id FROM resource_group_membership
     WHERE group_id IN (
       SELECT descendant_id FROM resource_group_closure
-      WHERE ancestor_id = 'FolderA'
+      WHERE ancestor_id = 'FolderA-uuid'
     )
   )
 ```
@@ -1653,15 +1660,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.tasks.task.v1~" },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["group_membership"],
@@ -1684,12 +1691,12 @@ Multiple constraints (OR semantics). Tenant constraint is included in each path:
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           },
           {
             "type": "in_group",
             "resource_property": "id",
-            "group_ids": ["ProjectA"]
+            "group_ids": ["ProjectA-uuid"]
           }
         ]
       },
@@ -1698,12 +1705,12 @@ Multiple constraints (OR semantics). Tenant constraint is included in each path:
           {
             "type": "eq",
             "resource_property": "owner_tenant_id",
-            "value": "T1"
+            "value": "T1-uuid"
           },
           {
             "type": "in",
             "resource_property": "id",
-            "values": ["task-shared-1", "task-shared-2"]
+            "values": ["taskshared1-uuid", "taskshared2-uuid"]
           }
         ]
       }
@@ -1716,15 +1723,15 @@ Multiple constraints (OR semantics). Tenant constraint is included in each path:
 ```sql
 SELECT * FROM tasks
 WHERE (
-    owner_tenant_id = 'T1'
+    owner_tenant_id = 'T1-uuid'
     AND id IN (
       SELECT resource_id FROM resource_group_membership
-      WHERE group_id = 'ProjectA'
+      WHERE group_id = 'ProjectA-uuid'
     )
   )
   OR (
-    owner_tenant_id = 'T1'
-    AND id IN ('task-shared-1', 'task-shared-2')
+    owner_tenant_id = 'T1-uuid'
+    AND id IN ('taskshared1-uuid', 'taskshared2-uuid')
   )
 ```
 
@@ -1747,15 +1754,15 @@ Authorization: Bearer <token>
 {
   "subject": {
     "type": "gts.x.core.security.subject_user.v1~",
-    "id": "user-123",
-    "properties": { "tenant_id": "T1" }
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.x.core.tasks.task.v1~" },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "T1"
+      "root_id": "T1-uuid"
     },
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
@@ -1771,7 +1778,7 @@ Authorization: Bearer <token>
   "context": {
     "deny_reason": {
       "error_code": "gts.x.core.errors.err.v1~x.authz.errors.insufficient_permissions.v1",
-      "details": "Subject 'user-123' lacks 'list' permission on 'gts.x.core.tasks.task.v1~' in tenant 'T1'"
+      "details": "Subject 'user123-uuid' lacks 'list' permission on 'gts.x.core.tasks.task.v1~' in tenant 'T1-uuid'"
     }
   }
 }
@@ -1786,6 +1793,343 @@ Authorization: Bearer <token>
 **Fail-closed principle:** The PEP never executes a database query when `decision: false`. This prevents any data leakage and ensures authorization is enforced before resource access.
 
 **Note on deny_reason:** The `deny_reason` is required when `decision: false`. PEP uses `error_code` for programmatic handling and logs `details` for troubleshooting, but returns a generic 403 response to prevent leaking authorization policy details to clients.
+
+---
+
+### Subject Owner-Based Access
+
+PEP supports `owner_id` as a standard resource property for per-subject ownership filtering. These scenarios demonstrate how `owner_id` constraints restrict access to resources owned by a specific user.
+
+**No projection tables** are needed — `owner_id` uses simple `eq` predicates compiled directly to SQL.
+
+**No prefetch** is needed — PDP always knows the subject's identity from `subject.id` in the evaluation request, so it can return `eq(owner_id, subject_id)` without PEP prefetching resource attributes. This is fundamentally different from "without tenant_closure" scenarios (S09–S11), where PEP must prefetch `owner_tenant_id` to tell PDP which specific tenant to validate.
+
+**`tenant_context` is omitted** from these requests. PDP infers the tenant context from `subject.properties.tenant_id` (see [DESIGN.md — tenant_context note](./DESIGN.md#request--response-example)). This is only safe when the subject's home tenant is the intended context; for cross-tenant access or service-to-service flows, supply `tenant_context` explicitly. PDP still returns `eq(owner_tenant_id, ...)` as defense-in-depth to ensure tenant isolation at the SQL level.
+
+---
+
+#### S24: LIST, owner-only access
+
+`GET /tasks`
+
+User requests only their own tasks. PDP restricts access to resources where `owner_id` matches the subject.
+
+**Use case:** Personal task list — "show only my tasks."
+
+**Request:**
+```http
+GET /tasks
+Authorization: Bearer <token>
+```
+
+**PEP → PDP Request:**
+```json
+{
+  "subject": {
+    "type": "gts.x.core.security.subject_user.v1~",
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
+  },
+  "action": { "name": "list" },
+  "resource": { "type": "gts.x.core.tasks.task.v1~" },
+  "context": {
+    "require_constraints": true,
+    "capabilities": [],
+    "supported_properties": ["owner_tenant_id", "id", "owner_id"]
+  }
+}
+```
+
+**PDP → PEP Response:**
+
+Single constraint with two predicates (AND semantics) — tenant isolation (defense-in-depth) plus owner restriction:
+
+```json
+{
+  "decision": true,
+  "context": {
+    "constraints": [
+      {
+        "predicates": [
+          {
+            "type": "eq",
+            "resource_property": "owner_tenant_id",
+            "value": "T1-uuid"
+          },
+          {
+            "type": "eq",
+            "resource_property": "owner_id",
+            "value": "user123-uuid"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**SQL:**
+```sql
+SELECT * FROM tasks
+WHERE owner_tenant_id = 'T1-uuid'
+  AND owner_id = 'user123-uuid'
+```
+
+---
+
+#### S25: GET, owner-only access
+
+`GET /tasks/{id}`
+
+User requests a specific task; PDP constrains access to resources owned by the subject.
+
+**Use case:** View task details — accessible only if the user owns it.
+
+**Request:**
+```http
+GET /tasks/task456-uuid
+Authorization: Bearer <token>
+```
+
+**PEP → PDP Request:**
+```json
+{
+  "subject": {
+    "type": "gts.x.core.security.subject_user.v1~",
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
+  },
+  "action": { "name": "read" },
+  "resource": {
+    "type": "gts.x.core.tasks.task.v1~",
+    "id": "task456-uuid"
+  },
+  "context": {
+    "require_constraints": true,
+    "capabilities": [],
+    "supported_properties": ["owner_tenant_id", "id", "owner_id"]
+  }
+}
+```
+
+**PDP → PEP Response:**
+```json
+{
+  "decision": true,
+  "context": {
+    "constraints": [
+      {
+        "predicates": [
+          {
+            "type": "eq",
+            "resource_property": "owner_tenant_id",
+            "value": "T1-uuid"
+          },
+          {
+            "type": "eq",
+            "resource_property": "owner_id",
+            "value": "user123-uuid"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**SQL:**
+```sql
+SELECT * FROM tasks
+WHERE id = 'task456-uuid'
+  AND owner_tenant_id = 'T1-uuid'
+  AND owner_id = 'user123-uuid'
+```
+
+**Result interpretation:**
+- 1 row → return task
+- 0 rows → **404 Not Found** (task doesn't exist, wrong tenant, or user doesn't own it)
+
+---
+
+#### S26: UPDATE, owner-only mutation
+
+`PUT /tasks/{id}`
+
+User updates a task; PDP constrains the mutation to resources owned by the subject. The `owner_id` constraint in the WHERE clause provides TOCTOU protection — if ownership changed between check and execution, the update atomically fails.
+
+**Use case:** User can only edit their own tasks.
+
+**Request:**
+```http
+PUT /tasks/task456-uuid
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"status": "done"}
+```
+
+**PEP → PDP Request:**
+```json
+{
+  "subject": {
+    "type": "gts.x.core.security.subject_user.v1~",
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
+  },
+  "action": { "name": "update" },
+  "resource": {
+    "type": "gts.x.core.tasks.task.v1~",
+    "id": "task456-uuid"
+  },
+  "context": {
+    "require_constraints": true,
+    "capabilities": [],
+    "supported_properties": ["owner_tenant_id", "id", "owner_id"]
+  }
+}
+```
+
+**PDP → PEP Response:**
+```json
+{
+  "decision": true,
+  "context": {
+    "constraints": [
+      {
+        "predicates": [
+          {
+            "type": "eq",
+            "resource_property": "owner_tenant_id",
+            "value": "T1-uuid"
+          },
+          {
+            "type": "eq",
+            "resource_property": "owner_id",
+            "value": "user123-uuid"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**SQL:**
+```sql
+UPDATE tasks
+SET status = 'done'
+WHERE id = 'task456-uuid'
+  AND owner_tenant_id = 'T1-uuid'
+  AND owner_id = 'user123-uuid'
+```
+
+**Result interpretation:**
+- 1 row affected → success
+- 0 rows affected → **404 Not Found** (task doesn't exist, wrong tenant, or user doesn't own it)
+
+---
+
+#### S27: DELETE, owner-only mutation
+
+`DELETE /tasks/{id}`
+
+DELETE follows the same pattern as UPDATE (S26). PDP returns `eq(owner_id)` + `eq(owner_tenant_id)` constraints, PEP applies them in the DELETE's WHERE clause.
+
+**SQL:**
+```sql
+DELETE FROM tasks
+WHERE id = 'task456-uuid'
+  AND owner_tenant_id = 'T1-uuid'
+  AND owner_id = 'user123-uuid'
+```
+
+**Result interpretation:**
+- 1 row affected → success
+- 0 rows affected → **404 Not Found** (task doesn't exist, wrong tenant, or user doesn't own it)
+
+TOCTOU protection is identical to S26: if `owner_id` or `owner_tenant_id` changed between check and DELETE, the WHERE clause won't match → 0 rows → **404**.
+
+---
+
+#### S28: CREATE, owner-only
+
+`POST /tasks`
+
+User creates a new task. PEP sets `owner_id` from `SecurityContext.subject_id` — the subject owns the resource they create. PDP validates both `owner_tenant_id` and `owner_id` via constraints, preventing the caller from creating resources assigned to a different user.
+
+**Use case:** User creates a task assigned to themselves.
+
+**Request:**
+```http
+POST /tasks
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"title": "New Task"}
+```
+
+**PEP resolves owner from SecurityContext:**
+
+PEP reads `subject_id` (user123-uuid) and `subject_tenant_id` (T1-uuid) from `SecurityContext`. These become `owner_id` and `owner_tenant_id` for the new resource — same pattern as S06 for tenant context.
+
+**PEP → PDP Request:**
+```json
+{
+  "subject": {
+    "type": "gts.x.core.security.subject_user.v1~",
+    "id": "user123-uuid",
+    "properties": { "tenant_id": "T1-uuid" }
+  },
+  "action": { "name": "create" },
+  "resource": {
+    "type": "gts.x.core.tasks.task.v1~",
+    "properties": {
+      "owner_tenant_id": "T1-uuid",
+      "owner_id": "user123-uuid"
+    }
+  },
+  "context": {
+    "require_constraints": true,
+    "capabilities": [],
+    "supported_properties": ["owner_tenant_id", "id", "owner_id"]
+  }
+}
+```
+
+**PDP → PEP Response:**
+```json
+{
+  "decision": true,
+  "context": {
+    "constraints": [
+      {
+        "predicates": [
+          {
+            "type": "eq",
+            "resource_property": "owner_tenant_id",
+            "value": "T1-uuid"
+          },
+          {
+            "type": "eq",
+            "resource_property": "owner_id",
+            "value": "user123-uuid"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**PEP compiles constraints**, then validates the INSERT against them:
+
+**SQL:**
+```sql
+INSERT INTO tasks (id, owner_tenant_id, owner_id, title, status)
+VALUES ('tasknew-uuid', 'T1-uuid', 'user123-uuid', 'New Task', 'pending')
+```
+
+**Note:** PDP returns constraints for CREATE using the same flow as other operations. PEP validates that the INSERT's `owner_tenant_id` and `owner_id` match the constraints. This prevents the caller from creating resources in unauthorized tenants or assigned to other users.
 
 ---
 
@@ -1825,13 +2169,23 @@ TOCTOU is a security concern only for **mutations** (UPDATE, DELETE). For **read
 | S18 | GET | ❌ | `eq` (tenant) | N/A (read-only) |
 | S19 | LIST | membership only | `in_group` (expanded) | ✅ Atomic SQL check |
 
+**Subject owner-based scenarios:**
+
+| Scenario | Operation | Constraint | TOCTOU Protection |
+|----------|-----------|------------|-------------------|
+| S24 | LIST | `eq` (owner) | N/A (read-only) |
+| S25 | GET | `eq` (owner) | N/A (read-only) |
+| S26 | UPDATE | `eq` (owner) | ✅ Atomic SQL check |
+| S27 | DELETE | `eq` (owner) | ✅ Atomic SQL check |
+| S28 | CREATE | `eq` (owner) | N/A (no existing resource) |
+
 ### Key Insight: Prefetch + Constraint for Mutations
 
 Without closure tables, mutations (UPDATE/DELETE) use a two-step pattern:
 
-1. **Prefetch:** PEP reads `owner_tenant_id = 'T2'` from database
-2. **PDP check:** PDP validates T2 is accessible, returns `eq: owner_tenant_id = 'T2'`
-3. **SQL execution:** `UPDATE tasks SET ... WHERE id = 'X' AND owner_tenant_id = 'T2'`
+1. **Prefetch:** PEP reads `owner_tenant_id = 'T2-uuid'` from database
+2. **PDP check:** PDP validates T2 is accessible, returns `eq: owner_tenant_id = 'T2-uuid'`
+3. **SQL execution:** `UPDATE tasks SET ... WHERE id = 'X' AND owner_tenant_id = 'T2-uuid'`
 4. **If tenant changed:** WHERE clause won't match → 0 rows affected → 404
 
 The constraint acts as a [compare-and-swap](https://en.wikipedia.org/wiki/Compare-and-swap) mechanism — if the value changed between check and use, the operation atomically fails.

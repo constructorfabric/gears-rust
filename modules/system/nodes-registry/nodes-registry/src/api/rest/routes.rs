@@ -7,6 +7,8 @@ use super::dto::{NodeDto, NodeSysCapDto, NodeSysInfoDto};
 use super::handlers;
 use crate::domain::service::Service;
 
+const API_TAG: &str = "Nodes Registry";
+
 /// Register all REST routes for the nodes registry module
 pub fn register_routes(
     mut router: Router,
@@ -18,7 +20,7 @@ pub fn register_routes(
         .operation_id("nodes_registry.list_nodes")
         .summary("List all nodes")
         .description("Get a list of all nodes in the deployment. Use ?details=true to include sysinfo and syscap. Use ?force_refresh=true to invalidate syscap cache.")
-        .tag("nodes")
+        .tag(API_TAG)
         .public()
         .query_param("details", false, "Include detailed system information and capabilities")
         .query_param("force_refresh", false, "Force refresh syscap, ignoring cache (only applies when details=true)")
@@ -32,7 +34,7 @@ pub fn register_routes(
         .operation_id("nodes_registry.get_node")
         .summary("Get node by ID")
         .description("Get detailed information about a specific node. Use ?details=true to include sysinfo and syscap. Use ?force_refresh=true to invalidate syscap cache.")
-        .tag("nodes")
+        .tag(API_TAG)
         .public()
         .path_param("id", "Node UUID")
         .query_param("details", false, "Include detailed system information and capabilities")
@@ -48,7 +50,7 @@ pub fn register_routes(
         .operation_id("nodes_registry.get_node_sysinfo")
         .summary("Get node system information")
         .description("Get detailed system information (OS, CPU, memory, etc.) for a specific node")
-        .tag("nodes")
+        .tag(API_TAG)
         .public()
         .path_param("id", "Node UUID")
         .handler(handlers::get_node_sysinfo)
@@ -66,7 +68,7 @@ pub fn register_routes(
         .operation_id("nodes_registry.get_node_syscap")
         .summary("Get node system capabilities")
         .description("Get system capabilities (hardware, software features) for a specific node. Use ?force_refresh=true to invalidate cache and refresh all capabilities.")
-        .tag("nodes")
+        .tag(API_TAG)
         .public()
         .path_param("id", "Node UUID")
         .query_param("force_refresh", false, "Force refresh all syscap, ignoring cache and TTL")

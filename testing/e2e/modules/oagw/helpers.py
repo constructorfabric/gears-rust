@@ -1,6 +1,7 @@
 """Shared helpers for OAGW E2E tests."""
 import re
 import uuid
+from typing import Optional
 
 import httpx
 
@@ -29,9 +30,10 @@ BEARER_AUTH_PLUGIN_ID = "gts.x.core.oagw.auth_plugin.v1~x.core.oagw.bearer.v1"
 OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID = "gts.x.core.oagw.auth_plugin.v1~x.core.oagw.oauth2_client_cred.v1"
 OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID = "gts.x.core.oagw.auth_plugin.v1~x.core.oagw.oauth2_client_cred_basic.v1"
 
-# Guard plugin instances (2)
+# Guard plugin instances (3)
 TIMEOUT_GUARD_PLUGIN_ID = "gts.x.core.oagw.guard_plugin.v1~x.core.oagw.timeout.v1"
 CORS_GUARD_PLUGIN_ID = "gts.x.core.oagw.guard_plugin.v1~x.core.oagw.cors.v1"
+REQUIRED_HEADERS_GUARD_PLUGIN_ID = "gts.x.core.oagw.guard_plugin.v1~x.core.oagw.required_headers.v1"
 
 # Transform plugin instances (3)
 LOGGING_TRANSFORM_PLUGIN_ID = "gts.x.core.oagw.transform_plugin.v1~x.core.oagw.logging.v1"
@@ -50,7 +52,7 @@ OAGW_INSTANCES = [
     NOOP_AUTH_PLUGIN_ID, APIKEY_AUTH_PLUGIN_ID, BASIC_AUTH_PLUGIN_ID,
     BEARER_AUTH_PLUGIN_ID, OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
     OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
-    TIMEOUT_GUARD_PLUGIN_ID, CORS_GUARD_PLUGIN_ID,
+    TIMEOUT_GUARD_PLUGIN_ID, CORS_GUARD_PLUGIN_ID, REQUIRED_HEADERS_GUARD_PLUGIN_ID,
     LOGGING_TRANSFORM_PLUGIN_ID, METRICS_TRANSFORM_PLUGIN_ID,
     REQUEST_ID_TRANSFORM_PLUGIN_ID,
 ]
@@ -126,10 +128,15 @@ async def create_upstream(
     base_url: str,
     headers: dict,
     mock_url: str,
-    alias: str | None = None,
+    alias: Optional[str] = None,
+    upstream_headers: Optional[dict] = None,
     **kwargs,
 ) -> dict:
     """Create an upstream via the Management API and return the response JSON.
+
+    ``upstream_headers`` maps to the upstream resource ``headers`` field
+    (e.g., ``{"request": {"passthrough": "all"}}``).  It is accepted as a
+    separate parameter to avoid colliding with the HTTP ``headers`` argument.
 
     ``kwargs`` are merged into the request body (e.g., ``enabled=False``,
     ``auth={...}``, ``rate_limit={...}``).
@@ -151,6 +158,8 @@ async def create_upstream(
     }
     if alias is not None:
         body["alias"] = alias
+    if upstream_headers is not None:
+        body["headers"] = upstream_headers
 
     body.update(kwargs)
 

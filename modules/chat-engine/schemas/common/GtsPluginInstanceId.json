@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.entities.plugin_instance_id.v1",
+  "title": "GTS Plugin Instance ID",
+  "description": "CyberFabric ModKit plugin instance GTS ID identifying a registered ChatEngineBackendPlugin implementation",
+  "type": "string",
+  "pattern": "^gts\\.x\\.core\\.modkit\\.plugin\\.v[0-9]+~[a-z0-9._-]+~[a-z0-9._-]+$",
+  "examples": [
+    "gts.x.core.modkit.plugin.v1~x.chat_engine.backend.plugin.v1~x.ai.llm_plugin.v1",
+    "gts.x.core.modkit.plugin.v1~x.chat_engine.backend.plugin.v1~contoso.support.webhook_adapter.v1"
+  ]
+}

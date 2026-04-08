@@ -6,13 +6,15 @@ use super::super::dto;
 use super::super::handlers;
 use super::License;
 
+const API_TAG: &str = "OAGW Upstreams";
+
 pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     // POST /oagw/v1/upstreams — Create upstream
     router = OperationBuilder::post("/oagw/v1/upstreams")
         .operation_id("oagw.create_upstream")
         .summary("Create upstream")
         .description("Create a new upstream service configuration")
-        .tag("upstreams")
+        .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
         .json_request::<dto::CreateUpstreamRequest>(openapi, "Upstream configuration")
@@ -30,7 +32,7 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("oagw.list_upstreams")
         .summary("List upstreams")
         .description("Retrieve a paginated list of upstream services")
-        .tag("upstreams")
+        .tag(API_TAG)
         .query_param_typed(
             "limit",
             false,
@@ -54,7 +56,7 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("oagw.get_upstream")
         .summary("Get upstream by ID")
         .description("Retrieve a specific upstream by its GTS identifier")
-        .tag("upstreams")
+        .tag(API_TAG)
         .path_param("id", "Upstream GTS identifier")
         .authenticated()
         .require_license_features::<License>([])
@@ -72,7 +74,7 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("oagw.update_upstream")
         .summary("Update upstream")
         .description("Partially update an existing upstream service configuration")
-        .tag("upstreams")
+        .tag(API_TAG)
         .path_param("id", "Upstream GTS identifier")
         .authenticated()
         .require_license_features::<License>([])
@@ -91,7 +93,7 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("oagw.delete_upstream")
         .summary("Delete upstream")
         .description("Delete an upstream and cascade-delete its routes")
-        .tag("upstreams")
+        .tag(API_TAG)
         .path_param("id", "Upstream GTS identifier")
         .authenticated()
         .require_license_features::<License>([])

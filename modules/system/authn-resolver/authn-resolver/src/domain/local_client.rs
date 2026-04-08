@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError, AuthenticationResult};
+use authn_resolver_sdk::{
+    AuthNResolverClient, AuthNResolverError, AuthenticationResult, ClientCredentialsRequest,
+};
 use modkit_macros::domain_model;
 
 use super::{DomainError, Service};
@@ -38,5 +40,15 @@ impl AuthNResolverClient for AuthNResolverLocalClient {
             .authenticate(bearer_token)
             .await
             .map_err(|e| log_and_convert("authenticate", e))
+    }
+
+    async fn exchange_client_credentials(
+        &self,
+        request: &ClientCredentialsRequest,
+    ) -> Result<AuthenticationResult, AuthNResolverError> {
+        self.svc
+            .exchange_client_credentials(request)
+            .await
+            .map_err(|e| log_and_convert("exchange_client_credentials", e))
     }
 }

@@ -32,7 +32,7 @@ dylint_testing.workspace = true
 gts-macros.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-schemars = "0.8"
+schemars.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true

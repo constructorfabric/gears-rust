@@ -18,9 +18,7 @@ name = "modkit_odata"
 workspace = true
 
 [features]
-with-odata-params = ["dep:odata-params"]
 with-utoipa = ["dep:utoipa"]
-chrono = []
 
 [dependencies]
 modkit-errors = { workspace = true }
@@ -28,7 +26,8 @@ modkit-errors-macro = { workspace = true }
 bigdecimal = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
-odata-params = { workspace = true, optional = true }
+peg = { workspace = true }
+chrono-tz = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }

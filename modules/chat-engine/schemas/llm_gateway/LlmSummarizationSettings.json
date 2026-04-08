@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.llm_gateway.summarization_settings.v1",
+  "title": "LlmSummarizationSettings",
+  "description": "Configuration for automatic context overflow summarization in the LLM gateway plugin. When the plugin returns a context_overflow error, Chat Engine summarizes older messages and retries with a compact context.",
+  "type": "object",
+  "properties": {
+    "recent_messages_to_keep": {
+      "type": "integer",
+      "minimum": 2,
+      "default": 10,
+      "description": "Number of most recent messages to keep unsummarized when context overflow occurs. The remaining older messages are sent to the plugin for summarization via on_session_summary."
+    }
+  },
+  "required": ["recent_messages_to_keep"],
+  "additionalProperties": false
+}

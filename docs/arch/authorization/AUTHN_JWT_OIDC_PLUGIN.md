@@ -610,7 +610,7 @@ The claim mapping is configured via [jwt.claim_mapping](#jwtclaim_mapping) and [
 |-----------------------|---------------------|------------------|-------|
 | `subject_id` | `sub` | `claim_mapping.subject_id` | Required, unique subject identifier |
 | `subject_type` | (vendor-defined) | `claim_mapping.subject_type` | Optional, GTS type ID (e.g., `gts.x.core.security.subject_user.v1~`) |
-| `subject_tenant_id` | (vendor-defined) | `claim_mapping.subject_tenant_id` | Optional, Subject Owner Tenant |
+| `subject_tenant_id` | (vendor-defined) | `claim_mapping.subject_tenant_id` | Optional, Subject Tenant |
 | `token_scopes` | `scope` (space-separated) | `claim_mapping.token_scopes` | Array of scopes, split on spaces |
 | `bearer_token` | Original from `Authorization` header | N/A | Optional, for PDP forwarding |
 
@@ -704,9 +704,89 @@ For systems with strict security requirements (PCI-DSS, HIPAA, SOC2), set `ttl: 
 
 ---
 
+## S2S Authentication (Client Credentials)
+
+The JWT/OIDC plugin implements `exchange_client_credentials()` for service-to-service authentication using the [OAuth 2.0 Client Credentials Grant (RFC 6749 §4.4)](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4).
+
+See [DESIGN.md — S2S Authentication](./DESIGN.md#s2s-authentication-service-to-service) for the overall S2S design and contract.
+
+### Flow
+
+```mermaid
+sequenceDiagram
+    participant Module as Calling Module
+    participant Plugin as JWT/OIDC Plugin
+    participant IdP as Vendor's IdP
+
+    Module->>Plugin: exchange_client_credentials(client_id, client_secret, scopes)
+    Plugin->>IdP: POST {token_endpoint}<br/>grant_type=client_credentials<br/>&client_id=...&client_secret=...&scope=...
+    IdP-->>Plugin: { access_token, token_type, expires_in, scope }
+    Plugin->>Plugin: Map token claims → SecurityContext
+    Plugin-->>Module: AuthenticationResult
+```
+
+### Token Endpoint Configuration
+
+The plugin uses the token endpoint from OIDC Discovery or explicit configuration:
+
+```yaml
+auth:
+  s2s:
+    # Token endpoint for client_credentials grant (required for S2S).
+    # Can be configured explicitly or resolved via OIDC Discovery from s2s.issuer.
+    token_endpoint: "https://idp.corp.example.com/oauth2/token"
+
+    # Alternatively, reference a trusted issuer for OIDC Discovery.
+    # The plugin discovers token_endpoint from {discovery_url}/.well-known/openid-configuration.
+    # Exactly one of token_endpoint or issuer must be configured.
+    # issuer: "my-corp-idp"  # must match a key in jwt.trusted_issuers
+
+    # Claim mapping for the issued token (if different from jwt.claim_mapping).
+    # Falls back to jwt.claim_mapping if not specified.
+    claim_mapping:
+      subject_id: "sub"
+      subject_type: "sub_type"
+      subject_tenant_id: "tenant_id"
+      token_scopes: "scope"
+```
+
+**Endpoint resolution:**
+- If `s2s.token_endpoint` is configured → use it directly
+- If `s2s.issuer` is configured → look up the issuer in `jwt.trusted_issuers`, discover `token_endpoint` from its OIDC configuration
+- If neither is configured → `exchange_client_credentials()` returns `TokenAcquisitionFailed`
+
+### SecurityContext Construction
+
+After obtaining the access token from the IdP:
+
+1. **If token is JWT** — extract claims directly (same as bearer token authentication)
+2. **If token is opaque** — introspect using the same introspection configuration
+3. **Map claims** to `SecurityContext` using `s2s.claim_mapping` (or `jwt.claim_mapping` fallback)
+4. **Set `bearer_token`** — the obtained access token, for PDP forwarding
+5. **Set `subject_type`** — from token claims via claim mapping (e.g., IdP may set `sub_type: "service"` for client_credentials grants)
+
+### Token Caching
+
+The plugin internally reuses `modkit-auth::oauth2::Token` handles with automatic refresh:
+
+- Repeated `exchange_client_credentials()` calls with the same `client_id` reuse the cached token
+- Token is automatically refreshed when it expires (using `expires_in` from the IdP response)
+- No cache configuration needed at the plugin level — caching is transparent to callers
+
+### Error Handling
+
+| Error | When |
+|-------|------|
+| `TokenAcquisitionFailed` | IdP returns error (invalid credentials, unauthorized client, network failure) |
+| `TokenAcquisitionFailed` | Token endpoint not configured and cannot be discovered |
+| `Internal` | Unexpected errors (response parsing failure, claim mapping errors) |
+
+---
+
 ## References
 
 - [DESIGN.md](./DESIGN.md) — Main authentication and authorization design
+- [RFC 6749: OAuth 2.0 Authorization Framework](https://datatracker.ietf.org/doc/html/rfc6749) (§4.4 Client Credentials Grant)
 - [RFC 7519: JSON Web Token (JWT)](https://datatracker.ietf.org/doc/html/rfc7519)
 - [RFC 7662: OAuth 2.0 Token Introspection](https://datatracker.ietf.org/doc/html/rfc7662)
 - [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html)

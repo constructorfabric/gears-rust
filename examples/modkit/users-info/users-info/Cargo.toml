@@ -49,15 +49,9 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 
-# Database - SeaORM
-sea-orm = { workspace = true, features = [
-    "sqlx-sqlite",
-    "runtime-tokio-rustls",
-    "macros",
-    "with-time",
-    "with-uuid",
-] }
-sea-orm-migration = { workspace = true, features = ["sqlx-sqlite"] }
+# Database - SeaORM (driver features come from modkit-db)
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -73,6 +67,7 @@ modkit-errors-macro = { workspace = true }
 modkit-odata = { workspace = true, features = ["with-utoipa"] }
 modkit-sdk = { workspace = true }
 modkit-macros = { workspace = true }
+opentelemetry = { workspace = true }
 
 [dev-dependencies]
 tokio-util = { workspace = true }
@@ -85,5 +80,4 @@ testcontainers-modules = { workspace = true, features = ["postgres"] }
 tracing-test = { workspace = true }
 httpmock = { workspace = true }
 tokio-test = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

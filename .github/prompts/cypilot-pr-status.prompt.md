@@ -4,4 +4,4 @@ description: "Generate status reports for GitHub PRs with severity assessment an
 ---
 
 
-ALWAYS open and follow `../../.cypilot/workflows/pr-status.md`
+ALWAYS open and follow `{cypilot_path}/config/kits/sdlc/workflows/pr-status.md`

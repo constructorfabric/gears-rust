@@ -1,7 +1,4 @@
----
-description: Review PRs using LLM-powered analysis
----
-
 # /cypilot-pr-review
 
-ALWAYS open and follow `../../.cypilot/workflows/pr-review.md`
+
+ALWAYS open and follow `{cypilot_path}/config/kits/sdlc/workflows/pr-review.md`

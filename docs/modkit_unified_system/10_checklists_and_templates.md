@@ -120,11 +120,11 @@ pub async fn find_by_id(
 ### Checklist
 
 - [ ] Use `OperationBuilder` for every route
-- [ ] Add `.require_auth()` for protected endpoints
+- [ ] Add `.authenticated()` + `.require_license_features::<License>([])` for protected endpoints
 - [ ] Add `.standard_errors(openapi)` or specific errors
 - [ ] Use `.json_response_with_schema()` for typed responses
 - [ ] Use `Extension<Arc<Service>>` and attach once after all routes
-- [ ] Use `Authz(ctx): Authz` to get `SecurityContext`
+- [ ] Use `Extension(ctx): Extension<SecurityContext>` to get `SecurityContext`
 - [ ] Use `ApiResult<T>` and `?` for error propagation
 - [ ] For OData: add `.with_odata_*()` helpers and use `OData(query)` extractor
 
@@ -133,7 +133,8 @@ pub async fn find_by_id(
 ```rust
 OperationBuilder::get("/users-info/v1/users")
     .operation_id("users_info.list_users")
-    .require_auth(&Resource::Users, &Action::Read)
+    .authenticated()
+    .require_license_features::<License>([])
     .handler(handlers::list_users)
     .json_response_with_schema::<modkit_odata::Page<dto::UserDto>>(
         openapi,
@@ -151,7 +152,7 @@ OperationBuilder::get("/users-info/v1/users")
 
 ```rust
 pub async fn list_users(
-    Authz(ctx): Authz,
+    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<Service>>,
     OData(query): OData,
 ) -> ApiResult<JsonPage<serde_json::Value>> {
@@ -328,18 +329,131 @@ async fn main() -> anyhow::Result<()> {
 
 ## Testing Templates
 
-### Test setup template
+### Testing with SecurityContext
+
+All service and repository tests need a `SecurityContext`. Use explicit tenant IDs for test contexts:
+
+```rust
+use modkit_security::SecurityContext;
+use uuid::Uuid;
+
+#[tokio::test]
+async fn test_service_method() {
+    let tenant_id = Uuid::new_v4();
+    let subject_id = Uuid::new_v4();
+    let test_user_id = Uuid::new_v4();
+    let ctx = SecurityContext::builder()
+        .tenant_id(tenant_id)
+        .subject_id(subject_id)
+        .build();
+    let service = create_test_service().await;
+
+    let result = service.get_user(&ctx, test_user_id).await;
+    assert!(result.is_ok());
+}
+```
+
+For multi-tenant tests, create separate contexts per tenant and verify isolation:
 
 ```rust
 #[tokio::test]
-async fn test_service() {
-    let db = setup_test_db().await;
-    let ctx = SecurityContext::test_tenant(Uuid::new_v4());
-    let service = Service::new(db);
-    
-    // Test operations
-    let result = service.do_something(&ctx, input).await.unwrap();
-    assert_eq!(result.expected, "value");
+async fn test_tenant_isolation() {
+    let tenant_a = SecurityContext::builder()
+        .tenant_id(Uuid::new_v4())
+        .subject_id(Uuid::new_v4())
+        .build();
+    let tenant_b = SecurityContext::builder()
+        .tenant_id(Uuid::new_v4())
+        .subject_id(Uuid::new_v4())
+        .build();
+
+    let service = create_test_service().await;
+
+    // Tenant A cannot see Tenant B's data
+    let result = service.list_users(&tenant_a, Default::default()).await;
+    assert!(result.is_ok());
+}
+```
+
+### Integration Test Template (Router::oneshot)
+
+Create `tests/integration_tests.rs`:
+
+```rust
+use axum::{body::Body, http::{Request, StatusCode}, Router};
+use modkit::api::OpenApiRegistry;
+use std::sync::Arc;
+use tower::ServiceExt;
+use api_gateway::ApiGateway;
+
+async fn create_test_router() -> Router {
+    let service = create_test_service().await;
+    let router = Router::new();
+    let openapi = ApiGateway::default();
+    your_module::api::rest::routes::register_routes(router, &openapi, service).unwrap()
+}
+
+#[tokio::test]
+async fn test_get_endpoint() {
+    let router = create_test_router().await;
+
+    let request = Request::builder()
+        .uri("/your-module/v1/resources/00000000-0000-0000-0000-000000000001")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_post_endpoint() {
+    let router = create_test_router().await;
+
+    let body = serde_json::json!({
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "email": "test@example.com",
+        "display_name": "Test User"
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/your-module/v1/resources")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+```
+
+### SSE Test Template
+
+```rust
+use futures::StreamExt;
+use modkit::SseBroadcaster;
+use tokio::time::{timeout, Duration};
+
+#[tokio::test]
+async fn test_sse_broadcaster() {
+    let broadcaster = SseBroadcaster::<UserEvent>::new(10);
+    let mut stream = Box::pin(broadcaster.subscribe_stream());
+
+    let event = UserEvent {
+        kind: "created".to_string(),
+        id: Uuid::new_v4(),
+        at: time::OffsetDateTime::now_utc(),
+    };
+
+    broadcaster.send(event.clone());
+
+    let received = timeout(Duration::from_millis(100), stream.next())
+        .await
+        .expect("timeout")
+        .expect("event received");
+
+    assert_eq!(received.kind, "created");
 }
 ```
 
@@ -349,8 +463,11 @@ async fn test_service() {
 #[tokio::test]
 async fn test_error_handling() {
     let service = setup_test_service().await;
-    let ctx = SecurityContext::test_tenant(Uuid::new_v4());
-    
+    let ctx = SecurityContext::builder()
+        .tenant_id(Uuid::new_v4())
+        .subject_id(Uuid::new_v4())
+        .build();
+
     let result = service.get_nonexistent(&ctx, Uuid::new_v4()).await;
     assert!(matches!(result, Err(DomainError::UserNotFound { .. })));
 }
@@ -363,7 +480,7 @@ async fn test_error_handling() {
 async fn test_odata_filter() {
     let query = ODataQuery::from_str("?$filter=email eq 'test@example.com'").unwrap();
     assert!(query.filter().is_some());
-    
+
     let filter = query.filter().unwrap();
     let condition = filter.to_sea_condition::<user::Entity>();
     // Verify condition

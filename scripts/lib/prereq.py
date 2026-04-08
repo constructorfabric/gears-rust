@@ -474,6 +474,29 @@ class PrereqPytest(Prereq):
             return PRECHECK_ERROR
 
 
+class PrereqProtoc(Prereq):
+    def __init__(self):
+        super().__init__(
+            name="protoc (Protocol Buffers compiler) is installed",
+            remediation=(
+                "Install protoc (protobuf compiler). "
+                "macOS: 'brew install protobuf'; "
+                "Debian/Ubuntu: 'apt-get install protobuf-compiler'"
+            ),
+        )
+
+    def check(self) -> str:
+        try:
+            subprocess.check_output(
+                ["protoc", "--version"], stderr=subprocess.DEVNULL
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logging.error("'protoc' command not found or not working")
+            logging.error(f"Possible remediation: {self.remediation}")
+            return PRECHECK_ERROR
+        return PRECHECK_OK
+
+
 class PrereqCargoLlvmCov(Prereq):
     def __init__(self):
         super().__init__(
@@ -508,15 +531,20 @@ class PrereqCargoLlvmCov(Prereq):
 # Core prerequisites needed for basic testing
 CORE_PREREQS = [
     PrereqCargo,
+    PrereqProtoc,
     PrereqPython,
     PrereqPytest,
     PrereqCargoLlvmCov,
 ]
 
-# E2E testing prerequisites
+# E2E local testing prerequisites (no Docker required)
 E2E_LOCAL_PREREQS = [
-    PrereqDocker,
     PrereqHSSrvMock,
+] + CORE_PREREQS
+
+# E2E docker testing prerequisites
+E2E_DOCKER_PREREQS = [
+    PrereqDocker,
 ] + CORE_PREREQS
 
 # Full testing prerequisites
@@ -592,7 +620,8 @@ def check_environment_ready(env_type="full"):
     prerequisites for the given command.
 
     Args:
-        env_type: Type of environment to check ('core', 'e2e', 'full')
+        env_type: Type of environment to check
+            ('core', 'e2e-local', 'e2e-docker', 'full')
 
     Returns:
         bool: True if environment is ready, False otherwise
@@ -601,6 +630,8 @@ def check_environment_ready(env_type="full"):
         prereq_list = CORE_PREREQS
     elif env_type == "e2e-local":
         prereq_list = E2E_LOCAL_PREREQS
+    elif env_type == "e2e-docker":
+        prereq_list = E2E_DOCKER_PREREQS
     else:
         prereq_list = ALL_PREREQS
 

@@ -1,10 +1,35 @@
+// Updated: 2026-03-16 by Constructor Tech
 //! Domain models for the tenant resolver module.
+
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Unique identifier for a tenant.
-pub type TenantId = Uuid;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TenantId(pub Uuid);
+
+impl TenantId {
+    /// Returns the nil UUID wrapped as a `TenantId`.
+    #[must_use]
+    pub fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    /// Returns `true` if the inner UUID is the nil UUID.
+    #[must_use]
+    pub fn is_nil(&self) -> bool {
+        self.0.is_nil()
+    }
+}
+
+impl fmt::Display for TenantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
 
 /// Information about a tenant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

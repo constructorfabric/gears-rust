@@ -41,7 +41,7 @@
 //! const NAME: FieldRef<UserSchema, String> = FieldRef::new(UserField::Name);
 //!
 //! // Build a query
-//! let user_id = uuid::Uuid::new_v4();
+//! let user_id = uuid::Uuid::nil();
 //! let query = QueryBuilder::<UserSchema>::new()
 //!     .filter(ID.eq(user_id).and(NAME.contains("john")))
 //!     .order_by(NAME, SortDir::Asc)
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn test_simple_eq_filter() {
-        let user_id = uuid::Uuid::new_v4();
+        let user_id = uuid::Uuid::nil();
         let query = QueryBuilder::<UserSchema>::new()
             .filter(ID.eq(user_id))
             .build();
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_and_combinator() {
-        let user_id = uuid::Uuid::new_v4();
+        let user_id = uuid::Uuid::nil();
         let query = QueryBuilder::<UserSchema>::new()
             .filter(ID.eq(user_id).and(AGE.gt(18)))
             .build();
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_complex_filter() {
-        let user_id = uuid::Uuid::new_v4();
+        let user_id = uuid::Uuid::nil();
         let query = QueryBuilder::<UserSchema>::new()
             .filter(
                 ID.eq(user_id)
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_full_query_build() {
-        let user_id = uuid::Uuid::new_v4();
+        let user_id = uuid::Uuid::nil();
         let query = QueryBuilder::<UserSchema>::new()
             .filter(ID.eq(user_id).and(AGE.gt(18)))
             .order_by(NAME, SortDir::Asc)
@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn test_filter_hash_stability() {
-        let user_id = uuid::Uuid::new_v4();
+        let user_id = uuid::Uuid::nil();
 
         let query1 = QueryBuilder::<UserSchema>::new()
             .filter(ID.eq(user_id))
@@ -576,7 +576,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "chrono")]
     #[test]
     fn test_chrono_datetime_conversion() {
         use chrono::Utc;
@@ -592,7 +591,6 @@ mod tests {
         assert!(query.has_filter());
     }
 
-    #[cfg(feature = "chrono")]
     #[test]
     fn test_chrono_naive_date_conversion() {
         use chrono::NaiveDate;
@@ -607,7 +605,6 @@ mod tests {
         assert!(query.has_filter());
     }
 
-    #[cfg(feature = "chrono")]
     #[test]
     fn test_chrono_naive_time_conversion() {
         use chrono::NaiveTime;

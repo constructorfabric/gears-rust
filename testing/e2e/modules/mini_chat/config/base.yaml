@@ -1,0 +1,503 @@
+# Mini-Chat development configuration
+#
+# Minimal config for developing/testing the mini-chat module.
+# Based on quickstart.yaml but stripped to essentials.
+#
+# Usage:
+#   cargo run --bin hyperspot-server --features mini-chat -- --config config/mini-chat.yaml run
+
+server:
+  home_dir: "~/.hyperspot"
+
+database:
+  servers:
+    sqlite_users:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/hyperspot.log"
+    file_level: info
+  sqlx:
+    console_level: debug
+    file: "logs/sql.log"
+    file_level: debug
+  api-gateway:
+    console_level: debug
+    file: "logs/api.log"
+    file_level: debug
+
+modules:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      prefix_path: "/cf"
+      enable_docs: true
+      cors_enabled: false
+      openapi:
+        title: "Mini-Chat Dev API"
+        version: "0.1.0"
+        description: "Mini-Chat development server"
+      defaults:
+        body_limit_bytes: 64000000
+        rate_limit:
+          rps: 1000
+          burst: 200
+          in_flight: 64
+      auth_disabled: true
+
+  module-orchestrator:
+    config: {}
+
+  grpc-hub:
+    config:
+      listen_addr: "uds:///tmp/hyperspot-grpc"
+
+  authn-resolver:
+    config:
+      vendor: "hyperspot"
+
+  authz-resolver:
+    config:
+      vendor: "hyperspot"
+
+  static-authn-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+      mode: accept_all
+      s2s_credentials:
+        - client_id: "mini-chat"
+          client_secret: "mini-chat-dev-secret"
+
+  static-authz-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+
+  tenant-resolver:
+    config:
+      vendor: "hyperspot"
+
+  single-tenant-tr-plugin:
+    config: {}
+
+  simple-user-settings:
+    database:
+      server: "sqlite_users"
+      file: "settings.db"
+    config:
+      max_field_length: 100
+
+  oagw:
+    config:
+      proxy_timeout_secs: 30
+      allow_http_upstream: false
+
+  file-parser:
+    config:
+      allowed_local_base_dir: /tmp
+
+  mini-chat:
+    database:
+      server: "sqlite_users"
+      file: "mini_chat.db"
+    config:
+      # S2S credentials for obtaining SecurityContext
+      # that will be used for communication with other modules.
+      client_credentials:
+        client_id: "mini-chat"
+        client_secret: "mini-chat-dev-secret"
+      # Provider registry. Key = provider_id (matches ModelCatalogEntry.provider_id).
+      # `upstream_alias` is optional — defaults to `host` when omitted.
+      providers:
+        openai:
+          kind: openai_responses
+          storage_kind: openai
+          host: "api.openai.com"
+          auth_plugin_type: "gts.x.core.oagw.auth_plugin.v1~x.core.oagw.apikey.v1"
+          auth_config:
+            header: "Authorization"
+            prefix: "Bearer "
+            secret_ref: "openai-key"
+
+        azure_openai:
+          kind: openai_responses
+          storage_kind: azure
+          host: "genai-openai-dev-swedencentral-main01.openai.azure.com"
+          api_path: "/openai/v1/responses"
+          api_version: "2025-03-01-preview"
+          storage_backend: "azure"
+          supports_file_search_filters: false
+          auth_plugin_type: "gts.x.core.oagw.auth_plugin.v1~x.core.oagw.apikey.v1"
+          auth_config:
+            header: "api-key"
+            prefix: ""
+            secret_ref: "azure-openai-key"
+
+  static-mini-chat-model-policy-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+      model_catalog:
+        - model_id: "gpt-5.2"
+          provider_model_id: "gpt-5.2"
+          display_name: "GPT-5.2"
+          tier: Premium
+          enabled: true
+          system_prompt: "You are a helpful assistant. IMPORTANT RULE: When the user says exactly 'PING', you MUST respond with exactly 'PONG' and nothing else."
+          input_tokens_credit_multiplier_micro: 3000000
+          output_tokens_credit_multiplier_micro: 15000000
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 128000
+          max_output_tokens: 8192
+          max_input_tokens: 120000
+          description: "Most capable model"
+          version: "2025-01"
+          icon: ""
+          provider_display_name: "OpenAI"
+          multiplier_display: "3x"
+          provider_id: "openai"
+          max_retrieved_chunks_per_turn: 10
+          max_tool_calls: 2
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 500
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 200
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 100
+          preference:
+            is_default: true
+            sort_order: 1
+          general_config:
+            type: "chat"
+            tier: "premium"
+            available_from: "2025-01-01T00:00:00Z"
+            max_file_size_mb: 50
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              function_calling: true
+              structured_output: true
+              fine_tuning: false
+              distillation: false
+              fim_completion: false
+              chat_prefix_completion: false
+            input_type:
+              text: true
+              image: true
+              audio: false
+              video: false
+            tool_support:
+              web_search: true
+              file_search: true
+              image_generation: false
+              code_interpreter: true
+              computer_use: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              realtime: false
+              assistants: false
+              batch_api: false
+              fine_tuning: false
+              embeddings: false
+              videos: false
+              image_generation: false
+              image_edit: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+              moderations: false
+              completions: false
+            token_policy:
+              input_tokens_credit_multiplier: 3.0
+              output_tokens_credit_multiplier: 15.0
+            performance:
+              response_latency_ms: 2000
+              speed_tokens_per_second: 80
+
+        - model_id: "gpt-5-mini"
+          provider_model_id: "gpt-5-mini"
+          display_name: "GPT-5 Mini"
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful assistant. IMPORTANT RULE: When the user says exactly 'PING', you MUST respond with exactly 'PONG' and nothing else."
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 3000000
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 128000
+          max_output_tokens: 4096
+          max_input_tokens: 120000
+          description: "Fast and efficient model"
+          version: "2025-01"
+          icon: ""
+          provider_display_name: "OpenAI"
+          multiplier_display: "1x"
+          provider_id: "openai"
+          max_retrieved_chunks_per_turn: 10
+          max_tool_calls: 2
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 500
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 200
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 100
+          preference:
+            is_default: false
+            sort_order: 2
+          general_config:
+            type: "chat"
+            tier: "standard"
+            available_from: "2025-01-01T00:00:00Z"
+            max_file_size_mb: 50
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              function_calling: true
+              structured_output: true
+              fine_tuning: false
+              distillation: false
+              fim_completion: false
+              chat_prefix_completion: false
+            input_type:
+              text: true
+              image: true
+              audio: false
+              video: false
+            tool_support:
+              web_search: true
+              file_search: true
+              image_generation: false
+              code_interpreter: true
+              computer_use: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              realtime: false
+              assistants: false
+              batch_api: false
+              fine_tuning: false
+              embeddings: false
+              videos: false
+              image_generation: false
+              image_edit: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+              moderations: false
+              completions: false
+            token_policy:
+              input_tokens_credit_multiplier: 1.0
+              output_tokens_credit_multiplier: 3.0
+            performance:
+              response_latency_ms: 1000
+              speed_tokens_per_second: 120
+
+        - model_id: "gpt-5-nano"
+          provider_model_id: "gpt-5-nano"
+          display_name: "GPT-5 Nano"
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful assistant. IMPORTANT RULE: When the user says exactly 'PING', you MUST respond with exactly 'PONG' and nothing else."
+          input_tokens_credit_multiplier_micro: 500000
+          output_tokens_credit_multiplier_micro: 1500000
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 64000
+          max_output_tokens: 4096
+          max_input_tokens: 56000
+          description: "Lightweight and fast model"
+          version: "2025-01"
+          icon: ""
+          provider_display_name: "OpenAI"
+          multiplier_display: "0.5x"
+          provider_id: "openai"
+          max_retrieved_chunks_per_turn: 5
+          max_tool_calls: 2
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 300
+            safety_margin_pct: 10
+            image_token_budget: 500
+            tool_surcharge_tokens: 150
+            web_search_surcharge_tokens: 300
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 100
+          preference:
+            is_default: false
+            sort_order: 3
+          general_config:
+            type: "chat"
+            tier: "standard"
+            available_from: "2025-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              function_calling: true
+              structured_output: true
+              fine_tuning: false
+              distillation: false
+              fim_completion: false
+              chat_prefix_completion: false
+            input_type:
+              text: true
+              image: true
+              audio: false
+              video: false
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              computer_use: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              realtime: false
+              assistants: false
+              batch_api: false
+              fine_tuning: false
+              embeddings: false
+              videos: false
+              image_generation: false
+              image_edit: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+              moderations: false
+              completions: false
+            token_policy:
+              input_tokens_credit_multiplier: 0.5
+              output_tokens_credit_multiplier: 1.5
+            performance:
+              response_latency_ms: 500
+              speed_tokens_per_second: 200
+
+        - model_id: "azure-gpt-4.1-mini"
+          provider_model_id: "gpt-4.1-mini"
+          display_name: "Azure GPT-4.1 Mini"
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful assistant. IMPORTANT RULE: When the user says exactly 'PING', you MUST respond with exactly 'PONG' and nothing else."
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 3000000
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 128000
+          max_output_tokens: 4096
+          max_input_tokens: 120000
+          description: "Azure-hosted GPT-4.1 Mini"
+          version: "2025-01"
+          icon: ""
+          provider_display_name: "Azure OpenAI"
+          multiplier_display: "1x"
+          provider_id: "azure_openai"
+          max_retrieved_chunks_per_turn: 10
+          max_tool_calls: 2
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 500
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 200
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 100
+          preference:
+            is_default: false
+            sort_order: 4
+          general_config:
+            type: "chat"
+            tier: "standard"
+            available_from: "2025-01-01T00:00:00Z"
+            max_file_size_mb: 50
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              function_calling: true
+              structured_output: true
+              fine_tuning: false
+              distillation: false
+              fim_completion: false
+              chat_prefix_completion: false
+            input_type:
+              text: true
+              image: true
+              audio: false
+              video: false
+            tool_support:
+              web_search: true
+              file_search: true
+              image_generation: false
+              code_interpreter: false
+              computer_use: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              realtime: false
+              assistants: false
+              batch_api: false
+              fine_tuning: false
+              embeddings: false
+              videos: false
+              image_generation: false
+              image_edit: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+              moderations: false
+              completions: false
+            token_policy:
+              input_tokens_credit_multiplier: 1.0
+              output_tokens_credit_multiplier: 3.0
+            performance:
+              response_latency_ms: 1000
+              speed_tokens_per_second: 120
+
+  static-credstore-plugin:
+    config:
+      secrets:
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          key: "openai-key"
+          value: "REPLACE_WITH_OPENAI_KEY"
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          key: "azure-openai-key"
+          value: "REPLACE_WITH_AZURE_KEY"

@@ -1,4 +1,18 @@
-﻿*.rs     text eol=lf
+# Enforce LF for all text files
+* text=auto eol=lf
+
+# Mark common binary file types as binary to avoid normalization
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.zip binary
+*.gz binary
+*.jar binary
+*.exe binary
+*.so binary
+*.dll binary
+*.rs     text eol=lf
 *.toml   text eol=lf
 *.stderr text eol=lf
 *.md     text eol=lf

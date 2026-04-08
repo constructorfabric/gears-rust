@@ -4,18 +4,32 @@ pub(crate) mod management;
 pub(crate) use client::ServiceGatewayClientV1Facade;
 pub(crate) use management::ControlPlaneServiceImpl;
 
+use async_trait::async_trait;
+use modkit_macros::domain_model;
 use modkit_security::SecurityContext;
 use oagw_sdk::Body;
 use uuid::Uuid;
 
+use std::net::SocketAddr;
+
 use crate::domain::error::DomainError;
 use crate::domain::model::{
-    CreateRouteRequest, CreateUpstreamRequest, ListQuery, Route, UpdateRouteRequest,
+    CreateRouteRequest, CreateUpstreamRequest, Endpoint, ListQuery, Route, UpdateRouteRequest,
     UpdateUpstreamRequest, Upstream,
 };
 
+/// Result of endpoint selection: the domain endpoint plus an optional
+/// pre-resolved socket address from the load balancer's DNS cache.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub(crate) struct SelectedEndpoint {
+    pub endpoint: Endpoint,
+    /// When set, `upstream_peer` can skip DNS and connect directly.
+    pub resolved_addr: Option<SocketAddr>,
+}
+
 /// Internal Control Plane service trait — configuration management and resolution.
-#[async_trait::async_trait]
+#[async_trait]
 pub(crate) trait ControlPlaneService: Send + Sync {
     // -- Upstream CRUD --
 
@@ -70,27 +84,42 @@ pub(crate) trait ControlPlaneService: Send + Sync {
 
     // -- Resolution --
 
-    async fn resolve_upstream(
+    /// Combined upstream + route resolution for the proxy hot path.
+    ///
+    /// Single `get_ancestors` call, correct multi-ID route matching across
+    /// ancestor upstreams, and full effective config merge including route
+    /// overrides.
+    async fn resolve_proxy_target(
         &self,
         ctx: &SecurityContext,
         alias: &str,
-    ) -> Result<Upstream, DomainError>;
-
-    async fn resolve_route(
-        &self,
-        ctx: &SecurityContext,
-        upstream_id: Uuid,
         method: &str,
         path: &str,
-    ) -> Result<Route, DomainError>;
+    ) -> Result<(Upstream, Route), DomainError>;
 }
 
 /// Internal Data Plane service trait — proxy orchestration and plugin execution.
-#[async_trait::async_trait]
+#[async_trait]
 pub(crate) trait DataPlaneService: Send + Sync {
     async fn proxy_request(
         &self,
         ctx: SecurityContext,
         req: http::Request<Body>,
     ) -> Result<http::Response<Body>, DomainError>;
+
+    /// Remove a rate-limit bucket by key (e.g. `"upstream:{id}"` or `"route:{id}"`).
+    fn remove_rate_limit_key(&self, key: &str);
+}
+
+/// Endpoint selection abstraction for multi-endpoint load balancing.
+///
+/// Implementations select the next healthy endpoint for a given upstream.
+#[async_trait]
+pub(crate) trait EndpointSelector: Send + Sync {
+    /// Select the next healthy endpoint for the given upstream.
+    /// Returns `None` if all backends are unhealthy or the endpoint list is empty.
+    async fn select(&self, upstream_id: Uuid, endpoints: &[Endpoint]) -> Option<SelectedEndpoint>;
+
+    /// Invalidate cached state for the given upstream (called on CRUD).
+    fn invalidate(&self, upstream_id: Uuid);
 }

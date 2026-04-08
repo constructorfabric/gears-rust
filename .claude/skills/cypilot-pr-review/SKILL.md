@@ -6,4 +6,4 @@ user-invocable: true
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep
 ---
 
-ALWAYS open and follow `../../../.cypilot/workflows/pr-review.md`
+ALWAYS open and follow `{cypilot_path}/config/kits/sdlc/workflows/pr-review.md`

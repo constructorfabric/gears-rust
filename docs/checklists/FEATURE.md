@@ -5,6 +5,35 @@
 **Last Updated**: 2026-02-03
 **Purpose**: Comprehensive quality checklist for FEATURE artifacts
 
+## Table of Contents
+
+1. [Referenced Standards](#referenced-standards)
+2. [Review Scope Selection](#review-scope-selection)
+3. [Prerequisites](#prerequisites)
+4. [Applicability Context](#applicability-context)
+5. [Severity Dictionary](#severity-dictionary)
+6. [MUST HAVE](#must-have)
+   - [🏗️ ARCHITECTURE Expertise (ARCH)](#architecture-expertise-arch)
+   - [Semantic Alignment (SEM)](#semantic-alignment-sem)
+   - [⚡ PERFORMANCE Expertise (PERF)](#performance-expertise-perf)
+   - [🔒 SECURITY Expertise (SEC)](#security-expertise-sec)
+   - [🛡️ RELIABILITY Expertise (REL)](#reliability-expertise-rel)
+   - [📊 DATA Expertise (DATA)](#data-expertise-data)
+   - [🔌 INTEGRATION Expertise (INT)](#integration-expertise-int)
+   - [🖥️ OPERATIONS Expertise (OPS)](#operations-expertise-ops)
+   - [🔧 MAINTAINABILITY Expertise (MAINT)](#maintainability-expertise-maint)
+   - [🧪 TESTING Expertise (TEST)](#testing-expertise-test)
+   - [📜 COMPLIANCE Expertise (COMPL)](#compliance-expertise-compl)
+   - [👤 USABILITY Expertise (UX)](#usability-expertise-ux)
+   - [🏢 BUSINESS Expertise (BIZ)](#business-expertise-biz)
+   - [DOC (DOC)](#doc-doc)
+7. [MUST NOT HAVE](#must-not-have)
+8. [Validation Summary](#validation-summary)
+   - [Final Checklist](#final-checklist)
+   - [Reporting Readiness Checklist](#reporting-readiness-checklist)
+   - [Reporting](#reporting)
+   - [Reporting Commitment](#reporting-commitment)
+
 ---
 
 ## Referenced Standards
@@ -19,36 +48,6 @@ This checklist validates FEATURE artifacts based on the following international 
 | [ISO/IEC/IEEE 29119-3:2021](https://www.iso.org/standard/79429.html) | **Test Documentation** | Software testing — test specification, acceptance criteria |
 | [OWASP ASVS 5.0](https://owasp.org/www-project-application-security-verification-standard/) | **Security Verification** | Application security requirements — authentication, authorization, input validation |
 | [WCAG 2.2](https://www.w3.org/TR/WCAG22/) | **Accessibility** | Web Content Accessibility Guidelines — POUR principles, Level AA |
-
----
-
-## Table of Contents
-
-1. [Review Scope Selection](#review-scope-selection)
-2. [Prerequisites](#prerequisites)
-3. [Applicability Context](#applicability-context)
-4. [Severity Dictionary](#severity-dictionary)
-5. [MUST HAVE](#must-have)
-   - [ARCHITECTURE Expertise (ARCH)](#️-architecture-expertise-arch)
-   - [PERFORMANCE Expertise (PERF)](#-performance-expertise-perf)
-   - [SECURITY Expertise (SEC)](#-security-expertise-sec)
-   - [RELIABILITY Expertise (REL)](#️-reliability-expertise-rel)
-   - [DATA Expertise (DATA)](#-data-expertise-data)
-   - [INTEGRATION Expertise (INT)](#-integration-expertise-int)
-   - [OPERATIONS Expertise (OPS)](#️-operations-expertise-ops)
-   - [MAINTAINABILITY Expertise (MAINT)](#-maintainability-expertise-maint)
-   - [TESTING Expertise (TEST)](#-testing-expertise-test)
-   - [COMPLIANCE Expertise (COMPL)](#-compliance-expertise-compl)
-   - [USABILITY Expertise (UX)](#-usability-expertise-ux)
-   - [BUSINESS Expertise (BIZ)](#-business-expertise-biz)
-   - [Semantic Alignment (SEM)](#semantic-alignment-sem)
-   - [Deliberate Omissions](#deliberate-omissions)
-6. [MUST NOT HAVE](#must-not-have)
-7. [Validation Summary](#validation-summary)
-   - [Final Checklist](#final-checklist)
-   - [Reporting Readiness Checklist](#reporting-readiness-checklist)
-   - [Reporting](#reporting)
-
 ---
 
 ## Review Scope Selection
@@ -151,38 +150,13 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] `featstatus` ID defined under H1 title in checkbox form (`- [ ] \`pN\` - **ID**: \`cpt-{system}-featstatus-{slug}\``)
 - [ ] `feature` reference present under H1 title in checkbox form (`- [x] \`pN\` - \`cpt-{system}-feature-{slug}\``) — backreference to DECOMPOSITION entry
 - [ ] Feature identifier is present and stable (unique within the project)
+- [ ] Feature status documented
 - [ ] Overall Design reference present
 - [ ] Requirements source reference present
 - [ ] Actors/user roles are defined and referenced consistently
 - [ ] Feature scope clearly stated
 - [ ] Feature boundaries explicit
 - [ ] Out-of-scope items documented
-
-### ARCH-FDESIGN-001b: Required Headings (cf-sdlc)
-**Severity**: HIGH
-**Ref**: constraints.json — FEATURE headings
-
-- [ ] `## Feature Context` present (required)
-- [ ] `### Overview` present (required)
-- [ ] `### Purpose` present (required)
-- [ ] `### Actors` present (required)
-- [ ] `### References` present (required)
-- [ ] `## Actor Flows (CDSL)` present (required)
-- [ ] `## Processes / Business Logic (CDSL)` present (required)
-- [ ] `## States (CDSL)` present (optional)
-- [ ] `## Definitions of Done` present (required)
-- [ ] `## Acceptance Criteria` present (required)
-
-### ARCH-FDESIGN-001c: ID Kinds and Code Traceability (cf-sdlc)
-**Severity**: HIGH
-**Ref**: constraints.json — FEATURE identifiers with `to_code: true`
-
-- [ ] `flow` IDs (if any) use checkbox form; `to_code: true` — require `@cpt-flow:` markers in code
-- [ ] `algo` IDs (if any) use checkbox form; `to_code: true` — require `@cpt-algo:` markers in code
-- [ ] `state` IDs (if any) use checkbox form; `to_code: true` — require `@cpt-state:` markers in code
-- [ ] `dod` IDs (at least one required) use checkbox form; `to_code: true` — require `@cpt-req:` markers in code
-- [ ] All FEATURE ID kinds have task+priority **required**
-- [ ] Checkbox cascade: all flow/algo/state/dod `[x]` → `featstatus` `[x]` → DECOMPOSITION `feature` `[x]`
 
 ### ARCH-FDESIGN-002: Overall Design Alignment
 **Severity**: CRITICAL
@@ -243,7 +217,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Customization points identified
 - [ ] Plugin/hook opportunities documented
 - [ ] Configuration options documented
-- [ ] Spec flags integration documented
+- [ ] Feature flags integration documented
 - [ ] Versioning considerations documented
 
 ---
@@ -602,7 +576,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Configuration validation documented
 - [ ] Runtime configuration documented
 - [ ] Environment-specific configuration documented
-- [ ] Spec flags documented
+- [ ] Feature flags documented
 
 ### OPS-FDESIGN-003: Health & Diagnostics
 **Severity**: MEDIUM
@@ -779,7 +753,7 @@ Before evaluating each checklist item, the expert MUST:
 
 ---
 
-## Deliberate Omissions
+## Deliberate Omissions (DOC)
 
 ### DOC-FDESIGN-001: Explicit Non-Applicability
 **Severity**: CRITICAL
@@ -792,9 +766,7 @@ Before evaluating each checklist item, the expert MUST:
 
 # MUST NOT HAVE
 
----
-
-## ❌ ARCH-FDESIGN-NO-001: No System-Level Type Redefinitions
+### ARCH-FDESIGN-NO-001: No System-Level Type Redefinitions
 **Severity**: CRITICAL
 
 **What to check**:
@@ -806,9 +778,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Central domain model / schema documentation
 
----
-
-## ❌ ARCH-FDESIGN-NO-002: No New API Endpoints
+### ARCH-FDESIGN-NO-002: No New API Endpoints
 **Severity**: CRITICAL
 
 **What to check**:
@@ -820,9 +790,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: API contract documentation (e.g., OpenAPI)
 
----
-
-## ❌ ARCH-FDESIGN-NO-003: No Architectural Decisions
+### ARCH-FDESIGN-NO-003: No Architectural Decisions
 **Severity**: HIGH
 
 **What to check**:
@@ -834,9 +802,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: `ADR`
 
----
-
-## ❌ BIZ-FDESIGN-NO-001: No Product Requirements
+### BIZ-FDESIGN-NO-001: No Product Requirements
 **Severity**: HIGH
 
 **What to check**:
@@ -848,9 +814,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: `PRD`
 
----
-
-## ❌ BIZ-FDESIGN-NO-002: No Sprint/Task Breakdowns
+### BIZ-FDESIGN-NO-002: No Sprint/Task Breakdowns
 **Severity**: HIGH
 
 **What to check**:
@@ -863,9 +827,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Project management tools
 
----
-
-## ❌ MAINT-FDESIGN-NO-001: No Code Snippets
+### MAINT-FDESIGN-NO-001: No Code Snippets
 **Severity**: HIGH
 
 **What to check**:
@@ -878,9 +840,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Source code repository
 
----
-
-## ❌ TEST-FDESIGN-NO-001: No Test Implementation
+### TEST-FDESIGN-NO-001: No Test Implementation
 **Severity**: MEDIUM
 
 **What to check**:
@@ -892,9 +852,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Test directories in source code
 
----
-
-## ❌ SEC-FDESIGN-NO-001: No Security Secrets
+### SEC-FDESIGN-NO-001: No Security Secrets
 **Severity**: CRITICAL
 
 **What to check**:
@@ -907,9 +865,7 @@ Before evaluating each checklist item, the expert MUST:
 
 **Where it belongs**: Secret management system
 
----
-
-## ❌ OPS-FDESIGN-NO-001: No Infrastructure Code
+### OPS-FDESIGN-NO-001: No Infrastructure Code
 **Severity**: MEDIUM
 
 **What to check**:
@@ -937,7 +893,7 @@ Confirm before reporting results:
 
 ### Explicit Handling Verification
 
-For each major checklist category (ARCH, PERF, SEC, REL, DATA, INT, OPS, MAINT, TEST, COMPL, UX, BIZ), confirm:
+For each major checklist category (ARCH, SEM, PERF, SEC, REL, DATA, INT, OPS, MAINT, TEST, COMPL, UX, BIZ, DOC), confirm:
 
 - [ ] Category is addressed in the document, OR
 - [ ] Category is explicitly marked "Not applicable" with reasoning in the document, OR

@@ -476,13 +476,13 @@ pub enum TlsRootConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportSecurity {
-    /// Require TLS for all connections (HTTPS only) - default and recommended
-    #[default]
+    /// Require TLS for all connections (HTTPS only)
     TlsOnly,
-    /// Allow insecure HTTP connections (for testing with mock servers only)
+    /// Allow insecure HTTP connections (default)
     ///
-    /// **WARNING**: This should only be used for local testing with mock servers.
-    /// Never use in production as it exposes traffic to interception.
+    /// Use [`HttpClientBuilder::deny_insecure_http`] to switch to `TlsOnly`
+    /// when TLS enforcement is required.
+    #[default]
     AllowInsecureHttp,
 }
 
@@ -517,9 +517,9 @@ pub struct HttpClientConfig {
     /// Rate limiting / concurrency configuration
     pub rate_limit: Option<RateLimitConfig>,
 
-    /// Transport security mode (default: `TlsOnly`)
+    /// Transport security mode (default: `AllowInsecureHttp`)
     ///
-    /// Use `AllowInsecureHttp` only for testing with local mock servers.
+    /// Use [`HttpClientBuilder::deny_insecure_http`] to enforce TLS for all connections.
     pub transport: TransportSecurity,
 
     /// TLS root certificate strategy (default: `WebPki`)
@@ -578,7 +578,7 @@ impl Default for HttpClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             retry: Some(RetryConfig::default()),
             rate_limit: Some(RateLimitConfig::default()),
-            transport: TransportSecurity::TlsOnly,
+            transport: TransportSecurity::AllowInsecureHttp,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 1024,
@@ -600,7 +600,7 @@ impl HttpClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             retry: None,
             rate_limit: None,
-            transport: TransportSecurity::TlsOnly,
+            transport: TransportSecurity::AllowInsecureHttp,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 256,
@@ -620,7 +620,7 @@ impl HttpClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             retry: Some(RetryConfig::aggressive()),
             rate_limit: Some(RateLimitConfig::default()),
-            transport: TransportSecurity::TlsOnly,
+            transport: TransportSecurity::AllowInsecureHttp,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 1024,
@@ -661,7 +661,7 @@ impl HttpClientConfig {
                 ..RetryConfig::default()
             }),
             rate_limit: Some(RateLimitConfig::conservative()),
-            transport: TransportSecurity::TlsOnly,
+            transport: TransportSecurity::AllowInsecureHttp,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 256,
@@ -672,9 +672,6 @@ impl HttpClientConfig {
     }
 
     /// Create configuration for testing with mock servers (allows insecure HTTP)
-    ///
-    /// **WARNING**: This configuration allows plain HTTP connections.
-    /// Use only for local testing with mock servers, never in production.
     #[must_use]
     pub fn for_testing() -> Self {
         Self {
@@ -743,7 +740,7 @@ impl HttpClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             retry: None, // SSE reconnection is protocol-level (Last-Event-ID)
             rate_limit: None,
-            transport: TransportSecurity::TlsOnly,
+            transport: TransportSecurity::AllowInsecureHttp,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 64,
@@ -979,7 +976,7 @@ mod tests {
         assert_eq!(config.user_agent, DEFAULT_USER_AGENT);
         assert!(config.retry.is_some());
         assert!(config.rate_limit.is_some());
-        assert_eq!(config.transport, TransportSecurity::TlsOnly);
+        assert_eq!(config.transport, TransportSecurity::AllowInsecureHttp);
         assert!(!config.otel);
         assert_eq!(config.buffer_capacity, 1024);
     }

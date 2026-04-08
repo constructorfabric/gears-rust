@@ -1,0 +1,31 @@
+# Created: 2026-03-13 by Constructor Tech
+# Updated: 2026-03-17 by Constructor Tech
+[package]
+name = "de0707_drop_zeroize"
+version = "0.1.0"
+authors = ["Cyber Fabric"]
+description = "Manual byte-zeroing in Drop may be optimized away; use the zeroize crate instead (DE0707)"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "bad_drop_zeroing"
+path = "ui/bad_drop_zeroing.rs"
+
+[[example]]
+name = "good_no_zeroing"
+path = "ui/good_no_zeroing.rs"
+
+[dependencies]
+clippy_utils.workspace = true
+dylint_linting.workspace = true
+lint_utils.workspace = true
+
+[dev-dependencies]
+dylint_testing.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true

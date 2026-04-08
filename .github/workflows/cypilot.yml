@@ -7,7 +7,7 @@ on:
       - '**/*.md'
       - 'docs/**'
       - 'modules/**/docs/**'
-      - '.cypilot-adapter/**'
+      - '.cypilot/config/**'
       - 'Makefile'
   workflow_call:
   workflow_dispatch:

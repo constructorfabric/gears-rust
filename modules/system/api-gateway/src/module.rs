@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tower_http::{
+    catch_panic::CatchPanicLayer,
     limit::RequestBodyLimitLayer,
     request_id::{PropagateRequestIdLayer, SetRequestIdLayer},
     timeout::TimeoutLayer,
@@ -77,6 +78,19 @@ impl Default for ApiGateway {
 }
 
 impl ApiGateway {
+    fn apply_prefix_nesting(mut router: Router, prefix: &str) -> Router {
+        if prefix.is_empty() {
+            return router;
+        }
+
+        let top = Router::new()
+            .route("/health", get(web::health_check))
+            .route("/healthz", get(|| async { "ok" }));
+
+        router = Router::new().nest(prefix, router);
+        top.merge(router)
+    }
+
     /// Create a new `ApiGateway` instance with the given configuration
     #[must_use]
     pub fn new(config: ApiGatewayConfig) -> Self {
@@ -125,11 +139,13 @@ impl ApiGateway {
         // Always mark built-in health check routes as public
         public_routes.insert((Method::GET, "/health".to_owned()));
         public_routes.insert((Method::GET, "/healthz".to_owned()));
+
         public_routes.insert((Method::GET, "/docs".to_owned()));
         public_routes.insert((Method::GET, "/openapi.json".to_owned()));
 
         for spec in &self.openapi_registry.operation_specs {
             let spec = spec.value();
+
             let route_key = (spec.method.clone(), spec.path.clone());
 
             if spec.authenticated {
@@ -158,6 +174,45 @@ impl ApiGateway {
         Ok(route_policy)
     }
 
+    fn normalize_prefix_path(raw: &str) -> Result<String> {
+        let trimmed = raw.trim();
+        // Collapse consecutive slashes then strip trailing slash(es).
+        let collapsed: String =
+            trimmed
+                .chars()
+                .fold(String::with_capacity(trimmed.len()), |mut acc, c| {
+                    if c == '/' && acc.ends_with('/') {
+                        // skip duplicate slash
+                    } else {
+                        acc.push(c);
+                    }
+                    acc
+                });
+        let prefix = collapsed.trim_end_matches('/');
+        let result = if prefix.is_empty() {
+            String::new()
+        } else if prefix.starts_with('/') {
+            prefix.to_owned()
+        } else {
+            format!("/{prefix}")
+        };
+        // Reject characters that are unsafe in URL paths or HTML attributes.
+        if !result
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'_' || b == b'-' || b == b'.')
+        {
+            anyhow::bail!(
+                "prefix_path contains invalid characters (must match [a-zA-Z0-9/_\\-.]): {raw:?}"
+            );
+        }
+
+        if result.split('/').any(|seg| seg == "." || seg == "..") {
+            anyhow::bail!("prefix_path must not contain '.' or '..' segments: {raw:?}");
+        }
+
+        Ok(result)
+    }
+
     /// Apply all middleware layers to a router (request ID, tracing, timeout, body limit, CORS, rate limiting, error mapping, auth)
     pub(crate) fn apply_middleware_stack(
         &self,
@@ -171,11 +226,18 @@ impl ApiGateway {
         // becomes the **outermost** layer and therefore runs **first** on the request path.
         //
         // Desired request execution order (outermost -> innermost):
-        // SetRequestId -> PropagateRequestId -> Trace -> push_req_id_to_extensions
-        // -> Timeout -> BodyLimit -> CORS -> MIME validation -> RateLimit -> ErrorMapping -> Auth -> Router
+        // SetRequestId -> PropagateRequestId -> Trace -> push_req_id
+        // -> HttpMetrics -> CatchPanic
+        // -> Timeout -> BodyLimit -> CORS -> MIME validation -> RateLimit -> ErrorMapping -> Auth -> License
+        // -> [Route matching] -> PropagateMatchedPath -> Handler
         //
         // Therefore we must add layers in the reverse order (innermost -> outermost) below.
         // Due future refactoring, this order must be maintained.
+
+        // 14) Propagate MatchedPath to response extensions (route_layer — innermost).
+        // This copies MatchedPath from the request (populated by Axum route matching)
+        // into the response so outer layer() middleware (metrics) can read it.
+        router = router.route_layer(from_fn(middleware::http_metrics::propagate_matched_path));
 
         let config = self.get_cached_config();
 
@@ -187,8 +249,9 @@ impl ApiGateway {
             .map(|e| e.value().clone())
             .collect();
 
-        // 11) License validation
+        // 13) License validation
         let license_map = middleware::license_validation::LicenseRequirementMap::from_specs(&specs);
+
         router = router.layer(from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let map = license_map.clone();
@@ -196,7 +259,7 @@ impl ApiGateway {
             },
         ));
 
-        // 10) Auth
+        // 12) Auth
         if config.auth_disabled {
             // Build security contexts for compatibility during migration
             let default_security_context = SecurityContext::builder()
@@ -205,7 +268,7 @@ impl ApiGateway {
                 .build()?;
 
             tracing::warn!(
-                "API Gateway auth is DISABLED: all requests will run with default tenant SecurityCtx. \
+                "API Gateway auth is DISABLED: all requests will run with default tenant SecurityContext. \
                  This mode bypasses authentication and is intended ONLY for single-user on-premises deployments without an IdP. \
                  Permission checks and secure ORM still apply. DO NOT use this mode in multi-tenant or production environments."
             );
@@ -231,11 +294,12 @@ impl ApiGateway {
             ));
         }
 
-        // 9) Error mapping (outer to auth so it can translate auth/handler errors)
+        // 11) Error mapping (outer to auth so it can translate auth/handler errors)
         router = router.layer(from_fn(modkit::api::error_layer::error_mapping_middleware));
 
-        // 8) Per-route rate limiting & in-flight limits
+        // 10) Per-route rate limiting & in-flight limits
         let rate_map = middleware::rate_limit::RateLimiterMap::from_specs(&specs, &config)?;
+
         router = router.layer(from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let map = rate_map.clone();
@@ -243,7 +307,7 @@ impl ApiGateway {
             },
         ));
 
-        // 7) MIME type validation
+        // 9) MIME type validation
         let mime_map = middleware::mime_validation::build_mime_validation_map(&specs);
         router = router.layer(from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
@@ -252,19 +316,32 @@ impl ApiGateway {
             },
         ));
 
-        // 6) CORS (must be outer to auth/limits so OPTIONS preflight short-circuits)
+        // 8) CORS (must be outer to auth/limits so OPTIONS preflight short-circuits)
         if config.cors_enabled {
             router = router.layer(crate::cors::build_cors_layer(&config));
         }
 
-        // 5) Body limit
+        // 7) Body limit
         router = router.layer(RequestBodyLimitLayer::new(config.defaults.body_limit_bytes));
         router = router.layer(DefaultBodyLimit::max(config.defaults.body_limit_bytes));
 
-        // 4) Timeout
+        // 6) Timeout
         router = router.layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
             Duration::from_secs(30),
+        ));
+
+        // 5) CatchPanic (converts panics to 500 before metrics sees them)
+        router = router.layer(CatchPanicLayer::new());
+
+        // 4) HTTP metrics (layer — captures all middleware responses including auth/rate-limit/timeout)
+        let http_metrics = Arc::new(middleware::http_metrics::HttpMetrics::new(
+            Self::MODULE_NAME,
+            &config.metrics.prefix,
+        ));
+        router = router.layer(from_fn_with_state(
+            http_metrics,
+            middleware::http_metrics::http_metrics_middleware,
         ));
 
         // 3) Record request_id into span + extensions (requires span to exist first => must be inner to Trace)
@@ -327,7 +404,7 @@ impl ApiGateway {
                 )
         });
 
-        // 1) Request ID handling
+        // 1) Request ID handling (outermost)
         let x_request_id = crate::middleware::request_id::header();
         // If missing, generate x-request-id first; then propagate it to the response.
         router = router.layer(PropagateRequestIdLayer::new(x_request_id.clone()));
@@ -362,6 +439,10 @@ impl ApiGateway {
         // Apply all middleware layers including auth, above the router
         let authn_client = self.authn_client.lock().clone();
         router = self.apply_middleware_stack(router, authn_client)?;
+
+        let config = self.get_cached_config();
+        let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
+        router = Self::apply_prefix_nesting(router, &prefix);
 
         // Cache the built router for future use
         self.router_cache.store(router.clone());
@@ -491,6 +572,9 @@ impl ApiGateway {
         );
 
         let openapi_doc = Arc::new(self.build_openapi()?);
+        let config = self.get_cached_config();
+        let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
+        let html_doc = web::serve_docs(&prefix);
 
         router = router
             .route(
@@ -517,7 +601,7 @@ impl ApiGateway {
                     }
                 }),
             )
-            .route("/docs", get(web::serve_docs));
+            .route("/docs", get(move || async move { html_doc }));
 
         #[cfg(feature = "embed_elements")]
         {
@@ -535,7 +619,6 @@ impl ApiGateway {
 #[async_trait]
 impl modkit::Module for ApiGateway {
     async fn init(&self, ctx: &modkit::context::ModuleCtx) -> anyhow::Result<()> {
-        debug!("Module initialized with context");
         let cfg = ctx.config::<crate::config::ApiGatewayConfig>()?;
         self.config.store(Arc::new(cfg.clone()));
 
@@ -594,6 +677,9 @@ impl modkit::contracts::ApiGatewayCapability for ApiGateway {
         tracing::debug!("Applying middleware stack to finalized router");
         let authn_client = self.authn_client.lock().clone();
         router = self.apply_middleware_stack(router, authn_client)?;
+
+        let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
+        router = Self::apply_prefix_nesting(router, &prefix);
 
         // Keep the finalized router to be used by `serve()`
         *self.final_router.lock() = Some(router.clone());
@@ -680,6 +766,107 @@ mod tests {
         assert_eq!(info.get("title").unwrap(), "Test API");
         assert_eq!(info.get("version").unwrap(), "1.0.0");
         assert_eq!(info.get("description").unwrap(), "Test Description");
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod normalize_prefix_path_tests {
+    use super::*;
+
+    #[test]
+    fn empty_string_returns_empty() {
+        assert_eq!(ApiGateway::normalize_prefix_path("").unwrap(), "");
+    }
+
+    #[test]
+    fn sole_slash_returns_empty() {
+        assert_eq!(ApiGateway::normalize_prefix_path("/").unwrap(), "");
+    }
+
+    #[test]
+    fn multiple_slashes_return_empty() {
+        assert_eq!(ApiGateway::normalize_prefix_path("///").unwrap(), "");
+    }
+
+    #[test]
+    fn whitespace_only_returns_empty() {
+        assert_eq!(ApiGateway::normalize_prefix_path("   ").unwrap(), "");
+    }
+
+    #[test]
+    fn simple_prefix_preserved() {
+        assert_eq!(ApiGateway::normalize_prefix_path("/cf").unwrap(), "/cf");
+    }
+
+    #[test]
+    fn trailing_slash_stripped() {
+        assert_eq!(ApiGateway::normalize_prefix_path("/cf/").unwrap(), "/cf");
+    }
+
+    #[test]
+    fn leading_slash_prepended_when_missing() {
+        assert_eq!(ApiGateway::normalize_prefix_path("cf").unwrap(), "/cf");
+    }
+
+    #[test]
+    fn consecutive_leading_slashes_collapsed() {
+        assert_eq!(ApiGateway::normalize_prefix_path("//cf").unwrap(), "/cf");
+    }
+
+    #[test]
+    fn consecutive_slashes_mid_path_collapsed() {
+        assert_eq!(
+            ApiGateway::normalize_prefix_path("/api//v1").unwrap(),
+            "/api/v1"
+        );
+    }
+
+    #[test]
+    fn many_consecutive_slashes_collapsed() {
+        assert_eq!(
+            ApiGateway::normalize_prefix_path("///api///v1///").unwrap(),
+            "/api/v1"
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_trimmed() {
+        assert_eq!(ApiGateway::normalize_prefix_path("  /cf  ").unwrap(), "/cf");
+    }
+
+    #[test]
+    fn nested_path_preserved() {
+        assert_eq!(
+            ApiGateway::normalize_prefix_path("/api/v1").unwrap(),
+            "/api/v1"
+        );
+    }
+
+    #[test]
+    fn dot_in_path_allowed() {
+        assert_eq!(
+            ApiGateway::normalize_prefix_path("/api/v1.0").unwrap(),
+            "/api/v1.0"
+        );
+    }
+
+    #[test]
+    fn rejects_html_injection() {
+        let result = ApiGateway::normalize_prefix_path(r#""><script>alert(1)</script>"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_spaces_in_path() {
+        let result = ApiGateway::normalize_prefix_path("/my path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_query_string_chars() {
+        let result = ApiGateway::normalize_prefix_path("/api?foo=bar");
+        assert!(result.is_err());
     }
 }
 

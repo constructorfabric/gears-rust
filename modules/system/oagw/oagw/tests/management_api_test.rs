@@ -59,7 +59,6 @@ async fn get_upstream_by_gts_id() {
                 },
                 "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
             )
-            .alias("openai")
             .build(),
         )
         .await
@@ -68,7 +67,7 @@ async fn get_upstream_by_gts_id() {
     let gts_id = format_upstream_gts(upstream.id);
     let resp = h.api_v1().get_upstream(&gts_id).expect_status(200).await;
     let json = resp.json();
-    assert_eq!(json["alias"].as_str().unwrap(), "openai");
+    assert_eq!(json["alias"].as_str().unwrap(), "api.openai.com");
 }
 
 // 7.9: GET with invalid GTS format -> 400.
@@ -111,7 +110,7 @@ async fn update_upstream_preserves_id() {
                 oagw_sdk::Server {
                     endpoints: vec![oagw_sdk::Endpoint {
                         scheme: oagw_sdk::Scheme::Https,
-                        host: "api.openai.com".into(),
+                        host: "10.0.0.1".into(),
                         port: 443,
                     }],
                 },
@@ -156,7 +155,6 @@ async fn delete_upstream_returns_204() {
                 },
                 "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
             )
-            .alias("to-delete")
             .build(),
         )
         .await
@@ -186,7 +184,6 @@ async fn create_route_success() {
                 },
                 "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
             )
-            .alias("openai")
             .build(),
         )
         .await
@@ -239,7 +236,6 @@ async fn list_upstreams_with_pagination() {
                     },
                     "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
                 )
-                .alias(format!("host{i}"))
                 .build(),
             )
             .await
@@ -295,7 +291,6 @@ async fn get_route_by_gts_id() {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
             "protocol": "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
-            "alias": "route-get-test",
             "enabled": true,
             "tags": []
         }))
@@ -352,7 +347,6 @@ async fn update_route_changes_fields() {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
             "protocol": "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
-            "alias": "route-update-test",
             "enabled": true,
             "tags": []
         }))
@@ -413,7 +407,6 @@ async fn delete_route_returns_204_then_get_returns_404() {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
             "protocol": "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
-            "alias": "route-delete-test",
             "enabled": true,
             "tags": []
         }))
@@ -458,10 +451,7 @@ async fn list_routes_filters_by_upstream() {
 
     // Create 2 upstreams with distinct hosts.
     let mut upstream_gts_ids = Vec::new();
-    for (alias, host) in [
-        ("upstream-a", "api.openai.com"),
-        ("upstream-b", "api.anthropic.com"),
-    ] {
+    for host in ["api.openai.com", "api.anthropic.com"] {
         let resp = h
             .api_v1()
             .post_upstream()
@@ -470,7 +460,6 @@ async fn list_routes_filters_by_upstream() {
                     "endpoints": [{"host": host, "port": 443, "scheme": "https"}]
                 },
                 "protocol": "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1",
-                "alias": alias,
                 "enabled": true,
                 "tags": []
             }))

@@ -17,6 +17,8 @@ single-tenant = ["dep:single-tenant-tr-plugin"]
 static-tenants = ["dep:static-tr-plugin"]
 static-authn = ["dep:static-authn-plugin"]
 static-authz = ["dep:static-authz-plugin"]
+static-credstore = ["dep:static-credstore-plugin"]
+mini-chat = ["dep:mini-chat"]
 otel = ["modkit/otel"]
 
 [dependencies]
@@ -43,16 +45,22 @@ static-tr-plugin = { package = "cf-static-tr-plugin", path = "../../modules/syst
 static-authn-plugin = { package = "cf-static-authn-plugin", path = "../../modules/system/authn-resolver/plugins/static-authn-plugin", optional = true }
 static-authz-plugin = { package = "cf-static-authz-plugin", path = "../../modules/system/authz-resolver/plugins/static-authz-plugin", optional = true }
 
+# Optional credstore plugins
+static-credstore-plugin = { package = "cf-static-credstore-plugin", path = "../../modules/credstore/plugins/static-credstore-plugin", optional = true }
+
 # user modules
 file_parser = { package = "cf-file-parser", path = "../../modules/file-parser" }
 nodes_registry = { package = "cf-nodes-registry", path = "../../modules/system/nodes-registry/nodes-registry" }
 simple_user_settings = { package = "cf-simple-user-settings", path = "../../modules/simple-user-settings/simple-user-settings" }
+credstore = { package = "cf-credstore", path = "../../modules/credstore/credstore" }
 
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true }
-serde_json = { workspace = true }
+
+# Optional mini-chat module
+mini-chat = { package = "cf-mini-chat", path = "../../modules/mini-chat/mini-chat", optional = true }
 
 # Optional example module
 users-info = { path = "../../examples/modkit/users-info/users-info", optional = true }
@@ -62,3 +70,4 @@ calculator = { path = "../../examples/oop-modules/calculator/calculator", option
 [dev-dependencies]
 tempfile = { workspace = true }
 serde-saphyr = { workspace = true }
+serde_json = { workspace = true }

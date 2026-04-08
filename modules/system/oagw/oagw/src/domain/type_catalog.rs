@@ -1,6 +1,6 @@
 //! Centralized catalog of all OAGW GTS entities for Types Registry registration.
 //!
-//! Returns all 20 entities (7 schemas + 13 instances) in a single batch,
+//! Returns all 21 entities (7 schemas + 14 instances) in a single batch,
 //! ready for `TypesRegistryClient::register()`.
 
 use serde_json::{Value, json};
@@ -55,9 +55,13 @@ pub fn oagw_gts_entities() -> Vec<Value> {
             OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
             "OAuth2 client credentials (Basic)",
         ),
-        // -- Guard plugin instances (2) --
+        // -- Guard plugin instances (3) --
         instance_entity(TIMEOUT_GUARD_PLUGIN_ID, "Request timeout"),
         instance_entity(CORS_GUARD_PLUGIN_ID, "CORS handling"),
+        instance_entity(
+            REQUIRED_HEADERS_GUARD_PLUGIN_ID,
+            "Required headers enforcement",
+        ),
         // -- Transform plugin instances (3) --
         instance_entity(LOGGING_TRANSFORM_PLUGIN_ID, "Request/response logging"),
         instance_entity(METRICS_TRANSFORM_PLUGIN_ID, "Prometheus metrics"),
@@ -75,12 +79,12 @@ mod tests {
     }
 
     #[test]
-    fn catalog_returns_exactly_20_entities() {
+    fn catalog_returns_exactly_21_entities() {
         let entities = oagw_gts_entities();
         assert_eq!(
             entities.len(),
-            20,
-            "expected 20 entities (7 schemas + 13 instances)"
+            21,
+            "expected 21 entities (7 schemas + 14 instances)"
         );
     }
 
@@ -124,7 +128,7 @@ mod tests {
             .collect();
 
         assert_eq!(schemas.len(), 7, "expected 7 schemas");
-        assert_eq!(instances.len(), 13, "expected 13 instances");
+        assert_eq!(instances.len(), 14, "expected 14 instances");
     }
 
     #[test]

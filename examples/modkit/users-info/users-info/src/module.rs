@@ -23,9 +23,10 @@ use crate::api::rest::sse_adapter::SseUserEventPublisher;
 use crate::config::UsersInfoConfig;
 use crate::domain::events::UserDomainEvent;
 use crate::domain::local_client::client::UsersInfoLocalClient;
-use crate::domain::ports::{AuditPort, EventPublisher};
+use crate::domain::ports::{AuditPort, EventPublisher, UsersMetricsPort};
 use crate::domain::service::{AppServices, ServiceConfig};
 use crate::infra::audit::HttpAuditClient;
+use crate::infra::metrics::UsersMetricsMeter;
 use crate::infra::storage::{OrmAddressesRepository, OrmCitiesRepository, OrmUsersRepository};
 
 /// Type alias for the concrete `AppServices` type used with ORM repositories.
@@ -60,8 +61,6 @@ impl Default for UsersInfo {
 #[async_trait]
 impl Module for UsersInfo {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
-        info!("Initializing {} module", Self::MODULE_NAME);
-
         // Load module configuration using new API
         let cfg: UsersInfoConfig = ctx.config()?;
         debug!(
@@ -110,6 +109,13 @@ impl Module for UsersInfo {
         let cities_repo = OrmCitiesRepository::new(limit_cfg);
         let addresses_repo = OrmAddressesRepository::new(limit_cfg);
 
+        // Create metrics adapter
+        let scope =
+            opentelemetry::InstrumentationScope::builder(Self::MODULE_NAME.to_owned()).build();
+        let metrics: Arc<dyn UsersMetricsPort> = Arc::new(UsersMetricsMeter::new(
+            &opentelemetry::global::meter_with_scope(scope),
+        ));
+
         // Create services with repository dependencies
         let services = Arc::new(AppServices::new(
             users_repo,
@@ -120,6 +126,7 @@ impl Module for UsersInfo {
             audit_adapter,
             authz,
             service_config,
+            metrics,
         ));
 
         self.service
@@ -133,7 +140,6 @@ impl Module for UsersInfo {
         ctx.client_hub()
             .register::<dyn UsersInfoClientV1>(Arc::new(local));
 
-        info!("{} module initialized successfully", Self::MODULE_NAME);
         Ok(())
     }
 }

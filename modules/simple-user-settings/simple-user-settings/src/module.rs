@@ -49,8 +49,6 @@ impl modkit::contracts::DatabaseCapability for SettingsModule {
 #[async_trait]
 impl Module for SettingsModule {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
-        info!("Initializing {} module", Self::MODULE_NAME);
-
         let cfg: SettingsConfig = ctx.config()?;
 
         let db: Arc<DBProvider<DbError>> = Arc::new(ctx.db_required()?);
@@ -75,8 +73,6 @@ impl Module for SettingsModule {
 
         let local_client: Arc<dyn SimpleUserSettingsClientV1> = Arc::new(LocalClient::new(service));
         ctx.client_hub().register(local_client);
-
-        info!("{} module initialized successfully", Self::MODULE_NAME);
 
         Ok(())
     }

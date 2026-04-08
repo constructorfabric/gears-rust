@@ -100,5 +100,6 @@ pub async fn delete_route(
         .delete_route(&ctx, uuid)
         .await
         .map_err(|e| domain_error_to_problem(e, &instance))?;
+    state.dp.remove_rate_limit_key(&format!("route:{uuid}"));
     Ok(StatusCode::NO_CONTENT)
 }

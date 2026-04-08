@@ -364,11 +364,54 @@ where
         self
     }
 
+    /// Execute a custom projection on this scoped query and return all results.
+    ///
+    /// The closure receives the inner
+    /// `Select<E>` (already scoped) and must return a
+    /// `Selector<SelectModel<T>>` — typically built via `.select_only()`,
+    /// `.column()`, `.group_by()`, `.into_model::<T>()`, etc.
+    ///
+    /// Because the method consumes `SecureSelect<E, Scoped>`, the compiler
+    /// guarantees that scope was applied before the projection runs.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let counts: Vec<ChatCount> = MsgEntity::find()
+    ///     .filter(condition)
+    ///     .secure()
+    ///     .scope_with(&scope)
+    ///     .project_all(conn, |q| {
+    ///         q.select_only()
+    ///          .column(MsgColumn::ChatId)
+    ///          .column_as(Expr::col(MsgColumn::Id).count(), "cnt")
+    ///          .group_by(MsgColumn::ChatId)
+    ///          .into_model::<ChatCount>()
+    ///     })
+    ///     .await?;
+    /// ```
+    ///
+    /// # Errors
+    /// Returns `ScopeError::Db` if the database query fails.
+    #[allow(clippy::disallowed_methods)]
+    pub async fn project_all<T, C, F>(self, runner: &C, project: F) -> Result<Vec<T>, ScopeError>
+    where
+        T: sea_orm::FromQueryResult + Send + Sync,
+        C: DBRunner,
+        F: FnOnce(sea_orm::Select<E>) -> sea_orm::Selector<sea_orm::SelectModel<T>>,
+    {
+        let selector = project(self.inner);
+        match DBRunnerInternal::as_seaorm(runner) {
+            SeaOrmRunner::Conn(db) => Ok(selector.all(db).await?),
+            SeaOrmRunner::Tx(tx) => Ok(selector.all(tx).await?),
+        }
+    }
+
     /// Unwrap the inner `SeaORM` `Select` for advanced use cases.
     ///
-    /// # Safety
-    /// The caller must ensure they don't remove or bypass the security
-    /// conditions that were applied during `.scope_with()`.
+    /// Prefer [`project_all`](Self::project_all) for custom projections —
+    /// it preserves compile-time scope enforcement. Use `into_inner()` only
+    /// when the query must be passed to an API that requires a raw `Select<E>`
+    /// (e.g., `paginate_odata`).
     #[must_use]
     pub fn into_inner(self) -> sea_orm::Select<E> {
         self.inner

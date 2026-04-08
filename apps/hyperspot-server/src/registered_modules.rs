@@ -7,10 +7,13 @@ use api_egress as _;
 use api_gateway as _;
 use authn_resolver as _;
 use authz_resolver as _;
+use credstore as _;
+#[cfg(not(feature = "oop-example"))]
 use file_parser as _;
 use grpc_hub as _;
 use module_orchestrator as _;
 use nodes_registry as _;
+#[cfg(not(feature = "oop-example"))]
 use simple_user_settings as _;
 use tenant_resolver as _;
 use types as _;
@@ -27,6 +30,20 @@ use static_authn_plugin as _;
 
 #[cfg(feature = "static-authz")]
 use static_authz_plugin as _;
+
+#[cfg(feature = "static-credstore")]
+use static_credstore_plugin as _;
+
+// === Optional Modules ===
+
+#[cfg(feature = "mini-chat")]
+use mini_chat as _;
+
+#[cfg(feature = "mini-chat")]
+use mini_chat::infra::plugins::static_audit as _;
+
+#[cfg(feature = "mini-chat")]
+use mini_chat::infra::plugins::static_model_policy as _;
 
 // === Example Features ===
 

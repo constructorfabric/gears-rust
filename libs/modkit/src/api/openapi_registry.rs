@@ -6,7 +6,7 @@
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use utoipa::openapi::{
     OpenApi, OpenApiBuilder, Ref, RefOr, Required,
@@ -104,6 +104,7 @@ impl OpenApiRegistryImpl {
     ///
     /// # Errors
     /// Returns an error if the `OpenAPI` specification cannot be built.
+    #[allow(unknown_lints, de0205_operation_builder)]
     pub fn build_openapi(&self, info: &OpenApiInfo) -> Result<OpenApi> {
         use http::Method;
 
@@ -314,8 +315,9 @@ impl OpenApiRegistryImpl {
         }
 
         // 2) Components (from our registry)
+        let reg = self.components_registry.load();
         let mut components = ComponentsBuilder::new();
-        for (name, schema) in self.components_registry.load().iter() {
+        for (name, schema) in reg.iter() {
             components = components.schema(name.clone(), schema.clone());
         }
 
@@ -342,6 +344,8 @@ impl OpenApiRegistryImpl {
             .paths(paths.build())
             .components(Some(components.build()))
             .build();
+
+        warn_dangling_refs_in_openapi(&openapi);
 
         Ok(openapi)
     }
@@ -393,6 +397,71 @@ impl OpenApiRegistry for OpenApiRegistryImpl {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+/// Walk the finalized `OpenAPI` document and warn about dangling `$ref` targets.
+///
+/// Scans the entire document (operations, request bodies, responses, and schemas)
+/// so that `$ref`s emitted outside `components.schemas` are also caught.
+fn warn_dangling_refs_in_openapi(openapi: &OpenApi) {
+    for ref_name in &collect_all_dangling_refs_in_openapi(openapi) {
+        tracing::warn!(
+            schema = %ref_name,
+            "Dangling $ref: schema '{}' is referenced but not registered. \
+             Add an explicit `ensure_schema::<T>(registry)` call.",
+            ref_name,
+        );
+    }
+}
+
+/// Serialize the full `OpenAPI` document to JSON, collect every
+/// `#/components/schemas/{name}` reference, and return those not defined
+/// in `components.schemas`.
+fn collect_all_dangling_refs_in_openapi(openapi: &OpenApi) -> Vec<String> {
+    let value = match serde_json::to_value(openapi) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::debug!(error = %err, "Failed to serialize OpenAPI doc for dangling $ref check");
+            return Vec::new();
+        }
+    };
+
+    let mut all_refs = HashSet::new();
+    collect_refs_from_json(&value, &mut all_refs);
+
+    // Defined schema names live under components.schemas keys
+    let defined: HashSet<&str> = value
+        .pointer("/components/schemas")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    all_refs
+        .into_iter()
+        .filter(|name| !defined.contains(name.as_str()))
+        .collect()
+}
+
+/// Recursively extract `#/components/schemas/{name}` targets from a JSON value.
+fn collect_refs_from_json(value: &serde_json::Value, refs: &mut HashSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(ref_str)) = map.get("$ref")
+                && let Some(name) = ref_str.strip_prefix("#/components/schemas/")
+            {
+                refs.insert(name.to_owned());
+            }
+            for v in map.values() {
+                collect_refs_from_json(v, refs);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_refs_from_json(v, refs);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -666,5 +735,91 @@ mod tests {
         let allowed_order = order_ext.get("allowedFields").unwrap().as_array().unwrap();
         assert!(allowed_order.iter().any(|v| v.as_str() == Some("name asc")));
         assert!(allowed_order.iter().any(|v| v.as_str() == Some("age desc")));
+    }
+
+    /// Helper: build a minimal `OpenAPI` doc with the given component schemas.
+    fn build_test_openapi(schemas: HashMap<String, RefOr<Schema>>) -> OpenApi {
+        let mut components = ComponentsBuilder::new();
+        for (name, schema) in schemas {
+            components = components.schema(name, schema);
+        }
+        OpenApiBuilder::new()
+            .components(Some(components.build()))
+            .build()
+    }
+
+    #[test]
+    fn test_dangling_refs_detects_missing_in_components() {
+        let mut schemas: HashMap<String, RefOr<Schema>> = HashMap::new();
+        // Register "Foo" with a $ref to "Bar" which is NOT registered
+        let foo_schema = serde_json::from_value::<Schema>(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "bar": { "$ref": "#/components/schemas/Bar" }
+            }
+        }))
+        .unwrap();
+        schemas.insert("Foo".to_owned(), RefOr::T(foo_schema));
+
+        let openapi = build_test_openapi(schemas);
+        let dangling = collect_all_dangling_refs_in_openapi(&openapi);
+        assert_eq!(dangling, vec!["Bar".to_owned()]);
+    }
+
+    #[test]
+    fn test_dangling_refs_no_false_positives() {
+        let mut schemas: HashMap<String, RefOr<Schema>> = HashMap::new();
+        // Register "Bar"
+        let bar_schema = Schema::Object(ObjectBuilder::new().build());
+        schemas.insert("Bar".to_owned(), RefOr::T(bar_schema));
+
+        // Register "Foo" referencing "Bar"
+        let foo_schema = serde_json::from_value::<Schema>(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "bar": { "$ref": "#/components/schemas/Bar" }
+            }
+        }))
+        .unwrap();
+        schemas.insert("Foo".to_owned(), RefOr::T(foo_schema));
+
+        let openapi = build_test_openapi(schemas);
+        let dangling = collect_all_dangling_refs_in_openapi(&openapi);
+        assert!(
+            dangling.is_empty(),
+            "Expected no dangling refs but got: {dangling:?}"
+        );
+    }
+
+    #[test]
+    fn test_dangling_refs_detects_missing_in_operations() {
+        // Build an OpenAPI doc with a response $ref to "MissingDto" but no
+        // matching component schema — simulates the scenario CodeRabbit flagged.
+        let openapi_json = serde_json::json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "0.1.0" },
+            "paths": {
+                "/items": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": "#/components/schemas/MissingDto" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {}
+            }
+        });
+        let openapi: OpenApi = serde_json::from_value(openapi_json).unwrap();
+        let dangling = collect_all_dangling_refs_in_openapi(&openapi);
+        assert_eq!(dangling, vec!["MissingDto".to_owned()]);
     }
 }

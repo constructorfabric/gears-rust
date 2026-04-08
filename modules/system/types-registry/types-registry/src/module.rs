@@ -47,8 +47,6 @@ impl Default for TypesRegistryModule {
 #[async_trait]
 impl Module for TypesRegistryModule {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
-        info!("Initializing {} module", Self::MODULE_NAME);
-
         let cfg: TypesRegistryConfig = ctx.config()?;
         debug!(
             "Loaded types_registry config: entity_id_fields={:?}, schema_id_fields={:?}",
@@ -66,7 +64,6 @@ impl Module for TypesRegistryModule {
         let api: Arc<dyn TypesRegistryClient> = Arc::new(TypesRegistryLocalClient::new(service));
         ctx.client_hub().register::<dyn TypesRegistryClient>(api);
 
-        info!("{} module initialized successfully", Self::MODULE_NAME);
         Ok(())
     }
 }

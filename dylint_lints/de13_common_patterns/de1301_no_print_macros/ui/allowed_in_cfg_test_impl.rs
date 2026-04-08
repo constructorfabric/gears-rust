@@ -10,10 +10,17 @@ impl Helper {
 
 struct Helper;
 
+fn _use_helper() {
+    let _ = Helper;
+}
+
 fn main() {
     // This call is not compiled, but keeps the impl reachable for the parser.
     #[cfg(test)]
     {
         Helper::call();
     }
+
+    // Use the helper to suppress unused warning
+    _use_helper();
 }

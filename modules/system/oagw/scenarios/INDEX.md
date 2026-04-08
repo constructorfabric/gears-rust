@@ -108,6 +108,10 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: [positive-2.12-list-upstreams-includes-disabled-resources.md](management-api/upstreams/positive-2.12-list-upstreams-includes-disabled-resources.md)
 - **Mechanism**: `GET /upstreams` returns both enabled and disabled upstreams with `enabled` field. Optional `$filter=enabled eq true` for active only.
 
+#### CRUD endpoint update invalidates load balancer
+- **Scenario**: [positive-2.13-crud-endpoint-update-invalidates-load-balancer.md](management-api/upstreams/positive-2.13-crud-endpoint-update-invalidates-load-balancer.md)
+- **Mechanism**: `PUT /upstreams/{id}` with new endpoints invalidates cached LoadBalancer. Next proxy request lazily rebuilds with updated endpoints.
+
 ---
 
 ### Route configuration
@@ -575,6 +579,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 #### Alias uniqueness enforced per tenant → conflict
 - **Scenario**: [negative-2.8-alias-uniqueness-enforced-per-tenant.md](management-api/upstreams/negative-2.8-alias-uniqueness-enforced-per-tenant.md)
 - **What happens**: Two upstreams with same alias in same tenant rejected (conflict). Same alias in different tenants succeeds.
+
+#### All backends unreachable → 502 or 504
+- **Scenario**: [negative-2.10-all-backends-unreachable-returns-502.md](management-api/upstreams/negative-2.10-all-backends-unreachable-returns-502.md)
+- **What happens**: Multi-endpoint upstream with all endpoints unreachable returns `502 Bad Gateway` or `504 Gateway Timeout`. The selected endpoint's connection attempt fails and the error is returned immediately (OAGW does not retry).
 
 #### Enforced ancestor limits still apply when alias shadowed
 - **Scenario**: [negative-6.2-enforced-ancestor-limits-still-apply-alias-shadowed.md](proxy-api/alias-resolution/negative-6.2-enforced-ancestor-limits-still-apply-alias-shadowed.md)

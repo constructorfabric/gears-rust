@@ -4,7 +4,7 @@ error: module name must not end with a hyphen
 6 |     name = "parser-",  // Should fail: ends with hyphen
   |            ^^^^^^^^^
 
-error[E0425]: cannot find type `TestModule` in this scope
+error[E0412]: cannot find type `TestModule` in this scope
   --> tests/ui/fail/module_name_ends_hyphen.rs:11:17
    |
 11 | impl Module for TestModule {

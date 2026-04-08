@@ -5,6 +5,8 @@ use modkit::api::operation_builder::OperationBuilder;
 use std::time::Duration;
 use tower_http::timeout::TimeoutLayer;
 
+const API_TAG: &str = "Users Info Events";
+
 pub(super) fn register_sse_route<S>(
     router: Router<S>,
     openapi: &dyn OpenApiRegistry,
@@ -20,7 +22,7 @@ where
         .require_license_features::<License>([])
         .summary("User events stream (SSE)")
         .description("Real-time stream of user events as Server-Sent Events")
-        .tag("users")
+        .tag(API_TAG)
         .handler(handlers::users_events)
         .sse_json::<dto::UserEvent>(openapi, "SSE stream of UserEvent")
         .register(router, openapi);

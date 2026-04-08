@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;
 use modkit::bootstrap::{
     AppConfig, dump_effective_modules_config_json, dump_effective_modules_config_yaml,
-    host::init_logging_unified, list_module_names, run_migrate, run_server,
+    host::init_logging_unified, host::init_panic_tracing, list_module_names, run_migrate,
+    run_server,
 };
 
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[derive(Parser)]
 #[command(name = "hyperspot-server")]
 #[command(about = "HyperSpot Server - modular platform for AI services")]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[allow(clippy::struct_excessive_bools)]
 struct Cli {
     /// Path to configuration file
@@ -72,19 +73,17 @@ async fn main() -> Result<()> {
     let mut config = AppConfig::load_or_default(&cli.config)?;
     config.apply_cli_overrides(cli.verbose);
 
+    // Application-level default for the OTel service name
+    if config.opentelemetry.resource.service_name.is_none() {
+        config.opentelemetry.resource.service_name = Some("hyperspot".to_owned());
+    }
+
     // Build OpenTelemetry layer before logging
-    // Convert TracingConfig from modkit::bootstrap to modkit's type (they have identical structure)
     #[cfg(feature = "otel")]
-    let modkit_tracing_config: Option<modkit::telemetry::TracingConfig> = config
-        .tracing
-        .as_ref()
-        .and_then(|tc| serde_json::to_value(tc).ok())
-        .and_then(|v| serde_json::from_value(v).ok());
-    #[cfg(feature = "otel")]
-    let otel_layer = if let Some(tc) = modkit_tracing_config.as_ref()
-        && tc.enabled
-    {
-        Some(modkit::telemetry::init::init_tracing(tc)?)
+    let otel_layer = if config.opentelemetry.tracing.enabled {
+        Some(modkit::telemetry::init::init_tracing(
+            &config.opentelemetry,
+        )?)
     } else {
         None
     };
@@ -92,13 +91,21 @@ async fn main() -> Result<()> {
     let otel_layer = None;
 
     // Initialize logging + otel in one Registry
-    let logging_config = config.logging.clone().unwrap_or_default();
-    init_logging_unified(&logging_config, &config.server.home_dir, otel_layer);
+    init_logging_unified(&config.logging, &config.server.home_dir, otel_layer);
+
+    // Register custom panic hook to reroute panic backtrace into tracing.
+    init_panic_tracing();
+
+    // Initialize OpenTelemetry metrics (or confirm noop when disabled)
+    #[cfg(feature = "otel")]
+    if let Err(e) = modkit::telemetry::init::init_metrics_provider(&config.opentelemetry) {
+        tracing::error!(error = %e, "OpenTelemetry metrics not initialized");
+    }
 
     // One-time connectivity probe
     #[cfg(feature = "otel")]
-    if let Some(tc) = modkit_tracing_config.as_ref()
-        && let Err(e) = modkit::telemetry::init::otel_connectivity_probe(tc)
+    if config.opentelemetry.tracing.enabled
+        && let Err(e) = modkit::telemetry::init::otel_connectivity_probe(&config.opentelemetry)
     {
         tracing::error!(error = %e, "OTLP connectivity probe failed");
     }
@@ -108,7 +115,11 @@ async fn main() -> Result<()> {
         tracing::info!("startup span alive - traces should be visible in Jaeger");
     });
 
-    tracing::info!("HyperSpot Server starting");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        rust_version = env!("CARGO_PKG_RUST_VERSION"),
+        "HyperSpot Server starting",
+    );
 
     // Print config and exit if requested
     if cli.print_config {

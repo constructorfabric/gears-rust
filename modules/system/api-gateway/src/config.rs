@@ -41,6 +41,16 @@ pub struct ApiGatewayConfig {
     /// If true, routes without explicit security requirement still require authentication (AuthN-only).
     #[serde(default = "default_require_auth_by_default")]
     pub require_auth_by_default: bool,
+
+    /// Optional URL path prefix prepended to every route (e.g. `"/cf"` → `/cf/users`).
+    /// Must start with a leading slash; trailing slashes are stripped automatically.
+    /// Empty string (the default) means no prefix.
+    #[serde(default)]
+    pub prefix_path: String,
+
+    /// HTTP metrics settings.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,6 +121,20 @@ impl Default for CorsConfig {
             max_age_seconds: 600,
         }
     }
+}
+
+/// HTTP metrics configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct MetricsConfig {
+    /// Optional prefix for HTTP metrics instrument names.
+    ///
+    /// When set, metric names become `{prefix}.http.server.request.duration`
+    /// and `{prefix}.http.server.active_requests` instead of the default
+    /// OpenTelemetry semantic convention names.
+    ///
+    /// Empty string (the default) means no prefix — standard `OTel` names are used.
+    pub prefix: String,
 }
 
 /// `OpenAPI` document metadata configuration

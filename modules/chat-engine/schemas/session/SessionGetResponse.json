@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.session.get_response.v1",
+  "title": "SessionGetResponse",
+  "description": "Response containing full session details",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "$ref": "../common/GtsSessionId.json",
+      "description": "Session identifier"
+    },
+    "tenant_id": {
+      "$ref": "../common/GtsTenantId.json",
+      "description": "Owning tenant"
+    },
+    "user_id": {
+      "$ref": "../common/GtsUserId.json",
+      "description": "Owning user"
+    },
+    "client_id": {
+      "$ref": "../common/GtsClientId.json",
+      "description": "Calling application identifier"
+    },
+    "session_type_id": {
+      "$ref": "../common/GtsSessionTypeId.json",
+      "description": "Current session type"
+    },
+    "enabled_capabilities": {
+      "type": "array",
+      "items": { "$ref": "../common/Capability.json" },
+      "description": "Available capabilities for this session"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Session metadata",
+      "additionalProperties": true
+    },
+    "lifecycle_state": {
+      "$ref": "../common/LifecycleState.json",
+      "description": "Current lifecycle state"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Session creation timestamp",
+      "examples": ["2024-01-15T10:30:00Z"]
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Last modification timestamp",
+      "examples": ["2024-01-15T10:30:00Z"]
+    },
+    "memory_strategy": {
+      "oneOf": [
+        { "$ref": "../common/MemoryStrategy.json" },
+        { "type": "null" }
+      ],
+      "description": "Conversation memory management strategy; null means default (full history)"
+    }
+  },
+  "required": ["session_id", "tenant_id", "user_id", "session_type_id", "enabled_capabilities", "lifecycle_state", "created_at", "updated_at"],
+  "additionalProperties": false
+}

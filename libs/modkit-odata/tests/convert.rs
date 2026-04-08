@@ -1,22 +1,22 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-#[cfg(feature = "with-odata-params")]
 mod tests {
     use modkit_odata::ast::*;
-    use odata_params::filters as od;
+    use modkit_odata::parse_filter_string;
 
     #[test]
     fn converts_and_contains() {
-        let src = od::parse_str("score ge 10 and contains(email,'@acme.com')").unwrap();
-        let dst: Expr = src.into();
+        let dst = parse_filter_string("score ge 10 and contains(email,'@acme.com')")
+            .unwrap()
+            .into_expr();
 
         match dst {
             Expr::And(a, b) => {
                 match *a {
                     Expr::Compare(l, op, r) => {
-                        matches!(*l, Expr::Identifier(_));
+                        assert!(matches!(*l, Expr::Identifier(_)));
                         assert!(matches!(op, CompareOperator::Ge));
-                        matches!(*r, Expr::Value(Value::Number(_)));
+                        assert!(matches!(*r, Expr::Value(Value::Number(_))));
                     }
                     _ => panic!("left not compare"),
                 }
@@ -35,11 +35,11 @@ mod tests {
 
     #[test]
     fn converts_in_uuid() {
-        let src = od::parse_str(
+        let dst = parse_filter_string(
             "id in (00000000-0000-0000-0000-000000000001, 00000000-0000-0000-0000-000000000002)",
         )
-        .unwrap();
-        let dst: Expr = src.into();
+        .unwrap()
+        .into_expr();
         if let Expr::In(lhs, list) = dst {
             assert!(matches!(*lhs, Expr::Identifier(_)));
             assert_eq!(list.len(), 2);

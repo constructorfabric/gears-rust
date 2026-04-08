@@ -135,7 +135,7 @@ async fn rejects_non_base_feature_requirement() {
                 "bind_addr": "0.0.0.0:8080",
                 "enable_docs": false,
                 "cors_enabled": false,
-                "auth_disabled": true
+                "auth_disabled": true,
             }
         }
     });
@@ -146,13 +146,13 @@ async fn rejects_non_base_feature_requirement() {
     let api_gateway = api_gateway::ApiGateway::default();
     api_gateway.init(&api_ctx).await.expect("Failed to init");
 
-    let router = Router::new();
+    let mut router = Router::new();
     let test_module = TestLicenseModule;
-    let router = test_module
+    router = test_module
         .register_rest(&test_ctx, router, &api_gateway)
         .expect("Failed to register routes");
 
-    let router = api_gateway
+    router = api_gateway
         .rest_finalize(&api_ctx, router)
         .expect("Failed to finalize");
 
@@ -170,6 +170,62 @@ async fn rejects_non_base_feature_requirement() {
 }
 
 #[tokio::test]
+async fn rejects_non_base_feature_requirement_with_prefix() {
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "enable_docs": false,
+                "cors_enabled": false,
+                "auth_disabled": true,
+                "prefix_path": "/cf",
+            }
+        }
+    });
+
+    let api_ctx = create_api_gateway_ctx(config);
+    let test_ctx = create_test_module_ctx();
+
+    let api_gateway = api_gateway::ApiGateway::default();
+    api_gateway.init(&api_ctx).await.expect("Failed to init");
+
+    let mut router = Router::new();
+    let test_module = TestLicenseModule;
+    router = test_module
+        .register_rest(&test_ctx, router, &api_gateway)
+        .expect("Failed to register routes");
+
+    router = api_gateway
+        .rest_finalize(&api_ctx, router)
+        .expect("Failed to finalize");
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/cf/tests/v1/license/bad")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/tests/v1/license/bad")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn allows_base_feature_requirement() {
     let config = json!({
         "api-gateway": {
@@ -177,7 +233,7 @@ async fn allows_base_feature_requirement() {
                 "bind_addr": "0.0.0.0:8080",
                 "enable_docs": false,
                 "cors_enabled": false,
-                "auth_disabled": true
+                "auth_disabled": true,
             }
         }
     });
@@ -212,14 +268,15 @@ async fn allows_base_feature_requirement() {
 }
 
 #[tokio::test]
-async fn allows_no_license_requirement() {
+async fn allows_base_feature_requirement_with_prefix() {
     let config = json!({
         "api-gateway": {
             "config": {
                 "bind_addr": "0.0.0.0:8080",
                 "enable_docs": false,
                 "cors_enabled": false,
-                "auth_disabled": true
+                "auth_disabled": true,
+                "prefix_path": "/cf",
             }
         }
     });
@@ -233,6 +290,48 @@ async fn allows_no_license_requirement() {
     let router = Router::new();
     let test_module = TestLicenseModule;
     let router = test_module
+        .register_rest(&test_ctx, router, &api_gateway)
+        .expect("Failed to register routes");
+
+    let router = api_gateway
+        .rest_finalize(&api_ctx, router)
+        .expect("Failed to finalize");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/cf/tests/v1/license/good")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn allows_no_license_requirement() {
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "enable_docs": false,
+                "cors_enabled": false,
+                "auth_disabled": true,
+            }
+        }
+    });
+
+    let api_ctx = create_api_gateway_ctx(config);
+    let test_ctx = create_test_module_ctx();
+
+    let api_gateway = api_gateway::ApiGateway::default();
+    api_gateway.init(&api_ctx).await.expect("Failed to init");
+
+    let mut router = Router::new();
+    let test_module = TestLicenseModule;
+    router = test_module
         .register_rest(&test_ctx, router, &api_gateway)
         .expect("Failed to register routes");
 

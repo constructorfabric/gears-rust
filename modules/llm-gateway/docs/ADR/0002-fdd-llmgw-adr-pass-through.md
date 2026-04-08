@@ -1,5 +1,19 @@
 # ADR-0002: Pass-through Content Processing
 
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+- [Related Design Elements](#related-design-elements)
+
+<!-- /toc -->
+
 **Date**: 2026-01-29
 
 **Status**: Accepted

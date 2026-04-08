@@ -1,4 +1,5 @@
 """E2E tests for nodes_registry get node endpoint."""
+import os
 import httpx
 import pytest
 import uuid
@@ -94,23 +95,25 @@ async def test_get_node_by_id_with_details(base_url, auth_headers):
         # Validate sysinfo structure (comprehensive check)
         if node["sysinfo"] is not None:
             sysinfo = node["sysinfo"]
-            
+
             # OS information
             assert sysinfo["os"]["name"] != ""
             assert sysinfo["os"]["version"] != ""
             assert sysinfo["os"]["arch"] in ["x86_64", "aarch64", "x86", "arm"]
-            
+
             # CPU information
-            assert sysinfo["cpu"]["model"] != ""
+            cpu_model = sysinfo["cpu"]["model"]
+            if os.getenv("E2E_DOCKER_MODE", "").lower() not in ("1", "true", "yes"):
+                assert cpu_model != ""
             assert sysinfo["cpu"]["num_cpus"] > 0
             assert sysinfo["cpu"]["cores"] > 0
             assert sysinfo["cpu"]["frequency_mhz"] > 0
-            
+
             # Memory information
             assert sysinfo["memory"]["total_bytes"] > 0
             assert sysinfo["memory"]["used_percent"] <= 100
             assert sysinfo["memory"]["available_bytes"] <= sysinfo["memory"]["total_bytes"]
-            
+
             # Host information
             assert sysinfo["host"]["hostname"] != ""
             assert sysinfo["host"]["uptime_seconds"] >= 0

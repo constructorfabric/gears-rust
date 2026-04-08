@@ -1,0 +1,56 @@
+error: tag format is invalid
+  --> $DIR/invalid_tag_format.rs:11:14
+   |
+LL |         .tag("simple resource registry")  // lowercase words
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: tags must contain whitespace-separated words, each starting with a capital letter
+   = note: example: "User Management", "Simple Resource Registry"
+   = note: `#[deny(de0205_operation_builder)]` on by default
+
+error: tag format is invalid
+  --> $DIR/invalid_tag_format.rs:17:14
+   |
+LL |         .tag("Simple resource registry")  // mixed case
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: tags must contain whitespace-separated words, each starting with a capital letter
+   = note: example: "User Management", "Simple Resource Registry"
+
+error: tag format is invalid
+  --> $DIR/invalid_tag_format.rs:23:14
+   |
+LL |         .tag("registry")  // single lowercase word
+   |              ^^^^^^^^^^
+   |
+   = help: tags must contain whitespace-separated words, each starting with a capital letter
+   = note: example: "User Management", "Simple Resource Registry"
+
+error: tag format is invalid
+  --> $DIR/invalid_tag_format.rs:29:14
+   |
+LL |         .tag("")  // empty string
+   |              ^^
+   |
+   = help: tags must contain whitespace-separated words, each starting with a capital letter
+   = note: example: "User Management", "Simple Resource Registry"
+
+error: tag must be a string literal or const string
+  --> $DIR/invalid_tag_format.rs:36:14
+   |
+LL |         .tag(tag_name)  // variable, not string literal or const
+   |              ^^^^^^^^
+   |
+   = help: use a string literal like `.tag("Your Tag")` or a const string
+
+error: tag format is invalid
+  --> $DIR/invalid_tag_format.rs:42:14
+   |
+LL |         .tag(INVALID_TAG)  // const with invalid format
+   |              ^^^^^^^^^^^
+   |
+   = help: tags must contain whitespace-separated words, each starting with a capital letter
+   = note: example: "User Management", "Simple Resource Registry"
+
+error: aborting due to 6 previous errors
+

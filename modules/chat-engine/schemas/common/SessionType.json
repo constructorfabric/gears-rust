@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.common.session_type.v1",
+  "title": "SessionType",
+  "description": "Session type configuration defining the backend plugin and capabilities. Multiple session types can share the same plugin_instance_id with different plugin configurations stored in the separate plugin_configs entity (see ADR-0022).",
+  "type": "object",
+  "properties": {
+    "session_type_id": {
+      "$ref": "./GtsSessionTypeId.json",
+      "description": "Unique session type identifier"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable session type name"
+    },
+    "description": {
+      "type": "string",
+      "description": "Detailed description of the session type"
+    },
+    "plugin_instance_id": {
+      "$ref": "./GtsPluginInstanceId.json",
+      "description": "GTS instance ID of the registered ChatEngineBackendPlugin. Multiple session types may reference the same plugin_instance_id with different plugin configs (see ADR-0022)"
+    },
+    "available_capabilities": {
+      "type": "array",
+      "items": { "$ref": "./Capability.json" },
+      "description": "Capabilities returned by the plugin via `on_session_type_configured`. This is the maximum set available for UI display and session type discovery. Users select `Session.enabled_capabilities` from this catalog."
+    },
+    "retention_policy": {
+      "oneOf": [
+        { "$ref": "./RetentionPolicy.json" },
+        { "type": "null" }
+      ],
+      "description": "Data retention and lifecycle policy for sessions of this type"
+    }
+  },
+  "required": ["session_type_id", "name", "plugin_instance_id", "available_capabilities"],
+  "additionalProperties": false
+}

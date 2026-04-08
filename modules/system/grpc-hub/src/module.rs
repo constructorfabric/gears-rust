@@ -6,6 +6,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use modkit::{
     DirectoryClient,
+    client_hub::ClientHub,
     context::ModuleCtx,
     contracts::{Module, SystemCapability},
     lifecycle::ReadySignal,
@@ -74,7 +75,7 @@ pub(crate) enum ListenConfig {
 pub struct GrpcHub {
     pub(crate) listen_cfg: RwLock<ListenConfig>,
     pub(crate) installer_store: OnceLock<Arc<GrpcInstallerStore>>,
-    pub(crate) directory: OnceLock<Option<Arc<dyn DirectoryClient>>>,
+    pub(crate) client_hub: OnceLock<Arc<ClientHub>>,
     pub(crate) instance_id: OnceLock<String>,
     pub(crate) bound_endpoint: RwLock<Option<String>>,
 }
@@ -84,7 +85,7 @@ impl Default for GrpcHub {
         Self {
             listen_cfg: RwLock::new(ListenConfig::Tcp(DEFAULT_LISTEN_ADDR)),
             installer_store: OnceLock::new(),
-            directory: OnceLock::new(),
+            client_hub: OnceLock::new(),
             instance_id: OnceLock::new(),
             bound_endpoint: RwLock::new(None),
         }
@@ -126,6 +127,14 @@ impl GrpcHub {
     /// Set the bound endpoint after the server has started listening.
     fn set_bound_endpoint(&self, endpoint: String) {
         *self.bound_endpoint.write() = Some(endpoint);
+    }
+
+    /// Resolve `DirectoryClient` lazily from the stored `ClientHub`.
+    /// Returns `None` if no `DirectoryClient` has been registered.
+    fn resolve_directory_client(&self) -> Option<Arc<dyn DirectoryClient>> {
+        self.client_hub
+            .get()
+            .and_then(|hub| hub.get::<dyn DirectoryClient>().ok())
     }
 
     /// Parse and apply listen address configuration.
@@ -276,8 +285,7 @@ impl GrpcHub {
 
     /// Deregister modules from Directory on shutdown.
     async fn deregister_modules(&self, modules: &[ModuleInstallers]) -> anyhow::Result<()> {
-        let directory = self.directory.get().cloned().unwrap_or(None);
-        let Some(directory) = directory else {
+        let Some(directory) = self.resolve_directory_client() else {
             return Ok(());
         };
 
@@ -442,8 +450,7 @@ impl GrpcHub {
         modules: &[ModuleInstallers],
         endpoint: &str,
     ) -> anyhow::Result<()> {
-        let directory = self.directory.get().cloned().unwrap_or(None);
-        let Some(directory) = directory else {
+        let Some(directory) = self.resolve_directory_client() else {
             tracing::info!("DirectoryClient not available; skipping Directory registration");
             return Ok(());
         };
@@ -538,11 +545,10 @@ impl Module for GrpcHub {
         // Parse listen_addr into appropriate transport type
         self.apply_listen_config(&cfg.listen_addr)?;
 
-        // Fetch DirectoryClient from ClientHub if available and persist the decision exactly once.
-        let dir = ctx.client_hub().get::<dyn DirectoryClient>().ok();
-        self.directory
-            .set(dir)
-            .map_err(|_| anyhow::anyhow!("DirectoryClient already set (init called twice?)"))?;
+        // Store ClientHub reference for lazy DirectoryClient resolution during serve phase.
+        self.client_hub
+            .set(ctx.client_hub())
+            .map_err(|_| anyhow::anyhow!("ClientHub already set (init called twice?)"))?;
 
         Ok(())
     }
@@ -1017,5 +1023,87 @@ mod tests {
             .await
             .expect("task should join successfully")
             .expect("should exit cleanly with no services");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_directory_client_lazy_after_init() {
+        use modkit::{
+            DirectoryClient as DirectoryClientTrait, RegisterInstanceInfo, ServiceEndpoint,
+            ServiceInstanceInfo,
+        };
+
+        struct MockDirectoryClient;
+
+        #[async_trait]
+        impl DirectoryClientTrait for MockDirectoryClient {
+            async fn resolve_grpc_service(
+                &self,
+                _service_name: &str,
+            ) -> anyhow::Result<ServiceEndpoint> {
+                Ok(ServiceEndpoint::new("mock://endpoint"))
+            }
+            async fn list_instances(
+                &self,
+                _module: &str,
+            ) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
+                Ok(vec![])
+            }
+            async fn register_instance(&self, _info: RegisterInstanceInfo) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn deregister_instance(
+                &self,
+                _module: &str,
+                _instance_id: &str,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_heartbeat(
+                &self,
+                _module: &str,
+                _instance_id: &str,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct EmptyConfigProvider;
+        impl ConfigProvider for EmptyConfigProvider {
+            fn get_module_config(&self, _module_name: &str) -> Option<&serde_json::Value> {
+                None
+            }
+        }
+
+        let client_hub = Arc::new(ClientHub::default());
+        let hub = GrpcHub::default();
+        let cancel = CancellationToken::new();
+
+        // Create context with an empty ClientHub (no DirectoryClient yet)
+        let ctx = ModuleCtx::new(
+            "grpc-hub",
+            Uuid::new_v4(),
+            Arc::new(EmptyConfigProvider),
+            Arc::clone(&client_hub),
+            cancel,
+            None,
+        );
+
+        hub.init(&ctx).await.expect("init should succeed");
+
+        // DirectoryClient is NOT registered yet — should return None
+        assert!(
+            hub.resolve_directory_client().is_none(),
+            "should be None before DirectoryClient is registered"
+        );
+
+        // Simulate module_orchestrator registering DirectoryClient after grpc-hub init
+        let mock_dir: Arc<dyn DirectoryClientTrait> = Arc::new(MockDirectoryClient);
+        client_hub.register::<dyn DirectoryClientTrait>(mock_dir);
+
+        // Now lazy resolution should find it
+        assert!(
+            hub.resolve_directory_client().is_some(),
+            "should resolve DirectoryClient registered after init()"
+        );
     }
 }

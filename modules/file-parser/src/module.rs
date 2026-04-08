@@ -35,8 +35,6 @@ impl Module for FileParserModule {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
         const BYTES_IN_MB: u64 = 1024_u64 * 1024;
 
-        info!("Initializing {} module", Self::MODULE_NAME);
-
         // Load module configuration
         let cfg: FileParserConfig = ctx.config()?;
         debug!(
@@ -99,7 +97,6 @@ impl Module for FileParserModule {
             .set(file_parser_service)
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
-        info!("{} module initialized successfully", Self::MODULE_NAME);
         Ok(())
     }
 }

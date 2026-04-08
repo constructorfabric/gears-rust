@@ -9,10 +9,10 @@ fn calculate_percent(used: u64, total: u64) -> u32 {
     if total == 0 {
         return 0;
     }
-    // Use f64 for division to satisfy clippy::integer_division
-    let percent = (used * 100) / total;
-    // Clamp to 0-100 range - percent is always positive here
-    percent.min(100).try_into().unwrap_or(0)
+    // Widen to u128 before multiplying to prevent overflow (used * 100 wraps at ~184 PB on u64).
+    // Clamp to 100 in u128 space before narrowing to avoid truncation (denied by cast_possible_truncation).
+    let percent = (u128::from(used) * 100 / u128::from(total)).min(100);
+    u32::try_from(percent).unwrap_or(0)
 }
 
 /// Collects system information for the current node
@@ -200,5 +200,40 @@ impl SysInfoCollector {
 impl Default for SysInfoCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calculate_percent;
+
+    #[test]
+    fn test_calculate_percent_zero_total() {
+        assert_eq!(calculate_percent(0, 0), 0);
+        assert_eq!(calculate_percent(100, 0), 0);
+    }
+
+    #[test]
+    fn test_calculate_percent_normal() {
+        assert_eq!(calculate_percent(50, 100), 50);
+        assert_eq!(calculate_percent(1, 4), 25);
+        assert_eq!(calculate_percent(3, 4), 75);
+        assert_eq!(calculate_percent(0, 100), 0);
+    }
+
+    #[test]
+    fn test_calculate_percent_full() {
+        assert_eq!(calculate_percent(100, 100), 100);
+        assert_eq!(calculate_percent(200, 100), 100);
+    }
+
+    #[test]
+    fn test_calculate_percent_overflow_repro() {
+        // used = u64::MAX would overflow u64 * 100 without u128 widening
+        assert_eq!(calculate_percent(u64::MAX, 1), 100);
+        assert_eq!(calculate_percent(u64::MAX, u64::MAX), 100);
+        // Very large values typical of PB-scale storage
+        let petabyte: u64 = 1_000_000_000_000_000;
+        assert_eq!(calculate_percent(petabyte, 2 * petabyte), 50);
     }
 }

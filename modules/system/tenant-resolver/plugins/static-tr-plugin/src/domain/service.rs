@@ -31,13 +31,13 @@ impl Service {
             .iter()
             .map(|t| {
                 (
-                    t.id,
+                    TenantId(t.id),
                     TenantInfo {
-                        id: t.id,
+                        id: TenantId(t.id),
                         name: t.name.clone(),
                         status: t.status,
                         tenant_type: t.tenant_type.clone(),
-                        parent_id: t.parent_id,
+                        parent_id: t.parent_id.map(TenantId),
                         self_managed: t.self_managed,
                     },
                 )
@@ -348,7 +348,7 @@ mod tests {
 
         let a = service
             .tenants
-            .get(&Uuid::parse_str(TENANT_A).unwrap())
+            .get(&TenantId(Uuid::parse_str(TENANT_A).unwrap()))
             .unwrap();
         assert_eq!(a.name, "Tenant A");
         assert_eq!(a.status, TenantStatus::Active);
@@ -372,9 +372,9 @@ mod tests {
         assert_eq!(service.tenants.len(), 3);
 
         // Check children index
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
-        let c_id = Uuid::parse_str(TENANT_C).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
+        let c_id = TenantId(Uuid::parse_str(TENANT_C).unwrap());
 
         let a_children = service.children.get(&a_id).unwrap();
         assert_eq!(a_children.len(), 1);
@@ -397,7 +397,7 @@ mod tests {
             ..Default::default()
         };
         let service = Service::from_config(&cfg);
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
 
         let ancestors = service.collect_ancestors(a_id, BarrierMode::Respect);
         assert!(ancestors.is_empty());
@@ -416,9 +416,9 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
-        let c_id = Uuid::parse_str(TENANT_C).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
+        let c_id = TenantId(Uuid::parse_str(TENANT_C).unwrap());
 
         // Ancestors of C should be [B, A]
         let ancestors = service.collect_ancestors(c_id, BarrierMode::Respect);
@@ -445,9 +445,9 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
-        let c_id = Uuid::parse_str(TENANT_C).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
+        let c_id = TenantId(Uuid::parse_str(TENANT_C).unwrap());
 
         // With BarrierMode::Respect, ancestors of C stop at B
         let ancestors = service.collect_ancestors(c_id, BarrierMode::Respect);
@@ -474,8 +474,8 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
 
         // With BarrierMode::Respect, B cannot see its parent chain
         let ancestors = service.collect_ancestors(b_id, BarrierMode::Respect);
@@ -496,7 +496,7 @@ mod tests {
             ..Default::default()
         };
         let service = Service::from_config(&cfg);
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
 
         let descendants = service.collect_descendants(a_id, &[], BarrierMode::Respect, None);
         assert!(descendants.is_empty());
@@ -515,9 +515,9 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
-        let c_id = Uuid::parse_str(TENANT_C).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
+        let c_id = TenantId(Uuid::parse_str(TENANT_C).unwrap());
 
         // Descendants of A (unlimited depth)
         let descendants = service.collect_descendants(a_id, &[], BarrierMode::Respect, None);
@@ -545,9 +545,9 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
-        let c_id = Uuid::parse_str(TENANT_C).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
+        let c_id = TenantId(Uuid::parse_str(TENANT_C).unwrap());
 
         // With BarrierMode::Respect, descendants of A exclude B (barrier) and its subtree
         let descendants = service.collect_descendants(a_id, &[], BarrierMode::Respect, None);
@@ -575,8 +575,8 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let d_id = Uuid::parse_str(TENANT_D).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let d_id = TenantId(Uuid::parse_str(TENANT_D).unwrap());
 
         // With BarrierMode::Respect, only D is visible
         let descendants = service.collect_descendants(a_id, &[], BarrierMode::Respect, None);
@@ -593,7 +593,7 @@ mod tests {
             ..Default::default()
         };
         let service = Service::from_config(&cfg);
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
 
         // Self is NOT an ancestor of self
         assert!(
@@ -614,8 +614,8 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
 
         assert!(
             service
@@ -642,8 +642,8 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let c_id = Uuid::parse_str(TENANT_C).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let c_id = TenantId(Uuid::parse_str(TENANT_C).unwrap());
 
         assert!(
             service
@@ -665,9 +665,9 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
-        let c_id = Uuid::parse_str(TENANT_C).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
+        let c_id = TenantId(Uuid::parse_str(TENANT_C).unwrap());
 
         // B is direct parent of C - no barrier crossed
         assert!(
@@ -705,8 +705,8 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
 
         // A is NOT ancestor of B when B is a barrier (BarrierMode::Respect)
         assert!(
@@ -738,8 +738,8 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let nonexistent = Uuid::parse_str(TENANT_B).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let nonexistent = TenantId(Uuid::parse_str(TENANT_B).unwrap());
 
         // Nonexistent ancestor
         assert!(matches!(
@@ -757,25 +757,25 @@ mod tests {
     #[test]
     fn collect_ancestors_cycle_terminates() {
         // Create a cycle: A -> B -> A (via parent_id)
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
 
         let cfg = StaticTrPluginConfig {
             tenants: vec![
                 TenantConfig {
-                    id: a_id,
+                    id: a_id.0,
                     name: "A".to_owned(),
                     status: TenantStatus::Active,
                     tenant_type: None,
-                    parent_id: Some(b_id),
+                    parent_id: Some(b_id.0),
                     self_managed: false,
                 },
                 TenantConfig {
-                    id: b_id,
+                    id: b_id.0,
                     name: "B".to_owned(),
                     status: TenantStatus::Active,
                     tenant_type: None,
-                    parent_id: Some(a_id),
+                    parent_id: Some(a_id.0),
                     self_managed: false,
                 },
             ],
@@ -791,30 +791,30 @@ mod tests {
     #[test]
     fn is_ancestor_of_cycle_terminates() {
         // Create a cycle: A -> B -> A (via parent_id)
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
-        let c_id = Uuid::parse_str(TENANT_C).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
+        let c_id = TenantId(Uuid::parse_str(TENANT_C).unwrap());
 
         let cfg = StaticTrPluginConfig {
             tenants: vec![
                 TenantConfig {
-                    id: a_id,
+                    id: a_id.0,
                     name: "A".to_owned(),
                     status: TenantStatus::Active,
                     tenant_type: None,
-                    parent_id: Some(b_id),
+                    parent_id: Some(b_id.0),
                     self_managed: false,
                 },
                 TenantConfig {
-                    id: b_id,
+                    id: b_id.0,
                     name: "B".to_owned(),
                     status: TenantStatus::Active,
                     tenant_type: None,
-                    parent_id: Some(a_id),
+                    parent_id: Some(a_id.0),
                     self_managed: false,
                 },
                 TenantConfig {
-                    id: c_id,
+                    id: c_id.0,
                     name: "C".to_owned(),
                     status: TenantStatus::Active,
                     tenant_type: None,
@@ -846,8 +846,8 @@ mod tests {
         };
         let service = Service::from_config(&cfg);
 
-        let a_id = Uuid::parse_str(TENANT_A).unwrap();
-        let b_id = Uuid::parse_str(TENANT_B).unwrap();
+        let a_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let b_id = TenantId(Uuid::parse_str(TENANT_B).unwrap());
 
         assert!(
             !service

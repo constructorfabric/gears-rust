@@ -123,12 +123,19 @@ struct HeadersConfig {
     response: Option<ResponseHeaderRules>,
 }
 
+#[derive(Deserialize)]
+struct PluginBinding {
+    plugin_ref: String,
+    #[serde(default)]
+    config: HashMap<String, String>,
+}
+
 #[derive(Deserialize, Default)]
 struct PluginsConfig {
     #[serde(default)]
     sharing: SharingMode,
     #[serde(default)]
-    items: Vec<String>,
+    items: Vec<PluginBinding>,
 }
 
 #[derive(Deserialize, Default)]
@@ -449,11 +456,20 @@ impl From<RateLimitConfig> for domain::RateLimitConfig {
     }
 }
 
+impl From<PluginBinding> for domain::PluginBinding {
+    fn from(v: PluginBinding) -> Self {
+        Self {
+            plugin_ref: v.plugin_ref,
+            config: v.config,
+        }
+    }
+}
+
 impl From<PluginsConfig> for domain::PluginsConfig {
     fn from(v: PluginsConfig) -> Self {
         Self {
             sharing: v.sharing.into(),
-            items: v.items,
+            items: v.items.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -508,21 +524,22 @@ impl From<MatchRules> for domain::MatchRules {
     }
 }
 
-impl From<UpstreamPayload> for ProvisionedUpstream {
-    fn from(p: UpstreamPayload) -> Self {
-        Self {
-            tenant_id: p.tenant_id,
+impl UpstreamPayload {
+    fn into_provisioned(self, gts_instance_id: Option<Uuid>) -> ProvisionedUpstream {
+        ProvisionedUpstream {
+            tenant_id: self.tenant_id,
             request: domain::CreateUpstreamRequest {
-                server: p.server.into(),
-                protocol: p.protocol,
-                alias: p.alias,
-                auth: p.auth.map(Into::into),
-                headers: p.headers.map(Into::into),
-                plugins: p.plugins.map(Into::into),
-                rate_limit: p.rate_limit.map(Into::into),
-                tags: p.tags,
-                enabled: p.enabled,
+                server: self.server.into(),
+                protocol: self.protocol,
+                alias: self.alias,
+                auth: self.auth.map(Into::into),
+                headers: self.headers.map(Into::into),
+                plugins: self.plugins.map(Into::into),
+                rate_limit: self.rate_limit.map(Into::into),
+                tags: self.tags,
+                enabled: self.enabled,
             },
+            gts_instance_id,
         }
     }
 }
@@ -542,6 +559,14 @@ impl From<RoutePayload> for ProvisionedRoute {
             },
         }
     }
+}
+
+/// Extract the instance UUID from a GTS identifier string.
+///
+/// Given `gts.x.core.oagw.upstream.v1~<hex-uuid>`, returns `Some(<Uuid>)`.
+fn extract_gts_instance_uuid(gts_id: &str) -> Option<Uuid> {
+    let instance = gts_id.rsplit('~').next()?;
+    Uuid::parse_str(instance).ok()
 }
 
 /// `TypeProvisioningService` implementation that delegates to `TypesRegistryClient`.
@@ -572,7 +597,8 @@ impl TypeProvisioningService for TypeProvisioningServiceImpl {
         for entity in entities {
             match serde_json::from_value::<UpstreamPayload>(entity.content.clone()) {
                 Ok(payload) => {
-                    result.push(payload.into());
+                    let gts_instance_id = extract_gts_instance_uuid(&entity.gts_id);
+                    result.push(payload.into_provisioned(gts_instance_id));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -859,7 +885,7 @@ mod tests {
         });
 
         let payload: UpstreamPayload = serde_json::from_value(json).unwrap();
-        let provisioned: ProvisionedUpstream = payload.into();
+        let provisioned = payload.into_provisioned(None);
 
         assert_eq!(provisioned.tenant_id, tenant);
         let req = &provisioned.request;
@@ -906,7 +932,7 @@ mod tests {
             },
             "plugins": {
                 "sharing": "inherit",
-                "items": ["plugin-a"]
+                "items": [{"plugin_ref": "plugin-a"}]
             },
             "rate_limit": {
                 "sustained": {"rate": 100, "window": "minute"},
@@ -941,7 +967,8 @@ mod tests {
 
         let plugins = req.plugins.as_ref().unwrap();
         assert_eq!(plugins.sharing, domain::SharingMode::Inherit);
-        assert_eq!(plugins.items, vec!["plugin-a"]);
+        assert_eq!(plugins.items.len(), 1);
+        assert_eq!(plugins.items[0].plugin_ref, "plugin-a");
 
         let rl = req.rate_limit.as_ref().unwrap();
         assert_eq!(rl.sustained.rate, 100);

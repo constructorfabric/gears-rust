@@ -18,7 +18,7 @@
 - **SDK pattern is the public API**: Use `<module>-sdk` crate for traits, models, errors. Do not expose internals.
 - **Secure-by-default DB access**: Use `SecureConn` + `AccessScope`. Modules cannot access raw database connections.
 - **RFC-9457 errors everywhere**: Use `Problem` (implements `IntoResponse`). Do not use `ProblemResponse`.
-- **Type-safe REST**: Use `OperationBuilder` with `.require_auth()` and `.standard_errors()`.
+- **Type-safe REST**: Use `OperationBuilder` with `.authenticated()` and `.standard_errors()`.
 - **OData macros are in `modkit-odata-macros`**: Use `modkit_odata_macros::ODataFilterable`.
 - **ClientHub registration**: `ctx.client_hub().register::<dyn MyModuleApi>(api)`; `ctx.client_hub().get::<dyn MyModuleApi>()?`.
 - **Cancellation**: Pass `CancellationToken` to background tasks for cooperative shutdown.
@@ -54,7 +54,8 @@ fn handler() -> ApiResult<T> { /* ... */ }
 
 // REST wiring
 OperationBuilder::get("/users")
-    .require_auth(&Resource::Users, &Action::Read)
+    .authenticated()
+    .require_license_features::<License>([])
     .handler(handler)
     .json_response_with_schema::<UserDto>(openapi, StatusCode::OK, "Users")
     .standard_errors(openapi)

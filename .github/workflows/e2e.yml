@@ -1,8 +1,12 @@
 name: e2e
 
 on:
-  push:
-    branches: ["main"]
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'guidelines/**'
   schedule:
     - cron: "0 2 * * *" # nightly full E2E at 02:00 UTC
   workflow_dispatch:
@@ -26,7 +30,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+  RUST_BACKTRACE: full
 
 jobs:
   e2e:
@@ -36,6 +40,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Set up Python
         uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.1
@@ -47,16 +56,30 @@ jobs:
 
       - name: Run E2E tests
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            make e2e-smoke
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" = "smoke" ]; then
-            make e2e-smoke
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            make e2e-local            # nightly — full suite
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" = "full" ]; then
+            make e2e-local            # manual — full suite
           else
-            make e2e
+            make e2e-local            # PR / manual-smoke, TODO: switch to e2e-local-smoke later
           fi
 
-      - name: Create or update issue on smoke failure
-        if: failure() && github.event_name == 'push'
+      - name: Run mini-chat E2E tests
+        run: make e2e-mini-chat
+
+      - name: Upload E2E logs
+        if: failure()
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: e2e-logs-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ github.workspace }}/tmp/e2e-logs/**
+            ${{ runner.home }}/.hyperspot/logs/**
+
+      - name: Create or update issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
@@ -92,10 +115,10 @@ jobs:
               }
             }
 
-            const title = "E2E smoke failed on main";
+            const title = "Nightly E2E failed";
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
             const body = [
-              "Smoke E2E tests failed on `main`.",
+              "Nightly E2E tests failed.",
               "",
               `- Commit: ${sha}`,
               `- Assigned to (latest commit author): @${assignee}`,
@@ -103,7 +126,7 @@ jobs:
             ].join("\n");
 
             const search = await github.rest.search.issuesAndPullRequests({
-              q: `repo:${owner}/${repo} is:issue is:open in:title "${title}" label:e2e-smoke`,
+              q: `repo:${owner}/${repo} is:issue is:open in:title "${title}" label:e2e-nightly`,
               per_page: 1,
             });
 
@@ -122,12 +145,7 @@ jobs:
                 repo,
                 title,
                 body,
-                labels: ["bug", "e2e-smoke", "ci"],
+                labels: ["bug", "e2e-nightly", "ci"],
               });
               await tryAssign(created.data.number);
             }
-
-      # cleans up stopped containers, dangling build cache, and unused networks.
-      - name: Docker cleanup
-        if: always()
-        run: docker system prune --force

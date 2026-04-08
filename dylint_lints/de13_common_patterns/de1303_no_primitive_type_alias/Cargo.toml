@@ -1,0 +1,33 @@
+# Created: 2026-03-13 by Constructor Tech
+# Updated: 2026-03-17 by Constructor Tech
+[package]
+name = "de1303_no_primitive_type_alias"
+version = "0.1.0"
+authors = ["Cyber Fabric"]
+description = "Disallow pub type X = primitive; use newtype for type safety (DE1303)"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "bad_uuid_type_alias"
+path = "ui/bad_uuid_type_alias.rs"
+
+[[example]]
+name = "good_uuid_newtype"
+path = "ui/good_uuid_newtype.rs"
+
+[dependencies]
+clippy_utils.workspace = true
+dylint_linting.workspace = true
+lint_utils.workspace = true
+
+[dev-dependencies]
+dylint_testing.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true

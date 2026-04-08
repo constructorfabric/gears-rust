@@ -18,12 +18,36 @@ name = "modkit_db"
 workspace = true
 
 [features]
-# You can use: sqlite + sea-orm for local development
 default = []
-pg = ["sea-orm/sqlx-postgres", "sqlx/postgres"]
-mysql = ["sea-orm/sqlx-mysql", "sqlx/mysql"]
-sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite"]
+
+# DB driver selection -- the single entry point for backend choice.
+# sea-orm and sea-orm-migration remain non-optional: modkit-db unconditionally
+# re-exports sea_orm_migration and uses sea_orm::{DatabaseConnection, DbErr, …}
+# in non-cfg-gated code.  sqlx is optional because every source-level use is
+# already behind #[cfg(feature = "pg"|"mysql"|"sqlite")].
+sqlite = [
+    "dep:sqlx",
+    "sqlx/sqlite",
+    "sea-orm/sqlx-sqlite",
+    "sea-orm-migration/sqlx-sqlite",
+]
+pg = [
+    "dep:sqlx",
+    "sqlx/postgres",
+    "sea-orm/sqlx-postgres",
+    "sea-orm-migration/sqlx-postgres",
+]
+mysql = [
+    "dep:sqlx",
+    "sqlx/mysql",
+    "sea-orm/sqlx-mysql",
+    "sea-orm-migration/sqlx-mysql",
+]
+
 integration = []
+
+# Transactional outbox pipeline (preview — API may change)
+preview-outbox = ["dep:tokio-util", "dep:futures-util"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -33,7 +57,7 @@ xxhash-rust = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true, features = ["serde", "clock"] }
 time = { workspace = true }
-sea-orm = { workspace = true, features = ["with-time"] }
+sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 modkit-db-macros = { workspace = true }
 thiserror = { workspace = true }
@@ -46,19 +70,49 @@ bigdecimal = { workspace = true }
 rust_decimal = { workspace = true }
 ryu = { workspace = true }
 url = { workspace = true }
-regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
 figment = { workspace = true }
-sqlx = { workspace = true, features = ["runtime-tokio"] }
+sqlx = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+[[example]]
+name = "outbox_transactional"
+required-features = ["sqlite", "preview-outbox"]
+
+[[example]]
+name = "outbox_retry_reject"
+required-features = ["sqlite", "preview-outbox"]
+
+[[example]]
+name = "outbox_dead_letters"
+required-features = ["sqlite", "preview-outbox"]
+
+[[example]]
+name = "outbox_batch_multi_queue"
+required-features = ["sqlite", "preview-outbox"]
+
+[[bench]]
+name = "outbox_throughput"
+harness = false
+required-features = ["preview-outbox"]
+
+[[bench]]
+name = "worker_overhead"
+harness = false
+required-features = ["preview-outbox"]
 
 [dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
 serde-saphyr = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 anyhow = { workspace = true }
 temp-env = { workspace = true }
 trybuild = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }

@@ -28,7 +28,7 @@ impl CalculatorServiceImpl {
 #[tonic::async_trait]
 impl CalculatorService for CalculatorServiceImpl {
     async fn add(&self, request: Request<AddRequest>) -> Result<Response<AddResponse>, Status> {
-        // Extract SecurityCtx from gRPC metadata (for authorization)
+        // Extract SecurityContext from gRPC metadata (for authorization)
         let _ctx = extract_secctx(request.metadata())?;
 
         let req = request.into_inner();

@@ -538,6 +538,138 @@ impl AccessScope {
             .iter()
             .any(|c| c.filters().iter().any(|f| f.property() == property))
     }
+
+    /// Create a new scope retaining only `owner_tenant_id` filters.
+    ///
+    /// Useful for entities declared with `no_owner` (e.g., messages, reactions),
+    /// where `owner_id` constraints cannot be resolved and would cause fail-closed
+    /// deny-all behaviour.
+    ///
+    /// - Unconstrained scopes become deny-all (fail-closed).
+    /// - Constraints that contain no `owner_tenant_id` filter are dropped entirely.
+    /// - If all constraints are dropped, the result is deny-all.
+    #[must_use]
+    pub fn tenant_only(&self) -> Self {
+        self.retain_properties(&[pep_properties::OWNER_TENANT_ID])
+    }
+
+    /// Create a new scope retaining only `owner_tenant_id` and `owner_id` filters.
+    ///
+    /// Useful for entities that have both tenant and owner columns but no
+    /// resource-level constraints (e.g., reactions scoped to the acting user).
+    ///
+    /// - Unconstrained scopes become deny-all (fail-closed).
+    /// - Constraints that contain none of the retained properties are dropped.
+    /// - If all constraints are dropped, the result is deny-all.
+    #[must_use]
+    pub fn tenant_and_owner(&self) -> Self {
+        self.retain_properties(&[pep_properties::OWNER_TENANT_ID, pep_properties::OWNER_ID])
+    }
+
+    /// Create a new scope that guarantees an `owner_id` equality filter
+    /// matching exactly the supplied `owner_id` is present in every constraint.
+    ///
+    /// **Intersection semantics**: if a constraint already contains an
+    /// `owner_id` filter, the supplied value must be among its values —
+    /// otherwise the constraint is dropped. When it matches, the filter is
+    /// narrowed to exactly that single value.
+    ///
+    /// - **Unconstrained** → single constraint with only the `owner_id` filter.
+    /// - **Deny-all** → stays deny-all.
+    /// - **No existing owner filter** → `owner_id` is injected.
+    /// - **Existing owner filter containing `owner_id`** → narrowed to `Eq`.
+    /// - **Existing owner filter NOT containing `owner_id`** → constraint dropped
+    ///   (constraints use OR semantics, so dropping one narrows access; dropping
+    ///   all yields deny-all).
+    ///
+    /// Use this as a defence-in-depth measure for user-owned resources when
+    /// the PDP may not always return `owner_id` constraints or may return a
+    /// broader set than the current subject.
+    #[must_use]
+    pub fn ensure_owner(&self, owner_id: Uuid) -> Self {
+        if self.is_deny_all() {
+            return Self::deny_all();
+        }
+
+        let owner_filter = ScopeFilter::eq(pep_properties::OWNER_ID, owner_id);
+
+        if self.unconstrained {
+            return Self::single(ScopeConstraint::new(vec![owner_filter]));
+        }
+
+        let constraints = self
+            .constraints
+            .iter()
+            .filter_map(|c| {
+                let owner_filters: Vec<&ScopeFilter> = c
+                    .filters()
+                    .iter()
+                    .filter(|f| f.property() == pep_properties::OWNER_ID)
+                    .collect();
+
+                if owner_filters.is_empty() {
+                    let mut filters = c.filters().to_vec();
+                    filters.push(owner_filter.clone());
+                    return Some(ScopeConstraint::new(filters));
+                }
+
+                // Intersection semantics: ALL owner_id predicates must contain
+                // the supplied owner_id, otherwise the constraint is dropped.
+                let all_match = owner_filters
+                    .iter()
+                    .all(|f| f.values().iter().any(|v| v.as_uuid() == Some(owner_id)));
+                if !all_match {
+                    return None;
+                }
+
+                // Fast path: single Eq already matches → constraint unchanged.
+                if owner_filters.len() == 1 && matches!(owner_filters[0], ScopeFilter::Eq(_)) {
+                    return Some(c.clone());
+                }
+
+                // Replace all owner_id filters with a single Eq.
+                let mut filters: Vec<ScopeFilter> = c
+                    .filters()
+                    .iter()
+                    .filter(|f| f.property() != pep_properties::OWNER_ID)
+                    .cloned()
+                    .collect();
+                filters.push(owner_filter.clone());
+                Some(ScopeConstraint::new(filters))
+            })
+            .collect();
+
+        Self::from_constraints(constraints)
+    }
+
+    /// Internal helper: build a new scope keeping only filters whose property
+    /// is in the given whitelist.
+    fn retain_properties(&self, properties: &[&str]) -> Self {
+        if self.unconstrained {
+            return Self::deny_all();
+        }
+
+        let constraints = self
+            .constraints
+            .iter()
+            .filter_map(|c| {
+                let kept: Vec<ScopeFilter> = c
+                    .filters()
+                    .iter()
+                    .filter(|f| properties.contains(&f.property()))
+                    .cloned()
+                    .collect();
+
+                if kept.is_empty() {
+                    None
+                } else {
+                    Some(ScopeConstraint::new(kept))
+                }
+            })
+            .collect();
+
+        Self::from_constraints(constraints)
+    }
 }
 
 #[cfg(test)]
@@ -599,5 +731,215 @@ mod tests {
         )]));
         assert!(scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
         assert!(!scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T2)));
+    }
+
+    // --- tenant_only ---
+
+    #[test]
+    fn tenant_only_strips_owner_id() {
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, uid(T1)),
+            ScopeFilter::eq(pep_properties::OWNER_ID, uid(T2)),
+        ]));
+
+        let tenant_scope = scope.tenant_only();
+        assert!(tenant_scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
+        assert!(!tenant_scope.has_property(pep_properties::OWNER_ID));
+    }
+
+    #[test]
+    fn tenant_only_unconstrained_becomes_deny_all() {
+        let scope = AccessScope::allow_all();
+        let tenant_scope = scope.tenant_only();
+        assert!(tenant_scope.is_deny_all());
+    }
+
+    #[test]
+    fn tenant_only_deny_all_when_no_tenant_filters() {
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_ID,
+            uid(T1),
+        )]));
+
+        let tenant_scope = scope.tenant_only();
+        assert!(tenant_scope.is_deny_all());
+    }
+
+    #[test]
+    fn tenant_only_on_deny_all_stays_deny_all() {
+        let scope = AccessScope::deny_all();
+        let tenant_scope = scope.tenant_only();
+        assert!(tenant_scope.is_deny_all());
+    }
+
+    // --- tenant_and_owner ---
+
+    #[test]
+    fn tenant_and_owner_keeps_both_properties() {
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, uid(T1)),
+            ScopeFilter::eq(pep_properties::OWNER_ID, uid(T2)),
+            ScopeFilter::eq(pep_properties::RESOURCE_ID, uid(T1)),
+        ]));
+
+        let narrowed = scope.tenant_and_owner();
+        assert!(narrowed.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
+        assert!(narrowed.contains_uuid(pep_properties::OWNER_ID, uid(T2)));
+        assert!(!narrowed.has_property(pep_properties::RESOURCE_ID));
+    }
+
+    #[test]
+    fn tenant_and_owner_unconstrained_becomes_deny_all() {
+        let scope = AccessScope::allow_all();
+        assert!(scope.tenant_and_owner().is_deny_all());
+    }
+
+    #[test]
+    fn tenant_and_owner_deny_all_when_no_matching_filters() {
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::RESOURCE_ID,
+            uid(T1),
+        )]));
+        assert!(scope.tenant_and_owner().is_deny_all());
+    }
+
+    // --- ensure_owner ---
+
+    #[test]
+    fn ensure_owner_adds_owner_when_missing() {
+        let scope = AccessScope::for_tenant(uid(T1));
+        let owner_id = uid(T2);
+
+        let scoped = scope.ensure_owner(owner_id);
+        assert!(scoped.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
+        assert!(scoped.contains_uuid(pep_properties::OWNER_ID, owner_id));
+    }
+
+    #[test]
+    fn ensure_owner_keeps_existing_owner() {
+        let existing_owner = uid(T2);
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, uid(T1)),
+            ScopeFilter::eq(pep_properties::OWNER_ID, existing_owner),
+        ]));
+
+        let scoped = scope.ensure_owner(existing_owner);
+        assert_eq!(
+            scoped.all_uuid_values_for(pep_properties::OWNER_ID),
+            &[existing_owner]
+        );
+    }
+
+    #[test]
+    fn ensure_owner_on_unconstrained_creates_owner_scope() {
+        let scope = AccessScope::allow_all();
+        let owner_id = uid(T1);
+
+        let scoped = scope.ensure_owner(owner_id);
+        assert!(!scoped.is_unconstrained());
+        assert!(scoped.contains_uuid(pep_properties::OWNER_ID, owner_id));
+    }
+
+    #[test]
+    fn ensure_owner_on_deny_all_stays_deny_all() {
+        let scope = AccessScope::deny_all();
+        let scoped = scope.ensure_owner(uid(T1));
+        assert!(scoped.is_deny_all());
+    }
+
+    #[test]
+    fn ensure_owner_narrows_existing_owner_to_subject() {
+        let user_a = uid(T1);
+        let user_b = uid(T2);
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, uid(T1)),
+            ScopeFilter::in_uuids(pep_properties::OWNER_ID, vec![user_a, user_b]),
+        ]));
+
+        let scoped = scope.ensure_owner(user_a);
+        assert_eq!(
+            scoped.all_uuid_values_for(pep_properties::OWNER_ID),
+            &[user_a],
+            "Must narrow to exactly the subject's owner_id"
+        );
+        assert!(scoped.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
+    }
+
+    #[test]
+    fn ensure_owner_drops_constraint_when_subject_not_in_pdp() {
+        let user_x = uid(T1);
+        let user_y = uid(T2);
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, uid(T1)),
+            ScopeFilter::eq(pep_properties::OWNER_ID, user_x),
+        ]));
+
+        let scoped = scope.ensure_owner(user_y);
+        assert!(
+            scoped.is_deny_all(),
+            "Must be deny-all when subject not in PDP's owner set"
+        );
+    }
+
+    #[test]
+    fn ensure_owner_checks_all_owner_filters_in_constraint() {
+        let alice = uid(T1);
+        let bob = uid(T2);
+        // Contrived: two owner_id filters in one constraint.
+        // alice is in the first but not the second → must be dropped.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_ID, vec![alice, bob]),
+            ScopeFilter::in_uuids(pep_properties::OWNER_ID, vec![bob]),
+        ]));
+
+        let scoped = scope.ensure_owner(alice);
+        assert!(
+            scoped.is_deny_all(),
+            "Must deny when subject is missing from any owner_id filter"
+        );
+
+        // bob is in both → should pass and narrow to Eq.
+        let scoped = scope.ensure_owner(bob);
+        assert!(!scoped.is_deny_all());
+        assert_eq!(
+            scoped.all_uuid_values_for(pep_properties::OWNER_ID),
+            &[bob],
+            "Must narrow to single Eq for the matching owner"
+        );
+    }
+
+    #[test]
+    fn ensure_owner_multi_constraint_keeps_only_matching() {
+        let alice = uid(T1);
+        let bob = uid(T2);
+        let tenant = uid(T1);
+
+        // Constraint 1: tenant + alice → matches alice
+        let c1 = ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, tenant),
+            ScopeFilter::eq(pep_properties::OWNER_ID, alice),
+        ]);
+        // Constraint 2: tenant + bob → does NOT match alice
+        let c2 = ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, tenant),
+            ScopeFilter::eq(pep_properties::OWNER_ID, bob),
+        ]);
+
+        let scope = AccessScope::from_constraints(vec![c1, c2]);
+        let scoped = scope.ensure_owner(alice);
+
+        assert!(
+            !scoped.is_deny_all(),
+            "Must not be deny-all - one constraint matches"
+        );
+        assert_eq!(
+            scoped.all_uuid_values_for(pep_properties::OWNER_ID),
+            &[alice],
+            "Must keep only the constraint matching alice"
+        );
+        assert!(
+            scoped.contains_uuid(pep_properties::OWNER_TENANT_ID, tenant),
+            "Tenant filter must be preserved"
+        );
     }
 }

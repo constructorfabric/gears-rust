@@ -172,6 +172,24 @@ impl CapabilitySet {
         self.caps.iter().find_map(|cap| T::try_get(cap).cloned())
     }
 
+    /// Returns human-readable capability labels (e.g. `"rest"`, `"db"`, `"system"`).
+    #[must_use]
+    pub fn labels(&self) -> Vec<&'static str> {
+        self.caps
+            .iter()
+            .map(|cap| match cap {
+                #[cfg(feature = "db")]
+                Capability::Database(_) => "db",
+                Capability::RestApi(_) => "rest",
+                Capability::ApiGateway(_) => "rest_host",
+                Capability::Runnable(_) => "stateful",
+                Capability::System(_) => "system",
+                Capability::GrpcHub(_) => "grpc_hub",
+                Capability::GrpcService(_) => "grpc",
+            })
+            .collect()
+    }
+
     /// Convenience helper for DB presence.
     #[must_use]
     pub fn has_db(&self) -> bool {
@@ -197,6 +215,26 @@ pub struct ModuleEntry {
     pub(crate) deps: &'static [&'static str],
     pub(crate) core: Arc<dyn contracts::Module>,
     pub(crate) caps: CapabilitySet,
+}
+
+impl ModuleEntry {
+    /// Returns the module name.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Returns the module dependency names.
+    #[must_use]
+    pub fn deps(&self) -> &'static [&'static str] {
+        self.deps
+    }
+
+    /// Returns the capability set.
+    #[must_use]
+    pub fn caps(&self) -> &CapabilitySet {
+        &self.caps
+    }
 }
 
 impl std::fmt::Debug for ModuleEntry {
@@ -965,6 +1003,21 @@ mod tests {
             }
             other => panic!("expected UnknownModule, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn module_entry_getters_work() {
+        let mut b = RegistryBuilder::default();
+        b.register_core_with_meta("alpha", &[], Arc::new(DummyCore));
+        b.register_core_with_meta("beta", &["alpha"], Arc::new(DummyCore));
+        b.register_rest_with_meta("beta", Arc::new(DummyRest));
+
+        let reg = b.build_topo_sorted().unwrap();
+        let beta = reg.modules().iter().find(|e| e.name() == "beta").unwrap();
+
+        assert_eq!(beta.name(), "beta");
+        assert_eq!(beta.deps(), &["alpha"]);
+        assert!(beta.caps().has::<RestApiCap>());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::domain::model::{HttpMethod, ListQuery, Route};
 use crate::domain::repo::{RepositoryError, RouteRepository};
+use async_trait::async_trait;
 use dashmap::DashMap;
 use modkit_macros::domain_model;
 use uuid::Uuid;
@@ -29,7 +30,7 @@ impl Default for InMemoryRouteRepo {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl RouteRepository for InMemoryRouteRepo {
     async fn create(&self, route: Route) -> Result<Route, RepositoryError> {
         let route_id = route.id;

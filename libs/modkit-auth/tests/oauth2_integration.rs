@@ -55,7 +55,6 @@ async fn full_oauth2_bearer_flow() {
     let token = Token::new(config).await.unwrap();
 
     let client = modkit_http::HttpClientBuilder::new()
-        .allow_insecure_http()
         .with_bearer_auth(token)
         .build()
         .unwrap();
@@ -128,7 +127,6 @@ async fn full_oauth2_with_oidc_discovery() {
     let token = Token::new(config).await.unwrap();
 
     let client = modkit_http::HttpClientBuilder::new()
-        .allow_insecure_http()
         .with_bearer_auth(token)
         .build()
         .unwrap();

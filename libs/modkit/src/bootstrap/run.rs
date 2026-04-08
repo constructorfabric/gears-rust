@@ -81,9 +81,12 @@ pub async fn run_server(config: AppConfig) -> anyhow::Result<()> {
 
     let result = run(run_options).await;
 
-    // Graceful shutdown - flush any remaining traces
+    // Graceful shutdown - flush remaining telemetry
     #[cfg(feature = "otel")]
-    crate::telemetry::init::shutdown_tracing();
+    {
+        crate::telemetry::init::shutdown_metrics();
+        crate::telemetry::init::shutdown_tracing();
+    }
 
     result
 }
@@ -150,9 +153,12 @@ pub async fn run_migrate(config: AppConfig) -> anyhow::Result<()> {
     // Run only the migration phases (pre-init + DB migration)
     let result = host.run_migration_phases().await;
 
-    // Graceful shutdown - flush any remaining traces
+    // Graceful shutdown - flush remaining telemetry
     #[cfg(feature = "otel")]
-    crate::telemetry::init::shutdown_tracing();
+    {
+        crate::telemetry::init::shutdown_metrics();
+        crate::telemetry::init::shutdown_tracing();
+    }
 
     result?;
 
@@ -214,7 +220,7 @@ fn try_build_oop_module_config(
         return Ok(None);
     };
 
-    if runtime_cfg.mod_type != RuntimeKind::Oop {
+    if !matches!(runtime_cfg.mod_type, RuntimeKind::Oop) {
         return Ok(None);
     }
 

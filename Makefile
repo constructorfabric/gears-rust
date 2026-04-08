@@ -1,10 +1,11 @@
 CI := 1
 
-OPENAPI_URL ?= http://127.0.0.1:8087/openapi.json
+OPENAPI_URL ?= http://127.0.0.1:8087/cf/openapi.json
 OPENAPI_OUT ?= docs/api/api.json
 
-# E2E Docker args
-E2E_ARGS ?= --features users-info-example
+# E2E feature set (single source of truth: config/e2e-features.txt)
+E2E_FEATURES ?= $(strip $(shell cat config/e2e-features.txt 2>/dev/null))
+E2E_ARGS ?= $(if $(E2E_FEATURES),--features $(E2E_FEATURES),)
 
 # -------- Utility macros --------
 
@@ -121,16 +122,7 @@ clippy:
 
 # Validate cypilot artifacts (specs, code, templates)
 cypilot-validate:
-	@if [ ! -d .cypilot/.git ] && [ ! -f .cypilot/.git ]; then \
-		echo "Initializing .cypilot submodule (first run)"; \
-		git submodule update --init --recursive -- .cypilot; \
-	elif git -C .cypilot symbolic-ref -q HEAD >/dev/null 2>&1; then \
-		echo "Skipping .cypilot update (branch checkout detected)"; \
-	else \
-		echo "Updating .cypilot via git submodule update (detached HEAD)"; \
-		git submodule update --init --recursive -- .cypilot; \
-	fi
-	@python3 .cypilot/skills/cypilot/scripts/cypilot.py validate && echo "OK. cypilot validation PASSED" || (echo "ERROR: cypilot validation FAILED"; exit 1)
+	@python3 .cypilot/.core/skills/cypilot/scripts/cypilot.py validate && echo "OK. cypilot validation PASSED" || (echo "ERROR: cypilot validation FAILED"; exit 1)
 
 # Run markdown checks with 'lychee'
 lychee:
@@ -160,8 +152,6 @@ gts-docs:
 	cargo run -p gts-docs-validator -- \
 		--exclude "target/*" \
 		--exclude "docs/api/*" \
-		--exclude "*.md" \
-		--exclude "*.json" \
 		docs modules libs examples
 
 ## Validate GTS docs with vendor check (ensures all IDs use vendor "x")
@@ -238,7 +228,7 @@ openapi:
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
 	@echo "Starting hyperspot-server to generate OpenAPI spec..."
 	# Run server in background
-	cargo run --bin hyperspot-server --features users-info-example,static-authn,static-authz -- --config config/quickstart.yaml &
+	cargo run --bin hyperspot-server $(E2E_ARGS) -- --config config/quickstart.yaml &
 	@SERVER_PID=$$!; \
 	trap 'kill $$SERVER_PID >/dev/null 2>&1 || true' EXIT; \
 	echo "hyperspot-server PID: $$SERVER_PID"; \
@@ -297,15 +287,16 @@ test-macros:
 
 ## Run SQLite integration tests
 test-sqlite:
-	cargo test -p cf-modkit-db --features sqlite,integration
+	cargo test -p cf-modkit-db --features sqlite,integration,preview-outbox
+	cargo build -p cf-modkit-db --examples --features sqlite,preview-outbox
 
 ## Run PostgreSQL integration tests
 test-pg:
-	cargo test -p cf-modkit-db --features pg,integration
+	cargo test -p cf-modkit-db --features pg,integration,preview-outbox
 
 ## Run MySQL integration tests
 test-mysql:
-	cargo test -p cf-modkit-db --features mysql,integration
+	cargo test -p cf-modkit-db --features mysql,integration,preview-outbox
 
 # Run all database integration tests
 test-db: test-sqlite test-pg test-mysql
@@ -314,24 +305,79 @@ test-db: test-sqlite test-pg test-mysql
 test-users-info-pg:
 	cargo test -p users-info --features "integration" -- --nocapture
 
+# -------- Benchmarks --------
+
+.PHONY: bench-pg bench-pg-profiler bench-mysql bench-mariadb bench-sqlite bench-db \
+       bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul bench-sqlite-longhaul bench-db-longhaul
+
+## Run outbox throughput benchmarks against PostgreSQL
+bench-pg:
+	cargo bench -p cf-modkit-db --features pg,preview-outbox --bench outbox_throughput -- postgres
+
+## Run outbox throughput benchmarks against MySQL
+bench-mysql:
+	cargo bench -p cf-modkit-db --features mysql,preview-outbox --bench outbox_throughput -- mysql
+
+## Run outbox throughput benchmarks against MariaDB
+bench-mariadb:
+	cargo bench -p cf-modkit-db --features mysql,preview-outbox --bench outbox_throughput -- mariadb
+
+## Run outbox throughput benchmarks against SQLite
+bench-sqlite:
+	cargo bench -p cf-modkit-db --features sqlite,preview-outbox --bench outbox_throughput -- sqlite
+
+## Run outbox throughput benchmarks against all database engines
+bench-db: bench-pg bench-mysql bench-mariadb bench-sqlite
+
+## Run long-haul (1M+10M) outbox benchmarks against PostgreSQL
+bench-pg-longhaul:
+	cargo bench -p cf-modkit-db --features pg,preview-outbox --bench outbox_throughput -- postgres_longhaul
+
+## Run long-haul (1M+10M) outbox benchmarks against MySQL
+bench-mysql-longhaul:
+	cargo bench -p cf-modkit-db --features mysql,preview-outbox --bench outbox_throughput -- mysql_longhaul
+
+## Run long-haul (1M+10M) outbox benchmarks against MariaDB
+bench-mariadb-longhaul:
+	cargo bench -p cf-modkit-db --features mysql,preview-outbox --bench outbox_throughput -- mariadb_longhaul
+
+## Run long-haul (100K 1P) outbox benchmarks against SQLite
+bench-sqlite-longhaul:
+	cargo bench -p cf-modkit-db --features sqlite,preview-outbox --bench outbox_throughput -- sqlite_longhaul
+
+## Run long-haul outbox benchmarks against all database engines
+bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul bench-sqlite-longhaul
+
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-docker e2e-smoke
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke
 
 # Run E2E tests in Docker (default)
 e2e: e2e-docker
 
+## Run E2E tests in Docker environment
+e2e-docker:
+	python3 scripts/ci.py e2e-docker $(E2E_ARGS)
+
 ## Run E2E smoke tests in Docker (only tests marked @pytest.mark.smoke)
-e2e-smoke:
-	python3 scripts/ci.py e2e --docker $(E2E_ARGS) -- -m smoke
+e2e-docker-smoke:
+	python3 scripts/ci.py e2e-docker $(E2E_ARGS) -- -m smoke
 
 # Run E2E tests locally
 e2e-local:
-	python3 scripts/ci.py e2e
+	python3 scripts/ci.py e2e-local
 
-## Run E2E tests in Docker environment
-e2e-docker:
-	python3 scripts/ci.py e2e --docker $(E2E_ARGS)
+## Run E2E smoke tests locally (only tests marked @pytest.mark.smoke)
+e2e-local-smoke:
+	python3 scripts/ci.py e2e-local --smoke
+
+MINI_CHAT_FEATURES = mini-chat,static-authn,static-authz,single-tenant,static-credstore
+
+## Run mini-chat E2E tests (separate binary with mini-chat features)
+e2e-mini-chat:
+	cargo build --bin hyperspot-server --features=$(MINI_CHAT_FEATURES)
+	E2E_BINARY=target/debug/hyperspot-server \
+		python3 -m pytest testing/e2e/modules/mini_chat/ --mode offline -vv
 
 # -------- Code coverage --------
 
@@ -349,7 +395,7 @@ coverage-unit:
 
 ## Ensure needed packages and programs installed for local e2e testing
 check-prereq-e2e-local:
-	python scripts/check_local_env.py --mode e2e-local
+	python3 scripts/check_local_env.py --mode e2e-local
 
 # Generate code coverage report (e2e-local tests only)
 coverage-e2e-local: check-prereq-e2e-local
@@ -412,7 +458,7 @@ fuzz-corpus: fuzz-install
 
 # -------- Main targets --------
 
-.PHONY: all check ci build quickstart example
+.PHONY: all check ci build quickstart example mini-chat
 
 # Start server with quickstart config
 quickstart:
@@ -421,11 +467,15 @@ quickstart:
 
 ## Run server with example module
 example:
-	cargo run --bin hyperspot-server --features users-info-example,static-authn,static-authz -- --config config/quickstart.yaml run
+	cargo run --bin hyperspot-server $(E2E_ARGS) -- --config config/quickstart.yaml run
+
+## Run server with mini-chat module
+mini-chat:
+	cargo run --bin hyperspot-server --features mini-chat,static-authn,static-authz,single-tenant,static-credstore,otel -- --config config/mini-chat.yaml run
 
 oop-example:
 	cargo build -p calculator --features oop_module
-	cargo run --bin hyperspot-server --features oop-example,users-info-example,static-authn,static-authz -- --config config/quickstart.yaml run
+	cargo run --bin hyperspot-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
 check: .setup-stamp fmt cypilot-validate clippy lychee security dylint-test dylint gts-docs test
@@ -437,9 +487,10 @@ ci_docs: lychee
 # Run CI pipeline locally, requires docker
 ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg lychee dylint dylint-test
 
-# Make a release build using stable toolchain
+# Build the hyperspot-server release binary using the stable toolchain.
+# Feature set is read from config/e2e-features.txt when present.
 build:
-	cargo +stable build --release
+	cargo +stable build --release --bin hyperspot-server $(E2E_ARGS)
 
 # Run all necessary quality checks and tests and then build the release binary
 all: build check test-sqlite e2e-local

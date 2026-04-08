@@ -49,12 +49,13 @@ impl TenantResolverPluginClient for Service {
         ctx: &SecurityContext,
         id: TenantId,
     ) -> Result<TenantInfo, TenantResolverError> {
+        let ctx_tenant = TenantId(ctx.subject_tenant_id());
         // Reject nil UUID (anonymous context)
-        if ctx.subject_tenant_id().is_nil() {
+        if ctx_tenant.is_nil() {
             return Err(TenantResolverError::TenantNotFound { tenant_id: id });
         }
         // Only return tenant info if ID matches security context
-        if id == ctx.subject_tenant_id() {
+        if id == ctx_tenant {
             Ok(build_tenant_info(id))
         } else {
             Err(TenantResolverError::TenantNotFound { tenant_id: id })
@@ -67,8 +68,9 @@ impl TenantResolverPluginClient for Service {
         ids: &[TenantId],
         options: &GetTenantsOptions,
     ) -> Result<Vec<TenantInfo>, TenantResolverError> {
+        let ctx_tenant = TenantId(ctx.subject_tenant_id());
         // Nil UUID context means no tenant exists
-        if ctx.subject_tenant_id().is_nil() {
+        if ctx_tenant.is_nil() {
             return Ok(vec![]);
         }
 
@@ -80,7 +82,7 @@ impl TenantResolverPluginClient for Service {
                 continue; // Skip duplicate IDs
             }
             // Only the context tenant exists
-            if *id == ctx.subject_tenant_id() {
+            if *id == ctx_tenant {
                 let tenant = build_tenant_info(*id);
                 if matches_status(&tenant, &options.status) {
                     result.push(tenant);
@@ -98,12 +100,13 @@ impl TenantResolverPluginClient for Service {
         id: TenantId,
         _options: &GetAncestorsOptions,
     ) -> Result<GetAncestorsResponse, TenantResolverError> {
+        let ctx_tenant = TenantId(ctx.subject_tenant_id());
         // Reject nil UUID (anonymous context)
-        if ctx.subject_tenant_id().is_nil() {
+        if ctx_tenant.is_nil() {
             return Err(TenantResolverError::TenantNotFound { tenant_id: id });
         }
         // Only the context tenant exists
-        if id != ctx.subject_tenant_id() {
+        if id != ctx_tenant {
             return Err(TenantResolverError::TenantNotFound { tenant_id: id });
         }
 
@@ -120,12 +123,13 @@ impl TenantResolverPluginClient for Service {
         id: TenantId,
         _options: &GetDescendantsOptions,
     ) -> Result<GetDescendantsResponse, TenantResolverError> {
+        let ctx_tenant = TenantId(ctx.subject_tenant_id());
         // Reject nil UUID (anonymous context)
-        if ctx.subject_tenant_id().is_nil() {
+        if ctx_tenant.is_nil() {
             return Err(TenantResolverError::TenantNotFound { tenant_id: id });
         }
         // Only the context tenant exists
-        if id != ctx.subject_tenant_id() {
+        if id != ctx_tenant {
             return Err(TenantResolverError::TenantNotFound { tenant_id: id });
         }
 
@@ -143,22 +147,21 @@ impl TenantResolverPluginClient for Service {
         descendant_id: TenantId,
         _options: &IsAncestorOptions,
     ) -> Result<bool, TenantResolverError> {
+        let ctx_tenant = TenantId(ctx.subject_tenant_id());
         // Reject nil UUID (anonymous context)
-        if ctx.subject_tenant_id().is_nil() {
+        if ctx_tenant.is_nil() {
             return Err(TenantResolverError::TenantNotFound {
                 tenant_id: ancestor_id,
             });
         }
-
-        let self_id = ctx.subject_tenant_id();
 
         // Both must be the context tenant (only one tenant exists)
-        if ancestor_id != self_id {
+        if ancestor_id != ctx_tenant {
             return Err(TenantResolverError::TenantNotFound {
                 tenant_id: ancestor_id,
             });
         }
-        if descendant_id != self_id {
+        if descendant_id != ctx_tenant {
             return Err(TenantResolverError::TenantNotFound {
                 tenant_id: descendant_id,
             });
@@ -176,10 +179,10 @@ mod tests {
     use tenant_resolver_sdk::TenantStatus;
     use uuid::Uuid;
 
-    fn ctx_for_tenant(tenant_id: Uuid) -> SecurityContext {
+    fn ctx_for_tenant(tenant_id: TenantId) -> SecurityContext {
         SecurityContext::builder()
             .subject_id(Uuid::new_v4())
-            .subject_tenant_id(tenant_id)
+            .subject_tenant_id(tenant_id.0)
             .build()
             .unwrap()
     }
@@ -192,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn get_tenant_returns_info_for_matching_id() {
         let service = Service;
-        let tenant_id = Uuid::parse_str(TENANT_A).unwrap();
+        let tenant_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
         let ctx = ctx_for_tenant(tenant_id);
 
         let result = service.get_tenant(&ctx, tenant_id).await;
@@ -210,8 +213,8 @@ mod tests {
     #[tokio::test]
     async fn get_tenant_returns_error_for_different_id() {
         let service = Service;
-        let ctx_tenant = Uuid::parse_str(TENANT_A).unwrap();
-        let query_tenant = Uuid::parse_str(TENANT_B).unwrap();
+        let ctx_tenant = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let query_tenant = TenantId(Uuid::parse_str(TENANT_B).unwrap());
         let ctx = ctx_for_tenant(ctx_tenant);
 
         let result = service.get_tenant(&ctx, query_tenant).await;
@@ -228,7 +231,7 @@ mod tests {
     #[tokio::test]
     async fn get_tenant_rejects_nil_uuid() {
         let service = Service;
-        let nil_id = Uuid::nil();
+        let nil_id = TenantId::nil();
         let ctx = ctx_for_tenant(nil_id);
 
         // Even if id matches ctx.subject_tenant_id().unwrap_or_default(), nil UUID is rejected
@@ -246,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn get_tenants_rejects_nil_uuid() {
         let service = Service;
-        let nil_id = Uuid::nil();
+        let nil_id = TenantId::nil();
         let ctx = ctx_for_tenant(nil_id);
 
         let result = service
@@ -260,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn get_ancestors_rejects_nil_uuid() {
         let service = Service;
-        let nil_id = Uuid::nil();
+        let nil_id = TenantId::nil();
         let ctx = ctx_for_tenant(nil_id);
 
         let result = service
@@ -277,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn get_descendants_rejects_nil_uuid() {
         let service = Service;
-        let nil_id = Uuid::nil();
+        let nil_id = TenantId::nil();
         let ctx = ctx_for_tenant(nil_id);
 
         let result = service
@@ -294,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn is_ancestor_rejects_nil_uuid() {
         let service = Service;
-        let nil_id = Uuid::nil();
+        let nil_id = TenantId::nil();
         let ctx = ctx_for_tenant(nil_id);
 
         let result = service
@@ -313,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn get_tenants_returns_self() {
         let service = Service;
-        let tenant_id = Uuid::parse_str(TENANT_A).unwrap();
+        let tenant_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
         let ctx = ctx_for_tenant(tenant_id);
 
         let result = service
@@ -329,8 +332,8 @@ mod tests {
     #[tokio::test]
     async fn get_tenants_skips_nonexistent() {
         let service = Service;
-        let ctx_tenant = Uuid::parse_str(TENANT_A).unwrap();
-        let other_tenant = Uuid::parse_str(TENANT_B).unwrap();
+        let ctx_tenant = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let other_tenant = TenantId(Uuid::parse_str(TENANT_B).unwrap());
         let ctx = ctx_for_tenant(ctx_tenant);
 
         // Request both the context tenant and a nonexistent one
@@ -352,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn get_tenants_with_filter() {
         let service = Service;
-        let tenant_id = Uuid::parse_str(TENANT_A).unwrap();
+        let tenant_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
         let ctx = ctx_for_tenant(tenant_id);
 
         // Filter for suspended status (our tenant is Active)
@@ -371,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn get_ancestors_returns_empty_for_self() {
         let service = Service;
-        let tenant_id = Uuid::parse_str(TENANT_A).unwrap();
+        let tenant_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
         let ctx = ctx_for_tenant(tenant_id);
 
         let result = service
@@ -387,8 +390,8 @@ mod tests {
     #[tokio::test]
     async fn get_ancestors_error_for_different_id() {
         let service = Service;
-        let ctx_tenant = Uuid::parse_str(TENANT_A).unwrap();
-        let other_tenant = Uuid::parse_str(TENANT_B).unwrap();
+        let ctx_tenant = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let other_tenant = TenantId(Uuid::parse_str(TENANT_B).unwrap());
         let ctx = ctx_for_tenant(ctx_tenant);
 
         let result = service
@@ -409,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn get_descendants_returns_empty_for_self() {
         let service = Service;
-        let tenant_id = Uuid::parse_str(TENANT_A).unwrap();
+        let tenant_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
         let ctx = ctx_for_tenant(tenant_id);
 
         let result = service
@@ -425,8 +428,8 @@ mod tests {
     #[tokio::test]
     async fn get_descendants_error_for_different_id() {
         let service = Service;
-        let ctx_tenant = Uuid::parse_str(TENANT_A).unwrap();
-        let other_tenant = Uuid::parse_str(TENANT_B).unwrap();
+        let ctx_tenant = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let other_tenant = TenantId(Uuid::parse_str(TENANT_B).unwrap());
         let ctx = ctx_for_tenant(ctx_tenant);
 
         let result = service
@@ -447,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn is_ancestor_self_returns_false() {
         let service = Service;
-        let tenant_id = Uuid::parse_str(TENANT_A).unwrap();
+        let tenant_id = TenantId(Uuid::parse_str(TENANT_A).unwrap());
         let ctx = ctx_for_tenant(tenant_id);
 
         let result = service
@@ -461,8 +464,8 @@ mod tests {
     #[tokio::test]
     async fn is_ancestor_error_for_different_ancestor() {
         let service = Service;
-        let ctx_tenant = Uuid::parse_str(TENANT_A).unwrap();
-        let other_tenant = Uuid::parse_str(TENANT_B).unwrap();
+        let ctx_tenant = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let other_tenant = TenantId(Uuid::parse_str(TENANT_B).unwrap());
         let ctx = ctx_for_tenant(ctx_tenant);
 
         let result = service
@@ -486,8 +489,8 @@ mod tests {
     #[tokio::test]
     async fn is_ancestor_error_for_different_descendant() {
         let service = Service;
-        let ctx_tenant = Uuid::parse_str(TENANT_A).unwrap();
-        let other_tenant = Uuid::parse_str(TENANT_B).unwrap();
+        let ctx_tenant = TenantId(Uuid::parse_str(TENANT_A).unwrap());
+        let other_tenant = TenantId(Uuid::parse_str(TENANT_B).unwrap());
         let ctx = ctx_for_tenant(ctx_tenant);
 
         let result = service

@@ -18,6 +18,7 @@ COPY rust-toolchain.toml ./
 
 # Copy all workspace members
 COPY apps/hyperspot-server ./apps/hyperspot-server
+COPY apps/gts-docs-validator ./apps/gts-docs-validator
 COPY libs ./libs
 COPY modules ./modules
 COPY examples ./examples
@@ -28,9 +29,9 @@ COPY proto ./proto
 # Using --bin to build only the specific binary
 # Features can be customized via CARGO_FEATURES build arg
 RUN if [ -n "$CARGO_FEATURES" ]; then \
-        cargo build --bin hyperspot-server --package=hyperspot-server --features "$CARGO_FEATURES"; \
+        cargo build --release --bin hyperspot-server --package=hyperspot-server --features "$CARGO_FEATURES"; \
     else \
-        cargo build --bin hyperspot-server --package=hyperspot-server; \
+        cargo build --release --bin hyperspot-server --package=hyperspot-server; \
     fi
 
 # Stage 2: Runtime - must match builder's base OS
@@ -38,15 +39,20 @@ FROM debian:13.3-slim
 
 WORKDIR /app
 
+# e2e-local config uses file-parser.allowed_local_base_dir: data
+# Ensure it exists in container runtime working directory.
+RUN mkdir -p /app/data
+
 # Copy the built binary from builder stage
-COPY --from=builder /build/target/debug/hyperspot-server /app/hyperspot-server
+COPY --from=builder /build/target/release/hyperspot-server /app/hyperspot-server
 # Copy config used in CMD
 COPY --from=builder /build/config /app/config
 
 # Expose the HTTP port for E2E tests
 EXPOSE 8086
 
-# Run the binary with minimal config suitable for E2E tests
-# Using --mock flag to use in-memory SQLite for any modules that need DB
-CMD ["/app/hyperspot-server", "--config", "/app/config/quickstart.yaml"]
-
+# Run with shared e2e-local config (same config path as local E2E).
+RUN useradd -U -u 1000 appuser && \
+    chown -R 1000:1000 /app
+USER 1000
+CMD ["/app/hyperspot-server", "--config", "/app/config/e2e-local.yaml"]

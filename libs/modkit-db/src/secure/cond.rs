@@ -96,11 +96,11 @@ where
         match filter {
             ScopeFilter::Eq(eq) => {
                 let expr = scope_value_to_sea_expr(eq.value());
-                and_cond = and_cond.add(Expr::col(col).eq(expr));
+                and_cond = and_cond.add(col.into_expr().eq(expr));
             }
             ScopeFilter::In(inf) => {
                 let sea_values = scope_values_to_sea_values(inf.values());
-                and_cond = and_cond.add(Expr::col(col).is_in(sea_values));
+                and_cond = and_cond.add(col.is_in(sea_values));
             }
         }
     }

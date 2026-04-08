@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.x.chat_engine.session.delete_request.v1",
+  "title": "SessionDeleteRequest",
+  "description": "Request to delete a session",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "$ref": "../common/GtsSessionId.json",
+      "description": "Session identifier to delete"
+    },
+    "deletion_type": {
+      "$ref": "../common/DeletionType.json",
+      "description": "Type of deletion: soft (recoverable) or hard (permanent)",
+      "default": "soft"
+    }
+  },
+  "required": ["session_id"],
+  "additionalProperties": false
+}

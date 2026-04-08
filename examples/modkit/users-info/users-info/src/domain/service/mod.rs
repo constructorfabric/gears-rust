@@ -60,7 +60,7 @@ use std::sync::Arc;
 use modkit_macros::domain_model;
 
 use crate::domain::events::UserDomainEvent;
-use crate::domain::ports::{AuditPort, EventPublisher};
+use crate::domain::ports::{AuditPort, EventPublisher, UsersMetricsPort};
 use crate::domain::repos::{AddressesRepository, CitiesRepository, UsersRepository};
 use authz_resolver_sdk::AuthZResolverClient;
 use authz_resolver_sdk::PolicyEnforcer;
@@ -230,6 +230,7 @@ where
         audit: Arc<dyn AuditPort>,
         authz: Arc<dyn AuthZResolverClient>,
         config: ServiceConfig,
+        metrics: Arc<dyn UsersMetricsPort>,
     ) -> Self {
         let users_repo = Arc::new(users_repo);
         let cities_repo = Arc::new(cities_repo);
@@ -259,6 +260,7 @@ where
                 config,
                 cities.clone(),
                 addresses.clone(),
+                metrics,
             ),
             cities,
             addresses,

@@ -1,5 +1,17 @@
 # DECOMPOSITION — Todo App
 
+
+<!-- toc -->
+
+- [1. Overview](#1-overview)
+- [2. Entries](#2-entries)
+  - [Feature 1: Task Management Core](#feature-1-task-management-core)
+  - [Feature 2: Task Organization & Logic](#feature-2-task-organization--logic)
+  - [Feature 3: Real-time Synchronization](#feature-3-real-time-synchronization)
+- [3. Feature Dependencies](#3-feature-dependencies)
+
+<!-- /toc -->
+
 - [ ] `p1` - **ID**: `cpt-examples-todo-app-status-overall`
 
 ## 1. Overview
