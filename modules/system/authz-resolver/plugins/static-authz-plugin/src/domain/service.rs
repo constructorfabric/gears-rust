@@ -44,7 +44,7 @@ impl Service {
             });
 
         let Some(tid) = tenant_id else {
-            // No tenant resolvable from context or subject — deny access.
+            // No tenant resolvable from context or subject - deny access.
             return EvaluationResponse {
                 decision: false,
                 context: EvaluationResponseContext::default(),
@@ -52,7 +52,7 @@ impl Service {
         };
 
         if tid == Uuid::default() {
-            // Nil UUID tenant — deny rather than grant unrestricted access.
+            // Nil UUID tenant - deny rather than grant unrestricted access.
             return EvaluationResponse {
                 decision: false,
                 context: EvaluationResponseContext::default(),
@@ -134,7 +134,7 @@ mod tests {
                 assert_eq!(in_pred.property, pep_properties::OWNER_TENANT_ID);
                 assert_eq!(in_pred.values, vec![tenant_id.into_filter_value()]);
             }
-            other @ Predicate::Eq(_) => panic!("Expected In predicate, got: {other:?}"),
+            other => panic!("Expected In predicate, got: {other:?}"),
         }
     }
 
@@ -158,7 +158,7 @@ mod tests {
                     ]
                 );
             }
-            other @ Predicate::Eq(_) => panic!("Expected In predicate, got: {other:?}"),
+            other => panic!("Expected In predicate, got: {other:?}"),
         }
     }
 

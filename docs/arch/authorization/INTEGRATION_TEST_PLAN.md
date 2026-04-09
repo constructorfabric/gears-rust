@@ -190,7 +190,7 @@ WHERE owner_tenant_id IN ('T1')
 
 **`constraints.rs`** (3 planned unit tests): serialization roundtrip for InGroup, InGroupSubtree, mixed constraint
 
-**`compiler.rs`** (3 planned unit tests): InGroup → InGroup filter, InGroupSubtree → InGroupSubtree filter, tenant + InGroup combined
+**`compiler.rs`** (6 unit tests): InGroup → InGroup filter, InGroupSubtree → InGroupSubtree filter, tenant + InGroup combined, empty In values fail-closed, empty InGroup group_ids fail-closed, empty InGroupSubtree ancestor_ids fail-closed
 
 **`cond.rs`** (3 planned unit tests): InGroup subquery condition, InGroupSubtree nested subquery, tenant + InGroup AND condition
 

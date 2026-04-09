@@ -26,13 +26,13 @@
 //! // Get the client from ClientHub
 //! let authz = hub.get::<dyn AuthZResolverClient>()?;
 //!
-//! // Create an enforcer (once, during init — serves all resource types)
+//! // Create an enforcer (once, during init - serves all resource types)
 //! let enforcer = PolicyEnforcer::new(authz);
 //!
 //! // All CRUD operations return AccessScope (PDP always returns constraints)
 //! let scope = enforcer.access_scope(&ctx, &USER, "get", Some(id)).await?;
 //!
-//! // CREATE — also returns AccessScope with constraints from PDP
+//! // CREATE - also returns AccessScope with constraints from PDP
 //! let scope = enforcer.access_scope_with(
 //!     &ctx, &USER, "create", None,
 //!     &AccessRequest::new()
@@ -52,7 +52,9 @@ pub mod plugin_api;
 
 // Re-export main types at crate root
 pub use api::AuthZResolverClient;
-pub use constraints::{Constraint, EqPredicate, InPredicate, Predicate};
+pub use constraints::{
+    Constraint, EqPredicate, InGroupPredicate, InGroupSubtreePredicate, InPredicate, Predicate,
+};
 pub use error::AuthZResolverError;
 pub use gts::AuthZResolverPluginSpecV1;
 pub use models::{

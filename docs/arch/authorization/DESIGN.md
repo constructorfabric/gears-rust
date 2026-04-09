@@ -659,6 +659,7 @@ The PEP MUST:
 8. **Handle missing required fields** - Treat containing constraint as false
 9. **Handle unknown property names** - Treat containing constraint as false (PEP doesn't know how to map). This is a **PDP contract violation** — PDP MUST only return properties from the `supported_properties` list provided in the request. PEP MUST log this as an error for debugging, then fail-closed. If all constraints evaluate to false, deny access (403 Forbidden).
 10. **Handle empty constraints array** - If `constraints` field is present but empty (`constraints: []`) -> deny all. An empty array means no access paths exist (OR of empty set is false).
+11. **Handle empty value lists in set predicates** - If an `In`, `InGroup`, or `InGroupSubtree` predicate has an empty value list (`values: []`, `group_ids: []`, `ancestor_ids: []`) -> treat containing constraint as false (fail-closed). An empty set means "match nothing", which is semantically a deny. Passing it to the ORM would generate `WHERE col IN ()` — a SQL error on some engines. This is a **PDP contract violation**: a well-behaved PDP MUST NOT emit set predicates with empty lists.
 
 ---
 
@@ -1271,7 +1272,7 @@ Capabilities declare what predicate types the PEP can enforce locally:
 **Progressive projection guidance:**
 - **Monolith** (single shared DB): no projections needed — PEP JOINs canonical tables directly.
 - **Microservices** (typical): project `resource_group` + `resource_group_closure` (small tables). Leave `resource_group_membership` to PDP capability degradation (→ `in` predicates with explicit IDs).
-- **Microservices** with membership filtering/pagination where the two-request pattern causes unacceptable N-request fan-out: project `resource_group_membership`. This table is expected to be **10× or more larger** (~455 M rows, ~110 GB at scale) — only project after profiling confirms the need.
+- **Microservices** with membership filtering/pagination where the two-request pattern causes unacceptable N-request fan-out: project `resource_group_membership`. This table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than hierarchy tables (see [RG DESIGN §Storage Estimates](../../../modules/system/resource-group/docs/DESIGN.md#storage-estimates)) — only project after profiling confirms the need.
 
 Do not add projections speculatively — each projection creates an additional database and synchronization load.
 
@@ -1345,7 +1346,7 @@ Closure table for resource group hierarchy. Similar structure to tenant_closure 
 
 #### `resource_group_membership` (RG-owned — project only when needed)
 
-Association between resources and groups. A resource can belong to multiple groups. This table is expected to be **10× or more larger** than other projection tables (~455M rows, ~110 GB at scale). Project only after profiling confirms the two-request pattern causes unacceptable latency — see [Capabilities and Projection Tables](#capabilities-and-projection-tables) for the progressive projection strategy.
+Association between resources and groups. A resource can belong to multiple groups. This table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than other projection tables — concrete estimates depend on vendor scale (see [RG DESIGN §Storage Estimates](../../../modules/system/resource-group/docs/DESIGN.md#storage-estimates)). Project only after profiling confirms the two-request pattern causes unacceptable latency — see [Capabilities -> Predicate Matrix](#capabilities---predicate-matrix) for the progressive projection strategy.
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|

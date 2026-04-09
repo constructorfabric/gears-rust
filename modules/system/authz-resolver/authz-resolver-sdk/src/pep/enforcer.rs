@@ -48,7 +48,7 @@ pub enum EnforcerError {
 /// [`PolicyEnforcer::access_scope()`] defaults don't suffice (ABAC resource
 /// properties, custom tenant mode, barrier bypass, etc.).
 ///
-/// All fields default to "not overridden" — only set what you need.
+/// All fields default to "not overridden" - only set what you need.
 ///
 /// # Examples
 ///
@@ -64,7 +64,7 @@ pub enum EnforcerError {
 ///         .resource_property(pep_properties::OWNER_TENANT_ID, target_tenant_id),
 /// ).await?;
 ///
-/// // Billing — ignore barriers (constrained scope)
+/// // Billing - ignore barriers (constrained scope)
 /// let scope = enforcer.access_scope_with(
 ///     &ctx, &RESOURCE, "list", None,
 ///     &AccessRequest::new().barrier_mode(BarrierMode::Ignore),
@@ -250,7 +250,8 @@ impl PolicyEnforcer {
         request: &AccessRequest,
     ) -> EvaluationRequest {
         // Pass through the caller's tenant context as-is.
-        // If no context_tenant_id was set, the PDP determines it by its own rules.
+        // If no context_tenant_id was set, the PDP determines it by its own rules
+        // (e.g. falling back to subject.properties["tenant_id"]).
         let tenant_context = request.tenant_context.clone();
 
         // Put subject's tenant_id into properties per AuthZEN spec
@@ -385,9 +386,11 @@ mod tests {
     const SUBJECT: &str = "22222222-2222-2222-2222-222222222222";
     const RESOURCE: &str = "33333333-3333-3333-3333-333333333333";
 
-    /// Mock that returns `decision=true` with a tenant constraint from
-    /// the request's `TenantContext.root_id` (always returns constraints,
-    /// regardless of `require_constraints`).
+    /// Mock that mirrors the real `static-authz-plugin` behaviour:
+    /// 1. Use `tenant_context.root_id` if present (explicit PEP override).
+    /// 2. Fall back to `subject.properties["tenant_id"]` (PDP self-resolution).
+    /// 3. Nil UUID → deny rather than grant unrestricted access.
+    /// 4. No tenant at all → deny.
     struct AllowAllMock;
 
     #[async_trait]
@@ -396,24 +399,43 @@ mod tests {
             &self,
             req: EvaluationRequest,
         ) -> Result<EvaluationResponse, AuthZResolverError> {
-            let constraints = if let Some(ref tc) = req.context.tenant_context {
-                if let Some(root_id) = tc.root_id {
-                    vec![Constraint {
-                        predicates: vec![Predicate::In(InPredicate::new(
-                            pep_properties::OWNER_TENANT_ID,
-                            [root_id],
-                        ))],
-                    }]
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
+            // Resolve tenant: explicit context first, then subject fallback.
+            let tenant_id = req
+                .context
+                .tenant_context
+                .as_ref()
+                .and_then(|tc| tc.root_id)
+                .or_else(|| {
+                    req.subject
+                        .properties
+                        .get("tenant_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                });
+
+            let Some(tid) = tenant_id else {
+                return Ok(EvaluationResponse {
+                    decision: false,
+                    context: EvaluationResponseContext::default(),
+                });
             };
+
+            if tid == Uuid::default() {
+                return Ok(EvaluationResponse {
+                    decision: false,
+                    context: EvaluationResponseContext::default(),
+                });
+            }
+
             Ok(EvaluationResponse {
                 decision: true,
                 context: EvaluationResponseContext {
-                    constraints,
+                    constraints: vec![Constraint {
+                        predicates: vec![Predicate::In(InPredicate::new(
+                            pep_properties::OWNER_TENANT_ID,
+                            [tid],
+                        ))],
+                    }],
                     ..Default::default()
                 },
             })
@@ -529,16 +551,20 @@ mod tests {
     // ── access_scope ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn access_scope_no_explicit_tenant_returns_compile_error() {
+    async fn access_scope_pdp_resolves_tenant_from_subject() {
         let e = enforcer(AllowAllMock);
         let ctx = test_ctx();
-        // No explicit context_tenant_id → mock returns empty constraints
-        // → require_constraints=true → CompileFailed
-        let result = e
+        // access_scope() passes default() — PDP resolves tenant from
+        // subject.properties["tenant_id"] via its own fallback logic.
+        let scope = e
             .access_scope(&ctx, &TEST_RESOURCE, "get", Some(uuid(RESOURCE)))
-            .await;
+            .await
+            .expect("PDP should resolve tenant from subject properties");
 
-        assert!(matches!(result, Err(EnforcerError::CompileFailed(_))));
+        assert_eq!(
+            scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
+            &[uuid(TENANT)]
+        );
     }
 
     #[tokio::test]
@@ -626,13 +652,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_scope_anonymous_no_tenant_returns_compile_error() {
+    async fn access_scope_anonymous_denied_by_pdp() {
         let e = enforcer(AllowAllMock);
         let ctx = SecurityContext::anonymous();
-        // No explicit tenant context → mock returns empty constraints → CompileFailed
+        // anonymous() has nil UUID as subject_tenant_id → PDP resolves it
+        // from subject.properties["tenant_id"], sees nil UUID, and denies.
         let result = e.access_scope(&ctx, &TEST_RESOURCE, "list", None).await;
 
-        assert!(matches!(result, Err(EnforcerError::CompileFailed(_))));
+        assert!(matches!(
+            result,
+            Err(EnforcerError::Denied { deny_reason: None })
+        ));
     }
 
     // ── builder methods ──────────────────────────────────────────────
@@ -926,6 +956,7 @@ mod tests {
             &AccessRequest::default(),
         );
 
+        // No explicit context_tenant_id → tenant_context is None (PDP decides)
         assert!(request.context.tenant_context.is_none());
         assert!(!request.context.require_constraints);
         assert_eq!(request.resource.id, None);
@@ -988,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn no_implicit_fallback_to_subject_tenant_id() {
+    fn default_request_has_no_tenant_context_pdp_decides() {
         let subject_tenant = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let ctx = SecurityContext::builder()
             .subject_id(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap())
@@ -998,7 +1029,7 @@ mod tests {
 
         let e = enforcer(AllowAllMock);
 
-        // No tenant_context provided — PDP decides, no implicit fallback
+        // No tenant_context provided — PEP passes None, PDP decides
         let request = e.build_request_with(
             &ctx,
             &TEST_RESOURCE,
@@ -1008,7 +1039,13 @@ mod tests {
             &AccessRequest::default(),
         );
 
+        // tenant_context is None — PDP will resolve from subject.properties
         assert!(request.context.tenant_context.is_none());
+        // But subject.properties["tenant_id"] is still populated for the PDP
+        assert_eq!(
+            request.subject.properties.get("tenant_id"),
+            Some(&serde_json::json!(subject_tenant.to_string())),
+        );
     }
 
     #[test]

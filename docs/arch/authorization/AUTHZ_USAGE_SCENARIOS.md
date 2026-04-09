@@ -92,7 +92,7 @@ Projection tables allow PEP to JOIN against local data, making authorization O(1
 
 **Closure tables** specifically solve the hierarchy traversal problem. A closure table contains all ancestor-descendant pairs, allowing subtree queries with a simple `WHERE ancestor_id = X` instead of recursive tree walking.
 
-> **Progressive projection:** do not add projections speculatively — each one creates an additional database and sync load. In a **monolith** with a single shared DB, no projections are needed (PEP JOINs against canonical tables). In **microservices**, start with `resource_group` + `resource_group_closure` (small tables, covers hierarchy). Only add `resource_group_membership` when profiling confirms the two-request pattern is unacceptable for the latency budget — this table is expected to be **10×+ larger** (~455 M rows, ~110 GB at scale).
+> **Progressive projection:** do not add projections speculatively — each one creates an additional database and sync load. In a **monolith** with a single shared DB, no projections are needed (PEP JOINs against canonical tables). In **microservices**, start with `resource_group` + `resource_group_closure` (small tables, covers hierarchy). Only add `resource_group_membership` when profiling confirms the two-request pattern is unacceptable for the latency budget — this table grows as `M_resources × N_groups_per_resource` and is expected to be **10×+ larger** than hierarchy tables (see [RG DESIGN §Storage Estimates](../../../modules/system/resource-group/docs/DESIGN.md#storage-estimates)).
 
 ### Choosing Projection Tables
 
@@ -137,7 +137,7 @@ The choice depends on the application's tenant structure, resource organization,
 
 ### `resource_group_membership` — When to Project
 
-The `resource_group_membership` table is expected to be **10× or more larger** than other projection tables (~455M rows, ~110 GB at scale). Do not project it speculatively.
+The `resource_group_membership` table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than other projection tables. Concrete estimates depend on vendor scale — see [RG DESIGN §Storage Estimates](../../../modules/system/resource-group/docs/DESIGN.md#storage-estimates). Do not project it speculatively.
 
 **Decision guide:**
 
@@ -1010,7 +1010,7 @@ WHERE id = 'task456-uuid'
 >
 > All group-based constraints also include a tenant predicate on the resource (typically `eq` on `owner_tenant_id`) as defense in depth, ensuring tenant isolation at the resource level.
 >
-> **Important — projection architecture:** `resource_group_membership` projection to domain services is **not recommended** (10×+ larger than other projections, ~455M rows) but **not forbidden**. `in_group`/`in_group_subtree` predicates require this table and are only executable when it is present in the PEP's database (RG module, monolith with shared DB, or an explicit projection). By default, domain services rely on PDP capability degradation — PDP resolves group memberships internally and returns degraded predicates: explicit resource IDs via `in`, or `eq` for point operations. Scenarios S14–S17 below are reference patterns (require membership table); S18–S19 are the standard domain service patterns.
+> **Important — projection architecture:** `resource_group_membership` grows as `M_resources × N_groups_per_resource` and is expected to be 10×+ larger than hierarchy tables. Project it only when profiling confirms the two-request pattern is unacceptable (see [When to Project](#resource_group_membership--when-to-project)). `in_group`/`in_group_subtree` predicates require this table and are only executable when it is present in the PEP's database (RG module, monolith with shared DB, or an explicit projection). By default, domain services rely on PDP capability degradation — PDP resolves group memberships internally and returns degraded predicates: explicit resource IDs via `in`, or `eq` for point operations. Scenarios S14–S17 below are reference patterns (require membership table); S18–S19 are the standard domain service patterns.
 
 ---
 

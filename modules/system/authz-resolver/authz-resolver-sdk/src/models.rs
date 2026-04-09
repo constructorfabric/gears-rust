@@ -27,10 +27,10 @@ pub enum TenantMode {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BarrierMode {
-    /// Respect all barriers — stop at barrier boundaries (default).
+    /// Respect all barriers - stop at barrier boundaries (default).
     #[default]
     Respect,
-    /// Ignore barriers — traverse through self-managed tenants.
+    /// Ignore barriers - traverse through self-managed tenants.
     Ignore,
 }
 
@@ -38,14 +38,19 @@ pub enum BarrierMode {
 ///
 /// Tells the PDP which advanced features the PEP can handle so the PDP
 /// can tailor its response accordingly.
+///
+/// **Note:** `GroupMembership` and `GroupHierarchy` require `resource_group_membership`
+/// table, which is not projected to domain services. These capabilities are only
+/// available within the RG module. Domain services should not declare them - PDP
+/// will degrade group predicates to explicit `in` with resolved resource IDs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// PEP understands tenant hierarchy constraints.
     TenantHierarchy,
-    /// PEP understands group membership constraints.
+    /// PEP understands group membership constraints (RG-internal only).
     GroupMembership,
-    /// PEP understands group hierarchy constraints.
+    /// PEP understands group hierarchy constraints (RG-internal only).
     GroupHierarchy,
 }
 
@@ -151,7 +156,7 @@ pub struct EvaluationRequestContext {
     #[serde(default)]
     pub supported_properties: Vec<String>,
     /// Original bearer token for PDP forwarding. Wrapped in `SecretString` to prevent
-    /// accidental logging. Skipped during serialization — the PDP receives the token
+    /// accidental logging. Skipped during serialization - the PDP receives the token
     /// through a separate channel if needed.
     #[serde(skip)]
     pub bearer_token: Option<SecretString>,

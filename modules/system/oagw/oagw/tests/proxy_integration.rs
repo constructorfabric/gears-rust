@@ -1848,6 +1848,9 @@ async fn proxy_websocket_rate_limit_on_handshake() {
 async fn proxy_websocket_idle_timeout_closes_connection() {
     use tokio::io::AsyncWriteExt;
 
+    // 1000ms instead of 200ms: the readiness probe (Ping→Pong roundtrip
+    // through proxy→upstream→proxy) can exceed 200ms under CI resource
+    // pressure, causing the idle timer to fire before the probe completes.
     let h = AppHarness::builder()
         .with_websocket_idle_timeout(std::time::Duration::from_secs(1))
         .build()
@@ -4082,6 +4085,8 @@ async fn proxy_websocket_close_frame_propagated() {
 // 14.6: Idle timeout sends Close 1001 (Going Away) to the client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxy_websocket_idle_timeout_sends_1001() {
+    // See comment in `proxy_websocket_idle_timeout_closes_connection` — 200ms
+    // is too tight for CI; the readiness probe races the idle timer.
     let h = AppHarness::builder()
         .with_websocket_idle_timeout(std::time::Duration::from_secs(1))
         .build()

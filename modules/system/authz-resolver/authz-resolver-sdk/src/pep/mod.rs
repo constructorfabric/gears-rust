@@ -1,9 +1,9 @@
 //! PEP (Policy Enforcement Point) helpers.
 //!
-//! - [`PolicyEnforcer`] — PEP object (build → evaluate → compile)
-//! - [`ResourceType`] — Static descriptor for a resource type + its supported properties
-//! - [`compile_to_access_scope`] — Low-level: compile evaluation response into `AccessScope`
-//! - [`IntoPropertyValue`] — Convert typed values into `serde_json::Value` for PDP requests
+//! - [`PolicyEnforcer`] - PEP object (build → evaluate → compile)
+//! - [`ResourceType`] - Static descriptor for a resource type + its supported properties
+//! - [`compile_to_access_scope`] - Low-level: compile evaluation response into `AccessScope`
+//! - [`IntoPropertyValue`] - Convert typed values into `serde_json::Value` for PDP requests
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -17,7 +17,7 @@ pub use enforcer::{AccessRequest, EnforcerError, PolicyEnforcer, ResourceType};
 /// Trait for types that can be converted into `serde_json::Value` for PDP
 /// evaluation requests and predicate construction.
 ///
-/// This trait lives at the PEP level — it converts typed values into JSON for
+/// This trait lives at the PEP level - it converts typed values into JSON for
 /// the authorization protocol. For scope-level typed values (post-compilation),
 /// see [`modkit_security::ScopeValue`].
 pub trait IntoPropertyValue {
