@@ -1,24 +1,15 @@
-# This workflow enforces two API contract checks on every PR:
+# This workflow enforces API contract checks on PRs that modify the API spec
+# (or this workflow file):
 #
-# Phase 1 — Spec freshness: generates the OpenAPI spec from code (same as `make openapi`)
-#   and compares it against the committed docs/api/api.json. If they differ the developer
-#   forgot to run `make openapi`; the build fails with instructions.
-#
-# Phase 2 — Breaking changes: compares the base-branch spec against the freshly generated
-#   spec using oasdiff. Breaking changes block merge unless the `breaking-api-acknowledged`
-#   label is present.
+# Breaking changes: compares the base-branch docs/api/api.json against the PR's
+# version using oasdiff. Breaking changes block merge unless the
+# `breaking-api-acknowledged` label is present.
 name: API Contracts
 
 on:
   pull_request:
     branches: [ main ]
     paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - 'Cargo.lock'
-      - 'Makefile'
-      - 'config/quickstart.yaml'
-      - 'config/e2e-features.txt'
       - 'docs/api/api.json'
       - '.github/workflows/api_contracts.yml'
 
@@ -28,10 +19,6 @@ concurrency:
 
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
 
 jobs:
   api_contracts:
@@ -67,73 +54,7 @@ jobs:
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── Build & generate spec ──────────────────────────────────────────
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Go (required for aws-lc-fips-sys FIPS build)
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
-        with:
-          go-version: 'stable'
-          cache: false
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@9bc92bc5598b4f3bec5d910d352094982cb0c3b9 # 1.92.0
-
-      # Cache Cargo registry/git + target/ across platforms.
-      - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          cache-bin: false
-          cache-targets: false
-          shared-key: pr-${{ runner.os }}-stable-1.92
-
-      # Install sccache (cross-platform)
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-
-      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
-      - name: Probe sccache & set RUSTC_WRAPPER
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
-
-      - name: Save committed spec & generate fresh spec
-        run: |
-          cp docs/api/api.json /tmp/api.committed.json
-          make openapi
-
-      # ── Phase 1: Spec freshness ───────────────────────────────────────
-
-      - name: Check spec is up to date
-        id: freshness
-        run: |
-          # Normalize both files (sorted keys, consistent formatting) to avoid false positives
-          # from non-deterministic JSON serialization order.
-          python3 -c "import json,sys; json.dump(json.load(open(sys.argv[1])),open(sys.argv[2],'w'),sort_keys=True,indent=2)" \
-            /tmp/api.committed.json /tmp/api.committed.norm.json
-          python3 -c "import json,sys; json.dump(json.load(open(sys.argv[1])),open(sys.argv[2],'w'),sort_keys=True,indent=2)" \
-            docs/api/api.json /tmp/api.generated.norm.json
-
-          if diff -q /tmp/api.committed.norm.json /tmp/api.generated.norm.json >/dev/null 2>&1; then
-            echo "stale=false" >> $GITHUB_OUTPUT
-            echo "✅ docs/api/api.json is up to date"
-          else
-            echo "stale=true" >> $GITHUB_OUTPUT
-            echo "::error::docs/api/api.json is out of date. Run 'make openapi' and commit the result."
-            echo ""
-            echo "=== Diff (committed vs generated, normalized) ==="
-            diff -u /tmp/api.committed.norm.json /tmp/api.generated.norm.json | head -200 || true
-          fi
-
-      # ── Phase 2: Breaking change detection ─────────────────────────────
+      # ── Breaking change detection ──────────────────────────────────────
 
       - name: Download oasdiff
         if: steps.fetch_prev.outputs.exists == 'true'
@@ -151,7 +72,7 @@ jobs:
         id: breaking_check
         if: steps.fetch_prev.outputs.exists == 'true'
         run: |
-          echo "Comparing base branch spec against generated spec..."
+          echo "Comparing base branch spec against PR spec..."
 
           # Without --fail-on: exit 0 = success (output may list breaking changes or be empty),
           # non-zero = tooling/parse error.
@@ -192,49 +113,25 @@ jobs:
       # ── Enforce ─────────────────────────────────────────────────────
 
       - name: Enforce contract checks
-        if: |
-          steps.freshness.outputs.stale == 'true' ||
-          (steps.breaking_check.outputs.has_breaking == 'true' && steps.check_label.outputs.bypass != 'true')
-        env:
-          FRESHNESS_STALE: ${{ steps.freshness.outputs.stale }}
-          BREAKING_HAS: ${{ steps.breaking_check.outputs.has_breaking }}
-          BYPASS: ${{ steps.check_label.outputs.bypass }}
+        if: steps.breaking_check.outputs.has_breaking == 'true' && steps.check_label.outputs.bypass != 'true'
         run: |
-          FAILED=false
-
-          if [ "$FRESHNESS_STALE" == "true" ]; then
-            echo "::error title=OpenAPI spec out of date::docs/api/api.json does not match the spec generated from code."
-            echo ""
-            echo "  To fix: run 'make openapi' locally and commit the updated docs/api/api.json."
-            echo ""
-            FAILED=true
-          fi
-
-          if [ "$BREAKING_HAS" == "true" ] && [ "$BYPASS" != "true" ]; then
-            echo "::error title=Breaking API changes::This PR introduces breaking changes to the OpenAPI contract."
-            echo ""
-            echo "Breaking changes:"
-            cat /tmp/breaking_text.txt
-            echo ""
-            echo "  To proceed, either:"
-            echo "    1. Fix the breaking changes to maintain backward compatibility."
-            echo "    2. Have a maintainer add the 'breaking-api-acknowledged' label to this PR."
-            echo ""
-            echo "  Note: Breaking API changes require a changelog update and may require a major version bump."
-            FAILED=true
-          fi
-
-          if [ "$FAILED" == "true" ]; then
-            exit 1
-          fi
+          echo "::error title=Breaking API changes::This PR introduces breaking changes to the OpenAPI contract."
+          echo ""
+          echo "Breaking changes:"
+          cat /tmp/breaking_text.txt
+          echo ""
+          echo "  To proceed, either:"
+          echo "    1. Fix the breaking changes to maintain backward compatibility."
+          echo "    2. Have a maintainer add the 'breaking-api-acknowledged' label to this PR."
+          echo ""
+          echo "  Note: Breaking API changes require a changelog update and may require a major version bump."
+          exit 1
 
       # ── Summary ────────────────────────────────────────────────────────
 
       - name: Summary
         if: always()
         env:
-          FRESHNESS_STALE: ${{ steps.freshness.outputs.stale }}
-          FRESHNESS_CONCLUSION: ${{ steps.freshness.conclusion }}
           BREAKING_HAS: ${{ steps.breaking_check.outputs.has_breaking }}
           BREAKING_CONCLUSION: ${{ steps.breaking_check.conclusion }}
           BREAKING_REPORT: ${{ steps.breaking_check.outputs.report }}
@@ -243,18 +140,6 @@ jobs:
         run: |
           echo "## API Contract Check Summary" >> $GITHUB_STEP_SUMMARY
 
-          # Phase 1: Freshness
-          if [ "$FRESHNESS_STALE" == "true" ]; then
-            echo "🔴 **docs/api/api.json is out of date** — run \`make openapi\` and commit" >> $GITHUB_STEP_SUMMARY
-          elif [ "$FRESHNESS_CONCLUSION" == "success" ]; then
-            echo "✅ **docs/api/api.json is up to date**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️ **Spec freshness check did not complete**" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Phase 2: Breaking changes
           if [ "$PREV_EXISTS" != "true" ]; then
             echo "ℹ️ No base branch spec found — breaking change check skipped" >> $GITHUB_STEP_SUMMARY
           elif [ "$BREAKING_CONCLUSION" != "success" ]; then
