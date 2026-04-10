@@ -1,0 +1,53 @@
+[package]
+name = "cf-api-contracts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "api-contracts example module — PaymentService with local and HTTP transport"
+rust-version.workspace = true
+
+[features]
+default = ["rest-client"]
+rest-client = ["api-contracts-sdk/rest-client"]
+grpc-client = [
+    "api-contracts-sdk/grpc-client",
+    "toolkit-contract/grpc-client",
+    "dep:tonic",
+    "dep:toolkit-transport-grpc",
+]
+
+[lints]
+workspace = true
+
+[dependencies]
+api-contracts-sdk.workspace = true
+toolkit-contract = { workspace = true, features = ["runtime-client"] }
+toolkit.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-security.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+async-stream = "0.3"
+axum.workspace = true
+http.workspace = true
+
+tonic = { workspace = true, features = ["transport"], optional = true }
+toolkit-transport-grpc = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+toolkit-http.workspace = true
+toolkit-canonical-errors.workspace = true
+secrecy.workspace = true
+mockall.workspace = true

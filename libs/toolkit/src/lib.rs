@@ -98,7 +98,20 @@ pub use client_hub::ClientHub;
 pub use registry::GearRegistry;
 
 // Re-export the macros from the proc-macro crate
+pub use toolkit_contract::{
+    ContractError, GrpcRepr, GrpcReprScalar, ProtoBridge, contract, grpc_contract, provides,
+    rest_contract,
+};
 pub use toolkit_macros::{ExpandVars, gear, lifecycle};
+
+pub mod contract_support {
+    // Re-export only the items referenced from generated macro code (see
+    // `toolkit-contract-macros::support::contract_support_path`). Keep this
+    // list minimal to avoid leaking unrelated `toolkit_contract` surface.
+    #[cfg(feature = "contract-grpc-client")]
+    pub use toolkit_contract::grpc;
+    pub use toolkit_contract::{contract, descriptor, error, grpc_repr, ir, policy, runtime};
+}
 
 // Re-export var_expand gear so derive-generated impls resolve via ::toolkit::var_expand
 pub use toolkit_utils::var_expand;
@@ -124,6 +137,7 @@ pub mod backends;
 pub mod lifecycle;
 pub mod plugins;
 pub mod runtime;
+pub mod wiring;
 
 // Domain layer marker traits for DDD enforcement
 pub mod domain;
@@ -132,7 +146,7 @@ pub use domain::{DomainErrorMarker, DomainModel};
 // Directory API for service discovery
 pub mod directory;
 pub use directory::{
-    DirectoryClient, LocalDirectoryClient, RegisterInstanceInfo, ServiceEndpoint,
+    DirectoryClient, GrpcServiceInfo, LocalDirectoryClient, RegisterInstanceInfo, ServiceEndpoint,
     ServiceInstanceInfo,
 };
 

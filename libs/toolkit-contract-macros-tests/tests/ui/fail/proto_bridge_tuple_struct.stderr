@@ -1,0 +1,5 @@
+error: ProtoBridge only supports structs with named fields
+  --> tests/ui/fail/proto_bridge_tuple_struct.rs:12:19
+   |
+12 | pub struct Request(pub i64);
+   |                   ^^^^^^^^^

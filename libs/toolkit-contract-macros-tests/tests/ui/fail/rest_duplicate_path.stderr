@@ -1,0 +1,5 @@
+error: duplicate REST binding `POST /dup`; each method must have a unique (verb, path) pair
+  --> tests/ui/fail/rest_duplicate_path.rs:17:14
+   |
+17 |     async fn two(&self, body: String) -> Result<u32, std::io::Error>;
+   |              ^^^
