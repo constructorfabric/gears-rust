@@ -46,6 +46,10 @@ members = [
     "libs/toolkit-utils",
     "libs/rustls-corecrypto-provider",
     "libs/rustls-fips-shim",
+    "libs/toolkit-contract",
+    "libs/toolkit-contract-macros",
+    "libs/toolkit-contract-macros-tests",
+    "libs/toolkit-contract-protogen",
     "libs/system-sdks",
     "libs/system-sdks/sdks/directory",
     "gears/credstore/credstore-sdk",
@@ -91,6 +95,8 @@ members = [
     "gears/system/oagw/oagw-sdk",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
+    "examples/toolkit/api-contracts/api-contracts-sdk",
+    "examples/toolkit/api-contracts/api-contracts",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
@@ -257,6 +263,9 @@ rustls-cng-crypto = { version = "0.1", default-features = false, features = ["fi
 pkcs8 = "0.10"
 sec1 = { version = "0.7", default-features = false, features = ["alloc", "der"] }
 
+toolkit-contract = { package = "cf-gears-toolkit-contract", version = "0.1.0", path = "libs/toolkit-contract" }
+toolkit-contract-macros = { package = "cf-gears-toolkit-contract-macros", version = "0.1.0", path = "libs/toolkit-contract-macros" }
+toolkit-contract-protogen = { package = "cf-gears-toolkit-contract-protogen", version = "0.1.0", path = "libs/toolkit-contract-protogen" }
 
 cf-gears-system-sdks = { version = "0.1.35", path = "libs/system-sdks" }
 cf-gears-system-sdk-directory = { version = "0.1.35", path = "libs/system-sdks/sdks/directory" }
@@ -278,12 +287,16 @@ credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.1.24", path =
 # mini-chat
 mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.6", path = "gears/mini-chat/mini-chat-sdk" }
 
+# api-contracts (example: toolkit-contract macros showcased on a Payment API)
+api-contracts-sdk = { package = "cf-api-contracts-sdk", version = "0.1.0", path = "examples/toolkit/api-contracts/api-contracts-sdk" }
+
 # System gears
 grpc_hub = { package = "cf-gears-grpc-hub", version = "0.2.6", path = "gears/system/grpc-hub" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
 serde-saphyr = "0.0.22"
 secrecy = { version = "0.10", features = ["serde"] }
 serde_urlencoded = "0.7"
@@ -541,6 +554,7 @@ kreuzberg = { version = "=4.9.7", features = ["html", "excel", "office", "pdf", 
 
 # Additional testing utilities
 tokio-test = "0.4"
+mockall = "0.13"
 temp-env = { version = "0.3", features = ["async_closure"] }
 
 # Additional utilities

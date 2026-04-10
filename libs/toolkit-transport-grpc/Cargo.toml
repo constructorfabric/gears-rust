@@ -21,9 +21,16 @@ workspace = true
 [dependencies]
 tonic = { workspace = true }
 toolkit-security = { workspace = true }
+secrecy = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+http = { workspace = true }

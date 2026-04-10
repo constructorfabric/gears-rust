@@ -1,0 +1,5 @@
+error: missing required `#[proto_bridge(stub = "...")]` on the type
+ --> tests/ui/fail/proto_bridge_missing_stub.rs:6:1
+  |
+6 | pub struct Request {
+  | ^^^

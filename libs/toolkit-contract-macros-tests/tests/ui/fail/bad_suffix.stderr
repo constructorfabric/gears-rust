@@ -1,0 +1,5 @@
+error: contract trait name must end with one of: `Api`, `Embedded`, `Backend`, `Extension` (PRD #1536 D6: contract type encoded in trait-name suffix)
+ --> tests/ui/fail/bad_suffix.rs:7:11
+  |
+7 | pub trait DemoService: Send + Sync {
+  |           ^^^^^^^^^^^
