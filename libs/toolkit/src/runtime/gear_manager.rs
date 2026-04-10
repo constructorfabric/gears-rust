@@ -88,11 +88,17 @@ pub struct InstanceRuntimeState {
 #[derive(Debug)]
 #[must_use]
 pub struct GearInstance {
+    /// Gear name this instance belongs to
     pub gear: String,
     pub instance_id: Uuid,
+    /// Optional control endpoint for lifecycle management
     pub control: Option<Endpoint>,
+    /// Map of gRPC service name to endpoint
     pub grpc_services: HashMap<String, Endpoint>,
+    /// Optional version string
     pub version: Option<String>,
+    /// Optional REST endpoint (not all modules expose REST)
+    pub rest_endpoint: Option<Endpoint>,
     inner: Arc<parking_lot::RwLock<InstanceRuntimeState>>,
 }
 
@@ -104,6 +110,7 @@ impl Clone for GearInstance {
             control: self.control.clone(),
             grpc_services: self.grpc_services.clone(),
             version: self.version.clone(),
+            rest_endpoint: self.rest_endpoint.clone(),
             inner: Arc::clone(&self.inner),
         }
     }
@@ -117,6 +124,7 @@ impl GearInstance {
             control: None,
             grpc_services: HashMap::new(),
             version: None,
+            rest_endpoint: None,
             inner: Arc::new(parking_lot::RwLock::new(InstanceRuntimeState {
                 last_heartbeat: Instant::now(),
                 state: InstanceState::Registered,
@@ -139,6 +147,12 @@ impl GearInstance {
         self
     }
 
+    /// Set the REST endpoint for this instance
+    pub fn with_rest_endpoint(mut self, ep: Endpoint) -> Self {
+        self.rest_endpoint = Some(ep);
+        self
+    }
+
     /// Get the current state of this instance
     #[must_use]
     pub fn state(&self) -> InstanceState {
@@ -152,13 +166,26 @@ impl GearInstance {
     }
 }
 
+/// Round-robin counter key. Typed instead of stringly-typed to keep the
+/// gRPC / REST / service buckets disjoint (a gear named `"rest:foo"`
+/// can't collide with the REST counter for gear `"foo"`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RrKey {
+    /// Counter for `pick_instance_round_robin(gear)`.
+    Gear(String),
+    /// Counter for `pick_rest_gear(gear)`.
+    Rest(String),
+    /// Counter for `pick_service_round_robin(service_name)`.
+    Service(String),
+}
+
 /// Central registry that tracks all running gear instances in the system.
 /// Provides discovery, health tracking, and round-robin load balancing.
 #[derive(Clone)]
 #[must_use]
 pub struct GearManager {
     inner: DashMap<String, Vec<Arc<GearInstance>>>,
-    rr_counters: DashMap<String, usize>,
+    rr_counters: DashMap<RrKey, usize>,
     hb_ttl: Duration,
     hb_grace: Duration,
 }
@@ -263,7 +290,8 @@ impl GearManager {
 
         if remove_gear {
             self.inner.remove(gear);
-            self.rr_counters.remove(gear);
+            self.rr_counters.remove(&RrKey::Gear(gear.to_owned()));
+            self.rr_counters.remove(&RrKey::Rest(gear.to_owned()));
         }
     }
 
@@ -316,31 +344,37 @@ impl GearManager {
 
         for gear in empty_gears {
             self.inner.remove(&gear);
-            self.rr_counters.remove(&gear);
+            self.rr_counters.remove(&RrKey::Gear(gear.clone()));
+            self.rr_counters.remove(&RrKey::Rest(gear));
         }
     }
 
     /// Pick an instance using round-robin selection, preferring healthy instances
     #[must_use]
     pub fn pick_instance_round_robin(&self, gear: &str) -> Option<Arc<GearInstance>> {
-        let instances_entry = self.inner.get(gear)?;
-        let instances = instances_entry.value();
+        // Holding the `self.inner` shard guard across a `self.rr_counters`
+        // access is a deadlock hazard; collect candidates first, then release.
+        let candidates: Vec<Arc<GearInstance>> = {
+            let instances_entry = self.inner.get(gear)?;
+            let instances = instances_entry.value();
 
-        if instances.is_empty() {
-            return None;
-        }
+            if instances.is_empty() {
+                return None;
+            }
 
-        // Prefer healthy or ready instances
-        let healthy: Vec<_> = instances
-            .iter()
-            .filter(|inst| matches!(inst.state(), InstanceState::Healthy | InstanceState::Ready))
-            .cloned()
-            .collect();
+            let healthy: Vec<Arc<GearInstance>> = instances
+                .iter()
+                .filter(|inst| {
+                    matches!(inst.state(), InstanceState::Healthy | InstanceState::Ready)
+                })
+                .cloned()
+                .collect();
 
-        let candidates: Vec<_> = if healthy.is_empty() {
-            instances.clone()
-        } else {
-            healthy
+            if healthy.is_empty() {
+                instances.clone()
+            } else {
+                healthy
+            }
         };
 
         if candidates.is_empty() {
@@ -348,11 +382,72 @@ impl GearManager {
         }
 
         let len = candidates.len();
-        let mut counter = self.rr_counters.entry(gear.to_owned()).or_insert(0);
-        let idx = *counter % len;
-        *counter = (*counter + 1) % len;
+        let idx = {
+            let mut counter = self
+                .rr_counters
+                .entry(RrKey::Gear(gear.to_owned()))
+                .or_insert(0);
+            let idx = *counter % len;
+            *counter = (*counter + 1) % len;
+            idx
+        };
 
         candidates.get(idx).cloned()
+    }
+
+    /// Pick a gear instance that has a REST endpoint, using round-robin
+    /// selection. Returns the instance and a clone of its REST endpoint,
+    /// preferring healthy/ready instances.
+    #[must_use]
+    pub fn pick_rest_gear(&self, gear_name: &str) -> Option<(Arc<GearInstance>, Endpoint)> {
+        // Collect candidate `Arc<GearInstance>`s under the `self.inner` shard
+        // guard, then drop it before touching `self.rr_counters`. Holding two
+        // DashMap guards across an unrelated map access is a deadlock hazard
+        // and blocks writes to the `inner` shard for the duration.
+        let candidates: Vec<Arc<GearInstance>> = {
+            let instances_entry = self.inner.get(gear_name)?;
+            let instances = instances_entry.value();
+
+            let healthy: Vec<Arc<GearInstance>> = instances
+                .iter()
+                .filter(|inst| {
+                    inst.rest_endpoint.is_some()
+                        && matches!(inst.state(), InstanceState::Healthy | InstanceState::Ready)
+                })
+                .cloned()
+                .collect();
+
+            if healthy.is_empty() {
+                instances
+                    .iter()
+                    .filter(|inst| inst.rest_endpoint.is_some())
+                    .cloned()
+                    .collect()
+            } else {
+                healthy
+            }
+        };
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let len = candidates.len();
+        let pick = {
+            let mut counter = self
+                .rr_counters
+                .entry(RrKey::Rest(gear_name.to_owned()))
+                .or_insert(0);
+            let idx = *counter % len;
+            *counter = (*counter + 1) % len;
+            idx
+        };
+
+        let chosen = &candidates[pick];
+        chosen
+            .rest_endpoint
+            .clone()
+            .map(|ep| (Arc::clone(chosen), ep))
     }
 
     /// Pick a service endpoint using round-robin, returning (gear, instance, endpoint).
@@ -362,30 +457,38 @@ impl GearManager {
         &self,
         service_name: &str,
     ) -> Option<(String, Arc<GearInstance>, Endpoint)> {
-        // Collect all instances that provide this service
-        let mut candidates = Vec::new();
-        for entry in &self.inner {
-            let gear = entry.key().clone();
-            for inst in entry.value() {
-                if let Some(ep) = inst.grpc_services.get(service_name) {
-                    let state = inst.state();
-                    if matches!(state, InstanceState::Healthy | InstanceState::Ready) {
-                        candidates.push((gear.clone(), inst.clone(), ep.clone()));
+        // Holding any `self.inner` shard guard across a `self.rr_counters`
+        // access is a deadlock hazard; collect candidates first, then release.
+        let candidates: Vec<(String, Arc<GearInstance>, Endpoint)> = {
+            let mut candidates = Vec::new();
+            for entry in &self.inner {
+                let gear = entry.key().clone();
+                for inst in entry.value() {
+                    if let Some(ep) = inst.grpc_services.get(service_name) {
+                        let state = inst.state();
+                        if matches!(state, InstanceState::Healthy | InstanceState::Ready) {
+                            candidates.push((gear.clone(), inst.clone(), ep.clone()));
+                        }
                     }
                 }
             }
-        }
+            candidates
+        };
 
         if candidates.is_empty() {
             return None;
         }
 
-        // Use a counter keyed by service name for round-robin
         let len = candidates.len();
-        let service_key = service_name.to_owned();
-        let mut counter = self.rr_counters.entry(service_key).or_insert(0);
-        let idx = *counter % len;
-        *counter = (*counter + 1) % len;
+        let idx = {
+            let mut counter = self
+                .rr_counters
+                .entry(RrKey::Service(service_name.to_owned()))
+                .or_insert(0);
+            let idx = *counter % len;
+            *counter = (*counter + 1) % len;
+            idx
+        };
 
         candidates.get(idx).cloned()
     }
@@ -727,5 +830,76 @@ mod tests {
         assert_ne!(inst1.instance_id, inst2.instance_id);
         // Endpoints should differ
         assert_ne!(ep1, ep2);
+    }
+
+    // Note: the builder `with_rest_endpoint` is exercised end-to-end by
+    // `test_pick_rest_gear_found` and `test_register_instance_with_rest_endpoint`
+    // (in `directory.rs`). A standalone constructor-echo test was removed —
+    // it would still pass even if `with_rest_endpoint` stored the value
+    // under the wrong field, as long as the URL string round-tripped.
+
+    #[test]
+    fn test_pick_rest_gear_none_available() {
+        let dir = GearManager::new();
+
+        // No instances at all
+        let result = dir.pick_rest_gear("nonexistent");
+        assert!(result.is_none());
+
+        // Instance exists but has no REST endpoint
+        let id = Uuid::new_v4();
+        let inst = Arc::new(GearInstance::new("grpc_only", id));
+        dir.register_instance(inst);
+        dir.update_heartbeat("grpc_only", id, Instant::now());
+
+        let result = dir.pick_rest_gear("grpc_only");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pick_rest_gear_found() {
+        let dir = GearManager::new();
+
+        let id = Uuid::new_v4();
+        let inst = Arc::new(
+            GearInstance::new("billing", id)
+                .with_rest_endpoint(Endpoint::http("billing-host", 8080)),
+        );
+        dir.register_instance(inst);
+        dir.update_heartbeat("billing", id, Instant::now());
+
+        let result = dir.pick_rest_gear("billing");
+        assert!(result.is_some());
+
+        let (picked_inst, ep) = result.unwrap();
+        assert_eq!(picked_inst.instance_id, id);
+        assert_eq!(ep.uri, "http://billing-host:8080");
+    }
+
+    #[test]
+    fn test_pick_rest_gear_round_robin() {
+        let dir = GearManager::new();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let inst1 = Arc::new(
+            GearInstance::new("billing", id1).with_rest_endpoint(Endpoint::http("host1", 8080)),
+        );
+        let inst2 = Arc::new(
+            GearInstance::new("billing", id2).with_rest_endpoint(Endpoint::http("host2", 8080)),
+        );
+        dir.register_instance(inst1);
+        dir.register_instance(inst2);
+        dir.update_heartbeat("billing", id1, Instant::now());
+        dir.update_heartbeat("billing", id2, Instant::now());
+
+        let pick1 = dir.pick_rest_gear("billing").unwrap();
+        let pick2 = dir.pick_rest_gear("billing").unwrap();
+        let pick3 = dir.pick_rest_gear("billing").unwrap();
+
+        // Round-robin: first and third should be the same
+        assert_eq!(pick1.0.instance_id, pick3.0.instance_id);
+        // First and second should differ
+        assert_ne!(pick1.0.instance_id, pick2.0.instance_id);
     }
 }

@@ -1,0 +1,95 @@
+[package]
+name = "cf-gears-toolkit-contract"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ToolKit contract IR, binding metadata, validation, policy stack, and proc-macro re-exports"
+rust-version.workspace = true
+
+[lib]
+name = "toolkit_contract"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+runtime-client = [
+    "canonical-errors",
+    "dep:toolkit-http",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:tokio",
+    "dep:bytes",
+    "dep:futures-util",
+    "dep:futures-core",
+    "dep:rand",
+    "dep:async-stream",
+]
+# Used by rest_contract codegen to gate the generated client struct.
+rest-client = ["runtime-client"]
+# Generate OpenAPI 3.1 specs from contract + binding IR.
+# Pulls in canonical-errors so the generated spec can reference the wire
+# `Problem` envelope under `components.schemas.Problem`. The OpenAPI document
+# is incomplete without the canonical error schema, so the two features
+# travel together.
+openapi = ["canonical-errors"]
+# Axum router helper that publishes the OpenAPI spec at /.well-known/openapi.json.
+openapi-axum = ["openapi", "dep:axum"]
+# Conversion of `TransportError` into `toolkit_canonical_errors::CanonicalError`.
+# Pull this in when SDKs want their `Result<_, CanonicalError>` to absorb
+# transport-layer failures via `?` without per-call mapping.
+canonical-errors = ["dep:toolkit-canonical-errors"]
+# Runtime gRPC helpers (status mapping, bearer auth, retry plumbing).
+# Generated `<Trait>Client` structs from `#[toolkit::grpc_contract]` need this.
+# Pulls in canonical-errors so the wire `Problem` envelope is the single
+# canonical type across REST + gRPC + SSE.
+grpc-client = [
+    "runtime-client",
+    "canonical-errors",
+    "dep:tonic",
+    "dep:toolkit-security",
+    "dep:toolkit-transport-grpc",
+]
+
+[dependencies]
+toolkit-contract-macros.workspace = true
+toolkit-utils = { workspace = true, features = ["humantime-serde"] }
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+http.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+percent-encoding = "2"
+
+toolkit-http = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["time", "macros"], optional = true }
+bytes = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+futures-core = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tonic = { workspace = true, features = ["transport"], optional = true }
+toolkit-security = { workspace = true, optional = true }
+toolkit-transport-grpc = { workspace = true, optional = true }
+toolkit-canonical-errors = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+parking_lot.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+axum.workspace = true
+toolkit-http.workspace = true
+secrecy.workspace = true
+toolkit-security.workspace = true
+tower.workspace = true
+uuid = { workspace = true, features = ["v4"] }

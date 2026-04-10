@@ -16,7 +16,8 @@ pub use directory::directory_service_server::{DirectoryService, DirectoryService
 pub use directory::{
     DeregisterInstanceRequest, GrpcServiceEndpoint, HeartbeatRequest, InstanceInfo,
     ListInstancesRequest, ListInstancesResponse, RegisterInstanceRequest,
-    ResolveGrpcServiceRequest, ResolveGrpcServiceResponse,
+    ResolveGrpcServiceRequest, ResolveGrpcServiceResponse, ResolveRestServiceRequest,
+    ResolveRestServiceResponse,
 };
 
 // Re-export the gRPC client implementation
