@@ -465,7 +465,7 @@ strsim = "0.11"
 
 # OData parsing
 peg = "0.8"
-chrono-tz = "0.9"
+chrono-tz = "0.10"
 
 # Procedural macros
 proc-macro2 = "1.0"
