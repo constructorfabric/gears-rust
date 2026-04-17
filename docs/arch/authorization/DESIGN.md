@@ -924,6 +924,37 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
 // INSERT INTO events ...
 ```
 
+**CREATE with tenant provisioning** (Resource Group module -- `is_tenant` property):
+
+When creating a group whose GTS type has `is_tenant = true` (from `x-gts-traits`), the RG handler passes `"is_tenant": true` in `resource.properties`. This signals to the PDP that the operation creates a new tenant scope (`tenant_id = group.id`), not a regular group.
+
+Note: `is_tenant` is orthogonal to `can_be_root`. A type with `can_be_root = true` but `is_tenant = false` (e.g., "Organization") is a root group that belongs to the caller's tenant, not a new tenant scope.
+
+```jsonc
+// PEP -> PDP (tenant group creation)
+{
+  "action": { "name": "create" },
+  "resource": {
+    "type": "gts.cf.core.rg.group.v1~",
+    "properties": { "is_tenant": true, "parent_id": null }
+  },
+  "context": { "require_constraints": true }
+  // ... subject, tenant_context
+}
+
+// PDP policy for create:
+// - is_tenant=true + parent_id=null (root tenant): NOT created via API.
+//   Root tenants are seeded directly in DB (deployment operation).
+// - is_tenant=true + parent_id present (sub-tenant): verify caller in
+//   parent hierarchy, allow.
+// - is_tenant absent/false: standard hierarchy check.
+```
+
+The `is_tenant` + `parent_id` properties enable PDP to differentiate between:
+- **Root tenant provisioning** (`is_tenant=true`, no parent) -- created via direct DB seeding, not through the API
+- **Sub-tenant provisioning** (`is_tenant=true`, with parent) -- verify caller in parent hierarchy
+- **Regular group creation** (`is_tenant=false`) -- requires existing hierarchy for scope resolution
+
 **LIST** (constraints required):
 ```jsonc
 // PEP -> PDP

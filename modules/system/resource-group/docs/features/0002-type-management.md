@@ -104,7 +104,7 @@ Types define the structural rules for the resource group hierarchy — which par
 8. [x] - `p1` - **IF** unique constraint violation → **RETURN** TypeAlreadyExists with conflicting schema_id - `inst-create-type-8`
 9. [x] - `p1` - DB: INSERT INTO gts_type_allowed_parent (type_id, parent_type_id) for each allowed parent - `inst-create-type-9`
 10. [x] - `p1` - DB: INSERT INTO gts_type_allowed_membership (type_id, membership_type_id) for each allowed membership - `inst-create-type-10`
-11. [x] - `p1` - **RETURN** created ResourceGroupType with schema_id, allowed_parents, allowed_memberships, can_be_root, metadata_schema - `inst-create-type-11`
+11. [x] - `p1` - **RETURN** created ResourceGroupType with schema_id, allowed_parents, allowed_memberships, can_be_root, is_tenant, metadata_schema - `inst-create-type-11`
 
 ### Update Type
 
@@ -166,7 +166,7 @@ Types define the structural rules for the resource group hierarchy — which par
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-algo-type-mgmt-validate-type-input`
 
-**Input**: Type create/update payload (`schema_id`, `allowed_parents`, `allowed_memberships`, `can_be_root`, `metadata_schema`)
+**Input**: Type create/update payload (`schema_id`, `allowed_parents`, `allowed_memberships`, `can_be_root`, `is_tenant` (default `false`), `metadata_schema`)
 
 **Output**: Validated type definition or validation error with field-level details
 

@@ -168,6 +168,11 @@ Base contract for all RG type definitions. Traits define topology rules; propert
         "description": "Whether this type permits root placement (no parent_id).",
         "default": false
       },
+      "is_tenant": {
+        "type": "boolean",
+        "description": "Whether instances create their own tenant scope (tenant_id = group.id). Default false.",
+        "default": false
+      },
       "allowed_parents": {
         "type": "array",
         "items": { "type": "string", "x-gts-ref": "gts.cf.core.rg.type.v1~" },
@@ -338,6 +343,7 @@ When a type is registered as an RG type, it chains with the base contract via a 
       },
       "x-gts-traits": {
         "can_be_root": true,
+        "is_tenant": true,
         "allowed_parents": ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"],
         "allowed_memberships": ["gts.z.core.idp.user.v1~"]
       }
@@ -543,7 +549,7 @@ Notes:
 
 | Table | Description |
 |---|---|
-| `gts_type` | GTS type definitions (SMALLINT id PK, schema_id UNIQUE, metadata_schema JSONB). `can_be_root` resolved at runtime from `x-gts-traits` in the registered GTS schema. |
+| `gts_type` | GTS type definitions (SMALLINT id PK, schema_id UNIQUE, metadata_schema JSONB). `can_be_root` and `is_tenant` resolved at runtime from `x-gts-traits` in the registered GTS schema. |
 | `gts_type_allowed_parent` | Junction: type_id → parent_type_id (both SMALLINT FK) |
 | `gts_type_allowed_membership` | Junction: type_id → membership_type_id (both SMALLINT FK) |
 | `resource_group` | Groups (UUID id, gts_type_id SMALLINT FK, name, metadata JSONB, parent_id UUID FK, tenant_id UUID) |
@@ -576,6 +582,7 @@ Entity defines x-gts-traits-schema but no x-gts-traits values are provided
 ```json
 "x-gts-traits": {
   "can_be_root": false,
+  "is_tenant": false,
   "allowed_parents": [],
   "allowed_memberships": []
 }

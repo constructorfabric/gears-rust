@@ -113,6 +113,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Type code validation: length 1..63, no whitespace, case-insensitive uniqueness via `schema_id` unique constraint
   - Duplicate rejection: deterministic `TypeAlreadyExists` on conflict
   - Hierarchy-safe updates: reject removal of `allowed_parents` or `can_be_root` changes when existing groups would violate new rules (`AllowedParentsViolation`)
+  - `is_tenant` trait (from `x-gts-traits`, default `false`): tenant types create self-referencing `tenant_id = group.id` scope; non-tenant types inherit tenant scope
   - Delete safety: reject type deletion when entities of that type exist
   - Type REST endpoints: CRUD under `/api/types-registry/v1/types` with OData `$filter` on `code` field
   - allowed_parents and allowed_memberships junction table management (gts_type_allowed_parent, gts_type_allowed_membership)

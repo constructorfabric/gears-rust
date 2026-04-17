@@ -139,7 +139,7 @@ Not applicable. This feature defines SDK contracts, module scaffold, and persist
 The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs` that represent the public API surface for all RG domain entities and query constructs.
 
 **Required types**:
-- `ResourceGroupType` — type definition with `schema_id` (GtsTypePath), `allowed_parents` (Vec), `allowed_memberships` (Vec), `can_be_root` (bool), `metadata_schema` (Option)
+- `ResourceGroupType` — type definition with `schema_id` (GtsTypePath), `allowed_parents` (Vec), `allowed_memberships` (Vec), `can_be_root` (bool), `is_tenant` (bool, default false), `metadata_schema` (Option)
 - `ResourceGroup` — group entity with `id` (Uuid), `type` (GtsTypePath), `name` (String), `metadata` (Option), `hierarchy` (ResourceGroupHierarchy with `parent_id`, `tenant_id`)
 - `ResourceGroupWithDepth` — extends ResourceGroup with `hierarchy.depth` (i32, relative distance)
 - `ResourceGroupMembership` — membership link with `group_id` (Uuid), `resource_type` (GtsTypePath), `resource_id` (String)

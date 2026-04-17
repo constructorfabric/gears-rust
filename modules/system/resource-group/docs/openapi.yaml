@@ -14,7 +14,7 @@ info:
     and the server stores them as-is. The server extracts type metadata from the schema structure:
     - `$id` → GTS type path (becomes the `schema_id` for lookups)
     - `x-gts-traits-schema` → trait shape definition (on base contracts)
-    - `x-gts-traits` → concrete trait values like `can_be_root`, `allowed_parents`, `allowed_memberships`
+    - `x-gts-traits` → concrete trait values like `can_be_root`, `is_tenant`, `allowed_parents`, `allowed_memberships`
     - `allOf` + `$ref` → type inheritance chain
 
     For chained RG types, the server stores extracted traits in junction tables
@@ -1154,7 +1154,7 @@ components:
         Raw GTS JSON Schema document. The server stores the schema as-is and extracts metadata:
         - `$id` → GTS type path (used as lookup key)
         - `x-gts-traits-schema` → trait shape (on base contracts)
-        - `x-gts-traits` → trait values like `can_be_root`, `allowed_parents`, `allowed_memberships` (on chained types)
+        - `x-gts-traits` → trait values like `can_be_root`, `is_tenant`, `allowed_parents`, `allowed_memberships` (on chained types)
         - `allOf` + `$ref` → type inheritance chain
         For chained RG types, extracted traits are stored in junction tables for DB-enforced referential integrity.
       additionalProperties: true

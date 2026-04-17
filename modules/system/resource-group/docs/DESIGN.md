@@ -462,11 +462,46 @@ Membership write semantics for AuthZ-facing profile:
 - tenant-incompatible membership writes fail deterministically (`TenantIncompatibility` error mapping)
 - no policy decision fields are produced by RG for these operations
 
-Platform-admin provisioning exception:
+#### Tenant Provisioning via `is_tenant` Trait
 
-- privileged platform-admin calls that create/manage tenant hierarchies through `ResourceGroupClient` may run without caller tenant scoping
-- this exception applies to provisioning/management operations only, not AuthZ query path
-- data invariants remain strict: parent-child and membership links must satisfy tenant hierarchy compatibility rules
+`can_be_root` and `is_tenant` are orthogonal GTS type traits:
+
+- `can_be_root` (boolean, default `false`) -- placement: whether instances of this type can be root groups (no parent)
+- `is_tenant` (boolean, default `false`) -- scope: whether instances of this type create their own tenant scope (`tenant_id = group.id`)
+
+Both are resolved from `x-gts-traits` in the registered GTS schema. `is_tenant` is a constant defined in the GTS type schema (e.g., `"is_tenant": true` in tenant type's `x-gts-traits`); it cannot be overridden per-instance. RG extracts it at type registration time alongside `can_be_root`.
+
+**`tenant_id` assignment logic** (`create_group`):
+
+| `is_tenant` | `can_be_root` | `parent_id` | `tenant_id` assignment | Example |
+|-------------|---------------|-------------|------------------------|---------|
+| `true` | `true` | `None` | `group.id` (self) | Root tenant (created via DB seeding) |
+| `true` | `true` | `Some(pid)` | `group.id` (self) | Sub-tenant under parent |
+| `true` | `false` | `Some(pid)` | `group.id` (self) | Sub-tenant (must have parent) |
+| `false` | `true` | `None` | `caller.subject_tenant_id` | Organization root (belongs to caller's tenant) |
+| `false` | `true` | `Some(pid)` | `parent.tenant_id` | Organization under parent |
+| `false` | `false` | `Some(pid)` | `parent.tenant_id` | Department, Branch, Team |
+
+**Key semantics:**
+
+- `is_tenant = true` always creates a self-referencing tenant scope regardless of placement (`tenant_id = group.id`)
+- `is_tenant = false` always inherits tenant scope from context (parent or caller)
+- `can_be_root` controls only whether root placement is allowed, not tenant identity
+- Both traits are optional in GTS schema with default `false`
+
+**AuthZ integration** (`resource.properties` on `action = "create"`):
+
+- Handler passes `"is_tenant": true` and `"parent_id": null|"uuid"` in `resource.properties` when applicable
+- AuthZ plugin uses this to apply provisioning-specific policy:
+  - **Root tenant** (`is_tenant = true`, `parent_id = null`): root tenants are created via direct DB seeding (deployment/provisioning operation), not through the REST API. This avoids the bootstrap chicken-and-egg problem.
+  - **Sub-tenant** (`is_tenant = true`, `parent_id` present): verify caller has access to parent's hierarchy, then allow
+  - **Normal group** (`is_tenant = false`): standard hierarchy check
+
+**Data invariants:**
+
+- Parent-child type compatibility (`allowed_parents`) is always enforced
+- For tenant groups (`is_tenant = true`): the new group creates its own tenant scope (`tenant_id = group.id`); the parent hierarchy link is preserved via `parent_id`. Tenant enforcement (`child.tenant_id == parent.tenant_id`) is **skipped** because the child intentionally gets a different `tenant_id`
+- For non-tenant groups (`is_tenant = false`): `child.tenant_id` must equal `parent.tenant_id` (or `caller.subject_tenant_id` for root). This is enforced at the domain service layer to prevent cross-tenant data leakage
 
 #### REST API Endpoints
 

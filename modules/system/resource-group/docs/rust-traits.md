@@ -19,6 +19,9 @@ use uuid::Uuid;
 pub struct ResourceGroupType {
     pub code: String,
     pub can_be_root: bool,
+    /// Whether instances of this type create their own tenant scope.
+    /// Default `false`. When `true`, `tenant_id = group.id` (self-referencing).
+    pub is_tenant: bool,
     pub allowed_parents: Vec<String>,
     pub allowed_memberships: Vec<String>,
     pub metadata_schema: Option<serde_json::Value>,
@@ -29,6 +32,8 @@ pub struct ResourceGroupType {
 pub struct CreateTypeRequest {
     pub code: String,
     pub can_be_root: bool,
+    /// Default `false`. Resolved from `x-gts-traits.is_tenant` in GTS schema.
+    pub is_tenant: bool,
     pub allowed_parents: Vec<String>,
     pub allowed_memberships: Vec<String>,
     pub metadata_schema: Option<serde_json::Value>,
@@ -38,6 +43,7 @@ pub struct CreateTypeRequest {
 #[derive(Debug, Clone)]
 pub struct UpdateTypeRequest {
     pub can_be_root: bool,
+    pub is_tenant: bool,
     pub allowed_parents: Vec<String>,
     pub allowed_memberships: Vec<String>,
     pub metadata_schema: Option<serde_json::Value>,

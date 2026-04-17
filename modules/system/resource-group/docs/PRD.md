@@ -351,8 +351,9 @@ Type data seeding (populating type definitions) is **optional** and deployment-s
 AuthZ deployment determines which types are needed:
 
 - **AuthZ does not use RG** — no type seeding required.
-- **Flat tenants** — create type `tenant` with `can_be_root: true, allowed_parents: {}` (root placement only, no nesting).
-- **Hierarchical tenants** — create type `tenant` with for example `can_be_root: true, allowed_parents: {'tenant'}` (root placement or nested under another tenant).
+- **Flat tenants** — create type `tenant` with `is_tenant: true, can_be_root: true, allowed_parents: {}` (root placement only, no nesting). `is_tenant` causes `tenant_id = group.id` (self-referencing scope).
+- **Hierarchical tenants** — create type `tenant` with `is_tenant: true, can_be_root: true, allowed_parents: {'tenant'}` (root placement or nested under another tenant). Sub-tenants also get `tenant_id = group.id`.
+- **Non-tenant root types** — create type `organization` with `is_tenant: false, can_be_root: true` (root placement, but inherits `tenant_id` from caller). `is_tenant` defaults to `false` if omitted.
 
 #### Validate Type Update Against Existing Hierarchy
 

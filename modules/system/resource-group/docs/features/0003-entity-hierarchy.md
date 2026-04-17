@@ -2,7 +2,8 @@
 
 # Feature: Group Entity & Hierarchy Engine
 
-- [x] `p1` - **ID**: `cpt-cf-resource-group-featstatus-entity-hierarchy`
+- [ ] `p1` - **ID**: `cpt-cf-resource-group-featstatus-entity-hierarchy`
+- [ ] `p2` - `cpt-cf-resource-group-flow-entity-hier-tenant-provisioning` (tenant provisioning via `can_be_root`)
 
 - [x] `p1` - `cpt-cf-resource-group-feature-entity-hierarchy`
 
@@ -18,6 +19,7 @@
   - [Update Group](#update-group)
   - [Move Group (Subtree)](#move-group-subtree)
   - [Delete Group](#delete-group)
+  - [Tenant Provisioning (`is_tenant` Trait)](#tenant-provisioning-is_tenant-trait)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Cycle Detection](#cycle-detection)
   - [Closure Table Rebuild for Subtree Move](#closure-table-rebuild-for-subtree-move)
@@ -222,6 +224,35 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
    1. [x] - `p1` - DB: DELETE FROM resource_group_closure WHERE descendant_id = {group_id} — remove closure rows - `inst-delete-group-6a`
    2. [x] - `p1` - DB: DELETE FROM resource_group WHERE id = {group_id} - `inst-delete-group-6b`
 7. [x] - `p1` - **RETURN** success (204 No Content) - `inst-delete-group-7`
+
+### Tenant Provisioning (`is_tenant` Trait)
+
+- [ ] `p2` - **ID**: `cpt-cf-resource-group-flow-entity-hier-tenant-provisioning`
+
+**Actor**: `cpt-cf-resource-group-actor-instance-administrator`
+
+**`is_tenant`** is a GTS type trait (from `x-gts-traits`, default `false`) that controls tenant scope assignment. It is orthogonal to `can_be_root` (which controls placement only).
+
+**`tenant_id` assignment**:
+
+- `is_tenant = true` -> `tenant_id = group.id` (self-referencing, creates own tenant scope). Tenant enforcement (`child.tenant_id == parent.tenant_id`) is skipped for `is_tenant` types because the child intentionally gets a different `tenant_id`.
+- `is_tenant = false`, root group -> `tenant_id = caller.subject_tenant_id`
+- `is_tenant = false`, child group -> `tenant_id = parent.tenant_id` (enforced: must match parent)
+
+**AuthZ create action** passes `resource.properties["is_tenant"]` and `resource.properties["parent_id"]` to enable provisioning policy:
+
+- **Root tenant** (`is_tenant=true`, `parent_id=null`): created via direct DB seeding (deployment operation), not through API. This avoids the bootstrap chicken-and-egg problem.
+- **Sub-tenant** (`is_tenant=true`, `parent_id` present): AuthZ verifies caller has access to parent's hierarchy, then allows.
+- **Normal group** (`is_tenant=false`): standard hierarchy check.
+
+**Test cases**:
+- TC-PROV-01: Root tenant seeded in DB -> visible via API, `tenant_id == group.id` [P1]
+- TC-PROV-02: Create sub-tenant (`is_tenant=true`) under existing tenant -> `tenant_id == group.id`, `parent_id` set [P1]
+- TC-PROV-03: Create root org (`is_tenant=false`, `can_be_root=true`) -> `tenant_id == caller.subject_tenant_id` [P1]
+- TC-PROV-04: Create normal child (`is_tenant=false`, `can_be_root=false`) -> `tenant_id == parent.tenant_id` [P1]
+- TC-PROV-05: Create root tenant, then list from new tenant -> visible via rg-authz [P1]
+- TC-PROV-06: Create sub-tenant with barrier metadata -> barrier semantics apply [P2]
+- TC-PROV-07: Create sub-tenant (`is_tenant=true`) under parent -> `tenant_id = group.id != parent.tenant_id`, tenant enforcement skipped [P1]
 
 ## 3. Processes / Business Logic (CDSL)
 

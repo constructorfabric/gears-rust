@@ -52,6 +52,7 @@ T1 (root tenant)
 | Scenario | Decision | Reason |
 |----------|----------|--------|
 | Valid tenant + non-empty hierarchy | `true` | Normal operation |
+| Create + `is_tenant` + parent exists (sub-tenant) | `true` | Sub-tenant provisioning -- caller verified in parent hierarchy |
 | No tenant resolvable | `false` | Cannot scope access |
 | Nil UUID tenant | `false` | Invalid identity |
 | Empty hierarchy from RG | `false` | No visible scope |
@@ -64,7 +65,7 @@ modules:
   rg_authz_plugin:
     config:
       vendor: "hyperspot"
-      priority: 50
+      priority: 200  # default; set lower than static-authz (100) to activate
 ```
 
 ## Dependencies
