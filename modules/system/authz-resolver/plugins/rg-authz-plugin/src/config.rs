@@ -17,7 +17,7 @@ impl Default for RgAuthZPluginConfig {
     fn default() -> Self {
         Self {
             vendor: "hyperspot".to_owned(),
-            priority: 50,
+            priority: 200,
         }
     }
 }

@@ -458,6 +458,10 @@ e2e-docker-smoke:
 e2e-local:
 	python3 scripts/ci.py e2e-local
 
+## Run RG + AuthZ barrier E2E tests with rg-authz-plugin (separate config)
+e2e-rg-authz:
+	python3 scripts/ci.py e2e-local --config config/e2e-rg-authz.yaml -- -k "resource_group"
+
 ## Run E2E smoke tests locally (only tests marked @pytest.mark.smoke)
 e2e-local-smoke:
 	python3 scripts/ci.py e2e-local --smoke

@@ -3936,6 +3936,7 @@ dependencies = [
  "cf-nodes-registry",
  "cf-oagw",
  "cf-resource-group",
+ "cf-rg-authz-plugin",
  "cf-simple-user-settings",
  "cf-single-tenant-tr-plugin",
  "cf-static-authn-plugin",

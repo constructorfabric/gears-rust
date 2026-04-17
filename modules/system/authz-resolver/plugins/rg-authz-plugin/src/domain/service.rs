@@ -58,7 +58,8 @@ impl Service {
             return Self::deny();
         }
 
-        // Resolve tenant subtree via RG hierarchy
+        // Resolve tenant subtree via RG hierarchy.
+        // No fallback: if tenant not in RG or RG error — deny (fail-closed).
         let ctx = modkit_security::SecurityContext::anonymous();
         let visible_tenants = match self.resolve_tenant_subtree(&ctx, tid).await {
             Ok(tenants) => tenants,

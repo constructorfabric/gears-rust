@@ -622,3 +622,67 @@ async def test_hierarchy_depth_filter_wiring(
         # Grandchild (descendant, depth=1) must be present
         assert grandchild["id"] in by_id, "Descendant missing"
         assert by_id[grandchild["id"]]["hierarchy"]["depth"] == 1
+
+
+# ── S12: Barrier metadata preserved in hierarchy ──────────────────────
+
+
+async def test_barrier_metadata_in_descendants(
+    rg_base_url, rg_headers, create_type, create_group,
+):
+    """Seam: Barrier data flows through RG HTTP hierarchy endpoint.
+
+    RG does NOT filter barriers -- it returns all descendants with metadata.
+    This verifies the data contract that AuthZ plugins rely on:
+    barrier groups have metadata.barrier = true, descendants are present.
+    The AuthZ plugin (not RG) is responsible for excluding barrier subtrees.
+    """
+    root_type = await create_type("s12root")
+    child_type = await create_type(
+        "s12child", can_be_root=False, allowed_parents=[root_type["code"]],
+    )
+    gc_type = await create_type(
+        "s12gc", can_be_root=False, allowed_parents=[child_type["code"]],
+    )
+
+    root = await create_group(root_type["code"], "S12 Root")
+    barrier = await create_group(
+        child_type["code"], "S12 Barrier",
+        parent_id=root["id"], metadata={"barrier": True},
+    )
+    behind = await create_group(
+        gc_type["code"], "S12 Behind",
+        parent_id=barrier["id"],
+    )
+    normal = await create_group(
+        child_type["code"], "S12 Normal",
+        parent_id=root["id"],
+    )
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        # GET descendants of root — RG returns ALL including barrier subtree
+        r = await c.get(
+            f"{_groups(rg_base_url)}/{root['id']}/descendants",
+            headers=rg_headers,
+        )
+        assert r.status_code == 200
+        items = r.json()["items"]
+        ids = {item["id"] for item in items}
+
+        # All 4 groups present (RG does not filter barriers)
+        assert root["id"] in ids, "root missing"
+        assert barrier["id"] in ids, "barrier missing"
+        assert behind["id"] in ids, "behind-barrier missing"
+        assert normal["id"] in ids, "normal missing"
+        assert len(items) == 4
+
+        # Barrier group has metadata.barrier = true
+        barrier_item = next(i for i in items if i["id"] == barrier["id"])
+        assert barrier_item.get("metadata", {}).get("barrier") is True, (
+            f"barrier metadata expected, got: {barrier_item.get('metadata')}"
+        )
+
+        # Non-barrier groups do NOT have barrier metadata
+        normal_item = next(i for i in items if i["id"] == normal["id"])
+        normal_meta = normal_item.get("metadata")
+        assert normal_meta is None or normal_meta.get("barrier") is not True
