@@ -1,0 +1,51 @@
+[package]
+name = "cf-rg-authz-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "AuthZ resolver plugin with RG hierarchy resolution for tenant and group scoping"
+repository.workspace = true
+readme = "README.md"
+keywords = ["cyberfabric", "cyberfabric-system", "authorization"]
+categories = ["authentication"]
+
+[lib]
+name = "rg_authz_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+authz-resolver-sdk = { package = "cf-authz-resolver-sdk", version = "0.2.18", path = "../../authz-resolver-sdk" }
+resource-group-sdk = { package = "cf-resource-group-sdk", version = "0.1.0", path = "../../../resource-group/resource-group-sdk" }
+types-registry-sdk = { package = "cf-types-registry-sdk", version = "0.1.5", path = "../../../types-registry/types-registry-sdk" }
+
+# ModKit dependencies
+modkit = { workspace = true }
+modkit-macros = { workspace = true }
+modkit-security = { workspace = true }
+modkit-odata = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Data structures
+uuid = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Required by modkit::module macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

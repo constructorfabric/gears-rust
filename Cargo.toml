@@ -79,6 +79,7 @@ members = [
     "modules/system/authz-resolver/authz-resolver-sdk",
     "modules/system/authz-resolver/authz-resolver",
     "modules/system/authz-resolver/plugins/static-authz-plugin",
+    "modules/system/authz-resolver/plugins/rg-authz-plugin",
     "modules/system/oagw/oagw",
     "modules/system/oagw/oagw-sdk",
     "modules/mini-chat/mini-chat-sdk",
