@@ -145,29 +145,45 @@ pub(super) fn register_group_routes(mut router: Router, openapi: &dyn OpenApiReg
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /resource-group/v1/groups/{group_id}/hierarchy - List group hierarchy
-    router = OperationBuilder::get("/resource-group/v1/groups/{group_id}/hierarchy")
-        .operation_id("resource_group.list_group_hierarchy")
-        .summary("List group hierarchy")
-        .description(
-            "Traverse hierarchy from a reference group with relative depth and OData filtering",
-        )
+    // GET /resource-group/v1/groups/{group_id}/descendants
+    router = OperationBuilder::get("/resource-group/v1/groups/{group_id}/descendants")
+        .operation_id("resource_group.get_group_descendants")
+        .summary("Get group descendants")
+        .description("Get descendants of a reference group (depth >= 0) with OData filtering")
         .tag(API_TAG)
         .authenticated()
         .no_license_required()
         .path_param("group_id", "Reference group UUID")
-        .query_param_typed(
-            "limit",
-            false,
-            "Maximum number of hierarchy entries to return",
-            "integer",
-        )
+        .query_param_typed("limit", false, "Maximum entries to return", "integer")
         .query_param("cursor", false, "Cursor for pagination")
-        .handler(handlers::list_group_hierarchy)
+        .handler(handlers::get_group_descendants)
         .json_response_with_schema::<modkit_odata::Page<dto::GroupWithDepthDto>>(
             openapi,
             http::StatusCode::OK,
-            "Paginated list of hierarchy entries with relative depth",
+            "Paginated descendants with relative depth",
+        )
+        .with_odata_filter::<HierarchyFilterField>()
+        .error_400(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    // GET /resource-group/v1/groups/{group_id}/ancestors
+    router = OperationBuilder::get("/resource-group/v1/groups/{group_id}/ancestors")
+        .operation_id("resource_group.get_group_ancestors")
+        .summary("Get group ancestors")
+        .description("Get ancestors of a reference group (depth <= 0) with OData filtering")
+        .tag(API_TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("group_id", "Reference group UUID")
+        .query_param_typed("limit", false, "Maximum entries to return", "integer")
+        .query_param("cursor", false, "Cursor for pagination")
+        .handler(handlers::get_group_ancestors)
+        .json_response_with_schema::<modkit_odata::Page<dto::GroupWithDepthDto>>(
+            openapi,
+            http::StatusCode::OK,
+            "Paginated ancestors with relative depth",
         )
         .with_odata_filter::<HierarchyFilterField>()
         .error_400(openapi)

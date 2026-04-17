@@ -466,8 +466,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         unreachable!("retry loop always returns")
     }
 
-    /// List hierarchy for a group (AuthZ-scoped).
-    pub async fn list_group_hierarchy(
+    /// Get descendants of a group (depth >= 0, AuthZ-scoped).
+    pub async fn get_group_descendants(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,
@@ -479,16 +479,34 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await
             .map_err(DomainError::from)?;
         let conn = self.db.conn()?;
-
-        // Verify group exists
-        let _existing = self
-            .group_repo
+        self.group_repo
             .find_model_by_id(&conn, group_id)
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
-
         self.group_repo
-            .list_hierarchy(&conn, &scope, group_id, query)
+            .get_descendants(&conn, &scope, group_id, query)
+            .await
+    }
+
+    /// Get ancestors of a group (depth <= 0, AuthZ-scoped).
+    pub async fn get_group_ancestors(
+        &self,
+        ctx: &SecurityContext,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
+        let scope = self
+            .enforcer
+            .access_scope(ctx, &RG_GROUP_RESOURCE, "list", Some(group_id))
+            .await
+            .map_err(DomainError::from)?;
+        let conn = self.db.conn()?;
+        self.group_repo
+            .find_model_by_id(&conn, group_id)
+            .await?
+            .ok_or_else(|| DomainError::group_not_found(group_id))?;
+        self.group_repo
+            .get_ancestors(&conn, &scope, group_id, query)
             .await
     }
 
@@ -583,7 +601,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             if let Some(max_depth) = profile.max_depth {
                 let parent_depth = group_repo.get_depth(tx, parent_id).await?;
                 #[allow(clippy::cast_possible_wrap)]
-                if parent_depth + 1 > max_depth as i32 {
+                if parent_depth + 1 >= max_depth as i32 {
                     return Err(DomainError::limit_violation(format!(
                         "Depth limit exceeded: adding child at depth {} exceeds max_depth {}",
                         parent_depth + 1,
@@ -1109,7 +1127,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2b
                 #[allow(clippy::cast_possible_wrap)]
-                if new_deepest > max_depth as i32 {
+                if new_deepest >= max_depth as i32 {
                     debug!(group_id = %group_id, new_deepest, max_depth, "Depth limit exceeded on move");
                     return Err(DomainError::limit_violation(format!(
                         "Depth limit exceeded: moving subtree would create depth {new_deepest}, max_depth is {max_depth}"

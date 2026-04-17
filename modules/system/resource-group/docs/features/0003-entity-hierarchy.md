@@ -333,8 +333,9 @@ The system **MUST** implement a Hierarchy Service that maintains the closure tab
 - Closure table maintenance: self-row on insert, ancestor rows from parent chain, full path rebuild on subtree move, cascade removal on delete
 - Ancestor queries: return all ancestors of a group ordered by depth (ascending)
 - Descendant queries: return all descendants of a group ordered by depth (ascending)
-- Hierarchy depth endpoint: `GET /groups/{group_id}/hierarchy` returning `Page<ResourceGroupWithDepth>` with `hierarchy.depth` (relative: 0=self, positive=descendants, negative=ancestors)
-- OData filtering on `hierarchy/depth` (eq, ne, gt, ge, lt, le) and `type` (eq, ne, in)
+- Descendants endpoint: `GET /groups/{group_id}/descendants` returning `Page<ResourceGroupWithDepth>` with `hierarchy.depth` (relative: 0=self, positive=descendants)
+- Ancestors endpoint: `GET /groups/{group_id}/ancestors` returning `Page<ResourceGroupWithDepth>` with `hierarchy.depth` (relative: 0=self, negative=ancestors)
+- OData filtering on `hierarchy/depth` (eq, ne, gt, ge, lt, le) and `type` (eq, ne, in) on both endpoints
 - Query profile enforcement: `max_depth`/`max_width` checked on writes only; reads return full stored data even if profile was tightened; no data rewrite on profile change
 
 **Implements**:
@@ -359,7 +360,8 @@ The system **MUST** implement REST endpoint handlers for group management under 
 - `GET /groups/{group_id}` — get group by UUID, return 404 if not found
 - `PUT /groups/{group_id}` — update group (name, type, metadata) or move group (hierarchy.parent_id), return 200 OK
 - `DELETE /groups/{group_id}?force={true|false}` — delete group, return 204 No Content
-- `GET /groups/{group_id}/hierarchy` — hierarchy depth traversal with OData `$filter` on `hierarchy/depth` and `type`, cursor-based pagination
+- `GET /groups/{group_id}/descendants` — descendants traversal with OData `$filter` on `hierarchy/depth` and `type`, cursor-based pagination
+- `GET /groups/{group_id}/ancestors` — ancestors traversal with OData `$filter` on `hierarchy/depth` and `type`, cursor-based pagination
 
 **Implements**:
 - `cpt-cf-resource-group-flow-entity-hier-create-group`
@@ -368,7 +370,7 @@ The system **MUST** implement REST endpoint handlers for group management under 
 - `cpt-cf-resource-group-flow-entity-hier-delete-group`
 
 **Touches**:
-- API: `GET/POST /api/resource-group/v1/groups`, `GET/PUT/DELETE /api/resource-group/v1/groups/{group_id}`, `GET /api/resource-group/v1/groups/{group_id}/hierarchy`
+- API: `GET/POST /api/resource-group/v1/groups`, `GET/PUT/DELETE /api/resource-group/v1/groups/{group_id}`, `GET /api/resource-group/v1/groups/{group_id}/descendants`, `GET /api/resource-group/v1/groups/{group_id}/ancestors`
 
 ### Group Data Seeding
 
@@ -408,7 +410,8 @@ All acceptance criteria from feature 0003 are covered by automated tests:
 REST-level tests for endpoints not covered by existing `api_rest_test.rs`:
 - PUT /types/{code} (update type)
 - POST/DELETE /memberships/{group_id}/{type}/{resource_id}
-- GET /groups/{id}/hierarchy
+- GET /groups/{id}/descendants
+- GET /groups/{id}/ancestors
 - DELETE /groups/{id}?force=true
 
 ## 6. Acceptance Criteria
@@ -604,7 +607,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-GRP-16: Hierarchy endpoint - ancestors and descendants [P1]
 - **Covers**: G21, 0003-AC-14
-- **Setup**: Create 3-level tree (A -> B -> C). Call list_group_hierarchy(B).
+- **Setup**: Create 3-level tree (A -> B -> C). Call get_group_descendants(B) and get_group_ancestors(B).
 - **Assert**: Returns A (depth=-1), B (depth=0), C (depth=1)
 
 #### TC-GRP-17: max_depth enforcement on create [P1]
@@ -679,7 +682,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - Group with no children, force=true — descendant_ids is empty, still works
 - **Assert**: Success
 
-#### TC-GRP-36: list_group_hierarchy nonexistent group [P2]
+#### TC-GRP-36: get_group_descendants / get_group_ancestors nonexistent group [P2]
 - **Assert**: `DomainError::GroupNotFound`
 
 #### TC-GRP-37: Depth limit exact boundary (parent_depth+1 == max_depth) [P1]
@@ -717,13 +720,13 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-META-17: Barrier group visible in hierarchy (RG does NOT filter) [P1]
 - Create parent → child with `metadata: {"barrier": true}` → grandchild
-- `list_group_hierarchy(parent)` → returns ALL 3 including barrier child
+- `get_group_descendants(parent)` → returns ALL 3 including barrier child
 - **Covers**: PRD "RG does not filter based on barrier", Feature 0005-AC
 - **Assert**: barrier group present in results, depth correct
 
 #### TC-META-18: Group metadata in hierarchy endpoint response [P1]
 - Create groups with various metadata
-- `list_group_hierarchy` → each `GroupWithDepthDto` includes `metadata` field
+- `get_group_descendants` / `get_group_ancestors` → each `GroupWithDepthDto` includes `metadata` field
 - **Assert**: metadata preserved in hierarchy response (Feature 0005 requirement)
 
 ### REST-level metadata serialization
@@ -1015,7 +1018,7 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 - **Assert**: `resource_type` is string GTS path. No `gts_type_id`.
 
 #### TC-ADR-20: Hierarchy response contains no SMALLINT IDs [P1]
-- list_group_hierarchy → response items
+- get_group_descendants → response items
 - **Assert**: each item `type` is string, no numeric type IDs
 
 ### REST API Layer
@@ -1051,7 +1054,7 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 
 #### TC-REST-08: Hierarchy endpoint via REST [P2]
 - **Covers**: G21
-- GET /groups/{id}/hierarchy, verify 200 + depth fields
+- GET /groups/{id}/descendants and GET /groups/{id}/ancestors, verify 200 + depth fields
 
 #### TC-REST-10: Error response HTTP mapping — status codes and Content-Type [P1]
 - **Covers**: RG3
@@ -1193,10 +1196,13 @@ Every test that creates, moves, or deletes groups **MUST** query the closure tab
 
 ### Hierarchy Endpoint Response Shape
 
-`list_group_hierarchy(B)` for tree A → B → C **MUST** return:
+`get_group_descendants(B)` for tree A → B → C **MUST** return:
+- Self-node B: `hierarchy.depth == 0`
+- Descendant C: `hierarchy.depth > 0` (e.g., 1)
+
+`get_group_ancestors(B)` for tree A → B → C **MUST** return:
 - Self-node B: `hierarchy.depth == 0`
 - Ancestor A: `hierarchy.depth < 0` (e.g., -1)
-- Descendant C: `hierarchy.depth > 0` (e.g., 1)
 - **All nodes present** (no missing nodes)
 - Each node has `hierarchy.tenant_id`, `hierarchy.parent_id`
 
@@ -1304,13 +1310,13 @@ Tests S5, S6, S7 verify PostgreSQL-specific behavior that unit tests cannot catc
 POST parent_type (can_be_root), child_type (allowed_parents: [parent])
 POST root → child → grandchild
 
-GET /groups/{root.id}/hierarchy     → 200
+GET /groups/{root.id}/descendants     → 200
   assert len(items) == 3
   assert root       depth == 0
   assert child      depth == 1
   assert grandchild depth == 2
 
-GET /groups/{child.id}/hierarchy    → 200
+GET /groups/{child.id}/descendants    → 200
   assert len(items) == 2
   assert child      depth == 0     (relative to query root)
   assert grandchild depth == 1
@@ -1328,7 +1334,7 @@ POST root_B
 
 PUT /groups/{child.id} {parent_id: root_B.id}    → 200
 
-GET /groups/{root_B.id}/hierarchy    → 200
+GET /groups/{root_B.id}/descendants    → 200
   assert child in items with depth == 1            (closure rebuilt on PG)
 ```
 

@@ -8714,10 +8714,10 @@
         ]
       }
     },
-    "/resource-group/v1/groups/{group_id}/hierarchy": {
+    "/resource-group/v1/groups/{group_id}/ancestors": {
       "get": {
-        "description": "Traverse hierarchy from a reference group with relative depth and OData filtering",
-        "operationId": "resource_group.list_group_hierarchy",
+        "description": "Get ancestors of a reference group (depth <= 0) with OData filtering",
+        "operationId": "resource_group.get_group_ancestors",
         "parameters": [
           {
             "description": "Reference group UUID",
@@ -8729,7 +8729,7 @@
             }
           },
           {
-            "description": "Maximum number of hierarchy entries to return",
+            "description": "Maximum entries to return",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -8765,7 +8765,7 @@
                 }
               }
             },
-            "description": "Paginated list of hierarchy entries with relative depth"
+            "description": "Paginated ancestors with relative depth"
           },
           "400": {
             "content": {
@@ -8803,7 +8803,123 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List group hierarchy",
+        "summary": "Get group ancestors",
+        "tags": [
+          "Resource Groups"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "hierarchy/depth": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "type": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        }
+      }
+    },
+    "/resource-group/v1/groups/{group_id}/descendants": {
+      "get": {
+        "description": "Get descendants of a reference group (depth >= 0) with OData filtering",
+        "operationId": "resource_group.get_group_descendants",
+        "parameters": [
+          {
+            "description": "Reference group UUID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum entries to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- hierarchy/depth: eq|ne|gt|ge|lt|le|in\n- type: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_GroupWithDepthDto"
+                }
+              }
+            },
+            "description": "Paginated descendants with relative depth"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get group descendants",
         "tags": [
           "Resource Groups"
         ],
@@ -8854,7 +8970,7 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- group_id: eq|ne|in\n- resource_type: eq|ne|gt|ge|lt|le|in\n- resource_id: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- group_id: eq|ne|in\n- resource_type: eq|ne|contains|startswith|endswith|in\n- resource_id: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
             "required": false,
@@ -8922,10 +9038,9 @@
             "resource_type": [
               "eq",
               "ne",
-              "gt",
-              "ge",
-              "lt",
-              "le",
+              "contains",
+              "startswith",
+              "endswith",
               "in"
             ]
           }

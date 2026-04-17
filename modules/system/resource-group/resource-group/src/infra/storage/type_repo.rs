@@ -137,27 +137,6 @@ impl TypeRepository {
             .map_err(|e| DomainError::database(e.to_string()))?
             .ok_or_else(|| DomainError::database("Insert succeeded but row not found"))
     }
-
-    /// Build the stored `metadata_schema` JSON with internal `__can_be_root` key.
-    fn build_stored_schema(
-        can_be_root: bool,
-        metadata_schema: Option<&serde_json::Value>,
-    ) -> serde_json::Value {
-        let mut map = match metadata_schema {
-            Some(serde_json::Value::Object(m)) => m.clone(),
-            Some(v) => {
-                let mut m = serde_json::Map::new();
-                m.insert("__user_schema".to_owned(), v.clone());
-                m
-            }
-            None => serde_json::Map::new(),
-        };
-        map.insert(
-            "__can_be_root".to_owned(),
-            serde_json::Value::Bool(can_be_root),
-        );
-        serde_json::Value::Object(map)
-    }
 }
 
 #[async_trait]
@@ -268,15 +247,13 @@ impl TypeRepositoryTrait for TypeRepository {
         &self,
         db: &C,
         schema_id: &str,
-        can_be_root: bool,
         metadata_schema: Option<&serde_json::Value>,
     ) -> Result<gts_type::Model, DomainError> {
-        let stored_schema = Self::build_stored_schema(can_be_root, metadata_schema);
         let scope = system_scope();
 
         let model = gts_type::ActiveModel {
             schema_id: Set(schema_id.to_owned()),
-            metadata_schema: Set(Some(stored_schema)),
+            metadata_schema: Set(metadata_schema.cloned()),
             ..Default::default()
         };
 
@@ -368,17 +345,18 @@ impl TypeRepositoryTrait for TypeRepository {
         db: &C,
         type_id: i16,
         code: &str,
-        can_be_root: bool,
         metadata_schema: Option<&serde_json::Value>,
     ) -> Result<gts_type::Model, DomainError> {
-        let stored_schema = Self::build_stored_schema(can_be_root, metadata_schema);
         let scope = system_scope();
 
         // Use SecureUpdateMany for scoped update
         GtsTypeEntity::update_many()
             .filter(gts_type::Column::Id.eq(type_id))
             .secure()
-            .col_expr(gts_type::Column::MetadataSchema, Expr::value(stored_schema))
+            .col_expr(
+                gts_type::Column::MetadataSchema,
+                Expr::value(metadata_schema.cloned()),
+            )
             .col_expr(
                 gts_type::Column::UpdatedAt,
                 Expr::value(time::OffsetDateTime::now_utc()),

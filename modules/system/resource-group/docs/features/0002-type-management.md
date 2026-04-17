@@ -452,7 +452,7 @@ Existing tests cover `DomainError -> ResourceGroupError` and `DomainError -> Pro
 
 **File**: `type_service_test.rs` (service-level with DB)
 
-`type_repo.rs` transforms metadata_schema on write (inject `__can_be_root`) and on read (strip `__` keys, derive `can_be_root`). This logic has **0 tests**.
+`type_service.rs` transforms metadata_schema on write (inject `__can_be_root` via `build_stored_schema`) and `type_repo.rs` transforms on read (strip `__` keys, derive `can_be_root`). This logic has **0 tests**.
 
 #### TC-META-01: Type with metadata_schema Object — round-trip [P1]
 - **Setup**: Create type with `metadata_schema: Some(json!({"type": "object", "properties": {"x": {"type": "string"}}}))`

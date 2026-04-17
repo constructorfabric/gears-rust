@@ -172,19 +172,24 @@ pub async fn delete_group(
         request_id = Empty,
     )
 )]
-pub async fn list_group_hierarchy(
+pub async fn get_group_descendants(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteGroupService>>,
     Path(group_id): Path<uuid::Uuid>,
     OData(query): OData,
 ) -> ApiResult<Json<modkit_odata::Page<GroupWithDepthDto>>> {
-    info!(
-        group_id = %group_id,
-        "Listing group hierarchy"
-    );
+    info!(group_id = %group_id, "Getting group descendants");
+    let page = svc.get_group_descendants(&ctx, group_id, &query).await?;
+    Ok(Json(page.map_items(GroupWithDepthDto::from)))
+}
 
-    let page = svc.list_group_hierarchy(&ctx, group_id, &query).await?;
-    let dto_page = page.map_items(GroupWithDepthDto::from);
-
-    Ok(Json(dto_page))
+pub async fn get_group_ancestors(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteGroupService>>,
+    Path(group_id): Path<uuid::Uuid>,
+    OData(query): OData,
+) -> ApiResult<Json<modkit_odata::Page<GroupWithDepthDto>>> {
+    info!(group_id = %group_id, "Getting group ancestors");
+    let page = svc.get_group_ancestors(&ctx, group_id, &query).await?;
+    Ok(Json(page.map_items(GroupWithDepthDto::from)))
 }

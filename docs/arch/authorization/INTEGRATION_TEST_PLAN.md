@@ -15,8 +15,8 @@ For background on how AuthZ uses RG data, see [RESOURCE_GROUP_MODEL.md](./RESOUR
 | RG Module | Planned | This branch documents the intended `ClientHub` contracts (`dyn ResourceGroupClient` + `dyn ResourceGroupReadHierarchy`) but does not add implementation code yet |
 | AuthZ Resolver | Existing | Plugin discovery, `PolicyEnforcer`, `AccessScope` → SecureORM already exist in the platform |
 | Static AuthZ Plugin | Existing | Returns `In(owner_tenant_id, [tid])` — tenant predicates only |
-| **PolicyEnforcer in RG handlers** | **Planned** | Target design: `GroupService` will call `enforcer.access_scope()` for list/get/hierarchy |
-| **AccessScope → SecureORM in RG repo** | **Planned** | Target design: `GroupRepository.list_groups`, `find_by_id`, `list_hierarchy` will accept `&AccessScope` |
+| **PolicyEnforcer in RG handlers** | **Planned** | Target design: `GroupService` will call `enforcer.access_scope()` for list/get/descendants/ancestors |
+| **AccessScope → SecureORM in RG repo** | **Planned** | Target design: `GroupRepository.list_groups`, `find_by_id`, `get_descendants`, `get_ancestors` will accept `&AccessScope` |
 | **Rust integration tests** | **Planned** | Target inventory: 24 tests covering enforcer flow + tenant scoping + full-chain verification |
 | **E2E HTTP tests** | **Planned** | Target inventory: pytest CRUD, hierarchy, membership, tenant isolation |
 | Group predicates (`in_group`, `in_group_subtree`) | Planned | Requires new predicate types and RG-aware PDP behavior |
@@ -104,8 +104,8 @@ E2E_BASE_URL=http://localhost:8087 pytest testing/e2e/modules/resource_group/ -v
 The intended AuthZ → RG chain is:
 
 1. **Module init** (`module.rs`): resolves `dyn AuthZResolverClient` from ClientHub, creates `PolicyEnforcer`
-2. **GroupService** (`group_service.rs`): receives `PolicyEnforcer`; all CRUD methods (`list_groups`, `get_group`, `update_group`, `delete_group`, `list_group_hierarchy`) call `enforcer.access_scope(&ctx, &RG_GROUP_RESOURCE, action, resource_id)`
-3. **GroupRepository** (`group_repo.rs`): `list_groups`, `find_by_id`, `list_hierarchy` accept `&AccessScope` and pass it to `SecureORM` via `.secure().scope_with(scope)`
+2. **GroupService** (`group_service.rs`): receives `PolicyEnforcer`; all CRUD methods (`list_groups`, `get_group`, `update_group`, `delete_group`, `get_group_descendants`, `get_group_ancestors`) call `enforcer.access_scope(&ctx, &RG_GROUP_RESOURCE, action, resource_id)`
+3. **GroupRepository** (`group_repo.rs`): `list_groups`, `find_by_id`, `get_descendants`, `get_ancestors` accept `&AccessScope` and pass it to `SecureORM` via `.secure().scope_with(scope)`
 4. **Handlers** (`handlers/groups.rs`): pass `&ctx` to service methods (no longer `_ctx`)
 5. **Error handling** (`error.rs`): `DomainError::AccessDenied` → HTTP 403
 
@@ -253,7 +253,9 @@ modules:
         allowed_clients: ["authz-resolver-plugin"]
         allowed_endpoints:
           - method: GET
-            path: "/api/resource-group/v1/groups/{group_id}/hierarchy"
+            path: "/api/resource-group/v1/groups/{group_id}/descendants"
+          - method: GET
+            path: "/api/resource-group/v1/groups/{group_id}/ancestors"
 ```
 
 #### 3.3 API Gateway TLS termination
@@ -263,19 +265,24 @@ Configure API Gateway to forward client certificate CN header to RG module for M
 ### Test scenario
 
 ```bash
-# MTLS request to allowed endpoint (hierarchy) — AuthZ bypassed
+# MTLS request to allowed endpoint (descendants) — AuthZ bypassed
 curl --cert plugin.pem --key plugin-key.pem --cacert ca.pem \
-  https://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/hierarchy
-# Expected: 200 OK with hierarchy data
+  https://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/descendants
+# Expected: 200 OK with descendants data
+
+# MTLS request to allowed endpoint (ancestors) — AuthZ bypassed
+curl --cert plugin.pem --key plugin-key.pem --cacert ca.pem \
+  https://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/ancestors
+# Expected: 200 OK with ancestors data
 
 # MTLS request to disallowed endpoint (POST groups) — rejected
 curl --cert plugin.pem --key plugin-key.pem --cacert ca.pem \
   -X POST https://127.0.0.1:8087/cf/resource-group/v1/groups
 # Expected: 403 Forbidden
 
-# JWT request to hierarchy endpoint — full AuthZ applied
+# JWT request to descendants endpoint — full AuthZ applied
 curl -H "Authorization: Bearer test" \
-  http://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/hierarchy
+  http://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/descendants
 # Expected: 200 OK with AuthZ-scoped results
 ```
 

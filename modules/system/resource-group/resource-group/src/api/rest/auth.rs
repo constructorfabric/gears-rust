@@ -17,7 +17,7 @@ pub struct MtlsConfig {
     /// Allowed client certificate CNs (e.g., "authz-resolver-plugin").
     pub allowed_clients: Vec<String>,
     /// Allowed method+path pairs for MTLS mode (e.g.,
-    /// "GET /api/resource-group/v1/groups/{group_id}/hierarchy").
+    /// "GET /api/resource-group/v1/groups/{group_id}/descendants").
     pub allowed_endpoints: Vec<AllowedEndpoint>,
 }
 
@@ -124,7 +124,7 @@ pub fn determine_auth_mode(
     // PolicyEnforcer -> AuthZ Resolver: evaluate(EvaluationRequest)
     // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-4
     // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-5
-    // AuthZ plugin internally: call ResourceGroupReadHierarchy.list_group_depth() (via MTLS/in-process)
+    // AuthZ plugin internally: call ResourceGroupReadHierarchy.get_group_descendants() (via MTLS/in-process)
     // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-5
     // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-6
     // AuthZ plugin: produce constraints (e.g., owner_tenant_id IN (...))
@@ -174,10 +174,16 @@ impl Default for MtlsConfig {
         Self {
             ca_cert: PathBuf::from("/etc/ssl/certs/rg-mtls-ca.pem"),
             allowed_clients: vec!["authz-resolver-plugin".to_owned()],
-            allowed_endpoints: vec![AllowedEndpoint {
-                method: http::Method::GET,
-                path_pattern: "/api/resource-group/v1/groups/{group_id}/hierarchy".to_owned(),
-            }],
+            allowed_endpoints: vec![
+                AllowedEndpoint {
+                    method: http::Method::GET,
+                    path_pattern: "/api/resource-group/v1/groups/{group_id}/descendants".to_owned(),
+                },
+                AllowedEndpoint {
+                    method: http::Method::GET,
+                    path_pattern: "/api/resource-group/v1/groups/{group_id}/ancestors".to_owned(),
+                },
+            ],
         }
     }
 }

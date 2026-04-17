@@ -163,8 +163,8 @@ The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs`
 The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs` that represent the stable public interface for all RG operations.
 
 **Required traits**:
-- `ResourceGroupClient` — full CRUD trait: type management (`create_type`, `get_type`, `list_types`, `update_type`, `delete_type`), group management (`create_group`, `get_group`, `list_groups`, `update_group`, `delete_group`, `list_group_depth`), membership management (`add_membership`, `remove_membership`, `list_memberships`). All methods accept `SecurityContext` as first argument.
-- `ResourceGroupReadHierarchy` — narrow hierarchy-only read trait: `list_group_depth(ctx, group_id, query)` returning `Page<ResourceGroupWithDepth>`. Used exclusively by AuthZ plugin.
+- `ResourceGroupClient` — full CRUD trait: type management (`create_type`, `get_type`, `list_types`, `update_type`, `delete_type`), group management (`create_group`, `get_group`, `list_groups`, `update_group`, `delete_group`, `get_group_descendants`, `get_group_ancestors`), membership management (`add_membership`, `remove_membership`, `list_memberships`). All methods accept `SecurityContext` as first argument.
+- `ResourceGroupReadHierarchy` — narrow hierarchy-only read trait: `get_group_descendants(ctx, group_id, query)` and `get_group_ancestors(ctx, group_id, query)` returning `Page<ResourceGroupWithDepth>`. Used exclusively by AuthZ plugin.
 - `ResourceGroupReadPluginClient` — extends `ResourceGroupReadHierarchy` with `list_memberships`. Used for vendor-specific plugin gateway routing.
 
 **Constraints**: `cpt-cf-resource-group-constraint-no-authz-decision`, `cpt-cf-resource-group-constraint-no-sql-filter-generation`
@@ -513,7 +513,8 @@ Helper `assert_group_shape(data)` verifies the JSON wire shape of a group respon
 ```
 HEAD /cf/resource-group/v1/groups               → not 404/405
 HEAD /cf/resource-group/v1/groups/{uuid}        → not 405 (404 ok — group doesn't exist)
-HEAD /cf/resource-group/v1/groups/{uuid}/hierarchy  → not 405
+HEAD /cf/resource-group/v1/groups/{uuid}/descendants  → not 405
+HEAD /cf/resource-group/v1/groups/{uuid}/ancestors    → not 405
 HEAD /cf/resource-group/v1/memberships          → not 405
 POST /cf/types-registry/v1/types (empty body)   → not 404/405 (400 ok — validation)
 

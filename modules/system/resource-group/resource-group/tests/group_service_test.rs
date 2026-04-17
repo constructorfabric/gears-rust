@@ -1318,21 +1318,44 @@ async fn group_hierarchy_depth_traversal() {
     .await;
 
     let query = ODataQuery::default();
-    let page = group_svc
-        .list_group_hierarchy(&ctx, b.id, &query)
+
+    // Descendants of B: should return B (depth=0) and C (depth=1)
+    let desc_page = group_svc
+        .get_group_descendants(&ctx, b.id, &query)
         .await
-        .expect("list hierarchy");
-
-    assert_eq!(page.items.len(), 3, "Should return A, B, C");
-
-    // Find each group in results
-    let item_a = page.items.iter().find(|i| i.id == a.id).expect("A present");
-    let item_b = page.items.iter().find(|i| i.id == b.id).expect("B present");
-    let item_c = page.items.iter().find(|i| i.id == c.id).expect("C present");
-
-    assert_eq!(item_a.hierarchy.depth, -1, "A should be at depth -1");
+        .expect("get descendants");
+    assert_eq!(desc_page.items.len(), 2, "Descendants should return B, C");
+    let item_b = desc_page
+        .items
+        .iter()
+        .find(|i| i.id == b.id)
+        .expect("B present");
+    let item_c = desc_page
+        .items
+        .iter()
+        .find(|i| i.id == c.id)
+        .expect("C present");
     assert_eq!(item_b.hierarchy.depth, 0, "B should be at depth 0");
     assert_eq!(item_c.hierarchy.depth, 1, "C should be at depth 1");
+
+    // Ancestors of B: should return B (depth=0) and A (depth=-1)
+    let anc_page = group_svc
+        .get_group_ancestors(&ctx, b.id, &query)
+        .await
+        .expect("get ancestors");
+    assert_eq!(anc_page.items.len(), 2, "Ancestors should return A, B");
+    let item_a = anc_page
+        .items
+        .iter()
+        .find(|i| i.id == a.id)
+        .expect("A present");
+    let item_b = anc_page
+        .items
+        .iter()
+        .find(|i| i.id == b.id)
+        .expect("B present in ancestors");
+    assert_eq!(item_a.hierarchy.depth, -1, "A should be at depth -1");
+    assert_eq!(item_b.hierarchy.depth, 0, "B should be at depth 0");
 
     // All nodes have tenant_id and parent_id
     assert_eq!(item_a.hierarchy.tenant_id, tenant_id);
@@ -1343,7 +1366,7 @@ async fn group_hierarchy_depth_traversal() {
     assert_eq!(item_c.hierarchy.parent_id, Some(b.id));
 }
 
-/// TC-GRP-36: list_group_hierarchy nonexistent group.
+/// TC-GRP-36: get_group_descendants nonexistent group.
 #[tokio::test]
 async fn group_hierarchy_nonexistent() {
     let db = common::test_db().await;
@@ -1352,7 +1375,7 @@ async fn group_hierarchy_nonexistent() {
     let ctx = common::make_ctx(tenant_id);
 
     let err = group_svc
-        .list_group_hierarchy(&ctx, Uuid::now_v7(), &ODataQuery::default())
+        .get_group_descendants(&ctx, Uuid::now_v7(), &ODataQuery::default())
         .await
         .unwrap_err();
 
@@ -2014,12 +2037,12 @@ async fn group_metadata_barrier_in_hierarchy() {
     )
     .await;
 
-    // Query hierarchy from barrier
+    // Query descendants from root — should include root, barrier, leaf
     let query = ODataQuery::default();
     let page = group_svc
-        .list_group_hierarchy(&ctx, barrier.id, &query)
+        .get_group_descendants(&ctx, root.id, &query)
         .await
-        .expect("list hierarchy");
+        .expect("get descendants");
 
     assert_eq!(
         page.items.len(),
@@ -2027,13 +2050,13 @@ async fn group_metadata_barrier_in_hierarchy() {
         "All 3 groups returned including barrier"
     );
 
-    // Verify barrier is present
+    // Verify barrier is present as a descendant of root
     let barrier_item = page
         .items
         .iter()
         .find(|i| i.id == barrier.id)
         .expect("barrier present");
-    assert_eq!(barrier_item.hierarchy.depth, 0);
+    assert_eq!(barrier_item.hierarchy.depth, 1, "barrier is child of root");
 }
 
 /// TC-META-18: Group metadata in hierarchy endpoint response.
@@ -2083,9 +2106,9 @@ async fn group_metadata_in_hierarchy_response() {
 
     let query = ODataQuery::default();
     let page = group_svc
-        .list_group_hierarchy(&ctx, child.id, &query)
+        .get_group_descendants(&ctx, root.id, &query)
         .await
-        .expect("list hierarchy");
+        .expect("get descendants");
 
     let root_item = page
         .items

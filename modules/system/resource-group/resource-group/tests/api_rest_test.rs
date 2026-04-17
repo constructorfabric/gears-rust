@@ -971,7 +971,7 @@ async fn rest_get_group_hierarchy_returns_200() {
 
     let req = json_request(
         "GET",
-        &format!("/resource-group/v1/groups/{}/hierarchy", child.id),
+        &format!("/resource-group/v1/groups/{}/descendants", child.id),
         None,
         tenant_id,
     );
@@ -1967,7 +1967,7 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
 
     let req = json_request(
         "GET",
-        &format!("/resource-group/v1/groups/{}/hierarchy", child.id),
+        &format!("/resource-group/v1/groups/{}/descendants", child.id),
         None,
         tenant_id,
     );
@@ -2354,7 +2354,7 @@ async fn rest_route_smoke_all_endpoints_registered() {
         ),
         (
             "GET",
-            format!("/resource-group/v1/groups/{fake_id}/hierarchy"),
+            format!("/resource-group/v1/groups/{fake_id}/descendants"),
             false,
             "hierarchy",
         ),

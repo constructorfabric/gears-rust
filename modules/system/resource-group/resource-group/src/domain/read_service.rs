@@ -66,19 +66,30 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
     ResourceGroupReadHierarchy for RgReadService<GR, TR, MR>
 {
-    async fn list_group_depth(
+    async fn get_group_descendants(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
         // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-3a
-        // Route to local persistence path: execute query against RG database
         self.group_service
-            .list_group_hierarchy(ctx, group_id, query)
+            .get_group_descendants(ctx, group_id, query)
             .await
             .map_err(ResourceGroupError::from)
         // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-3a
+    }
+
+    async fn get_group_ancestors(
+        &self,
+        ctx: &SecurityContext,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+        self.group_service
+            .get_group_ancestors(ctx, group_id, query)
+            .await
+            .map_err(ResourceGroupError::from)
     }
 }
 

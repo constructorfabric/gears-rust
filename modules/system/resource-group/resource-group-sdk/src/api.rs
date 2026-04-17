@@ -112,8 +112,16 @@ pub trait ResourceGroupClient: Send + Sync {
         force: bool,
     ) -> Result<(), ResourceGroupError>;
 
-    /// List group hierarchy with relative depth from a reference group.
-    async fn list_group_depth(
+    /// Get descendants of a reference group (depth >= 0).
+    async fn get_group_descendants(
+        &self,
+        ctx: &SecurityContext,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
+
+    /// Get ancestors of a reference group (depth <= 0).
+    async fn get_group_ancestors(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,
@@ -156,8 +164,16 @@ pub trait ResourceGroupClient: Send + Sync {
 /// depending on the full `ResourceGroupClient`.
 #[async_trait]
 pub trait ResourceGroupReadHierarchy: Send + Sync {
-    /// List group hierarchy with depth for a given group.
-    async fn list_group_depth(
+    /// Get descendants of a reference group (depth >= 0).
+    async fn get_group_descendants(
+        &self,
+        ctx: &SecurityContext,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
+
+    /// Get ancestors of a reference group (depth <= 0).
+    async fn get_group_ancestors(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,

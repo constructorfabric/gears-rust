@@ -39,7 +39,15 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroup>, DomainError>;
 
-    async fn list_hierarchy<C: DBRunner>(
+    async fn get_descendants<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, DomainError>;
+
+    async fn get_ancestors<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,

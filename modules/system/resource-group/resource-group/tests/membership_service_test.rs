@@ -142,9 +142,11 @@ async fn membership_add_duplicate() {
     assert!(
         matches!(
             err,
-            DomainError::Conflict { .. } | DomainError::ConflictActiveReferences { .. }
+            DomainError::Conflict { .. }
+                | DomainError::ConflictActiveReferences { .. }
+                | DomainError::DuplicateMembership { .. }
         ),
-        "expected Conflict or ConflictActiveReferences, got: {err:?}"
+        "expected Conflict, ConflictActiveReferences, or DuplicateMembership, got: {err:?}"
     );
 }
 

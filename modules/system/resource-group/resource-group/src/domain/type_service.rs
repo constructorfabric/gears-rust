@@ -121,15 +121,14 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // RETURN validated type definition (persisting below)
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-8
 
+        // Build stored schema with embedded __can_be_root
+        let stored_schema =
+            Self::build_stored_schema(req.can_be_root, req.metadata_schema.as_ref());
+
         // Persist the type
         let type_model = self
             .type_repo
-            .insert(
-                &conn,
-                &req.code,
-                req.can_be_root,
-                req.metadata_schema.as_ref(),
-            )
+            .insert(&conn, &req.code, Some(&stored_schema))
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-7
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-6
@@ -264,15 +263,11 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-11
 
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
+        let stored_schema =
+            Self::build_stored_schema(req.can_be_root, req.metadata_schema.as_ref());
         let updated_model = self
             .type_repo
-            .update_type(
-                &conn,
-                type_id,
-                code,
-                req.can_be_root,
-                req.metadata_schema.as_ref(),
-            )
+            .update_type(&conn, type_id, code, Some(&stored_schema))
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
 
@@ -336,6 +331,27 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         }
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-4
         Ok(())
+    }
+
+    /// Build the stored `metadata_schema` JSON with internal `__can_be_root` key.
+    fn build_stored_schema(
+        can_be_root: bool,
+        metadata_schema: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut map = match metadata_schema {
+            Some(serde_json::Value::Object(m)) => m.clone(),
+            Some(v) => {
+                let mut m = serde_json::Map::new();
+                m.insert("__user_schema".to_owned(), v.clone());
+                m
+            }
+            None => serde_json::Map::new(),
+        };
+        map.insert(
+            "__can_be_root".to_owned(),
+            serde_json::Value::Bool(can_be_root),
+        );
+        serde_json::Value::Object(map)
     }
 
     // @cpt-algo:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1

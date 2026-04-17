@@ -30,7 +30,7 @@ impl FilterField for HierarchyFilterField {
         match self {
             Self::HierarchyDepth => FieldKind::I64,
             // Type is a GTS type path string in the public API; the persistence
-            // layer resolves string paths to SMALLINT IDs after OData parsing.
+            // layer resolves string paths to SMALLINT IDs after OData validation.
             Self::Type => FieldKind::String,
         }
     }

@@ -59,7 +59,6 @@ def mtls_base_url():
 
 # ── Tests ────────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
 async def test_mtls_allowed_endpoint_hierarchy_200(
     mtls_base_url, mtls_ssl_context, rg_headers, create_type, create_group,
 ):
@@ -73,14 +72,20 @@ async def test_mtls_allowed_endpoint_hierarchy_200(
         verify=mtls_ssl_context,
     ) as client:
         resp = await client.get(
-            f"{mtls_base_url}/resource-group/v1/groups/{group['id']}/hierarchy",
+            f"{mtls_base_url}/resource-group/v1/groups/{group['id']}/descendants",
         )
         assert resp.status_code == 200, (
-            f"MTLS hierarchy should return 200, got {resp.status_code}: {resp.text}"
+            f"MTLS descendants should return 200, got {resp.status_code}: {resp.text}"
+        )
+
+        resp = await client.get(
+            f"{mtls_base_url}/resource-group/v1/groups/{group['id']}/ancestors",
+        )
+        assert resp.status_code == 200, (
+            f"MTLS ancestors should return 200, got {resp.status_code}: {resp.text}"
         )
 
 
-@pytest.mark.asyncio
 async def test_mtls_disallowed_endpoint_post_groups_403(
     mtls_base_url, mtls_ssl_context,
 ):
@@ -98,7 +103,6 @@ async def test_mtls_disallowed_endpoint_post_groups_403(
         )
 
 
-@pytest.mark.asyncio
 async def test_jwt_hierarchy_full_authz(
     rg_base_url, rg_headers, create_type, create_group,
 ):
@@ -108,7 +112,7 @@ async def test_jwt_hierarchy_full_authz(
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{rg_base_url}/resource-group/v1/groups/{group['id']}/hierarchy",
+            f"{rg_base_url}/resource-group/v1/groups/{group['id']}/descendants",
             headers=rg_headers,
         )
         assert resp.status_code == 200, (
@@ -116,7 +120,6 @@ async def test_jwt_hierarchy_full_authz(
         )
 
 
-@pytest.mark.asyncio
 async def test_mtls_invalid_cert_cn_rejected(mtls_cert_dir, mtls_base_url):
     """MTLS with invalid/unknown cert CN → 403 or connection refused."""
     invalid_cert = os.path.join(mtls_cert_dir, "invalid-client.pem")
@@ -133,7 +136,7 @@ async def test_mtls_invalid_cert_cn_rejected(mtls_cert_dir, mtls_base_url):
     async with httpx.AsyncClient(timeout=10.0, verify=ctx) as client:
         try:
             resp = await client.get(
-                f"{mtls_base_url}/resource-group/v1/groups/00000000-0000-0000-0000-000000000000/hierarchy",
+                f"{mtls_base_url}/resource-group/v1/groups/00000000-0000-0000-0000-000000000000/descendants",
             )
             assert resp.status_code in (403, 401), (
                 f"Invalid cert CN should be rejected, got {resp.status_code}"

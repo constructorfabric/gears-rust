@@ -283,7 +283,7 @@ async fn tenant_isolation_get_group_cross_tenant_invisible() {
     );
 }
 
-/// Full chain: `list_group_hierarchy` respects tenant scope.
+/// Full chain: `get_group_descendants` respects tenant scope.
 // Scenario: L2-Tenant-03 - Hierarchy queries are tenant-scoped
 #[tokio::test]
 async fn tenant_isolation_hierarchy_scoped() {
@@ -378,7 +378,7 @@ async fn tenant_isolation_hierarchy_scoped() {
     // Tenant A lists hierarchy from parent — should NOT include B's group
     let query = ODataQuery::default();
     let hier = group_svc
-        .list_group_hierarchy(&ctx_a, parent.id, &query)
+        .get_group_descendants(&ctx_a, parent.id, &query)
         .await
         .expect("list hierarchy for tenant A");
 

@@ -181,21 +181,34 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         &self,
         ctx: &SecurityContext,
         id: Uuid,
+        force: bool,
     ) -> Result<(), ResourceGroupError> {
         self.group_service
-            .delete_group(ctx, id, false)
+            .delete_group(ctx, id, force)
             .await
             .map_err(ResourceGroupError::from)
     }
 
-    async fn list_group_depth(
+    async fn get_group_descendants(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
         self.group_service
-            .list_group_hierarchy(ctx, group_id, query)
+            .get_group_descendants(ctx, group_id, query)
+            .await
+            .map_err(ResourceGroupError::from)
+    }
+
+    async fn get_group_ancestors(
+        &self,
+        ctx: &SecurityContext,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+        self.group_service
+            .get_group_ancestors(ctx, group_id, query)
             .await
             .map_err(ResourceGroupError::from)
     }

@@ -96,6 +96,19 @@ async def test_route_smoke_all_endpoints(
         )
         assert r.status_code not in (404, 405), f"DELETE /memberships/...: {r.status_code}"
 
+        # GET /groups/{id}/descendants -- hierarchy endpoint
+        grp = await create_group(org_type["code"], "S1 Desc")
+        r = await c.get(
+            f"{_groups(rg_base_url)}/{grp['id']}/descendants", headers=h,
+        )
+        assert r.status_code not in (404, 405), f"GET /groups/{{id}}/descendants: {r.status_code}"
+
+        # GET /groups/{id}/ancestors -- hierarchy endpoint
+        r = await c.get(
+            f"{_groups(rg_base_url)}/{grp['id']}/ancestors", headers=h,
+        )
+        assert r.status_code not in (404, 405), f"GET /groups/{{id}}/ancestors: {r.status_code}"
+
 
 # ── S2: DTO roundtrip ───────────────────────────────────────────────────
 
@@ -259,7 +272,7 @@ async def test_hierarchy_closure_postgresql(
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         # Hierarchy from root
         r = await c.get(
-            f"{_groups(rg_base_url)}/{root['id']}/hierarchy",
+            f"{_groups(rg_base_url)}/{root['id']}/descendants",
             headers=rg_headers,
         )
         assert r.status_code == 200
@@ -271,19 +284,29 @@ async def test_hierarchy_closure_postgresql(
         assert by_id[child["id"]]["hierarchy"]["depth"] == 1
         assert by_id[grandchild["id"]]["hierarchy"]["depth"] == 2
 
-        # Hierarchy from child (includes ancestors with negative depth)
+        # Descendants from child: self + grandchild
         r = await c.get(
-            f"{_groups(rg_base_url)}/{child['id']}/hierarchy",
+            f"{_groups(rg_base_url)}/{child['id']}/descendants",
             headers=rg_headers,
         )
         assert r.status_code == 200
         items = r.json()["items"]
-        assert len(items) == 3  # ancestor(root) + self(child) + descendant(grandchild)
-
+        assert len(items) == 2  # self(child) + descendant(grandchild)
         by_id = {item["id"]: item for item in items}
-        assert by_id[root["id"]]["hierarchy"]["depth"] == -1  # ancestor
         assert by_id[child["id"]]["hierarchy"]["depth"] == 0
         assert by_id[grandchild["id"]]["hierarchy"]["depth"] == 1
+
+        # Ancestors from child: self + root
+        r = await c.get(
+            f"{_groups(rg_base_url)}/{child['id']}/ancestors",
+            headers=rg_headers,
+        )
+        assert r.status_code == 200
+        items = r.json()["items"]
+        assert len(items) == 2  # self(child) + ancestor(root)
+        by_id = {item["id"]: item for item in items}
+        assert by_id[root["id"]]["hierarchy"]["depth"] == -1
+        assert by_id[child["id"]]["hierarchy"]["depth"] == 0
 
 
 # ── S6: Move + closure rebuild (PG) ─────────────────────────────────────
@@ -321,7 +344,7 @@ async def test_move_closure_rebuild_postgresql(
 
         # root_a hierarchy: only root_a remains
         r = await c.get(
-            f"{_groups(rg_base_url)}/{root_a['id']}/hierarchy",
+            f"{_groups(rg_base_url)}/{root_a['id']}/descendants",
             headers=rg_headers,
         )
         assert r.status_code == 200
@@ -330,7 +353,7 @@ async def test_move_closure_rebuild_postgresql(
 
         # root_b hierarchy: root_b + moved subtree
         r = await c.get(
-            f"{_groups(rg_base_url)}/{root_b['id']}/hierarchy",
+            f"{_groups(rg_base_url)}/{root_b['id']}/descendants",
             headers=rg_headers,
         )
         assert r.status_code == 200
@@ -342,7 +365,7 @@ async def test_move_closure_rebuild_postgresql(
 
         # Subtree from child preserved
         r = await c.get(
-            f"{_groups(rg_base_url)}/{child['id']}/hierarchy",
+            f"{_groups(rg_base_url)}/{child['id']}/descendants",
             headers=rg_headers,
         )
         assert r.status_code == 200
@@ -485,9 +508,10 @@ async def test_pagination_cursor_roundtrip(
             all_ids.extend(page_ids)
 
             page_info = data["page_info"]
-            if not page_info.get("has_next_page"):
+            next_cur = page_info.get("next_cursor")
+            if not next_cur:
                 break
-            cursor = page_info["next_cursor"]
+            cursor = next_cur
 
     # No duplicates
     assert len(all_ids) == len(set(all_ids)), (
@@ -580,7 +604,7 @@ async def test_hierarchy_depth_filter_wiring(
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         # Hierarchy from child with depth >= 0 filter (self + descendants only)
         r = await c.get(
-            f"{_groups(rg_base_url)}/{child['id']}/hierarchy",
+            f"{_groups(rg_base_url)}/{child['id']}/descendants",
             headers=rg_headers,
             params={"$filter": "hierarchy/depth ge 0"},
         )

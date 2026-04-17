@@ -29,15 +29,6 @@ use crate::infra::storage::entity::{
 use crate::infra::storage::odata_mapper::GroupODataMapper;
 use crate::infra::storage::type_repo::TypeRepository;
 
-/// Type alias for a pinned, boxed, Send future returning `Result<Box<Expr>, DomainError>`.
-type ResolveExprFuture<'a> = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = Result<Box<modkit_odata::ast::Expr>, DomainError>>
-            + Send
-            + 'a,
-    >,
->;
-
 /// Default `OData` pagination limits for groups.
 const GROUP_LIMIT_CFG: LimitCfg = LimitCfg {
     default: 25,
@@ -101,87 +92,193 @@ impl GroupRepository {
         cursor.encode().ok()
     }
 
-    /// Resolve GTS type path strings in `type` filter values to SMALLINT IDs.
-    ///
-    /// The API exposes `type` as a string field, but the DB column `gts_type_id`
-    /// is SMALLINT. This method walks the filter AST and replaces string values
-    /// adjacent to `type` identifiers with their resolved SMALLINT IDs.
-    async fn resolve_type_filter(
+    /// Shared helper: given raw `(group_id, depth)` pairs, load groups, resolve
+    /// type paths, apply `OData` filters, paginate, and return a `Page`.
+    async fn build_hierarchy_page(
+        &self,
         db: &impl DBRunner,
+        scope: &AccessScope,
         query: &ODataQuery,
-    ) -> Result<ODataQuery, DomainError> {
-        let Some(filter) = &query.filter else {
-            return Ok(query.clone());
+        group_depths: Vec<(Uuid, i32)>,
+    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
+        let (depth_filter, type_filter) = Self::parse_hierarchy_filter(query);
+
+        let group_ids: Vec<Uuid> = group_depths.iter().map(|(id, _)| *id).collect();
+        if group_ids.is_empty() {
+            return Ok(Page {
+                items: Vec::new(),
+                page_info: modkit_odata::PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: query.limit.unwrap_or(25).min(200),
+                },
+            });
+        }
+
+        let groups = ResourceGroupEntity::find()
+            .filter(rg_entity::Column::Id.is_in(group_ids.clone()))
+            .secure()
+            .scope_with(scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        let group_map: std::collections::HashMap<Uuid, rg_entity::Model> =
+            groups.into_iter().map(|g| (g.id, g)).collect();
+
+        let all_type_ids: Vec<i16> = group_map.values().map(|g| g.gts_type_id).collect();
+        let type_path_map = self.resolve_type_paths_batch(db, &all_type_ids).await?;
+
+        let mut results: Vec<ResourceGroupWithDepth> = Vec::new();
+        for (gid, depth) in &group_depths {
+            if let Some(ref df) = depth_filter
+                && !df.matches(*depth)
+            {
+                continue;
+            }
+            if let Some(model) = group_map.get(gid) {
+                let type_path = type_path_map
+                    .get(&model.gts_type_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(ref tf) = type_filter
+                    && !tf.matches(&type_path)
+                {
+                    continue;
+                }
+                results.push(ResourceGroupWithDepth {
+                    id: model.id,
+                    type_path,
+                    name: model.name.clone(),
+                    hierarchy: GroupHierarchyWithDepth {
+                        parent_id: model.parent_id,
+                        tenant_id: model.tenant_id,
+                        depth: *depth,
+                    },
+                    metadata: model.metadata.clone(),
+                });
+            }
+        }
+
+        results.sort_by(|a, b| {
+            a.hierarchy
+                .depth
+                .cmp(&b.hierarchy.depth)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let offset = query
+            .cursor
+            .as_ref()
+            .and_then(|c| c.k.first())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit_val = query.limit.unwrap_or(25).min(200);
+        let limit_usize = limit_val as usize;
+        let total = results.len();
+        let items: Vec<ResourceGroupWithDepth> =
+            results.into_iter().skip(offset).take(limit_usize).collect();
+
+        let next_cursor = if offset + limit_usize < total {
+            Self::encode_offset_cursor(offset + limit_usize, "fwd")
+        } else {
+            None
+        };
+        let prev_cursor = if offset > 0 {
+            Self::encode_offset_cursor(offset.saturating_sub(limit_usize), "bwd")
+        } else {
+            None
         };
 
-        let resolved = Self::resolve_type_expr(db, filter).await?;
-        let mut q = query.clone();
-        q.filter = Some(resolved);
-        Ok(q)
+        Ok(Page {
+            items,
+            page_info: modkit_odata::PageInfo {
+                next_cursor,
+                prev_cursor,
+                limit: limit_val,
+            },
+        })
     }
 
-    /// Resolve `type` field string values to SMALLINT IDs in a filter AST.
+    /// Resolve `type` string values to SMALLINT IDs in a validated `FilterNode`.
     ///
-    /// Non-recursive: only transforms leaf `Compare` and `In` nodes where the
-    /// identifier is `"type"`. Recurses through `And`/`Or`/`Not` via `Box::pin`.
-    fn resolve_type_expr<'a>(
+    /// Called AFTER `convert_expr_to_filter_node` validates the filter (String kind
+    /// for `type` field). Walks the tree and replaces `Value::String("gts...")`
+    /// with `Value::Number(id)` for `GroupFilterField::Type` fields. The resolved
+    /// numeric value is then handled by `filter_node_to_condition` which converts
+    /// it to `sea_orm::Value::BigInt` — `PostgreSQL` implicitly casts to SMALLINT.
+    #[allow(clippy::type_complexity)]
+    fn resolve_type_filter_node<'a>(
         db: &'a (impl DBRunner + 'a),
-        expr: &'a modkit_odata::ast::Expr,
-    ) -> ResolveExprFuture<'a> {
-        use modkit_odata::ast::{Expr as E, Value as V};
+        node: &'a modkit_odata::filter::FilterNode<GroupFilterField>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        modkit_odata::filter::FilterNode<GroupFilterField>,
+                        DomainError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        use modkit_odata::ast::Value as V;
+        use modkit_odata::filter::FilterNode as FN;
 
         Box::pin(async move {
-            Ok(Box::new(match expr {
-                E::And(l, r) => E::And(
-                    Self::resolve_type_expr(db, l).await?,
-                    Self::resolve_type_expr(db, r).await?,
-                ),
-                E::Or(l, r) => E::Or(
-                    Self::resolve_type_expr(db, l).await?,
-                    Self::resolve_type_expr(db, r).await?,
-                ),
-                E::Not(inner) => E::Not(Self::resolve_type_expr(db, inner).await?),
-                E::Compare(left, op, right) => {
-                    if let E::Identifier(name) = left.as_ref()
-                        && name == "type"
-                        && let E::Value(V::String(path)) = right.as_ref()
-                    {
-                        let id = TypeRepository::resolve_id(db, path).await?.ok_or_else(|| {
-                            DomainError::validation(format!("Unknown type in filter: {path}"))
-                        })?;
-                        return Ok(Box::new(E::Compare(
-                            left.clone(),
-                            *op,
-                            Box::new(E::Value(V::Number(id.into()))),
-                        )));
-                    }
-                    expr.clone()
+            match node {
+                FN::Binary {
+                    field: GroupFilterField::Type,
+                    op,
+                    value: V::String(path),
+                } => {
+                    let id = TypeRepository::resolve_id(db, path).await?.ok_or_else(|| {
+                        DomainError::validation(format!("Unknown type in filter: {path}"))
+                    })?;
+                    Ok(FN::Binary {
+                        field: GroupFilterField::Type,
+                        op: *op,
+                        value: V::Number(id.into()),
+                    })
                 }
-                E::In(left, list) => {
-                    if let E::Identifier(name) = left.as_ref()
-                        && name == "type"
-                    {
-                        let mut resolved = Vec::with_capacity(list.len());
-                        for item in list {
-                            if let E::Value(V::String(path)) = item {
-                                let id = TypeRepository::resolve_id(db, path).await?.ok_or_else(
-                                    || {
-                                        DomainError::validation(format!(
-                                            "Unknown type in filter: {path}"
-                                        ))
-                                    },
-                                )?;
-                                resolved.push(E::Value(V::Number(id.into())));
-                            } else {
-                                resolved.push(item.clone());
-                            }
+                FN::InList {
+                    field: GroupFilterField::Type,
+                    values,
+                } => {
+                    let mut resolved = Vec::with_capacity(values.len());
+                    for v in values {
+                        if let V::String(path) = v {
+                            let id =
+                                TypeRepository::resolve_id(db, path).await?.ok_or_else(|| {
+                                    DomainError::validation(format!(
+                                        "Unknown type in filter: {path}"
+                                    ))
+                                })?;
+                            resolved.push(V::Number(id.into()));
+                        } else {
+                            resolved.push(v.clone());
                         }
-                        return Ok(Box::new(E::In(left.clone(), resolved)));
                     }
-                    expr.clone()
+                    Ok(FN::InList {
+                        field: GroupFilterField::Type,
+                        values: resolved,
+                    })
                 }
-                _ => expr.clone(),
-            }))
+                FN::Composite { op, children } => {
+                    let mut resolved_children = Vec::with_capacity(children.len());
+                    for child in children {
+                        resolved_children.push(Self::resolve_type_filter_node(db, child).await?);
+                    }
+                    Ok(FN::Composite {
+                        op: *op,
+                        children: resolved_children,
+                    })
+                }
+                FN::Not(inner) => Ok(FN::Not(Box::new(
+                    Self::resolve_type_filter_node(db, inner).await?,
+                ))),
+                other => Ok(other.clone()),
+            }
         })
     }
 
@@ -338,15 +435,38 @@ impl GroupRepositoryTrait for GroupRepository {
         scope: &AccessScope,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroup>, DomainError> {
-        // Pre-resolve: transform `type` string values → SMALLINT IDs in filter AST
-        let resolved_query = Self::resolve_type_filter(db, query).await?;
+        // Validate filter (String kind for `type`) and resolve string values
+        // to SMALLINT IDs in the typed FilterNode — BEFORE paginate_odata.
+        let resolved_filter = if let Some(ast) = query.filter.as_deref() {
+            let validated =
+                modkit_odata::filter::convert_expr_to_filter_node::<GroupFilterField>(ast)
+                    .map_err(|e| DomainError::database(format!("invalid $filter: {e}")))?;
+            Some(Self::resolve_type_filter_node(db, &validated).await?)
+        } else {
+            None
+        };
 
+        // Build base query with resolved filter applied manually
         let base_query = ResourceGroupEntity::find().secure().scope_with(scope);
+        let base_query = if let Some(ref node) = resolved_filter {
+            let cond = modkit_db::odata::sea_orm_filter::filter_node_to_condition::<
+                GroupFilterField,
+                GroupODataMapper,
+            >(node)
+            .map_err(|e| DomainError::database(format!("invalid $filter: {e}")))?;
+            base_query.filter(cond)
+        } else {
+            base_query
+        };
+
+        // Strip filter from query — already applied above
+        let mut query_no_filter = query.clone();
+        query_no_filter.filter = None;
 
         let page = paginate_odata::<GroupFilterField, GroupODataMapper, _, _, _, _>(
             base_query,
             db,
-            &resolved_query,
+            &query_no_filter,
             ("id", SortDir::Desc),
             GROUP_LIMIT_CFG,
             |m: rg_entity::Model| m,
@@ -379,19 +499,15 @@ impl GroupRepositoryTrait for GroupRepository {
     /// Query hierarchy from a reference group, returning groups with relative depth.
     ///
     /// Uses the provided `AccessScope` for tenant-level filtering (`SecureORM`).
-    async fn list_hierarchy<C: DBRunner>(
+    async fn get_descendants<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
-        // Parse OData depth and type filters early so we can push depth bounds into SQL
-        let (depth_filter, type_filter) = Self::parse_hierarchy_filter(query);
-
-        // Get closure rows involving this group (both as ancestor and descendant).
-        // Push depth bounds into SQL when available to avoid loading unbounded data.
-        let sys = system_scope(); // closure table has no tenant column, use system scope
+        let (depth_filter, _) = Self::parse_hierarchy_filter(query);
+        let sys = system_scope();
 
         let mut desc_query =
             ClosureEntity::find().filter(closure_entity::Column::AncestorId.eq(group_id));
@@ -402,16 +518,47 @@ impl GroupRepositoryTrait for GroupRepository {
         {
             desc_query = desc_query.filter(closure_entity::Column::Depth.lte(max_desc));
         }
-        let ancestor_rows = desc_query
+        let rows = desc_query
             .secure()
             .scope_with(&sys)
             .all(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
+        let group_depths: Vec<(Uuid, i32)> =
+            rows.iter().map(|r| (r.descendant_id, r.depth)).collect();
+
+        self.build_hierarchy_page(db, scope, query, group_depths)
+            .await
+    }
+
+    async fn get_ancestors<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
+        let (depth_filter, _) = Self::parse_hierarchy_filter(query);
+        let sys = system_scope();
+
+        // Self-row (depth=0)
+        let self_row = ClosureEntity::find()
+            .filter(closure_entity::Column::AncestorId.eq(group_id))
+            .filter(closure_entity::Column::Depth.eq(0))
+            .secure()
+            .scope_with(&sys)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        let mut group_depths: Vec<(Uuid, i32)> =
+            self_row.iter().map(|r| (r.descendant_id, 0)).collect();
+
+        // Ancestor rows (depth > 0 in closure, negated to < 0 in result)
         let mut anc_query = ClosureEntity::find()
             .filter(closure_entity::Column::DescendantId.eq(group_id))
-            .filter(closure_entity::Column::Depth.ne(0)); // exclude self-row
+            .filter(closure_entity::Column::Depth.ne(0));
         if let Some(max_anc) = depth_filter
             .as_ref()
             .and_then(DepthFilter::max_ancestor_depth)
@@ -419,142 +566,18 @@ impl GroupRepositoryTrait for GroupRepository {
         {
             anc_query = anc_query.filter(closure_entity::Column::Depth.lte(max_anc));
         }
-        let descendant_rows = anc_query
+        let rows = anc_query
             .secure()
             .scope_with(&sys)
             .all(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
-
-        // Build map of group_id -> relative_depth
-        let mut group_depths: Vec<(Uuid, i32)> = Vec::new();
-
-        // Descendants: depth is positive (as stored in closure)
-        for row in &ancestor_rows {
-            group_depths.push((row.descendant_id, row.depth));
-        }
-
-        // Ancestors: depth is negative (negate the stored depth)
-        for row in &descendant_rows {
+        for row in &rows {
             group_depths.push((row.ancestor_id, -row.depth));
         }
 
-        // Load all referenced groups
-        let group_ids: Vec<Uuid> = group_depths.iter().map(|(id, _)| *id).collect();
-        if group_ids.is_empty() {
-            return Ok(Page {
-                items: Vec::new(),
-                page_info: modkit_odata::PageInfo {
-                    next_cursor: None,
-                    prev_cursor: None,
-                    limit: query.limit.unwrap_or(25).min(200),
-                },
-            });
-        }
-
-        let groups = ResourceGroupEntity::find()
-            .filter(rg_entity::Column::Id.is_in(group_ids.clone()))
-            .secure()
-            .scope_with(scope)
-            .all(db)
+        self.build_hierarchy_page(db, scope, query, group_depths)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        let group_map: std::collections::HashMap<Uuid, rg_entity::Model> =
-            groups.into_iter().map(|g| (g.id, g)).collect();
-
-        // Batch-resolve type paths for all groups (single query)
-        let all_type_ids: Vec<i16> = group_map.values().map(|g| g.gts_type_id).collect();
-        let type_path_map = self.resolve_type_paths_batch(db, &all_type_ids).await?;
-
-        // Build results with type path lookup and filtering
-        let mut results: Vec<ResourceGroupWithDepth> = Vec::new();
-        for (gid, depth) in &group_depths {
-            // Apply depth filter
-            if let Some(ref df) = depth_filter
-                && !df.matches(*depth)
-            {
-                continue;
-            }
-
-            if let Some(model) = group_map.get(gid) {
-                let type_path = type_path_map
-                    .get(&model.gts_type_id)
-                    .cloned()
-                    .unwrap_or_default();
-
-                // Apply type filter
-                if let Some(ref tf) = type_filter
-                    && !tf.matches(&type_path)
-                {
-                    continue;
-                }
-
-                results.push(ResourceGroupWithDepth {
-                    id: model.id,
-                    type_path,
-                    name: model.name.clone(),
-                    hierarchy: GroupHierarchyWithDepth {
-                        parent_id: model.parent_id,
-                        tenant_id: model.tenant_id,
-                        depth: *depth,
-                    },
-                    metadata: model.metadata.clone(),
-                });
-            }
-        }
-
-        // Sort by (depth, id) for deterministic pagination
-        results.sort_by(|a, b| {
-            a.hierarchy
-                .depth
-                .cmp(&b.hierarchy.depth)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-
-        // Parse offset from cursor (offset-based pagination for in-memory results)
-        let offset = query
-            .cursor
-            .as_ref()
-            .and_then(|c| c.k.first())
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-
-        let limit_val = query.limit.unwrap_or(25).min(200);
-        let limit_usize = limit_val as usize;
-        let total = results.len();
-
-        // Apply offset + limit to get the current page
-        let items: Vec<ResourceGroupWithDepth> =
-            results.into_iter().skip(offset).take(limit_usize).collect();
-
-        let has_next = offset + limit_usize < total;
-        let has_prev = offset > 0;
-
-        // Encode next/prev cursors using CursorV1 for round-trip compatibility
-        // with the OData extractor (which decodes cursor via CursorV1::decode).
-        let next_cursor = if has_next {
-            let next_offset = offset + limit_usize;
-            Self::encode_offset_cursor(next_offset, "fwd")
-        } else {
-            None
-        };
-
-        let prev_cursor = if has_prev {
-            let prev_offset = offset.saturating_sub(limit_usize);
-            Self::encode_offset_cursor(prev_offset, "bwd")
-        } else {
-            None
-        };
-
-        Ok(Page {
-            items,
-            page_info: modkit_odata::PageInfo {
-                next_cursor,
-                prev_cursor,
-                limit: limit_val,
-            },
-        })
     }
 
     // -- Write operations --

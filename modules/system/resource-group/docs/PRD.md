@@ -249,7 +249,7 @@ Caller: subject_tenant_id = T1
 ```
 - AccessScope: `{tenant_id IN (T1)}` — T7 excluded by TR/AuthZ.
 - `GET /groups`: sees D2, B3. Does NOT see T7, D8, or R8.
-- `GET /groups/{T1}/hierarchy`: sees T1, D2, B3. Does NOT see T7 or D8.
+- `GET /groups/{T1}/descendants`: sees T1, D2, B3. Does NOT see T7 or D8.
 
 **Scenario 2: Barrier tenant reads own data**
 ```
@@ -572,7 +572,7 @@ List endpoints **MUST** support:
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-list-groups-depth`
 
-A dedicated group hierarchy endpoint (`/groups/{group_id}/hierarchy`) **MUST** return groups with a computed `hierarchy.depth` field (relative distance from reference group) and support depth-based filtering via OData nested path `hierarchy/depth` (`eq`, `ne`, `gt`, `ge`, `lt`, `le`). Positive depth = descendants, negative depth = ancestors, `0` = reference group itself.
+Dedicated descendants (`/groups/{group_id}/descendants`) and ancestors (`/groups/{group_id}/ancestors`) endpoints **MUST** return groups with a computed `hierarchy.depth` field (relative distance from reference group) and support depth-based filtering via OData nested path `hierarchy/depth` (`eq`, `ne`, `gt`, `ge`, `lt`, `le`). The descendants endpoint returns depth ≥ 0 (self + children), the ancestors endpoint returns depth ≤ 0 (self + parent chain).
 
 #### Force Delete
 
@@ -599,7 +599,7 @@ The same public read contract must remain stable across provider strategies:
 
 In `ownership-graph` profile, integration read responses match REST API schemas:
 
-- hierarchy reads (`list_group_depth(ctx, group_id, query)`) return `Page<ResourceGroupWithDepth>` (matches REST `GET /groups/{group_id}/hierarchy`) — includes `tenant_id` per group
+- hierarchy reads (`get_group_descendants(ctx, group_id, query)` / `get_group_ancestors(ctx, group_id, query)`) return `Page<ResourceGroupWithDepth>` (matches REST `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors`) — includes `tenant_id` per group
 - membership reads (`list_memberships(ctx, query)`) return `Page<ResourceGroupMembership>` (matches REST `GET /memberships`) — no `tenant_id`; callers derive tenant scope from group data obtained via hierarchy reads
 - integration read methods accept caller `SecurityContext`; RG passes it through to selected provider path (for plugin path, pass-through is unchanged)
 - in AuthZ query path, caller `SecurityContext.subject_tenant_id` is mandatory and used to resolve effective tenant scope for tenant-scoped reads and compiled SQL predicates
@@ -640,7 +640,7 @@ RG REST API supports two authentication modes:
 
 **JWT (public, all endpoints)**: standard user/service requests via bearer token. All endpoints available. Every request goes through AuthZ evaluation via `PolicyEnforcer` — identical flow to any other domain service (courses, users, etc.).
 
-**MTLS (private, hierarchy endpoint only)**: service-to-service requests via mutual TLS client certificate. Used by AuthZ plugin to read tenant hierarchy. Only `GET /groups/{group_id}/hierarchy` is allowed — all other endpoints return `403 Forbidden`. MTLS requests **bypass AuthZ evaluation entirely** because:
+**MTLS (private, hierarchy endpoints only)**: service-to-service requests via mutual TLS client certificate. Used by AuthZ plugin to read tenant hierarchy. Only `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors` are allowed — all other endpoints return `403 Forbidden`. MTLS requests **bypass AuthZ evaluation entirely** because:
 - AuthZ plugin is the caller and cannot evaluate itself (circular dependency)
 - MTLS certificate identity is a trusted system principal
 - Single read-only endpoint — minimal attack surface
@@ -1067,7 +1067,7 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
       └── G21 (group, tenant_id=T7)
   ```
 - **AND** AuthZ plugin needs to resolve which tenants/groups are visible to a user whose `subject_tenant_id = T1`
-- **WHEN** plugin calls `list_group_depth(ctx, T1, filter="hierarchy/depth ge 0 and type in ('tenant','group')")` via MTLS
+- **WHEN** plugin calls `get_group_descendants(ctx, T1, filter="type in ('tenant','group')")` via MTLS
 - **THEN** RG returns:
   | id  | type   | hierarchy.tenant_id | hierarchy.depth |
   |-----|--------|---------------------|-----------------|
@@ -1084,7 +1084,7 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
 
 - **GIVEN** caller authenticates via MTLS client certificate
 - **WHEN** caller sends request to `POST /api/resource-group/v1/groups` (non-hierarchy endpoint)
-- **THEN** `403 Forbidden` — MTLS mode only allows `GET /groups/{group_id}/hierarchy`
+- **THEN** `403 Forbidden` — MTLS mode only allows `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors`
 
 ## 9. Acceptance Criteria
 
