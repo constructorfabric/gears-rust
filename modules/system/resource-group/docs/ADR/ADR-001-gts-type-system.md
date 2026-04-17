@@ -62,7 +62,7 @@ The Resource Group (RG) module needs a type identification standard for its hier
 * Cross-vendor composability — types defined by different vendors (tenant, department, user) must compose into a single hierarchy
 * DB-enforced referential integrity — type relationships (allowed parents, allowed memberships) must be enforced at the database level, not just application code
 * Compact storage — the type system must scale to millions of groups without storage overhead from long string type identifiers in every row
-* Separation of concerns — type-level metadata (topology rules like `can_be_root`, `allowed_parents`) must be distinct from instance-level data (group fields like `name`, `barrier`)
+* Separation of concerns — type-level metadata (topology rules like `can_be_root`, `allowed_parent_types`) must be distinct from instance-level data (group fields like `name`, `barrier`)
 * Alignment with platform type conventions — RG should use the same type system as other CyberFabric modules
 
 ## Considered Options
@@ -173,13 +173,13 @@ Base contract for all RG type definitions. Traits define topology rules; propert
         "description": "Whether instances create their own tenant scope (tenant_id = group.id). Default false.",
         "default": false
       },
-      "allowed_parents": {
+      "allowed_parent_types": {
         "type": "array",
         "items": { "type": "string", "x-gts-ref": "gts.cf.core.rg.type.v1~" },
         "description": "Well-known instances of allowed parent RG types.",
         "default": []
       },
-      "allowed_memberships": {
+      "allowed_membership_types": {
         "type": "array",
         "items": { "type": "string", "x-gts-ref": "gts.*" },
         "description": "GTS type identifiers of resource types allowed as members.",
@@ -189,8 +189,8 @@ Base contract for all RG type definitions. Traits define topology rules; propert
   },
   "x-gts-traits": {
     "can_be_root": false,
-    "allowed_parents": [],
-    "allowed_memberships": []
+    "allowed_parent_types": [],
+    "allowed_membership_types": []
   },
   "required": ["id", "name"],
   "properties": {
@@ -227,7 +227,7 @@ Base contract for all RG type definitions. Traits define topology rules; propert
     }
   },
   "x-gts-constraints": {
-    "placement-invariant": "can_be_root OR len(allowed_parents) >= 1"
+    "placement-invariant": "can_be_root OR len(allowed_parent_types) >= 1"
   }
 }
 ```
@@ -344,8 +344,8 @@ When a type is registered as an RG type, it chains with the base contract via a 
       "x-gts-traits": {
         "can_be_root": true,
         "is_tenant": true,
-        "allowed_parents": ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"],
-        "allowed_memberships": ["gts.z.core.idp.user.v1~"]
+        "allowed_parent_types": ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"],
+        "allowed_membership_types": ["gts.z.core.idp.user.v1~"]
       }
     }
   ]
@@ -378,8 +378,8 @@ When a type is registered as an RG type, it chains with the base contract via a 
       },
       "x-gts-traits": {
         "can_be_root": false,
-        "allowed_parents": ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"],
-        "allowed_memberships": ["gts.z.core.idp.user.v1~"]
+        "allowed_parent_types": ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"],
+        "allowed_membership_types": ["gts.z.core.idp.user.v1~"]
       }
     }
   ]
@@ -411,8 +411,8 @@ When a type is registered as an RG type, it chains with the base contract via a 
       },
       "x-gts-traits": {
         "can_be_root": false,
-        "allowed_parents": ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"],
-        "allowed_memberships": ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
+        "allowed_parent_types": ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"],
+        "allowed_membership_types": ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
       }
     }
   ]
@@ -583,8 +583,8 @@ Entity defines x-gts-traits-schema but no x-gts-traits values are provided
 "x-gts-traits": {
   "can_be_root": false,
   "is_tenant": false,
-  "allowed_parents": [],
-  "allowed_memberships": []
+  "allowed_parent_types": [],
+  "allowed_membership_types": []
 }
 ```
 

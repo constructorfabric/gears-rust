@@ -17,9 +17,9 @@ pub struct TypeDto {
     /// Whether groups of this type can be root nodes
     pub can_be_root: bool,
     /// GTS type paths of allowed parent types
-    pub allowed_parents: Vec<String>,
+    pub allowed_parent_types: Vec<String>,
     /// GTS type paths of allowed membership resource types
-    pub allowed_memberships: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
     /// Optional JSON Schema for instance metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_schema: Option<serde_json::Value>,
@@ -33,12 +33,15 @@ pub struct CreateTypeDto {
     pub code: String,
     /// Whether groups of this type can be root nodes.
     pub can_be_root: bool,
+    /// Whether instances create their own tenant scope. Default `false`.
+    #[serde(default)]
+    pub is_tenant: bool,
     /// GTS type paths of allowed parent types.
     #[serde(default)]
-    pub allowed_parents: Vec<String>,
+    pub allowed_parent_types: Vec<String>,
     /// GTS type paths of allowed membership resource types.
     #[serde(default)]
-    pub allowed_memberships: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
     /// Optional JSON Schema for instance metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_schema: Option<serde_json::Value>,
@@ -50,12 +53,15 @@ pub struct CreateTypeDto {
 pub struct UpdateTypeDto {
     /// Whether groups of this type can be root nodes.
     pub can_be_root: bool,
+    /// Whether instances create their own tenant scope. Default `false`.
+    #[serde(default)]
+    pub is_tenant: bool,
     /// GTS type paths of allowed parent types.
     #[serde(default)]
-    pub allowed_parents: Vec<String>,
+    pub allowed_parent_types: Vec<String>,
     /// GTS type paths of allowed membership resource types.
     #[serde(default)]
-    pub allowed_memberships: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
     /// Optional JSON Schema for instance metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_schema: Option<serde_json::Value>,
@@ -68,8 +74,8 @@ impl From<ResourceGroupType> for TypeDto {
         Self {
             code: t.code,
             can_be_root: t.can_be_root,
-            allowed_parents: t.allowed_parents,
-            allowed_memberships: t.allowed_memberships,
+            allowed_parent_types: t.allowed_parent_types,
+            allowed_membership_types: t.allowed_membership_types,
             metadata_schema: t.metadata_schema,
         }
     }
@@ -80,8 +86,9 @@ impl From<CreateTypeDto> for CreateTypeRequest {
         Self {
             code: dto.code,
             can_be_root: dto.can_be_root,
-            allowed_parents: dto.allowed_parents,
-            allowed_memberships: dto.allowed_memberships,
+            is_tenant: dto.is_tenant,
+            allowed_parent_types: dto.allowed_parent_types,
+            allowed_membership_types: dto.allowed_membership_types,
             metadata_schema: dto.metadata_schema,
         }
     }
@@ -91,8 +98,9 @@ impl From<UpdateTypeDto> for UpdateTypeRequest {
     fn from(dto: UpdateTypeDto) -> Self {
         Self {
             can_be_root: dto.can_be_root,
-            allowed_parents: dto.allowed_parents,
-            allowed_memberships: dto.allowed_memberships,
+            is_tenant: dto.is_tenant,
+            allowed_parent_types: dto.allowed_parent_types,
+            allowed_membership_types: dto.allowed_membership_types,
             metadata_schema: dto.metadata_schema,
         }
     }

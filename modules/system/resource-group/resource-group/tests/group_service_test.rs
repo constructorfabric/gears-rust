@@ -563,9 +563,10 @@ async fn group_move_child_to_root() {
         .create_type(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![root_type.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![root_type.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create flexible type");
@@ -685,9 +686,10 @@ async fn group_move_max_width_exceeded() {
         .create_type(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![root_type.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![root_type.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create flexible child type");
@@ -794,9 +796,10 @@ async fn group_update_type_parent_incompatible() {
         .create_type(CreateTypeRequest {
             code: incompatible_code.clone(),
             can_be_root: false,
-            allowed_parents: vec![other_root_type.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![other_root_type.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create incompatible type");
@@ -902,9 +905,10 @@ async fn group_update_simultaneous_type_and_parent() {
         .create_type(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: false,
-            allowed_parents: vec![type_a.code.clone(), type_b.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![type_a.code.clone(), type_b.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create multi-child type");
@@ -918,9 +922,10 @@ async fn group_update_simultaneous_type_and_parent() {
         .create_type(CreateTypeRequest {
             code: new_child_code.clone(),
             can_be_root: false,
-            allowed_parents: vec![type_a.code.clone(), type_b.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![type_a.code.clone(), type_b.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create new child type");
@@ -1507,9 +1512,10 @@ async fn group_move_max_depth_exceeded() {
         .create_type(CreateTypeRequest {
             code: sub_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![child_type.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![child_type.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create sub type");
@@ -1539,9 +1545,10 @@ async fn group_move_max_depth_exceeded() {
         .create_type(CreateTypeRequest {
             code: subsub_code.clone(),
             can_be_root: false,
-            allowed_parents: vec![sub_code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![sub_code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create subsub type");
@@ -2151,9 +2158,10 @@ async fn create_adr_types(
         .create_type(CreateTypeRequest {
             code: tenant_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![user_type.code.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![user_type.code.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create tenant type");
@@ -2163,9 +2171,10 @@ async fn create_adr_types(
             &tenant_code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![tenant_code.clone()],
-                allowed_memberships: vec![user_type.code.clone()],
+                allowed_parent_types: vec![tenant_code.clone()],
+                allowed_membership_types: vec![user_type.code.clone()],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
@@ -2359,9 +2368,9 @@ async fn adr_branch_only_under_department() {
     assert!(
         matches!(
             err,
-            DomainError::InvalidParentType { .. } | DomainError::AllowedParentsViolation { .. }
+            DomainError::InvalidParentType { .. } | DomainError::AllowedParentTypesViolation { .. }
         ),
-        "Expected InvalidParentType or AllowedParentsViolation, got {err:?}"
+        "Expected InvalidParentType or AllowedParentTypesViolation, got {err:?}"
     );
 }
 
@@ -2423,8 +2432,8 @@ async fn adr_tenant_rejects_course_membership() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("not in allowed_memberships")
-            || msg.contains("allowed_memberships")
+        msg.contains("not in allowed_membership_types")
+            || msg.contains("allowed_membership_types")
             || msg.contains("Validation"),
         "Expected membership validation error, got: {msg}"
     );

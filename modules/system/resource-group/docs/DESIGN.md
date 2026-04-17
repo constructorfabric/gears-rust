@@ -90,7 +90,7 @@ For AuthZ-facing deployments aligned with current platform architecture, `owners
 | `cpt-cf-resource-group-fr-seed-types`                         | Any RG plugin MUST perform schema migration. Type data seeding is optional and deployment-specific (plugin data migration, manual DB admin, or RG API). AuthZ config determines required types. Types have no interdependencies and SHOULD be seeded in parallel (`JoinSet`) for throughput. |
 | `cpt-cf-resource-group-fr-seed-groups`                        | Group data seeding is optional and deployment-specific (plugin data migration, manual DB admin, or RG API). Validates parent-child links and type compatibility when performed. Groups MUST be seeded sequentially (parents before children) due to hierarchy dependencies. |
 | `cpt-cf-resource-group-fr-seed-memberships`                   | Membership data seeding is optional and deployment-specific (plugin data migration, manual DB admin, or RG API). Validates group existence and tenant compatibility when performed. Memberships have no interdependencies and SHOULD be seeded in parallel. |
-| `cpt-cf-resource-group-fr-validate-type-update-hierarchy`     | Type update validates removed `allowed_parents` and `can_be_root` changes against existing groups; rejects with `AllowedParentsViolation` when hierarchy would become inconsistent. |
+| `cpt-cf-resource-group-fr-validate-type-update-hierarchy`     | Type update validates removed `allowed_parent_types` and `can_be_root` changes against existing groups; rejects with `AllowedParentTypesViolation` when hierarchy would become inconsistent. |
 | `cpt-cf-resource-group-fr-delete-type-only-if-empty`          | Type deletion flow checks for existing entities and rejects delete when references remain.                                            |
 | `cpt-cf-resource-group-fr-manage-entities`                    | Entity service with create/get/update/move/delete operations.                                                                         |
 | `cpt-cf-resource-group-fr-enforce-forest-hierarchy`           | Domain invariants + cycle checks before writes.                                                                                       |
@@ -246,18 +246,18 @@ SMALLINT surrogate IDs (`gts_type.id`, `gts_type_id` FK columns) are a **DB-inte
 
 **Strict type existence validation**: every GTS type path used in any API operation **MUST** reference an already-registered type in `gts_type`. This applies to:
 - `type` in group create/update requests (`POST /groups`, `PUT /groups/{id}`)
-- `allowed_parents` in type create/update requests
-- `allowed_memberships` in type create/update requests
+- `allowed_parent_types` in type create/update requests
+- `allowed_membership_types` in type create/update requests
 - `resource_type` in membership operations (`POST /memberships/...`)
 
 If a referenced type does not exist, the operation **MUST** return a validation error. Each chained type (e.g., `gts.cf.core.rg.type.v1~y.system.tn.tenant.v1~`) is a distinct type that must be registered separately — chaining does not auto-create constituent types. Registration order matters: base/resource types first, then chained RG types that reference them. Base types (including `gts.cf.core.rg.type.v1~`) must be created before use — via seeding, API calls, or manual DB administration.
 
 **RG type prefix requirement (`gts.cf.core.rg.type.v1~`)**:
 - **`type` in group operations**: `POST /groups`, `PUT /groups/{id}` — **MUST** have `gts.cf.core.rg.type.v1~` prefix. Rejected without it.
-- **`allowed_parents`**: **MUST** have `gts.cf.core.rg.type.v1~` prefix — parent groups are always RG types.
-- **`allowed_memberships`**: **NO prefix requirement** — membership resource types are external domain types (e.g., `gts.z.system.idp.user.v1~`, `gts.z.system.lms.course.v1~`) that do not need to be RG types.
+- **`allowed_parent_types`**: **MUST** have `gts.cf.core.rg.type.v1~` prefix — parent groups are always RG types.
+- **`allowed_membership_types`**: **NO prefix requirement** — membership resource types are external domain types (e.g., `gts.z.system.idp.user.v1~`, `gts.z.system.lms.course.v1~`) that do not need to be RG types.
 
-This ensures the hierarchy is always governed by the RG type contract (`can_be_root`, `allowed_parents`, `allowed_memberships`), while membership resources can be any registered GTS type.
+This ensures the hierarchy is always governed by the RG type contract (`can_be_root`, `allowed_parent_types`, `allowed_membership_types`), while membership resources can be any registered GTS type.
 
 **ADRs**: `cpt-cf-resource-group-adr-p1-gts-type-system`
 
@@ -366,7 +366,7 @@ Responsibilities:
 
 - create/get/update/move/delete entities
 - validate parent type compatibility (on create, move, and type change)
-- on `type` change: validate that the new type's `allowed_parents` permits the current parent's type, AND that all children's types include the new type in their `allowed_parents` — reject with `InvalidParentType` if any child would become invalid
+- on `type` change: validate that the new type's `allowed_parent_types` permits the current parent's type, AND that all children's types include the new type in their `allowed_parent_types` — reject with `InvalidParentType` if any child would become invalid
 - orchestrate subtree operations
 
 #### Hierarchy Service
@@ -444,7 +444,7 @@ SDK models are defined in `resource-group-sdk/src/models.rs` and are aligned wit
 
 | SDK Type | REST Schema | Description |
 | -------- | ----------- | ----------- |
-| `ResourceGroupType` | `Type` | `schema_id`, `allowed_parents`, `allowed_memberships`, `metadata_schema`. `can_be_root` resolved from `x-gts-traits`. |
+| `ResourceGroupType` | `Type` | `schema_id`, `allowed_parent_types`, `allowed_membership_types`, `metadata_schema`. `can_be_root` resolved from `x-gts-traits`. |
 | `ResourceGroup` | `Group` | group identity (`id`, `type`, `name`), `hierarchy` context, `metadata` (type-specific fields) |
 | `ResourceGroupWithDepth` | `GroupWithDepth` | same as `ResourceGroup` plus `hierarchy.depth` (relative distance) |
 | `ResourceGroupMembership` | `Membership` | `group_id`, `resource_type`, `resource_id` |
@@ -499,7 +499,7 @@ Both are resolved from `x-gts-traits` in the registered GTS schema. `is_tenant` 
 
 **Data invariants:**
 
-- Parent-child type compatibility (`allowed_parents`) is always enforced
+- Parent-child type compatibility (`allowed_parent_types`) is always enforced
 - For tenant groups (`is_tenant = true`): the new group creates its own tenant scope (`tenant_id = group.id`); the parent hierarchy link is preserved via `parent_id`. Tenant enforcement (`child.tenant_id == parent.tenant_id`) is **skipped** because the child intentionally gets a different `tenant_id`
 - For non-tenant groups (`is_tenant = false`): `child.tenant_id` must equal `parent.tenant_id` (or `caller.subject_tenant_id` for root). This is enforced at the domain service layer to prevent cross-tenant data leakage
 
@@ -1213,7 +1213,7 @@ Ownership-graph tenant enforcement:
 | missing type/entity         | `NotFound`                 |
 | duplicate type              | `TypeAlreadyExists`        |
 | invalid parent type         | `InvalidParentType`        |
-| type update violates existing hierarchy | `AllowedParentsViolation` |
+| type update violates existing hierarchy | `AllowedParentTypesViolation` |
 | cycle attempt               | `CycleDetected`            |
 | active references on delete | `ConflictActiveReferences` (response body MUST include list of blocking entities — children and/or memberships — so the caller can display what prevents deletion) |
 | depth/width violation       | `LimitViolation`           |
@@ -1328,7 +1328,7 @@ RG follows standard CyberFabric observability patterns:
 
 **Phase 2 (this commit)**: Types endpoints move to `/api/types-registry/v1/types*` URL namespace. RG module implements the types CRUD with DB persistence, but the URL aligns with Types Registry as the conceptual owner of GTS type operations. This is a URL-only change — no storage or runtime integration between modules yet.
 
-**Phase 3 (planned)**: GTS types migrate to their own persistent storage within the Types Registry module. Types Registry becomes the **single source of truth** for all GTS type definitions with its own DB-backed store, replacing the current in-memory `gts-rust` engine. RG and Types Registry coordinate via a **saga pattern**: type registration flows through Types Registry (schema validation, GTS catalog) and RG (hierarchy rules, junction tables for `allowed_parents`/`allowed_memberships`). Each module owns its domain-specific slice of the type data, and the saga ensures cross-module consistency.
+**Phase 3 (planned)**: GTS types migrate to their own persistent storage within the Types Registry module. Types Registry becomes the **single source of truth** for all GTS type definitions with its own DB-backed store, replacing the current in-memory `gts-rust` engine. RG and Types Registry coordinate via a **saga pattern**: type registration flows through Types Registry (schema validation, GTS catalog) and RG (hierarchy rules, junction tables for `allowed_parent_types`/`allowed_membership_types`). Each module owns its domain-specific slice of the type data, and the saga ensures cross-module consistency.
 
 Rationale:
 - Phase 2 aligns the URL namespace early to avoid breaking changes for API consumers when storage migration occurs in Phase 3
@@ -1440,12 +1440,12 @@ Test builder: `RgTestHarness::unit()` with fluent API — `.with_types(...)`, `.
 |---|---|---|
 | Type code validation (length, whitespace, case) | `InMemoryTypeRepository` | `Validation` error returned for invalid codes |
 | Type uniqueness on create | `InMemoryTypeRepository` pre-seeded with existing code | `TypeAlreadyExists` error returned |
-| `allowed_parents` update vs existing hierarchy | `InMemoryTypeRepository` + `InMemoryEntityRepository` | `AllowedParentsViolation` when groups would break new rules |
-| `can_be_root` removal vs existing root groups | `InMemoryTypeRepository` + `InMemoryEntityRepository` | `AllowedParentsViolation` when root groups exist |
+| `allowed_parent_types` update vs existing hierarchy | `InMemoryTypeRepository` + `InMemoryEntityRepository` | `AllowedParentTypesViolation` when groups would break new rules |
+| `can_be_root` removal vs existing root groups | `InMemoryTypeRepository` + `InMemoryEntityRepository` | `AllowedParentTypesViolation` when root groups exist |
 | Type delete-if-unused guard | `InMemoryTypeRepository` + `InMemoryEntityRepository` with matching type | `ConflictActiveReferences` when entities exist |
 | Cycle detection in entity create/move | `InMemoryClosureRepository` with ancestor chain | `CycleDetected` when target is descendant |
 | Self-parent rejection | `InMemoryEntityRepository` | `CycleDetected` for `parent_id == id` |
-| Parent type compatibility | `InMemoryTypeRepository` + `InMemoryEntityRepository` | `InvalidParentType` when parent type not in `allowed_parents` |
+| Parent type compatibility | `InMemoryTypeRepository` + `InMemoryEntityRepository` | `InvalidParentType` when parent type not in `allowed_parent_types` |
 | Depth limit enforcement | `InMemoryClosureRepository` + profile `max_depth=3` | `LimitViolation` at depth 4 |
 | Width limit enforcement | `InMemoryClosureRepository` + profile `max_width=N` | `LimitViolation` when exceeding |
 | Membership add — group does not exist | `InMemoryEntityRepository` empty | `NotFound` |

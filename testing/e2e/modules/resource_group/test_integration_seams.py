@@ -82,8 +82,8 @@ async def test_route_smoke_all_endpoints(
         assert r.status_code not in (404, 405), f"DELETE /types/{{code}}: {r.status_code}"
 
         # DELETE /memberships/{group_id}/{type}/{id} -- not exercised elsewhere
-        member_type = await create_type("s1mem", allowed_memberships=[])
-        org_type = await create_type("s1org", allowed_memberships=[member_type["code"]])
+        member_type = await create_type("s1mem", allowed_membership_types=[])
+        org_type = await create_type("s1org", allowed_membership_types=[member_type["code"]])
         group = await create_group(org_type["code"], "S1 Route")
         r = await c.post(
             f"{_memberships(rg_base_url)}/{group['id']}/{member_type['code']}/res-s1",
@@ -259,10 +259,10 @@ async def test_hierarchy_closure_postgresql(
     """
     root_type = await create_type("s5root")
     child_type = await create_type(
-        "s5child", can_be_root=False, allowed_parents=[root_type["code"]],
+        "s5child", can_be_root=False, allowed_parent_types=[root_type["code"]],
     )
     gc_type = await create_type(
-        "s5gc", can_be_root=False, allowed_parents=[child_type["code"]],
+        "s5gc", can_be_root=False, allowed_parent_types=[child_type["code"]],
     )
 
     root = await create_group(root_type["code"], "S5 Root")
@@ -322,10 +322,10 @@ async def test_move_closure_rebuild_postgresql(
     """
     root_type = await create_type("s6root")
     child_type = await create_type(
-        "s6child", can_be_root=False, allowed_parents=[root_type["code"]],
+        "s6child", can_be_root=False, allowed_parent_types=[root_type["code"]],
     )
     gc_type = await create_type(
-        "s6gc", can_be_root=False, allowed_parents=[child_type["code"]],
+        "s6gc", can_be_root=False, allowed_parent_types=[child_type["code"]],
     )
 
     root_a = await create_group(root_type["code"], "S6 Root A")
@@ -388,12 +388,12 @@ async def test_force_delete_cascade_postgresql(
     """
     member_type = await create_type("s7member")
     root_type = await create_type(
-        "s7root", allowed_memberships=[member_type["code"]],
+        "s7root", allowed_membership_types=[member_type["code"]],
     )
     child_type = await create_type(
         "s7child", can_be_root=False,
-        allowed_parents=[root_type["code"]],
-        allowed_memberships=[member_type["code"]],
+        allowed_parent_types=[root_type["code"]],
+        allowed_membership_types=[member_type["code"]],
     )
 
     root = await create_group(root_type["code"], "S7 Root")
@@ -535,7 +535,7 @@ async def test_membership_filter_wiring(
     -> FilterField -> SQL WHERE -- is never tested end-to-end.
     """
     member_type = await create_type("s10member")
-    org_type = await create_type("s10org", allowed_memberships=[member_type["code"]])
+    org_type = await create_type("s10org", allowed_membership_types=[member_type["code"]])
 
     group_a = await create_group(org_type["code"], "S10 Group A")
     group_b = await create_group(org_type["code"], "S10 Group B")
@@ -591,10 +591,10 @@ async def test_hierarchy_depth_filter_wiring(
     """
     root_type = await create_type("s11root")
     child_type = await create_type(
-        "s11child", can_be_root=False, allowed_parents=[root_type["code"]],
+        "s11child", can_be_root=False, allowed_parent_types=[root_type["code"]],
     )
     gc_type = await create_type(
-        "s11gc", can_be_root=False, allowed_parents=[child_type["code"]],
+        "s11gc", can_be_root=False, allowed_parent_types=[child_type["code"]],
     )
 
     root = await create_group(root_type["code"], "S11 Root")
@@ -639,10 +639,10 @@ async def test_barrier_metadata_in_descendants(
     """
     root_type = await create_type("s12root")
     child_type = await create_type(
-        "s12child", can_be_root=False, allowed_parents=[root_type["code"]],
+        "s12child", can_be_root=False, allowed_parent_types=[root_type["code"]],
     )
     gc_type = await create_type(
-        "s12gc", can_be_root=False, allowed_parents=[child_type["code"]],
+        "s12gc", can_be_root=False, allowed_parent_types=[child_type["code"]],
     )
 
     root = await create_group(root_type["code"], "S12 Root")

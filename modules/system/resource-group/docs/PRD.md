@@ -312,8 +312,8 @@ A type includes:
 
 - `schema_id` (unique GTS type path, case-insensitive)
 - `can_be_root` (boolean; `true` means the type permits root placement — no `parent_id`). Resolved from `x-gts-traits` in the registered GTS schema.
-- `allowed_parents` (allowed parent type codes; may be empty if the type is root-only). Invariant: `can_be_root OR len(allowed_parents) >= 1` — a type must have at least one valid placement
-- `allowed_memberships` (GTS type paths of resource types allowed as members of groups of this type, e.g. `["gts.cf.core.idp.user.v1~"]`)
+- `allowed_parent_types` (allowed parent type codes; may be empty if the type is root-only). Invariant: `can_be_root OR len(allowed_parent_types) >= 1` — a type must have at least one valid placement
+- `allowed_membership_types` (GTS type paths of resource types allowed as members of groups of this type, e.g. `["gts.cf.core.idp.user.v1~"]`)
 - `metadata_schema` (optional JSON Schema — defines the structure and validation rules for the `metadata` field on group instances of this type)
 
 #### Validate Type Code Format
@@ -351,20 +351,20 @@ Type data seeding (populating type definitions) is **optional** and deployment-s
 AuthZ deployment determines which types are needed:
 
 - **AuthZ does not use RG** — no type seeding required.
-- **Flat tenants** — create type `tenant` with `is_tenant: true, can_be_root: true, allowed_parents: {}` (root placement only, no nesting). `is_tenant` causes `tenant_id = group.id` (self-referencing scope).
-- **Hierarchical tenants** — create type `tenant` with `is_tenant: true, can_be_root: true, allowed_parents: {'tenant'}` (root placement or nested under another tenant). Sub-tenants also get `tenant_id = group.id`.
+- **Flat tenants** — create type `tenant` with `is_tenant: true, can_be_root: true, allowed_parent_types: {}` (root placement only, no nesting). `is_tenant` causes `tenant_id = group.id` (self-referencing scope).
+- **Hierarchical tenants** — create type `tenant` with `is_tenant: true, can_be_root: true, allowed_parent_types: {'tenant'}` (root placement or nested under another tenant). Sub-tenants also get `tenant_id = group.id`.
 - **Non-tenant root types** — create type `organization` with `is_tenant: false, can_be_root: true` (root placement, but inherits `tenant_id` from caller). `is_tenant` defaults to `false` if omitted.
 
 #### Validate Type Update Against Existing Hierarchy
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-validate-type-update-hierarchy`
 
-Updating a type's placement rules (`allowed_parents`, `can_be_root`) **MUST** be validated against the existing group hierarchy:
+Updating a type's placement rules (`allowed_parent_types`, `can_be_root`) **MUST** be validated against the existing group hierarchy:
 
-- Removing a type code from `allowed_parents` **MUST** be rejected if any group of this type currently has a parent whose type is the removed code.
+- Removing a type code from `allowed_parent_types` **MUST** be rejected if any group of this type currently has a parent whose type is the removed code.
 - Setting `can_be_root` from `true` to `false` **MUST** be rejected if any root group (no `parent_id`) of this type exists.
 
-Violation **MUST** return `AllowedParentsViolation` with details identifying the conflicting constraint.
+Violation **MUST** return `AllowedParentTypesViolation` with details identifying the conflicting constraint.
 
 #### Delete Type Only If Unused
 
@@ -777,7 +777,7 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
 
 #### Scenario: Create Type
 
-- **GIVEN** valid code `branch` and allowed_parents `["tenant", "department"]`
+- **GIVEN** valid code `branch` and allowed_parent_types `["tenant", "department"]`
 - **WHEN** caller creates type
 - **THEN** type is persisted with owner metadata
 
@@ -795,18 +795,18 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
 
 #### Scenario: Update Type Parents (Compatible)
 
-- **GIVEN** type `branch` exists with allowed_parents `["tenant"]`
+- **GIVEN** type `branch` exists with allowed_parent_types `["tenant"]`
 - **AND** no existing `branch` groups have a parent of type `department`
-- **WHEN** caller updates allowed_parents to `["tenant", "department"]` (adds new allowed parent)
+- **WHEN** caller updates allowed_parent_types to `["tenant", "department"]` (adds new allowed parent)
 - **THEN** type definition is updated
 - **AND** existing groups remain valid
 
 #### Scenario: Reject Update Type Parents When Existing Groups Violate New Rules
 
-- **GIVEN** type `branch` exists with allowed_parents `["tenant", "department"]`
+- **GIVEN** type `branch` exists with allowed_parent_types `["tenant", "department"]`
 - **AND** group `B1` (type `branch`) has parent `D1` (type `department`)
-- **WHEN** caller updates `branch` allowed_parents to `["tenant"]` (removes `department`)
-- **THEN** update is rejected with `AllowedParentsViolation` — existing group `B1` would violate new parent type rules
+- **WHEN** caller updates `branch` allowed_parent_types to `["tenant"]` (removes `department`)
+- **THEN** update is rejected with `AllowedParentTypesViolation` — existing group `B1` would violate new parent type rules
 
 #### Scenario: Delete Unused Type
 
@@ -852,10 +852,10 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
 
 #### Scenario: Reject Invalid Parent Type
 
-- **GIVEN** type `team` allows allowed_parents `["branch"]` only
+- **GIVEN** type `team` allows allowed_parent_types `["branch"]` only
 - **AND** parent entity `D1` has type `department`
 - **WHEN** caller creates group of type `team` with `parent_id = D1`
-- **THEN** `InvalidParentType` — `department` is not in allowed_parents for `team`
+- **THEN** `InvalidParentType` — `department` is not in allowed_parent_types for `team`
 
 #### Scenario: Move Subtree to Valid Parent
 

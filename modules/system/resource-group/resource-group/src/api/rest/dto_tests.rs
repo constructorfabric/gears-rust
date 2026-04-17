@@ -9,15 +9,16 @@ fn dto_type_from_resource_group_type() {
     let rgt = ResourceGroupType {
         code: "gts.x.system.rg.type.v1~x.test.dto.mytype.v1~".to_owned(),
         can_be_root: true,
-        allowed_parents: vec!["gts.parent~".to_owned()],
-        allowed_memberships: vec!["gts.member~".to_owned()],
+        allowed_parent_types: vec!["gts.parent~".to_owned()],
+        allowed_membership_types: vec!["gts.member~".to_owned()],
         metadata_schema: Some(serde_json::json!({"type": "object"})),
+        ..Default::default()
     };
     let dto: TypeDto = rgt.into();
     assert_eq!(dto.code, "gts.x.system.rg.type.v1~x.test.dto.mytype.v1~");
     assert!(dto.can_be_root);
-    assert_eq!(dto.allowed_parents, vec!["gts.parent~"]);
-    assert_eq!(dto.allowed_memberships, vec!["gts.member~"]);
+    assert_eq!(dto.allowed_parent_types, vec!["gts.parent~"]);
+    assert_eq!(dto.allowed_membership_types, vec!["gts.member~"]);
     assert!(dto.metadata_schema.is_some());
 }
 
@@ -27,15 +28,16 @@ fn dto_create_type_to_request() {
     let dto = CreateTypeDto {
         code: "gts.x.system.rg.type.v1~x.test.dto.mytype.v1~".to_owned(),
         can_be_root: false,
-        allowed_parents: vec!["gts.parent~".to_owned()],
-        allowed_memberships: vec![],
+        is_tenant: false,
+        allowed_parent_types: vec!["gts.parent~".to_owned()],
+        allowed_membership_types: vec![],
         metadata_schema: None,
     };
     let req: CreateTypeRequest = dto.into();
     assert_eq!(req.code, "gts.x.system.rg.type.v1~x.test.dto.mytype.v1~");
     assert!(!req.can_be_root);
-    assert_eq!(req.allowed_parents, vec!["gts.parent~"]);
-    assert!(req.allowed_memberships.is_empty());
+    assert_eq!(req.allowed_parent_types, vec!["gts.parent~"]);
+    assert!(req.allowed_membership_types.is_empty());
     assert!(req.metadata_schema.is_none());
 }
 
@@ -103,8 +105,8 @@ fn dto_create_group_deserialize_type_key() {
 fn dto_create_type_deserialize_missing_vectors_default_empty() {
     let json = r#"{"code": "gts.x.system.rg.type.v1~x.test.dto.mytype.v1~", "can_be_root": true}"#;
     let dto: CreateTypeDto = serde_json::from_str(json).unwrap();
-    assert!(dto.allowed_parents.is_empty());
-    assert!(dto.allowed_memberships.is_empty());
+    assert!(dto.allowed_parent_types.is_empty());
+    assert!(dto.allowed_membership_types.is_empty());
 }
 
 // TC-DTO-07: MembershipDto serialization has no tenant_id key

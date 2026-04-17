@@ -315,8 +315,8 @@ T2 (root tenant, token-b subject_tenant_id)
 
 **Setup steps** (all via REST API, executed once per session):
 
-1. Create tenant type (`is_tenant=true`, `can_be_root=true`, `allowed_parents=[self]`)
-2. Create department type (`is_tenant=false`, `can_be_root=false`, `allowed_parents=[tenant_type]`)
+1. Create tenant type (`is_tenant=true`, `can_be_root=true`, `allowed_parent_types=[self]`)
+2. Create department type (`is_tenant=false`, `can_be_root=false`, `allowed_parent_types=[tenant_type]`)
 3. **Seed T1 root tenant** directly in SQLite (`id` = token-a `subject_tenant_id`). Root tenants are created via DB seeding, not API.
 4. `POST /groups` -- T_normal (parent=T1) -- `tenant_id = T_normal.id`
 5. `POST /groups` -- T_barrier (parent=T1, metadata=`{"barrier": true}`) -- `tenant_id = T_barrier.id`

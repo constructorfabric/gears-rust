@@ -496,14 +496,14 @@
       "CreateTypeDto": {
         "description": "REST DTO for creating a new GTS type.",
         "properties": {
-          "allowed_memberships": {
+          "allowed_membership_types": {
             "description": "GTS type paths of allowed membership resource types.",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
-          "allowed_parents": {
+          "allowed_parent_types": {
             "description": "GTS type paths of allowed parent types.",
             "items": {
               "type": "string"
@@ -517,6 +517,10 @@
           "code": {
             "description": "GTS type path. Must have prefix `gts.x.system.rg.type.v1~`.",
             "type": "string"
+          },
+          "is_tenant": {
+            "description": "Whether instances create their own tenant scope. Default `false`.",
+            "type": "boolean"
           },
           "metadata_schema": {
             "description": "Optional JSON Schema for instance metadata."
@@ -3227,14 +3231,14 @@
       "TypeDto": {
         "description": "REST DTO for GTS type representation.",
         "properties": {
-          "allowed_memberships": {
+          "allowed_membership_types": {
             "description": "GTS type paths of allowed membership resource types",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
-          "allowed_parents": {
+          "allowed_parent_types": {
             "description": "GTS type paths of allowed parent types",
             "items": {
               "type": "string"
@@ -3256,8 +3260,8 @@
         "required": [
           "code",
           "can_be_root",
-          "allowed_parents",
-          "allowed_memberships"
+          "allowed_parent_types",
+          "allowed_membership_types"
         ],
         "type": "object"
       },
@@ -3395,14 +3399,14 @@
       "UpdateTypeDto": {
         "description": "REST DTO for updating a GTS type (full replacement via PUT).",
         "properties": {
-          "allowed_memberships": {
+          "allowed_membership_types": {
             "description": "GTS type paths of allowed membership resource types.",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
-          "allowed_parents": {
+          "allowed_parent_types": {
             "description": "GTS type paths of allowed parent types.",
             "items": {
               "type": "string"
@@ -3411,6 +3415,10 @@
           },
           "can_be_root": {
             "description": "Whether groups of this type can be root nodes.",
+            "type": "boolean"
+          },
+          "is_tenant": {
+            "description": "Whether instances create their own tenant scope. Default `false`.",
             "type": "boolean"
           },
           "metadata_schema": {

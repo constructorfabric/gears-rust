@@ -416,9 +416,12 @@ fn domain_error_conflict_active_references_format() {
 }
 
 #[test]
-fn domain_error_allowed_parents_violation_format() {
-    let err = DomainError::allowed_parents_violation("parent removed");
-    assert!(matches!(err, DomainError::AllowedParentsViolation { .. }));
+fn domain_error_allowed_parent_types_violation_format() {
+    let err = DomainError::allowed_parent_types_violation("parent removed");
+    assert!(matches!(
+        err,
+        DomainError::AllowedParentTypesViolation { .. }
+    ));
     assert!(err.to_string().contains("parent removed"));
 }
 
@@ -621,9 +624,9 @@ fn domain_to_problem_conflict_active_refs_is_409() {
 }
 
 #[test]
-fn domain_to_problem_allowed_parents_violation_is_409() {
+fn domain_to_problem_allowed_parent_types_violation_is_409() {
     use modkit::api::problem::Problem;
-    let domain = DomainError::allowed_parents_violation("violation");
+    let domain = DomainError::allowed_parent_types_violation("violation");
     let problem: Problem = domain.into();
     assert_eq!(problem.status, http::StatusCode::CONFLICT);
 }

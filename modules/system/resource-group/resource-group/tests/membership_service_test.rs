@@ -4,7 +4,7 @@
 //! Membership service integration tests (Phase 4).
 //!
 //! Tests the MembershipService domain logic: add/remove lifecycle,
-//! allowed_memberships validation, tenant compatibility, and duplicate detection.
+//! allowed_membership_types validation, tenant compatibility, and duplicate detection.
 
 mod common;
 
@@ -40,9 +40,10 @@ async fn create_type_with_memberships(
         .create_type(CreateTypeRequest {
             code,
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: memberships.iter().map(|s| (*s).to_owned()).collect(),
+            allowed_parent_types: vec![],
+            allowed_membership_types: memberships.iter().map(|s| (*s).to_owned()).collect(),
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type with memberships")
@@ -182,9 +183,9 @@ async fn membership_add_unregistered_resource_type() {
     );
 }
 
-// TC-MBR-05: resource_type not in allowed_memberships
+// TC-MBR-05: resource_type not in allowed_membership_types
 #[tokio::test]
-async fn membership_add_not_in_allowed_memberships() {
+async fn membership_add_not_in_allowed_membership_types() {
     let db = test_db().await;
     let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
     let group_svc = make_group_service(db.clone());
@@ -211,8 +212,8 @@ async fn membership_add_not_in_allowed_memberships() {
         "expected Validation, got: {err:?}"
     );
     assert!(
-        format!("{err:?}").contains("not in allowed_memberships"),
-        "error should mention allowed_memberships: {err:?}"
+        format!("{err:?}").contains("not in allowed_membership_types"),
+        "error should mention allowed_membership_types: {err:?}"
     );
 }
 
@@ -437,9 +438,9 @@ async fn membership_remove_unregistered_resource_type() {
     );
 }
 
-// TC-MBR-13: Empty allowed_memberships rejects all
+// TC-MBR-13: Empty allowed_membership_types rejects all
 #[tokio::test]
-async fn membership_empty_allowed_memberships_rejects_all() {
+async fn membership_empty_allowed_membership_types_rejects_all() {
     let db = test_db().await;
     let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
     let group_svc = make_group_service(db.clone());
@@ -456,15 +457,15 @@ async fn membership_empty_allowed_memberships_rejects_all() {
     let err = mbr_svc
         .add_membership(&ctx, group.id, &member_type.code, "res-001")
         .await
-        .expect_err("empty allowed_memberships should reject");
+        .expect_err("empty allowed_membership_types should reject");
 
     assert!(
         matches!(err, DomainError::Validation { .. }),
         "expected Validation, got: {err:?}"
     );
     assert!(
-        format!("{err:?}").contains("not in allowed_memberships"),
-        "error should mention allowed_memberships: {err:?}"
+        format!("{err:?}").contains("not in allowed_membership_types"),
+        "error should mention allowed_membership_types: {err:?}"
     );
 }
 

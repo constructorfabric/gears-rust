@@ -54,7 +54,7 @@ impl TypeRepository {
     }
 
     /// Resolve allowed parent SMALLINT IDs to string paths.
-    async fn load_allowed_parents(
+    async fn load_allowed_parent_types(
         db: &impl DBRunner,
         type_id: i16,
     ) -> Result<Vec<String>, DomainError> {
@@ -87,7 +87,7 @@ impl TypeRepository {
     }
 
     /// Resolve allowed membership SMALLINT IDs to string paths.
-    async fn load_allowed_memberships(
+    async fn load_allowed_membership_types(
         db: &impl DBRunner,
         type_id: i16,
     ) -> Result<Vec<String>, DomainError> {
@@ -189,18 +189,27 @@ impl TypeRepositoryTrait for TypeRepository {
         db: &C,
         type_model: &gts_type::Model,
     ) -> Result<ResourceGroupType, DomainError> {
-        let allowed_parents = Self::load_allowed_parents(db, type_model.id).await?;
-        let allowed_memberships = Self::load_allowed_memberships(db, type_model.id).await?;
+        let allowed_parent_types = Self::load_allowed_parent_types(db, type_model.id).await?;
+        let allowed_membership_types =
+            Self::load_allowed_membership_types(db, type_model.id).await?;
 
         // Derive can_be_root from stored metadata_schema internal key.
-        // Per the placement invariant: can_be_root == true OR len(allowed_parents) >= 1.
-        // If no allowed_parents, can_be_root must be true.
+        // Per the placement invariant: can_be_root == true OR len(allowed_parent_types) >= 1.
+        // If no allowed_parent_types, can_be_root must be true.
         let can_be_root = type_model
             .metadata_schema
             .as_ref()
             .and_then(|ms| ms.get("__can_be_root"))
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(allowed_parents.is_empty());
+            .unwrap_or(allowed_parent_types.is_empty());
+
+        // Derive is_tenant from stored metadata_schema internal key. Default false.
+        let is_tenant = type_model
+            .metadata_schema
+            .as_ref()
+            .and_then(|ms| ms.get("__is_tenant"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         // Extract the user-facing metadata_schema without internal keys.
         // Non-object schemas are stored under `__user_schema`; restore them on read.
@@ -227,8 +236,9 @@ impl TypeRepositoryTrait for TypeRepository {
         Ok(ResourceGroupType {
             code: type_model.schema_id.clone(),
             can_be_root,
-            allowed_parents,
-            allowed_memberships,
+            is_tenant,
+            allowed_parent_types,
+            allowed_membership_types,
             metadata_schema,
         })
     }
@@ -266,7 +276,7 @@ impl TypeRepositoryTrait for TypeRepository {
     }
 
     /// Insert allowed parent junction entries.
-    async fn insert_allowed_parents<C: DBRunner>(
+    async fn insert_allowed_parent_types<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,
@@ -286,7 +296,7 @@ impl TypeRepositoryTrait for TypeRepository {
     }
 
     /// Insert allowed membership junction entries.
-    async fn insert_allowed_memberships<C: DBRunner>(
+    async fn insert_allowed_membership_types<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,
@@ -306,7 +316,7 @@ impl TypeRepositoryTrait for TypeRepository {
     }
 
     /// Delete all allowed parent junction entries for a type.
-    async fn delete_allowed_parents<C: DBRunner>(
+    async fn delete_allowed_parent_types<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,
@@ -323,7 +333,7 @@ impl TypeRepositoryTrait for TypeRepository {
     }
 
     /// Delete all allowed membership junction entries for a type.
-    async fn delete_allowed_memberships<C: DBRunner>(
+    async fn delete_allowed_membership_types<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,

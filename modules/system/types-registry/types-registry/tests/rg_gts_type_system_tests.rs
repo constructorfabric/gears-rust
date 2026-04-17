@@ -7,7 +7,7 @@
 //! - Chained RG types with single $ref + inline metadata properties + x-gts-traits
 //! - Entity schemas registered for reference (not $ref'd from chained types)
 //! - Instance validation: base fields + metadata fields validated at GTS level
-//! - Topology trait constraints (`can_be_root`, `allowed_parents`, `allowed_memberships`)
+//! - Topology trait constraints (`can_be_root`, `allowed_parent_types`, `allowed_membership_types`)
 
 mod common;
 
@@ -35,12 +35,12 @@ fn rg_base_contract() -> serde_json::Value {
                     "type": "boolean",
                     "default": false
                 },
-                "allowed_parents": {
+                "allowed_parent_types": {
                     "type": "array",
                     "items": { "type": "string", "x-gts-ref": "gts.x.core.rg.type.v1~" },
                     "default": []
                 },
-                "allowed_memberships": {
+                "allowed_membership_types": {
                     "type": "array",
                     "items": { "type": "string", "x-gts-ref": "gts.*" },
                     "default": []
@@ -49,8 +49,8 @@ fn rg_base_contract() -> serde_json::Value {
         },
         "x-gts-traits": {
             "can_be_root": false,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         },
         "required": ["id", "name"],
         "properties": {
@@ -168,8 +168,8 @@ fn tenant_rg_type() -> serde_json::Value {
                 },
                 "x-gts-traits": {
                     "can_be_root": true,
-                    "allowed_parents": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
-                    "allowed_memberships": ["gts.z.core.idp.user.v1~"]
+                    "allowed_parent_types": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
+                    "allowed_membership_types": ["gts.z.core.idp.user.v1~"]
                 }
             }
         ]
@@ -196,8 +196,8 @@ fn department_rg_type() -> serde_json::Value {
                 },
                 "x-gts-traits": {
                     "can_be_root": false,
-                    "allowed_parents": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
-                    "allowed_memberships": ["gts.z.core.idp.user.v1~"]
+                    "allowed_parent_types": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
+                    "allowed_membership_types": ["gts.z.core.idp.user.v1~"]
                 }
             }
         ]
@@ -223,8 +223,8 @@ fn branch_rg_type() -> serde_json::Value {
                 },
                 "x-gts-traits": {
                     "can_be_root": false,
-                    "allowed_parents": ["gts.x.core.rg.type.v1~w.core.org.department.v1~"],
-                    "allowed_memberships": [
+                    "allowed_parent_types": ["gts.x.core.rg.type.v1~w.core.org.department.v1~"],
+                    "allowed_membership_types": [
                         "gts.z.core.idp.user.v1~",
                         "gts.z.core.lms.course.v1~"
                     ]
@@ -333,7 +333,7 @@ async fn test_chained_department_cannot_be_root() {
         .unwrap();
     assert_eq!(traits_block["x-gts-traits"]["can_be_root"], json!(false));
     assert_eq!(
-        traits_block["x-gts-traits"]["allowed_parents"],
+        traits_block["x-gts-traits"]["allowed_parent_types"],
         json!(["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"])
     );
 }
@@ -349,7 +349,7 @@ async fn test_branch_allows_users_and_courses_as_members() {
         .iter()
         .find(|i| i.get("x-gts-traits").is_some())
         .unwrap();
-    let memberships = traits_block["x-gts-traits"]["allowed_memberships"]
+    let memberships = traits_block["x-gts-traits"]["allowed_membership_types"]
         .as_array()
         .unwrap();
     assert_eq!(memberships.len(), 2);
@@ -705,7 +705,7 @@ async fn test_chained_type_with_broken_ref_fails_on_ready() {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "allOf": [
             { "$ref": "gts://gts.x.core.rg.type.v1~" },
-            { "x-gts-traits": { "can_be_root": true, "allowed_parents": [], "allowed_memberships": [] } }
+            { "x-gts-traits": { "can_be_root": true, "allowed_parent_types": [], "allowed_membership_types": [] } }
         ]
     });
     assert!(

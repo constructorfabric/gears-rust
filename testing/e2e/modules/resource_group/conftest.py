@@ -1,6 +1,9 @@
 # Created: 2026-04-16 by Constructor Tech
 """Pytest configuration and fixtures for resource-group E2E tests."""
+import json
 import os
+import pathlib
+import sqlite3
 import uuid
 import time
 
@@ -50,6 +53,79 @@ def _check_rg_reachable():
         pass
 
 
+# ── Root tenant seed (direct SQLite) ────────────────────────────────────
+
+# Tenant IDs must match static-authn-plugin token config in e2e yaml.
+TENANT_A_ID = "00000000-df51-5b42-9538-d2b56b7ee953"
+TENANT_B_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+TENANT_TYPE_CODE = "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _seed_root_tenants():
+    """Seed root tenant groups directly in SQLite.
+
+    Root tenants cannot be created via API because rg-authz-plugin requires
+    an existing hierarchy to authorize requests. This seeds the minimum data
+    needed: one tenant type + two root tenant groups + closure self-rows.
+
+    Idempotent: uses INSERT OR IGNORE.
+    """
+    home = os.path.expanduser(os.getenv("HYPERSPOT_HOME", "~/.hyperspot"))
+    db_path = pathlib.Path(home) / "resource-group" / "resource_group.db"
+    if not db_path.exists():
+        return  # server not started or different DB path
+
+    def uuid_to_blob(uuid_str: str) -> bytes:
+        """Convert UUID string to 16-byte binary (SeaORM SQLite format)."""
+        return uuid.UUID(uuid_str).bytes
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tid_a = uuid_to_blob(TENANT_A_ID)
+        tid_b = uuid_to_blob(TENANT_B_ID)
+
+        # 1. Tenant type (is_tenant=true, can_be_root=true)
+        metadata_schema = json.dumps({
+            "__can_be_root": True,
+            "__is_tenant": True,
+        })
+        conn.execute(
+            "INSERT OR IGNORE INTO gts_type (schema_id, metadata_schema) VALUES (?, ?)",
+            (TENANT_TYPE_CODE, metadata_schema),
+        )
+        row = conn.execute(
+            "SELECT id FROM gts_type WHERE schema_id = ?", (TENANT_TYPE_CODE,)
+        ).fetchone()
+        type_id = row[0]
+
+        # 2. Root tenant A (UUIDs as BLOB to match SeaORM format)
+        conn.execute(
+            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, name, tenant_id) VALUES (?, ?, ?, ?)",
+            (tid_a, type_id, "e2e-root-tenant-a", tid_a),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO resource_group_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",
+            (tid_a, tid_a),
+        )
+
+        # 3. Root tenant B
+        conn.execute(
+            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, name, tenant_id) VALUES (?, ?, ?, ?)",
+            (tid_b, type_id, "e2e-root-tenant-b", tid_b),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO resource_group_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",
+            (tid_b, tid_b),
+        )
+
+        conn.commit()
+        # Flush WAL so the server (separate process) sees our writes immediately
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
 # ── Test data helpers ────────────────────────────────────────────────────
 
 _counter = int(time.time() * 1000) % 1000000
@@ -67,13 +143,13 @@ def create_type(rg_base_url, rg_headers):
     """Factory fixture: create a GTS type and return its code."""
     created_codes = []
 
-    async def _create(name: str, can_be_root: bool = True, allowed_parents=None, allowed_memberships=None):
+    async def _create(name: str, can_be_root: bool = True, allowed_parent_types=None, allowed_membership_types=None):
         code = unique_type_code(name)
         payload = {
             "code": code,
             "can_be_root": can_be_root,
-            "allowed_parents": allowed_parents or [],
-            "allowed_memberships": allowed_memberships or [],
+            "allowed_parent_types": allowed_parent_types or [],
+            "allowed_membership_types": allowed_membership_types or [],
         }
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(

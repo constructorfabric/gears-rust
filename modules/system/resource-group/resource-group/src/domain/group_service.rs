@@ -106,17 +106,38 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         tenant_id: Uuid,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
-        // Actor sends POST /api/resource-group/v1/groups
-        // AuthZ gate: verify the caller can create groups
-        let _scope = self
-            .enforcer
-            .access_scope(ctx, &RG_GROUP_RESOURCE, "create", None)
-            .await
-            .map_err(DomainError::from)?;
-
         // Pre-validation (stateless, outside transaction)
         validation::validate_type_code(&req.type_path)?;
         Self::validate_name(&req.name)?;
+
+        // Resolve type to get is_tenant trait for AuthZ properties
+        let rg_type_for_authz = self
+            .type_repo
+            .find_by_code(&self.db.conn()?, &req.type_path)
+            .await?;
+        let is_tenant = rg_type_for_authz.is_some_and(|t| t.is_tenant);
+
+        // AuthZ gate with provisioning context
+        let _scope =
+            self.enforcer
+                .access_scope_with(
+                    ctx,
+                    &RG_GROUP_RESOURCE,
+                    "create",
+                    None,
+                    &authz_resolver_sdk::pep::enforcer::AccessRequest::default()
+                        .resource_properties(std::collections::HashMap::from([
+                            ("is_tenant".to_owned(), serde_json::Value::Bool(is_tenant)),
+                            (
+                                "parent_id".to_owned(),
+                                req.parent_id.map_or(serde_json::Value::Null, |id| {
+                                    serde_json::Value::String(id.to_string())
+                                }),
+                            ),
+                        ])),
+                )
+                .await
+                .map_err(DomainError::from)?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
 
         let profile = self.profile.clone();
@@ -510,6 +531,33 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await
     }
 
+    // -- Unscoped reads (for integration read service, bypasses AuthZ) --
+    //
+    // These methods are exposed via `ResourceGroupReadHierarchy` trait
+    // (registered in ClientHub as `dyn ResourceGroupReadHierarchy`).
+    // They use `AccessScope::allow_all()` — no tenant WHERE clause.
+    //
+    // This is by design (DESIGN §3.6): the AuthZ plugin is the primary
+    // consumer of these reads. It cannot evaluate itself (circular dep).
+    // In microservice deployments these endpoints are MTLS-only; in
+    // monolith mode the in-process ClientHub path skips AuthZ entirely.
+    //
+    // SECURITY: do NOT expose these methods via REST handlers.
+    // REST uses the scoped variants (`get_group_descendants` / `get_group_ancestors`).
+
+    /// Get descendants without AuthZ enforcement (private API, no tenant scoping).
+    pub async fn get_group_descendants_unscoped(
+        &self,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
+        let conn = self.db.conn()?;
+        let scope = modkit_security::AccessScope::allow_all();
+        self.group_repo
+            .get_descendants(&conn, &scope, group_id, query)
+            .await
+    }
+
     // -- Transaction-inner implementations --
 
     /// Inner logic for `create_group`, runs inside a SERIALIZABLE transaction.
@@ -546,6 +594,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
 
+        // Determine effective tenant_id based on is_tenant trait.
+        // is_tenant=true: tenant_id = group.id (self-referencing, new tenant scope)
+        // is_tenant=false: tenant_id from caller or parent (unchanged behavior)
+        let group_id = req.id.unwrap_or_else(Uuid::now_v7);
+        let effective_tenant_id = if rg_type.is_tenant {
+            group_id
+        } else {
+            tenant_id
+        };
+
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4
         if let Some(parent_id) = req.parent_id {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4a
@@ -560,7 +618,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4c
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4d
             let parent_type_path = Self::resolve_type_path_from_id(tx, parent.gts_type_id).await?;
-            if !rg_type.allowed_parents.contains(&parent_type_path) {
+            if !rg_type.allowed_parent_types.contains(&parent_type_path) {
                 return Err(DomainError::invalid_parent_type(format!(
                     "Type '{}' does not allow parent type '{}'",
                     req.type_path, parent_type_path
@@ -584,7 +642,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // IF membership write: validate target group's tenant_id is compatible
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-4
             // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-5
-            if parent.tenant_id != tenant_id {
+            // Skip tenant enforcement for is_tenant types — they intentionally
+            // create a new tenant scope (tenant_id = group.id != parent.tenant_id).
+            if !rg_type.is_tenant && parent.tenant_id != tenant_id {
                 return Err(DomainError::validation(format!(
                     "Child group tenant_id ({tenant_id}) must match parent tenant_id ({})",
                     parent.tenant_id
@@ -626,7 +686,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-6
             // Insert group
-            let group_id = req.id.unwrap_or_else(Uuid::now_v7);
             let _model = group_repo
                 .insert(
                     tx,
@@ -635,7 +694,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     type_id,
                     &req.name,
                     req.metadata.as_ref(),
-                    tenant_id,
+                    effective_tenant_id,
                 )
                 .await?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-6
@@ -673,7 +732,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
 
             // Insert group
-            let group_id = req.id.unwrap_or_else(Uuid::now_v7);
             let _model = group_repo
                 .insert(
                     tx,
@@ -682,7 +740,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     type_id,
                     &req.name,
                     req.metadata.as_ref(),
-                    tenant_id,
+                    effective_tenant_id,
                 )
                 .await?;
 
@@ -753,7 +811,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
                 let parent_type_path =
                     Self::resolve_type_path_from_id(tx, parent.gts_type_id).await?;
-                if !rg_type.allowed_parents.contains(&parent_type_path) {
+                if !rg_type.allowed_parent_types.contains(&parent_type_path) {
                     return Err(DomainError::invalid_parent_type(format!(
                         "New type '{}' does not allow current parent type '{}'",
                         req.type_path, parent_type_path
@@ -784,7 +842,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                         DomainError::database("Child type not found during validation")
                     })?;
 
-                if !child_type.allowed_parents.contains(&req.type_path) {
+                if !child_type.allowed_parent_types.contains(&req.type_path) {
                     return Err(DomainError::invalid_parent_type(format!(
                         "Child group '{}' of type '{}' does not allow '{}' as parent type",
                         child.name, child_type.code, req.type_path
@@ -1087,7 +1145,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
             let parent_type_path =
                 Self::resolve_type_path_from_id(conn, parent.gts_type_id).await?;
-            if !rg_type.allowed_parents.contains(&parent_type_path) {
+            if !rg_type.allowed_parent_types.contains(&parent_type_path) {
                 return Err(DomainError::invalid_parent_type(format!(
                     "Type '{}' does not allow parent type '{}'",
                     rg_type.code, parent_type_path

@@ -27,9 +27,11 @@ use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeR
 
 /// Adapter service exposing hierarchy reads via SDK traits.
 ///
-/// Registered with `ClientHub` so that external consumers (`AuthZ` plugin)
-/// can resolve `dyn ResourceGroupReadHierarchy` without depending on the
-/// module's internal domain types.
+/// **Bypasses `AuthZ` enforcement** — delegates to `GroupService` unscoped
+/// methods which use `AccessScope::allow_all()`. This is by design
+/// (see DESIGN §3.6): `AuthZ` plugin is the caller, and it cannot evaluate
+/// itself (circular dependency). MTLS and in-process `ClientHub` paths both
+/// skip `AuthZ`.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 pub struct RgReadService<
     GR: GroupRepositoryTrait,
@@ -68,13 +70,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 {
     async fn get_group_descendants(
         &self,
-        ctx: &SecurityContext,
+        _ctx: &SecurityContext,
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
         // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-3a
+        // Bypass AuthZ — use unscoped method (AccessScope::allow_all).
+        // AuthZ plugin is the caller; it cannot evaluate itself.
         self.group_service
-            .get_group_descendants(ctx, group_id, query)
+            .get_group_descendants_unscoped(group_id, query)
             .await
             .map_err(ResourceGroupError::from)
         // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-3a
@@ -86,6 +90,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+        // Ancestors use the scoped path (not bypassed) — AuthZ plugin
+        // only needs descendants for hierarchy resolution.
         self.group_service
             .get_group_ancestors(ctx, group_id, query)
             .await

@@ -12,7 +12,7 @@ use authz_resolver_sdk::{
 use modkit_odata::ODataQuery;
 use modkit_security::pep_properties;
 use resource_group_sdk::api::ResourceGroupReadHierarchy;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// RG-based `AuthZ` resolver service.
@@ -34,6 +34,12 @@ impl Service {
     /// Evaluate an authorization request with RG hierarchy resolution.
     #[allow(clippy::cognitive_complexity)]
     pub async fn evaluate(&self, request: &EvaluationRequest) -> EvaluationResponse {
+        info!(
+            action = %request.action.name,
+            resource_type = %request.resource.resource_type,
+            "rg-authz: evaluate called"
+        );
+
         let tenant_id = request
             .context
             .tenant_context
@@ -49,17 +55,33 @@ impl Service {
             });
 
         let Some(tid) = tenant_id else {
-            debug!("No tenant resolvable -- deny");
+            warn!("rg-authz: No tenant resolvable -- deny");
             return Self::deny();
         };
+
+        info!(tenant_id = %tid, "rg-authz: tenant resolved");
 
         if tid == Uuid::default() {
             debug!("Nil UUID tenant -- deny");
             return Self::deny();
         }
 
+        // Root tenant provisioning: create + is_tenant + no parent.
+        // Allow without hierarchy check -- root tenants bootstrap from empty DB.
+        // TODO: add ACL/permission check when vendor policy engine is available.
+        let props = &request.resource.properties;
+        let is_tenant = props
+            .get("is_tenant")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let has_parent = props.contains_key("parent_id") && !props["parent_id"].is_null();
+        if request.action.name == "create" && is_tenant && !has_parent {
+            debug!(tenant_id = %tid, "Root tenant provisioning -- allow without hierarchy check");
+            return Self::allow_single_tenant(tid);
+        }
+
         // Resolve tenant subtree via RG hierarchy.
-        // No fallback: if tenant not in RG or RG error — deny (fail-closed).
+        // No fallback: if tenant not in RG or RG error -- deny (fail-closed).
         let ctx = modkit_security::SecurityContext::anonymous();
         let visible_tenants = match self.resolve_tenant_subtree(&ctx, tid).await {
             Ok(tenants) => tenants,
@@ -70,9 +92,11 @@ impl Service {
         };
 
         if visible_tenants.is_empty() {
-            debug!(tenant_id = %tid, "Empty tenant subtree -- deny");
+            warn!(tenant_id = %tid, "rg-authz: Empty tenant subtree -- deny");
             return Self::deny();
         }
+
+        info!(tenant_id = %tid, visible = visible_tenants.len(), "rg-authz: allow");
 
         // Build predicates
         let mut predicates = vec![Predicate::In(InPredicate::new(
@@ -178,6 +202,21 @@ impl Service {
             .and_then(|m| m.get("barrier"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
+    }
+
+    fn allow_single_tenant(tid: Uuid) -> EvaluationResponse {
+        EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [tid],
+                    ))],
+                }],
+                ..Default::default()
+            },
+        }
     }
 
     fn deny() -> EvaluationResponse {

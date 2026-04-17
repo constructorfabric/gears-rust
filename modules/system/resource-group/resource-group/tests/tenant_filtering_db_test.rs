@@ -141,9 +141,10 @@ async fn tenant_isolation_list_groups() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -252,9 +253,10 @@ async fn tenant_isolation_get_group_cross_tenant_invisible() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -310,9 +312,10 @@ async fn tenant_isolation_hierarchy_scoped() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: parent_type.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create parent type");
@@ -321,9 +324,10 @@ async fn tenant_isolation_hierarchy_scoped() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: child_type.clone(),
             can_be_root: false,
-            allowed_parents: vec![parent_type.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![parent_type.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create child type");
@@ -418,9 +422,10 @@ async fn tenant_isolation_update_cross_tenant_blocked() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -481,9 +486,10 @@ async fn tenant_isolation_delete_cross_tenant_blocked() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -636,14 +642,15 @@ async fn group_based_membership_data_correctly_stored() {
         Uuid::now_v7().as_simple()
     );
 
-    // Create task type first (project references it in allowed_memberships)
+    // Create task type first (project references it in allowed_membership_types)
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: task_type.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create task type");
@@ -652,9 +659,10 @@ async fn group_based_membership_data_correctly_stored() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: project_type.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![task_type.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![task_type.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create project type");

@@ -80,8 +80,8 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "${API}/types-registry/v1/types" \
   -d "{
     \"code\": \"${TYPE_CODE}\",
     \"can_be_root\": true,
-    \"allowed_parents\": [],
-    \"allowed_memberships\": []
+    \"allowed_parent_types\": [],
+    \"allowed_membership_types\": []
   }" 2>/dev/null)
 BODY=$(echo "$RESP" | sed '$d')
 STATUS=$(echo "$RESP" | tail -1)
@@ -98,8 +98,8 @@ curl -s -o /dev/null -X PUT "${API}/types-registry/v1/types/${TYPE_CODE//\~/%7E}
   -H "Content-Type: application/json" \
   -d "{
     \"can_be_root\": true,
-    \"allowed_parents\": [\"${TYPE_CODE}\"],
-    \"allowed_memberships\": []
+    \"allowed_parent_types\": [\"${TYPE_CODE}\"],
+    \"allowed_membership_types\": []
   }" 2>/dev/null
 
 # Create member type
@@ -108,8 +108,8 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "${API}/types-registry/v1/types" \
   -d "{
     \"code\": \"${MEMBER_TYPE_CODE}\",
     \"can_be_root\": true,
-    \"allowed_parents\": [],
-    \"allowed_memberships\": []
+    \"allowed_parent_types\": [],
+    \"allowed_membership_types\": []
   }" 2>/dev/null)
 STATUS=$(echo "$RESP" | tail -1)
 if [ "$STATUS" = "201" ] || [ "$STATUS" = "409" ]; then
@@ -124,8 +124,8 @@ curl -s -o /dev/null -X PUT "${API}/types-registry/v1/types/${TYPE_CODE//\~/%7E}
   -H "Content-Type: application/json" \
   -d "{
     \"can_be_root\": true,
-    \"allowed_parents\": [\"${TYPE_CODE}\"],
-    \"allowed_memberships\": [\"${MEMBER_TYPE_CODE}\"]
+    \"allowed_parent_types\": [\"${TYPE_CODE}\"],
+    \"allowed_membership_types\": [\"${MEMBER_TYPE_CODE}\"]
   }" 2>/dev/null
 
 # List types

@@ -113,53 +113,62 @@ impl AsRef<str> for GtsTypePath {
 ///
 /// Matches the REST `Type` schema. All references use string GTS type paths;
 /// surrogate SMALLINT IDs are internal to the persistence layer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceGroupType {
     /// GTS type path (e.g. `gts.cf.core.rg.type.v1~x.system.tn.tenant.v1~`)
     pub code: String,
     /// Whether groups of this type can be root nodes (no parent).
     pub can_be_root: bool,
+    /// Whether instances create their own tenant scope (`tenant_id = group.id`).
+    #[serde(default)]
+    pub is_tenant: bool,
     /// GTS type paths of types allowed as parents.
-    pub allowed_parents: Vec<String>,
+    pub allowed_parent_types: Vec<String>,
     /// GTS type paths of resource types allowed as members.
-    pub allowed_memberships: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
     /// Optional JSON Schema for the metadata object of instances of this type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_schema: Option<serde_json::Value>,
 }
 
 /// Request body for creating a new GTS type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTypeRequest {
     /// GTS type path. Must have prefix `gts.cf.core.rg.type.v1~`.
     pub code: String,
     /// Whether groups of this type can be root nodes.
     pub can_be_root: bool,
+    /// Whether instances create their own tenant scope. Default `false`.
+    #[serde(default)]
+    pub is_tenant: bool,
     /// GTS type paths of allowed parent types.
     #[serde(default)]
-    pub allowed_parents: Vec<String>,
+    pub allowed_parent_types: Vec<String>,
     /// GTS type paths of allowed membership resource types.
     #[serde(default)]
-    pub allowed_memberships: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
     /// Optional JSON Schema for instance metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_schema: Option<serde_json::Value>,
 }
 
 /// Request body for updating an existing GTS type (full replacement via PUT).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTypeRequest {
     /// Whether groups of this type can be root nodes.
     pub can_be_root: bool,
+    /// Whether instances create their own tenant scope. Default `false`.
+    #[serde(default)]
+    pub is_tenant: bool,
     /// GTS type paths of allowed parent types.
     #[serde(default)]
-    pub allowed_parents: Vec<String>,
+    pub allowed_parent_types: Vec<String>,
     /// GTS type paths of allowed membership resource types.
     #[serde(default)]
-    pub allowed_memberships: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
     /// Optional JSON Schema for instance metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_schema: Option<serde_json::Value>,

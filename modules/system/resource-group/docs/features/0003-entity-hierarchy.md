@@ -107,7 +107,7 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 **Error Scenarios**:
 - Invalid type → Validation error
 - Parent not found → NotFound
-- Parent type not in allowed_parents → InvalidParentType
+- Parent type not in allowed_parent_types → InvalidParentType
 - Type does not allow root placement (can_be_root=false) and no parent → Validation error
 - Depth or width limit exceeded → LimitViolation
 
@@ -118,7 +118,7 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 4. [x] - `p1` - **IF** parent_id is provided - `inst-create-group-4`
    1. [x] - `p1` - DB: SELECT id, gts_type_id, tenant_id FROM resource_group WHERE id = {parent_id} — load parent in tx - `inst-create-group-4a`
    2. [x] - `p1` - **IF** parent not found → **RETURN** NotFound - `inst-create-group-4b`
-   3. [x] - `p1` - Validate child type's allowed_parents includes parent's type - `inst-create-group-4c`
+   3. [x] - `p1` - Validate child type's allowed_parent_types includes parent's type - `inst-create-group-4c`
    4. [x] - `p1` - **IF** type incompatible → **RETURN** InvalidParentType - `inst-create-group-4d`
    5. [x] - `p1` - Invoke query profile enforcement: check depth limit - `inst-create-group-4e`
    6. [x] - `p1` - Invoke query profile enforcement: check width limit (sibling count under parent) - `inst-create-group-4f`
@@ -145,17 +145,17 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 
 **Error Scenarios**:
 - Group not found → NotFound
-- New type's allowed_parents does not include current parent → InvalidParentType
-- Children's types do not include new type in their allowed_parents → InvalidParentType
+- New type's allowed_parent_types does not include current parent → InvalidParentType
+- Children's types do not include new type in their allowed_parent_types → InvalidParentType
 
 **Steps**:
 1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with {name, type, metadata} - `inst-update-group-1`
 2. [x] - `p1` - DB: SELECT FROM resource_group WHERE id = {group_id} — load existing group - `inst-update-group-2`
 3. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-update-group-3`
 4. [x] - `p1` - **IF** type is changed - `inst-update-group-4`
-   1. [x] - `p1` - Validate new type's allowed_parents permits current parent's type (or new type allows root if no parent) - `inst-update-group-4a`
+   1. [x] - `p1` - Validate new type's allowed_parent_types permits current parent's type (or new type allows root if no parent) - `inst-update-group-4a`
    2. [x] - `p1` - DB: SELECT gts_type_id FROM resource_group WHERE parent_id = {group_id} — load children types - `inst-update-group-4b`
-   3. [x] - `p1` - **FOR EACH** child: verify child's type includes new type in allowed_parents - `inst-update-group-4c`
+   3. [x] - `p1` - **FOR EACH** child: verify child's type includes new type in allowed_parent_types - `inst-update-group-4c`
    4. [x] - `p1` - **IF** any child would become invalid → **RETURN** InvalidParentType with child details - `inst-update-group-4d`
 5. [x] - `p1` - **IF** metadata provided AND type has metadata_schema → validate metadata against the chained GTS type schema via `TypesRegistryClient` / `gts` crate. **IF** invalid → **RETURN** Validation error - `inst-update-group-4e`
 6. [x] - `p1` - DB: UPDATE resource_group SET name, gts_type_id, metadata, updated_at — apply changes - `inst-update-group-5`
@@ -507,8 +507,8 @@ The plan was originally based on a gap analysis against acceptance criteria defi
 | `authz_integration_test.rs` | 9 | PolicyEnforcer tenant scoping, deny-all, allow-all, resource_id passing, all CRUD actions, full chain list_groups/deny |
 | `domain_unit_test.rs` | 79 | `validate_type_code` (5 cases), `DomainError` construction (13 variants), `DomainError` → `ResourceGroupError` mapping, `DomainError` → `Problem` mapping, serialization failure detection, `EnforcerError` → `DomainError` conversions, `DbErr` → `DomainError`, ADR-001 hierarchy reproduction, GTS-specific logic, invalid/non-GTS input validation |
 | `group_service_test.rs` | 55 | TC-GRP-01..38: child creation + closure rows, 3-level hierarchy, incompatible parent type, can_be_root enforcement, move with closure rebuild, cycle detection, self-parent, type change validation, leaf/force delete, hierarchy depth traversal, max_depth/max_width enforcement, name validation, cross-tenant parent, simultaneous type+parent change, detach to root, metadata barrier tests |
-| `type_service_test.rs` | 45 | TC-TYP-01..16 + TC-META-01..11 + TC-META-ATK-01..11 + TC-GTS-01..15: create/update/delete types, placement invariant, hierarchy safety checks, metadata_schema round-trip (Object/Array/String/Number), `can_be_root` resolution via TypesRegistry, internal key stripping, security attack vectors (privilege escalation, DoS, SQL injection), resolve_id/resolve_ids, allowed_parents/memberships resolution |
-| `membership_service_test.rs` | 15 | TC-MBR-01..15: add/remove membership, nonexistent group, duplicate, unregistered type, not in allowed_memberships, tenant incompatibility, multiple resource types, first-always-allowed tenant, empty resource_id |
+| `type_service_test.rs` | 45 | TC-TYP-01..16 + TC-META-01..11 + TC-META-ATK-01..11 + TC-GTS-01..15: create/update/delete types, placement invariant, hierarchy safety checks, metadata_schema round-trip (Object/Array/String/Number), `can_be_root` resolution via TypesRegistry, internal key stripping, security attack vectors (privilege escalation, DoS, SQL injection), resolve_id/resolve_ids, allowed_parent_types/memberships resolution |
+| `membership_service_test.rs` | 15 | TC-MBR-01..15: add/remove membership, nonexistent group, duplicate, unregistered type, not in allowed_membership_types, tenant incompatibility, multiple resource types, first-always-allowed tenant, empty resource_id |
 | `seeding_test.rs` | 12 | TC-SEED-01..12: seed_types (create/skip/update/idempotent), seed_groups (create with closure/skip/wrong order), seed_memberships (create/duplicate skip/tenant-incompatible skip/nonexistent group), empty list |
 | `tenant_filtering_db_test.rs` | 7 | Tenant isolation (list/get/hierarchy/update/delete cross-tenant), InGroup predicate, membership data storage |
 | `tenant_scoping_test.rs` | 10 | AccessScope construction (for_tenant, for_tenants, allow_all, deny_all, tenant_only, for_resource) |
@@ -563,7 +563,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-GRP-01: Create child group with parent - closure rows correct [P1]
 - **Covers**: G8, 0003-AC-1,2
-- **Setup**: Create parent type (can_be_root=true), child type (allowed_parents=[parent_type]). Create root group, then child group under it.
+- **Setup**: Create parent type (can_be_root=true), child type (allowed_parent_types=[parent_type]). Create root group, then child group under it.
 - **Assert**: Child group returned with `hierarchy.parent_id`, closure table has self-row (depth=0) and ancestor row (depth=1)
 
 #### TC-GRP-02: Create 3-level hierarchy - closure table completeness [P1]
@@ -573,12 +573,12 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-GRP-03: Create group with incompatible parent type [P1]
 - **Covers**: G9, 0003-AC-3
-- **Setup**: Create type A (can_be_root=true), type B (can_be_root=false, allowed_parents=[]... wait, that violates placement invariant). Create type A (root), type B (allowed_parents=[A]), type C (allowed_parents=[B]). Create root group of type A. Try to create child of type C under group A.
+- **Setup**: Create type A (can_be_root=true), type B (can_be_root=false, allowed_parent_types=[]... wait, that violates placement invariant). Create type A (root), type B (allowed_parent_types=[A]), type C (allowed_parent_types=[B]). Create root group of type A. Try to create child of type C under group A.
 - **Assert**: `DomainError::InvalidParentType`
 
 #### TC-GRP-04: Create root group when can_be_root=false [P1]
 - **Covers**: G10, 0003-AC-5
-- **Setup**: Create type with can_be_root=false, allowed_parents=[some_parent_type]. Try to create root group (no parent).
+- **Setup**: Create type with can_be_root=false, allowed_parent_types=[some_parent_type]. Try to create root group (no parent).
 - **Assert**: `DomainError::InvalidParentType` with "cannot be a root group"
 
 #### TC-GRP-05: Move group - happy path with closure rebuild [P1]
@@ -598,7 +598,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-GRP-08: Move group to incompatible parent type [P1]
 - **Covers**: G14, 0003-AC-9
-- **Setup**: Type A (root), Type B (allowed_parents=[A]). Create group of type B under group of type A. Create group of type A (root). Try to move group B under another group B.
+- **Setup**: Type A (root), Type B (allowed_parent_types=[A]). Create group of type B under group of type A. Create group of type A (root). Try to move group B under another group B.
 - **Assert**: `DomainError::InvalidParentType`
 
 #### TC-GRP-09: Update group name and metadata [P2]
@@ -608,12 +608,12 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-GRP-10: Update group type - validates parent compatibility [P1]
 - **Covers**: G16, 0003-AC-10
-- **Setup**: Type A (root), Type B (allowed_parents=[A]), Type C (root, no allowed_parents). Create group of type B under group of type A. Change group type to C (which doesn't allow parent A).
+- **Setup**: Type A (root), Type B (allowed_parent_types=[A]), Type C (root, no allowed_parent_types). Create group of type B under group of type A. Change group type to C (which doesn't allow parent A).
 - **Assert**: `DomainError::InvalidParentType` ("does not allow current parent type")
 
 #### TC-GRP-11: Update group type - validates children compatibility [P1]
 - **Covers**: G16, 0003-AC-10
-- **Setup**: Type P (root), Type C (allowed_parents=[P]), Type P2 (root). Create P group with C child. Change P group to type P2.
+- **Setup**: Type P (root), Type C (allowed_parent_types=[P]), Type P2 (root). Create P group with C child. Change P group to type P2.
 - **Assert**: `DomainError::InvalidParentType` ("child group... does not allow... as parent type")
 
 #### TC-GRP-12: Delete leaf group (no children, no memberships) [P1]
@@ -876,30 +876,30 @@ Reproduce the full ADR example hierarchy (T1→D2→B3, T7→D8, T9) with correc
 - **Membership assert**: each membership group_id + resource_type correct
 
 #### TC-ADR-02: Tenant type allows self-nesting (T7 under T1) [P1]
-- Tenant type: `allowed_parents: [tenant_type_code]` — self-referential
+- Tenant type: `allowed_parent_types: [tenant_type_code]` — self-referential
 - Create T1 (root), create T7 under T1 (both tenant type)
 - **Assert**: Success, T7 parent_id = T1.id
 
 #### TC-ADR-03: Department cannot be root [P1]
-- Department type: `can_be_root: false, allowed_parents: [tenant_type_code]`
+- Department type: `can_be_root: false, allowed_parent_types: [tenant_type_code]`
 - Try to create department with parent_id=None
 - **Assert**: `DomainError::InvalidParentType("cannot be a root group")`
 
 #### TC-ADR-04: Branch only under department (not under tenant) [P1]
-- Branch type: `allowed_parents: [department_type_code]`
+- Branch type: `allowed_parent_types: [department_type_code]`
 - Try to create branch directly under tenant
 - **Assert**: `DomainError::InvalidParentType`
 
 #### TC-ADR-05: Branch allows users AND courses as members [P1]
-- Branch type: `allowed_memberships: [user_type, course_type]`
+- Branch type: `allowed_membership_types: [user_type, course_type]`
 - Add user membership to branch → success
 - Add course membership to branch → success
 - **Assert**: both memberships exist
 
 #### TC-ADR-06: Tenant allows only users as members (not courses) [P1]
-- Tenant type: `allowed_memberships: [user_type]` (no course)
+- Tenant type: `allowed_membership_types: [user_type]` (no course)
 - Add user to tenant → success
-- Add course to tenant → **DomainError::Validation("not in allowed_memberships")**
+- Add course to tenant → **DomainError::Validation("not in allowed_membership_types")**
 
 #### TC-ADR-07: Same resource (user) in multiple groups with different group_ids [P1]
 - Per ADR: "R8 appears twice: as user in D8 and T7"
@@ -1038,7 +1038,7 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 
 #### TC-ADR-17: Type response contains no SMALLINT IDs [P1]
 - Create type, GET → response JSON
-- **Assert**: no `gts_type_id`, `type_id`, `parent_type_id` numeric fields. `code`, `allowed_parents`, `allowed_memberships` are all strings.
+- **Assert**: no `gts_type_id`, `type_id`, `parent_type_id` numeric fields. `code`, `allowed_parent_types`, `allowed_membership_types` are all strings.
 
 #### TC-ADR-18: Group response contains no SMALLINT IDs [P1]
 - Create group, GET → response JSON
@@ -1109,7 +1109,7 @@ These test domain invariants that prevent data corruption or violate core busine
 
 | ID | Test Case | Risk if Missing |
 |----|-----------|-----------------|
-| **TC-TYP-02** | Create type - nonexistent allowed_parents | Dangling type references |
+| **TC-TYP-02** | Create type - nonexistent allowed_parent_types | Dangling type references |
 | **TC-TYP-04** | Placement invariant violation | Orphan types that can't be placed |
 | **TC-TYP-06** | Update type - remove parent in use | Breaks existing group hierarchy |
 | **TC-TYP-07** | Update type - can_be_root=false with roots | Orphans existing root groups |
@@ -1134,9 +1134,9 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-MBR-01** | Add membership happy path | Core write feature |
 | **TC-MBR-02** | Add to nonexistent group | Dangling membership |
 | **TC-MBR-03** | Duplicate membership | Data integrity |
-| **TC-MBR-05** | Not in allowed_memberships | Type system bypassed |
+| **TC-MBR-05** | Not in allowed_membership_types | Type system bypassed |
 | **TC-MBR-06** | Tenant incompatibility | Cross-tenant data leak |
-| **TC-MBR-13** | Empty allowed_memberships rejects all | Type system bypassed |
+| **TC-MBR-13** | Empty allowed_membership_types rejects all | Type system bypassed |
 | **TC-MBR-14** | Same resource in multiple groups same tenant | Multi-group membership broken |
 | **TC-GRP-22** | Create group nonexistent type | Group with invalid type |
 | **TC-GRP-23** | Child group cross-tenant parent | Tenant isolation broken |
@@ -1291,7 +1291,7 @@ pub async fn assert_closure_rows(
 pub async fn assert_closure_count(conn: &impl DBRunner, group_ids: &[Uuid], expected_total: usize) { ... }
 
 /// Assert junction table rows for a type.
-pub async fn assert_allowed_parents(conn: &impl DBRunner, type_id: i16, expected_parent_ids: &[i16]) { ... }
+pub async fn assert_allowed_parent_types(conn: &impl DBRunner, type_id: i16, expected_parent_ids: &[i16]) { ... }
 
 /// Assert no SMALLINT IDs in JSON value (recursive check).
 pub fn assert_no_surrogate_ids(json: &serde_json::Value) { ... }
@@ -1338,7 +1338,7 @@ Tests S5, S6, S7 verify PostgreSQL-specific behavior that unit tests cannot catc
 **Why not in unit tests**: TC-GRP-01/02 verify closure rows on SQLite. PostgreSQL uses `INSERT INTO resource_group_closure SELECT ...` with joins against existing closure rows — column order or join condition errors produce wrong depth values silently on SQLite but fail or corrupt data on PostgreSQL.
 
 ```
-POST parent_type (can_be_root), child_type (allowed_parents: [parent])
+POST parent_type (can_be_root), child_type (allowed_parent_types: [parent])
 POST root → child → grandchild
 
 GET /groups/{root.id}/descendants     → 200

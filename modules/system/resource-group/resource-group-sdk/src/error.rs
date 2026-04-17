@@ -24,7 +24,7 @@ pub enum ResourceGroupError {
     /// Removing allowed parents or disabling root placement would break
     /// existing group hierarchy relationships.
     #[error("Allowed parents violation: {message}")]
-    AllowedParentsViolation { message: String },
+    AllowedParentTypesViolation { message: String },
 
     /// Cannot delete a type because groups of this type still exist.
     #[error("Active references exist: {message}")]
@@ -34,7 +34,7 @@ pub enum ResourceGroupError {
     #[error("Conflict: {message}")]
     Conflict { message: String },
 
-    /// Parent type is not allowed by the type's `allowed_parents` configuration.
+    /// Parent type is not allowed by the type's `allowed_parent_types` configuration.
     #[error("Invalid parent type: {message}")]
     InvalidParentType { message: String },
 
@@ -81,9 +81,9 @@ impl ResourceGroupError {
         }
     }
 
-    /// Create an `AllowedParentsViolation` error.
-    pub fn allowed_parents_violation(message: impl Into<String>) -> Self {
-        Self::AllowedParentsViolation {
+    /// Create an `AllowedParentTypesViolation` error.
+    pub fn allowed_parent_types_violation(message: impl Into<String>) -> Self {
+        Self::AllowedParentTypesViolation {
             message: message.into(),
         }
     }

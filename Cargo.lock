@@ -1893,11 +1893,14 @@ name = "cf-resource-group-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cf-modkit",
  "cf-modkit-odata",
  "cf-modkit-odata-macros",
  "cf-modkit-sdk",
  "cf-modkit-security",
  "gts",
+ "gts-macros",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

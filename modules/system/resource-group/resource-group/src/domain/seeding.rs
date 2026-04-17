@@ -48,16 +48,17 @@ pub async fn seed_types<TR: TypeRepositoryTrait>(
             Ok(existing) => {
                 // Compare: if definition differs, update; otherwise skip
                 if existing.can_be_root != seed.can_be_root
-                    || existing.allowed_parents != seed.allowed_parents
-                    || existing.allowed_memberships != seed.allowed_memberships
+                    || existing.allowed_parent_types != seed.allowed_parent_types
+                    || existing.allowed_membership_types != seed.allowed_membership_types
                     || existing.metadata_schema != seed.metadata_schema
                 {
                     // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2c
                     let update_req = UpdateTypeRequest {
                         can_be_root: seed.can_be_root,
-                        allowed_parents: seed.allowed_parents.clone(),
-                        allowed_memberships: seed.allowed_memberships.clone(),
+                        allowed_parent_types: seed.allowed_parent_types.clone(),
+                        allowed_membership_types: seed.allowed_membership_types.clone(),
                         metadata_schema: seed.metadata_schema.clone(),
+                        ..Default::default()
                     };
                     type_service.update_type(&seed.code, update_req).await?;
                     result.updated += 1;

@@ -76,7 +76,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 
     /// Add a membership link between a resource and a group.
     ///
-    /// Validates group existence, `resource_type` registration, `allowed_memberships`
+    /// Validates group existence, `resource_type` registration, `allowed_membership_types`
     /// compatibility, and tenant scope before inserting the membership row.
     pub async fn add_membership(
         &self,
@@ -123,7 +123,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-5
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
-        // Load group type's allowed_memberships and validate
+        // Load group type's allowed_membership_types and validate
         let allowed = self
             .type_repo
             .load_full_type_by_id(&conn, group_model.gts_type_id)
@@ -132,12 +132,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
         if !allowed
-            .allowed_memberships
+            .allowed_membership_types
             .iter()
             .any(|m| m == resource_type)
         {
             return Err(DomainError::validation(format!(
-                "Resource type '{resource_type}' is not in allowed_memberships for group type '{}'",
+                "Resource type '{resource_type}' is not in allowed_membership_types for group type '{}'",
                 allowed.code
             )));
         }

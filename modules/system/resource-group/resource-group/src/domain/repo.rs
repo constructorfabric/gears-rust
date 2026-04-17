@@ -185,27 +185,27 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         metadata_schema: Option<&serde_json::Value>,
     ) -> Result<gts_type::Model, DomainError>;
 
-    async fn insert_allowed_parents<C: DBRunner>(
+    async fn insert_allowed_parent_types<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,
         parent_ids: &[i16],
     ) -> Result<(), DomainError>;
 
-    async fn insert_allowed_memberships<C: DBRunner>(
+    async fn insert_allowed_membership_types<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,
         membership_ids: &[i16],
     ) -> Result<(), DomainError>;
 
-    async fn delete_allowed_parents<C: DBRunner>(
+    async fn delete_allowed_parent_types<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,
     ) -> Result<(), DomainError>;
 
-    async fn delete_allowed_memberships<C: DBRunner>(
+    async fn delete_allowed_membership_types<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,

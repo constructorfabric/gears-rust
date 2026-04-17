@@ -116,7 +116,7 @@ Not applicable. This feature provides SDK contracts and module infrastructure wi
    2. [x] - `p1` - `NotFound` -> 404 Not Found, type "not-found", entity identifier in detail - `inst-err-map-2b`
    3. [x] - `p1` - `TypeAlreadyExists` -> 409 Conflict, type "type-already-exists", conflicting code in detail - `inst-err-map-2c`
    4. [x] - `p1` - `InvalidParentType` -> 409 Conflict, type "invalid-parent-type", type mismatch in detail - `inst-err-map-2d`
-   5. [x] - `p1` - `AllowedParentsViolation` -> 409 Conflict, type "allowed-parents-violation", violating groups in detail - `inst-err-map-2e`
+   5. [x] - `p1` - `AllowedParentTypesViolation` -> 409 Conflict, type "allowed-parents-violation", violating groups in detail - `inst-err-map-2e`
    6. [x] - `p1` - `CycleDetected` -> 409 Conflict, type "cycle-detected", involved node IDs in detail - `inst-err-map-2f`
    7. [x] - `p1` - `ConflictActiveReferences` -> 409 Conflict, type "active-references", reference count in detail - `inst-err-map-2g`
    8. [x] - `p1` - `LimitViolation` -> 409 Conflict, type "limit-violation", limit name and values in detail - `inst-err-map-2h`
@@ -139,7 +139,7 @@ Not applicable. This feature defines SDK contracts, module scaffold, and persist
 The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs` that represent the public API surface for all RG domain entities and query constructs.
 
 **Required types**:
-- `ResourceGroupType` — type definition with `schema_id` (GtsTypePath), `allowed_parents` (Vec), `allowed_memberships` (Vec), `can_be_root` (bool), `is_tenant` (bool, default false), `metadata_schema` (Option)
+- `ResourceGroupType` — type definition with `schema_id` (GtsTypePath), `allowed_parent_types` (Vec), `allowed_membership_types` (Vec), `can_be_root` (bool), `is_tenant` (bool, default false), `metadata_schema` (Option)
 - `ResourceGroup` — group entity with `id` (Uuid), `type` (GtsTypePath), `name` (String), `metadata` (Option), `hierarchy` (ResourceGroupHierarchy with `parent_id`, `tenant_id`)
 - `ResourceGroupWithDepth` — extends ResourceGroup with `hierarchy.depth` (i32, relative distance)
 - `ResourceGroupMembership` — membership link with `group_id` (Uuid), `resource_type` (GtsTypePath), `resource_id` (String)
@@ -178,7 +178,7 @@ The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs
 
 The system **MUST** define `ResourceGroupError` enum in `resource-group-sdk/src/error.rs` covering all deterministic failure categories.
 
-**Required variants**: `Validation`, `NotFound`, `TypeAlreadyExists`, `InvalidParentType`, `AllowedParentsViolation`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `ServiceUnavailable`, `Internal`.
+**Required variants**: `Validation`, `NotFound`, `TypeAlreadyExists`, `InvalidParentType`, `AllowedParentTypesViolation`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `ServiceUnavailable`, `Internal`.
 
 Each variant **MUST** carry structured context (field details for Validation, entity identifier for NotFound, conflicting code for TypeAlreadyExists, etc.) sufficient for the error mapping algorithm to produce informative Problem responses.
 
@@ -389,7 +389,7 @@ Other modules (`nodes-registry`, `types-registry`) place pure-logic tests direct
 #### TC-SDK-14: SDK model camelCase serialization [P1]
 - **Covers**: G41
 - **Setup**: Serialize `ResourceGroupType` to JSON
-- **Assert**: Keys are camelCase (`canBeRoot`, `allowedParents`, `allowedMemberships`, `metadataSchema`)
+- **Assert**: Keys are camelCase (`canBeRoot`, `allowedParentTypes`, `allowedMembershipTypes`, `metadataSchema`)
 
 #### TC-SDK-15: SDK model `type` field rename [P1]
 - **Covers**: G41
@@ -413,7 +413,7 @@ Other modules test DTO conversion correctness. `dto.rs` has 9 `From` impls and s
 
 #### TC-DTO-01: ResourceGroupType -> TypeDto preserves all fields [P2]
 - **Covers**: G39
-- **Assert**: code, can_be_root, allowed_parents, allowed_memberships, metadata_schema all match
+- **Assert**: code, can_be_root, allowed_parent_types, allowed_membership_types, metadata_schema all match
 
 #### TC-DTO-02: CreateTypeDto -> CreateTypeRequest conversion [P2]
 - **Covers**: G39
@@ -434,8 +434,8 @@ Other modules test DTO conversion correctness. `dto.rs` has 9 `From` impls and s
 
 #### TC-DTO-06: CreateTypeDto default vectors [P2]
 - **Covers**: G40
-- **Setup**: Deserialize `{"code":"...", "can_be_root": true}` (no allowed_parents/memberships)
-- **Assert**: `allowed_parents == []`, `allowed_memberships == []` (via `#[serde(default)]`)
+- **Setup**: Deserialize `{"code":"...", "can_be_root": true}` (no allowed_parent_types/memberships)
+- **Assert**: `allowed_parent_types == []`, `allowed_membership_types == []` (via `#[serde(default)]`)
 
 #### TC-DTO-07: MembershipDto has no tenant_id field [P2]
 - **Covers**: G40, 0004-AC-12

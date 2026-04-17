@@ -112,14 +112,14 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Type service: create/list/get/update/delete type operations with domain validation
   - Type code validation: length 1..63, no whitespace, case-insensitive uniqueness via `schema_id` unique constraint
   - Duplicate rejection: deterministic `TypeAlreadyExists` on conflict
-  - Hierarchy-safe updates: reject removal of `allowed_parents` or `can_be_root` changes when existing groups would violate new rules (`AllowedParentsViolation`)
+  - Hierarchy-safe updates: reject removal of `allowed_parent_types` or `can_be_root` changes when existing groups would violate new rules (`AllowedParentTypesViolation`)
   - `is_tenant` trait (from `x-gts-traits`, default `false`): tenant types create self-referencing `tenant_id = group.id` scope; non-tenant types inherit tenant scope
   - Delete safety: reject type deletion when entities of that type exist
   - Type REST endpoints: CRUD under `/api/types-registry/v1/types` with OData `$filter` on `code` field
-  - allowed_parents and allowed_memberships junction table management (gts_type_allowed_parent, gts_type_allowed_membership)
+  - allowed_parent_types and allowed_membership_types junction table management (gts_type_allowed_parent, gts_type_allowed_membership)
   - Type data seeding: idempotent seed operation for bootstrapping (missing types created, existing types updated)
   - GTS type path ↔ SMALLINT surrogate ID resolution at persistence boundary
-  - Placement invariant enforcement: `can_be_root OR len(allowed_parents) >= 1`
+  - Placement invariant enforcement: `can_be_root OR len(allowed_parent_types) >= 1`
 
 - **Out of scope**:
   - Group entity operations (feature 3)
@@ -172,7 +172,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 - **Scope**:
   - Entity service: create/get/update (PUT full replace)/move/delete group operations with domain validation
   - Forest integrity: cycle detection and single-parent validation inside SERIALIZABLE write transactions
-  - Parent type compatibility: validate parent-child type rules on create, move, and type change (including validation that children's types still permit the new type in their `allowed_parents`)
+  - Parent type compatibility: validate parent-child type rules on create, move, and type change (including validation that children's types still permit the new type in their `allowed_parent_types`)
   - Entity delete safety: reject when active references (children, memberships) prevent removal per configured deletion policy
   - Closure table engine: self-row creation on entity insert, ancestor-descendant row computation on parent assignment, subtree move with full path rebuild (delete old paths + insert new paths), cascade closure row removal on entity delete
   - Hierarchy queries: ancestors/descendants ordered by depth via indexed closure table lookups
@@ -253,7 +253,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Membership REST endpoints: list/add/remove under `/api/resource-group/v1/memberships` with OData `$filter` on `resource_id`, `resource_type`, `group_id`
   - Tenant compatibility: tenant scope derived from group's `tenant_id` via JOIN, reject tenant-incompatible membership writes when resource already linked in incompatible tenant
   - GTS type path resolution for `resource_type` via surrogate ID at persistence boundary
-  - allowed_memberships validation: reject if `resource_type` is not in the group type's allowed_memberships
+  - allowed_membership_types validation: reject if `resource_type` is not in the group type's allowed_membership_types
   - Membership data seeding: idempotent seed with group existence and tenant compatibility validation
   - Active reference integration: membership references block entity deletion in feature 3 (unless force delete)
   - Data lifecycle: cascade-delete memberships on tenant deprovisioning

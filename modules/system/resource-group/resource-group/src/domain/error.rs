@@ -21,7 +21,7 @@ pub enum DomainError {
     Validation { message: String },
 
     #[error("Allowed parents violation: {message}")]
-    AllowedParentsViolation { message: String },
+    AllowedParentTypesViolation { message: String },
 
     #[error("Active references exist: {message}")]
     ConflictActiveReferences { message: String },
@@ -93,8 +93,8 @@ impl DomainError {
         }
     }
 
-    pub fn allowed_parents_violation(message: impl Into<String>) -> Self {
-        Self::AllowedParentsViolation {
+    pub fn allowed_parent_types_violation(message: impl Into<String>) -> Self {
+        Self::AllowedParentTypesViolation {
             message: message.into(),
         }
     }
@@ -171,8 +171,8 @@ impl From<DomainError> for ResourceGroupError {
             }
             DomainError::CycleDetected { message } => ResourceGroupError::cycle_detected(message),
             DomainError::LimitViolation { message } => ResourceGroupError::limit_violation(message),
-            DomainError::AllowedParentsViolation { message } => {
-                ResourceGroupError::allowed_parents_violation(message)
+            DomainError::AllowedParentTypesViolation { message } => {
+                ResourceGroupError::allowed_parent_types_violation(message)
             }
             DomainError::ConflictActiveReferences { message } => {
                 ResourceGroupError::conflict_active_references(message)

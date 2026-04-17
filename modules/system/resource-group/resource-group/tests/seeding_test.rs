@@ -60,9 +60,10 @@ async fn seed_types_creates_missing() {
     let seeds = vec![CreateTypeRequest {
         code: code.clone(),
         can_be_root: true,
-        allowed_parents: vec![],
-        allowed_memberships: vec![],
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![],
         metadata_schema: None,
+        ..Default::default()
     }];
 
     let result = seed_types(&type_svc, &seeds).await.expect("seed_types");
@@ -93,9 +94,10 @@ async fn seed_types_skips_unchanged() {
     let seeds = vec![CreateTypeRequest {
         code: code.clone(),
         can_be_root: true,
-        allowed_parents: vec![],
-        allowed_memberships: vec![],
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![],
         metadata_schema: None,
+        ..Default::default()
     }];
 
     seed_types(&type_svc, &seeds)
@@ -122,9 +124,10 @@ async fn seed_types_updates_changed() {
         .create_type(CreateTypeRequest {
             code: mbr_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create membership type");
@@ -133,22 +136,24 @@ async fn seed_types_updates_changed() {
     let seeds_v1 = vec![CreateTypeRequest {
         code: code.clone(),
         can_be_root: true,
-        allowed_parents: vec![],
-        allowed_memberships: vec![],
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![],
         metadata_schema: None,
+        ..Default::default()
     }];
 
     seed_types(&type_svc, &seeds_v1)
         .await
         .expect("seed_types v1");
 
-    // Change allowed_memberships
+    // Change allowed_membership_types
     let seeds_v2 = vec![CreateTypeRequest {
         code: code.clone(),
         can_be_root: true,
-        allowed_parents: vec![],
-        allowed_memberships: vec![mbr_code.clone()],
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![mbr_code.clone()],
         metadata_schema: None,
+        ..Default::default()
     }];
 
     let result = seed_types(&type_svc, &seeds_v2)
@@ -159,9 +164,9 @@ async fn seed_types_updates_changed() {
 
     let updated = type_svc.get_type(&code).await.expect("get_type");
     assert_eq!(
-        updated.allowed_memberships,
+        updated.allowed_membership_types,
         vec![mbr_code],
-        "allowed_memberships should be updated"
+        "allowed_membership_types should be updated"
     );
 }
 
@@ -175,9 +180,10 @@ async fn seed_types_idempotent_three_runs() {
     let seeds = vec![CreateTypeRequest {
         code: code.clone(),
         can_be_root: true,
-        allowed_parents: vec![],
-        allowed_memberships: vec![],
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![],
         metadata_schema: None,
+        ..Default::default()
     }];
 
     let r1 = seed_types(&type_svc, &seeds).await.expect("run 1");
@@ -206,9 +212,10 @@ async fn seed_groups_creates_with_closure() {
         .create_type(CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -269,9 +276,10 @@ async fn seed_groups_skips_existing() {
         .create_type(CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -312,9 +320,10 @@ async fn seed_memberships_creates_links() {
         .create_type(CreateTypeRequest {
             code: grp_type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![member_type.code.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![member_type.code.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create group type");
@@ -369,9 +378,10 @@ async fn seed_memberships_handles_duplicates() {
         .create_type(CreateTypeRequest {
             code: grp_type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![member_type.code.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![member_type.code.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create group type");
@@ -427,9 +437,10 @@ async fn seed_memberships_skips_tenant_incompatible() {
         .create_type(CreateTypeRequest {
             code: grp_type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![member_type.code.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![member_type.code.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create group type");
@@ -488,9 +499,10 @@ async fn seed_groups_wrong_order_child_before_parent() {
         .create_type(CreateTypeRequest {
             code: parent_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create parent type");
@@ -499,9 +511,10 @@ async fn seed_groups_wrong_order_child_before_parent() {
         .create_type(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: false,
-            allowed_parents: vec![parent_code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![parent_code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create child type");

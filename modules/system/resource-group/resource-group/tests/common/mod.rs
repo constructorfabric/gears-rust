@@ -157,9 +157,10 @@ pub async fn create_root_type(
     svc.create_type(CreateTypeRequest {
         code,
         can_be_root: true,
-        allowed_parents: vec![],
-        allowed_memberships: vec![],
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![],
         metadata_schema: None,
+        ..Default::default()
     })
     .await
     .expect("create root type")
@@ -180,9 +181,10 @@ pub async fn create_child_type(
     svc.create_type(CreateTypeRequest {
         code,
         can_be_root: false,
-        allowed_parents: parents.iter().map(|s| (*s).to_owned()).collect(),
-        allowed_memberships: memberships.iter().map(|s| (*s).to_owned()).collect(),
+        allowed_parent_types: parents.iter().map(|s| (*s).to_owned()).collect(),
+        allowed_membership_types: memberships.iter().map(|s| (*s).to_owned()).collect(),
         metadata_schema: None,
+        ..Default::default()
     })
     .await
     .expect("create child type")

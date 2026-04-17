@@ -14,7 +14,7 @@ info:
     and the server stores them as-is. The server extracts type metadata from the schema structure:
     - `$id` → GTS type path (becomes the `schema_id` for lookups)
     - `x-gts-traits-schema` → trait shape definition (on base contracts)
-    - `x-gts-traits` → concrete trait values like `can_be_root`, `is_tenant`, `allowed_parents`, `allowed_memberships`
+    - `x-gts-traits` → concrete trait values like `can_be_root`, `is_tenant`, `allowed_parent_types`, `allowed_membership_types`
     - `allOf` + `$ref` → type inheritance chain
 
     For chained RG types, the server stores extracted traits in junction tables
@@ -99,8 +99,8 @@ paths:
                                   barrier: { type: boolean, default: false }
                             x-gts-traits:
                               can_be_root: true
-                              allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                              allowed_memberships: ["gts.z.core.idp.user.v1~"]
+                              allowed_parent_types: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                              allowed_membership_types: ["gts.z.core.idp.user.v1~"]
                       - $id: "gts://gts.cf.core.rg.type.v1~w.core.org.department.v1~"
                         $schema: "http://json-schema.org/draft-07/schema#"
                         allOf:
@@ -114,8 +114,8 @@ paths:
                                   short_description: { type: string, maxLength: 500 }
                             x-gts-traits:
                               can_be_root: false
-                              allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                              allowed_memberships: ["gts.z.core.idp.user.v1~"]
+                              allowed_parent_types: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                              allowed_membership_types: ["gts.z.core.idp.user.v1~"]
                       - $id: "gts://gts.cf.core.rg.type.v1~x.core.rg.branch.v1~"
                         $schema: "http://json-schema.org/draft-07/schema#"
                         allOf:
@@ -128,8 +128,8 @@ paths:
                                   location: { type: string }
                             x-gts-traits:
                               can_be_root: false
-                              allowed_parents: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
-                              allowed_memberships: ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
+                              allowed_parent_types: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
+                              allowed_membership_types: ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
                     page_info:
                       next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
                       limit: 25
@@ -167,20 +167,20 @@ paths:
                         type: boolean
                         description: "Whether this type permits root placement."
                         default: false
-                      allowed_parents:
+                      allowed_parent_types:
                         type: array
                         items: { type: string, x-gts-ref: "gts.cf.core.rg.type.v1~" }
                         description: "Well-known instances of allowed parent RG types."
                         default: []
-                      allowed_memberships:
+                      allowed_membership_types:
                         type: array
                         items: { type: string, x-gts-ref: "gts.*" }
                         description: "Resource types allowed as members."
                         default: []
                   x-gts-traits:
                     can_be_root: false
-                    allowed_parents: []
-                    allowed_memberships: []
+                    allowed_parent_types: []
+                    allowed_membership_types: []
                   required: [id, name]
                   properties:
                     id: { type: string, format: uuid }
@@ -190,7 +190,7 @@ paths:
                     depth: { type: integer, readOnly: true }
                     metadata: { type: object, description: "Type-specific fields. Schema overridden by each chained RG type via allOf." }
                   x-gts-constraints:
-                    placement-invariant: "can_be_root OR len(allowed_parents) >= 1"
+                    placement-invariant: "can_be_root OR len(allowed_parent_types) >= 1"
 
               # ── Step 2: Entity types ──
 
@@ -278,8 +278,8 @@ paths:
                             barrier: { type: boolean, default: false }
                       x-gts-traits:
                         can_be_root: true
-                        allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                        allowed_memberships: ["gts.z.core.idp.user.v1~"]
+                        allowed_parent_types: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                        allowed_membership_types: ["gts.z.core.idp.user.v1~"]
 
               department-rg-type:
                 summary: "Step 3b: Department as RG type (chained, x-gts-traits)"
@@ -297,8 +297,8 @@ paths:
                             short_description: { type: string, maxLength: 500 }
                       x-gts-traits:
                         can_be_root: false
-                        allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                        allowed_memberships: ["gts.z.core.idp.user.v1~"]
+                        allowed_parent_types: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                        allowed_membership_types: ["gts.z.core.idp.user.v1~"]
 
               branch-rg-type:
                 summary: "Step 3c: Branch as RG type (chained, x-gts-traits)"
@@ -315,8 +315,8 @@ paths:
                             location: { type: string }
                       x-gts-traits:
                         can_be_root: false
-                        allowed_parents: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
-                        allowed_memberships: ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
+                        allowed_parent_types: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
+                        allowed_membership_types: ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
 
       responses:
         '201':
@@ -341,20 +341,20 @@ paths:
                           type: boolean
                           description: "Whether this type permits root placement."
                           default: false
-                        allowed_parents:
+                        allowed_parent_types:
                           type: array
                           items: { type: string, x-gts-ref: "gts.cf.core.rg.type.v1~" }
                           description: "Well-known instances of allowed parent RG types."
                           default: []
-                        allowed_memberships:
+                        allowed_membership_types:
                           type: array
                           items: { type: string, x-gts-ref: "gts.*" }
                           description: "Resource types allowed as members."
                           default: []
                     x-gts-traits:
                       can_be_root: false
-                      allowed_parents: []
-                      allowed_memberships: []
+                      allowed_parent_types: []
+                      allowed_membership_types: []
                     required: [id, name]
                     properties:
                       id: { type: string, format: uuid }
@@ -364,7 +364,7 @@ paths:
                       depth: { type: integer, readOnly: true }
                       metadata: { type: object, description: "Type-specific fields. Schema overridden by each chained RG type via allOf." }
                     x-gts-constraints:
-                      placement-invariant: "can_be_root OR len(allowed_parents) >= 1"
+                      placement-invariant: "can_be_root OR len(allowed_parent_types) >= 1"
                 tenant-rg-type:
                   summary: "Chained tenant RG type registered"
                   value:
@@ -381,8 +381,8 @@ paths:
                               barrier: { type: boolean, default: false }
                         x-gts-traits:
                           can_be_root: true
-                          allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                          allowed_memberships: ["gts.z.core.idp.user.v1~"]
+                          allowed_parent_types: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                          allowed_membership_types: ["gts.z.core.idp.user.v1~"]
                 tenant-entity:
                   summary: "Entity type registered"
                   value:
@@ -429,8 +429,8 @@ paths:
                               barrier: { type: boolean, default: false }
                         x-gts-traits:
                           can_be_root: true
-                          allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                          allowed_memberships: ["gts.z.core.idp.user.v1~"]
+                          allowed_parent_types: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
+                          allowed_membership_types: ["gts.z.core.idp.user.v1~"]
                 tenant-entity:
                   summary: "Entity: Tenant"
                   value:
@@ -456,12 +456,12 @@ paths:
                       additionalProperties: false
                       properties:
                         can_be_root: { type: boolean, default: false }
-                        allowed_parents: { type: array, items: { type: string }, default: [] }
-                        allowed_memberships: { type: array, items: { type: string }, default: [] }
+                        allowed_parent_types: { type: array, items: { type: string }, default: [] }
+                        allowed_membership_types: { type: array, items: { type: string }, default: [] }
                     x-gts-traits:
                       can_be_root: false
-                      allowed_parents: []
-                      allowed_memberships: []
+                      allowed_parent_types: []
+                      allowed_membership_types: []
                     required: [id, name]
                     properties:
                       id: { type: string, format: uuid }
@@ -828,6 +828,10 @@ paths:
         - `$filter`: `depth` (eq, ne, gt, ge, lt, le), `type` (eq, ne, in)
         - `limit`: page size (1..200), default 25
         - `cursor`: opaque token for pagination
+
+        **Dual auth mode**: available via JWT (AuthZ-scoped) and MTLS (AuthZ-bypassed,
+        private API for AuthZ plugin). In MTLS mode results are unscoped
+        (`AccessScope::allow_all`). See DESIGN §3.6 RG Authentication Modes.
       x-odata-filter:
         supported_fields:
           depth: [eq, ne, gt, ge, lt, le]
@@ -1154,7 +1158,7 @@ components:
         Raw GTS JSON Schema document. The server stores the schema as-is and extracts metadata:
         - `$id` → GTS type path (used as lookup key)
         - `x-gts-traits-schema` → trait shape (on base contracts)
-        - `x-gts-traits` → trait values like `can_be_root`, `is_tenant`, `allowed_parents`, `allowed_memberships` (on chained types)
+        - `x-gts-traits` → trait values like `can_be_root`, `is_tenant`, `allowed_parent_types`, `allowed_membership_types` (on chained types)
         - `allOf` + `$ref` → type inheritance chain
         For chained RG types, extracted traits are stored in junction tables for DB-enforced referential integrity.
       additionalProperties: true

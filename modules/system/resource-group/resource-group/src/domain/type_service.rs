@@ -49,7 +49,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         validation::validate_type_code(&req.code)?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-2
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-3
-        Self::validate_placement_invariant(req.can_be_root, &req.allowed_parents)?;
+        Self::validate_placement_invariant(req.can_be_root, &req.allowed_parent_types)?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-3
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
@@ -75,18 +75,18 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-4a
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-4b
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5
-        // Validate and resolve allowed_parents references
-        let parent_ids = if req.allowed_parents.is_empty() {
+        // Validate and resolve allowed_parent_types references
+        let parent_ids = if req.allowed_parent_types.is_empty() {
             Vec::new()
         } else {
-            for parent_code in &req.allowed_parents {
+            for parent_code in &req.allowed_parent_types {
                 // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5a
                 validation::validate_type_code(parent_code)?;
                 // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5a
             }
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5b
             self.type_repo
-                .resolve_ids(&conn, &req.allowed_parents)
+                .resolve_ids(&conn, &req.allowed_parent_types)
                 .await?
             // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5b
         };
@@ -99,8 +99,8 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-5a
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-5b
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6
-        // Validate and resolve allowed_memberships references
-        let membership_ids = if req.allowed_memberships.is_empty() {
+        // Validate and resolve allowed_membership_types references
+        let membership_ids = if req.allowed_membership_types.is_empty() {
             Vec::new()
         } else {
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6a
@@ -108,7 +108,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
             // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6a
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6b
             self.type_repo
-                .resolve_ids(&conn, &req.allowed_memberships)
+                .resolve_ids(&conn, &req.allowed_membership_types)
                 .await?
             // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6b
         };
@@ -123,7 +123,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
         // Build stored schema with embedded __can_be_root
         let stored_schema =
-            Self::build_stored_schema(req.can_be_root, req.metadata_schema.as_ref());
+            Self::build_stored_schema(req.can_be_root, req.is_tenant, req.metadata_schema.as_ref());
 
         // Persist the type
         let type_model = self
@@ -136,12 +136,12 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-9
         // Insert junction entries
         self.type_repo
-            .insert_allowed_parents(&conn, type_model.id, &parent_ids)
+            .insert_allowed_parent_types(&conn, type_model.id, &parent_ids)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-9
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-10
         self.type_repo
-            .insert_allowed_memberships(&conn, type_model.id, &membership_ids)
+            .insert_allowed_membership_types(&conn, type_model.id, &membership_ids)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-10
 
@@ -194,27 +194,27 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-4
         // Validate placement invariant on new values
-        Self::validate_placement_invariant(req.can_be_root, &req.allowed_parents)?;
+        Self::validate_placement_invariant(req.can_be_root, &req.allowed_parent_types)?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-4
 
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-5
         // Validate and resolve references
-        let parent_ids = if req.allowed_parents.is_empty() {
+        let parent_ids = if req.allowed_parent_types.is_empty() {
             Vec::new()
         } else {
-            for parent_code in &req.allowed_parents {
+            for parent_code in &req.allowed_parent_types {
                 validation::validate_type_code(parent_code)?;
             }
             self.type_repo
-                .resolve_ids(&conn, &req.allowed_parents)
+                .resolve_ids(&conn, &req.allowed_parent_types)
                 .await?
         };
 
-        let membership_ids = if req.allowed_memberships.is_empty() {
+        let membership_ids = if req.allowed_membership_types.is_empty() {
             Vec::new()
         } else {
             self.type_repo
-                .resolve_ids(&conn, &req.allowed_memberships)
+                .resolve_ids(&conn, &req.allowed_membership_types)
                 .await?
         };
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-5
@@ -242,29 +242,29 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-8
         // Clear old junction entries, insert new ones, update type
         self.type_repo
-            .delete_allowed_parents(&conn, type_id)
+            .delete_allowed_parent_types(&conn, type_id)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-8
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-9
         self.type_repo
-            .insert_allowed_parents(&conn, type_id, &parent_ids)
+            .insert_allowed_parent_types(&conn, type_id, &parent_ids)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-9
 
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-10
         self.type_repo
-            .delete_allowed_memberships(&conn, type_id)
+            .delete_allowed_membership_types(&conn, type_id)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-10
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-11
         self.type_repo
-            .insert_allowed_memberships(&conn, type_id, &membership_ids)
+            .insert_allowed_membership_types(&conn, type_id, &membership_ids)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-11
 
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
         let stored_schema =
-            Self::build_stored_schema(req.can_be_root, req.metadata_schema.as_ref());
+            Self::build_stored_schema(req.can_be_root, req.is_tenant, req.metadata_schema.as_ref());
         let updated_model = self
             .type_repo
             .update_type(&conn, type_id, code, Some(&stored_schema))
@@ -319,10 +319,10 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
     fn validate_placement_invariant(
         can_be_root: bool,
-        allowed_parents: &[String],
+        allowed_parent_types: &[String],
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-4
-        if !can_be_root && allowed_parents.is_empty() {
+        if !can_be_root && allowed_parent_types.is_empty() {
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-4a
             return Err(DomainError::validation(
                 "Type must allow root placement or have at least one allowed parent",
@@ -333,9 +333,10 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         Ok(())
     }
 
-    /// Build the stored `metadata_schema` JSON with internal `__can_be_root` key.
+    /// Build the stored `metadata_schema` JSON with internal `__can_be_root` and `__is_tenant` keys.
     fn build_stored_schema(
         can_be_root: bool,
+        is_tenant: bool,
         metadata_schema: Option<&serde_json::Value>,
     ) -> serde_json::Value {
         let mut map = match metadata_schema {
@@ -351,6 +352,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
             "__can_be_root".to_owned(),
             serde_json::Value::Bool(can_be_root),
         );
+        map.insert("__is_tenant".to_owned(), serde_json::Value::Bool(is_tenant));
         serde_json::Value::Object(map)
     }
 
@@ -363,11 +365,11 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         req: &UpdateTypeRequest,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
-        // Compute removed parent types: old_allowed_parents - new_allowed_parents
+        // Compute removed parent types: old_allowed_parent_types - new_allowed_parent_types
         let removed_parents: Vec<&String> = existing
-            .allowed_parents
+            .allowed_parent_types
             .iter()
-            .filter(|p| !req.allowed_parents.contains(p))
+            .filter(|p| !req.allowed_parent_types.contains(p))
             .collect();
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
 
@@ -385,7 +387,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                 if !violations.is_empty() {
                     let names: Vec<String> =
                         violations.iter().map(|(_, name)| name.clone()).collect();
-                    return Err(DomainError::allowed_parents_violation(format!(
+                    return Err(DomainError::allowed_parent_types_violation(format!(
                         "Cannot remove allowed parent '{removed_parent}': groups using this parent relationship: {}",
                         names.join(", ")
                     )));
@@ -405,7 +407,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-3b
             if !root_groups.is_empty() {
                 let names: Vec<String> = root_groups.iter().map(|(_, name)| name.clone()).collect();
-                return Err(DomainError::allowed_parents_violation(format!(
+                return Err(DomainError::allowed_parent_types_violation(format!(
                     "Cannot disable root placement: root groups of this type exist: {}",
                     names.join(", ")
                 )));
@@ -415,7 +417,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-3
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-4
-        // IF violations collected -> RETURN AllowedParentsViolation (handled inline above)
+        // IF violations collected -> RETURN AllowedParentTypesViolation (handled inline above)
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-4
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-5

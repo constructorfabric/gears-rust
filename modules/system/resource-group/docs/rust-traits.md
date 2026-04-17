@@ -22,8 +22,8 @@ pub struct ResourceGroupType {
     /// Whether instances of this type create their own tenant scope.
     /// Default `false`. When `true`, `tenant_id = group.id` (self-referencing).
     pub is_tenant: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
+    pub allowed_parent_types: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
     pub metadata_schema: Option<serde_json::Value>,
 }
 
@@ -34,8 +34,8 @@ pub struct CreateTypeRequest {
     pub can_be_root: bool,
     /// Default `false`. Resolved from `x-gts-traits.is_tenant` in GTS schema.
     pub is_tenant: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
+    pub allowed_parent_types: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
     pub metadata_schema: Option<serde_json::Value>,
 }
 
@@ -44,8 +44,8 @@ pub struct CreateTypeRequest {
 pub struct UpdateTypeRequest {
     pub can_be_root: bool,
     pub is_tenant: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
+    pub allowed_parent_types: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
     pub metadata_schema: Option<serde_json::Value>,
 }
 

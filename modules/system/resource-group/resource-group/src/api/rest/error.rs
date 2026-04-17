@@ -54,7 +54,7 @@ impl From<DomainError> for Problem {
             ),
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2e
-            DomainError::AllowedParentsViolation { message } => Problem::new(
+            DomainError::AllowedParentTypesViolation { message } => Problem::new(
                 http::StatusCode::CONFLICT,
                 "Allowed parents violation",
                 message,

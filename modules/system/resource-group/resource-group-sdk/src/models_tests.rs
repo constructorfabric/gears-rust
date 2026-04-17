@@ -126,9 +126,10 @@ fn resource_group_type_camel_case_keys() {
     let rgt = ResourceGroupType {
         code: "gts.cf.core.rg.type.v1~".to_owned(),
         can_be_root: true,
-        allowed_parents: vec!["gts.parent~".to_owned()],
-        allowed_memberships: vec!["gts.member~".to_owned()],
+        allowed_parent_types: vec!["gts.parent~".to_owned()],
+        allowed_membership_types: vec!["gts.member~".to_owned()],
         metadata_schema: None,
+        ..Default::default()
     };
     let json = serde_json::to_value(&rgt).unwrap();
     assert!(
@@ -136,12 +137,12 @@ fn resource_group_type_camel_case_keys() {
         "expected camelCase 'canBeRoot'"
     );
     assert!(
-        json.get("allowedParents").is_some(),
-        "expected camelCase 'allowedParents'"
+        json.get("allowedParentTypes").is_some(),
+        "expected camelCase 'allowedParentTypes'"
     );
     assert!(
-        json.get("allowedMemberships").is_some(),
-        "expected camelCase 'allowedMemberships'"
+        json.get("allowedMembershipTypes").is_some(),
+        "expected camelCase 'allowedMembershipTypes'"
     );
     assert!(
         json.get("metadataSchema").is_none(),

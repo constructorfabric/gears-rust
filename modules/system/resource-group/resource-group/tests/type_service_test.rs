@@ -46,9 +46,9 @@ fn system_scope() -> AccessScope {
 // Type CRUD tests (TC-TYP-01..16)
 // =========================================================================
 
-/// TC-TYP-01: Create type with valid allowed_parents.
-/// Child type created; allowed_parents contains parent code;
-/// junction rows COUNT = len(allowed_parents).
+/// TC-TYP-01: Create type with valid allowed_parent_types.
+/// Child type created; allowed_parent_types contains parent code;
+/// junction rows COUNT = len(allowed_parent_types).
 #[tokio::test]
 async fn type_create_with_valid_parents() {
     let db = common::test_db().await;
@@ -57,20 +57,21 @@ async fn type_create_with_valid_parents() {
     // Create parent type first
     let parent = common::create_root_type(&type_svc, "parent").await;
 
-    // Create child type with parent in allowed_parents
+    // Create child type with parent in allowed_parent_types
     let child_code = type_code("child");
     let child = type_svc
         .create_type(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: false,
-            allowed_parents: vec![parent.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![parent.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create child type");
 
-    assert_eq!(child.allowed_parents, vec![parent.code.clone()]);
+    assert_eq!(child.allowed_parent_types, vec![parent.code.clone()]);
     assert!(!child.can_be_root);
 
     // DB assertion: junction rows count matches
@@ -108,7 +109,7 @@ async fn type_create_with_valid_parents() {
     assert_eq!(junction_rows[0].parent_type_id, parent_model.id);
 }
 
-/// TC-TYP-02: Create type with non-existent allowed_parents -> Validation error.
+/// TC-TYP-02: Create type with non-existent allowed_parent_types -> Validation error.
 #[tokio::test]
 async fn type_create_nonexistent_parents() {
     let db = common::test_db().await;
@@ -120,9 +121,10 @@ async fn type_create_nonexistent_parents() {
         .create_type(CreateTypeRequest {
             code,
             can_be_root: false,
-            allowed_parents: vec![nonexistent_parent],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![nonexistent_parent],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect_err("should fail");
@@ -137,7 +139,7 @@ async fn type_create_nonexistent_parents() {
     );
 }
 
-/// TC-TYP-03: Create type with non-existent allowed_memberships -> error.
+/// TC-TYP-03: Create type with non-existent allowed_membership_types -> error.
 #[tokio::test]
 async fn type_create_nonexistent_memberships() {
     let db = common::test_db().await;
@@ -149,9 +151,10 @@ async fn type_create_nonexistent_memberships() {
         .create_type(CreateTypeRequest {
             code,
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![nonexistent_membership],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![nonexistent_membership],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect_err("should fail");
@@ -162,7 +165,7 @@ async fn type_create_nonexistent_memberships() {
     );
 }
 
-/// TC-TYP-04: Placement invariant: can_be_root=false, allowed_parents=[] -> Validation error.
+/// TC-TYP-04: Placement invariant: can_be_root=false, allowed_parent_types=[] -> Validation error.
 #[tokio::test]
 async fn type_create_placement_invariant_violation() {
     let db = common::test_db().await;
@@ -173,9 +176,10 @@ async fn type_create_placement_invariant_violation() {
         .create_type(CreateTypeRequest {
             code,
             can_be_root: false,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect_err("should fail");
@@ -190,7 +194,7 @@ async fn type_create_placement_invariant_violation() {
     );
 }
 
-/// TC-TYP-05: Update type happy path -- new allowed_parents replace old ones.
+/// TC-TYP-05: Update type happy path -- new allowed_parent_types replace old ones.
 /// DB assertion: old junction rows deleted, new rows match new list.
 #[tokio::test]
 async fn type_update_replaces_parents() {
@@ -206,9 +210,10 @@ async fn type_update_replaces_parents() {
         .create_type(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: false,
-            allowed_parents: vec![parent_a.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![parent_a.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create child");
@@ -219,15 +224,16 @@ async fn type_update_replaces_parents() {
             &child_code,
             UpdateTypeRequest {
                 can_be_root: false,
-                allowed_parents: vec![parent_b.code.clone()],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![parent_b.code.clone()],
+                allowed_membership_types: vec![],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
         .expect("update child");
 
-    assert_eq!(updated.allowed_parents, vec![parent_b.code.clone()]);
+    assert_eq!(updated.allowed_parent_types, vec![parent_b.code.clone()]);
 
     // DB assertion: junction rows now only contain parent_b
     let conn = db.conn().expect("get conn");
@@ -268,7 +274,7 @@ async fn type_update_replaces_parents() {
 }
 
 /// TC-TYP-06: Update type -- remove allowed_parent in use by groups.
-/// -> AllowedParentsViolation with violating group names.
+/// -> AllowedParentTypesViolation with violating group names.
 #[tokio::test]
 async fn type_update_remove_parent_in_use() {
     let db = common::test_db().await;
@@ -296,23 +302,24 @@ async fn type_update_remove_parent_in_use() {
     )
     .await;
 
-    // Try to remove parent_type from child_type's allowed_parents
+    // Try to remove parent_type from child_type's allowed_parent_types
     let err = type_svc
         .update_type(
             &child_type.code,
             UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
         .expect_err("should fail");
 
     assert!(
-        matches!(err, DomainError::AllowedParentsViolation { .. }),
-        "Expected AllowedParentsViolation: {err:?}"
+        matches!(err, DomainError::AllowedParentTypesViolation { .. }),
+        "Expected AllowedParentTypesViolation: {err:?}"
     );
     assert!(
         err.to_string().contains("ChildGrp"),
@@ -321,7 +328,7 @@ async fn type_update_remove_parent_in_use() {
 }
 
 /// TC-TYP-07: Update type -- set can_be_root=false with root groups existing.
-/// -> AllowedParentsViolation with root group names.
+/// -> AllowedParentTypesViolation with root group names.
 #[tokio::test]
 async fn type_update_disable_root_with_root_groups() {
     let db = common::test_db().await;
@@ -343,17 +350,18 @@ async fn type_update_disable_root_with_root_groups() {
             &root_type.code,
             UpdateTypeRequest {
                 can_be_root: false,
-                allowed_parents: vec![alt_parent_type.code.clone()],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![alt_parent_type.code.clone()],
+                allowed_membership_types: vec![],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
         .expect_err("should fail");
 
     assert!(
-        matches!(err, DomainError::AllowedParentsViolation { .. }),
-        "Expected AllowedParentsViolation: {err:?}"
+        matches!(err, DomainError::AllowedParentTypesViolation { .. }),
+        "Expected AllowedParentTypesViolation: {err:?}"
     );
     assert!(
         err.to_string().contains("RootGrp"),
@@ -373,9 +381,10 @@ async fn type_update_not_found() {
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
@@ -423,9 +432,10 @@ async fn type_update_placement_invariant_violation() {
             &rt.code,
             UpdateTypeRequest {
                 can_be_root: false,
-                allowed_parents: vec![],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
@@ -441,7 +451,7 @@ async fn type_update_placement_invariant_violation() {
     );
 }
 
-/// TC-TYP-11: Create type with self-reference in allowed_parents -> error (not found
+/// TC-TYP-11: Create type with self-reference in allowed_parent_types -> error (not found
 /// because the type doesn't exist yet at resolve time).
 #[tokio::test]
 async fn type_create_self_reference_parent() {
@@ -453,9 +463,10 @@ async fn type_create_self_reference_parent() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: false,
-            allowed_parents: vec![code],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![code],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect_err("should fail");
@@ -467,7 +478,7 @@ async fn type_create_self_reference_parent() {
     );
 }
 
-/// TC-TYP-12: Create type with invalid format in allowed_parents -> Validation.
+/// TC-TYP-12: Create type with invalid format in allowed_parent_types -> Validation.
 #[tokio::test]
 async fn type_create_invalid_parent_format() {
     let db = common::test_db().await;
@@ -478,9 +489,10 @@ async fn type_create_invalid_parent_format() {
         .create_type(CreateTypeRequest {
             code,
             can_be_root: false,
-            allowed_parents: vec!["invalid-no-prefix".to_owned()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec!["invalid-no-prefix".to_owned()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect_err("should fail");
@@ -528,9 +540,10 @@ async fn type_create_with_metadata_schema() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema.clone()),
+            ..Default::default()
         })
         .await
         .expect("create type with schema");
@@ -538,7 +551,7 @@ async fn type_create_with_metadata_schema() {
     assert_eq!(rg_type.metadata_schema, Some(schema));
 }
 
-/// TC-TYP-15: Update type replaces allowed_memberships [A, B] -> [B, C].
+/// TC-TYP-15: Update type replaces allowed_membership_types [A, B] -> [B, C].
 /// DB assertion: gts_type_allowed_membership contains only new entries.
 #[tokio::test]
 async fn type_update_replaces_memberships() {
@@ -554,9 +567,10 @@ async fn type_update_replaces_memberships() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![ma.code.clone(), mb.code.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![ma.code.clone(), mb.code.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -567,15 +581,16 @@ async fn type_update_replaces_memberships() {
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![],
-                allowed_memberships: vec![mb.code.clone(), mc.code.clone()],
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![mb.code.clone(), mc.code.clone()],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
         .expect("update type");
 
-    let mut actual_memberships = updated.allowed_memberships.clone();
+    let mut actual_memberships = updated.allowed_membership_types.clone();
     actual_memberships.sort();
     let mut expected = vec![mb.code.clone(), mc.code.clone()];
     expected.sort();
@@ -610,7 +625,7 @@ async fn type_update_replaces_memberships() {
 }
 
 /// TC-TYP-16: Update type -- hierarchy check skips deleted parent type -> no error.
-/// If the previously allowed parent type was deleted, removing it from allowed_parents
+/// If the previously allowed parent type was deleted, removing it from allowed_parent_types
 /// should succeed because there can be no groups using a deleted type.
 #[tokio::test]
 async fn type_update_hierarchy_check_skips_deleted_parent() {
@@ -623,9 +638,10 @@ async fn type_update_hierarchy_check_skips_deleted_parent() {
         .create_type(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: false,
-            allowed_parents: vec![parent.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![parent.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create child");
@@ -644,15 +660,16 @@ async fn type_update_hierarchy_check_skips_deleted_parent() {
             &child_code,
             UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
         .expect("update should succeed");
 
-    assert!(updated.allowed_parents.is_empty());
+    assert!(updated.allowed_parent_types.is_empty());
     assert!(updated.can_be_root);
 }
 
@@ -680,9 +697,10 @@ async fn meta_object_schema_roundtrip() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema.clone()),
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -742,9 +760,10 @@ async fn meta_non_object_array_roundtrip() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema.clone()),
+            ..Default::default()
         })
         .await;
 
@@ -773,9 +792,10 @@ async fn meta_non_object_string_roundtrip() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema),
+            ..Default::default()
         })
         .await;
 
@@ -803,9 +823,10 @@ async fn meta_non_object_number_roundtrip() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema),
+            ..Default::default()
         })
         .await;
 
@@ -838,9 +859,10 @@ async fn meta_user_can_be_root_overwritten() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema),
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -893,9 +915,10 @@ async fn meta_internal_keys_stripped() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema),
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -923,9 +946,10 @@ async fn meta_single_underscore_key_preserved() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema),
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -950,9 +974,10 @@ async fn meta_none_stored_with_can_be_root() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -975,8 +1000,8 @@ async fn meta_none_stored_with_can_be_root() {
     let stored = model.metadata_schema.expect("stored schema present");
     assert_eq!(
         stored,
-        json!({"__can_be_root": true}),
-        "DB should store __can_be_root even with None schema"
+        json!({"__can_be_root": true, "__is_tenant": false}),
+        "DB should store __can_be_root and __is_tenant even with None schema"
     );
 }
 
@@ -994,7 +1019,7 @@ async fn meta_can_be_root_derived_from_stored_key() {
         "Root type should have can_be_root=true"
     );
 
-    // Test can_be_root=false (with allowed_parents)
+    // Test can_be_root=false (with allowed_parent_types)
     let child_type =
         common::create_child_type(&type_svc, "cbrfalse", &[&root_type.code], &[]).await;
     assert!(
@@ -1030,7 +1055,7 @@ async fn meta_can_be_root_derived_from_stored_key() {
 }
 
 /// TC-META-10 / TC-GTS-11: can_be_root fallback when __can_be_root missing.
-/// Uses allowed_parents.is_empty() as fallback.
+/// Uses allowed_parent_types.is_empty() as fallback.
 /// Requires direct DB insert to create a type row without __can_be_root in JSONB.
 #[tokio::test]
 async fn meta_can_be_root_fallback_no_stored_key() {
@@ -1052,7 +1077,7 @@ async fn meta_can_be_root_fallback_no_stored_key() {
         .await
         .expect("direct insert");
 
-    // Load via service -- no allowed_parents so fallback = true
+    // Load via service -- no allowed_parent_types so fallback = true
     let loaded = type_svc.get_type(&code).await.expect("get type");
     assert!(
         loaded.can_be_root,
@@ -1107,7 +1132,7 @@ async fn meta_can_be_root_fallback_no_stored_key() {
         .await
         .expect("insert junction");
 
-    // Load via service -- has allowed_parents so fallback = false
+    // Load via service -- has allowed_parent_types so fallback = false
     let loaded_child = type_svc.get_type(&child_code).await.expect("get type");
     assert!(
         !loaded_child.can_be_root,
@@ -1133,9 +1158,10 @@ async fn meta_any_json_accepted() {
         .create_type(CreateTypeRequest {
             code,
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema.clone()),
+            ..Default::default()
         })
         .await
         .expect("any JSON should be accepted");
@@ -1305,9 +1331,9 @@ async fn gts_full_roundtrip_create_resolve_load() {
     assert_eq!(loaded.can_be_root, rt.can_be_root);
 }
 
-/// TC-GTS-08: load_allowed_parents junction -> IDs -> paths. Returns parent code.
+/// TC-GTS-08: load_allowed_parent_types junction -> IDs -> paths. Returns parent code.
 #[tokio::test]
-async fn gts_load_allowed_parents_returns_paths() {
+async fn gts_load_allowed_parent_types_returns_paths() {
     let db = common::test_db().await;
     let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
 
@@ -1315,19 +1341,19 @@ async fn gts_load_allowed_parents_returns_paths() {
     let child = common::create_child_type(&type_svc, "gtschild", &[&parent.code], &[]).await;
 
     assert_eq!(
-        child.allowed_parents,
+        child.allowed_parent_types,
         vec![parent.code.clone()],
-        "allowed_parents should contain the parent's GTS path"
+        "allowed_parent_types should contain the parent's GTS path"
     );
 
     // Also verify via direct get_type (which goes through load_full_type)
     let loaded = type_svc.get_type(&child.code).await.expect("get type");
-    assert_eq!(loaded.allowed_parents, vec![parent.code]);
+    assert_eq!(loaded.allowed_parent_types, vec![parent.code]);
 }
 
-/// TC-GTS-09: load_allowed_memberships junction -> IDs -> paths. Returns membership code.
+/// TC-GTS-09: load_allowed_membership_types junction -> IDs -> paths. Returns membership code.
 #[tokio::test]
-async fn gts_load_allowed_memberships_returns_paths() {
+async fn gts_load_allowed_membership_types_returns_paths() {
     let db = common::test_db().await;
     let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
 
@@ -1337,22 +1363,23 @@ async fn gts_load_allowed_memberships_returns_paths() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![membership_type.code.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![membership_type.code.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .expect("create type");
 
     assert_eq!(
-        rg_type.allowed_memberships,
+        rg_type.allowed_membership_types,
         vec![membership_type.code.clone()],
-        "allowed_memberships should contain the membership type's GTS path"
+        "allowed_membership_types should contain the membership type's GTS path"
     );
 
     // Verify via get_type
     let loaded = type_svc.get_type(&code).await.expect("get type");
-    assert_eq!(loaded.allowed_memberships, vec![membership_type.code]);
+    assert_eq!(loaded.allowed_membership_types, vec![membership_type.code]);
 }
 
 // =========================================================================
@@ -1373,12 +1400,13 @@ async fn security_metadata_schema_cannot_overwrite_can_be_root() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: false,
-            allowed_parents: vec![parent.code.clone()],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![parent.code.clone()],
+            allowed_membership_types: vec![],
             metadata_schema: Some(json!({
                 "__can_be_root": true,
                 "custom_field": "value"
             })),
+            ..Default::default()
         })
         .await
         .expect("create type with __can_be_root in metadata");
@@ -1401,12 +1429,13 @@ async fn security_metadata_schema_can_be_root_non_boolean() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(json!({
                 "__can_be_root": "not-a-bool",
-                "__allowed_parents": [1, 2, 3]
+                "__allowed_parent_types": [1, 2, 3]
             })),
+            ..Default::default()
         })
         .await
         .expect("create type with non-bool __ keys");
@@ -1431,9 +1460,10 @@ async fn security_metadata_schema_double_underscore_keys_filtered() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema),
+            ..Default::default()
         })
         .await
         .expect("create type with __ keys");
@@ -1460,9 +1490,10 @@ async fn security_metadata_schema_huge_payload() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema),
+            ..Default::default()
         })
         .await;
 
@@ -1507,9 +1538,10 @@ async fn security_metadata_schema_deep_nesting() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(nested),
+            ..Default::default()
         })
         .await;
 
@@ -1541,9 +1573,10 @@ async fn security_metadata_schema_special_values() {
         .create_type(CreateTypeRequest {
             code: code1.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(json!(null)),
+            ..Default::default()
         })
         .await;
     // null schema is accepted or rejected; no panic
@@ -1555,9 +1588,10 @@ async fn security_metadata_schema_special_values() {
         .create_type(CreateTypeRequest {
             code: code2.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(json!(true)),
+            ..Default::default()
         })
         .await;
     assert!(t2.is_ok() || !t2.unwrap_err().to_string().contains("panic"));
@@ -1582,9 +1616,10 @@ async fn security_metadata_schema_sql_column_names() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(schema),
+            ..Default::default()
         })
         .await
         .expect("create type with SQL column name keys");
@@ -1611,9 +1646,10 @@ async fn security_metadata_schema_update_full_replacement() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(json!({"old_key": "old_value", "shared": 1})),
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -1624,9 +1660,10 @@ async fn security_metadata_schema_update_full_replacement() {
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
                 metadata_schema: Some(json!({"new_key": "new_value"})),
+                ..Default::default()
             },
         )
         .await
@@ -1655,9 +1692,10 @@ async fn security_metadata_schema_last_write_wins() {
         .create_type(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: Some(json!({"version": 1})),
+            ..Default::default()
         })
         .await
         .expect("create type");
@@ -1668,9 +1706,10 @@ async fn security_metadata_schema_last_write_wins() {
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
                 metadata_schema: Some(json!({"version": 2, "extra": "a"})),
+                ..Default::default()
             },
         )
         .await
@@ -1681,9 +1720,10 @@ async fn security_metadata_schema_last_write_wins() {
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
                 metadata_schema: Some(json!({"version": 3})),
+                ..Default::default()
             },
         )
         .await

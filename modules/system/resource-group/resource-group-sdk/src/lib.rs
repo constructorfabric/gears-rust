@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod error;
+pub mod gts;
 pub mod models;
 
 // OData filter field definitions (feature-gated)

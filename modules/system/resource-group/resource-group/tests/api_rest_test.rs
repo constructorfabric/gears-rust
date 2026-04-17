@@ -205,8 +205,8 @@ async fn create_type_returns_201() {
         Some(serde_json::json!({
             "code": code,
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -233,9 +233,10 @@ async fn create_type_duplicate_returns_409() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -246,8 +247,8 @@ async fn create_type_duplicate_returns_409() {
         Some(serde_json::json!({
             "code": code,
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -267,8 +268,8 @@ async fn create_type_invalid_code_returns_400() {
         Some(serde_json::json!({
             "code": "wrong.prefix",
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -290,9 +291,10 @@ async fn list_types_returns_200_with_page() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -320,9 +322,10 @@ async fn get_type_returns_200() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -371,9 +374,10 @@ async fn delete_type_returns_204() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -404,9 +408,10 @@ async fn create_group_returns_201() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -536,9 +541,10 @@ async fn rest_put_type_returns_200() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -549,8 +555,8 @@ async fn rest_put_type_returns_200() {
         &format!("/types-registry/v1/types/{encoded}"),
         Some(serde_json::json!({
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -577,8 +583,8 @@ async fn rest_put_type_not_found_returns_404() {
         &format!("/types-registry/v1/types/{encoded}"),
         Some(serde_json::json!({
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -602,9 +608,10 @@ async fn rest_post_membership_returns_201() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -617,9 +624,10 @@ async fn rest_post_membership_returns_201() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![mt_code.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt_code.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -671,9 +679,10 @@ async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &s
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -682,9 +691,10 @@ async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &s
             &code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![code.clone()],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![code.clone()],
+                allowed_membership_types: vec![],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
@@ -742,9 +752,10 @@ async fn rest_delete_membership_returns_204() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -757,9 +768,10 @@ async fn rest_delete_membership_returns_204() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![mt.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -828,9 +840,10 @@ async fn rest_post_group_with_parent_returns_201() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: root_type.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -839,9 +852,10 @@ async fn rest_post_group_with_parent_returns_201() {
             &root_type,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
-                allowed_parents: vec![root_type.clone()],
-                allowed_memberships: vec![],
+                allowed_parent_types: vec![root_type.clone()],
+                allowed_membership_types: vec![],
                 metadata_schema: None,
+                ..Default::default()
             },
         )
         .await
@@ -1016,8 +1030,8 @@ async fn rest_create_type_with_metadata_schema() {
         Some(serde_json::json!({
             "code": code,
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": [],
+            "allowed_parent_types": [],
+            "allowed_membership_types": [],
             "metadata_schema": {"type": "object", "properties": {"barrier": {"type": "boolean"}}}
         })),
         tenant_id,
@@ -1053,9 +1067,10 @@ async fn rest_create_group_with_metadata() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1092,9 +1107,10 @@ async fn rest_group_response_omits_null_metadata() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1134,8 +1150,8 @@ async fn rest_type_response_omits_null_metadata_schema() {
         Some(serde_json::json!({
             "code": code,
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -1165,8 +1181,8 @@ async fn input_create_type_non_rg_prefix_returns_400() {
         Some(serde_json::json!({
             "code": "gts.x.other.prefix.v1~test.v1~",
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -1186,8 +1202,8 @@ async fn input_create_type_empty_code_returns_400() {
         Some(serde_json::json!({
             "code": "",
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -1207,8 +1223,8 @@ async fn input_create_type_sql_injection_returns_400() {
         Some(serde_json::json!({
             "code": "'; DROP TABLE gts_type; --",
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -1278,9 +1294,10 @@ async fn input_membership_non_gts_resource_type() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: rt.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1354,8 +1371,8 @@ async fn input_deser_type_code_number_returns_error() {
         Some(serde_json::json!({
             "code": 123,
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -1379,8 +1396,8 @@ async fn input_deser_type_can_be_root_string_returns_error() {
         Some(serde_json::json!({
             "code": "gts.cf.core.rg.type.v1~test.deser.v1~",
             "can_be_root": "yes",
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -1516,9 +1533,10 @@ async fn input_deser_group_empty_name_returns_400() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1584,8 +1602,8 @@ async fn input_deser_extra_fields_behavior() {
         Some(serde_json::json!({
             "code": code,
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": [],
+            "allowed_parent_types": [],
+            "allowed_membership_types": [],
             "unknown_field": "should be ignored"
         })),
         tenant_id,
@@ -1621,9 +1639,10 @@ async fn gts_membership_post_tilde_encoded() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1636,9 +1655,10 @@ async fn gts_membership_post_tilde_encoded() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![mt.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1687,9 +1707,10 @@ async fn gts_membership_delete_tilde_encoded() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1702,9 +1723,10 @@ async fn gts_membership_delete_tilde_encoded() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![mt.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1757,9 +1779,10 @@ async fn gts_put_type_tilde_encoded() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1770,8 +1793,8 @@ async fn gts_put_type_tilde_encoded() {
         &format!("/types-registry/v1/types/{encoded}"),
         Some(serde_json::json!({
             "can_be_root": true,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         })),
         tenant_id,
     );
@@ -1793,9 +1816,10 @@ async fn smallint_type_response_has_no_surrogate_ids() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1830,9 +1854,10 @@ async fn smallint_group_response_has_no_surrogate_ids() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1870,9 +1895,10 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1885,9 +1911,10 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![mt.clone()],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt.clone()],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -2188,9 +2215,10 @@ async fn rest_error_responses_have_problem_content_type_and_status() {
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
-            allowed_parents: vec![],
-            allowed_memberships: vec![],
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
             metadata_schema: None,
+            ..Default::default()
         })
         .await
         .unwrap();
