@@ -18,7 +18,7 @@ For background on how AuthZ uses RG data, see [RESOURCE_GROUP_MODEL.md](./RESOUR
 | **RG AuthZ Plugin** | **Done** | Reference plugin: resolves hierarchy via RG, barrier filtering, fail-closed. Feature: `rg-authz` |
 | **PolicyEnforcer in RG handlers** | **Done** | `GroupService` calls `enforcer.access_scope()` for all operations |
 | **AccessScope → SecureORM in RG repo** | **Done** | `GroupRepository.list_groups`, `find_by_id`, `get_descendants`, `get_ancestors` accept `&AccessScope` |
-| **Rust integration tests** | **Done** | 324 unit tests + 7 rg-authz-plugin tests |
+| **Rust integration tests** | **Done** | 324 unit tests + 7 rg-authz-plugin tests + 8 tr-authz-plugin tests |
 | **E2E HTTP tests** | **Partial** | 214 e2e tests (static-authz); rg-authz e2e blocked on tenant provisioning |
 | **Tenant provisioning** | **Planned** | `is_tenant` trait (from `x-gts-traits`): `tenant_id = group.id` for tenant groups. Required for rg-authz e2e |
 | Group predicates (`in_group`, `in_group_subtree`) | Planned | Requires RG-aware PDP behavior |
@@ -297,9 +297,13 @@ curl -H "Authorization: Bearer test" \
 
 ---
 
-## E2E Test Hierarchy Fixture (rg-authz-plugin)
+## E2E Test Hierarchy Fixture (AuthZ plugins)
 
-E2E tests using `rg-authz-plugin` (config: `config/e2e-rg-authz.yaml`) require a pre-seeded tenant hierarchy. A session-scoped pytest fixture creates the hierarchy via REST API before any tests run, then all tests reuse it.
+E2E tests using AuthZ plugins (config: `config/e2e-rg-authz.yaml`) require a pre-seeded tenant hierarchy. A session-scoped pytest fixture creates the hierarchy via REST API before any tests run, then all tests reuse it.
+
+**Available AuthZ plugins:**
+- `rg-authz-plugin` (priority 200) — resolves tenants directly via `ResourceGroupReadHierarchy`
+- `tr-authz-plugin` (priority 50) — resolves tenants via `TenantResolverClient` (recommended, no direct RG dependency)
 
 ### Fixture: `tenant_hierarchy`
 
@@ -333,9 +337,9 @@ T2 (root tenant, token-b subject_tenant_id)
 | Test | Fixture data used | Verifies |
 |------|-------------------|----------|
 | Barrier metadata in descendants | T1, T_barrier, T_behind | RG returns barrier data without filtering |
-| AuthZ tenant filter | T1, Dept1 | rg-authz-plugin resolves hierarchy, scopes correctly |
-| Cross-tenant invisible | T1, T2 | T2 cannot see T1 data via rg-authz-plugin |
-| Barrier exclusion from scope | T1, T_barrier, T_behind | rg-authz-plugin excludes barrier subtree from AccessScope |
+| AuthZ tenant filter | T1, Dept1 | AuthZ plugin resolves hierarchy, scopes correctly |
+| Cross-tenant invisible | T1, T2 | T2 cannot see T1 data via AuthZ plugin |
+| Barrier exclusion from scope | T1, T_barrier, T_behind | AuthZ plugin excludes barrier subtree from AccessScope |
 | Sub-tenant provisioning | T_normal | Verify `tenant_id == group.id` for sub-tenants |
 | Normal group inherits tenant | Dept1 | Verify `tenant_id == parent.tenant_id` |
 
@@ -345,7 +349,7 @@ T2 (root tenant, token-b subject_tenant_id)
 # Build with both authz plugins
 make build
 
-# Run RG + AuthZ e2e tests with rg-authz-plugin as primary
+# Run RG + AuthZ e2e tests (uses whichever authz plugin has higher priority)
 make e2e-rg-authz
 
 # Or manually:

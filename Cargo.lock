@@ -2180,6 +2180,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-tr-authz-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-authz-resolver-sdk",
+ "cf-modkit",
+ "cf-modkit-macros",
+ "cf-modkit-security",
+ "cf-tenant-resolver-sdk",
+ "cf-types-registry-sdk",
+ "inventory",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-types-registry"
 version = "0.1.18"
 dependencies = [
@@ -3970,6 +3990,7 @@ dependencies = [
  "cf-static-credstore-plugin",
  "cf-static-tr-plugin",
  "cf-tenant-resolver",
+ "cf-tr-authz-plugin",
  "cf-types-registry",
  "clap",
  "mimalloc",

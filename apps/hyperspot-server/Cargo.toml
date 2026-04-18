@@ -21,6 +21,7 @@ static-tenants = ["dep:static-tr-plugin"]
 static-authn = ["dep:static-authn-plugin"]
 static-authz = ["dep:static-authz-plugin"]
 rg-authz = ["dep:rg-authz-plugin"]
+tr-authz = ["dep:tr-authz-plugin"]
 tenant-resolver-rg = ["dep:rg-tr-plugin"]
 static-credstore = ["dep:static-credstore-plugin"]
 mini-chat = ["dep:mini-chat"]
@@ -53,6 +54,7 @@ rg-tr-plugin = { package = "cf-rg-tr-plugin", path = "../../modules/system/tenan
 static-authn-plugin = { package = "cf-static-authn-plugin", path = "../../modules/system/authn-resolver/plugins/static-authn-plugin", optional = true }
 static-authz-plugin = { package = "cf-static-authz-plugin", path = "../../modules/system/authz-resolver/plugins/static-authz-plugin", optional = true }
 rg-authz-plugin = { package = "cf-rg-authz-plugin", path = "../../modules/system/authz-resolver/plugins/rg-authz-plugin", optional = true }
+tr-authz-plugin = { package = "cf-tr-authz-plugin", path = "../../modules/system/authz-resolver/plugins/tr-authz-plugin", optional = true }
 
 # Optional credstore plugins
 static-credstore-plugin = { package = "cf-static-credstore-plugin", path = "../../modules/credstore/plugins/static-credstore-plugin", optional = true }
