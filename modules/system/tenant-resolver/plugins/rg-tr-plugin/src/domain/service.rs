@@ -221,6 +221,7 @@ impl Service {
 }
 
 #[derive(Clone, Copy)]
+#[allow(unknown_lints, de0309_must_have_domain_model)]
 enum Direction {
     Ancestors,
     Descendants,

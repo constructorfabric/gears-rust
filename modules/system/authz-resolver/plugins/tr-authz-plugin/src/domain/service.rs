@@ -23,6 +23,7 @@ use uuid::Uuid;
 /// 1. Extracts tenant root from request context
 /// 2. Calls `get_descendants` to resolve the visible tenant subtree (barriers handled by TR)
 /// 3. Returns `In(owner_tenant_id, visible_tenants)` + optional `InGroup`/`InGroupSubtree`
+#[modkit_macros::domain_model]
 pub struct Service {
     tr: Arc<dyn TenantResolverClient>,
 }

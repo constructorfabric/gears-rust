@@ -22,6 +22,7 @@ use uuid::Uuid;
 /// 2. Calls `get_group_descendants` to resolve the tenant subtree
 /// 3. Filters barrier tenants (`metadata.self_managed` = true) from scope
 /// 4. Returns `In(owner_tenant_id, visible_tenants)` + optional `InGroup`/`InGroupSubtree`
+#[modkit_macros::domain_model]
 pub struct Service {
     rg: Arc<dyn ResourceGroupReadHierarchy>,
 }
