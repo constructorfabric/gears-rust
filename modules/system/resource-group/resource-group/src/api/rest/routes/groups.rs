@@ -100,28 +100,6 @@ pub(super) fn register_group_routes(mut router: Router, openapi: &dyn OpenApiReg
         .error_500(openapi)
         .register(router, openapi);
 
-    // PATCH /resource-group/v1/groups/{group_id} - Patch a group
-    router = OperationBuilder::patch("/resource-group/v1/groups/{group_id}")
-        .operation_id("resource_group.patch_group")
-        .summary("Patch resource group")
-        .description("Partially update a resource group (PATCH). Only provided fields are changed.")
-        .tag(API_TAG)
-        .authenticated()
-        .no_license_required()
-        .path_param("group_id", "Group UUID")
-        .json_request::<dto::PatchGroupDto>(openapi, "Group patch data")
-        .handler(handlers::patch_group)
-        .json_response_with_schema::<dto::GroupDto>(
-            openapi,
-            http::StatusCode::OK,
-            "Patched resource group",
-        )
-        .error_400(openapi)
-        .error_404(openapi)
-        .error_409(openapi)
-        .error_500(openapi)
-        .register(router, openapi);
-
     // DELETE /resource-group/v1/groups/{group_id} - Delete a group
     router = OperationBuilder::delete("/resource-group/v1/groups/{group_id}")
         .operation_id("resource_group.delete_group")

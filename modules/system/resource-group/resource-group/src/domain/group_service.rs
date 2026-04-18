@@ -19,8 +19,7 @@ use modkit_db::secure::{DBRunner, TxConfig};
 use modkit_odata::{ODataQuery, Page};
 use modkit_security::{SecurityContext, pep_properties};
 use resource_group_sdk::models::{
-    CreateGroupRequest, PatchGroupRequest, ResourceGroup, ResourceGroupWithDepth,
-    UpdateGroupRequest,
+    CreateGroupRequest, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -290,75 +289,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                         max = MAX_SERIALIZATION_RETRIES,
                         group_id = %group_id,
                         "Serialization conflict in update_group, retrying"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        unreachable!("retry loop always returns")
-    }
-
-    /// Patch a resource group (partial update via PATCH).
-    ///
-    /// Loads the existing group, merges the patch fields, validates the merged
-    /// state, and delegates to the existing update path. Runs inside a
-    /// `SERIALIZABLE` transaction with bounded retry (max 3 attempts).
-    pub async fn patch_group(
-        &self,
-        ctx: &SecurityContext,
-        group_id: Uuid,
-        req: PatchGroupRequest,
-    ) -> Result<ResourceGroup, DomainError> {
-        let scope = self
-            .enforcer
-            .access_scope(ctx, &RG_GROUP_RESOURCE, "update", Some(group_id))
-            .await
-            .map_err(DomainError::from)?;
-
-        if let Some(ref name) = req.name {
-            Self::validate_name(name)?;
-        }
-
-        let profile = self.profile.clone();
-        let db = self.db.db();
-
-        for attempt in 1..=MAX_SERIALIZATION_RETRIES {
-            let req = req.clone();
-            let scope = scope.clone();
-            let profile = profile.clone();
-            let group_repo = self.group_repo.clone();
-            let type_repo = self.type_repo.clone();
-            let types_registry = self.types_registry.clone();
-
-            let result = db
-                .transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
-                    Box::pin(async move {
-                        Self::patch_group_inner(
-                            &*group_repo,
-                            &*type_repo,
-                            tx,
-                            &scope,
-                            group_id,
-                            &req,
-                            &profile,
-                            &*types_registry,
-                        )
-                        .await
-                    })
-                })
-                .await;
-
-            match result {
-                Ok(group) => return Ok(group),
-                Err(ref e)
-                    if e.is_serialization_failure() && attempt < MAX_SERIALIZATION_RETRIES =>
-                {
-                    warn!(
-                        attempt,
-                        max = MAX_SERIALIZATION_RETRIES,
-                        group_id = %group_id,
-                        "Serialization conflict in patch_group, retrying"
                     );
                 }
                 Err(e) => return Err(e),
@@ -913,73 +843,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
-    }
-
-    /// Inner logic for `patch_group`, runs inside a SERIALIZABLE transaction.
-    #[allow(clippy::too_many_arguments)]
-    async fn patch_group_inner(
-        group_repo: &GR,
-        type_repo: &TR,
-        tx: &impl DBRunner,
-        scope: &modkit_security::AccessScope,
-        group_id: Uuid,
-        req: &PatchGroupRequest,
-        profile: &QueryProfile,
-        types_registry: &dyn types_registry_sdk::TypesRegistryClient,
-    ) -> Result<ResourceGroup, DomainError> {
-        // Load existing group (AuthZ-scoped)
-        let existing_group = group_repo
-            .find_by_id(tx, scope, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))?;
-
-        let existing_model = group_repo
-            .find_model_by_id(tx, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))?;
-
-        // Resolve existing type_path from gts_type_id
-        let type_path = Self::resolve_type_path_from_id(tx, existing_model.gts_type_id).await?;
-
-        // Merge: name
-        let merged_name = match req.name {
-            Some(ref name) => name.clone(),
-            None => existing_group.name.clone(),
-        };
-
-        // Merge: parent_id (three-state)
-        let merged_parent_id = match req.parent_id {
-            Some(Some(pid)) => Some(pid),               // update
-            Some(None) => None,                         // clear
-            None => existing_group.hierarchy.parent_id, // unchanged
-        };
-
-        // Merge: metadata (three-state)
-        let merged_metadata = match req.metadata {
-            Some(Some(ref val)) => Some(val.clone()), // update
-            Some(None) => None,                       // clear
-            None => existing_group.metadata.clone(),  // unchanged
-        };
-
-        // Delegate to the existing update_group_inner which handles all validation
-        let update_req = UpdateGroupRequest {
-            type_path,
-            name: merged_name,
-            parent_id: merged_parent_id,
-            metadata: merged_metadata,
-        };
-
-        Self::update_group_inner(
-            group_repo,
-            type_repo,
-            tx,
-            scope,
-            group_id,
-            &update_req,
-            profile,
-            types_registry,
-        )
-        .await
     }
 
     /// Inner logic for `move_group`, runs inside a SERIALIZABLE transaction.

@@ -2009,168 +2009,6 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
 }
 
 // =========================================================================
-// Section F: PATCH group REST tests (TC-REST-09)
-// =========================================================================
-
-/// TC-REST-09: PATCH /groups/{id} -- partial update happy path.
-/// Only `name` provided → name updated, other fields unchanged.
-#[tokio::test]
-async fn rest_patch_group_updates_name_only() {
-    let (router, type_svc, group_svc, _) = build_shared_router().await;
-    let tenant_id = Uuid::now_v7();
-    let ctx = make_ctx(tenant_id);
-
-    let rt = create_self_ref_type(&type_svc, "patch").await;
-
-    let group = group_svc
-        .create_group(
-            &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                type_path: rt.clone(),
-                name: "Original".to_owned(),
-                parent_id: None,
-                metadata: Some(serde_json::json!({"keep": true})),
-            },
-            tenant_id,
-        )
-        .await
-        .unwrap();
-
-    let req = json_request(
-        "PATCH",
-        &format!("/resource-group/v1/groups/{}", group.id),
-        Some(serde_json::json!({"name": "Patched"})),
-        tenant_id,
-    );
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = response_body(resp).await;
-    assert_eq!(body["name"], "Patched", "name updated");
-    assert_eq!(body["type"], rt, "type unchanged");
-    assert_eq!(
-        body["metadata"],
-        serde_json::json!({"keep": true}),
-        "metadata unchanged"
-    );
-    assert!(
-        body["hierarchy"]["parent_id"].is_null(),
-        "parent_id unchanged (still root)"
-    );
-}
-
-/// TC-REST-09: PATCH with `{"parent_id": null}` detaches from parent.
-#[tokio::test]
-async fn rest_patch_group_null_parent_detaches() {
-    let (router, type_svc, group_svc, _) = build_shared_router().await;
-    let tenant_id = Uuid::now_v7();
-    let ctx = make_ctx(tenant_id);
-
-    let rt = create_self_ref_type(&type_svc, "patchdet").await;
-
-    let root = group_svc
-        .create_group(
-            &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                type_path: rt.clone(),
-                name: "Root".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
-            tenant_id,
-        )
-        .await
-        .unwrap();
-
-    let child = group_svc
-        .create_group(
-            &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                type_path: rt,
-                name: "Child".to_owned(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
-            tenant_id,
-        )
-        .await
-        .unwrap();
-
-    let req = json_request(
-        "PATCH",
-        &format!("/resource-group/v1/groups/{}", child.id),
-        Some(serde_json::json!({"parent_id": null})),
-        tenant_id,
-    );
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = response_body(resp).await;
-    assert!(
-        body["hierarchy"]["parent_id"].is_null(),
-        "parent_id cleared -- group is now root"
-    );
-    assert_eq!(body["name"], "Child", "name unchanged");
-}
-
-/// TC-REST-09: PATCH with empty body → 200, nothing changed.
-#[tokio::test]
-async fn rest_patch_group_empty_body_noop() {
-    let (router, type_svc, group_svc, _) = build_shared_router().await;
-    let tenant_id = Uuid::now_v7();
-    let ctx = make_ctx(tenant_id);
-
-    let rt = create_self_ref_type(&type_svc, "patchnoop").await;
-
-    let group = group_svc
-        .create_group(
-            &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                type_path: rt,
-                name: "NoChange".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
-            tenant_id,
-        )
-        .await
-        .unwrap();
-
-    let req = json_request(
-        "PATCH",
-        &format!("/resource-group/v1/groups/{}", group.id),
-        Some(serde_json::json!({})),
-        tenant_id,
-    );
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = response_body(resp).await;
-    assert_eq!(body["name"], "NoChange", "name unchanged");
-}
-
-/// TC-REST-09: PATCH nonexistent group → 404.
-#[tokio::test]
-async fn rest_patch_group_not_found_returns_404() {
-    let (router, _, _, _) = build_shared_router().await;
-    let tenant_id = Uuid::now_v7();
-    let fake_id = Uuid::now_v7();
-
-    let req = json_request(
-        "PATCH",
-        &format!("/resource-group/v1/groups/{fake_id}"),
-        Some(serde_json::json!({"name": "Ghost"})),
-        tenant_id,
-    );
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-// =========================================================================
 // Section G: Error response HTTP mapping (TC-REST-10)
 // =========================================================================
 
@@ -2300,8 +2138,8 @@ async fn rest_error_responses_have_problem_content_type_and_status() {
 // Section H: Route registration smoke test (RG7)
 // =========================================================================
 
-/// RG7: All 15 endpoints are registered and respond with non-405.
-/// Uses HEAD/POST/PATCH/DELETE with minimal bodies to exercise route matching
+/// RG7: All endpoints are registered and respond with non-405.
+/// Uses HEAD/POST/DELETE with minimal bodies to exercise route matching
 /// without needing valid data setup.
 #[tokio::test]
 async fn rest_route_smoke_all_endpoints_registered() {
@@ -2367,12 +2205,6 @@ async fn rest_route_smoke_all_endpoints_registered() {
             format!("/resource-group/v1/groups/{fake_id}"),
             true,
             "update group",
-        ),
-        (
-            "PATCH",
-            format!("/resource-group/v1/groups/{fake_id}"),
-            true,
-            "patch group",
         ),
         (
             "DELETE",

@@ -53,12 +53,6 @@ async def test_route_smoke_all_endpoints(
 
         # --- Endpoints NOT covered by other seam tests ---
 
-        # PATCH /groups/{id} -- not exercised by any other test
-        r = await c.patch(
-            f"{_groups(rg_base_url)}/{rid}", headers=h, json={"name": "x"},
-        )
-        assert r.status_code != 405, f"PATCH /groups/{{id}}: {r.status_code}"
-
         # GET /types -- list types, not exercised elsewhere
         r = await c.get(_types(rg_base_url), headers=h)
         assert r.status_code not in (404, 405), f"GET /types: {r.status_code}"

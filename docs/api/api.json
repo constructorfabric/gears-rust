@@ -2168,26 +2168,6 @@
         ],
         "type": "string"
       },
-      "PatchGroupDto": {
-        "description": "REST DTO for patching a resource group (partial update via PATCH).",
-        "properties": {
-          "metadata": {},
-          "name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "parent_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "PatchSimpleUserSettingsRequest": {
         "properties": {
           "language": {
@@ -8543,93 +8523,6 @@
           }
         ],
         "summary": "Get resource group by ID",
-        "tags": [
-          "Resource Groups"
-        ]
-      },
-      "patch": {
-        "description": "Partially update a resource group (PATCH). Only provided fields are changed.",
-        "operationId": "resource_group.patch_group",
-        "parameters": [
-          {
-            "description": "Group UUID",
-            "in": "path",
-            "name": "group_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PatchGroupDto"
-              }
-            }
-          },
-          "description": "Group patch data",
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GroupDto"
-                }
-              }
-            },
-            "description": "Patched resource group"
-          },
-          "400": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "404": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "500": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Internal Server Error"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "Patch resource group",
         "tags": [
           "Resource Groups"
         ]

@@ -2,9 +2,8 @@
 //! REST DTOs for resource-group type and group management.
 
 use resource_group_sdk::models::{
-    CreateGroupRequest, CreateTypeRequest, PatchGroupRequest, ResourceGroup,
-    ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
-    UpdateTypeRequest, option_option,
+    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupMembership,
+    ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
 };
 use uuid::Uuid;
 
@@ -202,28 +201,6 @@ pub struct UpdateGroupDto {
     /// Type-specific metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-}
-
-/// REST DTO for patching a resource group (partial update via PATCH).
-#[derive(Debug, Clone)]
-#[modkit_macros::api_dto(request)]
-#[allow(clippy::option_option)]
-pub struct PatchGroupDto {
-    pub name: Option<String>,
-    #[serde(default, deserialize_with = "option_option::deserialize")]
-    pub parent_id: Option<Option<Uuid>>,
-    #[serde(default, deserialize_with = "option_option::deserialize")]
-    pub metadata: Option<Option<serde_json::Value>>,
-}
-
-impl From<PatchGroupDto> for PatchGroupRequest {
-    fn from(dto: PatchGroupDto) -> Self {
-        Self {
-            name: dto.name,
-            parent_id: dto.parent_id,
-            metadata: dto.metadata,
-        }
-    }
 }
 
 // -- Group conversions --

@@ -11,10 +11,7 @@ use tracing::field::Empty;
 use modkit::api::odata::OData;
 use modkit::api::prelude::*;
 
-use super::{
-    CreateGroupDto, GroupDto, GroupWithDepthDto, PatchGroupDto, SecurityContext, UpdateGroupDto,
-    info,
-};
+use super::{CreateGroupDto, GroupDto, GroupWithDepthDto, SecurityContext, UpdateGroupDto, info};
 use crate::module::ConcreteGroupService;
 
 /// Query parameters for delete endpoint.
@@ -113,29 +110,6 @@ pub async fn update_group(
     );
 
     let group = svc.update_group(&ctx, group_id, req_body.into()).await?;
-    Ok(Json(GroupDto::from(group)))
-}
-
-/// Patch a resource group (partial update via PATCH).
-#[tracing::instrument(
-    skip(svc, req_body, ctx),
-    fields(
-        group.id = %group_id,
-        request_id = Empty,
-    )
-)]
-pub async fn patch_group(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<ConcreteGroupService>>,
-    Path(group_id): Path<uuid::Uuid>,
-    Json(req_body): Json<PatchGroupDto>,
-) -> ApiResult<Json<GroupDto>> {
-    info!(
-        group_id = %group_id,
-        "Patching resource group"
-    );
-
-    let group = svc.patch_group(&ctx, group_id, req_body.into()).await?;
     Ok(Json(GroupDto::from(group)))
 }
 

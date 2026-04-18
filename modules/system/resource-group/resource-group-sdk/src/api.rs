@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::error::ResourceGroupError;
 use crate::models::{
-    CreateGroupRequest, CreateTypeRequest, PatchGroupRequest, ResourceGroup,
+    CreateGroupRequest, CreateTypeRequest, ResourceGroup,
     ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
     UpdateTypeRequest,
 };
@@ -91,14 +91,6 @@ pub trait ResourceGroupClient: Send + Sync {
         ctx: &SecurityContext,
         id: Uuid,
         request: UpdateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError>;
-
-    /// Patch a resource group (partial update via PATCH).
-    async fn patch_group(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-        request: PatchGroupRequest,
     ) -> Result<ResourceGroup, ResourceGroupError>;
 
     /// Delete a resource group.

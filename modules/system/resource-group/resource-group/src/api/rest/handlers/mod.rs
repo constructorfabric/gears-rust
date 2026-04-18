@@ -1,8 +1,8 @@
 // Created: 2026-04-16 by Constructor Tech
 // @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-module-scaffold:p1
 use crate::api::rest::dto::{
-    CreateGroupDto, CreateTypeDto, GroupDto, GroupWithDepthDto, MembershipDto, PatchGroupDto,
-    TypeDto, UpdateGroupDto, UpdateTypeDto,
+    CreateGroupDto, CreateTypeDto, GroupDto, GroupWithDepthDto, MembershipDto, TypeDto,
+    UpdateGroupDto, UpdateTypeDto,
 };
 
 use modkit_security::SecurityContext;
@@ -18,7 +18,6 @@ pub(crate) use groups::get_group;
 pub(crate) use groups::get_group_ancestors;
 pub(crate) use groups::get_group_descendants;
 pub(crate) use groups::list_groups;
-pub(crate) use groups::patch_group;
 pub(crate) use groups::update_group;
 pub(crate) use memberships::add_membership;
 pub(crate) use memberships::list_memberships;

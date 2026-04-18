@@ -13,7 +13,7 @@ use modkit_security::SecurityContext;
 use resource_group_sdk::ResourceGroupClient;
 use resource_group_sdk::error::ResourceGroupError;
 use resource_group_sdk::models::{
-    CreateGroupRequest, CreateTypeRequest, PatchGroupRequest, ResourceGroup,
+    CreateGroupRequest, CreateTypeRequest, ResourceGroup,
     ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
     UpdateTypeRequest,
 };
@@ -161,18 +161,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     ) -> Result<ResourceGroup, ResourceGroupError> {
         self.group_service
             .update_group(ctx, id, request)
-            .await
-            .map_err(ResourceGroupError::from)
-    }
-
-    async fn patch_group(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-        request: PatchGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
-        self.group_service
-            .patch_group(ctx, id, request)
             .await
             .map_err(ResourceGroupError::from)
     }
