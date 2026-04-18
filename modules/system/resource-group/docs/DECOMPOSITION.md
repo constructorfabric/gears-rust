@@ -112,14 +112,13 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Type service: create/list/get/update/delete type operations with domain validation
   - Type code validation: length 1..63, no whitespace, case-insensitive uniqueness via `schema_id` unique constraint
   - Duplicate rejection: deterministic `TypeAlreadyExists` on conflict
-  - Hierarchy-safe updates: reject removal of `allowed_parent_types` or `can_be_root` changes when existing groups would violate new rules (`AllowedParentTypesViolation`)
-  - `is_tenant` trait (from `x-gts-traits`, default `false`): tenant types create self-referencing `tenant_id = group.id` scope; non-tenant types inherit tenant scope
+  - Hierarchy-safe updates: reject removal of `allowed_parents` or `can_be_root` changes when existing groups would violate new rules (`AllowedParentsViolation`)
   - Delete safety: reject type deletion when entities of that type exist
   - Type REST endpoints: CRUD under `/api/types-registry/v1/types` with OData `$filter` on `code` field
-  - allowed_parent_types and allowed_membership_types junction table management (gts_type_allowed_parent, gts_type_allowed_membership)
+  - allowed_parents and allowed_memberships junction table management (gts_type_allowed_parent, gts_type_allowed_membership)
   - Type data seeding: idempotent seed operation for bootstrapping (missing types created, existing types updated)
   - GTS type path ↔ SMALLINT surrogate ID resolution at persistence boundary
-  - Placement invariant enforcement: `can_be_root OR len(allowed_parent_types) >= 1`
+  - Placement invariant enforcement: `can_be_root OR len(allowed_parents) >= 1`
 
 - **Out of scope**:
   - Group entity operations (feature 3)
@@ -172,11 +171,11 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 - **Scope**:
   - Entity service: create/get/update (PUT full replace)/move/delete group operations with domain validation
   - Forest integrity: cycle detection and single-parent validation inside SERIALIZABLE write transactions
-  - Parent type compatibility: validate parent-child type rules on create, move, and type change (including validation that children's types still permit the new type in their `allowed_parent_types`)
+  - Parent type compatibility: validate parent-child type rules on create, move, and type change (including validation that children's types still permit the new type in their `allowed_parents`)
   - Entity delete safety: reject when active references (children, memberships) prevent removal per configured deletion policy
   - Closure table engine: self-row creation on entity insert, ancestor-descendant row computation on parent assignment, subtree move with full path rebuild (delete old paths + insert new paths), cascade closure row removal on entity delete
   - Hierarchy queries: ancestors/descendants ordered by depth via indexed closure table lookups
-  - Descendants endpoint: `GET /groups/{group_id}/descendants` and ancestors endpoint: `GET /groups/{group_id}/ancestors` returning `ResourceGroupWithDepth` with relative depth (positive = descendants, negative = ancestors, 0 = self) and OData filtering on `hierarchy/depth`
+  - Hierarchy depth endpoint: `GET /groups/{group_id}/hierarchy` returning `ResourceGroupWithDepth` with relative depth (positive = descendants, negative = ancestors, 0 = self) and OData filtering on `hierarchy/depth`
   - Query profile enforcement: configurable `max_depth`/`max_width` on writes, no truncation on reads for already-existing data, deterministic `DepthLimitExceeded`/`WidthLimitExceeded` errors
   - Group REST endpoints: CRUD under `/api/resource-group/v1/groups` with OData `$filter` on `type`, `hierarchy/parent_id`, `id`, `name`
   - Force delete: optional `?force=true` for cascade deletion of subtree and associated memberships
@@ -231,8 +230,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - GET /api/resource-group/v1/groups/{group_id}
   - PUT /api/resource-group/v1/groups/{group_id}
   - DELETE /api/resource-group/v1/groups/{group_id}
-  - GET /api/resource-group/v1/groups/{group_id}/descendants
-  - GET /api/resource-group/v1/groups/{group_id}/ancestors
+  - GET /api/resource-group/v1/groups/{group_id}/hierarchy
 
 - **Sequences**:
 
@@ -253,7 +251,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Membership REST endpoints: list/add/remove under `/api/resource-group/v1/memberships` with OData `$filter` on `resource_id`, `resource_type`, `group_id`
   - Tenant compatibility: tenant scope derived from group's `tenant_id` via JOIN, reject tenant-incompatible membership writes when resource already linked in incompatible tenant
   - GTS type path resolution for `resource_type` via surrogate ID at persistence boundary
-  - allowed_membership_types validation: reject if `resource_type` is not in the group type's allowed_membership_types
+  - allowed_memberships validation: reject if `resource_type` is not in the group type's allowed_memberships
   - Membership data seeding: idempotent seed with group existence and tenant compatibility validation
   - Active reference integration: membership references block entity deletion in feature 3 (unless force delete)
   - Data lifecycle: cascade-delete memberships on tenant deprovisioning
@@ -307,10 +305,10 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Integration read service: expose `ResourceGroupReadHierarchy` via ClientHub for AuthZ plugin consumption, returning hierarchy data without policy or SQL semantics
   - Plugin gateway routing: built-in provider (local persistence path) vs vendor-specific provider (resolve plugin instance by configured vendor, delegate to `ResourceGroupReadPluginClient`) with SecurityContext passthrough
   - JWT authentication: standard AuthZ evaluation via `PolicyEnforcer.access_scope()` on all REST endpoints, `AccessScope` applied via SecureORM for tenant-scoped queries
-  - MTLS authentication: client certificate verification against trusted CA bundle, endpoint allowlist (`GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors`), AuthZ bypass for trusted system principals, system SecurityContext creation
+  - MTLS authentication: client certificate verification against trusted CA bundle, endpoint allowlist (only `GET /groups/{group_id}/hierarchy`), AuthZ bypass for trusted system principals, system SecurityContext creation
   - MTLS configuration: `ca_cert`, `allowed_clients` (by certificate CN), `allowed_endpoints` (method + path pairs)
   - Tenant scope enforcement for ownership-graph profile: parent-child edges and membership writes validated for tenant-hierarchy compatibility, platform-admin provisioning exception for cross-tenant management, tenant-scoped reads via `SecurityContext.subject_tenant_id`
-  - Barrier as data: `metadata.barrier` stored in group metadata JSONB without enforcement by RG, returned in API responses within `metadata` object for consumption by Tenant Resolver and AuthZ
+  - Barrier as data: `metadata.self_managed` stored in group metadata JSONB without enforcement by RG, returned in API responses within `metadata` object for consumption by Tenant Resolver and AuthZ
   - In-process vs out-of-process: ClientHub direct call (monolith, no MTLS needed) vs MTLS-authenticated remote call (microservices)
   - SecurityContext propagation: `ctx` passed through gateway to selected provider without policy interpretation
 
@@ -344,8 +342,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - [x] `p1` - `cpt-cf-resource-group-component-integration-read-service`
 
 - **API**:
-  - GET /api/resource-group/v1/groups/{group_id}/descendants (JWT + MTLS)
-  - GET /api/resource-group/v1/groups/{group_id}/ancestors (JWT + MTLS)
+  - GET /api/resource-group/v1/groups/{group_id}/hierarchy (JWT + MTLS)
   - All other endpoints (JWT only, MTLS returns 403)
 
 - **Sequences**:

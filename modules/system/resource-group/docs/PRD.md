@@ -220,9 +220,9 @@ This aligns RG behavior with `docs/arch/authorization/RESOURCE_GROUP_MODEL.md`.
 
 #### Responsibility Split: RG stores, Tenant Resolver + AuthZ enforce
 
-**RG treats `barrier` purely as data — RG does not filter, restrict, or alter query results based on the barrier value.** For GTS types that support barrier semantics (e.g. tenant types), `barrier` is stored inside the `metadata` field as `metadata.barrier` (boolean). RG returns it in API responses within `metadata`, nothing more. All RG queries return data regardless of barrier values — barrier enforcement is entirely outside RG's scope.
+**RG treats `barrier` purely as data — RG does not filter, restrict, or alter query results based on the barrier value.** For GTS types that support barrier semantics (e.g. tenant types), `barrier` is stored inside the `metadata` field as `metadata.self_managed` (boolean). RG returns it in API responses within `metadata`, nothing more. All RG queries return data regardless of barrier values — barrier enforcement is entirely outside RG's scope.
 
-**Tenant Resolver enforces barrier during hierarchy traversal.** TR applies barrier logic when collecting ancestors and descendants. RG's `metadata.barrier` maps to TR's `self_managed` flag.
+**Tenant Resolver enforces barrier during hierarchy traversal.** TR applies barrier logic when collecting ancestors and descendants. RG's `metadata.self_managed` maps to TR's `self_managed` flag.
 
 **AuthZ integrates barrier into access constraints.** AuthZ supports `barrier_mode` parameter (`respect` / `ignore`). When respecting barriers, barrier tenants and their subtrees are excluded from access scope.
 
@@ -249,7 +249,7 @@ Caller: subject_tenant_id = T1
 ```
 - AccessScope: `{tenant_id IN (T1)}` — T7 excluded by TR/AuthZ.
 - `GET /groups`: sees D2, B3. Does NOT see T7, D8, or R8.
-- `GET /groups/{T1}/descendants`: sees T1, D2, B3. Does NOT see T7 or D8.
+- `GET /groups/{T1}/hierarchy`: sees T1, D2, B3. Does NOT see T7 or D8.
 
 **Scenario 2: Barrier tenant reads own data**
 ```
@@ -312,8 +312,8 @@ A type includes:
 
 - `schema_id` (unique GTS type path, case-insensitive)
 - `can_be_root` (boolean; `true` means the type permits root placement — no `parent_id`). Resolved from `x-gts-traits` in the registered GTS schema.
-- `allowed_parent_types` (allowed parent type codes; may be empty if the type is root-only). Invariant: `can_be_root OR len(allowed_parent_types) >= 1` — a type must have at least one valid placement
-- `allowed_membership_types` (GTS type paths of resource types allowed as members of groups of this type, e.g. `["gts.cf.core.idp.user.v1~"]`)
+- `allowed_parents` (allowed parent type codes; may be empty if the type is root-only). Invariant: `can_be_root OR len(allowed_parents) >= 1` — a type must have at least one valid placement
+- `allowed_memberships` (GTS type paths of resource types allowed as members of groups of this type, e.g. `["gts.x.system.idp.user.v1~"]`)
 - `metadata_schema` (optional JSON Schema — defines the structure and validation rules for the `metadata` field on group instances of this type)
 
 #### Validate Type Code Format
@@ -351,20 +351,19 @@ Type data seeding (populating type definitions) is **optional** and deployment-s
 AuthZ deployment determines which types are needed:
 
 - **AuthZ does not use RG** — no type seeding required.
-- **Flat tenants** — create type `tenant` with `is_tenant: true, can_be_root: true, allowed_parent_types: {}` (root placement only, no nesting). `is_tenant` causes `tenant_id = group.id` (self-referencing scope).
-- **Hierarchical tenants** — create type `tenant` with `is_tenant: true, can_be_root: true, allowed_parent_types: {'tenant'}` (root placement or nested under another tenant). Sub-tenants also get `tenant_id = group.id`.
-- **Non-tenant root types** — create type `organization` with `is_tenant: false, can_be_root: true` (root placement, but inherits `tenant_id` from caller). `is_tenant` defaults to `false` if omitted.
+- **Flat tenants** — create type `tenant` with `can_be_root: true, allowed_parents: {}` (root placement only, no nesting).
+- **Hierarchical tenants** — create type `tenant` with for example `can_be_root: true, allowed_parents: {'tenant'}` (root placement or nested under another tenant).
 
 #### Validate Type Update Against Existing Hierarchy
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-validate-type-update-hierarchy`
 
-Updating a type's placement rules (`allowed_parent_types`, `can_be_root`) **MUST** be validated against the existing group hierarchy:
+Updating a type's placement rules (`allowed_parents`, `can_be_root`) **MUST** be validated against the existing group hierarchy:
 
-- Removing a type code from `allowed_parent_types` **MUST** be rejected if any group of this type currently has a parent whose type is the removed code.
+- Removing a type code from `allowed_parents` **MUST** be rejected if any group of this type currently has a parent whose type is the removed code.
 - Setting `can_be_root` from `true` to `false` **MUST** be rejected if any root group (no `parent_id`) of this type exists.
 
-Violation **MUST** return `AllowedParentTypesViolation` with details identifying the conflicting constraint.
+Violation **MUST** return `AllowedParentsViolation` with details identifying the conflicting constraint.
 
 #### Delete Type Only If Unused
 
@@ -391,9 +390,9 @@ The module **MUST** provide API operations for:
 Entity fields (GTS-aligned naming):
 
 - `id` (UUID) — group identifier
-- `type` (GTS chained type path, e.g. `gts.cf.core.rg.type.v1~w.system.org.department.v1~`)
+- `type` (GTS chained type path, e.g. `gts.x.system.rg.type.v1~w.system.org.department.v1~`)
 - `name` (1..255) — display name
-- `metadata` (object) — type-specific fields defined by the chained RG type schema. Examples: `metadata.barrier`, `metadata.custom_domain`, `metadata.category`. For types supporting barrier semantics, `metadata.barrier` (boolean) is included here.
+- `metadata` (object) — type-specific fields defined by the chained RG type schema. Examples: `metadata.self_managed`, `metadata.custom_domain`, `metadata.category`. For types supporting barrier semantics, `metadata.self_managed` (boolean) is included here.
 - `hierarchy` (object) — RG hierarchy context:
   - `parent_id` (optional) — direct parent group
   - `tenant_id` (required) — tenant scope
@@ -573,7 +572,7 @@ List endpoints **MUST** support:
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-list-groups-depth`
 
-Dedicated descendants (`/groups/{group_id}/descendants`) and ancestors (`/groups/{group_id}/ancestors`) endpoints **MUST** return groups with a computed `hierarchy.depth` field (relative distance from reference group) and support depth-based filtering via OData nested path `hierarchy/depth` (`eq`, `ne`, `gt`, `ge`, `lt`, `le`). The descendants endpoint returns depth ≥ 0 (self + children), the ancestors endpoint returns depth ≤ 0 (self + parent chain).
+A dedicated group hierarchy endpoint (`/groups/{group_id}/hierarchy`) **MUST** return groups with a computed `hierarchy.depth` field (relative distance from reference group) and support depth-based filtering via OData nested path `hierarchy/depth` (`eq`, `ne`, `gt`, `ge`, `lt`, `le`). Positive depth = descendants, negative depth = ancestors, `0` = reference group itself.
 
 #### Force Delete
 
@@ -600,7 +599,7 @@ The same public read contract must remain stable across provider strategies:
 
 In `ownership-graph` profile, integration read responses match REST API schemas:
 
-- hierarchy reads (`get_group_descendants(ctx, group_id, query)` / `get_group_ancestors(ctx, group_id, query)`) return `Page<ResourceGroupWithDepth>` (matches REST `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors`) — includes `tenant_id` per group
+- hierarchy reads (`list_group_depth(ctx, group_id, query)`) return `Page<ResourceGroupWithDepth>` (matches REST `GET /groups/{group_id}/hierarchy`) — includes `tenant_id` per group
 - membership reads (`list_memberships(ctx, query)`) return `Page<ResourceGroupMembership>` (matches REST `GET /memberships`) — no `tenant_id`; callers derive tenant scope from group data obtained via hierarchy reads
 - integration read methods accept caller `SecurityContext`; RG passes it through to selected provider path (for plugin path, pass-through is unchanged)
 - in AuthZ query path, caller `SecurityContext.subject_tenant_id` is mandatory and used to resolve effective tenant scope for tenant-scoped reads and compiled SQL predicates
@@ -641,7 +640,7 @@ RG REST API supports two authentication modes:
 
 **JWT (public, all endpoints)**: standard user/service requests via bearer token. All endpoints available. Every request goes through AuthZ evaluation via `PolicyEnforcer` — identical flow to any other domain service (courses, users, etc.).
 
-**MTLS (private, hierarchy endpoints only)**: service-to-service requests via mutual TLS client certificate. Used by AuthZ plugin to read tenant hierarchy. Only `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors` are allowed — all other endpoints return `403 Forbidden`. MTLS requests **bypass AuthZ evaluation entirely** because:
+**MTLS (private, hierarchy endpoint only)**: service-to-service requests via mutual TLS client certificate. Used by AuthZ plugin to read tenant hierarchy. Only `GET /groups/{group_id}/hierarchy` is allowed — all other endpoints return `403 Forbidden`. MTLS requests **bypass AuthZ evaluation entirely** because:
 - AuthZ plugin is the caller and cannot evaluate itself (circular dependency)
 - MTLS certificate identity is a trusted system principal
 - Single read-only endpoint — minimal attack surface
@@ -777,7 +776,7 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
 
 #### Scenario: Create Type
 
-- **GIVEN** valid code `branch` and allowed_parent_types `["tenant", "department"]`
+- **GIVEN** valid code `branch` and allowed_parents `["tenant", "department"]`
 - **WHEN** caller creates type
 - **THEN** type is persisted with owner metadata
 
@@ -795,18 +794,18 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
 
 #### Scenario: Update Type Parents (Compatible)
 
-- **GIVEN** type `branch` exists with allowed_parent_types `["tenant"]`
+- **GIVEN** type `branch` exists with allowed_parents `["tenant"]`
 - **AND** no existing `branch` groups have a parent of type `department`
-- **WHEN** caller updates allowed_parent_types to `["tenant", "department"]` (adds new allowed parent)
+- **WHEN** caller updates allowed_parents to `["tenant", "department"]` (adds new allowed parent)
 - **THEN** type definition is updated
 - **AND** existing groups remain valid
 
 #### Scenario: Reject Update Type Parents When Existing Groups Violate New Rules
 
-- **GIVEN** type `branch` exists with allowed_parent_types `["tenant", "department"]`
+- **GIVEN** type `branch` exists with allowed_parents `["tenant", "department"]`
 - **AND** group `B1` (type `branch`) has parent `D1` (type `department`)
-- **WHEN** caller updates `branch` allowed_parent_types to `["tenant"]` (removes `department`)
-- **THEN** update is rejected with `AllowedParentTypesViolation` — existing group `B1` would violate new parent type rules
+- **WHEN** caller updates `branch` allowed_parents to `["tenant"]` (removes `department`)
+- **THEN** update is rejected with `AllowedParentsViolation` — existing group `B1` would violate new parent type rules
 
 #### Scenario: Delete Unused Type
 
@@ -852,10 +851,10 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
 
 #### Scenario: Reject Invalid Parent Type
 
-- **GIVEN** type `team` allows allowed_parent_types `["branch"]` only
+- **GIVEN** type `team` allows allowed_parents `["branch"]` only
 - **AND** parent entity `D1` has type `department`
 - **WHEN** caller creates group of type `team` with `parent_id = D1`
-- **THEN** `InvalidParentType` — `department` is not in allowed_parent_types for `team`
+- **THEN** `InvalidParentType` — `department` is not in allowed_parents for `team`
 
 #### Scenario: Move Subtree to Valid Parent
 
@@ -1068,7 +1067,7 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
       └── G21 (group, tenant_id=T7)
   ```
 - **AND** AuthZ plugin needs to resolve which tenants/groups are visible to a user whose `subject_tenant_id = T1`
-- **WHEN** plugin calls `get_group_descendants(ctx, T1, filter="type in ('tenant','group')")` via MTLS
+- **WHEN** plugin calls `list_group_depth(ctx, T1, filter="hierarchy/depth ge 0 and type in ('tenant','group')")` via MTLS
 - **THEN** RG returns:
   | id  | type   | hierarchy.tenant_id | hierarchy.depth |
   |-----|--------|---------------------|-----------------|
@@ -1085,7 +1084,7 @@ See `cpt-cf-resource-group-fr-dual-auth-modes` in section 5.9 for the full authe
 
 - **GIVEN** caller authenticates via MTLS client certificate
 - **WHEN** caller sends request to `POST /api/resource-group/v1/groups` (non-hierarchy endpoint)
-- **THEN** `403 Forbidden` — MTLS mode only allows `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors`
+- **THEN** `403 Forbidden` — MTLS mode only allows `GET /groups/{group_id}/hierarchy`
 
 ## 9. Acceptance Criteria
 

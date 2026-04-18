@@ -90,7 +90,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 2. [x] - `p1` - API Gateway: authenticate JWT via AuthNResolverClient → SecurityContext {subject_id, subject_tenant_id} - `inst-jwt-2`
 3. [x] - `p1` - RG Gateway: call PolicyEnforcer.access_scope(ctx, resource_type, action) - `inst-jwt-3`
 4. [x] - `p1` - PolicyEnforcer → AuthZ Resolver: evaluate(EvaluationRequest) - `inst-jwt-4`
-5. [x] - `p1` - AuthZ plugin internally: call ResourceGroupReadHierarchy.get_group_descendants() for tenant hierarchy resolution (via MTLS or in-process ClientHub — bypasses AuthZ) - `inst-jwt-5`
+5. [x] - `p1` - AuthZ plugin internally: call ResourceGroupReadHierarchy.list_group_depth() for tenant hierarchy resolution (via MTLS or in-process ClientHub — bypasses AuthZ) - `inst-jwt-5`
 6. [x] - `p1` - AuthZ plugin: produce constraints (e.g., owner_tenant_id IN (...)) - `inst-jwt-6`
 7. [x] - `p1` - PolicyEnforcer: compile_to_access_scope() → AccessScope - `inst-jwt-7`
 8. [x] - `p1` - RG Gateway: apply AccessScope via SecureORM (WHERE tenant_id IN (...)) to query - `inst-jwt-8`
@@ -112,7 +112,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 - Endpoint not in MTLS allowlist → 403 Forbidden
 
 **Steps**:
-1. [x] - `p1` - AuthZ plugin sends GET /api/resource-group/v1/groups/{group_id}/descendants (or /ancestors) with MTLS client certificate - `inst-mtls-1`
+1. [x] - `p1` - AuthZ plugin sends GET /api/resource-group/v1/groups/{group_id}/hierarchy with MTLS client certificate - `inst-mtls-1`
 2. [x] - `p1` - RG Gateway: extract client certificate from TLS handshake - `inst-mtls-2`
 3. [x] - `p1` - Validate certificate against trusted CA bundle (ca_cert): chain, expiration, revocation - `inst-mtls-3`
 4. [x] - `p1` - Match client identity (certificate CN/SAN) against allowed_clients list - `inst-mtls-4`
@@ -120,7 +120,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 6. [x] - `p1` - Check endpoint against allowed_endpoints allowlist (method + path) - `inst-mtls-6`
 7. [x] - `p1` - **IF** endpoint not in allowlist → **RETURN** 403 Forbidden - `inst-mtls-7`
 8. [x] - `p1` - Create system SecurityContext (no AuthZ evaluation — trusted system principal) - `inst-mtls-8`
-9. [x] - `p1` - RG Hierarchy Service: execute get_group_descendants(system_ctx, group_id, query) / get_group_ancestors(system_ctx, group_id, query) directly - `inst-mtls-9`
+9. [x] - `p1` - RG Hierarchy Service: execute list_group_depth(system_ctx, group_id, query) directly - `inst-mtls-9`
 10. [x] - `p1` - **RETURN** Page<ResourceGroupWithDepth> — hierarchy data with tenant_id per group, metadata including barrier - `inst-mtls-10`
 
 ### Plugin Gateway Routing
@@ -195,7 +195,7 @@ Not applicable. This feature configures authentication routing and integration r
 The system **MUST** implement an Integration Read Service that exposes `ResourceGroupReadHierarchy` via ClientHub for external consumers.
 
 **Required behavior**:
-- Expose `get_group_descendants(ctx, group_id, query)` and `get_group_ancestors(ctx, group_id, query)` returning `Page<ResourceGroupWithDepth>` with hierarchy data including `tenant_id` per group and `metadata` (including `barrier` for applicable types)
+- Expose `list_group_depth(ctx, group_id, query)` returning `Page<ResourceGroupWithDepth>` with hierarchy data including `tenant_id` per group and `metadata` (including `barrier` for applicable types)
 - Responses are policy-agnostic: no AuthZ decisions, no SQL fragments, no constraint objects
 - Plugin gateway routing: resolve configured provider (built-in vs vendor-specific), delegate with SecurityContext passthrough
 - In-process mode (monolith): direct ClientHub call, no network auth needed
@@ -220,10 +220,10 @@ The system **MUST** implement dual authentication mode routing in the RG gateway
 - Apply AccessScope via SecureORM to all queries
 - Identical flow to any other domain service (courses, users, etc.)
 
-**MTLS mode (hierarchy endpoints only)**:
+**MTLS mode (hierarchy endpoint only)**:
 - Verify client certificate against trusted CA bundle
 - Match client CN/SAN against `allowed_clients` configuration
-- Check endpoint against `allowed_endpoints` allowlist (`GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors`)
+- Check endpoint against `allowed_endpoints` allowlist (only `GET /groups/{group_id}/hierarchy`)
 - All other endpoints return 403 Forbidden in MTLS mode
 - Bypass AuthZ evaluation entirely — trusted system principal
 - Create system SecurityContext for RG service call
@@ -231,7 +231,7 @@ The system **MUST** implement dual authentication mode routing in the RG gateway
 **MTLS configuration**:
 - `ca_cert`: path to trusted CA bundle
 - `allowed_clients`: list of allowed client CNs (e.g., `authz-resolver-plugin`)
-- `allowed_endpoints`: list of method+path pairs (e.g., `GET /api/resource-group/v1/groups/{group_id}/descendants`, `GET /api/resource-group/v1/groups/{group_id}/ancestors`)
+- `allowed_endpoints`: list of method+path pairs (e.g., `GET /api/resource-group/v1/groups/{group_id}/hierarchy`)
 
 **Implements**:
 - `cpt-cf-resource-group-flow-integration-auth-jwt-request`
@@ -239,7 +239,7 @@ The system **MUST** implement dual authentication mode routing in the RG gateway
 - `cpt-cf-resource-group-algo-integration-auth-auth-mode-decision`
 
 **Touches**:
-- API: `GET /api/resource-group/v1/groups/{group_id}/descendants`, `GET /api/resource-group/v1/groups/{group_id}/ancestors` (JWT + MTLS), all other endpoints (JWT only)
+- API: `GET /api/resource-group/v1/groups/{group_id}/hierarchy` (JWT + MTLS), all other endpoints (JWT only)
 
 ### Tenant Scope Enforcement for Ownership-Graph Profile
 
@@ -252,13 +252,13 @@ The system **MUST** enforce tenant-hierarchy-compatible writes in ownership-grap
 - Membership writes validated against target group's tenant scope
 - Platform-admin provisioning exception: privileged calls may bypass caller tenant scoping for cross-tenant management, but data invariants (parent-child type compat, tenant hierarchy rules) remain strict
 - Tenant-scoped reads: in AuthZ query path, `SecurityContext.subject_tenant_id` determines effective tenant scope
-- Barrier as data: `metadata.barrier` stored in group metadata JSONB, returned in API responses within `metadata` object. RG does not filter, restrict, or alter query results based on barrier value.
+- Barrier as data: `metadata.self_managed` stored in group metadata JSONB, returned in API responses within `metadata` object. RG does not filter, restrict, or alter query results based on barrier value.
 
 **Implements**:
 - `cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement`
 
 **Touches**:
-- DB: `resource_group` (tenant_id validation, metadata.barrier storage)
+- DB: `resource_group` (tenant_id validation, metadata.self_managed storage)
 
 ### Unit Test Coverage for Integration Auth
 
@@ -272,10 +272,10 @@ In-source `#[cfg(test)]` tests covering auth-mode decision and tenant-scope enfo
 
 ## 6. Acceptance Criteria
 
-- [x] AuthZ plugin resolves `dyn ResourceGroupReadHierarchy` from ClientHub and successfully calls `get_group_descendants` / `get_group_ancestors`
+- [x] AuthZ plugin resolves `dyn ResourceGroupReadHierarchy` from ClientHub and successfully calls `list_group_depth`
 - [x] Integration read responses include `tenant_id` per group and `metadata` (including `barrier`) but no AuthZ decision fields
 - [x] JWT request to any RG endpoint goes through AuthN → AuthZ (PolicyEnforcer) → AccessScope → SecureORM pipeline
-- [x] MTLS request to `/groups/{group_id}/descendants` or `/groups/{group_id}/ancestors` bypasses AuthZ and returns hierarchy data
+- [x] MTLS request to `/groups/{group_id}/hierarchy` bypasses AuthZ and returns hierarchy data
 - [x] MTLS request to any other endpoint (e.g., `POST /groups`) returns 403 Forbidden
 - [x] MTLS request with invalid certificate returns 403 Forbidden
 - [x] MTLS request with valid certificate but client CN not in allowed_clients returns 403 Forbidden
@@ -283,7 +283,7 @@ In-source `#[cfg(test)]` tests covering auth-mode decision and tenant-scope enfo
 - [x] SecurityContext is passed through gateway to provider without policy interpretation
 - [x] Parent-child edge in ownership-graph profile with incompatible tenants is rejected with TenantIncompatibility
 - [x] Platform-admin provisioning call bypasses caller tenant scoping but still validates data invariants
-- [x] Group with `metadata.barrier = true` is stored and returned in API responses — RG does not filter based on barrier
+- [x] Group with `metadata.self_managed = true` is stored and returned in API responses — RG does not filter based on barrier
 - [x] In monolith deployment, AuthZ plugin uses ClientHub direct call (no MTLS needed)
 - [x] In microservice deployment, AuthZ plugin uses MTLS-authenticated remote call to hierarchy endpoint
 
@@ -316,7 +316,7 @@ In-source `#[cfg(test)]` tests covering auth-mode decision and tenant-scope enfo
 
 | TC | Scenario | Assert |
 |----|----------|--------|
-| TC-READ-01 | `get_group_descendants` / `get_group_ancestors` response | Contains `tenant_id` and `metadata` per group; no AuthZ decision fields |
+| TC-READ-01 | `list_group_depth` response | Contains `tenant_id` and `metadata` per group; no AuthZ decision fields |
 | TC-READ-02 | Plugin gateway with built-in provider configured | Routes to local persistence path |
 | TC-READ-03 | Plugin gateway with vendor-specific provider configured | Delegates to `ResourceGroupReadPluginClient` |
 

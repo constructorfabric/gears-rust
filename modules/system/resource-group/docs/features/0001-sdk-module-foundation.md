@@ -116,7 +116,7 @@ Not applicable. This feature provides SDK contracts and module infrastructure wi
    2. [x] - `p1` - `NotFound` -> 404 Not Found, type "not-found", entity identifier in detail - `inst-err-map-2b`
    3. [x] - `p1` - `TypeAlreadyExists` -> 409 Conflict, type "type-already-exists", conflicting code in detail - `inst-err-map-2c`
    4. [x] - `p1` - `InvalidParentType` -> 409 Conflict, type "invalid-parent-type", type mismatch in detail - `inst-err-map-2d`
-   5. [x] - `p1` - `AllowedParentTypesViolation` -> 409 Conflict, type "allowed-parents-violation", violating groups in detail - `inst-err-map-2e`
+   5. [x] - `p1` - `AllowedParentsViolation` -> 409 Conflict, type "allowed-parents-violation", violating groups in detail - `inst-err-map-2e`
    6. [x] - `p1` - `CycleDetected` -> 409 Conflict, type "cycle-detected", involved node IDs in detail - `inst-err-map-2f`
    7. [x] - `p1` - `ConflictActiveReferences` -> 409 Conflict, type "active-references", reference count in detail - `inst-err-map-2g`
    8. [x] - `p1` - `LimitViolation` -> 409 Conflict, type "limit-violation", limit name and values in detail - `inst-err-map-2h`
@@ -139,7 +139,7 @@ Not applicable. This feature defines SDK contracts, module scaffold, and persist
 The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs` that represent the public API surface for all RG domain entities and query constructs.
 
 **Required types**:
-- `ResourceGroupType` — type definition with `schema_id` (GtsTypePath), `allowed_parent_types` (Vec), `allowed_membership_types` (Vec), `can_be_root` (bool), `is_tenant` (bool, default false), `metadata_schema` (Option)
+- `ResourceGroupType` — type definition with `schema_id` (GtsTypePath), `allowed_parents` (Vec), `allowed_memberships` (Vec), `can_be_root` (bool), `metadata_schema` (Option)
 - `ResourceGroup` — group entity with `id` (Uuid), `type` (GtsTypePath), `name` (String), `metadata` (Option), `hierarchy` (ResourceGroupHierarchy with `parent_id`, `tenant_id`)
 - `ResourceGroupWithDepth` — extends ResourceGroup with `hierarchy.depth` (i32, relative distance)
 - `ResourceGroupMembership` — membership link with `group_id` (Uuid), `resource_type` (GtsTypePath), `resource_id` (String)
@@ -163,8 +163,8 @@ The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs`
 The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs` that represent the stable public interface for all RG operations.
 
 **Required traits**:
-- `ResourceGroupClient` — full CRUD trait: type management (`create_type`, `get_type`, `list_types`, `update_type`, `delete_type`), group management (`create_group`, `get_group`, `list_groups`, `update_group`, `delete_group`, `get_group_descendants`, `get_group_ancestors`), membership management (`add_membership`, `remove_membership`, `list_memberships`). All methods accept `SecurityContext` as first argument.
-- `ResourceGroupReadHierarchy` — narrow hierarchy-only read trait: `get_group_descendants(ctx, group_id, query)` and `get_group_ancestors(ctx, group_id, query)` returning `Page<ResourceGroupWithDepth>`. Used exclusively by AuthZ plugin.
+- `ResourceGroupClient` — full CRUD trait: type management (`create_type`, `get_type`, `list_types`, `update_type`, `delete_type`), group management (`create_group`, `get_group`, `list_groups`, `update_group`, `delete_group`, `list_group_depth`), membership management (`add_membership`, `remove_membership`, `list_memberships`). All methods accept `SecurityContext` as first argument.
+- `ResourceGroupReadHierarchy` — narrow hierarchy-only read trait: `list_group_depth(ctx, group_id, query)` returning `Page<ResourceGroupWithDepth>`. Used exclusively by AuthZ plugin.
 - `ResourceGroupReadPluginClient` — extends `ResourceGroupReadHierarchy` with `list_memberships`. Used for vendor-specific plugin gateway routing.
 
 **Constraints**: `cpt-cf-resource-group-constraint-no-authz-decision`, `cpt-cf-resource-group-constraint-no-sql-filter-generation`
@@ -178,7 +178,7 @@ The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs
 
 The system **MUST** define `ResourceGroupError` enum in `resource-group-sdk/src/error.rs` covering all deterministic failure categories.
 
-**Required variants**: `Validation`, `NotFound`, `TypeAlreadyExists`, `InvalidParentType`, `AllowedParentTypesViolation`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `ServiceUnavailable`, `Internal`.
+**Required variants**: `Validation`, `NotFound`, `TypeAlreadyExists`, `InvalidParentType`, `AllowedParentsViolation`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `ServiceUnavailable`, `Internal`.
 
 Each variant **MUST** carry structured context (field details for Validation, entity identifier for NotFound, conflicting code for TypeAlreadyExists, etc.) sufficient for the error mapping algorithm to produce informative Problem responses.
 
@@ -280,7 +280,7 @@ In-source `#[cfg(test)]` tests for filter field definitions and DTO conversions:
 ## 6. Acceptance Criteria
 
 - [x] SDK crate (`resource-group-sdk`) compiles with all model types, trait contracts, and error types defined
-- [x] `GtsTypePath::new("gts.cf.core.rg.type.v1~")` succeeds; `GtsTypePath::new("invalid")` returns validation error
+- [x] `GtsTypePath::new("gts.x.system.rg.type.v1~")` succeeds; `GtsTypePath::new("invalid")` returns validation error
 - [x] All 6 DB tables are created by migration scripts with correct constraints and indexes
 - [x] SeaORM entities compile and map to the DB schema without runtime errors
 - [x] Module registers `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy` in ClientHub during Phase 1 init
@@ -304,7 +304,7 @@ Other modules (`nodes-registry`, `types-registry`) place pure-logic tests direct
 
 #### TC-SDK-01: GtsTypePath::new() valid path [P1]
 - **Covers**: G36, 0001-AC-2
-- **Input**: `"gts.cf.core.rg.type.v1~"`
+- **Input**: `"gts.x.system.rg.type.v1~"`
 - **Assert**: `Ok(GtsTypePath)`, `as_str()` returns lowercase
 
 #### TC-SDK-02: GtsTypePath::new() empty string [P1]
@@ -327,32 +327,32 @@ Other modules (`nodes-registry`, `types-registry`) place pure-logic tests direct
 
 #### TC-SDK-06: GtsTypePath::new() invalid format - uppercase chars [P1]
 - **Covers**: G38
-- **Input**: `"GTS.X.CORE.RG.TYPE.V1~"` with uppercase -> trimmed/lowercased
+- **Input**: `"gts.x.system.rg.type.v1~"` with uppercase -> trimmed/lowercased
 
 #### TC-SDK-07: GtsTypePath::new() trims whitespace and lowercases [P2]
 - **Covers**: G36
-- **Input**: `"  GTS.X.CORE.RG.TYPE.V1~  "`
-- **Assert**: `Ok`, `as_str() == "gts.cf.core.rg.type.v1~"`
+- **Input**: `"  GTS.X.System.RG.Type.V1~  "`
+- **Assert**: `Ok`, `as_str() == "gts.x.system.rg.type.v1~"`
 
 #### TC-SDK-08: GtsTypePath::new() chained path (multi-segment) [P1]
 - **Covers**: G38
-- **Input**: `"gts.cf.core.rg.type.v1~x.test.v1~"`
+- **Input**: `"gts.x.system.rg.type.v1~x.test.v1~"`
 - **Assert**: `Ok`
 
 #### TC-SDK-09: GtsTypePath::new() double tilde (empty segment) [P2]
 - **Covers**: G38
-- **Input**: `"gts.cf.core.rg.type.v1~~"`
+- **Input**: `"gts.x.system.rg.type.v1~~"`
 - **Assert**: `Err` (empty segment between tildes)
 
 #### TC-SDK-10: GtsTypePath::new() special chars in segment [P2]
 - **Covers**: G38
-- **Input**: `"gts.cf.core.rg.type.v1~hello-world~"` (hyphen not allowed)
+- **Input**: `"gts.x.system.rg.type.v1~hello-world~"` (hyphen not allowed)
 - **Assert**: `Err`
 
 #### TC-SDK-11: GtsTypePath serde round-trip (JSON) [P1]
 - **Covers**: G37
 - **Setup**: Serialize `GtsTypePath` to JSON string, deserialize back
-- **Assert**: `serde_json::to_string(&path)` produces `"gts.cf.core.rg.type.v1~"`, deserialize back equals original
+- **Assert**: `serde_json::to_string(&path)` produces `"gts.x.system.rg.type.v1~"`, deserialize back equals original
 
 #### TC-SDK-12: GtsTypePath serde invalid JSON string [P1]
 - **Covers**: G37
@@ -389,7 +389,7 @@ Other modules (`nodes-registry`, `types-registry`) place pure-logic tests direct
 #### TC-SDK-14: SDK model camelCase serialization [P1]
 - **Covers**: G41
 - **Setup**: Serialize `ResourceGroupType` to JSON
-- **Assert**: Keys are camelCase (`canBeRoot`, `allowedParentTypes`, `allowedMembershipTypes`, `metadataSchema`)
+- **Assert**: Keys are camelCase (`canBeRoot`, `allowedParents`, `allowedMemberships`, `metadataSchema`)
 
 #### TC-SDK-15: SDK model `type` field rename [P1]
 - **Covers**: G41
@@ -413,7 +413,7 @@ Other modules test DTO conversion correctness. `dto.rs` has 9 `From` impls and s
 
 #### TC-DTO-01: ResourceGroupType -> TypeDto preserves all fields [P2]
 - **Covers**: G39
-- **Assert**: code, can_be_root, allowed_parent_types, allowed_membership_types, metadata_schema all match
+- **Assert**: code, can_be_root, allowed_parents, allowed_memberships, metadata_schema all match
 
 #### TC-DTO-02: CreateTypeDto -> CreateTypeRequest conversion [P2]
 - **Covers**: G39
@@ -434,8 +434,8 @@ Other modules test DTO conversion correctness. `dto.rs` has 9 `From` impls and s
 
 #### TC-DTO-06: CreateTypeDto default vectors [P2]
 - **Covers**: G40
-- **Setup**: Deserialize `{"code":"...", "can_be_root": true}` (no allowed_parent_types/memberships)
-- **Assert**: `allowed_parent_types == []`, `allowed_membership_types == []` (via `#[serde(default)]`)
+- **Setup**: Deserialize `{"code":"...", "can_be_root": true}` (no allowed_parents/memberships)
+- **Assert**: `allowed_parents == []`, `allowed_memberships == []` (via `#[serde(default)]`)
 
 #### TC-DTO-07: MembershipDto has no tenant_id field [P2]
 - **Covers**: G40, 0004-AC-12
@@ -466,7 +466,7 @@ OData filter fields use manual `FilterField` trait implementations with string f
 
 #### TC-ODATA-05: MembershipFilterField names and kinds [P1]
 - **Covers**: G44
-- **Assert**: `GroupId -> ("group_id", Uuid)`, `ResourceType -> ("resource_type", String)`, `ResourceId -> ("resource_id", String)`
+- **Assert**: `GroupId -> ("group_id", Uuid)`, `ResourceType -> ("resource_type", I64)`, `ResourceId -> ("resource_id", String)`
 
 #### TC-ODATA-06: TypeODataMapper field-to-column mapping [P2]
 - **Covers**: G45
@@ -513,8 +513,7 @@ Helper `assert_group_shape(data)` verifies the JSON wire shape of a group respon
 ```
 HEAD /cf/resource-group/v1/groups               → not 404/405
 HEAD /cf/resource-group/v1/groups/{uuid}        → not 405 (404 ok — group doesn't exist)
-HEAD /cf/resource-group/v1/groups/{uuid}/descendants  → not 405
-HEAD /cf/resource-group/v1/groups/{uuid}/ancestors    → not 405
+HEAD /cf/resource-group/v1/groups/{uuid}/hierarchy  → not 405
 HEAD /cf/resource-group/v1/memberships          → not 405
 POST /cf/types-registry/v1/types (empty body)   → not 404/405 (400 ok — validation)
 
@@ -530,7 +529,7 @@ No data setup needed. Fastest possible test.
 
 ```
 POST /types → create type
-POST /groups → create group with metadata: {"barrier": true}
+POST /groups → create group with metadata: {"self_managed": true}
 GET  /groups/{id} → 200
 
 Assert JSON keys:
@@ -540,7 +539,7 @@ Assert JSON keys:
   "tenant_id"  — string, UUID format
   "parent_id"  — null (root group)
   "depth"      — integer, == 0
-  "metadata"   — {"barrier": true} (JSONB roundtrip)
+  "metadata"   — {"self_managed": true} (JSONB roundtrip)
   "created_at" — string, ISO 8601
   "updated_at" — null or absent (fresh create)
 

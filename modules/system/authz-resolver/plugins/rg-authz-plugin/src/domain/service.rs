@@ -20,7 +20,7 @@ use uuid::Uuid;
 /// Resolves tenant hierarchy via `ResourceGroupReadHierarchy`:
 /// 1. Extracts tenant root from request context
 /// 2. Calls `get_group_descendants` to resolve the tenant subtree
-/// 3. Filters barrier tenants (metadata.barrier = true) from scope
+/// 3. Filters barrier tenants (metadata.self_managed = true) from scope
 /// 4. Returns `In(owner_tenant_id, visible_tenants)` + optional `InGroup`/`InGroupSubtree`
 pub struct Service {
     rg: Arc<dyn ResourceGroupReadHierarchy>,
@@ -194,12 +194,12 @@ impl Service {
         Ok(visible)
     }
 
-    /// Check if a group has barrier metadata.
+    /// Check if a group has barrier metadata (`self_managed = true`).
     fn is_barrier(group: &resource_group_sdk::models::ResourceGroupWithDepth) -> bool {
         group
             .metadata
             .as_ref()
-            .and_then(|m| m.get("barrier"))
+            .and_then(|m| m.get("self_managed"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
     }

@@ -306,7 +306,7 @@ E2E tests using `rg-authz-plugin` (config: `config/e2e-rg-authz.yaml`) require a
 ```
 T1 (root tenant, is_tenant=true, can_be_root=true, token-a subject_tenant_id)
 ├── T_normal (child tenant, is_tenant=true)
-├── T_barrier (tenant with metadata.barrier=true, is_tenant=true)
+├── T_barrier (tenant with metadata.self_managed=true, is_tenant=true)
 │   └── T_behind (child of barrier, is_tenant=true)
 └── Dept1 (department, is_tenant=false, can_be_root=false, inherits T1 tenant_id)
 
@@ -319,7 +319,7 @@ T2 (root tenant, token-b subject_tenant_id)
 2. Create department type (`is_tenant=false`, `can_be_root=false`, `allowed_parent_types=[tenant_type]`)
 3. **Seed T1 root tenant** directly in SQLite (`id` = token-a `subject_tenant_id`). Root tenants are created via DB seeding, not API.
 4. `POST /groups` -- T_normal (parent=T1) -- `tenant_id = T_normal.id`
-5. `POST /groups` -- T_barrier (parent=T1, metadata=`{"barrier": true}`) -- `tenant_id = T_barrier.id`
+5. `POST /groups` -- T_barrier (parent=T1, metadata=`{"self_managed": true}`) -- `tenant_id = T_barrier.id`
 6. `POST /groups` -- T_behind (parent=T_barrier) -- `tenant_id = T_behind.id`
 7. `POST /groups` -- Dept1 (parent=T1, dept type) -- `tenant_id = T1.id` (inherited, `is_tenant=false`)
 8. **Seed T2 root tenant** directly in SQLite (`id` = token-b `subject_tenant_id`)

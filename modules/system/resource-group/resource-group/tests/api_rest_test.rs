@@ -1032,7 +1032,7 @@ async fn rest_create_type_with_metadata_schema() {
             "can_be_root": true,
             "allowed_parent_types": [],
             "allowed_membership_types": [],
-            "metadata_schema": {"type": "object", "properties": {"barrier": {"type": "boolean"}}}
+            "metadata_schema": {"type": "object", "properties": {"self_managed": {"type": "boolean"}}}
         })),
         tenant_id,
     );
@@ -1081,7 +1081,7 @@ async fn rest_create_group_with_metadata() {
         Some(serde_json::json!({
             "type": code,
             "name": "MetaGroup",
-            "metadata": {"barrier": true}
+            "metadata": {"self_managed": true}
         })),
         tenant_id,
     );
@@ -1089,7 +1089,7 @@ async fn rest_create_group_with_metadata() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let body = response_body(resp).await;
-    assert_eq!(body["metadata"]["barrier"], true);
+    assert_eq!(body["metadata"]["self_managed"], true);
     assert_no_surrogate_ids(&body);
 }
 

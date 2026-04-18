@@ -27,6 +27,9 @@ use single_tenant_tr_plugin as _;
 #[cfg(feature = "static-tenants")]
 use static_tr_plugin as _;
 
+#[cfg(feature = "tenant-resolver-rg")]
+use rg_tr_plugin as _;
+
 #[cfg(feature = "static-authn")]
 use static_authn_plugin as _;
 

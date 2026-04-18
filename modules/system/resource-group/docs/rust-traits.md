@@ -19,11 +19,8 @@ use uuid::Uuid;
 pub struct ResourceGroupType {
     pub code: String,
     pub can_be_root: bool,
-    /// Whether instances of this type create their own tenant scope.
-    /// Default `false`. When `true`, `tenant_id = group.id` (self-referencing).
-    pub is_tenant: bool,
-    pub allowed_parent_types: Vec<String>,
-    pub allowed_membership_types: Vec<String>,
+    pub allowed_parents: Vec<String>,
+    pub allowed_memberships: Vec<String>,
     pub metadata_schema: Option<serde_json::Value>,
 }
 
@@ -32,10 +29,8 @@ pub struct ResourceGroupType {
 pub struct CreateTypeRequest {
     pub code: String,
     pub can_be_root: bool,
-    /// Default `false`. Resolved from `x-gts-traits.is_tenant` in GTS schema.
-    pub is_tenant: bool,
-    pub allowed_parent_types: Vec<String>,
-    pub allowed_membership_types: Vec<String>,
+    pub allowed_parents: Vec<String>,
+    pub allowed_memberships: Vec<String>,
     pub metadata_schema: Option<serde_json::Value>,
 }
 
@@ -43,9 +38,8 @@ pub struct CreateTypeRequest {
 #[derive(Debug, Clone)]
 pub struct UpdateTypeRequest {
     pub can_be_root: bool,
-    pub is_tenant: bool,
-    pub allowed_parent_types: Vec<String>,
-    pub allowed_membership_types: Vec<String>,
+    pub allowed_parents: Vec<String>,
+    pub allowed_memberships: Vec<String>,
     pub metadata_schema: Option<serde_json::Value>,
 }
 
@@ -187,8 +181,7 @@ pub trait ResourceGroupClient: Send + Sync {
     async fn delete_group(&self, ctx: &SecurityContext, group_id: Uuid, force: bool) -> Result<(), ResourceGroupError>;
 
     // ── Hierarchy ───────────────────────────────────────────────────
-    async fn get_group_descendants(&self, ctx: &SecurityContext, group_id: Uuid, query: ListQuery) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
-    async fn get_group_ancestors(&self, ctx: &SecurityContext, group_id: Uuid, query: ListQuery) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
+    async fn list_group_depth(&self, ctx: &SecurityContext, group_id: Uuid, query: ListQuery) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
 
     // ── Membership lifecycle ────────────────────────────────────────
     async fn add_membership(&self, ctx: &SecurityContext, request: AddMembershipRequest) -> Result<ResourceGroupMembership, ResourceGroupError>;
@@ -205,16 +198,8 @@ Narrow hierarchy-only read contract used exclusively by AuthZ plugin.
 /// Used by AuthZ plugin — provides only hierarchy traversal, no memberships.
 #[async_trait]
 pub trait ResourceGroupReadHierarchy: Send + Sync {
-    /// Matches REST `GET /groups/{group_id}/descendants` with OData query.
-    async fn get_group_descendants(
-        &self,
-        ctx: &SecurityContext,
-        group_id: Uuid,
-        query: ListQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
-
-    /// Matches REST `GET /groups/{group_id}/ancestors` with OData query.
-    async fn get_group_ancestors(
+    /// Matches REST `GET /groups/{group_id}/hierarchy` with OData query.
+    async fn list_group_depth(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,
@@ -273,19 +258,14 @@ let ctx = SecurityContext::builder()
 
 // Hierarchy traversal — descendants
 let descendants = rg_hierarchy
-    .get_group_descendants(&ctx, group_id, ListQuery::default())
-    .await?;
-
-// Hierarchy traversal — ancestors
-let ancestors = rg_hierarchy
-    .get_group_ancestors(&ctx, group_id, ListQuery::default())
+    .list_group_depth(&ctx, group_id, ListQuery::filter("hierarchy/depth ge 0"))
     .await?;
 
 // Full CRUD — create group
 let group = rg
     .create_group(&ctx, CreateGroupRequest {
         id: None,
-        r#type: "gts.cf.core.rg.type.v1~y.system.tn.tenant.v1~".into(),
+        r#type: "gts.x.system.rg.type.v1~y.system.tn.tenant.v1~".into(),
         name: "Acme Corp".into(),
         parent_id: None,
         metadata: Default::default(),
@@ -297,6 +277,6 @@ let group = rg
 
 | Trait | Methods | Consumers | ClientHub key |
 |-------|---------|-----------|---------------|
-| `ResourceGroupClient` | 15 (full CRUD: types, groups, memberships, hierarchy) | Domain services, Apps, Admins | `dyn ResourceGroupClient` |
-| `ResourceGroupReadHierarchy` | 2 (`get_group_descendants`, `get_group_ancestors`) | AuthZ plugin | `dyn ResourceGroupReadHierarchy` |
-| `ResourceGroupReadPluginClient` | 1 + inherited (`list_memberships` + `get_group_descendants` + `get_group_ancestors`) | Vendor-specific plugin gateway | Scoped plugin resolution |
+| `ResourceGroupClient` | 14 (full CRUD: types, groups, memberships, hierarchy) | Domain services, Apps, Admins | `dyn ResourceGroupClient` |
+| `ResourceGroupReadHierarchy` | 1 (`list_group_depth`) | AuthZ plugin | `dyn ResourceGroupReadHierarchy` |
+| `ResourceGroupReadPluginClient` | 1 + inherited (`list_memberships` + `list_group_depth`) | Vendor-specific plugin gateway | Scoped plugin resolution |

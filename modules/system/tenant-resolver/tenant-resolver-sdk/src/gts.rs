@@ -45,3 +45,14 @@ use modkit::gts::BaseModkitPluginV1;
     properties = ""
 )]
 pub struct TenantResolverPluginSpecV1;
+
+/// GTS type path for the tenant resource group type.
+///
+/// This type path identifies RG groups that represent tenants.
+/// The tenant RG type is created externally (via API/config) with:
+/// - `is_tenant: true` (instances create their own tenant scope)
+/// - `can_be_root: true` (root tenants allowed)
+/// - `metadata_schema` with `status` (`TenantStatus`) and `self_managed` (barrier) fields
+///
+/// The `rg-tr-plugin` only reads groups of this type — it does not seed the type itself.
+pub const TENANT_RG_TYPE_PATH: &str = "gts.cf.core.rg.type.v1~x.system.tn.tenant.v1~";

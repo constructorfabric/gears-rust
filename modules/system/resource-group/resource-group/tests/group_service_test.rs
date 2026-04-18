@@ -1767,8 +1767,8 @@ async fn group_create_name_too_long() {
 // Metadata tests (TC-META-12..18)
 // =========================================================================
 
-/// TC-META-12: Group with metadata barrier stored/returned.
-/// metadata.barrier == true, DB JSONB matches.
+/// TC-META-12: Group with metadata self_managed stored/returned.
+/// metadata.self_managed == true, DB JSONB matches.
 #[tokio::test]
 async fn group_metadata_barrier_stored() {
     let db = common::test_db().await;
@@ -1779,7 +1779,7 @@ async fn group_metadata_barrier_stored() {
 
     let root_type = common::create_root_type(&type_svc, "org").await;
 
-    let meta = json!({"barrier": true});
+    let meta = json!({"self_managed": true});
     let group = group_svc
         .create_group(
             &ctx,
@@ -1795,7 +1795,7 @@ async fn group_metadata_barrier_stored() {
         .await
         .expect("create barrier group");
 
-    assert_eq!(group.metadata.as_ref().unwrap()["barrier"], true);
+    assert_eq!(group.metadata.as_ref().unwrap()["self_managed"], true);
 
     // Verify DB directly
     let conn = db.conn().expect("conn");
@@ -2027,7 +2027,7 @@ async fn group_metadata_barrier_in_hierarchy() {
                 type_path: child_type.code.clone(),
                 name: "BarrierChild".to_owned(),
                 parent_id: Some(root.id),
-                metadata: Some(json!({"barrier": true})),
+                metadata: Some(json!({"self_managed": true})),
             },
             tenant_id,
         )

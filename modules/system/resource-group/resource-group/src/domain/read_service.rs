@@ -86,14 +86,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 
     async fn get_group_ancestors(
         &self,
-        ctx: &SecurityContext,
+        _ctx: &SecurityContext,
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
-        // Ancestors use the scoped path (not bypassed) — AuthZ plugin
-        // only needs descendants for hierarchy resolution.
+        // Bypass AuthZ — use unscoped method (AccessScope::allow_all).
+        // Tenant-resolver plugin needs full ancestor visibility regardless
+        // of caller's tenant scope. Confirmed: TR plugins ignore SecurityContext
+        // (Acronis/Virtuozzo, 2026-04-17).
         self.group_service
-            .get_group_ancestors(ctx, group_id, query)
+            .get_group_ancestors_unscoped(group_id, query)
             .await
             .map_err(ResourceGroupError::from)
     }

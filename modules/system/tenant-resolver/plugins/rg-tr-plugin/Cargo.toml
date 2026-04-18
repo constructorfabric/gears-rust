@@ -1,0 +1,52 @@
+[package]
+name = "cf-rg-tr-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Tenant resolver plugin with RG hierarchy resolution"
+repository.workspace = true
+readme = "README.md"
+keywords = ["cyberfabric", "cyberfabric-system", "tenant-resolver"]
+categories = ["authentication"]
+
+[lib]
+name = "rg_tr_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+tenant-resolver-sdk = { package = "cf-tenant-resolver-sdk", version = "0.2.17", path = "../../tenant-resolver-sdk" }
+resource-group-sdk = { package = "cf-resource-group-sdk", version = "0.1.0", path = "../../../resource-group/resource-group-sdk" }
+types-registry-sdk = { package = "cf-types-registry-sdk", version = "0.1.5", path = "../../../types-registry/types-registry-sdk" }
+
+# ModKit dependencies
+modkit = { workspace = true }
+modkit-macros = { workspace = true }
+modkit-security = { workspace = true }
+modkit-odata = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Data structures
+uuid = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Required by modkit::module macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

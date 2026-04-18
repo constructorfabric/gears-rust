@@ -124,7 +124,7 @@ async def test_dto_roundtrip_group_json_shape(
     """
     type_data = await create_type("s2dto")
     group = await create_group(
-        type_data["code"], "S2 DTO Test", metadata={"barrier": True},
+        type_data["code"], "S2 DTO Test", metadata={"self_managed": True},
     )
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
@@ -143,7 +143,7 @@ async def test_dto_roundtrip_group_json_shape(
         f"Unexpected top-level keys: {set(data.keys()) - allowed_top_keys}"
     )
     assert "metadata" in data
-    assert data["metadata"] == {"barrier": True}
+    assert data["metadata"] == {"self_managed": True}
 
     # "type" key (NOT legacy "type_path" or "gts_type_id")
     assert "type" in data
@@ -634,7 +634,7 @@ async def test_barrier_metadata_in_descendants(
 
     RG does NOT filter barriers -- it returns all descendants with metadata.
     This verifies the data contract that AuthZ plugins rely on:
-    barrier groups have metadata.barrier = true, descendants are present.
+    barrier groups have metadata.self_managed = true, descendants are present.
     The AuthZ plugin (not RG) is responsible for excluding barrier subtrees.
     """
     root_type = await create_type("s12root")
@@ -648,7 +648,7 @@ async def test_barrier_metadata_in_descendants(
     root = await create_group(root_type["code"], "S12 Root")
     barrier = await create_group(
         child_type["code"], "S12 Barrier",
-        parent_id=root["id"], metadata={"barrier": True},
+        parent_id=root["id"], metadata={"self_managed": True},
     )
     behind = await create_group(
         gc_type["code"], "S12 Behind",
@@ -676,13 +676,13 @@ async def test_barrier_metadata_in_descendants(
         assert normal["id"] in ids, "normal missing"
         assert len(items) == 4
 
-        # Barrier group has metadata.barrier = true
+        # Barrier group has metadata.self_managed = true
         barrier_item = next(i for i in items if i["id"] == barrier["id"])
-        assert barrier_item.get("metadata", {}).get("barrier") is True, (
-            f"barrier metadata expected, got: {barrier_item.get('metadata')}"
+        assert barrier_item.get("metadata", {}).get("self_managed") is True, (
+            f"self_managed metadata expected, got: {barrier_item.get('metadata')}"
         )
 
-        # Non-barrier groups do NOT have barrier metadata
+        # Non-barrier groups do NOT have self_managed metadata
         normal_item = next(i for i in items if i["id"] == normal["id"])
         normal_meta = normal_item.get("metadata")
-        assert normal_meta is None or normal_meta.get("barrier") is not True
+        assert normal_meta is None or normal_meta.get("self_managed") is not True

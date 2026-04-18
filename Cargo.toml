@@ -73,6 +73,7 @@ members = [
     "modules/system/tenant-resolver/tenant-resolver",
     "modules/system/tenant-resolver/plugins/static-tr-plugin",
     "modules/system/tenant-resolver/plugins/single-tenant-tr-plugin",
+    "modules/system/tenant-resolver/plugins/rg-tr-plugin",
     "modules/system/authn-resolver/authn-resolver-sdk",
     "modules/system/authn-resolver/authn-resolver",
     "modules/system/authn-resolver/plugins/static-authn-plugin",

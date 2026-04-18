@@ -79,7 +79,7 @@ fn tenant_entity_schema() -> serde_json::Value {
             "id": { "type": "string", "format": "uuid" },
             "name": { "type": "string", "minLength": 1, "maxLength": 255 },
             "custom_domain": { "type": "string", "format": "hostname" },
-            "barrier": { "type": "boolean", "default": false }
+            "self_managed": { "type": "boolean", "default": false }
         }
     })
 }
@@ -162,7 +162,7 @@ fn tenant_rg_type() -> serde_json::Value {
                         "additionalProperties": false,
                         "properties": {
                             "custom_domain": { "type": "string", "format": "hostname" },
-                            "barrier": { "type": "boolean", "default": false }
+                            "self_managed": { "type": "boolean", "default": false }
                         }
                     }
                 },
@@ -317,7 +317,7 @@ async fn test_chained_tenant_has_inline_metadata_schema() {
     // Verify inline metadata properties exist
     let meta_props = &override_block["properties"]["metadata"]["properties"];
     assert!(meta_props["custom_domain"].is_object());
-    assert!(meta_props["barrier"].is_object());
+    assert!(meta_props["self_managed"].is_object());
 }
 
 #[tokio::test]
@@ -442,12 +442,12 @@ async fn test_valid_tenant_with_metadata_barrier() {
         "parent_id": "11111111-1111-1111-1111-111111111111",
         "tenant_id": "77777777-7777-7777-7777-777777777777",
         "depth": 1,
-        "metadata": { "barrier": true }
+        "metadata": { "self_managed": true }
     });
     let results = service.register(vec![t7]);
     assert!(
         results[0].is_ok(),
-        "Tenant with metadata.barrier: {:?}",
+        "Tenant with metadata.self_managed: {:?}",
         results[0]
     );
 }
@@ -659,7 +659,7 @@ async fn test_top_level_custom_field_passes_gts_but_app_layer_rejects() {
         "parent_id": null,
         "tenant_id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
         "depth": 0,
-        "barrier": true
+        "self_managed": true
     });
     // GTS accepts (open model), RG module would strip/reject at app layer
     assert!(
@@ -748,7 +748,7 @@ async fn test_full_hierarchy_batch() {
             "id": "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~x.core._.t7.v1",
             "name": "T7", "parent_id": "11111111-1111-1111-1111-111111111111",
             "tenant_id": "77777777-7777-7777-7777-777777777777", "depth": 1,
-            "metadata": { "barrier": true }
+            "metadata": { "self_managed": true }
         }),
         json!({
             "id": "gts.x.core.rg.type.v1~w.core.org.department.v1~x.core._.d8.v1",

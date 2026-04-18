@@ -14,16 +14,16 @@ Demonstrates how an AuthZ plugin integrates with the RG module via `ResourceGrou
 
 1. **Tenant resolution** — extracts `tenant_id` from `TenantContext.root_id` or `subject.properties["tenant_id"]`
 2. **Hierarchy query** — calls `get_group_descendants(tenant_id)` via `ResourceGroupReadHierarchy` (resolved from ClientHub)
-3. **Barrier filtering** — walks the parent chain in memory; barrier groups (`metadata.barrier = true`) and all their descendants are excluded from the visible scope
+3. **Barrier filtering** — walks the parent chain in memory; barrier groups (`metadata.self_managed = true`) and all their descendants are excluded from the visible scope
 4. **Predicate generation** — returns `In(owner_tenant_id, [visible_tenant_ids])` for tenant scoping, plus optional `InGroup` / `InGroupSubtree` predicates when group context is present in the request
 
 ### Barrier Semantics
 
-A **barrier** is a tenant group with `metadata.barrier = true` (equivalent to `self_managed = true` in the tenant model). A barrier creates an isolation boundary: the parent tenant cannot see resources belonging to the barrier tenant or any of its descendants.
+A **barrier** is a tenant group with `metadata.self_managed = true`. A barrier creates an isolation boundary: the parent tenant cannot see resources belonging to the barrier tenant or any of its descendants.
 
 This is critical for multi-tenant SaaS platforms where a sub-tenant manages its own data independently. For example, a reseller (T1) provisions a self-managed customer (T7). T7's data is invisible to T1 even though T7 is in T1's hierarchy.
 
-**Algorithm:** after fetching the full descendant tree from RG, the plugin walks each group's `parent_id` chain. If any ancestor in the chain has `metadata.barrier = true`, the group is excluded from the visible scope.
+**Algorithm:** after fetching the full descendant tree from RG, the plugin walks each group's `parent_id` chain. If any ancestor in the chain has `metadata.self_managed = true` (barrier), the group is excluded from the visible scope.
 
 This mirrors the planned `tenant_closure.barrier` column behavior where `barrier = 1` means a barrier exists **on the path** between ancestor and descendant (not at the ancestor itself).
 
@@ -32,7 +32,7 @@ This mirrors the planned `tenant_closure.barrier` column behavior where `barrier
 ```
 T1 (root tenant)
 ├── T2 (normal department)       -- visible to T1
-├── T7 (barrier=true, reseller)  -- NOT visible to T1
+├── T7 (self_managed=true, reseller)  -- NOT visible to T1
 │   └── T8 (T7's customer)      -- NOT visible to T1 (behind barrier)
 └── T9 (normal branch)           -- visible to T1
 ```

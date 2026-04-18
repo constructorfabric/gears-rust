@@ -1929,6 +1929,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-rg-tr-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-modkit",
+ "cf-modkit-macros",
+ "cf-modkit-odata",
+ "cf-modkit-security",
+ "cf-resource-group-sdk",
+ "cf-tenant-resolver-sdk",
+ "cf-types-registry-sdk",
+ "futures",
+ "inventory",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-rustracing"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3940,6 +3962,7 @@ dependencies = [
  "cf-oagw",
  "cf-resource-group",
  "cf-rg-authz-plugin",
+ "cf-rg-tr-plugin",
  "cf-simple-user-settings",
  "cf-single-tenant-tr-plugin",
  "cf-static-authn-plugin",

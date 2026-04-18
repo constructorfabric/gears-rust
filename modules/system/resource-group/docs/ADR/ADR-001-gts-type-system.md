@@ -1,4 +1,3 @@
-<!-- Updated: 2026-04-16 by Constructor Tech -->
 ---
 status: accepted
 date: 2026-03-16
@@ -24,16 +23,16 @@ decision-makers: Constructor Tech
   - [Key Rules](#key-rules)
 - [Type Map](#type-map)
 - [Schemas](#schemas)
-  - [RG Type Contract — `gts.cf.core.rg.type.v1~`](#rg-type-contract--gtscfcorergtypev1)
+  - [RG Type Contract — `gts.x.core.rg.type.v1~`](#rg-type-contract--gtsxcorergtypev1)
   - [Tenant — `gts.y.core.tn.tenant.v1~`](#tenant--gtsycoretntenantv1)
   - [Department — `gts.w.core.org.department.v1~`](#department--gtswcoreorgdepartmentv1)
-  - [Branch — `gts.cf.core.rg.branch.v1~`](#branch--gtscfcorergbranchv1)
+  - [Branch — `gts.x.core.rg.branch.v1~`](#branch--gtsxcorergbranchv1)
   - [User — `gts.z.core.idp.user.v1~`](#user--gtszcoreidpuserv1)
   - [Course — `gts.z.core.lms.course.v1~`](#course--gtszcorelmscoursev1)
 - [Chained RG Type Schemas](#chained-rg-type-schemas)
-  - [Tenant as RG Type — `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~`](#tenant-as-rg-type--gtscfcorergtypev1ycoretntenantv1)
-  - [Department as RG Type — `gts.cf.core.rg.type.v1~w.core.org.department.v1~`](#department-as-rg-type--gtscfcorergtypev1wcoreorgdepartmentv1)
-  - [Branch as RG Type — `gts.cf.core.rg.type.v1~x.core.rg.branch.v1~`](#branch-as-rg-type--gtscfcorergtypev1xcorergbranchv1)
+  - [Tenant as RG Type — `gts.x.core.rg.type.v1~y.core.tn.tenant.v1~`](#tenant-as-rg-type--gtsxcorergtypev1ycoretntenantv1)
+  - [Department as RG Type — `gts.x.core.rg.type.v1~w.core.org.department.v1~`](#department-as-rg-type--gtsxcorergtypev1wcoreorgdepartmentv1)
+  - [Branch as RG Type — `gts.x.core.rg.type.v1~x.core.rg.branch.v1~`](#branch-as-rg-type--gtsxcorergtypev1xcorergbranchv1)
 - [Instance Examples](#instance-examples)
   - [Tenant T1 (root)](#tenant-t1-root)
   - [Department D2 (under T1)](#department-d2-under-t1)
@@ -62,7 +61,7 @@ The Resource Group (RG) module needs a type identification standard for its hier
 * Cross-vendor composability — types defined by different vendors (tenant, department, user) must compose into a single hierarchy
 * DB-enforced referential integrity — type relationships (allowed parents, allowed memberships) must be enforced at the database level, not just application code
 * Compact storage — the type system must scale to millions of groups without storage overhead from long string type identifiers in every row
-* Separation of concerns — type-level metadata (topology rules like `can_be_root`, `allowed_parent_types`) must be distinct from instance-level data (group fields like `name`, `barrier`)
+* Separation of concerns — type-level metadata (topology rules like `can_be_root`, `allowed_parents`) must be distinct from instance-level data (group fields like `name`, `barrier`)
 * Alignment with platform type conventions — RG should use the same type system as other CyberFabric modules
 
 ## Considered Options
@@ -77,7 +76,7 @@ Chosen option: "GTS with traits pattern", because it is the only option that pro
 
 ### Consequences
 
-* RG types use chained GTS identifiers: `gts.cf.core.rg.type.v1~<derived>~`
+* RG types use chained GTS identifiers: `gts.x.core.rg.type.v1~<derived>~`
 * SMALLINT surrogate keys and junction tables (`gts_type_allowed_parent`, `gts_type_allowed_membership`) enforce type relationships at DB level
 * `x-gts-traits-schema` on the base contract defines type-level metadata shape; `x-gts-traits` on each chained type provides concrete values
 * **Base contract MUST include `x-gts-traits` with defaults** alongside `x-gts-traits-schema` — the `gts` crate enforces this (see [Finding 1](#finding-1-x-gts-traits-mandatory-on-base-contract))
@@ -137,25 +136,25 @@ Chosen option: "GTS with traits pattern", because it is the only option that pro
 
 | GTS Type Path | Kind | Vendor |
 |---|---|---|
-| `gts.cf.core.rg.type.v1~` | RG base contract | x (platform) |
+| `gts.x.core.rg.type.v1~` | RG base contract | x (platform) |
 | `gts.y.core.tn.tenant.v1~` | entity type | y (tenant service) |
 | `gts.w.core.org.department.v1~` | entity type | w (org service) |
-| `gts.cf.core.rg.branch.v1~` | entity type | x (platform) |
+| `gts.x.core.rg.branch.v1~` | entity type | x (platform) |
 | `gts.z.core.idp.user.v1~` | resource type | z (IDP) |
 | `gts.z.core.lms.course.v1~` | resource type | z (LMS) |
-| `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` | chained RG type | x + y |
-| `gts.cf.core.rg.type.v1~w.core.org.department.v1~` | chained RG type | x + w |
-| `gts.cf.core.rg.type.v1~x.core.rg.branch.v1~` | chained RG type | x + x |
+| `gts.x.core.rg.type.v1~y.core.tn.tenant.v1~` | chained RG type | x + y |
+| `gts.x.core.rg.type.v1~w.core.org.department.v1~` | chained RG type | x + w |
+| `gts.x.core.rg.type.v1~x.core.rg.branch.v1~` | chained RG type | x + x |
 
 ## Schemas
 
-### RG Type Contract — `gts.cf.core.rg.type.v1~`
+### RG Type Contract — `gts.x.core.rg.type.v1~`
 
 Base contract for all RG type definitions. Traits define topology rules; properties define instance fields.
 
 ```json
 {
-  "$id": "gts://gts.cf.core.rg.type.v1~",
+  "$id": "gts://gts.x.core.rg.type.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Resource Group Type",
   "type": "object",
@@ -168,18 +167,13 @@ Base contract for all RG type definitions. Traits define topology rules; propert
         "description": "Whether this type permits root placement (no parent_id).",
         "default": false
       },
-      "is_tenant": {
-        "type": "boolean",
-        "description": "Whether instances create their own tenant scope (tenant_id = group.id). Default false.",
-        "default": false
-      },
-      "allowed_parent_types": {
+      "allowed_parents": {
         "type": "array",
-        "items": { "type": "string", "x-gts-ref": "gts.cf.core.rg.type.v1~" },
+        "items": { "type": "string", "x-gts-ref": "gts.x.core.rg.type.v1~" },
         "description": "Well-known instances of allowed parent RG types.",
         "default": []
       },
-      "allowed_membership_types": {
+      "allowed_memberships": {
         "type": "array",
         "items": { "type": "string", "x-gts-ref": "gts.*" },
         "description": "GTS type identifiers of resource types allowed as members.",
@@ -189,8 +183,8 @@ Base contract for all RG type definitions. Traits define topology rules; propert
   },
   "x-gts-traits": {
     "can_be_root": false,
-    "allowed_parent_types": [],
-    "allowed_membership_types": []
+    "allowed_parents": [],
+    "allowed_memberships": []
   },
   "required": ["id", "name"],
   "properties": {
@@ -227,7 +221,7 @@ Base contract for all RG type definitions. Traits define topology rules; propert
     }
   },
   "x-gts-constraints": {
-    "placement-invariant": "can_be_root OR len(allowed_parent_types) >= 1"
+    "placement-invariant": "can_be_root OR len(allowed_parents) >= 1"
   }
 }
 ```
@@ -245,7 +239,7 @@ Base contract for all RG type definitions. Traits define topology rules; propert
     "id": { "type": "string", "format": "uuid" },
     "name": { "type": "string", "minLength": 1, "maxLength": 255 },
     "custom_domain": { "type": "string", "format": "hostname" },
-    "barrier": { "type": "boolean", "default": false }
+    "self_managed": { "type": "boolean", "default": false }
   }
 }
 ```
@@ -267,11 +261,11 @@ Base contract for all RG type definitions. Traits define topology rules; propert
 }
 ```
 
-### Branch — `gts.cf.core.rg.branch.v1~`
+### Branch — `gts.x.core.rg.branch.v1~`
 
 ```json
 {
-  "$id": "gts://gts.cf.core.rg.branch.v1~",
+  "$id": "gts://gts.x.core.rg.branch.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Branch",
   "type": "object",
@@ -322,14 +316,14 @@ Base contract for all RG type definitions. Traits define topology rules; propert
 
 When a type is registered as an RG type, it chains with the base contract via a **single `$ref`** and provides: (1) trait values via `x-gts-traits`, and (2) type-specific fields via inline `properties.metadata` override. Entity schemas (e.g. `gts.y.core.tn.tenant.v1~`) are registered in GTS for reference but are **NOT `$ref`'d** from chained types — the `metadata` properties are defined inline. The `metadata` sub-object uses `additionalProperties: false` to reject unknown fields (see [Finding 3](#finding-3-entity-specific-field-validation-at-gts-level-via-metadata-object)).
 
-### Tenant as RG Type — `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~`
+### Tenant as RG Type — `gts.x.core.rg.type.v1~y.core.tn.tenant.v1~`
 
 ```json
 {
-  "$id": "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~",
+  "$id": "gts://gts.x.core.rg.type.v1~y.core.tn.tenant.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
   "allOf": [
-    { "$ref": "gts://gts.cf.core.rg.type.v1~" },
+    { "$ref": "gts://gts.x.core.rg.type.v1~" },
     {
       "properties": {
         "metadata": {
@@ -337,15 +331,14 @@ When a type is registered as an RG type, it chains with the base contract via a 
           "additionalProperties": false,
           "properties": {
             "custom_domain": { "type": "string", "format": "hostname" },
-            "barrier": { "type": "boolean", "default": false }
+            "self_managed": { "type": "boolean", "default": false }
           }
         }
       },
       "x-gts-traits": {
         "can_be_root": true,
-        "is_tenant": true,
-        "allowed_parent_types": ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"],
-        "allowed_membership_types": ["gts.z.core.idp.user.v1~"]
+        "allowed_parents": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
+        "allowed_memberships": ["gts.z.core.idp.user.v1~"]
       }
     }
   ]
@@ -357,14 +350,14 @@ When a type is registered as an RG type, it chains with the base contract via a 
 - Members: users
 - Instance `metadata` fields: `custom_domain` (hostname), `barrier` (boolean)
 
-### Department as RG Type — `gts.cf.core.rg.type.v1~w.core.org.department.v1~`
+### Department as RG Type — `gts.x.core.rg.type.v1~w.core.org.department.v1~`
 
 ```json
 {
-  "$id": "gts://gts.cf.core.rg.type.v1~w.core.org.department.v1~",
+  "$id": "gts://gts.x.core.rg.type.v1~w.core.org.department.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
   "allOf": [
-    { "$ref": "gts://gts.cf.core.rg.type.v1~" },
+    { "$ref": "gts://gts.x.core.rg.type.v1~" },
     {
       "properties": {
         "metadata": {
@@ -378,8 +371,8 @@ When a type is registered as an RG type, it chains with the base contract via a 
       },
       "x-gts-traits": {
         "can_be_root": false,
-        "allowed_parent_types": ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"],
-        "allowed_membership_types": ["gts.z.core.idp.user.v1~"]
+        "allowed_parents": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
+        "allowed_memberships": ["gts.z.core.idp.user.v1~"]
       }
     }
   ]
@@ -391,14 +384,14 @@ When a type is registered as an RG type, it chains with the base contract via a 
 - Members: users
 - Instance `metadata` fields: `category` (maxLength: 100), `short_description` (maxLength: 500)
 
-### Branch as RG Type — `gts.cf.core.rg.type.v1~x.core.rg.branch.v1~`
+### Branch as RG Type — `gts.x.core.rg.type.v1~x.core.rg.branch.v1~`
 
 ```json
 {
-  "$id": "gts://gts.cf.core.rg.type.v1~x.core.rg.branch.v1~",
+  "$id": "gts://gts.x.core.rg.type.v1~x.core.rg.branch.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
   "allOf": [
-    { "$ref": "gts://gts.cf.core.rg.type.v1~" },
+    { "$ref": "gts://gts.x.core.rg.type.v1~" },
     {
       "properties": {
         "metadata": {
@@ -411,8 +404,8 @@ When a type is registered as an RG type, it chains with the base contract via a 
       },
       "x-gts-traits": {
         "can_be_root": false,
-        "allowed_parent_types": ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"],
-        "allowed_membership_types": ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
+        "allowed_parents": ["gts.x.core.rg.type.v1~w.core.org.department.v1~"],
+        "allowed_memberships": ["gts.z.core.idp.user.v1~", "gts.z.core.lms.course.v1~"]
       }
     }
   ]
@@ -433,7 +426,7 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
 ```json
 {
   "id": "11111111-1111-1111-1111-111111111111",
-  "type": "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~",
+  "type": "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~",
   "name": "T1",
   "parent_id": null,
   "tenant_id": "11111111-1111-1111-1111-111111111111",
@@ -446,7 +439,7 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
 ```json
 {
   "id": "22222222-2222-2222-2222-222222222222",
-  "type": "gts.cf.core.rg.type.v1~w.core.org.department.v1~",
+  "type": "gts.x.core.rg.type.v1~w.core.org.department.v1~",
   "name": "D2",
   "parent_id": "11111111-1111-1111-1111-111111111111",
   "tenant_id": "11111111-1111-1111-1111-111111111111",
@@ -463,7 +456,7 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
 ```json
 {
   "id": "33333333-3333-3333-3333-333333333333",
-  "type": "gts.cf.core.rg.type.v1~x.core.rg.branch.v1~",
+  "type": "gts.x.core.rg.type.v1~x.core.rg.branch.v1~",
   "name": "B3",
   "parent_id": "22222222-2222-2222-2222-222222222222",
   "tenant_id": "11111111-1111-1111-1111-111111111111",
@@ -479,13 +472,13 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
 ```json
 {
   "id": "77777777-7777-7777-7777-777777777777",
-  "type": "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~",
+  "type": "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~",
   "name": "T7",
   "parent_id": "11111111-1111-1111-1111-111111111111",
   "tenant_id": "77777777-7777-7777-7777-777777777777",
   "depth": 1,
   "metadata": {
-    "barrier": true
+    "self_managed": true
   }
 }
 ```
@@ -495,7 +488,7 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
 ```json
 {
   "id": "99999999-9999-9999-9999-999999999999",
-  "type": "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~",
+  "type": "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~",
   "name": "T9",
   "parent_id": null,
   "tenant_id": "99999999-9999-9999-9999-999999999999",
@@ -511,7 +504,7 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
 ```json
 {
   "id": "88888888-8888-8888-8888-888888888888",
-  "type": "gts.cf.core.rg.type.v1~w.core.org.department.v1~",
+  "type": "gts.x.core.rg.type.v1~w.core.org.department.v1~",
   "name": "D8",
   "parent_id": "77777777-7777-7777-7777-777777777777",
   "tenant_id": "77777777-7777-7777-7777-777777777777",
@@ -541,7 +534,7 @@ tenant T9 (depth 0) {metadata: {custom_domain: "t9.example.com"}}
 ```
 
 Notes:
-- T7 has `metadata.barrier: true` — RG stores it in metadata JSONB. Tenant Resolver (`BarrierMode`) + AuthZ enforce it
+- T7 has `metadata.self_managed: true` — RG stores it in metadata JSONB. Tenant Resolver (`BarrierMode`) + AuthZ enforce it
 - R4 appears twice: as **course** in B3 and as **user** in T1 (different `gts_type_id`)
 - R8 appears twice: as **user** in D8 and T7 (same type, two group memberships)
 
@@ -549,7 +542,7 @@ Notes:
 
 | Table | Description |
 |---|---|
-| `gts_type` | GTS type definitions (SMALLINT id PK, schema_id UNIQUE, metadata_schema JSONB). `can_be_root` and `is_tenant` resolved at runtime from `x-gts-traits` in the registered GTS schema. |
+| `gts_type` | GTS type definitions (SMALLINT id PK, schema_id UNIQUE, metadata_schema JSONB). `can_be_root` resolved at runtime from `x-gts-traits` in the registered GTS schema. |
 | `gts_type_allowed_parent` | Junction: type_id → parent_type_id (both SMALLINT FK) |
 | `gts_type_allowed_membership` | Junction: type_id → membership_type_id (both SMALLINT FK) |
 | `resource_group` | Groups (UUID id, gts_type_id SMALLINT FK, name, metadata JSONB, parent_id UUID FK, tenant_id UUID) |
@@ -569,7 +562,7 @@ Key design choices:
 
 ### Finding 1: `x-gts-traits` mandatory on base contract
 
-**Problem**: The original base contract schema (`gts.cf.core.rg.type.v1~`) defined `x-gts-traits-schema` (the shape of traits) but did not include `x-gts-traits` (concrete trait values). The `gts` crate (v0.8.4) rejects this at `switch_to_ready()` validation:
+**Problem**: The original base contract schema (`gts.x.core.rg.type.v1~`) defined `x-gts-traits-schema` (the shape of traits) but did not include `x-gts-traits` (concrete trait values). The `gts` crate (v0.8.4) rejects this at `switch_to_ready()` validation:
 
 ```
 Entity defines x-gts-traits-schema but no x-gts-traits values are provided
@@ -582,9 +575,8 @@ Entity defines x-gts-traits-schema but no x-gts-traits values are provided
 ```json
 "x-gts-traits": {
   "can_be_root": false,
-  "is_tenant": false,
-  "allowed_parent_types": [],
-  "allowed_membership_types": []
+  "allowed_parents": [],
+  "allowed_memberships": []
 }
 ```
 
@@ -620,10 +612,10 @@ Expected format: vendor.package.namespace.type.vMAJOR[.MINOR]
 
 | Where in RG | Format | Example | Valid? |
 |-------------|--------|---------|--------|
-| `gts_type.schema_id` (DB) | Type path, ends with `~` | `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` | Yes — each segment is 4 tokens + version |
+| `gts_type.schema_id` (DB) | Type path, ends with `~` | `gts.x.core.rg.type.v1~y.core.tn.tenant.v1~` | Yes — each segment is 4 tokens + version |
 | `resource_group.id` (DB) | UUID | `11111111-1111-1111-1111-111111111111` | N/A — not a GTS ID |
 | `resource_group.gts_type_id` (DB) | SMALLINT FK | `3` | N/A — internal surrogate |
-| API response `type` field | Same as `gts_type.schema_id` | `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` | Yes |
+| API response `type` field | Same as `gts_type.schema_id` | `gts.x.core.rg.type.v1~y.core.tn.tenant.v1~` | Yes |
 | `resource_group_membership.resource_id` (DB) | Opaque TEXT | `user-uuid-here` | N/A — not a GTS ID |
 
 **No contradictions with migration.sql**: The `gts_type_path` domain regex in `migration.sql` already enforces the 4-token rule per segment via:
@@ -636,7 +628,7 @@ Expected format: vendor.package.namespace.type.vMAJOR[.MINOR]
 
 This matches exactly 4 name tokens per segment — the DB constraint and the `gts` crate are consistent.
 
-**Test artifact note**: The unit tests in `rg_gts_type_system_tests.rs` use well-known GTS instance IDs (e.g. `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~x.core._.t1.v1`) to register test instances in the types-registry. The `x.core._.t1.v1` segment format (with `_` as namespace placeholder) is needed only for these test-level well-known instances. **RG itself never constructs such IDs** — resource groups are anonymous instances with UUID `id` and a `type` field pointing to a type path. The `_` placeholder format is documented here for completeness in case future code needs to construct well-known instances.
+**Test artifact note**: The unit tests in `rg_gts_type_system_tests.rs` use well-known GTS instance IDs (e.g. `gts.x.core.rg.type.v1~y.core.tn.tenant.v1~x.core._.t1.v1`) to register test instances in the types-registry. The `x.core._.t1.v1` segment format (with `_` as namespace placeholder) is needed only for these test-level well-known instances. **RG itself never constructs such IDs** — resource groups are anonymous instances with UUID `id` and a `type` field pointing to a type path. The `_` placeholder format is documented here for completeness in case future code needs to construct well-known instances.
 
 ---
 
@@ -653,7 +645,7 @@ This matches exactly 4 name tokens per segment — the DB constraint and the `gt
 
 ```json
 "allOf": [
-  { "$ref": "gts://gts.cf.core.rg.type.v1~" },
+  { "$ref": "gts://gts.x.core.rg.type.v1~" },
   {
     "properties": {
       "metadata": {
@@ -675,7 +667,7 @@ This matches exactly 4 name tokens per segment — the DB constraint and the `gt
 - Chained type narrows `metadata` via `allOf` merge — `additionalProperties: false` applies only within the `metadata` sub-object
 - Unknown metadata fields rejected (e.g. `metadata: {foo: "bar"}` → error)
 - Entity-specific constraints enforced (e.g. `metadata.category` maxLength: 100 → validated)
-- Top-level field isolation: `metadata.barrier` can never clash with a future base field `barrier`
+- Top-level field isolation: `metadata.self_managed` can never clash with a future base field `barrier`
 
 **Test results** (33 tests, all passing):
 
@@ -683,9 +675,9 @@ This matches exactly 4 name tokens per segment — the DB constraint and the `gt
 |-----------|----------|--------|
 | Department `metadata.category` 101 chars | rejected | rejected |
 | Department `metadata.short_description` 501 chars | rejected | rejected |
-| Tenant `metadata.barrier: "yes"` (string) | rejected | rejected |
+| Tenant `metadata.self_managed: "yes"` (string) | rejected | rejected |
 | Tenant `metadata: {foo: "bar"}` (unknown field) | rejected | rejected |
-| Tenant `metadata.barrier: true` | accepted | accepted |
+| Tenant `metadata.self_managed: true` | accepted | accepted |
 | Tenant `metadata.custom_domain: "t9.example.com"` | accepted | accepted |
 | Branch `metadata.location: "..."` | accepted | accepted |
 | Top-level `barrier: true` (no metadata wrapper) | accepted by GTS* | accepted* |

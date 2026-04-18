@@ -558,6 +558,22 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await
     }
 
+    /// Get ancestors without AuthZ enforcement (private API, no tenant scoping).
+    ///
+    /// Used by `ResourceGroupReadHierarchy` consumers (e.g., tenant-resolver plugin)
+    /// that need full ancestor visibility regardless of the caller's tenant scope.
+    pub async fn get_group_ancestors_unscoped(
+        &self,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
+        let conn = self.db.conn()?;
+        let scope = modkit_security::AccessScope::allow_all();
+        self.group_repo
+            .get_ancestors(&conn, &scope, group_id, query)
+            .await
+    }
+
     // -- Transaction-inner implementations --
 
     /// Inner logic for `create_group`, runs inside a SERIALIZABLE transaction.

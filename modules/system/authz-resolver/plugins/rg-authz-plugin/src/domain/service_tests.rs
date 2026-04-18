@@ -170,7 +170,7 @@ async fn barrier_tenant_and_descendants_excluded() {
                 t_barrier,
                 Some(t1),
                 1,
-                Some(serde_json::json!({"barrier": true})),
+                Some(serde_json::json!({"self_managed": true})),
             ),
             make_group(t_behind, Some(t_barrier), 2, None),
         ],
