@@ -141,7 +141,10 @@ async fn get_tenant_not_found() {
     let svc = service_with(mock);
 
     let err = svc.get_tenant(&ctx(), TenantId(Uuid::now_v7())).await;
-    assert!(matches!(err, Err(TenantResolverError::TenantNotFound { .. })));
+    assert!(matches!(
+        err,
+        Err(TenantResolverError::TenantNotFound { .. })
+    ));
 }
 
 // -- get_tenants tests --
@@ -512,10 +515,7 @@ async fn is_ancestor_barrier_descendant_returns_false() {
         )
         .await
         .unwrap();
-    assert!(
-        !result,
-        "barrier descendant blocks ancestor claim"
-    );
+    assert!(!result, "barrier descendant blocks ancestor claim");
 }
 
 // -- RG error handling --

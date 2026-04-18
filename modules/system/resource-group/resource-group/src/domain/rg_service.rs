@@ -13,9 +13,8 @@ use modkit_security::SecurityContext;
 use resource_group_sdk::ResourceGroupClient;
 use resource_group_sdk::error::ResourceGroupError;
 use resource_group_sdk::models::{
-    CreateGroupRequest, CreateTypeRequest, ResourceGroup,
-    ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
-    UpdateTypeRequest,
+    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupMembership,
+    ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
 };
 use uuid::Uuid;
 

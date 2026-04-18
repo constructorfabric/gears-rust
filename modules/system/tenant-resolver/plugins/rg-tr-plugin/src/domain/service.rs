@@ -77,7 +77,9 @@ impl Service {
         barrier_mode: BarrierMode,
     ) -> Result<(TenantRef, Vec<TenantRef>), TenantResolverError> {
         let query = self.build_type_filter_query();
-        let items = self.drain_hierarchy_pages(ctx, id.0, &query, Direction::Ancestors).await?;
+        let items = self
+            .drain_hierarchy_pages(ctx, id.0, &query, Direction::Ancestors)
+            .await?;
 
         // Split: depth=0 is the tenant, depth<0 are ancestors
         let tenant_group = items
@@ -88,16 +90,12 @@ impl Service {
         let tenant_ref = map_to_tenant_ref(tenant_group);
 
         // Ancestors ordered by depth ascending (direct parent first = depth -1, then -2, etc.)
-        let mut ancestors: Vec<&ResourceGroupWithDepth> = items
-            .iter()
-            .filter(|g| g.hierarchy.depth < 0)
-            .collect();
+        let mut ancestors: Vec<&ResourceGroupWithDepth> =
+            items.iter().filter(|g| g.hierarchy.depth < 0).collect();
         ancestors.sort_by_key(|g| std::cmp::Reverse(g.hierarchy.depth)); // -1, -2, -3...
 
-        let ancestor_refs: Vec<TenantRef> = ancestors
-            .iter()
-            .map(|g| map_to_tenant_ref(g))
-            .collect();
+        let ancestor_refs: Vec<TenantRef> =
+            ancestors.iter().map(|g| map_to_tenant_ref(g)).collect();
 
         // Apply barrier filtering
         let filtered = filter_ancestors_by_barrier(&tenant_ref, ancestor_refs, barrier_mode);
@@ -118,8 +116,9 @@ impl Service {
         max_depth: Option<u32>,
     ) -> Result<(TenantRef, Vec<TenantRef>), TenantResolverError> {
         let query = self.build_type_filter_query();
-        let items =
-            self.drain_hierarchy_pages(ctx, id.0, &query, Direction::Descendants).await?;
+        let items = self
+            .drain_hierarchy_pages(ctx, id.0, &query, Direction::Descendants)
+            .await?;
 
         // Split: depth=0 is the tenant, depth>0 are descendants
         let tenant_group = items
@@ -129,10 +128,8 @@ impl Service {
 
         let tenant_ref = map_to_tenant_ref(tenant_group);
 
-        let descendants: Vec<&ResourceGroupWithDepth> = items
-            .iter()
-            .filter(|g| g.hierarchy.depth > 0)
-            .collect();
+        let descendants: Vec<&ResourceGroupWithDepth> =
+            items.iter().filter(|g| g.hierarchy.depth > 0).collect();
 
         let filtered =
             filter_descendants_by_barrier(&descendants, statuses, barrier_mode, max_depth);
@@ -159,8 +156,9 @@ impl Service {
         self.resolve_tenant(ctx, ancestor_id).await?;
 
         // Get ancestors of descendant with barrier filtering
-        let (descendant_ref, ancestors) =
-            self.resolve_ancestors(ctx, descendant_id, barrier_mode).await?;
+        let (descendant_ref, ancestors) = self
+            .resolve_ancestors(ctx, descendant_id, barrier_mode)
+            .await?;
 
         // If descendant is self_managed and we respect barriers, no ancestor can claim parentage
         if barrier_mode == BarrierMode::Respect && descendant_ref.self_managed {
@@ -220,7 +218,6 @@ impl Service {
 
         Ok(all_items)
     }
-
 }
 
 #[derive(Clone, Copy)]

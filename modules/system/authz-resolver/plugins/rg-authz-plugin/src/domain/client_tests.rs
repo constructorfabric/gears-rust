@@ -60,7 +60,7 @@ async fn client_trait_delegates_to_service() {
         subject: Subject {
             id: Uuid::now_v7(),
             subject_type: None,
-            properties: Default::default(),
+            properties: std::collections::HashMap::default(),
         },
         action: Action {
             name: "list".to_owned(),
@@ -68,7 +68,7 @@ async fn client_trait_delegates_to_service() {
         resource: Resource {
             resource_type: "test".to_owned(),
             id: None,
-            properties: Default::default(),
+            properties: std::collections::HashMap::default(),
         },
         context: EvaluationRequestContext {
             tenant_context: None,
@@ -84,5 +84,5 @@ async fn client_trait_delegates_to_service() {
         .evaluate(req)
         .await
         .expect("evaluate should not error");
-    assert!(!resp.decision, "no tenant → deny");
+    assert!(!resp.decision, "no tenant -> deny");
 }

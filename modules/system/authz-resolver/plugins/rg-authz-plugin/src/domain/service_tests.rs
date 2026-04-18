@@ -77,7 +77,7 @@ fn make_request(tenant_id: Uuid) -> EvaluationRequest {
         subject: Subject {
             id: Uuid::now_v7(),
             subject_type: None,
-            properties: Default::default(),
+            properties: std::collections::HashMap::default(),
         },
         action: Action {
             name: "list".to_owned(),
@@ -85,7 +85,7 @@ fn make_request(tenant_id: Uuid) -> EvaluationRequest {
         resource: Resource {
             resource_type: "gts.cf.test.v1~".to_owned(),
             id: None,
-            properties: Default::default(),
+            properties: std::collections::HashMap::default(),
         },
         context: EvaluationRequestContext {
             tenant_context: Some(TenantContext {
@@ -106,7 +106,7 @@ fn make_request_no_tenant() -> EvaluationRequest {
         subject: Subject {
             id: Uuid::now_v7(),
             subject_type: None,
-            properties: Default::default(),
+            properties: std::collections::HashMap::default(),
         },
         action: Action {
             name: "list".to_owned(),
@@ -114,7 +114,7 @@ fn make_request_no_tenant() -> EvaluationRequest {
         resource: Resource {
             resource_type: "gts.cf.test.v1~".to_owned(),
             id: None,
-            properties: Default::default(),
+            properties: std::collections::HashMap::default(),
         },
         context: EvaluationRequestContext {
             tenant_context: None,
@@ -201,7 +201,7 @@ async fn no_tenant_in_request_denies() {
     };
     let svc = Service::new(Arc::new(mock));
     let resp = svc.evaluate(&make_request_no_tenant()).await;
-    assert!(!resp.decision, "no tenant → deny");
+    assert!(!resp.decision, "no tenant -> deny");
 }
 
 #[tokio::test]
@@ -211,7 +211,7 @@ async fn nil_tenant_denies() {
     };
     let svc = Service::new(Arc::new(mock));
     let resp = svc.evaluate(&make_request(Uuid::default())).await;
-    assert!(!resp.decision, "nil tenant → deny");
+    assert!(!resp.decision, "nil tenant -> deny");
 }
 
 #[tokio::test]
@@ -222,7 +222,7 @@ async fn empty_hierarchy_denies() {
     };
     let svc = Service::new(Arc::new(mock));
     let resp = svc.evaluate(&make_request(tid)).await;
-    assert!(!resp.decision, "empty hierarchy → deny");
+    assert!(!resp.decision, "empty hierarchy -> deny");
 }
 
 #[tokio::test]
@@ -252,5 +252,5 @@ async fn rg_error_denies() {
 
     let svc = Service::new(Arc::new(FailingRg));
     let resp = svc.evaluate(&make_request(Uuid::now_v7())).await;
-    assert!(!resp.decision, "RG error → deny (fail-closed)");
+    assert!(!resp.decision, "RG error -> deny (fail-closed)");
 }

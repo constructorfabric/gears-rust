@@ -10,9 +10,8 @@ use uuid::Uuid;
 
 use crate::error::ResourceGroupError;
 use crate::models::{
-    CreateGroupRequest, CreateTypeRequest, ResourceGroup,
-    ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
-    UpdateTypeRequest,
+    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupMembership,
+    ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
 };
 
 /// Client trait for resource-group type management.

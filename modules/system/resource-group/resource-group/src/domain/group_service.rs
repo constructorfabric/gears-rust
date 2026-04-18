@@ -475,7 +475,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     // SECURITY: do NOT expose these methods via REST handlers.
     // REST uses the scoped variants (`get_group_descendants` / `get_group_ancestors`).
 
-    /// Get descendants without AuthZ enforcement (private API, no tenant scoping).
+    /// Get descendants without `AuthZ` enforcement (private API, no tenant scoping).
     pub async fn get_group_descendants_unscoped(
         &self,
         group_id: Uuid,
@@ -488,7 +488,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await
     }
 
-    /// Get ancestors without AuthZ enforcement (private API, no tenant scoping).
+    /// Get ancestors without `AuthZ` enforcement (private API, no tenant scoping).
     ///
     /// Used by `ResourceGroupReadHierarchy` consumers (e.g., tenant-resolver plugin)
     /// that need full ancestor visibility regardless of the caller's tenant scope.

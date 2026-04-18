@@ -310,10 +310,9 @@ async fn root_tenant_provisioning_allows_without_hierarchy() {
     let tid = Uuid::now_v7();
     let mut req = make_request(tid);
     req.action.name = "create".to_owned();
-    req.resource.properties.insert(
-        "is_tenant".to_owned(),
-        serde_json::Value::Bool(true),
-    );
+    req.resource
+        .properties
+        .insert("is_tenant".to_owned(), serde_json::Value::Bool(true));
     // No parent_id -> root tenant provisioning
 
     let resp = svc.evaluate(&req).await;

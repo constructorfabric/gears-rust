@@ -57,8 +57,9 @@ impl TenantResolverPluginClient for Service {
         id: TenantId,
         options: &GetAncestorsOptions,
     ) -> Result<GetAncestorsResponse, TenantResolverError> {
-        let (tenant, ancestors) =
-            self.resolve_ancestors(ctx, id, options.barrier_mode).await?;
+        let (tenant, ancestors) = self
+            .resolve_ancestors(ctx, id, options.barrier_mode)
+            .await?;
 
         Ok(GetAncestorsResponse { tenant, ancestors })
     }

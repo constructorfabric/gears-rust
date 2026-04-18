@@ -25,6 +25,6 @@ pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy, ResourceGroupRead
 pub use error::ResourceGroupError;
 pub use models::{
     CreateGroupRequest, CreateTypeRequest, GroupHierarchy, GroupHierarchyWithDepth, GtsTypePath,
-    ResourceGroup, ResourceGroupMembership, ResourceGroupType,
-    ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
+    ResourceGroup, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,
+    UpdateGroupRequest, UpdateTypeRequest,
 };

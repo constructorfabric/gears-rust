@@ -20,7 +20,7 @@ use uuid::Uuid;
 /// Resolves tenant hierarchy via `ResourceGroupReadHierarchy`:
 /// 1. Extracts tenant root from request context
 /// 2. Calls `get_group_descendants` to resolve the tenant subtree
-/// 3. Filters barrier tenants (metadata.self_managed = true) from scope
+/// 3. Filters barrier tenants (`metadata.self_managed` = true) from scope
 /// 4. Returns `In(owner_tenant_id, visible_tenants)` + optional `InGroup`/`InGroupSubtree`
 pub struct Service {
     rg: Arc<dyn ResourceGroupReadHierarchy>,
