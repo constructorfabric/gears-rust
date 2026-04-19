@@ -1,0 +1,53 @@
+# Created: 2026-04-16 by Constructor Tech
+[package]
+name = "cf-resource-group-sdk"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for resource-group module: API trait, types, and error definitions"
+
+[lints]
+workspace = true
+
+[features]
+default = ["odata"]
+odata = [
+    "dep:modkit-odata-macros",
+    "dep:modkit-sdk",
+]
+
+[dependencies]
+# Core dependencies for API trait
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+# OData macros (for #[derive(ODataFilterable)])
+modkit-odata-macros = { workspace = true, optional = true }
+
+# UUID support
+uuid = { workspace = true }
+
+# Security context for API methods
+modkit-security = { workspace = true }
+
+# SDK utilities (typed OData queries)
+modkit-sdk = { workspace = true, optional = true }
+
+# OData support for pagination and query types (required for API trait)
+modkit-odata = { workspace = true }
+
+# GTS type system — ID parsing and validation
+gts = { workspace = true }
+
+# GTS macros — struct_to_gts_schema for GTS schema definitions
+gts-macros = { workspace = true }
+
+# JSON Schema (required by struct_to_gts_schema)
+schemars = { workspace = true }
+
+# ModKit — BaseModkitPluginV1 for plugin spec base type
+modkit = { workspace = true }

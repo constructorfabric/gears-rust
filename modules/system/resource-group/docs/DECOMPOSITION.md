@@ -308,7 +308,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - MTLS authentication: client certificate verification against trusted CA bundle, endpoint allowlist (only `GET /groups/{group_id}/hierarchy`), AuthZ bypass for trusted system principals, system SecurityContext creation
   - MTLS configuration: `ca_cert`, `allowed_clients` (by certificate CN), `allowed_endpoints` (method + path pairs)
   - Tenant scope enforcement for ownership-graph profile: parent-child edges and membership writes validated for tenant-hierarchy compatibility, platform-admin provisioning exception for cross-tenant management, tenant-scoped reads via `SecurityContext.subject_tenant_id`
-  - Barrier as data: `metadata.barrier` stored in group metadata JSONB without enforcement by RG, returned in API responses within `metadata` object for consumption by Tenant Resolver and AuthZ
+  - Barrier as data: `metadata.self_managed` stored in group metadata JSONB without enforcement by RG, returned in API responses within `metadata` object for consumption by Tenant Resolver and AuthZ
   - In-process vs out-of-process: ClientHub direct call (monolith, no MTLS needed) vs MTLS-authenticated remote call (microservices)
   - SecurityContext propagation: `ctx` passed through gateway to selected provider without policy interpretation
 

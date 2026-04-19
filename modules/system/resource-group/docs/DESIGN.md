@@ -198,12 +198,12 @@ In ownership-graph usage, groups are tenant-scoped and links must be tenant-hier
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-barrier-as-data`
 
-`barrier` is not a dedicated database column. For GTS types that support barrier semantics (e.g. tenant types), `barrier` is stored inside the `metadata` JSONB field as `metadata.barrier` (boolean). **ADRs**: `cpt-cf-resource-group-adr-p1-gts-type-system`. **RG stores and returns it without enforcement** — RG does not filter, restrict, or alter query results based on the barrier value. RG stores it in `metadata` and returns it in API responses within the `metadata` object, nothing more.
+`barrier` is not a dedicated database column. For GTS types that support barrier semantics (e.g. tenant types), `barrier` is stored inside the `metadata` JSONB field as `metadata.self_managed` (boolean). **ADRs**: `cpt-cf-resource-group-adr-p1-gts-type-system`. **RG stores and returns it without enforcement** — RG does not filter, restrict, or alter query results based on the barrier value. RG stores it in `metadata` and returns it in API responses within the `metadata` object, nothing more.
 
 Barrier enforcement is a **joint responsibility of Tenant Resolver and AuthZ**:
 
-- **RG does not enforce barriers**: all RG queries (hierarchy, groups, memberships) return data regardless of barrier values. If a caller has an `AccessScope` that includes `tenant_id = T7`, RG will return T7's data even if T7 has `metadata.barrier = true`.
-- **Tenant Resolver enforces barriers in hierarchy traversal**: TR SDK defines `BarrierMode` (`Respect` / `Ignore`). The static-tr-plugin's `collect_descendants` skips barrier tenants (`self_managed = true`) and their entire subtrees. `collect_ancestors` from a barrier tenant returns empty. RG's `metadata.barrier` maps to TR's `TenantInfo.self_managed`.
+- **RG does not enforce barriers**: all RG queries (hierarchy, groups, memberships) return data regardless of barrier values. If a caller has an `AccessScope` that includes `tenant_id = T7`, RG will return T7's data even if T7 has `metadata.self_managed = true`.
+- **Tenant Resolver enforces barriers in hierarchy traversal**: TR SDK defines `BarrierMode` (`Respect` / `Ignore`). The static-tr-plugin's `collect_descendants` skips barrier tenants (`self_managed = true`) and their entire subtrees. `collect_ancestors` from a barrier tenant returns empty. RG's `metadata.self_managed` maps to TR's `TenantInfo.self_managed`.
 - **AuthZ integrates barriers into SQL constraints**: the `in_tenant_subtree` predicate supports `barrier_mode: "all"` (default, reads `metadata->>'barrier'` from the closure query) or `"none"` (ignores barriers for billing, provisioning).
 - **Each layer is vendor-replaceable**: vendors can implement custom TR plugins and AuthZ plugins with different barrier semantics. RG remains policy-agnostic.
 
@@ -571,7 +571,7 @@ The integration read contract returns **data rows only** (no policy/decision fie
 | `id`          | UUID        | Yes      | Group identifier                                                             |
 | `type`        | string      | Yes      | GTS chained type path                                                        |
 | `name`        | string      | Yes      | Display name                                                                 |
-| `metadata`     | object | No   | Type-specific fields nested in `metadata` object (e.g. `metadata.barrier`, `metadata.category`). Stored in DB `metadata` JSONB. Schema defined by chained GTS type. |
+| `metadata`     | object | No   | Type-specific fields nested in `metadata` object (e.g. `metadata.self_managed`, `metadata.category`). Stored in DB `metadata` JSONB. Schema defined by chained GTS type. |
 | `hierarchy`   | object      | Yes      | RG hierarchy context                                                         |
 | `hierarchy.parent_id` | UUID / null | No | Parent group (null for root groups)                                    |
 | `hierarchy.tenant_id` | UUID  | Yes    | Tenant scope (can differ per row under tenant hierarchy scope)               |
@@ -810,8 +810,8 @@ sequenceDiagram
     Note right of AZ: subject.properties.tenant_id = T1<br/>action.name = "list"<br/>resource.type = "gts.x.lms.course.v1~"<br/>context.require_constraints = true<br/>context.supported_properties = ["owner_tenant_id"]
 
     AZ->>RG: list_group_depth(system_ctx, T1, filter: "hierarchy/depth ge 0 and type eq 'tenant'")
-    RG-->>AZ: [{T1, depth:0, metadata:{}}, {T7, depth:1, metadata:{barrier:true}}]
-    Note right of AZ: AuthZ policy logic (not RG):<br/>T7.metadata.barrier=true, caller≠T7<br/>→ exclude T7 scope from AccessScope
+    RG-->>AZ: [{T1, depth:0, metadata:{}}, {T7, depth:1, metadata:{self_managed:true}}]
+    Note right of AZ: AuthZ policy logic (not RG):<br/>T7.metadata.self_managed=true, caller≠T7<br/>→ exclude T7 scope from AccessScope
 
     AZ-->>PE: decision=true, constraints=[{owner_tenant_id IN (T1)}]
     PE->>PE: compile_to_access_scope()
@@ -1077,7 +1077,7 @@ Constraints:
 | `parent_id`   | UUID NULL   | parent entity (FK to `resource_group.id`)         |
 | `gts_type_id` | SMALLINT    | type reference (FK to `gts_type.id`)              |
 | `name`        | TEXT        | display name                                      |
-| `metadata`    | JSONB NULL  | type-specific fields for group instance, validated against the chained GTS type schema. For types supporting barrier semantics, includes `metadata.barrier` (boolean). |
+| `metadata`    | JSONB NULL  | type-specific fields for group instance, validated against the chained GTS type schema. For types supporting barrier semantics, includes `metadata.self_managed` (boolean). |
 | `tenant_id`   | UUID        | tenant scope                                      |
 | `created_at`     | TIMESTAMPTZ | creation time                                     |
 | `updated_at`    | TIMESTAMPTZ | update time (nullable)                            |
@@ -1335,7 +1335,7 @@ Test dataset: 100K groups, 200K memberships, 359K closure rows:
 
 #### Column Widths (avg bytes, measured via pg_stats in test environment)
 
-**resource_group** (~100 B/row): `id` 16 B (UUID), `parent_id` 16 B (UUID nullable), `gts_type_id` 2 B (SMALLINT), `name` 14 B (TEXT avg), `metadata` variable (JSONB nullable, typically 20–60 B when present; includes `barrier` for applicable types), `tenant_id` 16 B (UUID), `created_at`/`updated_at` 8 B each, row overhead ~20 B. Note: `barrier` is not a separate column — it is stored inside `metadata` JSONB as `metadata.barrier` (see `cpt-cf-resource-group-principle-barrier-as-data`).
+**resource_group** (~100 B/row): `id` 16 B (UUID), `parent_id` 16 B (UUID nullable), `gts_type_id` 2 B (SMALLINT), `name` 14 B (TEXT avg), `metadata` variable (JSONB nullable, typically 20–60 B when present; includes `barrier` for applicable types), `tenant_id` 16 B (UUID), `created_at`/`updated_at` 8 B each, row overhead ~20 B. Note: `barrier` is not a separate column — it is stored inside `metadata` JSONB as `metadata.self_managed` (see `cpt-cf-resource-group-principle-barrier-as-data`).
 
 **resource_group_closure** (68 B/row): `ancestor_id` 16 B, `descendant_id` 16 B, `depth` 4 B, row overhead ~32 B.
 

@@ -79,32 +79,32 @@ Types define the structural rules for the resource group hierarchy — which par
 **Actor**: `cpt-cf-resource-group-actor-instance-administrator`
 
 **Success Scenarios**:
-- Type is created with schema_id, allowed_parents, allowed_memberships, and metadata_schema
+- Type is created with schema_id, allowed_parent_types, allowed_membership_types, and metadata_schema
 - Type is immediately available for group creation
 
 **Error Scenarios**:
 - Invalid GTS type path format → Validation error
 - Duplicate schema_id → TypeAlreadyExists
-- Referenced allowed_parents type does not exist → Validation error
-- Referenced allowed_memberships type does not exist → Validation error
-- Placement invariant violated (not can_be_root AND no allowed_parents) → Validation error
+- Referenced allowed_parent_types type does not exist → Validation error
+- Referenced allowed_membership_types type does not exist → Validation error
+- Placement invariant violated (not can_be_root AND no allowed_parent_types) → Validation error
 
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/types-registry/v1/types with type definition payload - `inst-create-type-1`
 2. [x] - `p1` - Validate GTS type path format via `GtsTypePath` value object - `inst-create-type-2`
-3. [x] - `p1` - Validate placement invariant: `can_be_root OR len(allowed_parents) >= 1` - `inst-create-type-3`
-4. [x] - `p1` - **IF** allowed_parents is non-empty - `inst-create-type-4`
-   1. [x] - `p1` - DB: SELECT id FROM gts_type WHERE schema_id IN (allowed_parents) — verify all referenced parent types exist - `inst-create-type-4a`
+3. [x] - `p1` - Validate placement invariant: `can_be_root OR len(allowed_parent_types) >= 1` - `inst-create-type-3`
+4. [x] - `p1` - **IF** allowed_parent_types is non-empty - `inst-create-type-4`
+   1. [x] - `p1` - DB: SELECT id FROM gts_type WHERE schema_id IN (allowed_parent_types) — verify all referenced parent types exist - `inst-create-type-4a`
    2. [x] - `p1` - **IF** any parent type not found → **RETURN** Validation error with missing type paths - `inst-create-type-4b`
-5. [x] - `p1` - **IF** allowed_memberships is non-empty - `inst-create-type-5`
-   1. [x] - `p1` - DB: SELECT id FROM gts_type WHERE schema_id IN (allowed_memberships) — verify all referenced membership types exist - `inst-create-type-5a`
+5. [x] - `p1` - **IF** allowed_membership_types is non-empty - `inst-create-type-5`
+   1. [x] - `p1` - DB: SELECT id FROM gts_type WHERE schema_id IN (allowed_membership_types) — verify all referenced membership types exist - `inst-create-type-5a`
    2. [x] - `p1` - **IF** any membership type not found → **RETURN** Validation error with missing type paths - `inst-create-type-5b`
 6. [x] - `p1` - Resolve GTS type path to SMALLINT surrogate ID at persistence boundary - `inst-create-type-6`
 7. [x] - `p1` - DB: INSERT INTO gts_type (schema_id, metadata_schema) — with uniqueness constraint on schema_id - `inst-create-type-7`
 8. [x] - `p1` - **IF** unique constraint violation → **RETURN** TypeAlreadyExists with conflicting schema_id - `inst-create-type-8`
 9. [x] - `p1` - DB: INSERT INTO gts_type_allowed_parent (type_id, parent_type_id) for each allowed parent - `inst-create-type-9`
 10. [x] - `p1` - DB: INSERT INTO gts_type_allowed_membership (type_id, membership_type_id) for each allowed membership - `inst-create-type-10`
-11. [x] - `p1` - **RETURN** created ResourceGroupType with schema_id, allowed_parents, allowed_memberships, can_be_root, metadata_schema - `inst-create-type-11`
+11. [x] - `p1` - **RETURN** created ResourceGroupType with schema_id, allowed_parent_types, allowed_membership_types, can_be_root, is_tenant, metadata_schema - `inst-create-type-11`
 
 ### Update Type
 
@@ -113,13 +113,13 @@ Types define the structural rules for the resource group hierarchy — which par
 **Actor**: `cpt-cf-resource-group-actor-instance-administrator`
 
 **Success Scenarios**:
-- Type definition updated (allowed_parents, allowed_memberships, metadata_schema)
+- Type definition updated (allowed_parent_types, allowed_membership_types, metadata_schema)
 - Existing groups remain valid under new rules
 
 **Error Scenarios**:
 - Type not found → NotFound
-- Removing allowed_parent that is in use by existing groups → AllowedParentsViolation
-- Setting can_be_root=false when root groups of this type exist → AllowedParentsViolation
+- Removing allowed_parent that is in use by existing groups → AllowedParentTypesViolation
+- Setting can_be_root=false when root groups of this type exist → AllowedParentTypesViolation
 - Referenced type does not exist → Validation error
 - Placement invariant violated → Validation error
 
@@ -128,9 +128,9 @@ Types define the structural rules for the resource group hierarchy — which par
 2. [x] - `p1` - DB: SELECT FROM gts_type WHERE schema_id = {code} — load existing type - `inst-update-type-2`
 3. [x] - `p1` - **IF** type not found → **RETURN** NotFound - `inst-update-type-3`
 4. [x] - `p1` - Validate placement invariant on new values - `inst-update-type-4`
-5. [x] - `p1` - Validate all referenced allowed_parents and allowed_memberships types exist - `inst-update-type-5`
-6. [x] - `p1` - Invoke hierarchy safety check algorithm for allowed_parents and can_be_root changes - `inst-update-type-6`
-7. [x] - `p1` - **IF** hierarchy safety check fails → **RETURN** AllowedParentsViolation with violating group details - `inst-update-type-7`
+5. [x] - `p1` - Validate all referenced allowed_parent_types and allowed_membership_types types exist - `inst-update-type-5`
+6. [x] - `p1` - Invoke hierarchy safety check algorithm for allowed_parent_types and can_be_root changes - `inst-update-type-6`
+7. [x] - `p1` - **IF** hierarchy safety check fails → **RETURN** AllowedParentTypesViolation with violating group details - `inst-update-type-7`
 8. [x] - `p1` - DB: DELETE FROM gts_type_allowed_parent WHERE type_id = {id} — clear old parents - `inst-update-type-8`
 9. [x] - `p1` - DB: INSERT INTO gts_type_allowed_parent — insert new parents - `inst-update-type-9`
 10. [x] - `p1` - DB: DELETE FROM gts_type_allowed_membership WHERE type_id = {id} — clear old memberships - `inst-update-type-10`
@@ -166,43 +166,43 @@ Types define the structural rules for the resource group hierarchy — which par
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-algo-type-mgmt-validate-type-input`
 
-**Input**: Type create/update payload (`schema_id`, `allowed_parents`, `allowed_memberships`, `can_be_root`, `metadata_schema`)
+**Input**: Type create/update payload (`schema_id`, `allowed_parent_types`, `allowed_membership_types`, `can_be_root`, `is_tenant` (default `false`), `metadata_schema`)
 
 **Output**: Validated type definition or validation error with field-level details
 
 **Steps**:
 1. [x] - `p1` - Validate `schema_id` via GtsTypePath value object (format, length, non-empty) - `inst-val-input-1`
-2. [x] - `p1` - **IF** `schema_id` does not have RG type prefix `gts.x.system.rg.type.v1~` - `inst-val-input-2`
+2. [x] - `p1` - **IF** `schema_id` does not have RG type prefix `gts.cf.core.rg.type.v1~` - `inst-val-input-2`
    1. [x] - `p1` - **RETURN** Validation error: "Type schema_id must have RG type prefix" - `inst-val-input-2a`
-3. [x] - `p1` - Validate placement invariant: `can_be_root == true OR len(allowed_parents) >= 1` - `inst-val-input-3`
+3. [x] - `p1` - Validate placement invariant: `can_be_root == true OR len(allowed_parent_types) >= 1` - `inst-val-input-3`
 4. [x] - `p1` - **IF** invariant violated - `inst-val-input-4`
    1. [x] - `p1` - **RETURN** Validation error: "Type must allow root placement or have at least one allowed parent" - `inst-val-input-4a`
-5. [x] - `p1` - **FOR EACH** parent_path in allowed_parents - `inst-val-input-5`
-   1. [x] - `p1` - Validate parent_path has RG type prefix `gts.x.system.rg.type.v1~` - `inst-val-input-5a`
+5. [x] - `p1` - **FOR EACH** parent_path in allowed_parent_types - `inst-val-input-5`
+   1. [x] - `p1` - Validate parent_path has RG type prefix `gts.cf.core.rg.type.v1~` - `inst-val-input-5a`
    2. [x] - `p1` - Verify parent_path exists in gts_type table - `inst-val-input-5b`
-6. [x] - `p1` - **FOR EACH** membership_path in allowed_memberships - `inst-val-input-6`
+6. [x] - `p1` - **FOR EACH** membership_path in allowed_membership_types - `inst-val-input-6`
    1. [x] - `p1` - Validate membership_path is a valid GtsTypePath (no RG prefix requirement) - `inst-val-input-6a`
    2. [x] - `p1` - Verify membership_path exists in gts_type table - `inst-val-input-6b`
-7. [x] - `p1` - **IF** metadata_schema provided, validate it is a valid JSON Schema via `jsonschema::validator_for()`. Returns validation error if the schema cannot be compiled. - `inst-val-input-7`
+7. [x] - `p1` - **IF** metadata_schema provided, validate it is a valid JSON Schema via `jsonschema::validator_for()` (compile-check). Runtime metadata validation against group instances uses `validate_metadata_via_gts()` through `TypesRegistryClient`. - `inst-val-input-7`
 8. [x] - `p1` - **RETURN** validated type definition - `inst-val-input-8`
 
 ### Hierarchy Safety Check for Type Update
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety`
 
-**Input**: Existing type definition, proposed new `allowed_parents` and `can_be_root` values
+**Input**: Existing type definition, proposed new `allowed_parent_types` and `can_be_root` values
 
-**Output**: Pass or AllowedParentsViolation with conflicting group details
+**Output**: Pass or AllowedParentTypesViolation with conflicting group details
 
 **Steps**:
-1. [x] - `p1` - Compute removed parent types: `old_allowed_parents - new_allowed_parents` - `inst-hier-check-1`
+1. [x] - `p1` - Compute removed parent types: `old_allowed_parent_types - new_allowed_parent_types` - `inst-hier-check-1`
 2. [x] - `p1` - **FOR EACH** removed_parent_type in removed set - `inst-hier-check-2`
    1. [x] - `p1` - DB: SELECT rg.id, rg.name FROM resource_group rg JOIN resource_group parent ON rg.parent_id = parent.id WHERE rg.gts_type_id = {this_type_id} AND parent.gts_type_id = {removed_parent_type_id} - `inst-hier-check-2a`
    2. [x] - `p1` - **IF** any groups found → collect as violations - `inst-hier-check-2b`
 3. [x] - `p1` - **IF** can_be_root changed from true to false - `inst-hier-check-3`
    1. [x] - `p1` - DB: SELECT id, name FROM resource_group WHERE gts_type_id = {this_type_id} AND parent_id IS NULL - `inst-hier-check-3a`
    2. [x] - `p1` - **IF** any root groups found → collect as violations - `inst-hier-check-3b`
-4. [x] - `p1` - **IF** violations collected → **RETURN** AllowedParentsViolation with violating group IDs, names, and constraint details - `inst-hier-check-4`
+4. [x] - `p1` - **IF** violations collected → **RETURN** AllowedParentTypesViolation with violating group IDs, names, and constraint details - `inst-hier-check-4`
 5. [x] - `p1` - **RETURN** pass - `inst-hier-check-5`
 
 ### Type Seeding
@@ -301,7 +301,7 @@ The system **MUST** provide an idempotent type seeding mechanism for deployment 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-dod-testing-type-mgmt`
 
 All acceptance criteria from feature 0002 are covered by automated tests:
-- Create with valid/invalid `allowed_parents` and `allowed_memberships`
+- Create with valid/invalid `allowed_parent_types` and `allowed_membership_types`
 - Placement invariant enforcement
 - Update with hierarchy safety checks (removed parent in use, can_be_root toggle)
 - Delete with active group references blocked
@@ -326,12 +326,12 @@ Extend `domain_unit_test.rs` with FROM-direction error conversions:
 
 ## 6. Acceptance Criteria
 
-- [x] Type with valid schema_id and allowed_parents is created and persisted with junction table entries
+- [x] Type with valid schema_id and allowed_parent_types is created and persisted with junction table entries
 - [x] Creating type with duplicate schema_id returns `TypeAlreadyExists` (409)
 - [x] Creating type with invalid GTS type path format returns validation error (400) with field details
-- [x] Creating type without `can_be_root` and without `allowed_parents` returns validation error (placement invariant)
-- [x] Updating type to remove allowed_parent that is in use by existing groups returns `AllowedParentsViolation` (409)
-- [x] Updating type to set `can_be_root=false` when root groups exist returns `AllowedParentsViolation` (409)
+- [x] Creating type without `can_be_root` and without `allowed_parent_types` returns validation error (placement invariant)
+- [x] Updating type to remove allowed_parent that is in use by existing groups returns `AllowedParentTypesViolation` (409)
+- [x] Updating type to set `can_be_root=false` when root groups exist returns `AllowedParentTypesViolation` (409)
 - [x] Updating type to add new allowed_parent succeeds when no existing groups violate new rules
 - [x] Deleting unused type succeeds (204) and removes junction table entries via CASCADE
 - [x] Deleting type with existing groups returns `ConflictActiveReferences` (409) with response body including entity count so the caller can display what prevents deletion
@@ -352,40 +352,40 @@ Extend `domain_unit_test.rs` with FROM-direction error conversions:
 
 Test setup: SQLite in-memory + TypeService + GroupService (for hierarchy safety tests).
 
-#### TC-TYP-01: Create type with valid allowed_parents [P1]
+#### TC-TYP-01: Create type with valid allowed_parent_types [P1]
 - **Covers**: G4 (positive path), 0002-AC-1
 - **Setup**: Create parent type first, then create child type referencing it
-- **Assert**: Child type created, `allowed_parents` contains parent code
+- **Assert**: Child type created, `allowed_parent_types` contains parent code
 
-#### TC-TYP-02: Create type with non-existent allowed_parents [P1]
+#### TC-TYP-02: Create type with non-existent allowed_parent_types [P1]
 - **Covers**: G4
-- **Setup**: Create type with `allowed_parents: ["gts.x.system.rg.type.v1~nonexistent.v1~"]`
+- **Setup**: Create type with `allowed_parent_types: ["gts.cf.core.rg.type.v1~nonexistent.v1~"]`
 - **Assert**: `DomainError::TypeNotFound` or `DomainError::Validation`
 
-#### TC-TYP-03: Create type with non-existent allowed_memberships [P1]
+#### TC-TYP-03: Create type with non-existent allowed_membership_types [P1]
 - **Covers**: G5
-- **Setup**: Create type with `allowed_memberships: ["gts.x.system.rg.type.v1~nonexistent.v1~"]`
+- **Setup**: Create type with `allowed_membership_types: ["gts.cf.core.rg.type.v1~nonexistent.v1~"]`
 - **Assert**: Error (type not found)
 
 #### TC-TYP-04: Placement invariant violation (can_be_root=false, no parents) [P1]
 - **Covers**: G6, 0002-AC-4
-- **Setup**: `CreateTypeRequest { can_be_root: false, allowed_parents: [] }`
+- **Setup**: `CreateTypeRequest { can_be_root: false, allowed_parent_types: [] }`
 - **Assert**: `DomainError::Validation` with "root placement or" message
 
 #### TC-TYP-05: Update type happy path [P1]
 - **Covers**: G1, 0002-AC-7
-- **Setup**: Create type, then update with new `allowed_parents`
+- **Setup**: Create type, then update with new `allowed_parent_types`
 - **Assert**: Updated type returned with new parents
 
 #### TC-TYP-06: Update type - remove allowed_parent in use by groups [P1]
 - **Covers**: G2, 0002-AC-5
-- **Setup**: Create parent type P, child type C (allowed_parents=[P]), create group of type P, create child group of type C under P group. Then update type C removing P from allowed_parents.
-- **Assert**: `DomainError::AllowedParentsViolation` with violating group names
+- **Setup**: Create parent type P, child type C (allowed_parent_types=[P]), create group of type P, create child group of type C under P group. Then update type C removing P from allowed_parent_types.
+- **Assert**: `DomainError::AllowedParentTypesViolation` with violating group names
 
 #### TC-TYP-07: Update type - set can_be_root=false with existing root groups [P1]
 - **Covers**: G3, 0002-AC-6
 - **Setup**: Create type with can_be_root=true, create root group of that type. Then update type setting can_be_root=false.
-- **Assert**: `DomainError::AllowedParentsViolation` with root group names
+- **Assert**: `DomainError::AllowedParentTypesViolation` with root group names
 
 #### TC-TYP-08: Update type - not found [P2]
 - **Covers**: G1
@@ -398,15 +398,15 @@ Test setup: SQLite in-memory + TypeService + GroupService (for hierarchy safety 
 
 #### TC-TYP-10: Update type - placement invariant on new values [P2]
 - **Covers**: G1
-- **Setup**: Update type with can_be_root=false and allowed_parents=[]
+- **Setup**: Update type with can_be_root=false and allowed_parent_types=[]
 - **Assert**: `DomainError::Validation`
 
-#### TC-TYP-11: Create type with self-reference in allowed_parents [P2]
+#### TC-TYP-11: Create type with self-reference in allowed_parent_types [P2]
 - Type A lists itself as allowed_parent, but A doesn't exist yet during resolve_ids
 - **Assert**: Error (type not found for self-reference)
 
-#### TC-TYP-12: Create type with invalid format in allowed_parents[i] [P2]
-- allowed_parents: `["wrong.prefix"]` — each parent validated via validate_type_code
+#### TC-TYP-12: Create type with invalid format in allowed_parent_types[i] [P2]
+- allowed_parent_types: `["wrong.prefix"]` — each parent validated via validate_type_code
 - **Assert**: `DomainError::Validation` (prefix error)
 
 #### TC-TYP-13: Delete nonexistent type [P2]
@@ -416,12 +416,12 @@ Test setup: SQLite in-memory + TypeService + GroupService (for hierarchy safety 
 - Create type with `metadata_schema: Some(json_schema)`, get type, verify schema stored
 - **Assert**: Returned type has matching metadata_schema
 
-#### TC-TYP-15: Update type replaces allowed_memberships [P2]
+#### TC-TYP-15: Update type replaces allowed_membership_types [P2]
 - Create type with memberships [A, B], update to [B, C]
 - **Assert**: Updated type has only [B, C], A removed
 
 #### TC-TYP-16: Update type - hierarchy check skips deleted parent type [P3]
-- Remove parent type from allowed_parents, but the parent type itself was already deleted from system
+- Remove parent type from allowed_parent_types, but the parent type itself was already deleted from system
 - **Assert**: No error (resolve_id returns None → skip)
 
 ### Error Conversions
@@ -452,7 +452,7 @@ Existing tests cover `DomainError -> ResourceGroupError` and `DomainError -> Pro
 
 **File**: `type_service_test.rs` (service-level with DB)
 
-`type_repo.rs` transforms metadata_schema on write (inject `__can_be_root`) and on read (strip `__` keys, derive `can_be_root`). This logic has **0 tests**.
+`type_service.rs` transforms metadata_schema on write (inject `__can_be_root` via `build_stored_schema`) and `type_repo.rs` transforms on read (strip `__` keys, derive `can_be_root`). This logic has **0 tests**.
 
 #### TC-META-01: Type with metadata_schema Object — round-trip [P1]
 - **Setup**: Create type with `metadata_schema: Some(json!({"type": "object", "properties": {"x": {"type": "string"}}}))`
@@ -501,8 +501,8 @@ Existing tests cover `DomainError -> ResourceGroupError` and `DomainError -> Pro
 
 #### TC-META-10: can_be_root fallback when __can_be_root missing from stored JSON [P1]
 - Manually insert gts_type row with `metadata_schema = '{}'` (no __can_be_root key)
-- Type has allowed_parents → `can_be_root = false` (fallback: `allowed_parents.is_empty()`)
-- Type has no allowed_parents → `can_be_root = true`
+- Type has allowed_parent_types → `can_be_root = false` (fallback: `allowed_parent_types.is_empty()`)
+- Type has no allowed_parent_types → `can_be_root = true`
 
 #### TC-META-11: metadata_schema not validated as JSON Schema [P2]
 - Feature 0002 says "validate it is valid JSON Schema" (inst-val-input-7)
@@ -515,7 +515,7 @@ Existing tests cover `DomainError -> ResourceGroupError` and `DomainError -> Pro
 These tests verify the system is resilient to adversarial metadata_schema payloads. The key attack surface is `build_stored_schema()` which clones user input into the storage JSONB.
 
 #### TC-META-ATK-01: Overwrite `__can_be_root` via metadata_schema to escalate privileges [P1]
-- Create type with `can_be_root: false, allowed_parents: [P], metadata_schema: {"__can_be_root": true}`
+- Create type with `can_be_root: false, allowed_parent_types: [P], metadata_schema: {"__can_be_root": true}`
 - **Attack**: user tries to force `can_be_root=true` via injected internal key
 - **Assert**: `get_type().can_be_root == false` (system wins, user's `__can_be_root` overwritten by `build_stored_schema`)
 
@@ -523,7 +523,7 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 - `metadata_schema: {"__can_be_root": "maybe", "x": 1}`
 - `build_stored_schema` overwrites with `Bool(can_be_root)` → no issue
 - But what if stored JSONB was manually corrupted to `{"__can_be_root": "not-a-bool"}`?
-- `load_full_type` calls `.as_bool()` → `None` → fallback to `allowed_parents.is_empty()`
+- `load_full_type` calls `.as_bool()` → `None` → fallback to `allowed_parent_types.is_empty()`
 - **Assert**: Verify fallback works, no panic
 
 #### TC-META-ATK-03: Inject multiple `__` prefixed keys to pollute internal storage [P1]
@@ -570,7 +570,7 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 - Create type, verify `resolve_id(code)` returns `Some(id)` where id is `i16`
 
 #### TC-GTS-02: resolve_id returns None for nonexistent path [P1]
-- `resolve_id("gts.x.system.rg.type.v1~nonexistent.v1~")` → `None`
+- `resolve_id("gts.cf.core.rg.type.v1~nonexistent.v1~")` → `None`
 
 #### TC-GTS-03: resolve_ids batch — all found [P1]
 - Create 3 types, `resolve_ids([code1, code2, code3])` → `Ok(vec![id1, id2, id3])`
@@ -590,14 +590,14 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 - Create type with code X, resolve to ID, resolve back to path
 - **Assert**: returned path == X (exact string equality)
 
-#### TC-GTS-08: load_allowed_parents resolves junction → IDs → paths [P1]
-- Create parent type P, child type C(allowed_parents=[P])
-- load_allowed_parents(C.id) → `vec!["gts.x...P..."]`
+#### TC-GTS-08: load_allowed_parent_types resolves junction → IDs → paths [P1]
+- Create parent type P, child type C(allowed_parent_types=[P])
+- load_allowed_parent_types(C.id) → `vec!["gts.cf...P..."]`
 - **Assert**: returned path == P's code
 
-#### TC-GTS-09: load_allowed_memberships resolves junction → IDs → paths [P1]
-- Create member type M, group type G(allowed_memberships=[M])
-- load_allowed_memberships(G.id) → `vec!["gts.x...M..."]`
+#### TC-GTS-09: load_allowed_membership_types resolves junction → IDs → paths [P1]
+- Create member type M, group type G(allowed_membership_types=[M])
+- load_allowed_membership_types(G.id) → `vec!["gts.cf...M..."]`
 
 #### can_be_root Derivation & Internal Key Handling
 
@@ -610,7 +610,7 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 
 #### TC-GTS-11: can_be_root fallback when __can_be_root key missing [P1]
 - Manually insert row in gts_type with metadata_schema without `__can_be_root` key
-- load_full_type → `can_be_root` should default to `allowed_parents.is_empty()`
+- load_full_type → `can_be_root` should default to `allowed_parent_types.is_empty()`
 - **Scenario**: type with parents → false; type without parents → true
 
 #### TC-GTS-12: Internal keys stripped from metadata_schema response [P1]
@@ -630,8 +630,8 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 - Create type with no metadata_schema
 - DB has `{"__can_be_root": true}` → after stripping __ keys → empty object → `None`
 
-#### TC-GTS-19: allowed_parents.contains() exact string match after roundtrip [P1]
-- Create parent type P, child type C(allowed_parents=[P])
+#### TC-GTS-19: allowed_parent_types.contains() exact string match after roundtrip [P1]
+- Create parent type P, child type C(allowed_parent_types=[P])
 - Create group of type P (root), create child group of type C under it
 - **Assert**: success — proves the path stored for P matches P's code exactly during comparison
 
@@ -660,7 +660,7 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 
 #### TC-SEED-03: seed_types updates changed type [P1]
 - **Covers**: G46, 0002-AC-10
-- **Setup**: Seed type with can_be_root=true, then seed again with can_be_root=false + allowed_parents.
+- **Setup**: Seed type with can_be_root=true, then seed again with can_be_root=false + allowed_parent_types.
 - **Assert**: `result.updated == 1`, type in DB reflects new values
 
 #### TC-SEED-04: seed_types idempotent (3 runs) [P2]
@@ -689,7 +689,7 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 
 | Operation | Required DB Assertions |
 |-----------|----------------------|
-| **Create type with parents** | Junction rows COUNT = `len(allowed_parents)`. Each `parent_type_id` correctly resolved from GTS path to SMALLINT. |
-| **Update type (replace parents)** | Old junction rows **deleted**. New rows match new list. COUNT = `len(new_allowed_parents)`. |
+| **Create type with parents** | Junction rows COUNT = `len(allowed_parent_types)`. Each `parent_type_id` correctly resolved from GTS path to SMALLINT. |
+| **Update type (replace parents)** | Old junction rows **deleted**. New rows match new list. COUNT = `len(new_allowed_parent_types)`. |
 | **Update type (replace memberships)** | `gts_type_allowed_membership` contains only new entries. |
 | **Delete type (CASCADE)** | `gts_type_allowed_parent WHERE type_id` → 0. `gts_type_allowed_membership WHERE type_id` → 0. |

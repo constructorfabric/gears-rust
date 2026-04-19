@@ -220,9 +220,9 @@ This aligns RG behavior with `docs/arch/authorization/RESOURCE_GROUP_MODEL.md`.
 
 #### Responsibility Split: RG stores, Tenant Resolver + AuthZ enforce
 
-**RG treats `barrier` purely as data — RG does not filter, restrict, or alter query results based on the barrier value.** For GTS types that support barrier semantics (e.g. tenant types), `barrier` is stored inside the `metadata` field as `metadata.barrier` (boolean). RG returns it in API responses within `metadata`, nothing more. All RG queries return data regardless of barrier values — barrier enforcement is entirely outside RG's scope.
+**RG treats `barrier` purely as data — RG does not filter, restrict, or alter query results based on the barrier value.** For GTS types that support barrier semantics (e.g. tenant types), `barrier` is stored inside the `metadata` field as `metadata.self_managed` (boolean). RG returns it in API responses within `metadata`, nothing more. All RG queries return data regardless of barrier values — barrier enforcement is entirely outside RG's scope.
 
-**Tenant Resolver enforces barrier during hierarchy traversal.** TR applies barrier logic when collecting ancestors and descendants. RG's `metadata.barrier` maps to TR's `self_managed` flag.
+**Tenant Resolver enforces barrier during hierarchy traversal.** TR applies barrier logic when collecting ancestors and descendants. RG's `metadata.self_managed` maps to TR's `self_managed` flag.
 
 **AuthZ integrates barrier into access constraints.** AuthZ supports `barrier_mode` parameter (`respect` / `ignore`). When respecting barriers, barrier tenants and their subtrees are excluded from access scope.
 
@@ -392,7 +392,7 @@ Entity fields (GTS-aligned naming):
 - `id` (UUID) — group identifier
 - `type` (GTS chained type path, e.g. `gts.x.system.rg.type.v1~w.system.org.department.v1~`)
 - `name` (1..255) — display name
-- `metadata` (object) — type-specific fields defined by the chained RG type schema. Examples: `metadata.barrier`, `metadata.custom_domain`, `metadata.category`. For types supporting barrier semantics, `metadata.barrier` (boolean) is included here.
+- `metadata` (object) — type-specific fields defined by the chained RG type schema. Examples: `metadata.self_managed`, `metadata.custom_domain`, `metadata.category`. For types supporting barrier semantics, `metadata.self_managed` (boolean) is included here.
 - `hierarchy` (object) — RG hierarchy context:
   - `parent_id` (optional) — direct parent group
   - `tenant_id` (required) — tenant scope

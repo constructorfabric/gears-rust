@@ -46,7 +46,7 @@ pub mod plugin_api;
 // Re-export main types at crate root
 pub use api::TenantResolverClient;
 pub use error::TenantResolverError;
-pub use gts::TenantResolverPluginSpecV1;
+pub use gts::{TENANT_RG_TYPE_PATH, TenantResolverPluginSpecV1};
 pub use models::{
     BarrierMode, GetAncestorsOptions, GetAncestorsResponse, GetDescendantsOptions,
     GetDescendantsResponse, GetTenantsOptions, HasStatus, IsAncestorOptions, TenantId, TenantInfo,

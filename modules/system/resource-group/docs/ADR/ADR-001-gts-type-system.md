@@ -239,7 +239,7 @@ Base contract for all RG type definitions. Traits define topology rules; propert
     "id": { "type": "string", "format": "uuid" },
     "name": { "type": "string", "minLength": 1, "maxLength": 255 },
     "custom_domain": { "type": "string", "format": "hostname" },
-    "barrier": { "type": "boolean", "default": false }
+    "self_managed": { "type": "boolean", "default": false }
   }
 }
 ```
@@ -331,7 +331,7 @@ When a type is registered as an RG type, it chains with the base contract via a 
           "additionalProperties": false,
           "properties": {
             "custom_domain": { "type": "string", "format": "hostname" },
-            "barrier": { "type": "boolean", "default": false }
+            "self_managed": { "type": "boolean", "default": false }
           }
         }
       },
@@ -478,7 +478,7 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
   "tenant_id": "77777777-7777-7777-7777-777777777777",
   "depth": 1,
   "metadata": {
-    "barrier": true
+    "self_managed": true
   }
 }
 ```
@@ -534,7 +534,7 @@ tenant T9 (depth 0) {metadata: {custom_domain: "t9.example.com"}}
 ```
 
 Notes:
-- T7 has `metadata.barrier: true` — RG stores it in metadata JSONB. Tenant Resolver (`BarrierMode`) + AuthZ enforce it
+- T7 has `metadata.self_managed: true` — RG stores it in metadata JSONB. Tenant Resolver (`BarrierMode`) + AuthZ enforce it
 - R4 appears twice: as **course** in B3 and as **user** in T1 (different `gts_type_id`)
 - R8 appears twice: as **user** in D8 and T7 (same type, two group memberships)
 
@@ -667,7 +667,7 @@ This matches exactly 4 name tokens per segment — the DB constraint and the `gt
 - Chained type narrows `metadata` via `allOf` merge — `additionalProperties: false` applies only within the `metadata` sub-object
 - Unknown metadata fields rejected (e.g. `metadata: {foo: "bar"}` → error)
 - Entity-specific constraints enforced (e.g. `metadata.category` maxLength: 100 → validated)
-- Top-level field isolation: `metadata.barrier` can never clash with a future base field `barrier`
+- Top-level field isolation: `metadata.self_managed` can never clash with a future base field `barrier`
 
 **Test results** (33 tests, all passing):
 
@@ -675,9 +675,9 @@ This matches exactly 4 name tokens per segment — the DB constraint and the `gt
 |-----------|----------|--------|
 | Department `metadata.category` 101 chars | rejected | rejected |
 | Department `metadata.short_description` 501 chars | rejected | rejected |
-| Tenant `metadata.barrier: "yes"` (string) | rejected | rejected |
+| Tenant `metadata.self_managed: "yes"` (string) | rejected | rejected |
 | Tenant `metadata: {foo: "bar"}` (unknown field) | rejected | rejected |
-| Tenant `metadata.barrier: true` | accepted | accepted |
+| Tenant `metadata.self_managed: true` | accepted | accepted |
 | Tenant `metadata.custom_domain: "t9.example.com"` | accepted | accepted |
 | Branch `metadata.location: "..."` | accepted | accepted |
 | Top-level `barrier: true` (no metadata wrapper) | accepted by GTS* | accepted* |

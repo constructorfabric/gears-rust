@@ -52,6 +52,7 @@ members = [
     "modules/system/grpc-hub",
     "modules/system/nodes-registry/nodes-registry",
     "modules/system/nodes-registry/nodes-registry-sdk",
+    "modules/system/resource-group/resource-group-sdk",
     "modules/system/module-orchestrator",
     "examples/modkit/users-info/users-info-sdk",
     "examples/modkit/users-info/users-info",

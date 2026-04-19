@@ -637,7 +637,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - This is NOT InvalidParentType — it's a separate Validation branch (line 379-384)
 
 #### TC-GRP-24: Create group with metadata (JSONB) [P2]
-- Create with `metadata: Some(json!({"barrier": true}))`, verify stored and returned
+- Create with `metadata: Some(json!({"self_managed": true}))`, verify stored and returned
 
 #### TC-GRP-25: Multiple root groups of same type [P2]
 - Create 2 root groups of same can_be_root=true type, both succeed
@@ -693,13 +693,13 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 **File**: `group_service_test.rs` (service-level), `api_rest_test.rs` (REST-level)
 
 #### TC-META-12: Group with metadata barrier stored and returned [P1]
-- Create group with `metadata: Some(json!({"barrier": true}))`
-- Get group → `metadata.barrier == true`
+- Create group with `metadata: Some(json!({"self_managed": true}))`
+- Get group → `metadata.self_managed == true`
 - **Covers**: PRD 3.4, Feature 0005-AC "barrier as data"
-- **DB assert**: `resource_group.metadata` JSONB column contains `{"barrier": true}`
+- **DB assert**: `resource_group.metadata` JSONB column contains `{"self_managed": true}`
 
 #### TC-META-13: Group with rich metadata — multiple fields [P1]
-- `metadata: Some(json!({"barrier": true, "label": "Partner", "category": "premium"}))`
+- `metadata: Some(json!({"self_managed": true, "label": "Partner", "category": "premium"}))`
 - **Assert**: all fields preserved in round-trip
 
 #### TC-META-14: Group metadata update replaces entirely (not merge) [P1]
@@ -708,14 +708,14 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - **DB assert**: confirm in `resource_group` table
 
 #### TC-META-15: Group metadata None → update with metadata → get returns metadata [P2]
-- Create with None, update with `{"barrier": false}`, get → `{"barrier": false}`
+- Create with None, update with `{"self_managed": false}`, get → `{"self_managed": false}`
 
 #### TC-META-16: Group metadata set → update with None → metadata gone [P2]
 - Create with `{"x": 1}`, update with `metadata: None`
 - **Assert**: get returns metadata = None, JSON response has no `metadata` key
 
 #### TC-META-17: Barrier group visible in hierarchy (RG does NOT filter) [P1]
-- Create parent → child with `metadata: {"barrier": true}` → grandchild
+- Create parent → child with `metadata: {"self_managed": true}` → grandchild
 - `list_group_hierarchy(parent)` → returns ALL 3 including barrier child
 - **Covers**: PRD "RG does not filter based on barrier", Feature 0005-AC
 - **Assert**: barrier group present in results, depth correct
@@ -734,8 +734,8 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - **Assert**: 201, response body has `"metadataSchema"` key (camelCase)
 
 #### TC-META-20: REST create group with metadata in body [P1]
-- POST body: `{"type": "...", "name": "X", "metadata": {"barrier": true}}`
-- **Assert**: 201, response body has `"metadata": {"barrier": true}`
+- POST body: `{"type": "...", "name": "X", "metadata": {"self_managed": true}}`
+- **Assert**: 201, response body has `"metadata": {"self_managed": true}`
 
 #### TC-META-21: REST response omits metadata when null [P2]
 - Create group without metadata
@@ -888,20 +888,20 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 
 ##### Tenant metadata (`barrier: boolean`, `custom_domain: hostname`)
 
-#### TC-ADR-09: Tenant — valid metadata.barrier=true accepted [P1]
-- Create tenant group with `metadata: {"barrier": true}`
+#### TC-ADR-09: Tenant — valid metadata.self_managed=true accepted [P1]
+- Create tenant group with `metadata: {"self_managed": true}`
 - **Assert**: 201 success
 
 #### TC-ADR-10: Tenant — barrier wrong type (string) rejected [P1]
-- Create tenant group with `metadata: {"barrier": "yes"}`
+- Create tenant group with `metadata: {"self_managed": "yes"}`
 - **Assert**: 400 Validation error — `barrier` must be boolean
 
 #### TC-ADR-11: Tenant — barrier wrong type (number) rejected [P1]
-- `metadata: {"barrier": 42}`
+- `metadata: {"self_managed": 42}`
 - **Assert**: 400
 
 #### TC-ADR-12: Tenant — unknown metadata field rejected [P1]
-- `metadata: {"barrier": true, "foo": "bar"}`
+- `metadata: {"self_managed": true, "foo": "bar"}`
 - **Assert**: 400 — `additionalProperties: false` rejects unknown fields
 
 #### TC-ADR-13: Tenant — valid custom_domain accepted [P1]
@@ -967,7 +967,7 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 ##### Cross-type metadata isolation
 
 #### TC-ADR-27: Tenant metadata fields on department → rejected [P1]
-- Create department group with `metadata: {"barrier": true}`
+- Create department group with `metadata: {"self_managed": true}`
 - Department schema does NOT have `barrier` → `additionalProperties: false` rejects
 - **Assert**: 400
 

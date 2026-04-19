@@ -252,13 +252,13 @@ The system **MUST** enforce tenant-hierarchy-compatible writes in ownership-grap
 - Membership writes validated against target group's tenant scope
 - Platform-admin provisioning exception: privileged calls may bypass caller tenant scoping for cross-tenant management, but data invariants (parent-child type compat, tenant hierarchy rules) remain strict
 - Tenant-scoped reads: in AuthZ query path, `SecurityContext.subject_tenant_id` determines effective tenant scope
-- Barrier as data: `metadata.barrier` stored in group metadata JSONB, returned in API responses within `metadata` object. RG does not filter, restrict, or alter query results based on barrier value.
+- Barrier as data: `metadata.self_managed` stored in group metadata JSONB, returned in API responses within `metadata` object. RG does not filter, restrict, or alter query results based on barrier value.
 
 **Implements**:
 - `cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement`
 
 **Touches**:
-- DB: `resource_group` (tenant_id validation, metadata.barrier storage)
+- DB: `resource_group` (tenant_id validation, metadata.self_managed storage)
 
 ### Unit Test Coverage for Integration Auth
 
@@ -283,7 +283,7 @@ In-source `#[cfg(test)]` tests covering auth-mode decision and tenant-scope enfo
 - [x] SecurityContext is passed through gateway to provider without policy interpretation
 - [x] Parent-child edge in ownership-graph profile with incompatible tenants is rejected with TenantIncompatibility
 - [x] Platform-admin provisioning call bypasses caller tenant scoping but still validates data invariants
-- [x] Group with `metadata.barrier = true` is stored and returned in API responses — RG does not filter based on barrier
+- [x] Group with `metadata.self_managed = true` is stored and returned in API responses — RG does not filter based on barrier
 - [x] In monolith deployment, AuthZ plugin uses ClientHub direct call (no MTLS needed)
 - [x] In microservice deployment, AuthZ plugin uses MTLS-authenticated remote call to hierarchy endpoint
 

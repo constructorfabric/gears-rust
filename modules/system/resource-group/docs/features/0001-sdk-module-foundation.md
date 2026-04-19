@@ -529,7 +529,7 @@ No data setup needed. Fastest possible test.
 
 ```
 POST /types → create type
-POST /groups → create group with metadata: {"barrier": true}
+POST /groups → create group with metadata: {"self_managed": true}
 GET  /groups/{id} → 200
 
 Assert JSON keys:
@@ -539,7 +539,7 @@ Assert JSON keys:
   "tenant_id"  — string, UUID format
   "parent_id"  — null (root group)
   "depth"      — integer, == 0
-  "metadata"   — {"barrier": true} (JSONB roundtrip)
+  "metadata"   — {"self_managed": true} (JSONB roundtrip)
   "created_at" — string, ISO 8601
   "updated_at" — null or absent (fresh create)
 
