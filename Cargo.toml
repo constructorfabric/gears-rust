@@ -424,7 +424,7 @@ prost-build = "0.14"
 tonic-prost-build = "0.14"
 
 # Blocking HTTP client (for build scripts)
-ureq = "2.12"
+ureq = "3.3"
 
 # Time handling
 time = { version = "0.3.47", features = ["serde", "formatting", "parsing"] }
