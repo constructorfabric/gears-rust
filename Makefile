@@ -441,7 +441,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz
 
 # Run E2E tests in Docker (default)
 e2e: e2e-docker
@@ -457,6 +457,13 @@ e2e-docker-smoke:
 # Run E2E tests locally
 e2e-local:
 	python3 tools/scripts/ci.py e2e-local
+
+## Run RG + AuthZ barrier E2E tests with tr-authz-plugin going through TR -> RG
+e2e-tr-authz:
+	python3 tools/scripts/ci.py e2e-local \
+		--config config/e2e-tr-authz.yaml \
+		--features "users-info-example,mini-chat,static-tenants,static-authn,static-authz,tr-authz,tenant-resolver-rg,static-credstore" \
+		-- -k "resource_group"
 
 ## Run E2E smoke tests locally (only tests marked @pytest.mark.smoke)
 e2e-local-smoke:

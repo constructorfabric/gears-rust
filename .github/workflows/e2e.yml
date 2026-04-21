@@ -72,6 +72,9 @@ jobs:
       - name: Run mini-chat E2E tests
         run: make e2e-mini-chat
 
+      - name: Run RG + AuthZ E2E tests (tr-authz-plugin, AuthZ -> TR -> RG chain)
+        run: make e2e-tr-authz
+
       - name: Upload E2E logs
         if: failure()
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1

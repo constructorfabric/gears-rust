@@ -7,7 +7,7 @@
 //! - Chained RG types with single $ref + inline metadata properties + x-gts-traits
 //! - Entity schemas registered for reference (not $ref'd from chained types)
 //! - Instance validation: base fields + metadata fields validated at GTS level
-//! - Topology trait constraints (`can_be_root`, `allowed_parents`, `allowed_memberships`)
+//! - Topology trait constraints (`can_be_root`, `allowed_parent_types`, `allowed_membership_types`)
 
 mod common;
 
@@ -35,12 +35,12 @@ fn rg_base_contract() -> serde_json::Value {
                     "type": "boolean",
                     "default": false
                 },
-                "allowed_parents": {
+                "allowed_parent_types": {
                     "type": "array",
                     "items": { "type": "string", "x-gts-ref": "gts.x.core.rg.type.v1~" },
                     "default": []
                 },
-                "allowed_memberships": {
+                "allowed_membership_types": {
                     "type": "array",
                     "items": { "type": "string", "x-gts-ref": "gts.*" },
                     "default": []
@@ -49,8 +49,8 @@ fn rg_base_contract() -> serde_json::Value {
         },
         "x-gts-traits": {
             "can_be_root": false,
-            "allowed_parents": [],
-            "allowed_memberships": []
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
         },
         "required": ["id", "name"],
         "properties": {
@@ -79,7 +79,7 @@ fn tenant_entity_schema() -> serde_json::Value {
             "id": { "type": "string", "format": "uuid" },
             "name": { "type": "string", "minLength": 1, "maxLength": 255 },
             "custom_domain": { "type": "string", "format": "hostname" },
-            "barrier": { "type": "boolean", "default": false }
+            "self_managed": { "type": "boolean", "default": false }
         }
     })
 }
@@ -162,14 +162,14 @@ fn tenant_rg_type() -> serde_json::Value {
                         "additionalProperties": false,
                         "properties": {
                             "custom_domain": { "type": "string", "format": "hostname" },
-                            "barrier": { "type": "boolean", "default": false }
+                            "self_managed": { "type": "boolean", "default": false }
                         }
                     }
                 },
                 "x-gts-traits": {
                     "can_be_root": true,
-                    "allowed_parents": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
-                    "allowed_memberships": ["gts.z.core.idp.user.v1~"]
+                    "allowed_parent_types": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
+                    "allowed_membership_types": ["gts.z.core.idp.user.v1~"]
                 }
             }
         ]
@@ -196,8 +196,8 @@ fn department_rg_type() -> serde_json::Value {
                 },
                 "x-gts-traits": {
                     "can_be_root": false,
-                    "allowed_parents": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
-                    "allowed_memberships": ["gts.z.core.idp.user.v1~"]
+                    "allowed_parent_types": ["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"],
+                    "allowed_membership_types": ["gts.z.core.idp.user.v1~"]
                 }
             }
         ]
@@ -223,8 +223,8 @@ fn branch_rg_type() -> serde_json::Value {
                 },
                 "x-gts-traits": {
                     "can_be_root": false,
-                    "allowed_parents": ["gts.x.core.rg.type.v1~w.core.org.department.v1~"],
-                    "allowed_memberships": [
+                    "allowed_parent_types": ["gts.x.core.rg.type.v1~w.core.org.department.v1~"],
+                    "allowed_membership_types": [
                         "gts.z.core.idp.user.v1~",
                         "gts.z.core.lms.course.v1~"
                     ]
@@ -317,7 +317,7 @@ async fn test_chained_tenant_has_inline_metadata_schema() {
     // Verify inline metadata properties exist
     let meta_props = &override_block["properties"]["metadata"]["properties"];
     assert!(meta_props["custom_domain"].is_object());
-    assert!(meta_props["barrier"].is_object());
+    assert!(meta_props["self_managed"].is_object());
 }
 
 #[tokio::test]
@@ -333,7 +333,7 @@ async fn test_chained_department_cannot_be_root() {
         .unwrap();
     assert_eq!(traits_block["x-gts-traits"]["can_be_root"], json!(false));
     assert_eq!(
-        traits_block["x-gts-traits"]["allowed_parents"],
+        traits_block["x-gts-traits"]["allowed_parent_types"],
         json!(["gts.x.core.rg.type.v1~y.core.tn.tenant.v1~"])
     );
 }
@@ -349,7 +349,7 @@ async fn test_branch_allows_users_and_courses_as_members() {
         .iter()
         .find(|i| i.get("x-gts-traits").is_some())
         .unwrap();
-    let memberships = traits_block["x-gts-traits"]["allowed_memberships"]
+    let memberships = traits_block["x-gts-traits"]["allowed_membership_types"]
         .as_array()
         .unwrap();
     assert_eq!(memberships.len(), 2);
@@ -442,12 +442,12 @@ async fn test_valid_tenant_with_metadata_barrier() {
         "parent_id": "11111111-1111-1111-1111-111111111111",
         "tenant_id": "77777777-7777-7777-7777-777777777777",
         "depth": 1,
-        "metadata": { "barrier": true }
+        "metadata": { "self_managed": true }
     });
     let results = service.register(vec![t7]);
     assert!(
         results[0].is_ok(),
-        "Tenant with metadata.barrier: {:?}",
+        "Tenant with metadata.self_managed: {:?}",
         results[0]
     );
 }
@@ -659,7 +659,7 @@ async fn test_top_level_custom_field_passes_gts_but_app_layer_rejects() {
         "parent_id": null,
         "tenant_id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
         "depth": 0,
-        "barrier": true
+        "self_managed": true
     });
     // GTS accepts (open model), RG module would strip/reject at app layer
     assert!(
@@ -705,7 +705,7 @@ async fn test_chained_type_with_broken_ref_fails_on_ready() {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "allOf": [
             { "$ref": "gts://gts.x.core.rg.type.v1~" },
-            { "x-gts-traits": { "can_be_root": true, "allowed_parents": [], "allowed_memberships": [] } }
+            { "x-gts-traits": { "can_be_root": true, "allowed_parent_types": [], "allowed_membership_types": [] } }
         ]
     });
     assert!(
@@ -748,7 +748,7 @@ async fn test_full_hierarchy_batch() {
             "id": "gts.x.core.rg.type.v1~y.core.tn.tenant.v1~x.core._.t7.v1",
             "name": "T7", "parent_id": "11111111-1111-1111-1111-111111111111",
             "tenant_id": "77777777-7777-7777-7777-777777777777", "depth": 1,
-            "metadata": { "barrier": true }
+            "metadata": { "self_managed": true }
         }),
         json!({
             "id": "gts.x.core.rg.type.v1~w.core.org.department.v1~x.core._.d8.v1",

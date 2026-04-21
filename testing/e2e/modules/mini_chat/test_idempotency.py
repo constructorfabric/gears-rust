@@ -1,3 +1,4 @@
+# Updated: 2026-04-16 by Constructor Tech
 """Tests for request_id idempotency — conflict detection, replay priority, quota invariance."""
 
 import threading
@@ -9,7 +10,6 @@ import pytest
 
 from .conftest import (
     API_PREFIX,
-    DB_PATH,
     expect_done,
     expect_stream_started,
     parse_sse,
@@ -75,7 +75,7 @@ class TestIdempotency:
         many_deltas.append(
             MockEvent("response.output_text.done", {"text": "done"})
         )
-        mock_provider.set_next_scenario(Scenario(slow=0.5, events=many_deltas))
+        mock_provider.set_next_scenario(Scenario(slow=0.2, events=many_deltas))
 
         url = f"{API_PREFIX}/chats/{chat_id}/messages:stream"
         body = {"content": "Hello slow.", "request_id": request_id}
@@ -185,6 +185,7 @@ class TestIdempotency:
         assert second_resp.status_code == 409
         assert second_resp.json().get("title") == "request_id_conflict"
 
+    @pytest.mark.timeout(30)
     def test_replay_priority_over_parallel_check(self, chat, mock_provider):
         """Replay of a completed turn returns 200 even while another turn is running."""
         chat_id = chat["id"]

@@ -1,3 +1,4 @@
+# Updated: 2026-04-16 by Constructor Tech
 """Mini-chat E2E conftest — SSE helpers, provider fixtures, module test env."""
 
 from __future__ import annotations
@@ -458,6 +459,16 @@ def server(test_env):
 def mock_provider(test_env):
     """Access to the mock provider sidecar (for set_next_scenario)."""
     return test_env.sidecars.get("mock-provider")
+
+
+@pytest.fixture(autouse=True)
+def reset_mock_provider_state(mock_provider):
+    """Prevent session-scoped mock sidecar state from leaking between tests."""
+    mock_provider.clear_captured_requests()
+    mock_provider.clear_override_scenarios()
+    yield
+    mock_provider.clear_captured_requests()
+    mock_provider.clear_override_scenarios()
 
 
 @pytest.fixture

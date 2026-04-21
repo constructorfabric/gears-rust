@@ -1,0 +1,425 @@
+# !! KEEP THIS FILE IDENTICAL TO e2e-local.yaml EXCEPT for the
+# !! tr-authz-plugin / rg-tr-plugin priority overrides below.
+#
+# This config activates the AuthZ → TenantResolver → Resource Group chain:
+#   * tr-authz-plugin (priority=90) over static-authz-plugin
+#     (default priority=100). tr-authz-plugin resolves tenant hierarchy
+#     via TenantResolverClient rather than touching Resource Group directly.
+#   * rg-tr-plugin   (priority=10) over static-tr-plugin (priority=20),
+#     so TenantResolver answers hierarchy queries against Resource Group
+#     instead of the static in-memory tenant table.
+#
+# End-to-end: AuthZ request → tr-authz-plugin → TenantResolverClient
+#             → rg-tr-plugin → ResourceGroupReadHierarchy → RG storage.
+#
+# HyperSpot Server Configuration
+#
+# Database Architecture Overview:
+# ===============================
+#
+# HyperSpot uses a centralized DbManager that:
+# 1. Loads global database server templates from `database.servers`
+# 2. For each module, merges server template with module-specific overrides
+# 3. Creates isolated database connections per module
+# 4. Caches DbHandle instances for reuse within the same module
+#
+# Key principles:
+# - Each module gets its own database connection (no sharing)
+# - SQLite modules automatically get their own database file
+# - Configuration follows a clear precedence hierarchy
+# - Environment variables are expanded (${VAR_NAME})
+# - All paths are resolved relative to server.home_dir
+
+# Core server configuration (global section)
+server:
+  home_dir: "~/.hyperspot"
+
+# Database configuration (DbManager architecture)
+#
+# The database config has two levels:
+# 1. Global "servers" - shared connection templates that modules can reference
+# 2. Per-module configs - specific database settings for each module
+#
+# Configuration precedence (highest to lowest):
+# - Module `params` map (highest priority)
+# - Module DSN query params
+# - Module fields (host, port, user, etc.)
+# - Module DSN base
+# - Server `params` map
+# - Server DSN query params
+# - Server fields
+# - Server DSN base (lowest priority)
+#
+database:
+  # Global database servers - reusable connection templates
+  # These define shared settings that multiple modules can inherit
+  servers:
+    # SQLite server template for user data modules
+    # Note: No DSN or file specified here - modules specify their own database files
+    # This prevents accidental sharing of SQLite databases between modules
+    sqlite_users:
+      engine: "sqlite"
+      # SQLite PRAGMA parameters applied to all connections using this server
+      params:
+        WAL: "true"              # Enable Write-Ahead Logging for better concurrency
+        synchronous: "NORMAL"    # Balance between safety and performance
+        busy_timeout: "5000"     # Wait 5 seconds for locked database
+      # Connection pool settings shared by all modules using this server
+      pool:
+        max_conns: 5             # Maximum 5 concurrent connections
+        acquire_timeout: "30s"   # Timeout when acquiring connection from pool
+
+  # Global database options
+  # auto_provision: true       # (default) Create directories automatically for SQLite files
+  # auto_provision: false      # Fail if directories don't exist
+
+# Logging configuration (global section)
+logging:
+  # global section
+  default:
+    console_level: info
+    file: "logs/hyperspot-e2e.log"
+    file_level: info
+    max_age_days: 28
+    max_backups: 3
+    max_size_mb: 10
+  sqlx:
+    console_level: debug
+    file: "logs/sql.log"
+    file_level: debug
+  api-gateway:
+    console_level: debug
+    file: "logs/api.log"
+    file_level: debug
+    max_age_days: 28
+    max_backups: 3
+    max_size_mb: 100
+  types-registry:
+    console_level: info
+    file: "logs/types_registry.log"
+    file_level: debug
+    max_age_days: 7
+    max_backups: 3
+    max_size_mb: 50
+
+
+# Per-module configurations using new structure
+modules:
+  api-gateway:
+    # No database needed for api-gateway
+    config:
+      bind_addr: "0.0.0.0:8086"
+      enable_docs: true
+      cors_enabled: false
+
+      # OpenAPI Documentation Configuration
+      openapi:
+        title: "HyperSpot API"
+        version: "0.1.0"
+        description: "HyperSpot Server API Documentation"
+      defaults:
+        body_limit_bytes: 64000000
+        rate_limit:
+          rps: 1000
+          burst: 200
+          in_flight: 64
+
+      # Authentication Configuration
+      auth_disabled: false
+      require_auth_by_default: true
+
+  # --- Tenant Resolver example (gateway + plugins) ---
+  types-registry:
+    config: {}
+
+  static-tr-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 20
+      tenants:
+        # Root tenant used by oagw + credstore e2e tests
+        - id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          name: "e2e-root"
+          parent_id: null
+          status: active
+        # Tenant B for cross-tenant E2E tests
+        - id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+          name: "e2e-tenant-b"
+          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          status: active
+        # Hierarchy sub-root
+        - id: "00000000-0000-0000-0000-000000000001"
+          name: "hierarchy-root"
+          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000002"
+          name: "hierarchy-l1a"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000005"
+          name: "hierarchy-l1b"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000003"
+          name: "hierarchy-l2a-deleted"
+          parent_id: "00000000-0000-0000-0000-000000000002"
+          status: deleted
+        - id: "00000000-0000-0000-0000-000000000004"
+          name: "hierarchy-l2b"
+          parent_id: "00000000-0000-0000-0000-000000000002"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000006"
+          name: "hierarchy-l2c"
+          parent_id: "00000000-0000-0000-0000-000000000005"
+          status: active
+
+  tenant-resolver:
+    config:
+      vendor: "hyperspot"
+
+  static-credstore-plugin:
+    config:
+      secrets:
+        # Test-only fake client ID, not a real credential
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          owner_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+          key: "openai-key"
+          value: "sk-test-e2e-fake-key"
+        # Test-only fake credentials for OAuth2 client ID and secret
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          owner_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+          key: "test-oauth2-client-id"
+          value: "test-client-id"
+        # Test-only fake client secret, not a real credential
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          owner_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+          key: "test-oauth2-client-secret"
+          value: "test-client-secret"
+
+  grpc-hub:
+    config:
+      listen_addr: "uds:///tmp/hyperspot-grpc-e2e"
+
+  users-info:
+    # Module-specific database configuration
+    database:
+      # Reference to global server template defined above
+      server: "sqlite_users"               # Inherits params and pool settings from sqlite_users
+
+      # Module-specific database file (required for SQLite modules)
+      file: "users_info.db"                # Creates: ~/.hyperspot/users_info/users_info.db
+
+      # Module can override server settings:
+      # params:
+      #   synchronous: "FULL"              # Would override server's "NORMAL" setting
+      #   custom_pragma: "value"           # Would add new PRAGMA setting
+      # pool:
+      #   max_conns: 10                    # Would override server's max_conns: 5
+
+      # Alternative ways to specify database location:
+      # path: "/absolute/path/to/db.sqlite" # Use absolute path instead of file
+      # dsn: "sqlite://custom.db?WAL=false" # Complete DSN override (ignores server)
+
+      # For other database types (PostgreSQL, MySQL):
+      # host: "localhost"                  # Override server host
+      # port: 5432                         # Override server port
+      # user: "app_user"                   # Override server user
+      # password: "${DB_PASSWORD}"         # Environment variable expansion
+      # dbname: "users_db"                 # Override server database name
+
+    # Module-specific application configuration
+    config:
+      default_page_size: 5
+      max_page_size: 100
+
+  authz-resolver:
+    config:
+      vendor: "hyperspot"
+  
+  static-authn-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+      mode: static_tokens
+      tokens:
+        - token: "e2e-token-tenant-a"
+          identity:
+            subject_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            token_scopes: ["*"]
+        - token: "e2e-token-tenant-b"
+          identity:
+            subject_id: "22222222-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            token_scopes: ["*"]
+        # Nil-tenant token: static-authz denies requests with the nil UUID
+        # tenant, producing a clean 403 Forbidden. Used by
+        # testing/e2e/modules/oagw/test_authz.py::test_proxy_authz_forbidden_nil_tenant
+        - token: "e2e-token-nil-tenant"
+          identity:
+            subject_id: "33333333-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-0000-0000-0000-000000000000"
+            token_scopes: ["*"]
+      s2s_credentials:
+        - client_id: "mini-chat"
+          client_secret: "mini-chat-dev-secret"
+
+  tr-authz-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 90  # Below static-authz-plugin default (100), so tr-authz is selected
+
+  rg-tr-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 10  # Below static-tr-plugin (20), so rg-tr is the winning TR plugin
+
+  mini-chat:
+    # Module-specific database configuration
+    database:
+      server: "sqlite_users"
+      file: "mini_chat.db"
+    config:
+      # S2S credentials for obtaining SecurityContext
+      # that will be used for communication with other modules.
+      client_credentials:
+        client_id: "mini-chat"
+        client_secret: "mini-chat-dev-secret"
+
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
+
+  simple-user-settings:
+    # Module-specific database configuration
+    database:
+      server: "sqlite_users"
+      file: "settings.db"
+    config: {}
+
+  file-parser:
+    config:
+      allowed_local_base_dir: /tmp
+
+  oagw:
+    config:
+      proxy_timeout_secs: 2
+      allow_http_upstream: true # Only for testing - do not enable in production without proper security controls
+
+# OpenTelemetry configuration (resource identity, tracing, metrics)
+opentelemetry:
+  # Shared resource identity (attached to all traces and metrics)
+  resource:
+    service_name: "hyperspot-api"
+    attributes:
+      service.version: "1.3.7"
+      deployment.environment: "dev"
+      service.namespace: "hyperspot"
+
+  # Default exporter shared by tracing and metrics.
+  # Per-signal `exporter` fields override this when present.
+  exporter:
+    kind: "otlp_grpc"  # or "otlp_http"
+    endpoint: "http://127.0.0.1:4317"
+    headers:
+      # Add any required headers, e.g., for authentication
+      # authorization: "Bearer your-token"
+      uptrace-dsn: "http://project1_secret@localhost:14318?grpc=14317"
+    timeout_ms: 5000
+
+  # Tracing configuration
+  tracing:
+    enabled: false
+
+    # Per-signal exporter override (fully replaces the shared exporter)
+    exporter:
+      kind: "otlp_grpc"
+      endpoint: "http://127.0.0.1:14317"  # Jaeger OTLP gRPC endpoint
+
+    # Sampling configuration
+    sampler:
+      parent_based_ratio: # parent_based_always_on | parent_based_ratio | always_on | always_off
+        ratio: 1.0  # Sample 100% of traces
+
+    # Propagation configuration
+    propagation:
+      w3c_trace_context: true  # Enable W3C Trace Context propagation
+
+    # HTTP-specific options
+    http:
+      inject_request_id_header: "x-request-id"
+      # WARNING: "authorization" sends bearer tokens to the trace collector — dev/test only
+      record_headers: [ "user-agent", "x-forwarded-for", "authorization" ]
+
+    # Log correlation (future feature)
+    logs_correlation:
+      inject_trace_ids_into_logs: true
+
+  # Metrics configuration
+  metrics:
+    enabled: false
+
+# Example configurations for different database scenarios:
+#
+# Example 1: PostgreSQL server with multiple modules
+# ==================================================
+# database:
+#   servers:
+#     main_postgres:
+#       host: "localhost"
+#       port: 5432
+#       user: "hyperspot"
+#       password: "${POSTGRES_PASSWORD}"  # From environment variable
+#       params:
+#         sslmode: "require"
+#         application_name: "hyperspot"
+#       pool:
+#         max_conns: 20
+#         acquire_timeout: "30s"
+# modules:
+#   users_module:
+#     database:
+#       server: "main_postgres"
+#       dbname: "users_db"              # Each module gets its own database
+#   orders_module:
+#     database:
+#       server: "main_postgres"
+#       dbname: "orders_db"             # Separate database for orders
+#       pool:
+#         max_conns: 10                 # Module-specific pool override
+#
+# Example 2: Mixed database types
+# ===============================
+# database:
+#   servers:
+#     postgres_main:
+#       dsn: "postgres://user:${PG_PASS}@localhost:5432/main"
+#     redis_cache:
+#       dsn: "redis://localhost:6379/0"
+# modules:
+#   user_service:
+#     database:
+#       server: "postgres_main"
+#       dbname: "users"
+#   cache_service:
+#     database:
+#       server: "redis_cache"
+#
+# Example 3: Complete DSN override
+# ================================
+# modules:
+#   analytics:
+#     database:
+#       dsn: "postgres://analytics:${ANALYTICS_PASSWORD}@analytics-db:5432/metrics?sslmode=require"
+#       # When DSN is specified, server reference is ignored
+#
+# Example 4: No database module
+# =============================
+# modules:
+#   static_files:
+#     # No database section - module won't get database access
+#     config:
+#       static_dir: "/var/www/static"

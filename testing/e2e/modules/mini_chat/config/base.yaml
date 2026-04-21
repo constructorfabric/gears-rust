@@ -1,3 +1,4 @@
+# Updated: 2026-04-16 by Constructor Tech
 # Mini-Chat development configuration
 #
 # Minimal config for developing/testing the mini-chat module.
@@ -92,6 +93,12 @@ modules:
       vendor: "hyperspot"
 
   single-tenant-tr-plugin:
+    config: {}
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
     config: {}
 
   simple-user-settings:
@@ -427,9 +434,3 @@ modules:
         - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
           key: "azure-openai-key"
           value: "REPLACE_WITH_AZURE_KEY"
-
-  resource-group:
-    database:
-      server: "sqlite_users"
-      file: "resource_group.db"
-    config: {}

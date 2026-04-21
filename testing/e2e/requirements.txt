@@ -1,6 +1,8 @@
+# Updated: 2026-04-16 by Constructor Tech
 pytest>=7.0.0
 httpx>=0.28.0  # Previously 0.23.0 minimum for PYSEC-2022-183 fix
 pytest-asyncio
+pytest-timeout>=2.3
 aiohttp>=3.13.3  # Mock upstream server for OAGW E2E tests
 websockets>=14.0  # WebSocket client for OAGW WebSocket proxy E2E tests
 

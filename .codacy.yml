@@ -13,3 +13,5 @@ exclude_paths:
   - ".venv/**"
   - "**/*.min.js"
   - "**/*.min.css"
+  - "testing/e2e/**"
+  - "modules/**/tests/**"

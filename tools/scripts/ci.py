@@ -420,10 +420,11 @@ def cmd_e2e(args):
         os.makedirs(data_dir, exist_ok=True)
 
         # Start server in background with logs redirected to files
+        config_path = getattr(args, "config", "config/e2e-local.yaml")
         server_cmd = [
             release_bin,
             "--config",
-            "config/e2e-local.yaml",
+            config_path,
         ]
 
         server_log_file = os.path.join(logs_dir, "hyperspot-e2e.log")
@@ -840,6 +841,11 @@ def build_parser():
         "--features",
         default="users-info-example",
         help="Ignored in local mode (kept for CLI parity)",
+    )
+    p_e2e_local.add_argument(
+        "--config",
+        default="config/e2e-local.yaml",
+        help="Path to server config file",
     )
     p_e2e_local.add_argument(
         "--smoke",
