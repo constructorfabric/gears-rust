@@ -1,3 +1,4 @@
+# Updated: 2026-04-16 by Constructor Tech
 # HyperSpot Server Configuration
 #
 # Database Architecture Overview:
@@ -196,6 +197,12 @@ modules:
       #       header: "api-key"
       #       prefix: ""
       #       secret_ref: "azure-openai-key-tenant-b"
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
 
   simple-user-settings:
     # Module-specific database configuration

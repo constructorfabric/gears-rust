@@ -3,6 +3,12 @@
 //! Resource Group Module — contracts and domain types.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+// === MODULE DEFINITION ===
+pub mod module;
+pub use module::ResourceGroup;
+
+// === INTERNAL MODULES ===
+#[doc(hidden)]
 pub mod domain;
 #[doc(hidden)]
 pub mod infra;

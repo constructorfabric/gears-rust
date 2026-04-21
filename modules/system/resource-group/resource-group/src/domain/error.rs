@@ -32,6 +32,9 @@ pub enum DomainError {
     #[error("Membership not found: {key}")]
     MembershipNotFound { key: String },
 
+    #[error("Duplicate membership: {message}")]
+    DuplicateMembership { message: String },
+
     #[error("Invalid parent type: {message}")]
     InvalidParentType { message: String },
 
@@ -117,6 +120,12 @@ impl DomainError {
         Self::MembershipNotFound { key: key.into() }
     }
 
+    pub fn duplicate_membership(message: impl Into<String>) -> Self {
+        Self::DuplicateMembership {
+            message: message.into(),
+        }
+    }
+
     pub fn invalid_parent_type(message: impl Into<String>) -> Self {
         Self::InvalidParentType {
             message: message.into(),
@@ -174,7 +183,9 @@ impl From<DomainError> for ResourceGroupError {
             DomainError::ConflictActiveReferences { message } => {
                 ResourceGroupError::conflict_active_references(message)
             }
-            DomainError::Conflict { message } => ResourceGroupError::conflict(message),
+            DomainError::Conflict { message } | DomainError::DuplicateMembership { message } => {
+                ResourceGroupError::conflict(message)
+            }
             DomainError::GroupNotFound { id } => ResourceGroupError::not_found(id.to_string()),
             DomainError::MembershipNotFound { key } => ResourceGroupError::not_found(key),
             DomainError::TenantIncompatibility { message } => {

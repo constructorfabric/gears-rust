@@ -61,6 +61,40 @@ pub fn validate_metadata_schema(schema: &serde_json::Value) -> Result<(), Domain
 }
 // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
 
+/// Validate a metadata JSON value against a raw JSON Schema.
+///
+/// Synchronous counterpart to [`validate_metadata_via_gts`] that does not
+/// resolve GTS types. When either `metadata` or `schema` is `None`, the
+/// check passes trivially.
+///
+/// # Errors
+///
+/// Returns [`DomainError::validation`] when the schema fails to compile
+/// or the metadata violates any schema constraint.
+pub fn validate_metadata_against_schema(
+    metadata: Option<&serde_json::Value>,
+    schema: Option<&serde_json::Value>,
+) -> Result<(), DomainError> {
+    let (Some(metadata), Some(schema)) = (metadata, schema) else {
+        return Ok(());
+    };
+
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|e| DomainError::validation(format!("metadata_schema is invalid: {e}")))?;
+
+    let errors: Vec<String> = validator
+        .iter_errors(metadata)
+        .map(|e| e.to_string())
+        .collect();
+    if !errors.is_empty() {
+        return Err(DomainError::validation(format!(
+            "Metadata does not match type schema: {}",
+            errors.join("; ")
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a metadata value against a resolved GTS type schema.
 ///
 /// Uses `TypesRegistryClient` to fetch the resolved schema (with `allOf`
@@ -87,11 +121,16 @@ pub async fn validate_metadata_via_gts(
 
     // Fetch the GTS entity — its content contains the resolved schema
     // including allOf composition and $ref resolution from types-registry.
-    let entity = types_registry.get(type_code).await.map_err(|e| {
-        DomainError::validation(format!(
-            "Failed to resolve GTS type '{type_code}' for metadata validation: {e}"
-        ))
-    })?;
+    let entity = match types_registry.get(type_code).await {
+        Ok(entity) => entity,
+        // No registered schema for this type -- skip metadata validation.
+        Err(types_registry_sdk::TypesRegistryError::NotFound(_)) => return Ok(()),
+        Err(e) => {
+            return Err(DomainError::validation(format!(
+                "Failed to resolve GTS type '{type_code}' for metadata validation: {e}"
+            )));
+        }
+    };
 
     // Extract metadata sub-schema from the GTS entity content.
     // The chained RG type schema defines a `metadata` property within

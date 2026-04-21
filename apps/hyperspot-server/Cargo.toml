@@ -40,6 +40,7 @@ types_registry = { package = "cf-types-registry", path = "../../modules/system/t
 tenant-resolver = { package = "cf-tenant-resolver", path = "../../modules/system/tenant-resolver/tenant-resolver" }
 authn-resolver = { package = "cf-authn-resolver", path = "../../modules/system/authn-resolver/authn-resolver" }
 authz-resolver = { package = "cf-authz-resolver", path = "../../modules/system/authz-resolver/authz-resolver" }
+resource_group = { package = "cf-resource-group", path = "../../modules/system/resource-group/resource-group" }
 
 # Optional tenant resolver plugins
 single-tenant-tr-plugin = { package = "cf-single-tenant-tr-plugin", path = "../../modules/system/tenant-resolver/plugins/single-tenant-tr-plugin", optional = true }

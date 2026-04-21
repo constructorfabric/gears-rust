@@ -427,3 +427,9 @@ modules:
         - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
           key: "azure-openai-key"
           value: "REPLACE_WITH_AZURE_KEY"
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}

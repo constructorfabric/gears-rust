@@ -291,6 +291,12 @@ modules:
       proxy_timeout_secs: 2
       allow_http_upstream: true # Only for testing - do not enable in production without proper security controls
 
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
+
 # OpenTelemetry configuration (resource identity, tracing, metrics)
 opentelemetry:
   # Shared resource identity (attached to all traces and metrics)
