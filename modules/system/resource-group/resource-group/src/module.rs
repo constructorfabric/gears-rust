@@ -4,13 +4,15 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
-use modkit::{DatabaseCapability, Module, ModuleCtx};
+use modkit::api::OpenApiRegistry;
+use modkit::{DatabaseCapability, Module, ModuleCtx, RestApiCapability};
 use modkit_db::DBProvider;
 use modkit_db::DbError;
 use resource_group_sdk::{ResourceGroupClient, ResourceGroupReadHierarchy};
 use sea_orm_migration::MigrationTrait;
 use tracing::info;
 
+use crate::api::rest::routes;
 use crate::domain::group_service::{GroupService, QueryProfile};
 use crate::domain::membership_service::MembershipService;
 use crate::domain::read_service::RgReadService;
@@ -31,7 +33,7 @@ pub type ConcreteRgService = RgService<GroupRepository, TypeRepository, Membersh
 #[modkit::module(
     name = "resource-group",
     deps = ["authz-resolver", "types-registry"],
-    capabilities = [db]
+    capabilities = [db, rest]
 )]
 #[allow(clippy::struct_field_names)]
 pub struct ResourceGroup {
@@ -148,4 +150,42 @@ impl DatabaseCapability for ResourceGroup {
     }
 }
 
-// REST capability and route registration are added in a follow-up PR.
+impl RestApiCapability for ResourceGroup {
+    fn register_rest(
+        &self,
+        _ctx: &ModuleCtx,
+        router: axum::Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<axum::Router> {
+        info!("Registering resource_group REST routes");
+
+        let type_service = self
+            .type_service
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("TypeService not initialized"))?
+            .clone();
+
+        let group_service = self
+            .group_service
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("GroupService not initialized"))?
+            .clone();
+
+        let membership_service = self
+            .membership_service
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("MembershipService not initialized"))?
+            .clone();
+
+        let router = routes::register_routes(
+            router,
+            openapi,
+            type_service,
+            group_service,
+            membership_service,
+        );
+
+        info!("Resource Group REST routes registered successfully");
+        Ok(router)
+    }
+}

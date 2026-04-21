@@ -1,3 +1,4 @@
+# Updated: 2026-04-16 by Constructor Tech
 [package]
 name = "hyperspot-server"
 version = "0.6.1"
@@ -19,6 +20,8 @@ single-tenant = ["dep:single-tenant-tr-plugin"]
 static-tenants = ["dep:static-tr-plugin"]
 static-authn = ["dep:static-authn-plugin"]
 static-authz = ["dep:static-authz-plugin"]
+tr-authz = ["dep:tr-authz-plugin"]
+tenant-resolver-rg = ["dep:rg-tr-plugin"]
 static-credstore = ["dep:static-credstore-plugin"]
 mini-chat = ["dep:mini-chat"]
 k8s = ["mini-chat/k8s"]
@@ -40,7 +43,6 @@ types_registry = { package = "cf-types-registry", path = "../../modules/system/t
 tenant-resolver = { package = "cf-tenant-resolver", path = "../../modules/system/tenant-resolver/tenant-resolver" }
 authn-resolver = { package = "cf-authn-resolver", path = "../../modules/system/authn-resolver/authn-resolver" }
 authz-resolver = { package = "cf-authz-resolver", path = "../../modules/system/authz-resolver/authz-resolver" }
-resource_group = { package = "cf-resource-group", path = "../../modules/system/resource-group/resource-group" }
 
 # Optional tenant resolver plugins
 single-tenant-tr-plugin = { package = "cf-single-tenant-tr-plugin", path = "../../modules/system/tenant-resolver/plugins/single-tenant-tr-plugin", optional = true }
@@ -54,6 +56,8 @@ tr-authz-plugin = { package = "cf-tr-authz-plugin", path = "../../modules/system
 
 # Optional credstore plugins
 static-credstore-plugin = { package = "cf-static-credstore-plugin", path = "../../modules/credstore/plugins/static-credstore-plugin", optional = true }
+
+resource_group = { package = "cf-resource-group", path = "../../modules/system/resource-group/resource-group" }
 
 # user modules
 file_parser = { package = "cf-file-parser", path = "../../modules/file-parser" }

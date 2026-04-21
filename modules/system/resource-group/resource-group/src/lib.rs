@@ -9,6 +9,8 @@ pub use module::ResourceGroup;
 
 // === INTERNAL MODULES ===
 #[doc(hidden)]
+pub mod api;
+#[doc(hidden)]
 pub mod domain;
 #[doc(hidden)]
 pub mod infra;
