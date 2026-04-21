@@ -16,3 +16,7 @@ impl AuthZResolverPluginClient for Service {
         Ok(self.evaluate(&request).await)
     }
 }
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod client_tests;

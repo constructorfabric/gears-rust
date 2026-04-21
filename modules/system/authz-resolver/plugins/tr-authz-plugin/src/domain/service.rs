@@ -459,3 +459,7 @@ impl Service {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod service_tests;

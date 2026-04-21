@@ -189,3 +189,7 @@ impl Default for MtlsConfig {
 }
 
 // @cpt-end:cpt-cf-resource-group-dod-integration-auth-dual-auth:p1:inst-full
+
+#[cfg(test)]
+#[path = "auth_tests.rs"]
+mod tests;

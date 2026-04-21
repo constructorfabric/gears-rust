@@ -284,3 +284,7 @@ impl From<ResourceGroupMembership> for MembershipDto {
 }
 
 // @cpt-dod:cpt-cf-resource-group-dod-testing-odata-dto:p1
+
+#[cfg(test)]
+#[path = "dto_tests.rs"]
+mod tests;

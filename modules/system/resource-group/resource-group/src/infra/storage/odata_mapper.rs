@@ -135,3 +135,7 @@ impl ODataFieldMapping<MembershipFilterField> for MembershipODataMapper {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "odata_mapper_tests.rs"]
+mod tests;
