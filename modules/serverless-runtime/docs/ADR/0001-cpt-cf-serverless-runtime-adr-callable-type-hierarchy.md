@@ -44,6 +44,23 @@ date: 2026-03-23
 
 <!-- /toc -->
 
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Option A: Function → Workflow (function as base type)](#option-a-function--workflow-function-as-base-type)
+  - [Option B: Entrypoint → Function | Workflow (abstract entrypoint base)](#option-b-entrypoint--function--workflow-abstract-entrypoint-base)
+  - [Option C: Callable → Function | Workflow (abstract callable base)](#option-c-callable--function--workflow-abstract-callable-base)
+- [More Information](#more-information)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
 **ID**: `cpt-cf-serverless-runtime-adr-callable-type-hierarchy`
 
 ## Context and Problem Statement

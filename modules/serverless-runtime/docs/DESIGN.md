@@ -1,6 +1,5 @@
 # Technical Design — Serverless Runtime
 
-
 <!-- toc -->
 
 - [1. Architecture Overview](#1-architecture-overview)
@@ -133,13 +132,14 @@ Requirements that significantly influence architecture decisions.
 
 | ADR ID | Decision Summary |
 |--------|-----------------|
-| `cpt-cf-serverless-runtime-adr-callable-type-hierarchy` | Unified callable type hierarchy: Function and Workflow as sibling GTS base types with identical base schema fields |
+| `cpt-cf-serverless-runtime-adr-callable-type-hierarchy` | Unified callable type hierarchy: Function as base type, Workflow as derived specialization |
+| `cpt-cf-serverless-runtime-adr-jsonrpc-mcp-protocol-surfaces` | JSON-RPC 2.0 and MCP protocol surfaces for direct function invocation and AI agent tool integration |
 
 ### 1.3 Architecture Layers
 
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
-| API | REST endpoints for function management, invocation, scheduling, triggers, tenant policy, observability | REST / JSON, RFC 9457 Problem Details |
+| API | REST endpoints for function management, invocation, scheduling, triggers, tenant policy, observability; JSON-RPC 2.0 endpoint for direct function invocation; MCP server endpoint for AI agent tool integration | REST / JSON, JSON-RPC 2.0, MCP (Streamable HTTP), RFC 9457 Problem Details |
 | Domain | Core entities, state machines, validation rules, GTS type resolution | Rust, GTS type system |
 | Runtime | Pluggable execution adapters, invocation engine, scheduler, event processing | Rust async traits, adapter plugins |
 | Infrastructure | Persistence, caching, event broker integration, secret management | TBD per deployment |
@@ -1007,6 +1007,7 @@ This allocation means the orchestrator can ship with a simple adapter (e.g., Sta
 | Trigger | `gts.x.core.sless.trigger.v1~` | Event-driven invocation binding |
 | Webhook Trigger | `gts.x.core.sless.webhook_trigger.v1~` | HTTP endpoint trigger for external systems |
 | TenantRuntimePolicy | `gts.x.core.sless.tenant_policy.v1~` | Tenant-level governance settings |
+| McpSession | `gts.x.core.sless.mcp_session.v1~` | MCP protocol session state for AI agent interactions |
 
 #### Supporting Types
 
@@ -1023,6 +1024,11 @@ This allocation means the orchestrator can ship with a simple adapter (e.g., Sta
 | `gts.x.core.sless.status.v1~` | Invocation status (derived types per state) |
 | `gts.x.core.sless.err.v1~` | Error types (derived types per error kind) |
 | `gts.x.core.sless.timeline_event.v1~` | Invocation timeline event for execution history |
+| `gts.x.core.sless.jsonrpc_traits.v1~` | JSON-RPC protocol exposure configuration for a function |
+| `gts.x.core.sless.mcp_traits.v1~` | MCP protocol exposure and tool configuration for a function |
+| `gts.x.core.sless.mcp_tool_annotations.v1~` | MCP tool annotation hints (read-only, destructive, idempotent, open-world) |
+| `gts.x.core.sless.mcp_elicitation_context.v1~` | Elicitation request parameters passed from executor to MCP server layer |
+| `gts.x.core.sless.mcp_sampling_context.v1~` | Sampling request parameters passed from executor to MCP server layer |
 
 #### Executor
 
@@ -1044,6 +1050,19 @@ They are distinguished via their GTS base types, which are siblings — neither 
 
 - **sync** — caller waits for completion and receives the result in the response. Best for short runs.
 - **async** — caller receives an `invocation_id` immediately and polls for status/results later.
+- **stream** — caller receives an SSE (Server-Sent Events) stream that delivers progress notifications, intermediate events (elicitation requests, sampling requests), and the final result. This mode is used by the MCP server for streaming tool calls and by the JSON-RPC endpoint for streaming function invocations. Stream mode is a form of asynchronous execution with real-time push delivery instead of polling.
+
+##### Protocol surfaces
+
+Functions can be invoked through multiple protocol surfaces. Each surface translates its wire protocol into the Invocation Engine's domain model:
+
+| Protocol Surface | Endpoint | Function Identity | Streaming | Session |
+|------------------|----------|-------------------|-----------|---------|
+| REST API | `POST /api/serverless-runtime/v1/invocations` | `function_id` in request body | No (poll-based async) | No |
+| JSON-RPC 2.0 | `POST /api/serverless-runtime/v1/json-rpc` | `method` field = GTS function ID | Optional (SSE response + input stream) | No |
+| MCP Server | `POST /api/serverless-runtime/v1/mcp` | `tools/call` `name` = GTS function ID | Yes (SSE with progress, elicitation, sampling) | Yes (MCP session) |
+
+All protocol surfaces delegate to the same Invocation Engine for validation, execution, and lifecycle management. The function definition's `traits.json_rpc` and `traits.mcp` fields control exposure on each surface — functions without these fields are not accessible through the respective protocol.
 
 ---
 
@@ -1589,6 +1608,162 @@ and execution history visualization per PRD BR-015 and BR-130.
 
 > Schema: [`gts.x.core.sless.timeline_event.v1~`](DESIGN_GTS_SCHEMAS.md#invocationtimelineevent)
 
+#### JsonRpcTraits
+
+**GTS ID:** `gts.x.core.sless.jsonrpc_traits.v1~`
+
+Controls whether and how a function is exposed on the JSON-RPC 2.0 endpoint. Functions without
+`traits.json_rpc` are not accessible via JSON-RPC.
+
+##### Fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | boolean | No | `false` | Whether the function is exposed on the JSON-RPC endpoint |
+| `stream_response` | boolean | No | `false` | When `true`, the JSON-RPC endpoint returns an SSE stream (`Content-Type: text/event-stream`) with progress notifications and the final result. When `false`, returns a single JSON-RPC response (`Content-Type: application/json`). |
+| `stream_input` | boolean | No | `false` | When `true`, the function accepts input streaming — the client can POST additional input messages to a correlation endpoint during execution. Requires `stream_response: true`. |
+
+> Schema: [`gts.x.core.sless.jsonrpc_traits.v1~`](DESIGN_GTS_SCHEMAS.md#jsonrpctraits)
+
+#### McpTraits
+
+**GTS ID:** `gts.x.core.sless.mcp_traits.v1~`
+
+Controls whether and how a function is exposed as an MCP tool on the MCP server endpoint.
+Functions without `traits.mcp` are not visible to MCP clients. This field is analogous to
+Cyberville's `cti-traits.mcp` reference but uses GTS-native configuration within the function
+definition's `traits` object.
+
+##### Fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | boolean | No | `false` | Whether the function is exposed as an MCP tool |
+| `stream_response` | boolean | No | `false` | When `true`, `tools/call` returns an SSE stream with progress, elicitation, sampling, and the final result. When `false`, returns a single JSON response. Determines sync vs. async execution path. |
+| `tool_annotations` | McpToolAnnotations | No | (defaults) | MCP tool annotation hints per MCP spec |
+| `elicitation_capable` | boolean | No | `false` | Whether the function may request human input during execution via MCP `elicitation/create`. Requires `stream_response: true`. |
+| `sampling_capable` | boolean | No | `false` | Whether the function may request LLM completions during execution via MCP `sampling/createMessage`. Requires `stream_response: true`. |
+
+> Schema: [`gts.x.core.sless.mcp_traits.v1~`](DESIGN_GTS_SCHEMAS.md#mcptraits)
+
+#### McpToolAnnotations
+
+**GTS ID:** `gts.x.core.sless.mcp_tool_annotations.v1~`
+
+MCP tool annotation hints included in `tools/list` responses. Per the MCP specification, these
+are hints — clients must not rely on them for correctness or security.
+
+##### Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `title` | string | (function title) | Human-readable display name for the tool |
+| `read_only_hint` | boolean | `false` | If `true`, the tool does not modify its environment |
+| `destructive_hint` | boolean | `true` | Meaningful only when `read_only_hint` is `false`. If `true`, the tool may perform destructive updates. |
+| `idempotent_hint` | boolean | `false` | Meaningful only when `read_only_hint` is `false`. If `true`, repeated calls with same arguments have no additional effect. |
+| `open_world_hint` | boolean | `true` | If `true`, the tool interacts with external entities beyond its local environment |
+
+> Schema: [`gts.x.core.sless.mcp_tool_annotations.v1~`](DESIGN_GTS_SCHEMAS.md#mcptoolannotations)
+
+#### McpSession
+
+**GTS ID:** `gts.x.core.sless.mcp_session.v1~`
+
+Represents an MCP protocol session. Each session is scoped to a single client connection (e.g.,
+one AI agent chat conversation). Session state is persisted to the database so any platform
+instance can serve any session, enabling failover and horizontal scaling.
+
+Sessions follow the MCP 2025-03-26 lifecycle: `initialize` → operation → `DELETE`. Session
+state tracks the negotiated protocol version, client capabilities, active SSE streams, and
+expiry. The `Mcp-Session-Id` header is used for session affinity at the ingress layer.
+
+##### Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | Yes | Cryptographically-secure random identifier, returned in `Mcp-Session-Id` response header. Visible ASCII only (0x21–0x7E). |
+| `tenant_id` | string | Yes | Extracted from the JWT on `initialize`. All subsequent requests must carry a JWT for the same tenant. |
+| `protocol_version` | string | Yes | Negotiated MCP protocol version (e.g., `"2025-03-26"`). |
+| `client_capabilities` | object | Yes | Capabilities declared by the client during `initialize` (e.g., `sampling`, `elicitation`, `roots`). |
+| `server_capabilities` | object | Yes | Capabilities declared by the server in the `initialize` response (e.g., `tools`). |
+| `status` | string | Yes | One of `initializing`, `active`, `expired`, `terminated`. |
+| `last_activity_at` | string | Yes | ISO 8601 timestamp of last client activity. Used for inactivity-based expiry. |
+| `created_at` | string | Yes | ISO 8601 timestamp of session creation. |
+| `expires_at` | string | Yes | ISO 8601 timestamp of absolute session expiry. |
+
+##### Session Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> initializing : initialize request received
+    initializing --> active : notifications/initialized received
+    active --> active : any valid request (resets inactivity timer)
+    active --> expired : inactivity timeout or max session length exceeded
+    active --> terminated : DELETE /mcp received
+    expired --> [*]
+    terminated --> [*]
+```
+
+##### Session Expiry
+
+Sessions expire after a configurable inactivity timeout (default: 30 minutes). Each request
+resets the inactivity timer. Sessions also have a configurable maximum length (default: 24
+hours). On expiry or termination, the session is soft-deleted and all associated SSE streams
+and event logs are cleaned up. In-flight invocations continue independently — their results
+are stored in the `invocations` table and persist beyond session lifetime.
+
+##### Session Affinity
+
+Session state is persisted to the database, so any platform instance can serve requests for
+any session. However, the ingress should be configured for header-based session affinity
+using the `Mcp-Session-Id` header to keep active SSE streams on the same instance and avoid
+unnecessary database lookups.
+
+> Schema: [`gts.x.core.sless.mcp_session.v1~`](DESIGN_GTS_SCHEMAS.md#mcpsession)
+
+#### McpElicitationContext
+
+**GTS ID:** `gts.x.core.sless.mcp_elicitation_context.v1~`
+
+Defines the parameters passed from the executor to the MCP server layer when a function requests
+human input during execution. The executor transitions the invocation to `suspended` status and
+provides the elicitation context. The MCP server layer uses these parameters to construct an
+MCP `elicitation/create` request and send it to the client inline on the active SSE stream.
+
+##### Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message` | string | Yes | Prompt text displayed to the human user |
+| `requested_schema` | object | Yes | JSON Schema describing the expected input structure |
+| `timeout_seconds` | integer | No | Maximum time to wait for human input before timing out the elicitation. Default from tenant policy. |
+
+> Schema: [`gts.x.core.sless.mcp_elicitation_context.v1~`](DESIGN_GTS_SCHEMAS.md#mcpelicitationcontext)
+
+#### McpSamplingContext
+
+**GTS ID:** `gts.x.core.sless.mcp_sampling_context.v1~`
+
+Defines the parameters passed from the executor to the MCP server layer when a function requests
+an LLM completion during execution. The MCP server layer constructs an MCP
+`sampling/createMessage` request and sends it to the client inline on the active SSE stream.
+Unlike elicitation, the executor may remain actively waiting (holding its execution slot) for
+the typically fast LLM response rather than entering a suspended state.
+
+##### Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `messages` | array | Yes | Array of message objects (`{role, content}`) forming the conversation context for the LLM |
+| `model_preferences` | object | No | Hints about which model to use (e.g., preferred providers, cost/speed/intelligence priorities) |
+| `system_prompt` | string | No | System prompt for the LLM |
+| `max_tokens` | integer | No | Maximum tokens in the LLM response |
+| `temperature` | number | No | Sampling temperature |
+| `stop_sequences` | array | No | Stop sequences for the LLM |
+| `include_context` | string | No | Whether to include MCP server context: `"none"`, `"thisServer"`, `"allServers"` |
+
+> Schema: [`gts.x.core.sless.mcp_sampling_context.v1~`](DESIGN_GTS_SCHEMAS.md#mcpsamplingcontext)
+
 #### Function (Base Type)
 
 **GTS ID:** `gts.x.core.sless.function.v1~`
@@ -1760,6 +1935,23 @@ GTS Address: `gts.x.core.sless.function.v1~vendor.app.billing.calculate_tax.v1~`
       "initial_delay_ms": 200,
       "max_delay_ms": 10000,
       "backoff_multiplier": 2.0
+    },
+    "json_rpc": {
+      "enabled": true,
+      "stream_response": false,
+      "stream_input": false
+    },
+    "mcp": {
+      "enabled": true,
+      "stream_response": false,
+      "tool_annotations": {
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false
+      },
+      "elicitation_capable": false,
+      "sampling_capable": false
     }
   },
   "implementation": {
@@ -2249,6 +2441,12 @@ See **[DESIGN_RUST_TYPES.md](./DESIGN_RUST_TYPES.md)** for the full Rust source.
 | `TenantRuntimePolicy` | struct | Per-tenant quotas, retention, allowed runtimes, and default limits |
 | `ServerlessRuntime` | trait | Abstract async interface for all runtime operations (register, invoke, schedule, trigger, policy) |
 | `RuntimeErrorPayload` | struct | Structured error with GTS error type ID, category, message, and details |
+| `JsonRpcTraits` | struct | JSON-RPC protocol exposure configuration (enabled, stream_response, stream_input) |
+| `McpTraits` | struct | MCP protocol exposure and tool configuration (enabled, stream_response, annotations, elicitation, sampling) |
+| `McpToolAnnotations` | struct | MCP tool annotation hints (read-only, destructive, idempotent, open-world) |
+| `McpSession` | struct | MCP session state (session ID, tenant, protocol version, capabilities, status, expiry) |
+| `McpElicitationContext` | struct | Elicitation request parameters from executor to MCP server layer |
+| `McpSamplingContext` | struct | Sampling request parameters from executor to MCP server layer |
 
 ### 3.1.1 Complete Entity Examples
 
@@ -2604,12 +2802,177 @@ Manages tenant-level governance, quotas, and configuration for the serverless ru
 - Does NOT enforce quotas at invocation time directly -- provides quota data to the Invocation Engine
 - Does NOT manage individual functions or schedules
 
+#### JSON-RPC Handler
+
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-component-jsonrpc-handler`
+
+##### Why this component exists
+
+Provides a JSON-RPC 2.0 protocol surface for direct function invocation. The JSON-RPC `method` field is the function's GTS ID, enabling any JSON-RPC client to invoke functions without adopting the REST API's request envelope. This mirrors the Cyberville dispatcher's existing JSON-RPC endpoint, adapted for CyberFabric's GTS-based identity model.
+
+##### Responsibility scope
+
+- JSON-RPC 2.0 protocol handling: parse, validate, route, format responses
+- Method resolution: map `method` field to function GTS ID via the Function Registry
+- Single request and batch array support per JSON-RPC 2.0 specification
+- Notification handling (requests without `id`): fire-and-forget invocation, no response
+- Streaming response mode: for functions with `traits.json_rpc.stream_response: true`, return `Content-Type: text/event-stream` with progress notifications and final result
+- Input streaming: for functions with `traits.json_rpc.stream_input: true`, accept additional POST requests on `/json-rpc/input/{invocation_id}` to feed input data into a running execution
+- Error mapping: translate Invocation Engine errors to JSON-RPC error codes (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`, `-32001`)
+- Authentication: same JWT middleware as the REST API
+
+##### Responsibility boundaries
+
+- Does NOT manage function definitions or lifecycle -- delegates to Function Registry
+- Does NOT execute functions directly -- delegates to Invocation Engine
+- Does NOT manage MCP sessions -- that is the MCP Server Handler
+- Does NOT implement MCP protocol features (tools/list, elicitation, sampling) -- JSON-RPC is a simpler protocol surface
+
+#### MCP Server Handler
+
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-component-mcp-server`
+
+##### Why this component exists
+
+Implements the Model Context Protocol (MCP) 2025-03-26 Streamable HTTP transport, enabling AI agents and LLM clients to discover and invoke functions as MCP tools. This component handles MCP session lifecycle, tool discovery, streaming tool execution with progress notifications, human-in-the-loop (elicitation), and LLM-in-the-loop (sampling). It translates MCP protocol interactions into Invocation Engine operations.
+
+##### Responsibility scope
+
+- MCP Streamable HTTP transport: POST (messages), GET (SSE resumability), DELETE (session termination) on `/api/serverless-runtime/v1/mcp`
+- MCP session lifecycle: `initialize` handshake, capability negotiation, session state persistence, inactivity expiry, session termination
+- Tool discovery: `tools/list` returns functions with `traits.mcp.enabled: true`, with pagination. Tool `name` is the function GTS ID, `inputSchema` from `schema.params`, `description` from function metadata, `annotations` from `traits.mcp.tool_annotations`.
+- Tool invocation: `tools/call` routes through Invocation Engine. Sync (single JSON response) for `stream_response: false`; async (SSE stream) for `stream_response: true`.
+- SSE stream management: open stream on async `tools/call`, relay progress notifications, deliver final result, close stream
+- SSE resumability: assign event IDs, persist event log to database, replay missed events on GET with `Last-Event-ID`
+- Elicitation: when an executor suspends an invocation with `McpElicitationContext`, send `elicitation/create` inline on the active SSE stream, validate response against `requested_schema`, dispatch resume to executor with human input
+- Sampling: when an executor provides `McpSamplingContext`, send `sampling/createMessage` inline on the active SSE stream, receive LLM result, dispatch resume to executor
+- Cancellation: handle `notifications/cancelled` by signaling the Invocation Engine to cancel the invocation
+- Ping: respond to `ping` with empty result `{}`
+- Protocol version negotiation and `MCP-Protocol-Version` header enforcement
+
+##### Responsibility boundaries
+
+- Does NOT execute function code -- delegates to Invocation Engine and Executor adapters
+- Does NOT manage function definitions -- delegates to Function Registry
+- Does NOT manage the invocation lifecycle state machine -- the Invocation Engine handles status transitions
+- Does NOT present UI for elicitation -- sends the MCP `elicitation/create` request; the client is responsible for presenting the prompt
+
+#### Transport Gateway Architecture
+
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-component-transport-gateway`
+
+##### Why this component exists
+
+The protocol handlers above (REST, JSON-RPC, MCP) are **pluggable transports** — self-contained
+protocol surfaces that translate a wire format into Invocation Engine operations. The Transport
+Gateway is the deployment-time composition layer that decides which transports are active, what
+traffic each instance handles, and how they map to the shared domain core.
+
+This separation exists because different protocol surfaces have fundamentally different operational
+profiles. REST and JSON-RPC handle short-lived request/response cycles; MCP maintains long-lived
+SSE connections with session state. A single deployment configuration cannot optimally serve all
+traffic patterns, so the architecture must allow operators to compose and tune transport
+instances independently.
+
+##### Pluggable transport model
+
+Each transport is a self-contained module that:
+
+1. **Owns its wire format** — parses inbound messages, serializes responses, manages
+   protocol-specific sessions and connection lifecycle.
+2. **Speaks a common internal interface** — all transports route through the Invocation Engine
+   using the same domain operations (invoke, cancel, list, status). No transport has privileged
+   access to domain internals.
+3. **Declares its capabilities** — a transport advertises what it supports (streaming, sessions,
+   bidirectional communication) so the gateway can validate function trait compatibility at
+   routing time.
+4. **Is independently deployable** — a transport can be compiled in or out, enabled or disabled
+   via configuration, or deployed as a separate process behind a load balancer.
+
+The current transports are REST, JSON-RPC 2.0, and MCP. The model is designed to accommodate
+future transports — for example, a gRPC transport could be added to serve high-throughput
+service-to-service invocation without altering the domain layer or existing transports.
+
+##### Deployment topologies
+
+The gateway architecture supports a spectrum of deployment topologies, from a single binary to a
+fully decomposed fleet:
+
+**Single binary (monolith).** All transports are compiled into one binary and share a single
+process. This is the default for development and small deployments. Configuration enables or
+disables individual transports:
+
+```toml
+[transports]
+rest.enabled     = true
+json_rpc.enabled = true
+mcp.enabled      = true
+```
+
+**Single build, multiple configurations.** The same binary is deployed multiple times with
+different transport configurations. Each instance handles a subset of protocols, allowing
+independent scaling. For example, one pool handles REST and JSON-RPC traffic while a separate
+pool handles MCP's long-lived SSE connections:
+
+```toml
+# instance-pool: api
+[transports]
+rest.enabled     = true
+json_rpc.enabled = true
+mcp.enabled      = false
+
+# instance-pool: mcp
+[transports]
+rest.enabled     = false
+json_rpc.enabled = false
+mcp.enabled      = true
+```
+
+**GTS mask filtering.** Any transport instance can be further scoped to a GTS mask, restricting
+which functions it exposes. This allows a dedicated proxy tuned for a specific workload — for
+example, an MCP transport that only serves functions in a particular vendor namespace:
+
+```toml
+# instance-pool: mcp-analytics
+[transports]
+mcp.enabled  = true
+mcp.gts_mask = "gts.x.core.sless.function.v1~vendor.analytics.*"
+```
+
+Multiple mask-scoped instances can coexist behind a routing layer (e.g., an ingress controller or
+service mesh) that directs traffic based on path prefix or header.
+
+**Fully decomposed.** Each transport runs as an independent service with its own binary, scaling
+policy, and resource limits. The services share no process state — they communicate with the
+domain layer through a defined internal API (or the Invocation Engine is deployed as its own
+service). This topology suits large-scale deployments where protocol-specific SLOs, connection
+limits, or compliance boundaries require physical isolation.
+
+##### Responsibility scope
+
+- Transport lifecycle management: initialize, configure, start, stop, health-check each
+  transport independently
+- Configuration-driven composition: read deployment config to determine which transports are
+  active, their GTS mask filters, and their scaling parameters
+- Common middleware: authentication, rate limiting, and request tracing are applied uniformly
+  across transports before protocol-specific handling begins
+- Transport registration: new transports plug in by implementing the transport trait and
+  registering with the gateway — no changes to the domain layer or existing transports required
+
+##### Responsibility boundaries
+
+- Does NOT define wire formats — each transport owns its own protocol implementation
+- Does NOT execute functions — transports delegate to the Invocation Engine
+- Does NOT replace the Invocation Engine's routing or authorization — the gateway controls
+  which transports are active and what GTS mask they serve; the Engine still enforces per-request
+  authorization
+
 ### 3.3 API Contracts
 
-**Technology**: REST / JSON
+**Technology**: REST / JSON, JSON-RPC 2.0, MCP (Streamable HTTP)
 **Base URL**: `/api/serverless-runtime/v1`
 
-All management APIs require authentication. Authorization is enforced based on tenant context, user context, and required permissions per operation.
+All APIs require authentication. Authorization is enforced based on tenant context, user context, and required permissions per operation. The REST API uses standard request/response JSON. The JSON-RPC endpoint uses the JSON-RPC 2.0 wire format. The MCP endpoint uses MCP's Streamable HTTP transport with JSON-RPC 2.0 as the message format.
 
 Follows [DNA (Development Norms & Architecture)](https://github.com/hypernetix/DNA) guidelines.
 
@@ -3647,6 +4010,608 @@ Manually triggers an immediate execution independent of the cron schedule.
 
 ---
 
+#### JSON-RPC API
+
+The JSON-RPC endpoint exposes functions for direct invocation using the JSON-RPC 2.0 wire format.
+The `method` field is the function's GTS ID. Only functions with `traits.json_rpc.enabled: true`
+are accessible. Authentication uses the same JWT middleware as the REST API — the tenant is
+derived from the JWT, not from the request body.
+
+Base URL: `/api/serverless-runtime/v1`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/json-rpc` | JSON-RPC 2.0 function invocation (single or batch) |
+| `POST` | `/json-rpc/input/{invocation_id}` | Stream input data into a running stream-input invocation |
+
+##### 1) Invoke Function (Single Request)
+
+`POST /json-rpc`
+
+**Request:**
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "gts.x.core.sless.function.v1~vendor.app.billing.calculate_tax.v1~",
+  "params": {
+    "invoice_id": "inv_001",
+    "amount": 100.0
+  },
+  "id": "req-001"
+}
+```
+
+The `params` object contains the function's input parameters directly — there is no wrapping
+envelope. The tenant is derived from the JWT on the request.
+
+**Non-streaming response** (`traits.json_rpc.stream_response: false`):
+
+`Content-Type: application/json`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "tax": 10.0,
+    "total": 110.0
+  },
+  "id": "req-001"
+}
+```
+
+**Streaming response** (`traits.json_rpc.stream_response: true`):
+
+The client must send `Accept: application/json, text/event-stream`. The server responds with
+`Content-Type: text/event-stream` and an SSE stream that delivers progress notifications and
+the final result:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+X-Invocation-Id: inv_abc123
+
+event: message
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"invocation_id":"inv_abc123","progress":1,"total":5,"message":"Step 1 of 5"}}
+
+event: message
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"invocation_id":"inv_abc123","progress":3,"total":5,"message":"Step 3 of 5"}}
+
+event: message
+data: {"jsonrpc":"2.0","result":{"records_processed":5000},"id":"req-001"}
+
+```
+
+The `X-Invocation-Id` response header provides the invocation ID for correlation. Progress
+notifications are JSON-RPC notifications (no `id`). The final event carries the `id` from the
+original request and contains the function result. The stream closes after the final result.
+
+##### 2) Invoke Function (Batch Request)
+
+`POST /json-rpc`
+
+Multiple calls can be sent in a single HTTP request as a JSON array:
+
+```json
+[
+  {
+    "jsonrpc": "2.0",
+    "method": "gts.x.core.sless.function.v1~vendor.app.billing.calculate_tax.v1~",
+    "params": {"invoice_id": "inv_001", "amount": 100.0},
+    "id": "req-1"
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "gts.x.core.sless.function.v1~vendor.app.billing.calculate_tax.v1~",
+    "params": {"invoice_id": "inv_002", "amount": 200.0},
+    "id": "req-2"
+  }
+]
+```
+
+**Response:**
+```json
+[
+  {"jsonrpc": "2.0", "result": {"tax": 10.0, "total": 110.0}, "id": "req-1"},
+  {"jsonrpc": "2.0", "result": {"tax": 20.0, "total": 220.0}, "id": "req-2"}
+]
+```
+
+Requests within a batch are independent — failure of one does not affect others. Batch requests
+are only supported for non-streaming functions. If any function in a batch has
+`stream_response: true`, the entire batch is rejected with `-32600 Invalid Request`.
+If a batch contains only notifications (all entries omit `id`), the server returns no response body.
+
+##### 3) Notification (Fire-and-Forget)
+
+A request without an `id` field is a JSON-RPC notification. The function is still executed, but
+no response is returned. A single notification returns HTTP 204 No Content.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "gts.x.core.sless.function.v1~vendor.app.analytics.track_event.v1~",
+  "params": {"event_type": "page_view", "url": "/dashboard"}
+}
+```
+
+##### 4) Stream Input
+
+`POST /json-rpc/input/{invocation_id}`
+
+For functions with `traits.json_rpc.stream_input: true`, the client can feed additional input
+data into a running execution. This enables bidirectional streaming: the server streams output
+via SSE while the client pushes input via POST requests.
+
+**Request:**
+```json
+{
+  "data": {"chunk_index": 0, "records": [{"id": "r1"}, {"id": "r2"}]}
+}
+```
+
+**Response:** `202 Accepted` or `404 Not Found` if the invocation does not exist or has completed.
+
+The executor receives input chunks through the runtime's input channel. Input streaming is
+complete when the client sends:
+
+```json
+{
+  "end_of_stream": true
+}
+```
+
+##### Error Codes
+
+| JSON-RPC Code | Message | When |
+|---------------|---------|------|
+| `-32700` | Parse error | Malformed JSON |
+| `-32600` | Invalid Request | Missing or wrong `jsonrpc` version, missing `method`, invalid `id` type, empty batch, streaming function in batch |
+| `-32601` | Method not found | Function GTS ID not found or not JSON-RPC enabled (`traits.json_rpc.enabled` is `false` or absent) |
+| `-32602` | Invalid params | Input parameters do not match function's `schema.params` |
+| `-32603` | Internal error | Unexpected server error |
+| `-32001` | Execution error | Function execution failed (timeout, runtime error, quota exceeded) |
+| `-32002` | Rate limited | Per-function rate limit exceeded. `data` includes `retry_after_seconds`. |
+
+##### Error Response Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32001,
+    "message": "Execution error",
+    "data": {
+      "error_type": "gts.x.core.sless.err.v1~x.core.sless.err.runtime_timeout.v1~",
+      "detail": "Function execution exceeded timeout of 30 seconds"
+    }
+  },
+  "id": "req-001"
+}
+```
+
+---
+
+#### MCP Server API
+
+The MCP server endpoint implements the Model Context Protocol 2025-03-26 Streamable HTTP
+transport. Functions with `traits.mcp.enabled: true` are exposed as MCP tools. The tool `name`
+is the function's GTS ID. The MCP server supports session management, tool discovery, streaming
+tool execution with progress, human-in-the-loop (elicitation), and LLM-in-the-loop (sampling).
+
+All JSON-RPC messages between client and server use the MCP message format (JSON-RPC 2.0 with
+MCP-defined methods). Authentication uses the same JWT middleware — the `Mcp-Session-Id` header
+identifies the session, and the JWT on each request provides the security context.
+
+Base URL: `/api/serverless-runtime/v1`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/mcp` | All JSON-RPC messages from client to server (requests, notifications, responses) |
+| `GET` | `/mcp` | SSE stream for server-initiated messages and stream resumability |
+| `DELETE` | `/mcp` | Session termination |
+
+##### Initialization Handshake
+
+**Step 1 — Client sends `initialize`:**
+
+`POST /mcp`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2025-03-26",
+    "capabilities": {
+      "sampling": {},
+      "elicitation": {},
+      "roots": {"listChanged": true}
+    },
+    "clientInfo": {
+      "name": "AI Agent Service",
+      "version": "1.0.0"
+    }
+  }
+}
+```
+
+**Step 2 — Server responds with capabilities and session ID:**
+
+Response header: `Mcp-Session-Id: <session-id>`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocolVersion": "2025-03-26",
+    "capabilities": {
+      "tools": {"listChanged": true}
+    },
+    "serverInfo": {
+      "name": "Serverless Runtime MCP Server",
+      "version": "1.0.0"
+    },
+    "instructions": "Serverless function execution server. Tools are backed by GTS-identified functions."
+  }
+}
+```
+
+The server checks client capabilities:
+
+- **`sampling`** declared → LLM-in-the-loop enabled for functions with `traits.mcp.sampling_capable: true`
+- **`elicitation`** declared → human-in-the-loop enabled for functions with `traits.mcp.elicitation_capable: true`
+
+**Step 3 — Client sends `notifications/initialized`:**
+
+`POST /mcp` with `Mcp-Session-Id` header
+
+```json
+{"jsonrpc": "2.0", "method": "notifications/initialized"}
+```
+
+Server responds: `202 Accepted`. The session enters the operation phase. All subsequent
+requests must include `Mcp-Session-Id`.
+
+##### Tool Discovery (`tools/list`)
+
+`POST /mcp`
+
+```json
+{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+```
+
+**Response:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      {
+        "name": "gts.x.core.sless.function.v1~vendor.app.billing.calculate_tax.v1~",
+        "description": "Calculate tax for invoice.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "invoice_id": {"type": "string"},
+            "amount": {"type": "number"}
+          },
+          "required": ["invoice_id", "amount"]
+        },
+        "annotations": {
+          "title": "Calculate Tax",
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      }
+    ],
+    "nextCursor": null
+  }
+}
+```
+
+Tool fields are mapped from the function definition:
+
+| MCP Tool Field | Source |
+|----------------|--------|
+| `name` | Function GTS ID |
+| `description` | Function `description` field |
+| `inputSchema` | Function `schema.params` |
+| `annotations.title` | Function `title` field |
+| `annotations.readOnlyHint` | `traits.mcp.tool_annotations.read_only_hint` |
+| `annotations.destructiveHint` | `traits.mcp.tool_annotations.destructive_hint` |
+| `annotations.idempotentHint` | `traits.mcp.tool_annotations.idempotent_hint` |
+| `annotations.openWorldHint` | `traits.mcp.tool_annotations.open_world_hint` |
+
+**Tool naming and aliases.** GTS IDs are the canonical function identifiers across REST,
+JSON-RPC, and MCP. For MCP interoperability, each tool may also expose an alias derived from the
+vendor-specific segment of the GTS ID. The alias is included in list responses and accepted as an
+alternative identifier in call requests, while authorization, audit, and routing continue to use
+the canonical GTS ID.
+
+The server sends `notifications/tools/list_changed` when functions with MCP exposure are
+registered, updated, or removed.
+
+##### Tool Invocation (`tools/call`)
+
+`POST /mcp`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "gts.x.core.sless.function.v1~vendor.app.billing.calculate_tax.v1~",
+    "arguments": {
+      "invoice_id": "inv_001",
+      "amount": 100.0
+    },
+    "_meta": {
+      "progressToken": "op-001"
+    }
+  }
+}
+```
+
+The `name` field is the function GTS ID (or alias). The `arguments` are passed directly as
+function input parameters. The tenant is derived from the JWT on the request.
+
+**Sync tool call** (`traits.mcp.stream_response: false`):
+
+`Content-Type: application/json`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"tax\":10.0,\"total\":110.0}"
+      }
+    ],
+    "isError": false
+  }
+}
+```
+
+**Async tool call** (`traits.mcp.stream_response: true`):
+
+`Content-Type: text/event-stream`
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+
+id: stream-001:0
+event: message
+data:
+
+id: stream-001:1
+event: message
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"op-001","progress":1,"total":5,"message":"Processing batch 1 of 5"}}
+
+id: stream-001:2
+event: message
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"op-001","progress":3,"total":5,"message":"Processing batch 3 of 5"}}
+
+id: stream-001:3
+event: message
+data: {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"records_processed\":5000}"}],"isError":false}}
+
+```
+
+The initial SSE event (empty data, with event ID) primes the client for reconnection. Progress
+notifications have no `id` (they are JSON-RPC notifications). The final event carries the `id`
+from the original request. The stream closes after the final result.
+
+Each SSE event has an `id` field composed of `{stream_id}:{sequence}` for resumability. If the
+client disconnects, it can reconnect via `GET /mcp` with `Last-Event-ID` header to replay missed
+events.
+
+##### Tool Error Handling
+
+Tool execution errors are returned in the MCP tool result with `isError: true`, not as JSON-RPC
+errors. JSON-RPC errors are reserved for protocol-level failures.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Function execution failed: validation error on field 'amount' — must be a positive number"
+      }
+    ],
+    "isError": true
+  }
+}
+```
+
+`isError: true` signals to the LLM that the tool call failed and the content describes the
+failure. The LLM can then decide how to proceed (retry with different params, ask the user, etc.).
+
+##### Content Types
+
+Tool results use the MCP `content` array:
+
+| Type | Format | Description |
+|------|--------|-------------|
+| `TextContent` | `{"type": "text", "text": "..."}` | JSON-serialized function result (primary) |
+| `ImageContent` | `{"type": "image", "data": "<base64>", "mimeType": "..."}` | Binary image output |
+| `AudioContent` | `{"type": "audio", "data": "<base64>", "mimeType": "..."}` | Binary audio output |
+| `EmbeddedResource` | `{"type": "resource", "resource": {"uri": "...", ...}}` | Reference to an external resource |
+
+The default content type is `TextContent` — function results are JSON-serialized into the `text`
+field. Binary content types are supported when the executor produces binary output.
+
+##### Human-in-the-Loop (Elicitation)
+
+When a function with `traits.mcp.elicitation_capable: true` needs human input during execution,
+the executor transitions the invocation to `suspended` status and provides an
+`McpElicitationContext`. The MCP server sends `elicitation/create` inline on the active SSE
+stream.
+
+The client must have declared `elicitation` capability during `initialize`. If the client did not
+declare the capability, functions requiring elicitation will fail with a timeout.
+
+**Server sends on SSE stream:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "e-550e8400",
+  "method": "elicitation/create",
+  "params": {
+    "message": "This workflow will delete 1,247 records. Please confirm.",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "confirmed": {
+          "type": "boolean",
+          "title": "Confirm deletion"
+        }
+      },
+      "required": ["confirmed"]
+    }
+  }
+}
+```
+
+**Client responds via POST /mcp:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "e-550e8400",
+  "result": {
+    "action": "accept",
+    "content": {
+      "confirmed": true
+    }
+  }
+}
+```
+
+The server validates the response against `requestedSchema`, then dispatches the resume to the
+executor with the human input. The function continues from its suspension point and eventually
+delivers the final result on the same SSE stream.
+
+If the user declines (`"action": "decline"`), the server cancels the invocation and closes the
+SSE stream with a tool error.
+
+##### LLM-in-the-Loop (Sampling)
+
+When a function with `traits.mcp.sampling_capable: true` needs an LLM completion during
+execution, the executor provides an `McpSamplingContext`. The MCP server sends
+`sampling/createMessage` inline on the active SSE stream.
+
+The client must have declared `sampling` capability during `initialize`.
+
+**Server sends on SSE stream:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "s-770a1234",
+  "method": "sampling/createMessage",
+  "params": {
+    "messages": [
+      {
+        "role": "user",
+        "content": {"type": "text", "text": "Summarize the following report data: ..."}
+      }
+    ],
+    "maxTokens": 500
+  }
+}
+```
+
+**Client responds via POST /mcp:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "s-770a1234",
+  "result": {
+    "role": "assistant",
+    "content": {"type": "text", "text": "The report shows a 15% increase in..."},
+    "model": "claude-sonnet-4-5-20250514"
+  }
+}
+```
+
+The server dispatches the LLM result to the executor. Unlike elicitation, the executor may
+remain actively waiting (holding its execution slot) for the typically fast LLM response rather
+than entering a suspended state.
+
+##### Cancellation
+
+`POST /mcp`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/cancelled",
+  "params": {
+    "requestId": 3,
+    "reason": "User requested cancellation"
+  }
+}
+```
+
+The server responds `202 Accepted` and attempts best-effort cancellation via the Invocation
+Engine. The SSE stream closes without sending a final result.
+
+##### Ping
+
+`POST /mcp`
+
+```json
+{"jsonrpc": "2.0", "id": 5, "method": "ping"}
+```
+
+```json
+{"jsonrpc": "2.0", "id": 5, "result": {}}
+```
+
+##### Session Termination
+
+`DELETE /mcp` with `Mcp-Session-Id` header.
+
+Response: `204 No Content`. The session is marked as terminated. Subsequent requests with that
+session ID receive `404 Not Found`. In-flight invocations continue independently.
+
+##### SSE Resumability
+
+The server assigns a unique `id` to each SSE event, composed of `{stream_id}:{sequence}`. Event
+IDs are unique within the session. SSE stream state and sent events are persisted to the database.
+
+When the client's connection drops during a streaming `tools/call`, it can reconnect by sending
+`GET /mcp` with the `Last-Event-ID` header set to the last event ID it received. The server
+replays missed events from the disconnected stream and resumes the live stream.
+
+If `Last-Event-ID` is missing on a GET request, the server returns `405 Method Not Allowed` —
+there is no standalone notification stream (tool discovery uses `tools/list`, not push
+notifications). If `Last-Event-ID` references an unknown or expired stream, the server returns
+`404 Not Found`.
+
+##### MCP Error Codes
+
+| Error | JSON-RPC Code | When |
+|-------|---------------|------|
+| Parse error | `-32700` | Malformed JSON |
+| Invalid request | `-32600` | Missing `jsonrpc`, batch arrays (not supported for MCP), missing `Mcp-Session-Id` after init |
+| Method not found | `-32601` | Unsupported MCP method |
+| Invalid params | `-32602` | Invalid parameters for the method |
+| Internal error | `-32603` | Unexpected server error |
+
+---
+
 #### Tenant Enablement API
 
 ##### Enable Serverless Runtime for Tenant
@@ -3930,6 +4895,65 @@ When a workflow fails or is canceled and has compensation configured:
 
 The state machines for both invocation status and function status are defined in section 3.1 with full Mermaid diagrams.
 
+#### JSON-RPC Invocation Flow
+
+**ID**: `cpt-cf-serverless-runtime-seq-jsonrpc-invocation`
+
+The JSON-RPC invocation flow translates the JSON-RPC 2.0 protocol to the Invocation Engine:
+
+1. Client sends `POST /json-rpc` with a JSON-RPC request where `method` is the function GTS ID
+2. JSON-RPC Handler validates the request: parse JSON, verify `jsonrpc: "2.0"`, extract `method`, validate `params` against function `schema.params`
+3. JSON-RPC Handler resolves the function via the Function Registry, verifying `traits.json_rpc.enabled: true`
+4. If `traits.json_rpc.stream_response: false`: dispatch sync invocation via Invocation Engine, translate result to JSON-RPC response, return `Content-Type: application/json`
+5. If `traits.json_rpc.stream_response: true`: dispatch async invocation via Invocation Engine, open SSE stream, relay progress notifications, deliver final result as JSON-RPC response on stream, close stream
+6. For streaming invocations with `traits.json_rpc.stream_input: true`: the `X-Invocation-Id` response header provides the invocation ID. The client can POST input chunks to `/json-rpc/input/{invocation_id}`. The executor receives input via the runtime's input channel. The client sends `end_of_stream: true` to signal completion.
+
+For batch requests: each request is dispatched independently. Responses are collected and returned as a JSON array. Notifications (no `id`) produce no response entry.
+
+#### MCP Tool Call Flow
+
+**ID**: `cpt-cf-serverless-runtime-seq-mcp-tool-call`
+
+The MCP tool call flow translates MCP protocol interactions to the Invocation Engine:
+
+1. Client sends `POST /mcp` with `tools/call` request. The MCP Server Handler validates the session, JWT, and resolves the function by GTS ID (the `name` field).
+2. The MCP Server Handler maps `arguments` to function input `params`.
+3. If `traits.mcp.stream_response: false` (sync): dispatch sync invocation via Invocation Engine. Translate function result to MCP `CallToolResult` with `TextContent`. Return `Content-Type: application/json`.
+4. If `traits.mcp.stream_response: true` (async): open SSE stream. Send initial priming event. Dispatch async invocation via Invocation Engine. Subscribe to invocation status updates.
+5. As the executor reports progress: translate to `notifications/progress` on the SSE stream.
+6. If the executor suspends for elicitation: send `elicitation/create` inline on the stream. Await client response via `POST /mcp`. Validate response. Dispatch resume.
+7. If the executor requests sampling: send `sampling/createMessage` inline on the stream. Await client response. Dispatch resume.
+8. On function completion: send `tools/call` result as final SSE event. Close stream.
+9. On function failure: send tool result with `isError: true`. Close stream.
+
+#### MCP Elicitation Flow
+
+**ID**: `cpt-cf-serverless-runtime-seq-mcp-elicitation`
+
+When a function needs human input during an MCP streaming tool call:
+
+1. The executor reaches a point requiring human input and transitions the invocation to `suspended` status, providing an `McpElicitationContext` with message, requested schema, and timeout.
+2. The Invocation Engine persists the suspension and elicitation context with the invocation record.
+3. The MCP Server Handler reads the elicitation context and sends `elicitation/create` inline on the active SSE stream. The SSE stream remains open.
+4. The client presents the prompt to the human and collects input.
+5. The client sends the elicitation response as a `POST /mcp` (JSON-RPC response to the `elicitation/create` request ID).
+6. The MCP Server Handler validates the response against `requested_schema`.
+7. If valid: the MCP Server Handler dispatches the resume via the Invocation Engine with the human input. The invocation transitions from `suspended` to `running`. The executor resumes from its checkpoint with the input.
+8. If declined: the invocation is canceled. The SSE stream closes with a tool error.
+9. On timeout: the elicitation expires. The invocation transitions to `failed`. The SSE stream closes with a timeout error.
+
+#### MCP Sampling Flow
+
+**ID**: `cpt-cf-serverless-runtime-seq-mcp-sampling`
+
+When a function needs an LLM completion during an MCP streaming tool call:
+
+1. The executor reaches a point requiring LLM input and provides an `McpSamplingContext` with messages, model preferences, and constraints.
+2. The MCP Server Handler sends `sampling/createMessage` inline on the active SSE stream. Unlike elicitation, the executor may remain actively waiting (holding its execution slot) rather than entering a suspended state, since LLM responses are typically fast.
+3. The client dispatches the LLM request and returns the completion result as a `POST /mcp` (JSON-RPC response to the `sampling/createMessage` request ID).
+4. The MCP Server Handler delivers the LLM result to the executor. The function continues execution.
+5. If the client does not respond within the timeout, or if the executor's wait timeout expires, the executor enters a suspended state with a checkpoint. The MCP Server Handler can retry the sampling request if the client reconnects.
+
 ### 3.7 Database schemas & tables
 
 The persistence layer maps directly from the domain model entities defined in section 3.1. Physical schema details (indexes, partitioning, engine-specific types) depend on the deployment target and are deferred to implementation. The logical tables below capture the primary storage entities and their key columns.
@@ -3945,6 +4969,8 @@ The persistence layer maps directly from the domain model entities defined in se
 | `event_triggers` | `(tenant_id, trigger_id)` | Yes | Event-driven trigger bindings: event type, filter, batching config |
 | `webhook_triggers` | `(tenant_id, trigger_id)` | Yes | Webhook trigger endpoints: path, auth type, secret hash, allowed sources |
 | `tenant_policies` | `(tenant_id)` | Yes | Tenant-level governance: quotas, retention, allowed runtimes, approval policies |
+| `mcp_sessions` | `(tenant_id, session_id)` | Yes | MCP session state: protocol version, client/server capabilities, status, expiry timestamps |
+| `mcp_sse_events` | `(tenant_id, session_id, stream_id, seq)` | Yes | SSE event log for stream resumability. Each row stores one sent SSE event (event ID, data, timestamp). |
 
 #### Key Relationships
 
@@ -3953,6 +4979,7 @@ The persistence layer maps directly from the domain model entities defined in se
 - `event_triggers.function_id` → `functions.function_id`
 - `webhook_triggers.function_id` → `functions.function_id`
 - `invocation_timeline.invocation_id` → `invocations.invocation_id`
+- `mcp_sse_events.session_id` → `mcp_sessions.session_id`
 
 #### Tenant Isolation
 
@@ -3993,6 +5020,22 @@ All tables are scoped by `tenant_id`. Queries are filtered by tenant context at 
 3. **Secret rotation:** Support for secret regeneration without downtime.
 4. **Payload validation:** Incoming payloads validated against expected schema.
 
+#### JSON-RPC Security
+
+1. **Authentication:** Same JWT middleware as the REST API. Every request must carry `Authorization: Bearer <token>`.
+2. **Function visibility:** Only functions with `traits.json_rpc.enabled: true` are accessible. Attempts to invoke other functions return `-32601 Method not found`.
+3. **Input validation:** Params validated against `schema.params` before invocation.
+4. **Rate limiting:** Per-function rate limits apply identically to JSON-RPC invocations.
+
+#### MCP Session Security
+
+1. **Authentication:** Every POST, GET, and DELETE to `/mcp` must carry a valid JWT. The tenant is bound at `initialize` time — subsequent requests must carry a JWT for the same tenant.
+2. **Session binding:** The `Mcp-Session-Id` is cryptographically-secure and visible ASCII only. Requests without the header (except `initialize`) are rejected with `400 Bad Request`. Requests with an expired or unknown session ID receive `404 Not Found`.
+3. **Origin validation:** The server validates the `Origin` header on all incoming connections to prevent DNS rebinding attacks per the MCP specification.
+4. **Capability scoping:** Elicitation and sampling are only sent to clients that declared the respective capabilities during `initialize`. Functions requiring these features fail with a timeout if the client does not support them.
+5. **Tool visibility:** Only functions with `traits.mcp.enabled: true` are listed and callable. Function-level authorization (via `SecurityContext`) is enforced on each `tools/call`.
+6. **Session expiry:** Inactive sessions are automatically expired. Maximum session length is enforced.
+
 ### Audit Events
 
 All registry and trigger operations emit audit events for traceability and compliance.
@@ -4027,6 +5070,19 @@ All registry and trigger operations emit audit events for traceability and compl
 | `gts.x.core.sless.audit.v1~x.core.triggers.webhook_created.v1~` | Webhook trigger created |
 | `gts.x.core.sless.audit.v1~x.core.triggers.webhook_deleted.v1~` | Webhook trigger deleted |
 | `gts.x.core.sless.audit.v1~x.core.triggers.webhook_secret_regenerated.v1~` | Webhook secret regenerated |
+
+#### MCP Session Audit Events
+
+| Event Type | Description |
+|------------|-------------|
+| `gts.x.core.sless.audit.v1~x.core.mcp.session_created.v1~` | MCP session initialized |
+| `gts.x.core.sless.audit.v1~x.core.mcp.session_terminated.v1~` | MCP session terminated by client |
+| `gts.x.core.sless.audit.v1~x.core.mcp.session_expired.v1~` | MCP session expired (inactivity or max length) |
+| `gts.x.core.sless.audit.v1~x.core.mcp.tool_called.v1~` | MCP tools/call invoked |
+| `gts.x.core.sless.audit.v1~x.core.mcp.elicitation_requested.v1~` | Elicitation/create sent to client |
+| `gts.x.core.sless.audit.v1~x.core.mcp.elicitation_responded.v1~` | Elicitation response received |
+| `gts.x.core.sless.audit.v1~x.core.mcp.sampling_requested.v1~` | Sampling/createMessage sent to client |
+| `gts.x.core.sless.audit.v1~x.core.mcp.sampling_responded.v1~` | Sampling response received |
 
 #### Common Audit Event Envelope
 
@@ -4098,6 +5154,16 @@ Notes:
 |---|---|---|---|---|
 | Result caching (TTL) | `traits.caching.max_age_seconds` defines client caching TTL for successful results | No first-class "function result cache TTL"; caching typically external (API gateway/CDN/app cache) | No first-class "function result cache TTL"; caching typically external | No first-class "function result cache TTL"; caching typically external |
 
+#### Category: Protocol Surfaces and AI Integration
+
+| Capability | Hyperspot Serverless Runtime | AWS | Google Cloud | Azure |
+|---|---|---|---|---|
+| JSON-RPC invocation | Native JSON-RPC 2.0 endpoint with method = GTS function ID, batch support, streaming | Not a standard surface; typically REST or SDK-based | Not a standard surface; typically REST or SDK-based | Not a standard surface; typically REST or SDK-based |
+| MCP server integration | Native MCP 2025-03-26 Streamable HTTP transport; functions exposed as MCP tools with tool discovery, streaming execution, elicitation (HITL), sampling (LLM-in-the-loop) | No native MCP support; Lambda functions accessible via custom MCP server wrappers | No native MCP support; Cloud Functions accessible via custom MCP server wrappers | No native MCP support; Azure Functions accessible via custom MCP server wrappers |
+| Streaming tool execution | SSE streaming on both JSON-RPC and MCP surfaces with progress notifications, bidirectional input streaming on JSON-RPC | Lambda response streaming (2023+); Step Functions provide polling, not SSE | Cloud Functions support streaming responses; Workflows provide polling | Durable Functions support streaming via SignalR; Functions support streaming |
+| Human-in-the-loop (HITL) | MCP `elicitation/create` inline on SSE stream during tool execution; function suspension + resume with validated human input | Step Functions support human approval via callback patterns; not integrated with execution streaming | Workflows support wait states; no integrated HITL streaming protocol | Durable Functions support external events for human input; no integrated HITL streaming |
+| LLM-in-the-loop | MCP `sampling/createMessage` inline on SSE stream during tool execution; function receives LLM completion and continues | Not a standard capability; requires custom implementation | Not a standard capability; requires custom implementation | Not a standard capability; requires custom implementation |
+
 #### Open-Source Landscape (Context)
 
 Open-source systems that overlap with parts of this design:
@@ -4107,10 +5173,14 @@ Open-source systems that overlap with parts of this design:
 
 ### Implementation Considerations
 
-- Authorization checks are enforced on all operations (definition management, invocation lifecycle, schedules, debug, tenant policy).
+- Authorization checks are enforced on all operations (definition management, invocation lifecycle, schedules, debug, tenant policy, JSON-RPC invocation, MCP tool calls).
 - In-flight invocations continue with their original definition version.
 - Audit events include `tenant_id`, `actor`, and `correlation_id`.
 - Observability includes correlation and trace identifiers, and metrics segmented by tenant and function.
+- MCP sessions should be stored in time-based partitions to allow efficient retention-based cleanup. No tenant-specific retention configuration is required.
+- MCP SSE event logs are retained until the stream record is cleaned up (session expiry or termination). Event logs enable resumability across connection drops and platform instance failovers.
+- The JSON-RPC and MCP endpoints share the same Invocation Engine, ensuring consistent rate limiting, quota enforcement, and retry behavior across all protocol surfaces.
+- MCP session affinity at the ingress layer (e.g., `Mcp-Session-Id` header hashing) improves SSE stream locality but is not required for correctness — session state and event logs are persisted to the database.
 
 ### Non-Applicable Domains
 
