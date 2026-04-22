@@ -1,4 +1,5 @@
 <!-- Created: 2026-04-07 by Constructor Tech -->
+<!-- Updated: 2026-04-20 by Constructor Tech -->
 
 # AuthZ + Resource Group Integration Test Plan
 
@@ -12,14 +13,15 @@ For background on how AuthZ uses RG data, see [RESOURCE_GROUP_MODEL.md](./RESOUR
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| RG Module | Planned | This branch documents the intended `ClientHub` contracts (`dyn ResourceGroupClient` + `dyn ResourceGroupReadHierarchy`) but does not add implementation code yet |
+| RG Module | **Done** | `ResourceGroupClient` + `ResourceGroupReadHierarchy` traits, `get_group_descendants` / `get_group_ancestors` endpoints |
 | AuthZ Resolver | Existing | Plugin discovery, `PolicyEnforcer`, `AccessScope` → SecureORM already exist in the platform |
 | Static AuthZ Plugin | Existing | Returns `In(owner_tenant_id, [tid])` — tenant predicates only |
-| **PolicyEnforcer in RG handlers** | **Planned** | Target design: `GroupService` will call `enforcer.access_scope()` for list/get/hierarchy |
-| **AccessScope → SecureORM in RG repo** | **Planned** | Target design: `GroupRepository.list_groups`, `find_by_id`, `list_hierarchy` will accept `&AccessScope` |
-| **Rust integration tests** | **Planned** | Target inventory: 24 tests covering enforcer flow + tenant scoping + full-chain verification |
-| **E2E HTTP tests** | **Planned** | Target inventory: pytest CRUD, hierarchy, membership, tenant isolation |
-| Group predicates (`in_group`, `in_group_subtree`) | Planned | Requires new predicate types and RG-aware PDP behavior |
+| **PolicyEnforcer in RG handlers** | **Done** | `GroupService` calls `enforcer.access_scope()` for all operations |
+| **AccessScope → SecureORM in RG repo** | **Done** | `GroupRepository.list_groups`, `find_by_id`, `get_descendants`, `get_ancestors` accept `&AccessScope` |
+| **Rust integration tests** | **Done** | 324 unit tests + 8 tr-authz-plugin tests |
+| **E2E HTTP tests** | **Partial** | 214 e2e tests (static-authz); authz e2e blocked on tenant provisioning |
+| **Tenant provisioning** | **Planned** | Tenant groups are identified by GTS type prefix (`TENANT_RG_TYPE_PATH`): `tenant_id = group.id` for tenant groups. Required for authz e2e |
+| Group predicates (`in_group`, `in_group_subtree`) | Planned | Requires RG-aware PDP behavior |
 
 ---
 
@@ -104,8 +106,8 @@ E2E_BASE_URL=http://localhost:8087 pytest testing/e2e/modules/resource_group/ -v
 The intended AuthZ → RG chain is:
 
 1. **Module init** (`module.rs`): resolves `dyn AuthZResolverClient` from ClientHub, creates `PolicyEnforcer`
-2. **GroupService** (`group_service.rs`): receives `PolicyEnforcer`; all CRUD methods (`list_groups`, `get_group`, `update_group`, `delete_group`, `list_group_hierarchy`) call `enforcer.access_scope(&ctx, &RG_GROUP_RESOURCE, action, resource_id)`
-3. **GroupRepository** (`group_repo.rs`): `list_groups`, `find_by_id`, `list_hierarchy` accept `&AccessScope` and pass it to `SecureORM` via `.secure().scope_with(scope)`
+2. **GroupService** (`group_service.rs`): receives `PolicyEnforcer`; all CRUD methods (`list_groups`, `get_group`, `update_group`, `delete_group`, `get_group_descendants`, `get_group_ancestors`) call `enforcer.access_scope(&ctx, &RG_GROUP_RESOURCE, action, resource_id)`
+3. **GroupRepository** (`group_repo.rs`): `list_groups`, `find_by_id`, `get_descendants`, `get_ancestors` accept `&AccessScope` and pass it to `SecureORM` via `.secure().scope_with(scope)`
 4. **Handlers** (`handlers/groups.rs`): pass `&ctx` to service methods (no longer `_ctx`)
 5. **Error handling** (`error.rs`): `DomainError::AccessDenied` → HTTP 403
 
@@ -253,7 +255,9 @@ modules:
         allowed_clients: ["authz-resolver-plugin"]
         allowed_endpoints:
           - method: GET
-            path: "/api/resource-group/v1/groups/{group_id}/hierarchy"
+            path: "/api/resource-group/v1/groups/{group_id}/descendants"
+          - method: GET
+            path: "/api/resource-group/v1/groups/{group_id}/ancestors"
 ```
 
 #### 3.3 API Gateway TLS termination
@@ -263,19 +267,24 @@ Configure API Gateway to forward client certificate CN header to RG module for M
 ### Test scenario
 
 ```bash
-# MTLS request to allowed endpoint (hierarchy) — AuthZ bypassed
+# MTLS request to allowed endpoint (descendants) — AuthZ bypassed
 curl --cert plugin.pem --key plugin-key.pem --cacert ca.pem \
-  https://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/hierarchy
-# Expected: 200 OK with hierarchy data
+  https://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/descendants
+# Expected: 200 OK with descendants data
+
+# MTLS request to allowed endpoint (ancestors) — AuthZ bypassed
+curl --cert plugin.pem --key plugin-key.pem --cacert ca.pem \
+  https://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/ancestors
+# Expected: 200 OK with ancestors data
 
 # MTLS request to disallowed endpoint (POST groups) — rejected
 curl --cert plugin.pem --key plugin-key.pem --cacert ca.pem \
   -X POST https://127.0.0.1:8087/cf/resource-group/v1/groups
 # Expected: 403 Forbidden
 
-# JWT request to hierarchy endpoint — full AuthZ applied
+# JWT request to descendants endpoint — full AuthZ applied
 curl -H "Authorization: Bearer test" \
-  http://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/hierarchy
+  http://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/descendants
 # Expected: 200 OK with AuthZ-scoped results
 ```
 
@@ -285,6 +294,68 @@ curl -H "Authorization: Bearer test" \
 - MTLS + disallowed endpoint → 403
 - JWT + same endpoint → 200, AuthZ evaluation logged
 - Invalid cert CN → 403
+
+---
+
+## E2E Test Hierarchy Fixture (AuthZ plugins)
+
+E2E tests using AuthZ plugins (config: `config/e2e-tr-authz.yaml`) require a pre-seeded tenant hierarchy. A session-scoped pytest fixture creates the hierarchy via REST API before any tests run, then all tests reuse it.
+
+**Available AuthZ plugins:**
+- `tr-authz-plugin` (priority 50) — resolves tenants via `TenantResolverClient` (recommended, no direct RG dependency)
+
+### Fixture: `tenant_hierarchy`
+
+```
+T1 (root tenant, tenant type, can_be_root=true, token-a subject_tenant_id)
+├── T_normal (child tenant, tenant type)
+├── T_barrier (tenant with metadata.self_managed=true, tenant type)
+│   └── T_behind (child of barrier, tenant type)
+└── Dept1 (department, non-tenant type, can_be_root=false, inherits T1 tenant_id)
+
+T2 (root tenant, token-b subject_tenant_id)
+```
+
+Tenant-type recognition is code-prefix-driven: any GTS type whose path starts with `TENANT_RG_TYPE_PATH` (`gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`) creates a new tenant scope for its instances.
+
+**Setup steps** (all via REST API, executed once per session):
+
+1. Create tenant type (code starts with `TENANT_RG_TYPE_PATH`, `can_be_root=true`, `allowed_parent_types=[self]`)
+2. Create department type (code outside the tenant prefix, `can_be_root=false`, `allowed_parent_types=[tenant_type]`)
+3. **Seed T1 root tenant** directly in the DB backend used by `config/e2e-tr-authz.yaml` — SQLite in CI/e2e; in production deployments the same seeding query runs against the configured SQL-compatible backend (PostgreSQL by default). `id` = token-a `subject_tenant_id`. Root tenants are created via DB seeding, not API.
+4. `POST /groups` -- T_normal (parent=T1) -- `tenant_id = T_normal.id`
+5. `POST /groups` -- T_barrier (parent=T1, metadata=`{"self_managed": true}`) -- `tenant_id = T_barrier.id`
+6. `POST /groups` -- T_behind (parent=T_barrier) -- `tenant_id = T_behind.id`
+7. `POST /groups` -- Dept1 (parent=T1, dept type) -- `tenant_id = T1.id` (inherited, non-tenant type)
+8. **Seed T2 root tenant** directly in the same DB backend (SQLite in CI/e2e; PostgreSQL in production deployments). `id` = token-b `subject_tenant_id`.
+
+**Prerequisites**:
+- Tenant provisioning feature (tenant-type prefix): sub-tenant groups set `tenant_id = group.id` when their type code starts with `TENANT_RG_TYPE_PATH`
+- Root tenants seeded in DB before server start or via conftest SQLite fixture
+
+### Test coverage using fixture
+
+| Test | Fixture data used | Verifies |
+|------|-------------------|----------|
+| Barrier metadata in descendants | T1, T_barrier, T_behind | RG returns barrier data without filtering |
+| AuthZ tenant filter | T1, Dept1 | AuthZ plugin resolves hierarchy, scopes correctly |
+| Cross-tenant invisible | T1, T2 | T2 cannot see T1 data via AuthZ plugin |
+| Barrier exclusion from scope | T1, T_barrier, T_behind | AuthZ plugin excludes barrier subtree from AccessScope |
+| Sub-tenant provisioning | T_normal | Verify `tenant_id == group.id` for sub-tenants |
+| Normal group inherits tenant | Dept1 | Verify `tenant_id == parent.tenant_id` |
+
+### Running
+
+```bash
+# Build with both authz plugins
+make build
+
+# Run RG + AuthZ e2e tests (uses whichever authz plugin has higher priority)
+make e2e-tr-authz
+
+# Or manually:
+python3 scripts/ci.py e2e-local --config config/e2e-tr-authz.yaml -- -k "resource_group"
+```
 
 ---
 

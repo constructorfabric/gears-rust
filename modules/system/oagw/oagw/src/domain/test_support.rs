@@ -34,6 +34,22 @@ pub fn allow_all_enforcer() -> PolicyEnforcer {
     PolicyEnforcer::new(Arc::new(MockAuthZResolverClient))
 }
 
+/// Install a rustls `CryptoProvider` once per process.
+///
+/// Workspace feature unification activates both `aws-lc-rs` and `ring`
+/// on rustls (via gts -> jsonschema), so rustls 0.23 cannot auto-determine
+/// a provider and panics on first TLS construction (pingora `LoadBalancer`
+/// or `HttpProxy::new`). Under `cargo nextest` each test runs in its own
+/// process, so every test that builds a pingora-backed service must
+/// install a provider explicitly.
+pub fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 /// Mock AuthZ resolver that always allows access for testing.
 struct MockAuthZResolverClient;
 
@@ -566,6 +582,7 @@ impl TestDpBuilder {
             .unwrap_or_else(|| Arc::new(MockAuthZResolverClient));
         let policy_enforcer = PolicyEnforcer::new(authz_client);
 
+        ensure_crypto_provider();
         let server_conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
         let pingora_proxy = crate::infra::proxy::pingora_proxy::PingoraProxy::new(
             Duration::from_secs(10),

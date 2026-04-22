@@ -43,6 +43,12 @@ struct H2MockState {
 /// Start a TLS server on a random port that only accepts HTTP/2 via ALPN.
 /// Returns (addr, shared_state, join_handle).
 async fn start_h2_mock() -> (SocketAddr, Arc<H2MockState>, tokio::task::JoinHandle<()>) {
+    // Workspace feature unification activates both `aws-lc-rs` and `ring` on
+    // rustls (via gts -> jsonschema), so rustls cannot auto-determine the
+    // process-wide CryptoProvider. Install one explicitly before building
+    // the rustls ServerConfig below.
+    oagw::test_support::ensure_crypto_provider();
+
     // Generate self-signed cert for localhost / 127.0.0.1.
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
     let cert = generate_simple_self_signed(subject_alt_names).expect("cert generation");

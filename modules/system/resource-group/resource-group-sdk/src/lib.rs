@@ -23,6 +23,7 @@ pub mod odata;
 // Re-export main types at crate root for convenience
 pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy};
 pub use error::ResourceGroupError;
+pub use gts::TENANT_RG_TYPE_PATH;
 pub use models::{
     CreateGroupRequest, CreateTypeRequest, GroupHierarchy, GroupHierarchyWithDepth, GtsTypePath,
     ResourceGroup, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,

@@ -129,7 +129,6 @@ fn resource_group_type_camel_case_keys() {
         allowed_parent_types: vec!["gts.parent~".to_owned()],
         allowed_membership_types: vec!["gts.member~".to_owned()],
         metadata_schema: None,
-        ..Default::default()
     };
     let json = serde_json::to_value(&rgt).unwrap();
     assert!(

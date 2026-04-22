@@ -18,4 +18,5 @@ pub use crate::domain::test_support::{
     APIKEY_AUTH_PLUGIN_ID, CapturingAuthZResolverClient, DenyingAuthZResolverClient,
     OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID, TestAppState,
     TestCpBuilder, TestCredStoreClient, TestDpBuilder, build_test_app_state, build_test_gateway,
+    ensure_crypto_provider,
 };

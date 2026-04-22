@@ -1,4 +1,5 @@
 <!-- Created: 2026-04-07 by Constructor Tech -->
+<!-- Updated: 2026-04-20 by Constructor Tech -->
 
 # Feature: Membership Management
 
@@ -41,7 +42,7 @@
 
 ### 1.1 Overview
 
-Membership lifecycle (add, remove, list) with composite key semantics `(group_id, resource_type, resource_id)`, deterministic lookups by group and by resource, allowed_memberships type validation, tenant compatibility enforcement, and idempotent membership seeding.
+Membership lifecycle (add, remove, list) with composite key semantics `(group_id, resource_type, resource_id)`, deterministic lookups by group and by resource, allowed_membership_types type validation, tenant compatibility enforcement, and idempotent membership seeding.
 
 ### 1.2 Purpose
 
@@ -80,7 +81,7 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 **Error Scenarios**:
 - Group not found → NotFound
 - Duplicate membership (same composite key) → Conflict
-- resource_type not in group type's allowed_memberships → Validation error
+- resource_type not in group type's allowed_membership_types → Validation error
 - resource_type GTS path not registered → Validation error
 - Tenant-incompatible: resource already linked in incompatible tenant → TenantIncompatibility
 
@@ -91,8 +92,8 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 4. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-add-memb-4`
 5. [x] - `p1` - Resolve resource_type GTS path to surrogate ID; verify type exists in gts_type - `inst-add-memb-5`
 6. [x] - `p1` - **IF** resource_type not registered → **RETURN** Validation error - `inst-add-memb-6`
-7. [x] - `p1` - Load group type's allowed_memberships from gts_type_allowed_membership junction - `inst-add-memb-7`
-8. [x] - `p1` - **IF** resource_type not in allowed_memberships → **RETURN** Validation error: "resource_type not permitted for this group type" - `inst-add-memb-8`
+7. [x] - `p1` - Load group type's allowed_membership_types from gts_type_allowed_membership junction - `inst-add-memb-7`
+8. [x] - `p1` - **IF** resource_type not in allowed_membership_types → **RETURN** Validation error: "resource_type not permitted for this group type" - `inst-add-memb-8`
 9. [x] - `p1` - Invoke tenant compatibility check for resource across existing memberships - `inst-add-memb-9`
 10. [x] - `p1` - **IF** tenant incompatible → **RETURN** TenantIncompatibility - `inst-add-memb-10`
 11. [x] - `p1` - DB: INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id, created_at) with UNIQUE constraint - `inst-add-memb-11`
@@ -184,7 +185,7 @@ Not applicable. Memberships are stateless links — they exist or do not exist. 
 The system **MUST** implement a Membership Service that provides add, remove, and list operations for membership links with composite key semantics and tenant compatibility enforcement.
 
 **Required behavior**:
-- Add: validate group existence, validate resource_type exists and is in allowed_memberships, check tenant compatibility, persist with unique constraint
+- Add: validate group existence, validate resource_type exists and is in allowed_membership_types, check tenant compatibility, persist with unique constraint
 - Remove: delete by composite key, return NotFound if absent
 - List: paginated query with OData `$filter` on `resource_id`, `resource_type`, `group_id`; cursor-based pagination
 - Tenant compatibility: derive tenant scope from group's tenant_id; reject if resource already linked in incompatible tenant
@@ -244,7 +245,7 @@ The system **MUST** provide an idempotent membership seeding mechanism for deplo
 
 All acceptance criteria from feature 0004 are covered by automated tests:
 - Add/remove lifecycle with composite key semantics
-- allowed_memberships validation
+- allowed_membership_types validation
 - Tenant compatibility enforcement
 - Duplicate detection
 
@@ -254,7 +255,7 @@ All acceptance criteria from feature 0004 are covered by automated tests:
 - [x] Adding membership to nonexistent group returns `NotFound` (404)
 - [x] Adding duplicate membership `(G1, User, R1)` returns `Conflict` (409)
 - [x] Adding membership with unregistered resource_type GTS path returns validation error (400)
-- [x] Adding membership with resource_type not in group type's allowed_memberships returns validation error (400)
+- [x] Adding membership with resource_type not in group type's allowed_membership_types returns validation error (400)
 - [x] Multiple resource types can coexist in the same group: `(G1, User, U1)` and `(G1, Document, D1)` both succeed
 - [x] Adding membership for resource already linked in incompatible tenant returns `TenantIncompatibility` (409)
 - [x] Removing existing membership returns 204 No Content
@@ -280,7 +281,7 @@ Test setup: SQLite in-memory + TypeService + GroupService + MembershipService.
 
 #### TC-MBR-01: Add membership happy path [P1]
 - **Covers**: G25, 0004-AC-1
-- **Setup**: Create type with allowed_memberships=[member_type], create group. Add membership.
+- **Setup**: Create type with allowed_membership_types=[member_type], create group. Add membership.
 - **Assert**: Membership returned with group_id, resource_type, resource_id
 
 #### TC-MBR-02: Add membership to nonexistent group [P1]
@@ -296,10 +297,10 @@ Test setup: SQLite in-memory + TypeService + GroupService + MembershipService.
 - **Covers**: G28, 0004-AC-4
 - **Assert**: `DomainError::Validation` with "Unknown resource type"
 
-#### TC-MBR-05: Add membership with resource_type not in allowed_memberships [P1]
+#### TC-MBR-05: Add membership with resource_type not in allowed_membership_types [P1]
 - **Covers**: G29, 0004-AC-5
-- **Setup**: Create group of type that does NOT include resource_type in allowed_memberships
-- **Assert**: `DomainError::Validation` with "not in allowed_memberships"
+- **Setup**: Create group of type that does NOT include resource_type in allowed_membership_types
+- **Assert**: `DomainError::Validation` with "not in allowed_membership_types"
 
 #### TC-MBR-06: Tenant compatibility violation [P1]
 - **Covers**: G30, 0004-AC-7
@@ -317,7 +318,7 @@ Test setup: SQLite in-memory + TypeService + GroupService + MembershipService.
 
 #### TC-MBR-09: Multiple resource types in same group [P2]
 - **Covers**: 0004-AC-6
-- **Setup**: Type with allowed_memberships=[typeA, typeB]. Create group. Add (group, typeA, R1) and (group, typeB, R2).
+- **Setup**: Type with allowed_membership_types=[typeA, typeB]. Create group. Add (group, typeA, R1) and (group, typeB, R2).
 - **Assert**: Both succeed, list_memberships returns both
 
 #### TC-MBR-10: Tenant compatibility - first membership always allowed [P2]
@@ -332,9 +333,9 @@ Test setup: SQLite in-memory + TypeService + GroupService + MembershipService.
 #### TC-MBR-12: Remove membership with unregistered resource_type [P2]
 - resolve_id returns None → `DomainError::Validation("Unknown resource type")`
 
-#### TC-MBR-13: Add membership to group with empty allowed_memberships [P1]
-- Group type has `allowed_memberships: []` — any resource_type should be rejected
-- **Assert**: `DomainError::Validation("not in allowed_memberships")`
+#### TC-MBR-13: Add membership to group with empty allowed_membership_types [P1]
+- Group type has `allowed_membership_types: []` — any resource_type should be rejected
+- **Assert**: `DomainError::Validation("not in allowed_membership_types")`
 
 #### TC-MBR-14: Same resource linked in multiple groups of same tenant [P1]
 - Resource (type, R1) added to Group A (tenant T), then to Group B (tenant T)
@@ -390,7 +391,7 @@ Test setup: SQLite in-memory + TypeService + GroupService + MembershipService.
 **Why not in unit tests**: TC-ODATA-05 verifies that `MembershipFilterField` maps `group_id` to the correct column name and kind. The full chain — HTTP `$filter=group_id eq '{id}'` → OData parser → FilterField lookup → SQL `WHERE group_id = ?` — is never tested end-to-end. A mismatch between the parser's expected field name and the FilterField impl breaks filtering silently (returns all rows instead of filtered).
 
 ```
-POST type (with allowed_memberships)
+POST type (with allowed_membership_types)
 POST group_a, group_b
 
 PUT /groups/{a.id}/memberships/{type}/res-1     → 201
