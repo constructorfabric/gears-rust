@@ -26,7 +26,7 @@ k8s = ["dep:kube", "dep:k8s-openapi"]
 mini-chat-sdk = { workspace = true }
 
 # AuthN resolver for S2S client credentials exchange
-authn-resolver-sdk = { package = "cf-authn-resolver-sdk", version = "0.3.9", path = "../../system/authn-resolver/authn-resolver-sdk" }
+authn-resolver-sdk = { package = "cf-authn-resolver-sdk", version = "0.3.10", path = "../../system/authn-resolver/authn-resolver-sdk" }
 
 # AuthZ resolver for authorization (PEP flow)
 authz-resolver-sdk = { workspace = true }

@@ -9,6 +9,155 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/cyberfabric/cyberfabric-core/compare/cf-modkit-canonical-errors-v0.6.1...cf-modkit-canonical-errors-v0.7.0) - 2026-04-22
+
+### Other
+
+- release (by @github-actions[bot]) - #1381
+- *(errors)* convert resource_error macro to attribute macro (by @lansfy)
+
+### Contributors
+
+* @github-actions[bot]
+* @lansfy
+
+## [0.6.1](https://github.com/cyberfabric/cyberfabric-core/releases/tag/cf-modkit-canonical-errors-macro-v0.6.1) - 2026-04-22
+
+### Other
+
+- fix new warnings from Clippy (by @fluiderson) - #1534
+- *(errors)* convert resource_error macro to attribute macro (by @lansfy)
+
+### Contributors
+
+* @fluiderson
+* @lansfy
+
+## [0.6.2](https://github.com/cyberfabric/cyberfabric-core/compare/types-sdk-v0.6.1...types-sdk-v0.6.2) - 2026-04-22
+
+### Other
+
+- release (by @github-actions[bot]) - #1381
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.1.17](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-tr-plugin-v0.1.16...cf-static-tr-plugin-v0.1.17) - 2026-04-22
+
+### Added
+
+- *(tenant-resolver)* adopt single-root tree topology (by @aviator5)
+
+### Other
+
+- Some real code split (by @ffedoroff) - #1462
+- release (by @github-actions[bot]) - #1381
+- *(modkit)* split required and defaulted module config loading (by @fluiderson)
+
+### Contributors
+
+* @aviator5
+* @ffedoroff
+* @github-actions[bot]
+* @fluiderson
+
+## [0.1.14](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-credstore-plugin-v0.1.13...cf-static-credstore-plugin-v0.1.14) - 2026-04-22
+
+### Other
+
+- Some real code split (by @ffedoroff) - #1462
+- release (by @github-actions[bot]) - #1381
+- *(modkit)* split required and defaulted module config loading (by @fluiderson)
+
+### Contributors
+
+* @ffedoroff
+* @github-actions[bot]
+* @fluiderson
+
+## [0.1.16](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authz-plugin-v0.1.15...cf-static-authz-plugin-v0.1.16) - 2026-04-22
+
+### Added
+
+- *(de1101)* add max_inline_test_lines threshold and companion file guard (by @ffedoroff)
+- *(authz)* InGroup/InGroupSubtree predicates + PDP tenant resolution (by @ffedoroff)
+
+### Other
+
+- Some real code split (by @ffedoroff) - #1462
+- release (by @github-actions[bot]) - #1381
+- *(modkit)* split required and defaulted module config loading (by @fluiderson)
+
+### Contributors
+
+* @ffedoroff
+* @github-actions[bot]
+* @fluiderson
+
+## [0.2.7](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authn-plugin-v0.2.6...cf-static-authn-plugin-v0.2.7) - 2026-04-22
+
+### Other
+
+- Some real code split (by @ffedoroff) - #1462
+- release (by @github-actions[bot]) - #1381
+- *(modkit)* split required and defaulted module config loading (by @fluiderson)
+
+### Contributors
+
+* @ffedoroff
+* @github-actions[bot]
+* @fluiderson
+
+## [0.1.18](https://github.com/cyberfabric/cyberfabric-core/compare/cf-single-tenant-tr-plugin-v0.1.17...cf-single-tenant-tr-plugin-v0.1.18) - 2026-04-22
+
+### Added
+
+- *(tenant-resolver)* adopt single-root tree topology (by @aviator5)
+
+### Other
+
+- Some real code split (by @ffedoroff) - #1462
+- release (by @github-actions[bot]) - #1381
+
+### Contributors
+
+* @aviator5
+* @ffedoroff
+* @github-actions[bot]
+
+## [0.6.3](https://github.com/cyberfabric/cyberfabric-core/compare/cf-modkit-http-v0.6.2...cf-modkit-http-v0.6.3) - 2026-04-22
+
+### Other
+
+- fix new warnings from Clippy (by @fluiderson) - #1534
+
+### Contributors
+
+* @fluiderson
+
+## [0.6.4](https://github.com/cyberfabric/cyberfabric-core/compare/cf-modkit-v0.6.3...cf-modkit-v0.6.4) - 2026-04-22
+
+### Fixed
+
+- *(bootstrap)* unify crypto provider init in main() for both FIPS and non-FIPS modes (by @MikeFalcon77)
+- *(modkit)* pass fresh deadline token to stop() for graceful shutdown
+
+### Other
+
+- fix new warnings from Clippy (by @fluiderson) - #1534
+- restore spawned-task approach for two-phase shutdown
+- per-module deadline tokens, RunOptions.shutdown_deadline, test guards
+
+### Removed
+
+- removed additional task spawn in run_stop_phase, removed arc wrapper for AromicBool
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+
 ## [0.6.2](https://github.com/cyberfabric/cyberfabric-core/compare/types-sdk-v0.6.1...types-sdk-v0.6.2) - 2026-04-08
 
 ### Other
