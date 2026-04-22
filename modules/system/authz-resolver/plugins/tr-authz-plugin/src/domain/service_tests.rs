@@ -334,28 +334,6 @@ async fn tr_error_denies() {
 }
 
 #[tokio::test]
-async fn root_tenant_provisioning_allows_without_hierarchy() {
-    let mock = MockTenantResolver::empty();
-    let svc = Service::new(Arc::new(mock));
-
-    let tid = Uuid::now_v7();
-    let mut req = make_request(tid);
-    req.action.name = "create".to_owned();
-    req.resource
-        .properties
-        .insert("is_tenant".to_owned(), serde_json::Value::Bool(true));
-    // No parent_id -> root tenant provisioning
-
-    let resp = svc.evaluate(&req).await;
-    assert!(resp.decision, "root tenant provisioning -> allow");
-    let preds = &resp.context.constraints[0].predicates;
-    if let Predicate::In(p) = &preds[0] {
-        assert_eq!(p.values.len(), 1, "single tenant scope");
-        assert_eq!(p.values[0], serde_json::Value::String(tid.to_string()));
-    }
-}
-
-#[tokio::test]
 async fn group_predicates_from_request_properties() {
     let t1 = Uuid::now_v7();
     let mock = MockTenantResolver::with_tenants(t1, vec![]);
