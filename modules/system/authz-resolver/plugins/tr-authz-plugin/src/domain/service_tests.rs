@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::models::{Action, Resource, Subject};
-use authz_resolver_sdk::{EvaluationRequest, EvaluationRequestContext, Predicate, TenantContext};
+use authz_resolver_sdk::{
+    EvaluationRequest, EvaluationRequestContext, EvaluationResponse, Predicate, TenantContext,
+};
 use modkit_security::SecurityContext;
 use tenant_resolver_sdk::{
     GetAncestorsOptions, GetAncestorsResponse, GetDescendantsOptions, GetDescendantsResponse,
@@ -126,11 +128,20 @@ impl TenantResolverClient for MockTenantResolver {
 }
 
 fn make_request(tenant_id: Uuid) -> EvaluationRequest {
+    // `subject.properties["tenant_id"] = tenant_id` mirrors the PEP-injected
+    // home tenant for a caller whose subject tenant equals `root_id`. That
+    // matches the original intent of these legacy tests (subject is allowed
+    // to see its own tenant's subtree — R6-style).
+    let mut subject_props = std::collections::HashMap::default();
+    subject_props.insert(
+        "tenant_id".to_owned(),
+        serde_json::Value::String(tenant_id.to_string()),
+    );
     EvaluationRequest {
         subject: Subject {
             id: Uuid::now_v7(),
             subject_type: None,
-            properties: std::collections::HashMap::default(),
+            properties: subject_props,
         },
         action: Action {
             name: "list".to_owned(),
@@ -359,4 +370,557 @@ async fn group_predicates_from_request_properties() {
     assert!(matches!(&preds[0], Predicate::In(_)));
     assert!(matches!(&preds[1], Predicate::InGroup(_)));
     assert!(matches!(&preds[2], Predicate::InGroupSubtree(_)));
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// R1–R8 decision matrix tests
+// ──────────────────────────────────────────────────────────────────────
+//
+// Hierarchy used by the R-tests (as in aviator5's review comment on PR #1550):
+//
+//     r (root)
+//     └── t1 (partner)
+//         └── t2 (partner)
+//             ├── t3 (customer)
+//             └── t4 (customer)
+//
+// `HierarchyMock` implements `is_ancestor` and `get_descendants` against this
+// shape; `get_tenant` / `get_ancestors` / `get_root_tenant` / `get_tenants`
+// are unused by `tr-authz-plugin::evaluate`.
+
+struct HierarchyMock {
+    all: Vec<Uuid>,
+    parent: std::collections::HashMap<Uuid, Option<Uuid>>,
+}
+
+impl HierarchyMock {
+    fn is_ancestor_of(&self, anc: Uuid, desc: Uuid) -> bool {
+        let mut cur = Some(desc);
+        while let Some(c) = cur {
+            match self.parent.get(&c).copied().flatten() {
+                Some(p) if p == anc => return true,
+                Some(p) => cur = Some(p),
+                None => return false,
+            }
+        }
+        false
+    }
+
+    fn collect_descendants(&self, root: Uuid) -> Vec<Uuid> {
+        self.all
+            .iter()
+            .copied()
+            .filter(|&t| t != root && self.is_ancestor_of(root, t))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl TenantResolverClient for HierarchyMock {
+    async fn get_tenant(
+        &self,
+        _ctx: &SecurityContext,
+        id: TenantId,
+    ) -> Result<TenantInfo, TenantResolverError> {
+        Err(TenantResolverError::TenantNotFound { tenant_id: id })
+    }
+
+    async fn get_root_tenant(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<TenantInfo, TenantResolverError> {
+        unimplemented!("not used")
+    }
+
+    async fn get_tenants(
+        &self,
+        _ctx: &SecurityContext,
+        _ids: &[TenantId],
+        _options: &GetTenantsOptions,
+    ) -> Result<Vec<TenantInfo>, TenantResolverError> {
+        unimplemented!("not used")
+    }
+
+    async fn get_ancestors(
+        &self,
+        _ctx: &SecurityContext,
+        _id: TenantId,
+        _options: &GetAncestorsOptions,
+    ) -> Result<GetAncestorsResponse, TenantResolverError> {
+        unimplemented!("not used")
+    }
+
+    async fn get_descendants(
+        &self,
+        _ctx: &SecurityContext,
+        id: TenantId,
+        _options: &GetDescendantsOptions,
+    ) -> Result<GetDescendantsResponse, TenantResolverError> {
+        let tenant_ref = TenantRef {
+            id,
+            status: TenantStatus::Active,
+            tenant_type: None,
+            parent_id: self.parent.get(&id.0).copied().flatten().map(TenantId),
+            self_managed: false,
+        };
+        let descendants = self
+            .collect_descendants(id.0)
+            .into_iter()
+            .map(|d| TenantRef {
+                id: TenantId(d),
+                status: TenantStatus::Active,
+                tenant_type: None,
+                parent_id: self.parent.get(&d).copied().flatten().map(TenantId),
+                self_managed: false,
+            })
+            .collect();
+        Ok(GetDescendantsResponse {
+            tenant: tenant_ref,
+            descendants,
+        })
+    }
+
+    async fn is_ancestor(
+        &self,
+        _ctx: &SecurityContext,
+        ancestor_id: TenantId,
+        descendant_id: TenantId,
+        _options: &IsAncestorOptions,
+    ) -> Result<bool, TenantResolverError> {
+        Ok(self.is_ancestor_of(ancestor_id.0, descendant_id.0))
+    }
+}
+
+/// Builds hierarchy `r → t1 → t2 → {t3, t4}` with fixed UUIDs so each test
+/// can reason about the topology locally.
+fn build_hierarchy() -> (HierarchyMock, [Uuid; 5]) {
+    let r = Uuid::now_v7();
+    let t1 = Uuid::now_v7();
+    let t2 = Uuid::now_v7();
+    let t3 = Uuid::now_v7();
+    let t4 = Uuid::now_v7();
+    let parent: std::collections::HashMap<Uuid, Option<Uuid>> = [
+        (r, None),
+        (t1, Some(r)),
+        (t2, Some(t1)),
+        (t3, Some(t2)),
+        (t4, Some(t2)),
+    ]
+    .into_iter()
+    .collect();
+    let mock = HierarchyMock {
+        all: vec![r, t1, t2, t3, t4],
+        parent,
+    };
+    (mock, [r, t1, t2, t3, t4])
+}
+
+/// Generic request builder for R-rule tests.
+fn build_r_request(
+    subject_tid: Uuid,
+    action: &str,
+    resource_id: Option<Uuid>,
+    owner_tenant_id: Option<Uuid>,
+    root_id: Option<Uuid>,
+    mode: Option<authz_resolver_sdk::TenantMode>,
+) -> EvaluationRequest {
+    let mut subject_props = std::collections::HashMap::default();
+    subject_props.insert(
+        "tenant_id".to_owned(),
+        serde_json::Value::String(subject_tid.to_string()),
+    );
+    let mut resource_props = std::collections::HashMap::default();
+    if let Some(owner) = owner_tenant_id {
+        resource_props.insert(
+            "owner_tenant_id".to_owned(),
+            serde_json::Value::String(owner.to_string()),
+        );
+    }
+    let tenant_context = if root_id.is_some() || mode.is_some() {
+        Some(TenantContext {
+            root_id,
+            mode: mode.unwrap_or_default(),
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+    EvaluationRequest {
+        subject: Subject {
+            id: Uuid::now_v7(),
+            subject_type: None,
+            properties: subject_props,
+        },
+        action: Action {
+            name: action.to_owned(),
+        },
+        resource: Resource {
+            resource_type: "gts.cf.test.v1~".to_owned(),
+            id: resource_id,
+            properties: resource_props,
+        },
+        context: EvaluationRequestContext {
+            tenant_context,
+            token_scopes: vec![],
+            require_constraints: true,
+            capabilities: vec![],
+            supported_properties: vec![],
+            bearer_token: None,
+        },
+    }
+}
+
+/// Assert that the response is `allow` with a single `In(owner_tenant_id, …)`
+/// predicate whose values equal `expected` as a set.
+fn assert_allow_in(resp: &EvaluationResponse, expected: &[Uuid]) {
+    assert!(resp.decision, "expected allow, got deny");
+    let preds = &resp.context.constraints[0].predicates;
+    assert_eq!(preds.len(), 1);
+    let Predicate::In(p) = &preds[0] else {
+        panic!("expected In predicate");
+    };
+    let got: std::collections::HashSet<_> = p
+        .values
+        .iter()
+        .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+        .collect();
+    let want: std::collections::HashSet<_> = expected.iter().copied().collect();
+    assert_eq!(got, want, "predicate values mismatch");
+}
+
+// ── R1: single, root_id, root_only ─────────────────────────────────────
+#[tokio::test]
+async fn r1_partner_reads_customer_task_root_only() {
+    let (mock, [_r, t1, t2, _t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(
+            t1,
+            "get",
+            Some(Uuid::now_v7()),
+            Some(t2),
+            Some(t2),
+            Some(authz_resolver_sdk::TenantMode::RootOnly),
+        ))
+        .await;
+    assert_allow_in(&resp, &[t2]);
+}
+
+#[tokio::test]
+async fn r1_deny_when_owner_differs_from_root_id() {
+    let (mock, [_r, t1, t2, t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    // owner_tenant_id=t3 but root_id=t2 → mismatch → deny.
+    let resp = svc
+        .evaluate(&build_r_request(
+            t1,
+            "get",
+            Some(Uuid::now_v7()),
+            Some(t3),
+            Some(t2),
+            Some(authz_resolver_sdk::TenantMode::RootOnly),
+        ))
+        .await;
+    assert!(!resp.decision);
+}
+
+// ── R2: single, root_id, subtree (default) ─────────────────────────────
+#[tokio::test]
+async fn r2_partner_reads_task_from_customer_subtree() {
+    let (mock, [_r, t1, t2, t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(
+            t1,
+            "get",
+            Some(Uuid::now_v7()),
+            Some(t3),
+            Some(t2),
+            None, // default: Subtree
+        ))
+        .await;
+    assert_allow_in(&resp, &[t3]);
+}
+
+#[tokio::test]
+async fn r2_deny_when_owner_outside_root_subtree() {
+    let (mock, [_r, t1, _t2, _t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    // subject=t1, root_id=t1, but owner=non-existent → not in t1's subtree.
+    let alien = Uuid::now_v7();
+    let resp = svc
+        .evaluate(&build_r_request(
+            t1,
+            "get",
+            Some(Uuid::now_v7()),
+            Some(alien),
+            Some(t1),
+            None,
+        ))
+        .await;
+    assert!(!resp.decision);
+}
+
+// ── R3: single, no root_id, root_only ─────────────────────────────────
+#[tokio::test]
+async fn r3_user_reads_own_task_root_only() {
+    let (mock, [_r, _t1, _t2, t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(
+            t3,
+            "get",
+            Some(Uuid::now_v7()),
+            Some(t3),
+            None,
+            Some(authz_resolver_sdk::TenantMode::RootOnly),
+        ))
+        .await;
+    assert_allow_in(&resp, &[t3]);
+}
+
+#[tokio::test]
+async fn r3_deny_when_owner_differs_from_subject() {
+    let (mock, [_r, _t1, _t2, t3, t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(
+            t3,
+            "get",
+            Some(Uuid::now_v7()),
+            Some(t4),
+            None,
+            Some(authz_resolver_sdk::TenantMode::RootOnly),
+        ))
+        .await;
+    assert!(!resp.decision);
+}
+
+// ── R4: single, no root_id, subtree (default) ─────────────────────────
+#[tokio::test]
+async fn r4_partner_reads_task_from_own_subtree() {
+    let (mock, [_r, t1, _t2, t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(
+            t1,
+            "get",
+            Some(Uuid::now_v7()),
+            Some(t3),
+            None,
+            None,
+        ))
+        .await;
+    assert_allow_in(&resp, &[t3]);
+}
+
+#[tokio::test]
+async fn r4_allow_when_owner_equals_subject_reflexive() {
+    let (mock, [_r, t1, _t2, _t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    // Reflexive: owner == subject — `is_in_subtree(subject, owner)` short-circuits.
+    let resp = svc
+        .evaluate(&build_r_request(
+            t1,
+            "get",
+            Some(Uuid::now_v7()),
+            Some(t1),
+            None,
+            None,
+        ))
+        .await;
+    assert_allow_in(&resp, &[t1]);
+}
+
+#[tokio::test]
+async fn r4_deny_when_owner_outside_subject_subtree() {
+    let (mock, [_r, _t1, _t2, t3, t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    // subject=t3, owner=t4 → siblings, neither is ancestor of the other.
+    let resp = svc
+        .evaluate(&build_r_request(
+            t3,
+            "get",
+            Some(Uuid::now_v7()),
+            Some(t4),
+            None,
+            None,
+        ))
+        .await;
+    assert!(!resp.decision);
+}
+
+// ── R5: list, root_id, root_only ──────────────────────────────────────
+#[tokio::test]
+async fn r5_partner_lists_customer_tasks_root_only() {
+    let (mock, [_r, t1, t2, _t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(
+            t1,
+            "list",
+            None,
+            None,
+            Some(t2),
+            Some(authz_resolver_sdk::TenantMode::RootOnly),
+        ))
+        .await;
+    assert_allow_in(&resp, &[t2]);
+}
+
+#[tokio::test]
+async fn r5_deny_when_subject_cannot_see_root_id() {
+    let (mock, [_r, _t1, _t2, t3, t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    // subject=t3 (customer), root_id=t4 (sibling) → subject not an ancestor of t4.
+    let resp = svc
+        .evaluate(&build_r_request(
+            t3,
+            "list",
+            None,
+            None,
+            Some(t4),
+            Some(authz_resolver_sdk::TenantMode::RootOnly),
+        ))
+        .await;
+    assert!(!resp.decision);
+}
+
+// ── R6: list, root_id, subtree ────────────────────────────────────────
+#[tokio::test]
+async fn r6_partner_lists_customer_subtree() {
+    let (mock, [_r, t1, t2, t3, t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(t1, "list", None, None, Some(t2), None))
+        .await;
+    assert_allow_in(&resp, &[t2, t3, t4]);
+}
+
+#[tokio::test]
+async fn r6_deny_when_subject_cannot_see_root_id() {
+    let (mock, [_r, _t1, _t2, t3, t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    // subject=t3 (customer), root_id=t4 (sibling) → subject not an ancestor of t4 → deny.
+    let resp = svc
+        .evaluate(&build_r_request(t3, "list", None, None, Some(t4), None))
+        .await;
+    assert!(!resp.decision);
+}
+
+// ── R7: list, no root_id, root_only ───────────────────────────────────
+#[tokio::test]
+async fn r7_user_lists_own_tasks_root_only() {
+    let (mock, [_r, _t1, _t2, t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(
+            t3,
+            "list",
+            None,
+            None,
+            None,
+            Some(authz_resolver_sdk::TenantMode::RootOnly),
+        ))
+        .await;
+    assert_allow_in(&resp, &[t3]);
+}
+
+// ── R8: list, no root_id, subtree ─────────────────────────────────────
+#[tokio::test]
+async fn r8_partner_lists_own_subtree() {
+    let (mock, [_r, t1, t2, t3, t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(t1, "list", None, None, None, None))
+        .await;
+    assert_allow_in(&resp, &[t1, t2, t3, t4]);
+}
+
+#[tokio::test]
+async fn r8_deny_on_tr_error() {
+    // Dedicated R8 fail-path: `get_descendants(subject)` TR failure → deny.
+    struct FailingOnDescendants;
+
+    #[async_trait]
+    impl TenantResolverClient for FailingOnDescendants {
+        async fn get_tenant(
+            &self,
+            _ctx: &SecurityContext,
+            id: TenantId,
+        ) -> Result<TenantInfo, TenantResolverError> {
+            Err(TenantResolverError::TenantNotFound { tenant_id: id })
+        }
+        async fn get_root_tenant(
+            &self,
+            _ctx: &SecurityContext,
+        ) -> Result<TenantInfo, TenantResolverError> {
+            unimplemented!("not used")
+        }
+        async fn get_tenants(
+            &self,
+            _ctx: &SecurityContext,
+            _ids: &[TenantId],
+            _opts: &GetTenantsOptions,
+        ) -> Result<Vec<TenantInfo>, TenantResolverError> {
+            unimplemented!("not used")
+        }
+        async fn get_ancestors(
+            &self,
+            _ctx: &SecurityContext,
+            _id: TenantId,
+            _opts: &GetAncestorsOptions,
+        ) -> Result<GetAncestorsResponse, TenantResolverError> {
+            unimplemented!("not used")
+        }
+        async fn get_descendants(
+            &self,
+            _ctx: &SecurityContext,
+            _id: TenantId,
+            _opts: &GetDescendantsOptions,
+        ) -> Result<GetDescendantsResponse, TenantResolverError> {
+            Err(TenantResolverError::Internal(
+                "simulated TR failure".to_owned(),
+            ))
+        }
+        async fn is_ancestor(
+            &self,
+            _ctx: &SecurityContext,
+            _a: TenantId,
+            _d: TenantId,
+            _opts: &IsAncestorOptions,
+        ) -> Result<bool, TenantResolverError> {
+            unimplemented!("not used")
+        }
+    }
+    let svc = Service::new(Arc::new(FailingOnDescendants));
+    let resp = svc
+        .evaluate(&build_r_request(
+            Uuid::now_v7(),
+            "list",
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await;
+    assert!(!resp.decision, "R8: TR error on get_descendants -> deny");
+}
+
+// ── Fail-closed: single-resource missing owner_tenant_id ───────────────
+#[tokio::test]
+async fn single_resource_missing_owner_tenant_id_denies() {
+    let (mock, [_r, t1, _t2, _t3, _t4]) = build_hierarchy();
+    let svc = Service::new(Arc::new(mock));
+    let resp = svc
+        .evaluate(&build_r_request(
+            t1,
+            "get",
+            Some(Uuid::now_v7()),
+            None, // missing owner_tenant_id in properties
+            None,
+            None,
+        ))
+        .await;
+    assert!(!resp.decision);
 }
