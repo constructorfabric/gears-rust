@@ -2169,6 +2169,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-static-types-registry-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-modkit",
+ "cf-modkit-security",
+ "cf-types-registry-sdk",
+ "inventory",
+ "serde",
+ "serde-saphyr 0.0.22",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-system-sdk-directory"
 version = "0.1.34"
 dependencies = [
@@ -4055,6 +4073,7 @@ dependencies = [
  "cf-static-authz-plugin",
  "cf-static-credstore-plugin",
  "cf-static-tr-plugin",
+ "cf-static-types-registry-plugin",
  "cf-tenant-resolver",
  "cf-types-registry",
  "clap",

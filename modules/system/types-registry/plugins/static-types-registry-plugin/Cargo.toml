@@ -1,0 +1,46 @@
+[package]
+name = "cf-static-types-registry-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Types Registry plugin that seeds static GTS entities from YAML configuration"
+repository.workspace = true
+keywords = ["cyberfabric", "cyberfabric-module"]
+
+[lib]
+name = "static_types_registry_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+types-registry-sdk = { package = "cf-types-registry-sdk", version = "0.1.5", path = "../../types-registry-sdk" }
+
+# ModKit dependencies
+modkit = { workspace = true }
+modkit-security = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Required by modkit::module macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+serde-saphyr = { workspace = true }

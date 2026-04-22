@@ -673,6 +673,7 @@ pub fn build_test_app_state(
                 websocket_close_timeout_secs: 5,
                 websocket_max_frame_size_bytes: None,
                 streaming_idle_timeout_secs: 300,
+                management_api_enabled: true,
             },
         },
         facade,

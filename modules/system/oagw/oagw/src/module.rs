@@ -179,6 +179,7 @@ impl Module for OutboundApiGatewayModule {
         };
 
         self.state.store(Some(Arc::new(app_state)));
+
         Ok(())
     }
 }
@@ -276,8 +277,6 @@ impl RestApiCapability for OutboundApiGatewayModule {
         router: axum::Router,
         openapi: &dyn OpenApiRegistry,
     ) -> anyhow::Result<axum::Router> {
-        info!("Registering OAGW REST routes");
-
         let state = self
             .state
             .load()
@@ -285,6 +284,12 @@ impl RestApiCapability for OutboundApiGatewayModule {
             .ok_or_else(|| anyhow::anyhow!("OAGW module not initialized — call init() first"))?
             .as_ref()
             .clone();
+
+        let mgmt_enabled = state.config.management_api_enabled;
+        info!(
+            management_api_enabled = mgmt_enabled,
+            "Registering OAGW REST routes"
+        );
 
         let router = routes::register_routes(router, openapi, state);
         Ok(router)

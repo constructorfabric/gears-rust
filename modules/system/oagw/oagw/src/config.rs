@@ -48,6 +48,12 @@ pub struct OagwConfig {
     /// will use ALPN H2H1 negotiation). Default: 3600 (1 hour).
     #[serde(default = "default_protocol_cache_ttl_secs")]
     pub protocol_cache_ttl_secs: u64,
+    /// Whether the upstream/route management REST APIs are enabled.
+    /// When `true`, all CRUD endpoints are registered. When `false`, only
+    /// read-only endpoints (list / get) are available — write operations
+    /// (create / update / delete) are omitted. Default: `true`.
+    #[serde(default = "default_true")]
+    pub management_api_enabled: bool,
 }
 
 impl Default for OagwConfig {
@@ -63,8 +69,13 @@ impl Default for OagwConfig {
             websocket_max_frame_size_bytes: None,
             streaming_idle_timeout_secs: default_streaming_idle_timeout_secs(),
             protocol_cache_ttl_secs: default_protocol_cache_ttl_secs(),
+            management_api_enabled: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_proxy_timeout_secs() -> u64 {
@@ -126,6 +137,7 @@ pub struct RuntimeConfig {
     pub websocket_close_timeout_secs: u64,
     pub websocket_max_frame_size_bytes: Option<usize>,
     pub streaming_idle_timeout_secs: u64,
+    pub management_api_enabled: bool,
 }
 
 impl From<&OagwConfig> for RuntimeConfig {
@@ -136,6 +148,7 @@ impl From<&OagwConfig> for RuntimeConfig {
             websocket_close_timeout_secs: cfg.websocket_close_timeout_secs,
             websocket_max_frame_size_bytes: cfg.websocket_max_frame_size_bytes,
             streaming_idle_timeout_secs: cfg.streaming_idle_timeout_secs,
+            management_api_enabled: cfg.management_api_enabled,
         }
     }
 }
@@ -190,6 +203,7 @@ impl fmt::Debug for OagwConfig {
                 &self.streaming_idle_timeout_secs,
             )
             .field("protocol_cache_ttl_secs", &self.protocol_cache_ttl_secs)
+            .field("management_api_enabled", &self.management_api_enabled)
             .finish()
     }
 }

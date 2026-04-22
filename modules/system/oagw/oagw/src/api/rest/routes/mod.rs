@@ -19,13 +19,18 @@ impl AsRef<str> for License {
 impl LicenseFeature for License {}
 
 /// Register all OAGW REST routes with OpenAPI metadata.
+///
+/// When `state.config.management_api_enabled` is `false`, only read-only
+/// endpoints (list / get) and the proxy catch-all are registered. Write
+/// operations (create / update / delete) are omitted.
 pub fn register_routes(
     mut router: Router,
     openapi: &dyn OpenApiRegistry,
     state: AppState,
 ) -> Router {
-    router = upstream::register(router, openapi);
-    router = route::register(router, openapi);
+    let writable = state.config.management_api_enabled;
+    router = upstream::register(router, openapi, writable);
+    router = route::register(router, openapi, writable);
     router = proxy::register(router);
     router.layer(axum::Extension(state))
 }

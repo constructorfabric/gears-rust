@@ -8,24 +8,30 @@ use super::License;
 
 const API_TAG: &str = "OAGW Routes";
 
-pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+pub(super) fn register(
+    mut router: Router,
+    openapi: &dyn OpenApiRegistry,
+    writable: bool,
+) -> Router {
     // POST /oagw/v1/routes — Create route
-    router = OperationBuilder::post("/oagw/v1/routes")
-        .operation_id("oagw.create_route")
-        .summary("Create route")
-        .description("Create a new route mapping for an upstream service")
-        .tag(API_TAG)
-        .authenticated()
-        .require_license_features::<License>([])
-        .json_request::<dto::CreateRouteRequest>(openapi, "Route configuration")
-        .handler(handlers::route::create_route)
-        .json_response_with_schema::<dto::RouteResponse>(
-            openapi,
-            http::StatusCode::CREATED,
-            "Created route",
-        )
-        .standard_errors(openapi)
-        .register(router, openapi);
+    if writable {
+        router = OperationBuilder::post("/oagw/v1/routes")
+            .operation_id("oagw.create_route")
+            .summary("Create route")
+            .description("Create a new route mapping for an upstream service")
+            .tag(API_TAG)
+            .authenticated()
+            .require_license_features::<License>([])
+            .json_request::<dto::CreateRouteRequest>(openapi, "Route configuration")
+            .handler(handlers::route::create_route)
+            .json_response_with_schema::<dto::RouteResponse>(
+                openapi,
+                http::StatusCode::CREATED,
+                "Created route",
+            )
+            .standard_errors(openapi)
+            .register(router, openapi);
+    }
 
     // GET /oagw/v1/routes/{id} — Get route
     router = OperationBuilder::get("/oagw/v1/routes/{id}")
@@ -45,38 +51,40 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .standard_errors(openapi)
         .register(router, openapi);
 
-    // PUT /oagw/v1/routes/{id} — Update route
-    router = OperationBuilder::put("/oagw/v1/routes/{id}")
-        .operation_id("oagw.update_route")
-        .summary("Update route")
-        .description("Replace an existing route configuration")
-        .tag(API_TAG)
-        .path_param("id", "Route GTS identifier")
-        .authenticated()
-        .require_license_features::<License>([])
-        .json_request::<dto::UpdateRouteRequest>(openapi, "Route update data")
-        .handler(handlers::route::update_route)
-        .json_response_with_schema::<dto::RouteResponse>(
-            openapi,
-            http::StatusCode::OK,
-            "Updated route",
-        )
-        .standard_errors(openapi)
-        .register(router, openapi);
+    if writable {
+        // PUT /oagw/v1/routes/{id} — Update route
+        router = OperationBuilder::put("/oagw/v1/routes/{id}")
+            .operation_id("oagw.update_route")
+            .summary("Update route")
+            .description("Replace an existing route configuration")
+            .tag(API_TAG)
+            .path_param("id", "Route GTS identifier")
+            .authenticated()
+            .require_license_features::<License>([])
+            .json_request::<dto::UpdateRouteRequest>(openapi, "Route update data")
+            .handler(handlers::route::update_route)
+            .json_response_with_schema::<dto::RouteResponse>(
+                openapi,
+                http::StatusCode::OK,
+                "Updated route",
+            )
+            .standard_errors(openapi)
+            .register(router, openapi);
 
-    // DELETE /oagw/v1/routes/{id} — Delete route
-    router = OperationBuilder::delete("/oagw/v1/routes/{id}")
-        .operation_id("oagw.delete_route")
-        .summary("Delete route")
-        .description("Delete a route by its GTS identifier")
-        .tag(API_TAG)
-        .path_param("id", "Route GTS identifier")
-        .authenticated()
-        .require_license_features::<License>([])
-        .handler(handlers::route::delete_route)
-        .json_response(http::StatusCode::NO_CONTENT, "Route deleted")
-        .standard_errors(openapi)
-        .register(router, openapi);
+        // DELETE /oagw/v1/routes/{id} — Delete route
+        router = OperationBuilder::delete("/oagw/v1/routes/{id}")
+            .operation_id("oagw.delete_route")
+            .summary("Delete route")
+            .description("Delete a route by its GTS identifier")
+            .tag(API_TAG)
+            .path_param("id", "Route GTS identifier")
+            .authenticated()
+            .require_license_features::<License>([])
+            .handler(handlers::route::delete_route)
+            .json_response(http::StatusCode::NO_CONTENT, "Route deleted")
+            .standard_errors(openapi)
+            .register(router, openapi);
+    }
 
     // GET /oagw/v1/routes — List routes (optional upstream_id filter)
     router = OperationBuilder::get("/oagw/v1/routes")

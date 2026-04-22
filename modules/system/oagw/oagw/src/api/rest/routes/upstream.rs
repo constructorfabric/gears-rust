@@ -8,24 +8,30 @@ use super::License;
 
 const API_TAG: &str = "OAGW Upstreams";
 
-pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+pub(super) fn register(
+    mut router: Router,
+    openapi: &dyn OpenApiRegistry,
+    writable: bool,
+) -> Router {
     // POST /oagw/v1/upstreams — Create upstream
-    router = OperationBuilder::post("/oagw/v1/upstreams")
-        .operation_id("oagw.create_upstream")
-        .summary("Create upstream")
-        .description("Create a new upstream service configuration")
-        .tag(API_TAG)
-        .authenticated()
-        .require_license_features::<License>([])
-        .json_request::<dto::CreateUpstreamRequest>(openapi, "Upstream configuration")
-        .handler(handlers::upstream::create_upstream)
-        .json_response_with_schema::<dto::UpstreamResponse>(
-            openapi,
-            http::StatusCode::CREATED,
-            "Created upstream",
-        )
-        .standard_errors(openapi)
-        .register(router, openapi);
+    if writable {
+        router = OperationBuilder::post("/oagw/v1/upstreams")
+            .operation_id("oagw.create_upstream")
+            .summary("Create upstream")
+            .description("Create a new upstream service configuration")
+            .tag(API_TAG)
+            .authenticated()
+            .require_license_features::<License>([])
+            .json_request::<dto::CreateUpstreamRequest>(openapi, "Upstream configuration")
+            .handler(handlers::upstream::create_upstream)
+            .json_response_with_schema::<dto::UpstreamResponse>(
+                openapi,
+                http::StatusCode::CREATED,
+                "Created upstream",
+            )
+            .standard_errors(openapi)
+            .register(router, openapi);
+    }
 
     // GET /oagw/v1/upstreams — List upstreams
     router = OperationBuilder::get("/oagw/v1/upstreams")
@@ -69,38 +75,40 @@ pub(super) fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .standard_errors(openapi)
         .register(router, openapi);
 
-    // PUT /oagw/v1/upstreams/{id} — Update upstream
-    router = OperationBuilder::put("/oagw/v1/upstreams/{id}")
-        .operation_id("oagw.update_upstream")
-        .summary("Update upstream")
-        .description("Replace an existing upstream service configuration")
-        .tag(API_TAG)
-        .path_param("id", "Upstream GTS identifier")
-        .authenticated()
-        .require_license_features::<License>([])
-        .json_request::<dto::UpdateUpstreamRequest>(openapi, "Upstream update data")
-        .handler(handlers::upstream::update_upstream)
-        .json_response_with_schema::<dto::UpstreamResponse>(
-            openapi,
-            http::StatusCode::OK,
-            "Updated upstream",
-        )
-        .standard_errors(openapi)
-        .register(router, openapi);
+    if writable {
+        // PUT /oagw/v1/upstreams/{id} — Update upstream
+        router = OperationBuilder::put("/oagw/v1/upstreams/{id}")
+            .operation_id("oagw.update_upstream")
+            .summary("Update upstream")
+            .description("Replace an existing upstream service configuration")
+            .tag(API_TAG)
+            .path_param("id", "Upstream GTS identifier")
+            .authenticated()
+            .require_license_features::<License>([])
+            .json_request::<dto::UpdateUpstreamRequest>(openapi, "Upstream update data")
+            .handler(handlers::upstream::update_upstream)
+            .json_response_with_schema::<dto::UpstreamResponse>(
+                openapi,
+                http::StatusCode::OK,
+                "Updated upstream",
+            )
+            .standard_errors(openapi)
+            .register(router, openapi);
 
-    // DELETE /oagw/v1/upstreams/{id} — Delete upstream
-    router = OperationBuilder::delete("/oagw/v1/upstreams/{id}")
-        .operation_id("oagw.delete_upstream")
-        .summary("Delete upstream")
-        .description("Delete an upstream and cascade-delete its routes")
-        .tag(API_TAG)
-        .path_param("id", "Upstream GTS identifier")
-        .authenticated()
-        .require_license_features::<License>([])
-        .handler(handlers::upstream::delete_upstream)
-        .json_response(http::StatusCode::NO_CONTENT, "Upstream deleted")
-        .standard_errors(openapi)
-        .register(router, openapi);
+        // DELETE /oagw/v1/upstreams/{id} — Delete upstream
+        router = OperationBuilder::delete("/oagw/v1/upstreams/{id}")
+            .operation_id("oagw.delete_upstream")
+            .summary("Delete upstream")
+            .description("Delete an upstream and cascade-delete its routes")
+            .tag(API_TAG)
+            .path_param("id", "Upstream GTS identifier")
+            .authenticated()
+            .require_license_features::<License>([])
+            .handler(handlers::upstream::delete_upstream)
+            .json_response(http::StatusCode::NO_CONTENT, "Upstream deleted")
+            .standard_errors(openapi)
+            .register(router, openapi);
+    }
 
     router
 }
