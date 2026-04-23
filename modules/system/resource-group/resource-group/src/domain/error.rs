@@ -47,6 +47,16 @@ pub enum DomainError {
     #[error("Conflict: {message}")]
     Conflict { message: String },
 
+    /// Second tenant-type root rejected.
+    ///
+    /// Raised when a `create_group`/`update_group` would leave the RG forest
+    /// with more than one root group whose GTS type code starts with
+    /// `TENANT_RG_TYPE_PATH`. Enforces
+    /// `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. Maps to
+    /// `ResourceGroupError::conflict` (HTTP 409).
+    #[error("Tenant root already exists: {message}")]
+    TenantRootAlreadyExists { message: String },
+
     /// Cross-tenant link rejected when adding a membership.
     ///
     /// Raised by `MembershipService::add_membership` when the target group's
@@ -150,6 +160,12 @@ impl DomainError {
         }
     }
 
+    pub fn tenant_root_already_exists(message: impl Into<String>) -> Self {
+        Self::TenantRootAlreadyExists {
+            message: message.into(),
+        }
+    }
+
     pub fn tenant_incompatibility(message: impl Into<String>) -> Self {
         Self::TenantIncompatibility {
             message: message.into(),
@@ -183,7 +199,9 @@ impl From<DomainError> for ResourceGroupError {
             DomainError::ConflictActiveReferences { message } => {
                 ResourceGroupError::conflict_active_references(message)
             }
-            DomainError::Conflict { message } | DomainError::DuplicateMembership { message } => {
+            DomainError::Conflict { message }
+            | DomainError::DuplicateMembership { message }
+            | DomainError::TenantRootAlreadyExists { message } => {
                 ResourceGroupError::conflict(message)
             }
             DomainError::GroupNotFound { id } => ResourceGroupError::not_found(id.to_string()),

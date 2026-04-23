@@ -1184,6 +1184,7 @@ Ownership-graph tenant enforcement:
 | active references on delete | `ConflictActiveReferences` (response body MUST include list of blocking entities — children and/or memberships — so the caller can display what prevents deletion) |
 | depth/width violation       | `LimitViolation`           |
 | tenant-incompatible parent/child/membership write | `TenantIncompatibility` |
+| second tenant-type root rejected | `TenantRootAlreadyExists` (HTTP 409 Conflict) |
 | infra timeout/unavailable   | `ServiceUnavailable`       |
 | unexpected failure          | `Internal`                 |
 

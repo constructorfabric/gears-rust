@@ -420,6 +420,41 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))
     }
 
+    /// Return the id of any existing root group (`parent_id IS NULL`) whose
+    /// `gts_type.schema_id` starts with the given prefix, or `None` when no
+    /// such root exists. Used to enforce tenant-root uniqueness.
+    ///
+    /// Bypasses `SecureORM` because this check is a system invariant that
+    /// must see every tenant — the caller's `AccessScope` is irrelevant for
+    /// correctness here.
+    async fn find_root_id_with_type_prefix<C: DBRunner>(
+        &self,
+        db: &C,
+        type_prefix: &str,
+    ) -> Result<Option<Uuid>, DomainError> {
+        use sea_orm::{JoinType, QuerySelect};
+
+        // Bypass SecureORM: tenant-root uniqueness is a system invariant that
+        // must see every tenant, not only the caller's scope.
+        let scope = system_scope();
+        let model: Option<rg_entity::Model> = ResourceGroupEntity::find()
+            .join(
+                JoinType::InnerJoin,
+                rg_entity::Entity::belongs_to(GtsTypeEntity)
+                    .from(rg_entity::Column::GtsTypeId)
+                    .to(gts_type::Column::Id)
+                    .into(),
+            )
+            .filter(rg_entity::Column::ParentId.is_null())
+            .filter(gts_type::Column::SchemaId.starts_with(type_prefix))
+            .secure()
+            .scope_with(&scope)
+            .one(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(model.map(|m| m.id))
+    }
+
     /// List groups with `OData` filtering and pagination.
     ///
     /// The `type` filter field accepts GTS type path strings from the API

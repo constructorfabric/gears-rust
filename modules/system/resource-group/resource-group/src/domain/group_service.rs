@@ -666,6 +666,22 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 )));
             }
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5a
+
+            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5c
+            // Tenant-root uniqueness: at most one tenant-type group may be a
+            // forest root. `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`.
+            if is_tenant_type {
+                if let Some(existing_root_id) = group_repo
+                    .find_root_id_with_type_prefix(tx, TENANT_RG_TYPE_PATH)
+                    .await?
+                {
+                    return Err(DomainError::tenant_root_already_exists(format!(
+                        "Cannot create tenant-type root '{}' ({}): tenant root already exists (id={})",
+                        req.name, req.code, existing_root_id
+                    )));
+                }
+            }
+            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5c
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
 
             // Insert group
@@ -795,6 +811,23 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         validation::validate_metadata_via_gts(req.metadata.as_ref(), &req.code, types_registry)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
+
+        // Tenant-root uniqueness on update: if the post-update group would
+        // be a tenant-type root (new parent_id = NULL AND new type is tenant),
+        // ensure no *other* tenant-type root already exists.
+        // `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`.
+        let new_is_tenant_type = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        if new_is_tenant_type && req.parent_id.is_none() {
+            if let Some(existing_root_id) = group_repo
+                .find_root_id_with_type_prefix(tx, TENANT_RG_TYPE_PATH)
+                .await?
+                && existing_root_id != group_id
+            {
+                return Err(DomainError::tenant_root_already_exists(format!(
+                    "Cannot update group {group_id} to tenant-type root: tenant root already exists (id={existing_root_id})"
+                )));
+            }
+        }
 
         if parent_changed {
             // Delegate to move logic (cycle detection + closure rebuild)

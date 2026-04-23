@@ -32,6 +32,19 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<Option<rg_entity::Model>, DomainError>;
 
+    /// Return the id of *any* existing root group (parent_id IS NULL) whose
+    /// `gts_type.schema_id` starts with the given prefix, or `None` when no
+    /// such root exists. Used to enforce tenant-root uniqueness
+    /// (`cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`).
+    ///
+    /// Expected to be called inside a `SERIALIZABLE` transaction so the
+    /// uniqueness check is race-free against concurrent root creations.
+    async fn find_root_id_with_type_prefix<C: DBRunner>(
+        &self,
+        db: &C,
+        type_prefix: &str,
+    ) -> Result<Option<Uuid>, DomainError>;
+
     async fn list_groups<C: DBRunner>(
         &self,
         db: &C,
