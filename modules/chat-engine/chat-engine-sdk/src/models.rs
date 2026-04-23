@@ -2,19 +2,40 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// A chat session: the top-level container that groups a conversation's
+/// messages, tenant/user ownership, backend plugin binding, and lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// Unique session identifier (primary key).
     pub session_id: Uuid,
+    /// Tenant that owns the session; all queries are scoped by this value.
     pub tenant_id: String,
+    /// End-user who created the session (opaque string from the auth token).
     pub user_id: String,
+    /// Optional client identifier (e.g., app/device) that initiated the session.
     pub client_id: Option<String>,
+    /// Session type this session is bound to; determines which backend plugin
+    /// handles messages and which capabilities are exposed. May be `None` for
+    /// session types that haven't been configured yet.
     pub session_type_id: Option<Uuid>,
+    /// Capability values (from the `Capability` schema declared by the plugin)
+    /// actually enabled for this session — typed as JSON because the shape is
+    /// plugin-defined. Use `CapabilityValue` for structured access.
     pub enabled_capabilities: Option<serde_json::Value>,
+    /// Opaque per-session metadata (client-defined). Chat Engine never
+    /// interprets this field beyond storing/retrieving it. Also used internally
+    /// to persist `memory_strategy`, `retention_policy`, and `share_expires_at`
+    /// under reserved keys.
     pub metadata: Option<serde_json::Value>,
+    /// Current lifecycle state (active / archived / soft_deleted / hard_deleted).
     pub lifecycle_state: LifecycleState,
+    /// Cryptographically-random token granting read-only access to a shared
+    /// view of this session. Present only while sharing is active.
     pub share_token: Option<String>,
+    /// Creation timestamp (UTC, RFC3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Last-modified timestamp (UTC, RFC3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
@@ -29,9 +50,14 @@ pub struct Session {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleState {
+    /// Session is live and accepts reads/writes.
     Active,
+    /// Session is hidden from default listings but remains readable; can be
+    /// restored to `Active`.
     Archived,
+    /// Session marked for deletion; hidden from listings, reversible via restore.
     SoftDeleted,
+    /// Session physically deleted (terminal state); messages and subtree gone.
     HardDeleted,
 }
 
@@ -83,39 +109,75 @@ impl std::fmt::Display for LifecycleState {
     }
 }
 
+/// A registered session type — pairs a human-readable name with the backend
+/// plugin instance that will process its sessions' messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionType {
+    /// Unique session type identifier (primary key).
     pub session_type_id: Uuid,
+    /// Human-readable name used by developers when registering a type.
     pub name: String,
+    /// GTS plugin instance ID bound to this session type. `None` means the
+    /// type is registered but not yet wired to a backend.
     pub plugin_instance_id: Option<String>,
+    /// Creation timestamp (UTC).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Last-modified timestamp (UTC).
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
+/// A message node in the immutable conversation tree.
+///
+/// Messages form a DAG rooted at the session: each message (except the first)
+/// has a `parent_message_id`, and siblings sharing the same parent are
+/// *variants* differentiated by `variant_index`. Exactly one sibling per parent
+/// is `is_active=true`, which defines the current conversation path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Unique message identifier (primary key).
     pub message_id: Uuid,
+    /// Session this message belongs to.
     pub session_id: Uuid,
+    /// Parent message in the tree; `None` for the first (root) message.
     pub parent_message_id: Option<Uuid>,
+    /// Ordinal among siblings sharing the same `parent_message_id` within the
+    /// same session. Starts at 0 and increments per recreate.
     #[serde(default)]
     pub variant_index: i32,
+    /// True if this variant is currently on the active conversation path.
+    /// Exactly one sibling per parent should be active.
     #[serde(default)]
     pub is_active: bool,
+    /// Who produced the message: user / assistant / system.
     pub role: MessageRole,
+    /// Message payload (plugin-defined shape: text, content parts array, etc.).
     pub content: serde_json::Value,
+    /// External file UUIDs referenced by this message. Chat Engine forwards
+    /// them opaquely — file content is never fetched by Chat Engine itself.
     #[serde(default)]
     pub file_ids: Vec<Uuid>,
+    /// Per-message metadata (model used, finish_reason, usage, etc.). Typed as
+    /// JSON because it is plugin-defined.
     pub metadata: Option<serde_json::Value>,
+    /// `true` once the assistant finished streaming (or the message was
+    /// persisted whole). User messages are always complete on creation.
     #[serde(default = "default_true")]
     pub is_complete: bool,
+    /// Hide this message from client UIs (e.g., system messages, internal
+    /// summaries that should not appear in the transcript).
     #[serde(default)]
     pub is_hidden_from_user: bool,
+    /// Exclude this message from the history sent to backend plugins
+    /// (e.g., messages already covered by a newer summary).
     #[serde(default)]
     pub is_hidden_from_backend: bool,
+    /// Creation timestamp (UTC).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Last-modified timestamp (UTC). Typically changes only when an assistant
+    /// placeholder is filled in.
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
@@ -124,91 +186,165 @@ fn default_true() -> bool {
     true
 }
 
+/// Message author role.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
+    /// End-user input.
     User,
+    /// Model/plugin-generated response.
     Assistant,
+    /// Internal/system message (summaries, tool output, injected context).
     System,
 }
 
+/// Schema declaration of a capability supported by a backend plugin.
+///
+/// Returned from `on_session_type_configured` / `on_session_created` /
+/// `on_session_updated` to tell Chat Engine *what is tunable*. Chat Engine
+/// stores these in `session.enabled_capabilities` and exposes the menu to
+/// clients. See also `CapabilityValue` for the chosen-value counterpart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capability {
+    /// Capability identifier (e.g., `"model"`, `"temperature"`, `"stream"`).
     pub name: String,
+    /// Schema descriptor for allowed values — plugin-defined JSON. Typical
+    /// shape: `{ type: "enum", enum_values: [...], default_value: ... }` or
+    /// `{ type: "float", min: 0.0, max: 2.0, default_value: 0.7 }`.
     pub value: serde_json::Value,
 }
 
+/// A concrete capability value chosen by the client for a specific call.
+///
+/// Passed in `PluginCallContext.enabled_capabilities` — Chat Engine forwards
+/// these to the plugin so it knows which options were selected. Compare with
+/// `Capability` which is the schema side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityValue {
+    /// Must match a capability `name` previously declared by the plugin.
     pub name: String,
+    /// The chosen value (e.g., `"gpt-4"`, `0.9`, `false`). Must validate
+    /// against the schema in the corresponding `Capability.value`.
     pub value: serde_json::Value,
 }
 
+/// Summary of one variant at a given tree position — returned when listing
+/// variants for a message so clients can render navigation UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariantInfo {
+    /// Variant's message ID (the sibling itself).
     pub message_id: Uuid,
+    /// Ordinal of this variant among siblings.
     pub variant_index: i32,
+    /// How many variants exist at this position (including this one).
     pub total_variants: i32,
+    /// True iff this variant is currently on the active path.
     pub is_active: bool,
 }
 
+/// Per-session memory strategy controlling how much conversation history is
+/// sent to the backend plugin on each call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MemoryStrategy {
+    /// Send the entire active path.
     Full,
-    SlidingWindow { window_size: u32 },
-    Summarized { recent_messages_to_keep: u32 },
+    /// Send only the most recent `window_size` messages.
+    SlidingWindow {
+        /// Number of recent messages to keep; must be ≥ 1.
+        window_size: u32,
+    },
+    /// Send AI-generated summary + the last `recent_messages_to_keep` messages.
+    Summarized {
+        /// Number of most-recent messages to preserve unsummarized; must be ≥ 2.
+        recent_messages_to_keep: u32,
+    },
 }
 
+/// Message retention policy — when messages in a session should be cleaned up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RetentionPolicy {
+    /// Keep messages forever (default).
     None,
-    AgeBased { max_age_days: u32 },
-    CountBased { max_message_count: u32 },
+    /// Delete messages older than `max_age_days`.
+    AgeBased {
+        /// Maximum age in days before cleanup; must be ≥ 1.
+        max_age_days: u32,
+    },
+    /// Keep at most `max_message_count` messages; oldest are cleaned up first.
+    CountBased {
+        /// Maximum number of retained messages; must be ≥ 1.
+        max_message_count: u32,
+    },
 }
 
+/// Plugin health status returned by `ChatEngineBackendPlugin::health_check`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
+    /// Plugin is fully operational.
     Healthy,
+    /// Plugin is reachable but reporting partial degradation.
     Degraded,
+    /// Plugin is unreachable or reporting failure.
     Unhealthy,
 }
 
+/// NDJSON streaming event emitted by a plugin during response generation.
+///
+/// Serialized with a `"type"` discriminator: `"start"`, `"chunk"`, `"complete"`,
+/// or `"error"`. A well-formed response stream is: one `Start` → zero or more
+/// `Chunk` → one `Complete` (or `Error` at any point).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamingEvent {
+    /// Marks the beginning of an assistant message's stream.
     Start(StreamingStartEvent),
+    /// A partial content chunk; multiple `Chunk`s concatenate to the full text.
     Chunk(StreamingChunkEvent),
+    /// Stream completed successfully; may carry final metadata.
     Complete(StreamingCompleteEvent),
+    /// Stream terminated with an error; no more events follow.
     Error(StreamingErrorEvent),
 }
 
+/// Opens a stream for a given assistant message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamingStartEvent {
+    /// ID of the assistant message being streamed.
     pub message_id: Uuid,
 }
 
+/// A single text fragment appended to the assistant message in flight.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamingChunkEvent {
+    /// ID of the assistant message this chunk belongs to.
     pub message_id: Uuid,
+    /// Text payload to append to the message content.
     pub chunk: String,
 }
 
+/// Signals the assistant message is fully persisted and the stream is closing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamingCompleteEvent {
+    /// ID of the completed assistant message.
     pub message_id: Uuid,
+    /// Final plugin-defined metadata (model used, finish_reason, token usage,
+    /// etc.). Omitted from the wire when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Signals a mid-stream failure; the assistant message may be incomplete.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamingErrorEvent {
+    /// ID of the assistant message that failed to stream.
     pub message_id: Uuid,
+    /// Human-readable error description (may include plugin error code).
     pub error: String,
 }
