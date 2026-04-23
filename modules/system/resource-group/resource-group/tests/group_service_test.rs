@@ -2612,3 +2612,291 @@ async fn security_group_metadata_large_payload() {
         }
     }
 }
+
+// =========================================================================
+// Tenant-root uniqueness (cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness)
+// =========================================================================
+
+/// Build a unique tenant-type code: code starts with `TENANT_RG_TYPE_PATH` so
+/// `type_code.starts_with(TENANT_RG_TYPE_PATH)` classifies the group as a
+/// tenant-type group.
+fn unique_tenant_type_code() -> String {
+    format!(
+        "{}test{}.v1~",
+        resource_group_sdk::TENANT_RG_TYPE_PATH,
+        Uuid::now_v7().as_simple()
+    )
+}
+
+/// Create a tenant-type RG type (`can_be_root=true`, `allowed_parent_types=[self]`).
+async fn create_tenant_type(
+    svc: &TypeService<TypeRepository>,
+) -> resource_group_sdk::models::ResourceGroupType {
+    // `allowed_parent_types = []` because self-references aren't allowed at
+    // create time (the type is not yet in the registry). Suitable for testing
+    // the uniqueness invariant at root level.
+    svc.create_type(resource_group_sdk::CreateTypeRequest {
+        code: unique_tenant_type_code(),
+        can_be_root: true,
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![],
+        metadata_schema: None,
+    })
+    .await
+    .expect("create tenant type")
+}
+
+/// Create a tenant-type RG type that allows being placed under the given
+/// parent tenant-type (used to build a root→sub-tenant fixture).
+async fn create_tenant_sub_type(
+    svc: &TypeService<TypeRepository>,
+    parent_type_code: &str,
+) -> resource_group_sdk::models::ResourceGroupType {
+    svc.create_type(resource_group_sdk::CreateTypeRequest {
+        code: unique_tenant_type_code(),
+        can_be_root: true,
+        allowed_parent_types: vec![parent_type_code.to_owned()],
+        allowed_membership_types: vec![],
+        metadata_schema: None,
+    })
+    .await
+    .expect("create tenant sub-type")
+}
+
+/// TC-TRU-01: First tenant-type root is accepted.
+#[tokio::test]
+async fn tenant_root_first_create_allowed() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let tenant_type = create_tenant_type(&type_svc).await;
+    let root = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: tenant_type.code.clone(),
+                name: "MainTenant".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("first tenant root should succeed");
+    assert!(root.hierarchy.parent_id.is_none());
+    // Effective tenant_id = group.id for tenant-type groups.
+    assert_eq!(root.hierarchy.tenant_id, root.id);
+}
+
+/// TC-TRU-02: Second tenant-type root is rejected with `TenantRootAlreadyExists`.
+#[tokio::test]
+async fn tenant_root_second_create_rejected() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    // Create the first tenant root.
+    let tenant_type = create_tenant_type(&type_svc).await;
+    group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: tenant_type.code.clone(),
+                name: "First".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("first tenant root should succeed");
+
+    // Second tenant-type root must be rejected regardless of type identity
+    // (any tenant-type root collides with any other tenant-type root).
+    let second_type = create_tenant_type(&type_svc).await;
+    let err = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: second_type.code.clone(),
+                name: "Second".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            Uuid::now_v7(),
+        )
+        .await
+        .expect_err("second tenant root must be rejected");
+    assert!(
+        matches!(err, DomainError::TenantRootAlreadyExists { .. }),
+        "expected TenantRootAlreadyExists, got: {err:?}"
+    );
+}
+
+/// TC-TRU-03: Non-tenant root may coexist alongside a tenant root (RG is a forest).
+#[tokio::test]
+async fn non_tenant_root_alongside_tenant_root_allowed() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    // Tenant root.
+    let tenant_type = create_tenant_type(&type_svc).await;
+    let tenant_root = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: tenant_type.code.clone(),
+                name: "MainTenant".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("tenant root");
+
+    // Non-tenant root (auxiliary forest, e.g. "workspace") — created with a
+    // regular can_be_root type whose code does NOT start with TENANT_RG_TYPE_PATH.
+    let workspace_type = common::create_root_type(&type_svc, "workspace").await;
+    let workspace = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: workspace_type.code.clone(),
+                name: "Workspaces".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_root.hierarchy.tenant_id,
+        )
+        .await
+        .expect("non-tenant root must be allowed alongside tenant root");
+    assert!(workspace.hierarchy.parent_id.is_none());
+}
+
+/// TC-TRU-04: `update_group` that would turn a group into a second tenant root
+/// (set `parent_id = NULL` while type is tenant-type) is rejected.
+#[tokio::test]
+async fn tenant_root_update_to_second_root_rejected() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    // Tenant root #1 (root type — no parents allowed at root level).
+    let root_type = create_tenant_type(&type_svc).await;
+    let root = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: root_type.code.clone(),
+                name: "Root".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("tenant root");
+
+    // Sub-tenant type: another tenant-type group placed under root_type.
+    let sub_type = create_tenant_sub_type(&type_svc, &root_type.code).await;
+    let child = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: sub_type.code.clone(),
+                name: "SubTenant".to_owned(),
+                parent_id: Some(root.id),
+                metadata: None,
+            },
+            root.hierarchy.tenant_id,
+        )
+        .await
+        .expect("sub-tenant under root");
+
+    // Attempt to promote child to a root (parent_id = None) — must deny,
+    // the tenant root already exists. For a tenant-type sub-tenant the
+    // effective tenant_id equals its own id (derived by code-prefix), so the
+    // caller's scope must target that tenant to pass the AuthZ pre-check.
+    let child_ctx = common::make_ctx(child.hierarchy.tenant_id);
+    let err = group_svc
+        .update_group(
+            &child_ctx,
+            child.id,
+            UpdateGroupRequest {
+                code: sub_type.code.clone(),
+                name: child.name.clone(),
+                parent_id: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("promoting sub-tenant to a second root must fail");
+    assert!(
+        matches!(err, DomainError::TenantRootAlreadyExists { .. }),
+        "expected TenantRootAlreadyExists, got: {err:?}"
+    );
+}
+
+/// TC-TRU-05: Idempotent update of the existing tenant root (no parent change,
+/// no type change) does not spuriously trip the uniqueness check.
+#[tokio::test]
+async fn tenant_root_self_update_allowed() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let tenant_type = create_tenant_type(&type_svc).await;
+    let root = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: tenant_type.code.clone(),
+                name: "RootA".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("tenant root");
+
+    // Rename only — still tenant-type, still root; existing_root_id == group_id,
+    // so the check must NOT raise TenantRootAlreadyExists. Target the root's
+    // own tenant scope so the AuthZ pre-check finds it.
+    let root_ctx = common::make_ctx(root.hierarchy.tenant_id);
+    let updated = group_svc
+        .update_group(
+            &root_ctx,
+            root.id,
+            UpdateGroupRequest {
+                code: tenant_type.code.clone(),
+                name: "RootB".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("self-update of the only tenant root must succeed");
+    assert_eq!(updated.name, "RootB");
+}
