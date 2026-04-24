@@ -2,6 +2,7 @@ CI := 1
 
 OPENAPI_URL ?= http://127.0.0.1:8087/cf/openapi.json
 OPENAPI_OUT ?= docs/api/api.json
+REQUIRED_RUST_STABLE := $(strip $(shell sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml))
 
 # E2E feature set (single source of truth: config/e2e-features.txt)
 E2E_FEATURES ?= $(strip $(shell cat config/e2e-features.txt 2>/dev/null))
@@ -16,6 +17,20 @@ endef
 define check_rustup_component
     @command -v rustup >/dev/null || (echo "ERROR: rustup not installed. Install rustup or run 'make setup'." && exit 1)
 	@rustup component list --installed | grep -q '^$(1)' || (echo "ERROR: $(1) component not installed. Run 'rustup component add $(1)' or 'make setup'." && exit 1)
+endef
+
+define check_stable_toolchain
+	@command -v rustup >/dev/null || (echo "ERROR: rustup not installed. Install rustup or run 'make setup'." && exit 1)
+	@if [ -z "$(REQUIRED_RUST_STABLE)" ]; then \
+		echo "ERROR: Could not parse required Rust version from rust-toolchain.toml."; \
+		exit 1; \
+	fi
+	@ACTUAL_RUST_STABLE=$$(rustc +stable --version | awk '{print $$2}'); \
+	if [ "$$ACTUAL_RUST_STABLE" != "$(REQUIRED_RUST_STABLE)" ]; then \
+		echo "ERROR: rustc +stable is $$ACTUAL_RUST_STABLE but this repo requires $(REQUIRED_RUST_STABLE)."; \
+		echo "Run 'rustup update stable' and verify with 'rustc +stable --version'."; \
+		exit 1; \
+	fi
 endef
 
 # Generic server start/stop with cleanup (cross-platform: Linux, Mac, Windows)
@@ -700,6 +715,7 @@ ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg lychee
 
 # Build the hyperspot-server release binary using the stable toolchain.
 cargo-build:
+	$(call check_stable_toolchain)
 	cargo +stable build --release --bin hyperspot-server $(E2E_ARGS)
 
 # Split debug symbols into separate artifact(s) and strip the binary.
