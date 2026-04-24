@@ -30,7 +30,7 @@ pub type ConcreteRgService = RgService<GroupRepository, TypeRepository, Membersh
 /// Main module struct for the resource-group module.
 #[modkit::module(
     name = "resource-group",
-    deps = [],
+    deps = ["authz-resolver", "types-registry"],
     capabilities = [db]
 )]
 #[allow(clippy::struct_field_names)]

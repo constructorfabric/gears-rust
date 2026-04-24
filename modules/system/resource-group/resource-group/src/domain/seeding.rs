@@ -46,17 +46,27 @@ pub async fn seed_types<TR: TypeRepositoryTrait>(
         match type_service.get_type(&seed.code).await {
             // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2a
             Ok(existing) => {
+                // Normalize allowed-type lists before diffing: `load_full_type()`
+                // returns these sorted, while the seed preserves caller order.
+                // Without sorting, the same logical config rewrites the type on
+                // every startup if the YAML happens to list members in a
+                // different order, breaking idempotency.
+                let mut seed_allowed_parent_types = seed.allowed_parent_types.clone();
+                seed_allowed_parent_types.sort();
+                let mut seed_allowed_membership_types = seed.allowed_membership_types.clone();
+                seed_allowed_membership_types.sort();
+
                 // Compare: if definition differs, update; otherwise skip
                 if existing.can_be_root != seed.can_be_root
-                    || existing.allowed_parent_types != seed.allowed_parent_types
-                    || existing.allowed_membership_types != seed.allowed_membership_types
+                    || existing.allowed_parent_types != seed_allowed_parent_types
+                    || existing.allowed_membership_types != seed_allowed_membership_types
                     || existing.metadata_schema != seed.metadata_schema
                 {
                     // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2c
                     let update_req = UpdateTypeRequest {
                         can_be_root: seed.can_be_root,
-                        allowed_parent_types: seed.allowed_parent_types.clone(),
-                        allowed_membership_types: seed.allowed_membership_types.clone(),
+                        allowed_parent_types: seed_allowed_parent_types,
+                        allowed_membership_types: seed_allowed_membership_types,
                         metadata_schema: seed.metadata_schema.clone(),
                     };
                     type_service.update_type(&seed.code, update_req).await?;
@@ -121,9 +131,14 @@ pub async fn seed_groups<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait>(
     let mut result = SeedResult::default();
     // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2
     for seed in seeds {
-        let anon = modkit_security::SecurityContext::anonymous();
+        // Seeding runs at module init, before any caller `SecurityContext`
+        // exists; using `SecurityContext::anonymous()` would gate this path
+        // on whether anonymous subjects are allowed to read/create groups,
+        // which is brittle and outright fails in locked-down deployments.
+        // Use the dedicated `*_unscoped` entry points instead — domain
+        // invariants still run, only the `PolicyEnforcer` gate is skipped.
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2a
-        match group_service.get_group(&anon, seed.id).await {
+        match group_service.get_group_unscoped(seed.id).await {
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2a
             Ok(_existing) => {
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2b
@@ -145,7 +160,7 @@ pub async fn seed_groups<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait>(
                     metadata: seed.metadata.clone(),
                 };
                 group_service
-                    .create_group(&anon, req, seed.tenant_id)
+                    .create_group_unscoped(req, seed.tenant_id)
                     .await?;
                 result.created += 1;
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2d

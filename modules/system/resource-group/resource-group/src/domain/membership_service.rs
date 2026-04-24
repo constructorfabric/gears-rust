@@ -96,6 +96,35 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             .await
             .map_err(DomainError::from)?;
 
+        self.add_membership_inner(group_id, resource_type, resource_id)
+            .await
+    }
+
+    /// Add a membership link without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose this through a REST handler. Used by
+    /// the membership seeding adapter (which runs at module init, before
+    /// any caller `SecurityContext` exists). Domain invariants
+    /// (group existence, type registration, `allowed_membership_types`
+    /// compatibility, tenant scope) still run; only the `PolicyEnforcer`
+    /// gate is skipped.
+    pub async fn add_membership_unscoped(
+        &self,
+        group_id: Uuid,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<ResourceGroupMembership, DomainError> {
+        self.add_membership_inner(group_id, resource_type, resource_id)
+            .await
+    }
+
+    /// Shared post-authz body of `add_membership` / `add_membership_unscoped`.
+    async fn add_membership_inner(
+        &self,
+        group_id: Uuid,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<ResourceGroupMembership, DomainError> {
         let conn = self.conn()?;
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-3
@@ -304,8 +333,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         resource_type: &str,
         resource_id: &str,
     ) -> Result<(), DomainError> {
-        let anon = SecurityContext::anonymous();
-        self.add_membership(&anon, group_id, resource_type, resource_id)
+        // Seeding runs at module init, before any caller `SecurityContext`
+        // exists; using `SecurityContext::anonymous()` here would gate the
+        // path on whether anonymous subjects are allowed to create
+        // memberships, which is brittle and outright fails in locked-down
+        // deployments. Use the dedicated unscoped entry point — domain
+        // invariants still run, only the `PolicyEnforcer` gate is skipped.
+        self.add_membership_unscoped(group_id, resource_type, resource_id)
             .await
             .map(|_| ())
     }

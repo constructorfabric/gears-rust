@@ -104,7 +104,14 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
             Vec::new()
         } else {
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6a
-            // Validate membership_path is a valid GtsTypePath (no RG prefix requirement)
+            // Syntactic validation of each membership type code (mirror the
+            // `allowed_parent_types` loop above) — `resolve_ids` checks
+            // existence in the DB but not the GTS-path syntax, so without
+            // this loop a malformed code would surface as a "not found"
+            // error rather than the more specific validation error.
+            for membership_code in &req.allowed_membership_types {
+                validation::validate_type_code(membership_code)?;
+            }
             // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6a
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6b
             self.type_repo

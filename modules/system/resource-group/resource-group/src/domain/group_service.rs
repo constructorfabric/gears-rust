@@ -517,6 +517,83 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         self.group_repo.list_groups(&conn, &scope, query).await
     }
 
+    /// Get a single group by id without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose this through a REST handler. Used by
+    /// the seeding path (which runs at module init, before any caller
+    /// security context exists) to check whether a seeded group is already
+    /// present. Mirrors the pattern of the other `*_unscoped` methods.
+    pub async fn get_group_unscoped(&self, group_id: Uuid) -> Result<ResourceGroup, DomainError> {
+        let conn = self.db.conn()?;
+        let scope = modkit_security::AccessScope::allow_all();
+        self.group_repo
+            .find_by_id(&conn, &scope, group_id)
+            .await?
+            .ok_or_else(|| DomainError::group_not_found(group_id))
+    }
+
+    /// Create a group without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose this through a REST handler. Used by
+    /// the seeding path to provision required groups at module init, before
+    /// any caller security context exists. Domain invariants (type
+    /// validation, parent compatibility, tenant scoping, closure table
+    /// maintenance) still run because this method calls the same
+    /// `create_group_inner` as the public path; only the `PolicyEnforcer`
+    /// gate is skipped.
+    pub async fn create_group_unscoped(
+        &self,
+        req: CreateGroupRequest,
+        tenant_id: Uuid,
+    ) -> Result<ResourceGroup, DomainError> {
+        validation::validate_type_code(&req.code)?;
+        Self::validate_name(&req.name)?;
+
+        let profile = self.profile.clone();
+        let db = self.db.db();
+
+        for attempt in 1..=MAX_SERIALIZATION_RETRIES {
+            let req = req.clone();
+            let profile = profile.clone();
+            let group_repo = self.group_repo.clone();
+            let type_repo = self.type_repo.clone();
+            let types_registry = self.types_registry.clone();
+
+            let result = db
+                .transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
+                    Box::pin(async move {
+                        Self::create_group_inner(
+                            &*group_repo,
+                            &*type_repo,
+                            tx,
+                            &req,
+                            tenant_id,
+                            &profile,
+                            &*types_registry,
+                        )
+                        .await
+                    })
+                })
+                .await;
+
+            match result {
+                Ok(group) => return Ok(group),
+                Err(ref e)
+                    if e.is_serialization_failure() && attempt < MAX_SERIALIZATION_RETRIES =>
+                {
+                    warn!(
+                        attempt,
+                        max = MAX_SERIALIZATION_RETRIES,
+                        "Serialization conflict in create_group_unscoped, retrying"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        unreachable!("retry loop always returns")
+    }
+
     // -- Transaction-inner implementations --
 
     /// Inner logic for `create_group`, runs inside a SERIALIZABLE transaction.
@@ -723,7 +800,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     }
 
     /// Inner logic for `update_group`, runs inside a SERIALIZABLE transaction.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     async fn update_group_inner(
         group_repo: &GR,
         type_repo: &TR,
@@ -843,6 +920,28 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             )));
         }
 
+        // Recompute the effective tenant_id under the post-update shape using
+        // the same rule as `create_group_inner`:
+        //   - if new type is tenant-typed → tenant_id = group_id (own scope)
+        //   - else if new parent is set → tenant_id = parent.tenant_id
+        //   - else (non-tenant root, only legal when rg_type.can_be_root) →
+        //     keep the existing tenant_id (no parent to inherit from).
+        // Reject the update outright if a non-tenant child would land under
+        // a parent in a different tenant — that would silently produce a
+        // cross-tenant tree, breaking the scoping invariant the rest of the
+        // module relies on.
+        let new_effective_tenant_id = if new_is_tenant_type {
+            group_id
+        } else if let Some(new_parent_id) = req.parent_id {
+            let new_parent = group_repo
+                .find_model_by_id(tx, new_parent_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
+            new_parent.tenant_id
+        } else {
+            existing.tenant_id
+        };
+
         if parent_changed {
             // Delegate to move logic (cycle detection + closure rebuild)
             Self::move_group_internal_impl(
@@ -857,7 +956,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
-        // Update the group record
+        // Update the group record (note: `update` does not touch `tenant_id`,
+        // see `update_tenant_id` call below).
         let _model = group_repo
             .update(
                 tx,
@@ -868,6 +968,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 req.metadata.as_ref(),
             )
             .await?;
+
+        // Persist the recomputed `tenant_id` if it actually changed.
+        // Skipping this when nothing changed avoids touching `updated_at`
+        // unnecessarily and keeps the no-op update path observable as such.
+        if new_effective_tenant_id != existing.tenant_id {
+            group_repo
+                .update_tenant_id(tx, group_id, new_effective_tenant_id)
+                .await?;
+        }
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
@@ -931,6 +1040,32 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             )
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
+
+        // Recompute and persist `tenant_id` under the post-move shape using
+        // the same rule as `create_group_inner` and `update_group_inner`:
+        //   - tenant-typed group → keeps own scope (tenant_id = group_id)
+        //   - non-tenant child reparented under a parent → inherit
+        //     parent.tenant_id, rejecting the move if the new parent lives
+        //     in a different tenant than the moved subtree (mirrors the
+        //     create-time check). A non-tenant moved to no parent keeps
+        //     its existing tenant_id (only legal when rg_type.can_be_root).
+        let is_tenant_type = rg_type.code.starts_with(TENANT_RG_TYPE_PATH);
+        let new_effective_tenant_id = if is_tenant_type {
+            group_id
+        } else if let Some(new_parent_id) = new_parent_id {
+            let new_parent = group_repo
+                .find_model_by_id(tx, new_parent_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
+            new_parent.tenant_id
+        } else {
+            existing.tenant_id
+        };
+        if new_effective_tenant_id != existing.tenant_id {
+            group_repo
+                .update_tenant_id(tx, group_id, new_effective_tenant_id)
+                .await?;
+        }
 
         let sys = modkit_security::AccessScope::allow_all();
         group_repo

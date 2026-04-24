@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS resource_group (
     id TEXT PRIMARY KEY,
     parent_id TEXT,
     gts_type_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
+    name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 255),
     metadata TEXT,
     tenant_id TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
