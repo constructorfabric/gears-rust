@@ -51,8 +51,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Update Rust
-        run: rustup update
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
       - name: Install Python dependencies
         run: pip install -r testing/e2e/requirements.txt
