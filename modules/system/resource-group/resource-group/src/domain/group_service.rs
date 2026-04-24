@@ -502,6 +502,21 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await
     }
 
+    /// List groups without `AuthZ` enforcement (private API, no tenant scoping).
+    ///
+    /// Used by `ResourceGroupReadHierarchy::list_groups` consumers (e.g.,
+    /// the tenant-resolver RG plugin's batch `get_tenants` path) which need
+    /// to resolve groups by id/type predicates regardless of the caller's
+    /// tenant scope. Mirrors the pattern of `get_group_*_unscoped`.
+    pub async fn list_groups_unscoped(
+        &self,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroup>, DomainError> {
+        let conn = self.db.conn()?;
+        let scope = modkit_security::AccessScope::allow_all();
+        self.group_repo.list_groups(&conn, &scope, query).await
+    }
+
     // -- Transaction-inner implementations --
 
     /// Inner logic for `create_group`, runs inside a SERIALIZABLE transaction.

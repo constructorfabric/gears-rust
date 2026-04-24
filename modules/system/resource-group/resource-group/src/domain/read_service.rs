@@ -18,7 +18,7 @@ use modkit_odata::{ODataQuery, Page};
 use modkit_security::SecurityContext;
 use resource_group_sdk::ResourceGroupReadHierarchy;
 use resource_group_sdk::error::ResourceGroupError;
-use resource_group_sdk::models::ResourceGroupWithDepth;
+use resource_group_sdk::models::{ResourceGroup, ResourceGroupWithDepth};
 use uuid::Uuid;
 
 use crate::domain::group_service::GroupService;
@@ -97,6 +97,21 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // (Acronis/Virtuozzo, 2026-04-17).
         self.group_service
             .get_group_ancestors_unscoped(group_id, query)
+            .await
+            .map_err(ResourceGroupError::from)
+    }
+
+    async fn list_groups(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+        // Bypass AuthZ — same rationale as the hierarchy reads above.
+        // Used by the tenant-resolver RG plugin's batch `get_tenants` path,
+        // which queries `id in (…)` over tenant-typed groups regardless of
+        // the caller's tenant scope.
+        self.group_service
+            .list_groups_unscoped(query)
             .await
             .map_err(ResourceGroupError::from)
     }
