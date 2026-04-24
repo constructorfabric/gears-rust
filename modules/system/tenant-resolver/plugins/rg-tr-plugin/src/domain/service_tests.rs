@@ -6,7 +6,9 @@ use modkit_security::SecurityContext;
 use resource_group_sdk::TENANT_RG_TYPE_PATH;
 use resource_group_sdk::api::ResourceGroupReadHierarchy;
 use resource_group_sdk::error::ResourceGroupError;
-use resource_group_sdk::models::{GroupHierarchyWithDepth, ResourceGroupWithDepth};
+use resource_group_sdk::models::{
+    GroupHierarchy, GroupHierarchyWithDepth, ResourceGroup, ResourceGroupWithDepth,
+};
 use tenant_resolver_sdk::{
     BarrierMode, GetAncestorsOptions, GetDescendantsOptions, GetTenantsOptions, IsAncestorOptions,
     TenantId, TenantResolverError, TenantResolverPluginClient, TenantStatus,
@@ -107,6 +109,54 @@ impl ResourceGroupReadHierarchy for MockRgHierarchy {
                 .cloned()
                 .unwrap_or_default()
         };
+        Ok(Page {
+            items,
+            page_info: PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 100,
+            },
+        })
+    }
+
+    async fn list_groups(
+        &self,
+        _ctx: &SecurityContext,
+        _query: &ODataQuery,
+    ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+        // Flatten every `ResourceGroupWithDepth` known to the mock (ancestors
+        // + descendants + per-id dispatches) into `ResourceGroup` entries,
+        // deduplicated by id. Ignores the OData filter — tests populate the
+        // mock with only the groups they care about, so a simple "return
+        // everything" is an acceptable stub for `id in (…)` queries.
+        let mut seen = std::collections::HashSet::new();
+        let mut items: Vec<ResourceGroup> = Vec::new();
+        let flatten = |src: &[ResourceGroupWithDepth],
+                       seen: &mut std::collections::HashSet<Uuid>,
+                       items: &mut Vec<ResourceGroup>| {
+            for g in src {
+                if seen.insert(g.id) {
+                    items.push(ResourceGroup {
+                        id: g.id,
+                        code: g.code.clone(),
+                        name: g.name.clone(),
+                        hierarchy: GroupHierarchy {
+                            parent_id: g.hierarchy.parent_id,
+                            tenant_id: g.hierarchy.tenant_id,
+                        },
+                        metadata: g.metadata.clone(),
+                    });
+                }
+            }
+        };
+        flatten(&self.ancestors, &mut seen, &mut items);
+        flatten(&self.descendants, &mut seen, &mut items);
+        for v in self.ancestors_by_id.values() {
+            flatten(v, &mut seen, &mut items);
+        }
+        for v in self.descendants_by_id.values() {
+            flatten(v, &mut seen, &mut items);
+        }
         Ok(Page {
             items,
             page_info: PageInfo {
@@ -600,6 +650,14 @@ async fn rg_error_propagates() {
             _group_id: Uuid,
             _query: &ODataQuery,
         ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+            Err(ResourceGroupError::internal())
+        }
+
+        async fn list_groups(
+            &self,
+            _ctx: &SecurityContext,
+            _query: &ODataQuery,
+        ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
             Err(ResourceGroupError::internal())
         }
     }
