@@ -269,6 +269,16 @@ pattern = "ADR/*.md"
 traceability = "DOCS-ONLY"
 required = false
 
+[systems.autodetect.children.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
 [systems.autodetect.children.validation]
 require_kind_registered_in_kit = true
 require_md_extension = true

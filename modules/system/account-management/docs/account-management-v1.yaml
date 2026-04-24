@@ -924,7 +924,7 @@ components:
     Problem:
       type: object
       additionalProperties: true
-      required: [type, title, status, code]
+      required: [type, title, status, code, sub_code]
       properties:
         type:
           type: string
@@ -952,6 +952,14 @@ components:
         sub_code:
           type: string
           enum:
+            - validation
+            - not_found
+            - conflict
+            - cross_tenant_denied
+            - idp_unavailable
+            - idp_unsupported_operation
+            - service_unavailable
+            - internal
             - invalid_tenant_type
             - type_not_allowed
             - tenant_depth_exceeded
@@ -964,8 +972,8 @@ components:
             - root_tenant_cannot_convert
             - metadata_schema_not_registered
             - metadata_entry_not_found
-          nullable: true
-          description: Stable module-specific discriminator when the contract defines one.
+          nullable: false
+          description: Stable module-specific discriminator. Broad categories use the category name when no finer discriminator applies.
         details:
           type: object
           additionalProperties: true

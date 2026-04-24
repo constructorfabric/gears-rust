@@ -46,7 +46,7 @@ AM is the foundational multi-tenancy source-of-truth module for the Cyber Fabric
 
 The architecture separates data ownership from enforcement. AM stores and validates the tenant tree structure, barrier flags, and type constraints. It does not evaluate authorization policies, generate SQL predicates, or validate bearer tokens on the per-request path. Tenant Resolver and AuthZ Resolver consume AM source-of-truth data for runtime enforcement. This separation keeps AM focused on administrative correctness while letting specialized resolvers optimize the hot path independently.
 
-IdP integration uses the CyberFabric gateway + plugin pattern, analogous to AuthN Resolver (see `cpt-cf-account-management-adr-idp-contract-separation`). AM defines an `IdpProviderPluginClient` trait for tenant and user administrative operations (tenant provisioning/deprovisioning, user provision/deprovision, tenant-scoped query). The plugin is discovered via GTS types-registry and resolved through `ClientHub`. The platform ships a default provider plugin; vendors substitute their own implementation behind the same trait. The IdP provider plugin is intentionally separate from the AuthN Resolver plugin — the two target different concerns (admin operations vs hot-path token validation) with different performance profiles and protocols. The contract is one-directional: AM calls IdP, IdP does not call AM.
+IdP integration uses the CyberFabric gateway + plugin pattern, analogous to AuthN Resolver (see `cpt-cf-account-management-adr-idp-contract-separation`). AM defines an `IdpProviderPluginClient` trait for tenant and user administrative operations (provider availability check, tenant provisioning/deprovisioning, user provision/deprovision, tenant-scoped query). The plugin is discovered via GTS types-registry and resolved through `ClientHub`. The platform ships a default provider plugin; vendors substitute their own implementation behind the same trait. The IdP provider plugin is intentionally separate from the AuthN Resolver plugin — the two target different concerns (admin operations vs hot-path token validation) with different performance profiles and protocols. The contract is one-directional: AM calls IdP, IdP does not call AM.
 
 User group management is handled by the [Resource Group](../../resource-group/docs/PRD.md) module. AM registers a dedicated Resource Group type for user groups during module initialization; consumers call `ResourceGroupClient` directly for group lifecycle, membership, and hierarchy operations.
 
@@ -101,7 +101,7 @@ graph LR
 | `cpt-cf-account-management-fr-conversion-cancel` | `ConversionService::cancel` transitions a pending `ConversionRequest` to `cancelled` only when `caller_side == initiator_side`. Exposed via `PATCH .../conversions/{r}` (child scope) and `PATCH .../child-conversions/{r}` (parent scope) with body `{"status": "cancelled"}`. Role-check failures return `409 conflict` with sub-code `invalid_actor_for_transition`. |
 | `cpt-cf-account-management-fr-conversion-reject` | `ConversionService::reject` transitions a pending `ConversionRequest` to `rejected` only when `caller_side != initiator_side`. Exposed via the same `PATCH` endpoints with body `{"status": "rejected"}`. Role-check failures return `409 conflict` with sub-code `invalid_actor_for_transition`. |
 | `cpt-cf-account-management-fr-conversion-retention` | Background job `ConversionService::soft_delete_resolved` stamps `deleted_at` on resolved rows older than `resolved_retention` (default 30d); default queries filter `deleted_at IS NULL`. Hard-delete follows AM's existing retention cadence. |
-| `cpt-cf-account-management-fr-idp-tenant-provision` | Tenant creation uses a saga pattern: (1) short TX inserts the tenant with `status=provisioning`, (2) `IdpProviderPluginClient::provision_tenant` is called outside any transaction, (3) a second short TX persists provider-returned metadata and transitions the tenant to `active`. If the IdP call fails, a compensating TX deletes the `provisioning` row — no orphan in either system. If the finalization TX fails, AM does not retry the DB completion step; the tenant remains in `provisioning` state until the background reaper compensates (see Reliability Architecture — Data Consistency). `POST /tenants` remains intentionally non-idempotent. |
+| `cpt-cf-account-management-fr-idp-tenant-provision` | Tenant creation uses a saga pattern: (1) short TX inserts the tenant with `status=provisioning`, (2) `IdpProviderPluginClient::provision_tenant` is called outside any transaction, (3) a second short TX persists provider-returned metadata and transitions the tenant to `active`. If the IdP call returns a clean compensable failure proving no provider state was retained, a compensating TX deletes the `provisioning` row. If the IdP outcome is ambiguous, or if the finalization TX fails after IdP success, AM does not retry the DB completion step; the tenant remains in `provisioning` state until the background reaper compensates (see Reliability Architecture — Data Consistency). `POST /tenants` remains intentionally non-idempotent. |
 | `cpt-cf-account-management-fr-idp-tenant-provision-failure` | The tenant-creation saga distinguishes clean compensation from ambiguous external outcomes and maps both paths into deterministic public failure behavior plus reaper-backed reconciliation. |
 | `cpt-cf-account-management-fr-idp-tenant-deprovision` | Background hard-deletion job calls `IdpProviderPluginClient::deprovision_tenant` for every hard-deleted tenant. Provider implementations clean up tenant-scoped IdP resources, guided by tenant type traits such as `idp_provisioning`. Providers **MUST NOT** silently no-op on mutating operations — unsupported deprovisioning **MUST** fail with `idp_unsupported_operation`. Failure retries rather than skips. |
 | `cpt-cf-account-management-fr-idp-user-provision` | `IdpProviderPluginClient::create_user` with tenant scope binding and resolved tenant metadata (for IdP context resolution, e.g., effective Keycloak realm). |
@@ -517,8 +517,8 @@ Central domain service for all tenant lifecycle operations. Encapsulates tree in
 TenantService owns tenant lifecycle orchestration, tenant-related IdP operations, and hierarchy integrity rules.
 
 - Tenant CRUD: create child tenant, read tenant, update mutable tenant fields, and soft-delete tenants.
-- Tenant creation saga: insert the tenant in `provisioning`, call `IdpProviderPluginClient::provision_tenant` outside the transaction, then persist provider-returned metadata and finalize the tenant as `active`. If provisioning fails, a compensating transaction removes the `provisioning` row so neither system keeps an orphan.
-- Provisioning recovery: if finalization fails after the IdP step succeeds, the tenant remains in internal `provisioning` state. A background provisioning reaper always compensates by calling `deprovision_tenant` and deleting the row; it does not retry finalization. `provisioning` tenants are hidden from API queries and rejected for all normal operations.
+- Tenant creation saga: insert the tenant in `provisioning`, call `IdpProviderPluginClient::provision_tenant` outside the transaction, then persist provider-returned metadata and finalize the tenant as `active`. If provisioning returns a clean compensable failure proving no IdP-side state was retained, a compensating transaction removes the `provisioning` row. Ambiguous provisioning outcomes leave the row for reaper compensation.
+- Provisioning recovery: if finalization fails after the IdP step succeeds, or an ambiguous provisioning outcome leaves external state uncertain, the tenant remains in internal `provisioning` state. A background provisioning reaper compensates by calling `deprovision_tenant` and deletes the row only after deprovision succeeds or reports already-absent state; failed deprovision retains the row for retry/remediation. The reaper does not retry finalization. `provisioning` tenants are hidden from API queries and rejected for all normal operations.
 - Hierarchy and lifecycle rules: validate depth against advisory and strict thresholds, allow only `active` ↔ `suspended` status changes on PATCH, and require the `DELETE` flow for deletion so child and resource-ownership preconditions are enforced.
 - Closure maintenance: every write path that changes tenant SDK-visibility also mutates `tenant_closure` in the same transaction as the owning `tenants` write, and `tenant_closure` never contains rows for tenants in the internal `provisioning` state. **Activation** (the `provisioning → active` transition at the end of the tenant-create saga) inserts the descendant's self-row with `barrier = 0` plus one strict-ancestor row per step up the `parent_id` chain, materializing `barrier` as `1` iff some tenant on `(ancestor, descendant]` is self-managed, and setting `descendant_status = active`. **Compensation** (provisioning reaper rolling back a stuck `provisioning` row) removes the `tenants` row only; no closure work is needed because no closure rows were ever written. **Status change** (between SDK-visible states `active` / `suspended` / `deleted`) rewrites `descendant_status` on every row where `descendant_id = X`. **Hard-deletion** (leaves only) removes every row where the hard-deleted tenant appears as descendant. Soft-delete flips both `tenants.status` and the matching `tenant_closure.descendant_status` rows; no closure row is inserted or removed. Subtree moves are not supported in v1 (`update_tenant` mutates only `name` and `status`), so no subtree-wide closure rebuild is needed.
 - Mode conversion delegation: post-creation toggles of `self_managed` are not applied directly by `TenantService`; they are routed to `ConversionService` (see below), which owns the `ConversionRequest` state machine, role-per-transition validation, and the atomic toggle-at-approval step. `TenantService::create_tenant` still accepts `self_managed=true` at creation time without a `ConversionRequest` — the parent's explicit creation call is the consent.
@@ -660,7 +660,7 @@ Handles one-time platform initialization: creating the initial root tenant and l
 
 ##### Responsibility scope
 
-Acquires a distributed lock to prevent concurrent bootstrap from parallel service starts. Checks whether the initial root tenant already exists (idempotency). Waits for IdP availability with configurable retry/backoff and timeout. Creates the initial root tenant through the same internal provisioning saga used for API-created tenants: internal `provisioning` state first, then finalization to visible `active` status once bootstrap completes successfully. Calls `provision_tenant` with deployer-configured `root_tenant_metadata` (same contract as all tenants) so the IdP provider plugin can establish the tenant-to-IdP binding. Any provider-returned `ProvisionResult` metadata is persisted as tenant metadata; if the provider returns no metadata, bootstrap proceeds normally. Bootstrap completion emits a platform audit event with `actor=system`. Releases the lock.
+Acquires a distributed lock to prevent concurrent bootstrap from parallel service starts. Checks whether the initial root tenant already exists (idempotency). Waits for IdP availability via `IdpProviderPluginClient::check_availability()` with configurable retry/backoff and timeout. Preflights `root_tenant_type` through GTS effective-trait resolution before writing any tenant row, requiring a registered chained tenant type whose effective `allowed_parent_types` is `[]`. Creates the initial root tenant through the same internal provisioning saga used for API-created tenants: internal `provisioning` state first, then finalization to visible `active` status once bootstrap completes successfully. Calls `provision_tenant` with deployer-configured `root_tenant_metadata` (same contract as all tenants) so the IdP provider plugin can establish the tenant-to-IdP binding. Any provider-returned `ProvisionResult` metadata is persisted as tenant metadata; if the provider returns no metadata, bootstrap proceeds normally. Bootstrap completion emits a platform audit event with `actor=system`. Releases the lock.
 
 ##### Responsibility boundaries
 
@@ -762,11 +762,12 @@ This interface exposes raw and resolved tenant metadata keyed by registered GTS 
 - **Location**: `modules/system/account-management/account-management-sdk/src/idp.rs`
 - **ADR**: `cpt-cf-account-management-adr-idp-contract-separation`
 
-`IdpProviderPluginClient` is the deployment-specific outbound identity boundary for tenant provisioning, tenant deprovisioning, and user lifecycle operations. The architecture expects:
+`IdpProviderPluginClient` is the deployment-specific outbound identity boundary for tenant provisioning, tenant deprovisioning, user lifecycle operations, and an explicit bootstrap readiness probe (`check_availability`). The architecture expects:
 
 - provider implementations to be discoverable and replaceable without changing AM's public API contract
 - tenant provisioning and user lifecycle calls to accept AM-owned tenant identifiers plus resolved tenant metadata, with provider-specific interpretation remaining outside AM
 - provider-returned metadata to use pre-registered schema identifiers so AM can validate and persist it safely
+- `check_availability` to be side-effect-free, bounded by the bootstrap retry timeout, and to return provider availability without provisioning tenant or user state
 - outbound identity credentials, federation setup, session semantics, and service authentication to remain owned by the provider implementation and the platform AuthN layer rather than by AM
 
 ### 3.4 Internal Dependencies
@@ -891,11 +892,11 @@ sequenceDiagram
     else No root tenant
         DB-->>BS: Not found
         loop Retry with backoff
-            BS->>IDP: Health check
+            BS->>IDP: check_availability()
             IDP-->>BS: Available / Unavailable
         end
         BS->>TS: create_root_tenant(bootstrap_config)
-        TS->>TS: Resolve root_tenant_type from config
+        TS->>TS: Resolve root_tenant_type via GTS effective traits and require root eligibility
         rect rgb(230, 245, 255)
             Note over TS,DB: Saga step 1 — short TX
             TS->>DB: INSERT tenant (root, type=root_tenant_type, status='provisioning', self_managed)
@@ -946,7 +947,7 @@ sequenceDiagram
 | `idp_retry_backoff_max` | duration | No (default: 30s) | Maximum backoff for IdP availability retry. |
 | `idp_retry_timeout` | duration | No (default: 5min) | Total timeout for IdP availability wait. Bootstrap fails if exceeded. |
 
-**Description**: On first platform start, AM acquires a distributed lock to prevent concurrent bootstrap from parallel service starts, then creates the initial root tenant using the configured `root_tenant_type` (validated against GTS — must be a registered type). Tenant creation follows the same saga pattern as API-created tenants: (1) a short transaction inserts the `tenants` row with `status=provisioning` — no `tenant_closure` rows are written yet, because provisioning tenants are absent from the closure by contract; (2) `provision_tenant` is called outside any transaction with the deployer-configured `root_tenant_metadata`; (3) a second short transaction persists any provider-returned metadata, transitions the tenant to visible `active` status, and inserts the root's self-row into `tenant_closure` (`ancestor_id = descendant_id = root_id`, `barrier = 0`, `descendant_status = active`) — the root has no strict ancestors, so only the self-row is created. The metadata is opaque to AM — it flows through to the IdP provider plugin, which uses it to determine deployment-specific behavior (e.g., a Keycloak provider receiving `{ "adopt_realm": "master" }` may adopt an existing realm, while other metadata may trigger fresh resource creation). If the provider returns no metadata (binding established through external configuration or convention), bootstrap proceeds normally. On subsequent starts, bootstrap detects the existing root (in `active` status) and is a no-op. A root tenant stuck in `provisioning` status from a prior failed bootstrap attempt is left for provisioning-reaper compensation; bootstrap does not create a second root while that stale row exists. Successful bootstrap emits a platform audit event with `actor=system`. If IdP is unavailable, bootstrap retries with backoff until timeout. The lock ensures that even with multiple replicas starting simultaneously, only one performs the bootstrap sequence. The lock implementation is infrastructure-specific (e.g., database advisory lock, distributed lock service) and not prescribed by this design.
+**Description**: On first platform start, AM acquires a distributed lock to prevent concurrent bootstrap from parallel service starts, waits for IdP readiness through `IdpProviderPluginClient::check_availability()`, then creates the initial root tenant using the configured `root_tenant_type`. Bootstrap preflights the type through GTS effective-trait resolution before writing any row: it must be a registered chained tenant type under `gts.x.core.am.tenant_type.v1~`, and its effective `allowed_parent_types` must be `[]` so it is root-eligible. GTS unavailability, an unregistered type, or a non-root-eligible type fails bootstrap without DB or IdP side effects. Tenant creation follows the same saga pattern as API-created tenants: (1) a short transaction inserts the `tenants` row with `status=provisioning` — no `tenant_closure` rows are written yet, because provisioning tenants are absent from the closure by contract; (2) `provision_tenant` is called outside any transaction with the deployer-configured `root_tenant_metadata`; (3) a second short transaction persists any provider-returned metadata, transitions the tenant to visible `active` status, and inserts the root's self-row into `tenant_closure` (`ancestor_id = descendant_id = root_id`, `barrier = 0`, `descendant_status = active`) — the root has no strict ancestors, so only the self-row is created. The metadata is opaque to AM — it flows through to the IdP provider plugin, which uses it to determine deployment-specific behavior (e.g., a Keycloak provider receiving `{ "adopt_realm": "master" }` may adopt an existing realm, while other metadata may trigger fresh resource creation). If the provider returns no metadata (binding established through external configuration or convention), bootstrap proceeds normally. On subsequent starts, bootstrap detects the existing root (in `active` status) and is a no-op. A root tenant stuck in `provisioning` status from an ambiguous provider outcome or finalization failure is left for provisioning-reaper compensation; bootstrap does not create a second root while that stale row exists. Successful bootstrap emits a platform audit event with `actor=system`. If IdP is unavailable, bootstrap retries with backoff until timeout before any row is written. The lock ensures that even with multiple replicas starting simultaneously, only one performs the bootstrap sequence. The lock implementation is infrastructure-specific (e.g., database advisory lock, distributed lock service) and not prescribed by this design.
 
 #### Create Child Tenant with Type Validation
 
@@ -990,17 +991,28 @@ sequenceDiagram
     Note over TS,IDP: Saga step 2 — IdP call (no open TX)
     TS->>IDP: provision_tenant(child_id, name, type, parent_id, metadata)
 
-    alt IdP provisioning fails
-        IDP-->>TS: Error
-        rect rgb(255, 230, 230)
-            Note over TS,DB: Compensate — short TX
-            TS->>DB: DELETE tenant WHERE id = child_id AND status = 'provisioning'
-            Note over TS,DB: No tenant_closure cleanup needed — no rows were written
-            TS->>DB: COMMIT
-        end
-        TS-->>API: Error: idp_unavailable
-        API-->>Admin: 503 Service Unavailable
-    else IdP provisioning succeeds
+        alt IdP provisioning cleanly fails with no retained provider state
+            IDP-->>TS: Clean failure
+            rect rgb(255, 230, 230)
+                Note over TS,DB: Compensate — short TX
+                TS->>DB: DELETE tenant WHERE id = child_id AND status = 'provisioning'
+                Note over TS,DB: No tenant_closure cleanup needed — no rows were written
+                TS->>DB: COMMIT
+            end
+            TS-->>API: Error: idp_unavailable
+            API-->>Admin: 503 Service Unavailable
+        else IdP provisioning outcome is ambiguous
+            IDP-->>TS: Timeout / transport error / ambiguous 5xx
+            TS-->>API: Error: internal, reconciliation required
+            API-->>Admin: 500 Internal Server Error
+            PR->>DB: Scan stale provisioning tenants
+            DB-->>PR: child tenant still provisioning
+            PR->>IDP: deprovision_tenant(child_id, ...)
+            IDP-->>PR: OK / already absent
+            PR->>DB: DELETE tenant WHERE id = child_id AND status = 'provisioning'
+            Note over PR,DB: Failed deprovision retains the row for retry/remediation
+            PR->>DB: COMMIT
+        else IdP provisioning succeeds
         IDP-->>TS: ProvisionResult (optional metadata entries)
         alt Finalization succeeds
             rect rgb(230, 245, 255)
@@ -1025,12 +1037,12 @@ sequenceDiagram
             PR->>DB: DELETE tenant WHERE id = child_id AND status = 'provisioning'
             Note over PR,DB: No tenant_closure cleanup needed — provisioning rows never enter the closure
             PR->>DB: COMMIT
-            Note over TS,PR: Step 3 failure always compensates, and AM does not retry finalization
+            Note over TS,PR: Step 3 failure is routed to reaper compensation; AM does not retry finalization
         end
     end
 ```
 
-**Description**: Tenant creation validates parent status, type constraints via GTS, and hierarchy depth. The creation itself follows a three-step saga to avoid holding a DB transaction open during the external IdP call: (1) a short transaction inserts the tenant row with `status=provisioning` — no `tenant_closure` rows are written yet, because the closure contract excludes provisioning tenants entirely (`cpt-cf-account-management-fr-tenant-closure`); (2) `IdpProviderPluginClient::provision_tenant` is called outside any transaction to set up IdP-side resources (e.g., a Keycloak realm); (3) a second short transaction persists any provider-returned metadata entries (e.g., effective realm name), transitions the tenant to visible `active` status, and atomically inserts the matching `tenant_closure` rows (self-row with `barrier=0` plus one row per strict ancestor along the `parent_id` chain, with `barrier` set to `1` iff some tenant on `(ancestor, descendant]` is self-managed, and `descendant_status=active`). If the IdP call fails at step 2, a compensating transaction deletes the `provisioning` row — no closure cleanup is needed because nothing was ever written there — and the caller receives `idp_unavailable`. If the finalization transaction at step 3 fails, the tenant remains in `provisioning` status with no closure rows; a background provisioning reaper compensates by calling `deprovision_tenant` (idempotent), emitting a platform audit event with `actor=system`, and deleting the `tenants` row. AM does not retry the finalization step (see Reliability Architecture). `POST /tenants` is intentionally non-idempotent: only the clean compensated `idp_unavailable` path is retry-safe; transport failure, timeout, or generic `5xx` require reconciliation before retry. If the advisory threshold is exceeded, AM emits the v1 advisory warning signal (metric increment plus structured warning log entry) and creation proceeds. In strict mode, creation is rejected when the hard limit is exceeded.
+**Description**: Tenant creation validates parent status, type constraints via GTS, and hierarchy depth. The creation itself follows a three-step saga to avoid holding a DB transaction open during the external IdP call: (1) a short transaction inserts the tenant row with `status=provisioning` — no `tenant_closure` rows are written yet, because the closure contract excludes provisioning tenants entirely (`cpt-cf-account-management-fr-tenant-closure`); (2) `IdpProviderPluginClient::provision_tenant` is called outside any transaction to set up IdP-side resources (e.g., a Keycloak realm); (3) a second short transaction persists any provider-returned metadata entries (e.g., effective realm name), transitions the tenant to visible `active` status, and atomically inserts the matching `tenant_closure` rows (self-row with `barrier=0` plus one row per strict ancestor along the `parent_id` chain, with `barrier` set to `1` iff some tenant on `(ancestor, descendant]` is self-managed, and `descendant_status=active`). If step 2 returns a clean compensable failure proving no IdP-side state was retained, a compensating transaction deletes the `provisioning` row — no closure cleanup is needed because nothing was ever written there — and the caller receives `idp_unavailable`. If step 2 has an ambiguous outcome (transport failure, timeout, or generic `5xx` where provider state may have been retained), the tenant remains in `provisioning` and the caller receives `internal` / reconciliation-required semantics. If the finalization transaction at step 3 fails, the tenant also remains in `provisioning` status with no closure rows. A background provisioning reaper compensates by calling `deprovision_tenant` (idempotent), emitting a platform audit event with `actor=system`, and deleting the `tenants` row only after deprovision succeeds or reports already absent; failed deprovision retains the row for retry/remediation. AM does not retry the finalization step (see Reliability Architecture). `POST /tenants` is intentionally non-idempotent: only the clean compensated `idp_unavailable` path is retry-safe; transport failure, timeout, or generic `5xx` require reconciliation before retry. If the advisory threshold is exceeded, AM emits the v1 advisory warning signal (metric increment plus structured warning log entry) and creation proceeds. In strict mode, creation is rejected when the hard limit is exceeded.
 
 #### Resolve Inherited Metadata
 
@@ -1284,7 +1296,7 @@ The physical schema in [migration.sql](./migration.sql) must preserve these inva
 
 ### 3.8 Error Codes Reference
 
-All errors follow the platform RFC 9457 Problem Details format. The authoritative public `sub_code` values are the exact identifiers enumerated in the OpenAPI `Problem` schema.
+All errors follow the platform RFC 9457 Problem Details format. The authoritative public `sub_code` values are the exact identifiers enumerated in the OpenAPI `Problem` schema. `sub_code` is required and non-null; broad categories use the category name (for example `service_unavailable` or `internal`) when no finer discriminator applies.
 
 | Error Code | HTTP Status | Category | Description |
 |------------|-------------|----------|-------------|

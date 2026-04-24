@@ -96,7 +96,7 @@ schemars = { workspace = true, features = ["derive"] }
 # GTS support
 gts = { workspace = true }
 gts-macros = { workspace = true }
-zip = { version = "2.3", default-features = false, features = ["deflate"] }
+zip = { version = "4.6", default-features = false, features = ["deflate"] }
 
 # Performance / lock-free structures
 parking_lot = { workspace = true }
@@ -125,7 +125,7 @@ tonic = { workspace = true, optional = true }
 nix = { version = "0.29", default-features = false, features = ["signal"] }
 
 [build-dependencies]
-zip = { version = "2.3", default-features = false, features = ["deflate"] }
+zip = { version = "4.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tower = { workspace = true }
