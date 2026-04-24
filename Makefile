@@ -698,9 +698,13 @@ ci_docs: lychee
 # Run CI pipeline locally, requires docker
 ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg lychee dylint dylint-test
 
-# Build the hyperspot-server release binary using the stable toolchain.
+# Build the hyperspot-server release binary.
+# Toolchain is pinned by rust-toolchain.toml at the repo root — do NOT
+# pass `cargo +stable`, that overrides the pin and picks up whatever
+# rustup's `stable` channel currently resolves to (which on a stale
+# runner image can be a version older than the workspace MSRV).
 cargo-build:
-	cargo +stable build --release --bin hyperspot-server $(E2E_ARGS)
+	cargo build --release --bin hyperspot-server $(E2E_ARGS)
 
 # Split debug symbols into separate artifact(s) and strip the binary.
 # Requires platform tools: objcopy (Linux), dsymutil+strip (macOS).

@@ -81,7 +81,7 @@ jobs:
           cache: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        uses: dtolnay/rust-toolchain@stable
 
       # Cache Cargo registry/git + target/ across platforms.
       - name: Cache Cargo/target
