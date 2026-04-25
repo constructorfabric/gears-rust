@@ -243,8 +243,10 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await
             .map_err(DomainError::from)?;
 
-        // Pre-validation (stateless, outside transaction)
-        validation::validate_type_code(&req.code)?;
+        // Pre-validation (stateless, outside transaction).
+        // Type is immutable on update — `UpdateGroupRequest` deliberately
+        // does not carry a `code` field — so there is nothing to validate
+        // syntactically here besides the display name.
         Self::validate_name(&req.name)?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
 
@@ -800,7 +802,22 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     }
 
     /// Inner logic for `update_group`, runs inside a SERIALIZABLE transaction.
-    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+    ///
+    /// **Type immutability.** A group's GTS type is fixed at creation —
+    /// `UpdateGroupRequest` does not carry a `code` field. The existing
+    /// `gts_type_id` is reused unchanged for the persisted update, so all
+    /// type-driven validation (allowed parents/children, tenant-root rule,
+    /// metadata schema lookup) is anchored on the existing type, not on a
+    /// caller-supplied one.
+    ///
+    /// **Tenant immutability.** A group's `tenant_id` is also fixed at
+    /// creation. Reparenting is therefore allowed only **within the same
+    /// tenant** — the new parent's `tenant_id` must equal the group's
+    /// `existing.tenant_id`, otherwise the move is rejected with the same
+    /// rule `create_group_inner` uses for non-tenant children. Tenant-type
+    /// roots already have `tenant_id = group_id`, so the same equality check
+    /// trivially holds for them as well.
+    #[allow(clippy::too_many_arguments)]
     async fn update_group_inner(
         group_repo: &GR,
         type_repo: &TR,
@@ -828,122 +845,52 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // IF group not found -> RETURN NotFound (handled by ok_or_else above)
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-3
 
-        // Resolve new type
-        let new_type_id = type_repo
-            .resolve_id(tx, &req.code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&req.code))?;
-
+        // Type is immutable on update — reuse the existing `gts_type_id` and
+        // resolve the type definition for `move_group_internal_impl`'s
+        // parent-compatibility check below.
+        let existing_type_path = Self::resolve_type_path_from_id(tx, existing.gts_type_id).await?;
         let rg_type = type_repo
-            .find_by_code(tx, &req.code)
+            .find_by_code(tx, &existing_type_path)
             .await?
-            .ok_or_else(|| DomainError::type_not_found(&req.code))?;
-
-        // Determine if parent changed
-        let parent_changed = existing.parent_id != req.parent_id;
-        let type_changed = existing.gts_type_id != new_type_id;
-
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4
-        if type_changed {
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
-            // Validate new type against current parent
-            if let Some(parent_id) = req.parent_id.or(existing.parent_id) {
-                let parent = group_repo
-                    .find_model_by_id(tx, parent_id)
-                    .await?
-                    .ok_or_else(|| DomainError::group_not_found(parent_id))?;
-
-                let parent_type_path =
-                    Self::resolve_type_path_from_id(tx, parent.gts_type_id).await?;
-                if !rg_type.allowed_parent_types.contains(&parent_type_path) {
-                    return Err(DomainError::invalid_parent_type(format!(
-                        "New type '{}' does not allow current parent type '{}'",
-                        req.code, parent_type_path
-                    )));
-                }
-            } else if !rg_type.can_be_root {
-                return Err(DomainError::invalid_parent_type(format!(
-                    "New type '{}' cannot be a root group",
-                    req.code
-                )));
-            }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
-
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4b
-            // Validate that all children's types allow the new type as parent
-            let children = Self::get_direct_children(tx, group_id).await?;
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4b
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4c
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4d
-            for child in &children {
-                let child_type = type_repo
-                    .find_by_code(
-                        tx,
-                        &Self::resolve_type_path_from_id(tx, child.gts_type_id).await?,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        DomainError::database("Child type not found during validation")
-                    })?;
-
-                if !child_type.allowed_parent_types.contains(&req.code) {
-                    return Err(DomainError::invalid_parent_type(format!(
-                        "Child group '{}' of type '{}' does not allow '{}' as parent type",
-                        child.name, child_type.code, req.code
-                    )));
-                }
-            }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4d
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4c
-        }
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4
+            .ok_or_else(|| DomainError::type_not_found(&existing_type_path))?;
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
-        validation::validate_metadata_via_gts(req.metadata.as_ref(), &req.code, types_registry)
-            .await?;
+        validation::validate_metadata_via_gts(
+            req.metadata.as_ref(),
+            &existing_type_path,
+            types_registry,
+        )
+        .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
 
-        // Tenant-root uniqueness on update: if the post-update group would
-        // be a tenant-type root (new parent_id = NULL AND new type is tenant),
-        // ensure no *other* tenant-type root already exists.
-        // `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`.
-        let new_is_tenant_type = req.code.starts_with(TENANT_RG_TYPE_PATH);
-        if new_is_tenant_type
-            && req.parent_id.is_none()
-            && let Some(existing_root_id) = group_repo
-                .find_root_id_with_type_prefix(tx, TENANT_RG_TYPE_PATH)
-                .await?
-            && existing_root_id != group_id
+        // Cross-tenant parent change is forbidden. `tenant_id` is established
+        // at creation and never rewritten — see the function-level doc above
+        // for the invariant. Mirror `create_group_inner`'s tenant-scope
+        // enforcement for non-tenant children. (Tenant-type roots have
+        // `tenant_id == group_id` by construction; reparenting one under a
+        // different parent is also rejected here because the equality check
+        // would fail.)
+        if let Some(new_parent_id) = req.parent_id
+            && new_parent_id != existing.parent_id.unwrap_or_default()
         {
-            return Err(DomainError::tenant_root_already_exists(format!(
-                "Cannot update group {group_id} to tenant-type root: tenant root already exists (id={existing_root_id})"
-            )));
-        }
-
-        // Recompute the effective tenant_id under the post-update shape using
-        // the same rule as `create_group_inner`:
-        //   - if new type is tenant-typed → tenant_id = group_id (own scope)
-        //   - else if new parent is set → tenant_id = parent.tenant_id
-        //   - else (non-tenant root, only legal when rg_type.can_be_root) →
-        //     keep the existing tenant_id (no parent to inherit from).
-        // Reject the update outright if a non-tenant child would land under
-        // a parent in a different tenant — that would silently produce a
-        // cross-tenant tree, breaking the scoping invariant the rest of the
-        // module relies on.
-        let new_effective_tenant_id = if new_is_tenant_type {
-            group_id
-        } else if let Some(new_parent_id) = req.parent_id {
             let new_parent = group_repo
                 .find_model_by_id(tx, new_parent_id)
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
-            new_parent.tenant_id
-        } else {
-            existing.tenant_id
-        };
+            if new_parent.tenant_id != existing.tenant_id {
+                return Err(DomainError::validation(format!(
+                    "Cannot move group {group_id} to a parent in a different tenant \
+                     ({} → {}); cross-tenant moves are not supported",
+                    existing.tenant_id, new_parent.tenant_id
+                )));
+            }
+        }
 
+        let parent_changed = existing.parent_id != req.parent_id;
         if parent_changed {
-            // Delegate to move logic (cycle detection + closure rebuild)
+            // Delegate to move logic (cycle detection + closure rebuild).
+            // Type stays the same, so use the resolved `rg_type` for parent
+            // compatibility checks inside the move helper.
             Self::move_group_internal_impl(
                 group_repo,
                 tx,
@@ -956,27 +903,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
-        // Update the group record (note: `update` does not touch `tenant_id`,
-        // see `update_tenant_id` call below).
+        // Persist name/parent/metadata. `gts_type_id` is reused from the
+        // existing row — type is immutable on update.
         let _model = group_repo
             .update(
                 tx,
                 group_id,
                 req.parent_id,
-                new_type_id,
+                existing.gts_type_id,
                 &req.name,
                 req.metadata.as_ref(),
             )
             .await?;
-
-        // Persist the recomputed `tenant_id` if it actually changed.
-        // Skipping this when nothing changed avoids touching `updated_at`
-        // unnecessarily and keeps the no-op update path observable as such.
-        if new_effective_tenant_id != existing.tenant_id {
-            group_repo
-                .update_tenant_id(tx, group_id, new_effective_tenant_id)
-                .await?;
-        }
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
@@ -1027,8 +965,27 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-5
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-4
 
+        // Cross-tenant moves are forbidden (`tenant_id` is immutable per the
+        // module-wide invariant). Reject the move when the new parent lives
+        // in a different tenant than the moved group; tenant-type roots have
+        // `tenant_id == group_id`, so the equality check covers them too.
+        if let Some(new_parent_id) = new_parent_id {
+            let new_parent = group_repo
+                .find_model_by_id(tx, new_parent_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
+            if new_parent.tenant_id != existing.tenant_id {
+                return Err(DomainError::validation(format!(
+                    "Cannot move group {group_id} to a parent in a different tenant \
+                     ({} → {}); cross-tenant moves are not supported",
+                    existing.tenant_id, new_parent.tenant_id
+                )));
+            }
+        }
+
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
-        // Update parent_id on the group
+        // Update parent_id on the group. Type and tenant_id are immutable —
+        // both reuse the existing row's values.
         group_repo
             .update(
                 tx,
@@ -1040,32 +997,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             )
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
-
-        // Recompute and persist `tenant_id` under the post-move shape using
-        // the same rule as `create_group_inner` and `update_group_inner`:
-        //   - tenant-typed group → keeps own scope (tenant_id = group_id)
-        //   - non-tenant child reparented under a parent → inherit
-        //     parent.tenant_id, rejecting the move if the new parent lives
-        //     in a different tenant than the moved subtree (mirrors the
-        //     create-time check). A non-tenant moved to no parent keeps
-        //     its existing tenant_id (only legal when rg_type.can_be_root).
-        let is_tenant_type = rg_type.code.starts_with(TENANT_RG_TYPE_PATH);
-        let new_effective_tenant_id = if is_tenant_type {
-            group_id
-        } else if let Some(new_parent_id) = new_parent_id {
-            let new_parent = group_repo
-                .find_model_by_id(tx, new_parent_id)
-                .await?
-                .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
-            new_parent.tenant_id
-        } else {
-            existing.tenant_id
-        };
-        if new_effective_tenant_id != existing.tenant_id {
-            group_repo
-                .update_tenant_id(tx, group_id, new_effective_tenant_id)
-                .await?;
-        }
 
         let sys = modkit_security::AccessScope::allow_all();
         group_repo

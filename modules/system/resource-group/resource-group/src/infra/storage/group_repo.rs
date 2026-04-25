@@ -693,28 +693,6 @@ impl GroupRepositoryTrait for GroupRepository {
     }
 
     /// Rewrite `tenant_id` on a single group row.
-    async fn update_tenant_id<C: DBRunner>(
-        &self,
-        db: &C,
-        id: Uuid,
-        tenant_id: Uuid,
-    ) -> Result<(), DomainError> {
-        let scope = system_scope();
-        ResourceGroupEntity::update_many()
-            .filter(rg_entity::Column::Id.eq(id))
-            .secure()
-            .col_expr(rg_entity::Column::TenantId, Expr::value(tenant_id))
-            .col_expr(
-                rg_entity::Column::UpdatedAt,
-                Expr::value(time::OffsetDateTime::now_utc()),
-            )
-            .scope_with(&scope)
-            .exec(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-        Ok(())
-    }
-
     /// Delete a resource group entity by ID.
     async fn delete_by_id<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError> {
         let scope = system_scope();

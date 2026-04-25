@@ -91,19 +91,6 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         metadata: Option<&serde_json::Value>,
     ) -> Result<rg_entity::Model, DomainError>;
 
-    /// Rewrite `tenant_id` on a single group row.
-    ///
-    /// Used by the update/move flow when a group's effective tenant changes —
-    /// either because it was reparented under a parent in a different tenant,
-    /// or because it was converted to a tenant-type root (in which case the
-    /// new `tenant_id` equals the group's own id).
-    async fn update_tenant_id<C: DBRunner>(
-        &self,
-        db: &C,
-        id: Uuid,
-        tenant_id: Uuid,
-    ) -> Result<(), DomainError>;
-
     async fn delete_by_id<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError>;
 
     // -- Closure table operations --

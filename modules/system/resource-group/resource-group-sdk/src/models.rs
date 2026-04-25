@@ -254,15 +254,21 @@ pub struct CreateGroupRequest {
 }
 
 /// Request body for updating a resource group (full replacement via PUT).
+///
+/// **The group's type is immutable after creation.** A group cannot be
+/// converted between tenant-typed and non-tenant-typed (or between any two
+/// distinct GTS types) — the request payload deliberately does not carry a
+/// `type` / `code` field. To change semantics, delete the old group and
+/// create a new one. See `UpdateTypeRequest` for changing the *definition*
+/// of an existing GTS type — that's a different concern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateGroupRequest {
-    /// GTS chained type code. Must have prefix `gts.cf.core.rg.type.v1~`.
-    #[serde(rename = "type")]
-    pub code: String,
     /// Display name (1..255 characters).
     pub name: String,
-    /// Parent group ID (null for root groups).
+    /// Parent group ID (null for root groups). Reparenting is allowed only
+    /// within the same tenant scope; cross-tenant moves are rejected by the
+    /// service layer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
     /// Type-specific metadata.

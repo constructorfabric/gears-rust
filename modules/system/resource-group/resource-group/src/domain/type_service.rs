@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use modkit_db::secure::DBRunner;
+use modkit_db::secure::{DBRunner, TxConfig};
 use modkit_odata::{ODataQuery, Page};
 use resource_group_sdk::models::{CreateTypeRequest, ResourceGroupType, UpdateTypeRequest};
 
@@ -38,124 +38,70 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-create-type:p1
     /// Create a new GTS type definition.
+    ///
+    /// The full INSERT-junction sequence (`type_repo.insert` →
+    /// `insert_allowed_parent_types` → `insert_allowed_membership_types` →
+    /// `load_full_type`) runs inside one `SERIALIZABLE` transaction so that
+    /// a failure on any step rolls back the whole operation. Without this,
+    /// a partial insert (e.g. type row written but parent-types junction
+    /// failed) would leave the registry in an inconsistent state.
     pub async fn create_type(
         &self,
         req: CreateTypeRequest,
     ) -> Result<ResourceGroupType, DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-1
-        // Actor sends POST /api/types-registry/v1/types
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-1
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-2
+        // Pre-validation (pure, no DB) — runs outside the transaction.
         validation::validate_type_code(&req.code)?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-2
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-3
         Self::validate_placement_invariant(req.can_be_root, &req.allowed_parent_types)?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-3
-
-        // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
         if let Some(ref schema) = req.metadata_schema {
             validation::validate_metadata_schema(schema)?;
         }
-        // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
-
-        let conn = self.db.conn()?;
-
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-6
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-7
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-8
-        // Check uniqueness
-        let existing = self.type_repo.find_by_code(&conn, &req.code).await?;
-        if existing.is_some() {
-            debug!(code = %req.code, "Type already exists, rejecting create");
-            return Err(DomainError::type_already_exists(&req.code));
+        for parent_code in &req.allowed_parent_types {
+            validation::validate_type_code(parent_code)?;
         }
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-8
+        for membership_code in &req.allowed_membership_types {
+            validation::validate_type_code(membership_code)?;
+        }
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-4
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-4a
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-4b
-        // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5
-        // Validate and resolve allowed_parent_types references
-        let parent_ids = if req.allowed_parent_types.is_empty() {
-            Vec::new()
-        } else {
-            for parent_code in &req.allowed_parent_types {
-                // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5a
-                validation::validate_type_code(parent_code)?;
-                // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5a
-            }
-            // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5b
-            self.type_repo
-                .resolve_ids(&conn, &req.allowed_parent_types)
-                .await?
-            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5b
-        };
-        // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-5
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-4b
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-4a
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-4
-
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-5
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-5a
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-5b
-        // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6
-        // Validate and resolve allowed_membership_types references
-        let membership_ids = if req.allowed_membership_types.is_empty() {
-            Vec::new()
-        } else {
-            // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6a
-            // Syntactic validation of each membership type code (mirror the
-            // `allowed_parent_types` loop above) — `resolve_ids` checks
-            // existence in the DB but not the GTS-path syntax, so without
-            // this loop a malformed code would surface as a "not found"
-            // error rather than the more specific validation error.
-            for membership_code in &req.allowed_membership_types {
-                validation::validate_type_code(membership_code)?;
-            }
-            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6a
-            // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6b
-            self.type_repo
-                .resolve_ids(&conn, &req.allowed_membership_types)
-                .await?
-            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6b
-        };
-        // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-5b
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-5a
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-5
-
-        // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-8
-        // RETURN validated type definition (persisting below)
-        // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-8
-
-        // Build stored schema with embedded __can_be_root
         let stored_schema =
             Self::build_stored_schema(req.can_be_root, req.metadata_schema.as_ref());
+        let db = self.db.db();
+        let type_repo = self.type_repo.clone();
 
-        // Persist the type
-        let type_model = self
-            .type_repo
-            .insert(&conn, &req.code, Some(&stored_schema))
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-7
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-6
+        db.transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
+            Box::pin(async move {
+                // Uniqueness check (inside tx so a concurrent create cannot slip
+                // a duplicate row in between this read and the insert below).
+                if type_repo.find_by_code(tx, &req.code).await?.is_some() {
+                    debug!(code = %req.code, "Type already exists, rejecting create");
+                    return Err(DomainError::type_already_exists(&req.code));
+                }
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-9
-        // Insert junction entries
-        self.type_repo
-            .insert_allowed_parent_types(&conn, type_model.id, &parent_ids)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-9
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-10
-        self.type_repo
-            .insert_allowed_membership_types(&conn, type_model.id, &membership_ids)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-10
+                let parent_ids = if req.allowed_parent_types.is_empty() {
+                    Vec::new()
+                } else {
+                    type_repo.resolve_ids(tx, &req.allowed_parent_types).await?
+                };
+                let membership_ids = if req.allowed_membership_types.is_empty() {
+                    Vec::new()
+                } else {
+                    type_repo
+                        .resolve_ids(tx, &req.allowed_membership_types)
+                        .await?
+                };
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-11
-        // Load and return the full type
-        self.type_repo.load_full_type(&conn, &type_model).await
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-11
+                let type_model = type_repo
+                    .insert(tx, &req.code, Some(&stored_schema))
+                    .await?;
+                type_repo
+                    .insert_allowed_parent_types(tx, type_model.id, &parent_ids)
+                    .await?;
+                type_repo
+                    .insert_allowed_membership_types(tx, type_model.id, &membership_ids)
+                    .await?;
+                type_repo.load_full_type(tx, &type_model).await
+            })
+        })
+        .await
     }
 
     /// Get a GTS type definition by its code (GTS type path).
@@ -178,109 +124,80 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-update-type:p1
     /// Update a GTS type definition (full replacement).
+    ///
+    /// The `delete_allowed_*` / `insert_allowed_*` / `update_type` sequence
+    /// runs inside one `SERIALIZABLE` transaction so a failure on any later
+    /// step rolls back the partial junction rewrites — without it, a crash
+    /// between the parent-types delete and the membership-types insert
+    /// would leave the registry pointing at half the new definition.
     pub async fn update_type(
         &self,
         code: &str,
         req: UpdateTypeRequest,
     ) -> Result<ResourceGroupType, DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-1
-        // Actor sends PUT /api/types-registry/v1/types/{code}
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-1
-        let conn = self.db.conn()?;
-
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-2
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
-        // Load existing type
-        let existing = self
-            .type_repo
-            .find_by_code(&conn, code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(code))?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-2
-
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-4
-        // Validate placement invariant on new values
+        // Pre-validation (pure, no DB) — runs outside the transaction.
         Self::validate_placement_invariant(req.can_be_root, &req.allowed_parent_types)?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-4
-
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-5
-        // Validate and resolve references
-        let parent_ids = if req.allowed_parent_types.is_empty() {
-            Vec::new()
-        } else {
-            for parent_code in &req.allowed_parent_types {
-                validation::validate_type_code(parent_code)?;
-            }
-            self.type_repo
-                .resolve_ids(&conn, &req.allowed_parent_types)
-                .await?
-        };
-
-        let membership_ids = if req.allowed_membership_types.is_empty() {
-            Vec::new()
-        } else {
-            self.type_repo
-                .resolve_ids(&conn, &req.allowed_membership_types)
-                .await?
-        };
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-5
-
-        // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
+        for parent_code in &req.allowed_parent_types {
+            validation::validate_type_code(parent_code)?;
+        }
+        for membership_code in &req.allowed_membership_types {
+            validation::validate_type_code(membership_code)?;
+        }
         if let Some(ref schema) = req.metadata_schema {
             validation::validate_metadata_schema(schema)?;
         }
-        // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
 
-        // Resolve our own ID
-        let type_id = self
-            .type_repo
-            .resolve_id(&conn, code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(code))?;
-
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-6
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-7
-        // Hierarchy safety check
-        Self::check_hierarchy_safety(&*self.type_repo, &conn, type_id, &existing, &req).await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-7
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-6
-
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-8
-        // Clear old junction entries, insert new ones, update type
-        self.type_repo
-            .delete_allowed_parent_types(&conn, type_id)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-8
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-9
-        self.type_repo
-            .insert_allowed_parent_types(&conn, type_id, &parent_ids)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-9
-
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-10
-        self.type_repo
-            .delete_allowed_membership_types(&conn, type_id)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-10
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-11
-        self.type_repo
-            .insert_allowed_membership_types(&conn, type_id, &membership_ids)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-11
-
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
         let stored_schema =
             Self::build_stored_schema(req.can_be_root, req.metadata_schema.as_ref());
-        let updated_model = self
-            .type_repo
-            .update_type(&conn, type_id, code, Some(&stored_schema))
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
+        let db = self.db.db();
+        let type_repo = self.type_repo.clone();
+        let code = code.to_owned();
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-13
-        self.type_repo.load_full_type(&conn, &updated_model).await
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-13
+        db.transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
+            Box::pin(async move {
+                let existing = type_repo
+                    .find_by_code(tx, &code)
+                    .await?
+                    .ok_or_else(|| DomainError::type_not_found(&code))?;
+
+                let parent_ids = if req.allowed_parent_types.is_empty() {
+                    Vec::new()
+                } else {
+                    type_repo.resolve_ids(tx, &req.allowed_parent_types).await?
+                };
+                let membership_ids = if req.allowed_membership_types.is_empty() {
+                    Vec::new()
+                } else {
+                    type_repo
+                        .resolve_ids(tx, &req.allowed_membership_types)
+                        .await?
+                };
+
+                let type_id = type_repo
+                    .resolve_id(tx, &code)
+                    .await?
+                    .ok_or_else(|| DomainError::type_not_found(&code))?;
+
+                Self::check_hierarchy_safety(&*type_repo, tx, type_id, &existing, &req).await?;
+
+                type_repo.delete_allowed_parent_types(tx, type_id).await?;
+                type_repo
+                    .insert_allowed_parent_types(tx, type_id, &parent_ids)
+                    .await?;
+                type_repo
+                    .delete_allowed_membership_types(tx, type_id)
+                    .await?;
+                type_repo
+                    .insert_allowed_membership_types(tx, type_id, &membership_ids)
+                    .await?;
+
+                let updated_model = type_repo
+                    .update_type(tx, type_id, &code, Some(&stored_schema))
+                    .await?;
+                type_repo.load_full_type(tx, &updated_model).await
+            })
+        })
+        .await
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1
