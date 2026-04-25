@@ -49,6 +49,20 @@ use super::tx_config::TxConfig;
 use super::tx_error::TxError;
 use crate::{DbError, DbHandle};
 
+/// Default number of attempts for [`Db::transaction_serializable_with_retry`].
+///
+/// Three attempts is the canonical "small bounded retry" value used across
+/// Cyberfabric services that wrap writes in `SERIALIZABLE` transactions
+/// (e.g. closure-table or hierarchy mutations). It balances:
+///
+/// - resilience against transient `SERIALIZABLE` conflicts (`PostgreSQL`) and
+///   `InnoDB` deadlocks (`MySQL`/`MariaDB`);
+/// - bounded latency on the hot path — no exponential backoff, just immediate
+///   retry of a guaranteed-stale transaction;
+/// - predictable failure semantics — after exhausting attempts the original
+///   error is returned, so callers can surface e.g. `503 Service Unavailable`.
+pub const DEFAULT_SERIALIZATION_RETRIES: u32 = 3;
+
 // Task-local guard to detect transaction bypass attempts.
 //
 // When set to `true`, any call to `Db::conn()` will fail with
@@ -346,6 +360,132 @@ impl Db {
             Err(e) => {
                 _ = txn.rollback().await;
                 Err(e)
+            }
+        }
+    }
+
+    /// Execute a closure inside a `SERIALIZABLE` transaction with bounded retries
+    /// on retryable failures.
+    ///
+    /// Under `SERIALIZABLE` isolation, both `PostgreSQL` (read/write dependency
+    /// conflicts, SQLSTATE `40001`) and `MySQL`/`InnoDB` (deadlocks, SQLSTATE
+    /// `40001`) may abort one of two conflicting transactions. Such aborts are
+    /// always safe to retry — that is the contract of `SERIALIZABLE`. This helper
+    /// wraps [`Self::transaction_ref_mapped_with_config`] with an immediate (no
+    /// backoff) bounded retry policy, which is the canonical pattern across
+    /// Cyberfabric services for hierarchy and closure-table mutations.
+    ///
+    /// Uses [`DEFAULT_SERIALIZATION_RETRIES`] as the attempt budget. Use
+    /// [`Self::transaction_serializable_with_retry_max`] if you need to override
+    /// the budget (typically only in tests).
+    ///
+    /// # Parameters
+    ///
+    /// - `is_retryable`: Predicate over the domain error `E` deciding whether a
+    ///   given failure is a serialization conflict that should be retried. For
+    ///   raw `DbErr` callers, see [`crate::deadlock::is_serialization_failure`];
+    ///   domain errors that wrap `DbErr` typically expose their own predicate.
+    /// - `body`: The transactional work. Called with a fresh `&DbTx` per attempt.
+    ///   Each retry runs in a brand-new transaction, so the closure must be
+    ///   idempotent across attempts (any in-memory state mutated by an earlier
+    ///   attempt must be reset by the closure itself before re-running).
+    ///
+    /// # Behaviour
+    ///
+    /// 1. Begin a `SERIALIZABLE` transaction and invoke `body`.
+    /// 2. On `Ok`, commit and return.
+    /// 3. On `Err(e)`:
+    ///    - if `is_retryable(&e)` and attempts remain, log at `WARN` and retry;
+    ///    - otherwise, return the error.
+    ///
+    /// On exhausting all attempts the **last** error is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E` if the transaction fails (after retries) or if any
+    /// infrastructure error mapped from `DbError` occurs.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let result: Result<MyType, MyError> = db
+    ///     .transaction_serializable_with_retry(
+    ///         MyError::is_serialization_failure,
+    ///         |tx| Box::pin(async move {
+    ///             repo.do_atomic_work(tx).await?;
+    ///             Ok(MyType::default())
+    ///         }),
+    ///     )
+    ///     .await;
+    /// ```
+    pub async fn transaction_serializable_with_retry<T, E, R, F>(
+        &self,
+        is_retryable: R,
+        body: F,
+    ) -> Result<T, E>
+    where
+        E: From<DbError> + Send + 'static,
+        T: Send + 'static,
+        R: Fn(&E) -> bool + Send,
+        F: for<'a> FnMut(&'a DbTx<'a>) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>
+            + Send,
+    {
+        self.transaction_serializable_with_retry_max(
+            DEFAULT_SERIALIZATION_RETRIES,
+            is_retryable,
+            body,
+        )
+        .await
+    }
+
+    /// Like [`Self::transaction_serializable_with_retry`] but with an explicit
+    /// attempt budget. See that method for behaviour and parameter semantics.
+    ///
+    /// `max_attempts` includes the first try (so `1` disables retries). Values
+    /// below `1` are clamped to `1`. Production code should call the default
+    /// variant instead of hard-coding a number here; this method exists mainly
+    /// for tests and for the rare case where a service has a justified reason
+    /// to deviate from the workspace-wide default.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E` if the transaction fails (after retries) or if any
+    /// infrastructure error mapped from `DbError` occurs.
+    pub async fn transaction_serializable_with_retry_max<T, E, R, F>(
+        &self,
+        max_attempts: u32,
+        is_retryable: R,
+        mut body: F,
+    ) -> Result<T, E>
+    where
+        E: From<DbError> + Send + 'static,
+        T: Send + 'static,
+        R: Fn(&E) -> bool + Send,
+        F: for<'a> FnMut(&'a DbTx<'a>) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>
+            + Send,
+    {
+        let max = max_attempts.max(1);
+        let mut attempt: u32 = 1;
+
+        loop {
+            let result = self
+                .transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| body(tx))
+                .await;
+
+            match result {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    if is_retryable(&e) && attempt < max {
+                        tracing::warn!(
+                            attempt,
+                            max_attempts = max,
+                            "retrying SERIALIZABLE transaction after retryable failure"
+                        );
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e);
+                }
             }
         }
     }

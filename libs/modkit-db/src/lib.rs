@@ -100,7 +100,7 @@ pub use manager::DbManager;
 pub use options::redact_credentials_in_dsn;
 
 // Re-export secure database types for convenience
-pub use secure::{Db, DbConn, DbTx};
+pub use secure::{DEFAULT_SERIALIZATION_RETRIES, Db, DbConn, DbTx};
 
 // Re-export service-friendly provider
 pub use db_provider::DBProvider;

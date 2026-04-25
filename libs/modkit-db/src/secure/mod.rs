@@ -140,7 +140,7 @@ pub use runner::DBRunner;
 pub(crate) use runner::{DBRunnerInternal, SeaOrmRunner};
 
 // Primary database types (new secure API)
-pub use db::{Db, DbConn, DbTx};
+pub use db::{DEFAULT_SERIALIZATION_RETRIES, Db, DbConn, DbTx};
 
 // Transaction error types (no SeaORM types leaked)
 pub use tx_error::{InfraError, TxError};
