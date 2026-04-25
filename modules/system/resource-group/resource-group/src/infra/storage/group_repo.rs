@@ -483,7 +483,7 @@ impl GroupRepositoryTrait for GroupRepository {
         let resolved_filter = if let Some(ast) = query.filter.as_deref() {
             let validated =
                 modkit_odata::filter::convert_expr_to_filter_node::<GroupFilterField>(ast)
-                    .map_err(|e| DomainError::database(format!("invalid $filter: {e}")))?;
+                    .map_err(|e| DomainError::validation(format!("invalid $filter: {e}")))?;
             Some(Self::resolve_type_filter_node(db, &validated).await?)
         } else {
             None
@@ -496,7 +496,7 @@ impl GroupRepositoryTrait for GroupRepository {
                 GroupFilterField,
                 GroupODataMapper,
             >(node)
-            .map_err(|e| DomainError::database(format!("invalid $filter: {e}")))?;
+            .map_err(|e| DomainError::validation(format!("invalid $filter: {e}")))?;
             base_query.filter(cond)
         } else {
             base_query

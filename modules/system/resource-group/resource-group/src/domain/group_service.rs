@@ -1103,12 +1103,31 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-4
             // Profile checks passed
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-4
-        } else if !rg_type.can_be_root {
-            // Moving to root: validate can_be_root
-            return Err(DomainError::invalid_parent_type(format!(
-                "Type '{}' cannot be a root group (can_be_root=false)",
-                rg_type.code
-            )));
+        } else {
+            // Moving to root: validate can_be_root + tenant-root uniqueness.
+            if !rg_type.can_be_root {
+                return Err(DomainError::invalid_parent_type(format!(
+                    "Type '{}' cannot be a root group (can_be_root=false)",
+                    rg_type.code
+                )));
+            }
+
+            // Tenant-root uniqueness: at most one tenant-type group may be a
+            // forest root. Mirrors the guard in `create_group_inner` —
+            // `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. We
+            // exclude the moved group itself so a no-op move (already root)
+            // does not falsely fire.
+            if rg_type.code.starts_with(TENANT_RG_TYPE_PATH)
+                && let Some(existing_root_id) = group_repo
+                    .find_root_id_with_type_prefix(conn, TENANT_RG_TYPE_PATH)
+                    .await?
+                && existing_root_id != group_id
+            {
+                return Err(DomainError::tenant_root_already_exists(format!(
+                    "Cannot move tenant-type group '{}' ({group_id}) to root: tenant root already exists (id={existing_root_id})",
+                    rg_type.code
+                )));
+            }
         }
 
         // Rebuild closure table for the subtree
