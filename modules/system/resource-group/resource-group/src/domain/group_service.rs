@@ -789,10 +789,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
             if new_parent.tenant_id != existing.tenant_id {
+                // Generic message: do not interpolate tenant ids — the caller
+                // can't act on them legitimately, and disclosing the foreign
+                // tenant_id would leak ownership of `new_parent_id` across the
+                // tenant boundary.
                 return Err(DomainError::validation(format!(
-                    "Cannot move group {group_id} to a parent in a different tenant \
-                     ({} → {}); cross-tenant moves are not supported",
-                    existing.tenant_id, new_parent.tenant_id
+                    "Cannot move group {group_id} to a parent in a different tenant; \
+                     cross-tenant moves are not supported"
                 )));
             }
         }
@@ -886,10 +889,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
             if new_parent.tenant_id != existing.tenant_id {
+                // Generic message: do not interpolate tenant ids — the caller
+                // can't act on them legitimately, and disclosing the foreign
+                // tenant_id would leak ownership of `new_parent_id` across the
+                // tenant boundary.
                 return Err(DomainError::validation(format!(
-                    "Cannot move group {group_id} to a parent in a different tenant \
-                     ({} → {}); cross-tenant moves are not supported",
-                    existing.tenant_id, new_parent.tenant_id
+                    "Cannot move group {group_id} to a parent in a different tenant; \
+                     cross-tenant moves are not supported"
                 )));
             }
         }
@@ -1232,7 +1238,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     }
 
     fn validate_name(name: &str) -> Result<(), DomainError> {
-        if name.is_empty() || name.len() > 255 {
+        // Count Unicode scalar values, not UTF-8 bytes, so the limit matches
+        // the documented "255 characters" and aligns with the DB-level
+        // `length(name) BETWEEN 1 AND 255` CHECK on PostgreSQL/SQLite, where
+        // `length(text)` is character-based on both engines.
+        if name.is_empty() || name.chars().count() > 255 {
             return Err(DomainError::validation(
                 "Group name must be between 1 and 255 characters",
             ));
