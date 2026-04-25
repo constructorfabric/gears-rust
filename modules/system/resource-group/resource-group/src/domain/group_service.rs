@@ -15,14 +15,14 @@
 use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
-use modkit_db::secure::{DBRunner, TxConfig};
+use modkit_db::secure::DBRunner;
 use modkit_odata::{ODataQuery, Page};
 use modkit_security::{SecurityContext, pep_properties};
 use resource_group_sdk::TENANT_RG_TYPE_PATH;
 use resource_group_sdk::models::{
     CreateGroupRequest, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::domain::DbProvider;
@@ -35,9 +35,6 @@ pub const RG_GROUP_RESOURCE: ResourceType = ResourceType {
     name: "gts.x.system.rg.group.v1~",
     supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 };
-
-/// Maximum number of transaction retry attempts for serialization conflicts.
-const MAX_SERIALIZATION_RETRIES: u32 = 3;
 
 /// Query profile configuration for depth/width limits.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
@@ -139,55 +136,38 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
         let profile = self.profile.clone();
         let db = self.db.db();
+        let group_repo = self.group_repo.clone();
+        let type_repo = self.type_repo.clone();
+        let types_registry = self.types_registry.clone();
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
-        for attempt in 1..=MAX_SERIALIZATION_RETRIES {
+        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
+        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
+        db.transaction_serializable_with_retry(DomainError::is_serialization_failure, |tx| {
             let req = req.clone();
             let profile = profile.clone();
-            let group_repo = self.group_repo.clone();
-            let type_repo = self.type_repo.clone();
-            let types_registry = self.types_registry.clone();
-
-            let result = db
-                .transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
-                    Box::pin(async move {
-                        Self::create_group_inner(
-                            &*group_repo,
-                            &*type_repo,
-                            tx,
-                            &req,
-                            tenant_id,
-                            &profile,
-                            &*types_registry,
-                        )
-                        .await
-                    })
-                })
-                .await;
-
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
-            match result {
-                // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
-                Ok(group) => return Ok(group),
-                // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
-                Err(ref e)
-                    if e.is_serialization_failure() && attempt < MAX_SERIALIZATION_RETRIES =>
-                {
-                    warn!(
-                        attempt,
-                        max = MAX_SERIALIZATION_RETRIES,
-                        "Serialization conflict in create_group, retrying"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
-        }
+            let group_repo = group_repo.clone();
+            let type_repo = type_repo.clone();
+            let types_registry = types_registry.clone();
+            Box::pin(async move {
+                Self::create_group_inner(
+                    &*group_repo,
+                    &*type_repo,
+                    tx,
+                    &req,
+                    tenant_id,
+                    &profile,
+                    &*types_registry,
+                )
+                .await
+            })
+        })
+        .await
+        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
+        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-2
-
-        unreachable!("retry loop always returns")
     }
 
     /// Get a resource group by ID (AuthZ-scoped).
@@ -252,50 +232,32 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
         let profile = self.profile.clone();
         let db = self.db.db();
+        let group_repo = self.group_repo.clone();
+        let type_repo = self.type_repo.clone();
+        let types_registry = self.types_registry.clone();
 
-        for attempt in 1..=MAX_SERIALIZATION_RETRIES {
+        db.transaction_serializable_with_retry(DomainError::is_serialization_failure, |tx| {
             let req = req.clone();
             let scope = scope.clone();
             let profile = profile.clone();
-            let group_repo = self.group_repo.clone();
-            let type_repo = self.type_repo.clone();
-            let types_registry = self.types_registry.clone();
-
-            let result = db
-                .transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
-                    Box::pin(async move {
-                        Self::update_group_inner(
-                            &*group_repo,
-                            &*type_repo,
-                            tx,
-                            &scope,
-                            group_id,
-                            &req,
-                            &profile,
-                            &*types_registry,
-                        )
-                        .await
-                    })
-                })
-                .await;
-
-            match result {
-                Ok(group) => return Ok(group),
-                Err(ref e)
-                    if e.is_serialization_failure() && attempt < MAX_SERIALIZATION_RETRIES =>
-                {
-                    warn!(
-                        attempt,
-                        max = MAX_SERIALIZATION_RETRIES,
-                        group_id = %group_id,
-                        "Serialization conflict in update_group, retrying"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        unreachable!("retry loop always returns")
+            let group_repo = group_repo.clone();
+            let type_repo = type_repo.clone();
+            let types_registry = types_registry.clone();
+            Box::pin(async move {
+                Self::update_group_inner(
+                    &*group_repo,
+                    &*type_repo,
+                    tx,
+                    &scope,
+                    group_id,
+                    &req,
+                    &profile,
+                    &*types_registry,
+                )
+                .await
+            })
+        })
+        .await
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-move-group:p1
@@ -313,53 +275,34 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
         let profile = self.profile.clone();
         let db = self.db.db();
+        let group_repo = self.group_repo.clone();
+        let type_repo = self.type_repo.clone();
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
-        for attempt in 1..=MAX_SERIALIZATION_RETRIES {
+        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
+        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
+        db.transaction_serializable_with_retry(DomainError::is_serialization_failure, |tx| {
             let profile = profile.clone();
-            let group_repo = self.group_repo.clone();
-            let type_repo = self.type_repo.clone();
-
-            let result = db
-                .transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
-                    Box::pin(async move {
-                        Self::move_group_inner(
-                            &*group_repo,
-                            &*type_repo,
-                            tx,
-                            group_id,
-                            new_parent_id,
-                            &profile,
-                        )
-                        .await
-                    })
-                })
-                .await;
-
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
-            match result {
-                // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
-                Ok(group) => return Ok(group),
-                // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
-                Err(ref e)
-                    if e.is_serialization_failure() && attempt < MAX_SERIALIZATION_RETRIES =>
-                {
-                    warn!(
-                        attempt,
-                        max = MAX_SERIALIZATION_RETRIES,
-                        group_id = %group_id,
-                        "Serialization conflict in move_group, retrying"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
-        }
+            let group_repo = group_repo.clone();
+            let type_repo = type_repo.clone();
+            Box::pin(async move {
+                Self::move_group_inner(
+                    &*group_repo,
+                    &*type_repo,
+                    tx,
+                    group_id,
+                    new_parent_id,
+                    &profile,
+                )
+                .await
+            })
+        })
+        .await
+        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
+        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-2
-
-        unreachable!("retry loop always returns")
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-delete-group:p1
@@ -385,36 +328,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-1
 
         let db = self.db.db();
+        let group_repo = self.group_repo.clone();
 
-        for attempt in 1..=MAX_SERIALIZATION_RETRIES {
+        db.transaction_serializable_with_retry(DomainError::is_serialization_failure, |tx| {
             let scope = scope.clone();
-            let group_repo = self.group_repo.clone();
-
-            let result = db
-                .transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
-                    Box::pin(async move {
-                        Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force).await
-                    })
-                })
-                .await;
-
-            match result {
-                Ok(()) => return Ok(()),
-                Err(ref e)
-                    if e.is_serialization_failure() && attempt < MAX_SERIALIZATION_RETRIES =>
-                {
-                    warn!(
-                        attempt,
-                        max = MAX_SERIALIZATION_RETRIES,
-                        group_id = %group_id,
-                        "Serialization conflict in delete_group, retrying"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        unreachable!("retry loop always returns")
+            let group_repo = group_repo.clone();
+            Box::pin(async move {
+                Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force).await
+            })
+        })
+        .await
     }
 
     /// Get descendants of a group (depth >= 0, AuthZ-scoped).
@@ -553,47 +476,30 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
         let profile = self.profile.clone();
         let db = self.db.db();
+        let group_repo = self.group_repo.clone();
+        let type_repo = self.type_repo.clone();
+        let types_registry = self.types_registry.clone();
 
-        for attempt in 1..=MAX_SERIALIZATION_RETRIES {
+        db.transaction_serializable_with_retry(DomainError::is_serialization_failure, |tx| {
             let req = req.clone();
             let profile = profile.clone();
-            let group_repo = self.group_repo.clone();
-            let type_repo = self.type_repo.clone();
-            let types_registry = self.types_registry.clone();
-
-            let result = db
-                .transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
-                    Box::pin(async move {
-                        Self::create_group_inner(
-                            &*group_repo,
-                            &*type_repo,
-                            tx,
-                            &req,
-                            tenant_id,
-                            &profile,
-                            &*types_registry,
-                        )
-                        .await
-                    })
-                })
-                .await;
-
-            match result {
-                Ok(group) => return Ok(group),
-                Err(ref e)
-                    if e.is_serialization_failure() && attempt < MAX_SERIALIZATION_RETRIES =>
-                {
-                    warn!(
-                        attempt,
-                        max = MAX_SERIALIZATION_RETRIES,
-                        "Serialization conflict in create_group_unscoped, retrying"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        unreachable!("retry loop always returns")
+            let group_repo = group_repo.clone();
+            let type_repo = type_repo.clone();
+            let types_registry = types_registry.clone();
+            Box::pin(async move {
+                Self::create_group_inner(
+                    &*group_repo,
+                    &*type_repo,
+                    tx,
+                    &req,
+                    tenant_id,
+                    &profile,
+                    &*types_registry,
+                )
+                .await
+            })
+        })
+        .await
     }
 
     // -- Transaction-inner implementations --
