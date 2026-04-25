@@ -353,8 +353,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await
             .map_err(DomainError::from)?;
         let conn = self.db.conn()?;
+        // Scope-aware preflight: a cross-tenant id must look the same as a
+        // non-existent id from the caller's viewpoint, otherwise we leak the
+        // existence of cross-tenant roots (random id → 404, foreign id → 200
+        // with empty page).
         self.group_repo
-            .find_model_by_id(&conn, group_id)
+            .find_by_id(&conn, &scope, group_id)
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
         self.group_repo
@@ -375,8 +379,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await
             .map_err(DomainError::from)?;
         let conn = self.db.conn()?;
+        // Scope-aware preflight: see comment in `get_group_descendants`.
         self.group_repo
-            .find_model_by_id(&conn, group_id)
+            .find_by_id(&conn, &scope, group_id)
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
         self.group_repo

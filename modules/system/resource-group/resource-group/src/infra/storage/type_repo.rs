@@ -122,7 +122,11 @@ impl TypeRepository {
         Ok(codes)
     }
 
-    /// Find the raw model by code.
+    /// Find the raw model by code. Used to re-read a row immediately after
+    /// `INSERT … RETURNING`-less writes (insert/update); returns a
+    /// `DomainError::Database` if the row is unexpectedly missing — i.e. the
+    /// write committed but the row vanished (possible only under concurrent
+    /// delete with the same `schema_id`).
     async fn find_model_by_code(
         db: &impl DBRunner,
         code: &str,
@@ -135,7 +139,11 @@ impl TypeRepository {
             .one(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?
-            .ok_or_else(|| DomainError::database("Insert succeeded but row not found"))
+            .ok_or_else(|| {
+                DomainError::database(format!(
+                    "GTS type row with schema_id={code} not found after write (concurrent delete?)"
+                ))
+            })
     }
 }
 

@@ -288,10 +288,18 @@ impl GroupRepository {
             return (None, None);
         };
 
-        let Ok(filter_node) =
-            modkit_odata::filter::convert_expr_to_filter_node::<HierarchyFilterField>(filter_expr)
-        else {
-            return (None, None);
+        let filter_node = match modkit_odata::filter::convert_expr_to_filter_node::<
+            HierarchyFilterField,
+        >(filter_expr)
+        {
+            Ok(node) => node,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "hierarchy $filter could not be typed (e.g. Or/Ne/In on hierarchy fields); falling back to superset + in-memory filter"
+                );
+                return (None, None);
+            }
         };
 
         let depth = Self::extract_depth_from_node(&filter_node);
@@ -692,7 +700,6 @@ impl GroupRepositoryTrait for GroupRepository {
             .ok_or_else(|| DomainError::group_not_found(id))
     }
 
-    /// Rewrite `tenant_id` on a single group row.
     /// Delete a resource group entity by ID.
     async fn delete_by_id<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError> {
         let scope = system_scope();
