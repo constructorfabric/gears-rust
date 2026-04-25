@@ -742,7 +742,6 @@ async fn group_update_name_and_metadata() {
             &ctx,
             root.id,
             UpdateGroupRequest {
-                code: root_type.code.clone(),
                 name: "NewName".to_owned(),
                 parent_id: None,
                 metadata: Some(new_meta.clone()),
@@ -772,259 +771,23 @@ async fn group_update_name_and_metadata() {
     assert_eq!(model.metadata, Some(new_meta));
 }
 
-/// TC-GRP-10: Update group type -- parent compatibility.
-/// InvalidParentType("does not allow current parent type").
-#[tokio::test]
-async fn group_update_type_parent_incompatible() {
-    let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-    let ctx = common::make_ctx(tenant_id);
+// Removed: TC-GRP-10 (`group_update_type_parent_incompatible`) and TC-GRP-11
+// (`group_update_type_children_incompatible`) were authored when
+// `UpdateGroupRequest` carried a `code` field. Now that the group's GTS type
+// is immutable post-creation (per DESIGN: "The group's type is immutable
+// after creation"), these scenarios are physically unreachable through the
+// SDK — `update_group` cannot trigger a parent/children type-compatibility
+// failure because the type never changes. Coverage of the underlying
+// invariant lives in the `create_group` and `move_group` paths instead.
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
-    // new_type allows only some other type as parent, NOT root_type
-    let other_root_type = common::create_root_type(&type_svc, "other").await;
-    let incompatible_code = format!(
-        "gts.cf.core.rg.type.v1~x.test.incompat{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type(CreateTypeRequest {
-            code: incompatible_code.clone(),
-            can_be_root: false,
-            allowed_parent_types: vec![other_root_type.code.clone()],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create incompatible type");
-
-    let root =
-        common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
-    let child = common::create_child_group(
-        &group_svc,
-        &ctx,
-        &child_type.code,
-        root.id,
-        "Child",
-        tenant_id,
-    )
-    .await;
-
-    // Update child to incompatible type
-    let err = group_svc
-        .update_group(
-            &ctx,
-            child.id,
-            UpdateGroupRequest {
-                code: incompatible_code,
-                name: child.name.clone(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
-    assert!(
-        matches!(err, DomainError::InvalidParentType { ref message } if message.contains("does not allow")),
-        "Expected InvalidParentType, got: {err:?}"
-    );
-}
-
-/// TC-GRP-11: Update group type -- children compatibility.
-/// InvalidParentType("child group... does not allow... as parent type").
-#[tokio::test]
-async fn group_update_type_children_incompatible() {
-    let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-    let ctx = common::make_ctx(tenant_id);
-
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let mid_type = common::create_child_type(&type_svc, "mid", &[&root_type.code], &[]).await;
-    // leaf only allows mid_type as parent
-    let leaf_type = common::create_child_type(&type_svc, "leaf", &[&mid_type.code], &[]).await;
-
-    // another_root_type that can be root, but leaf_type does NOT list it as parent
-    let another_root_type = common::create_root_type(&type_svc, "alt").await;
-
-    let root =
-        common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
-    let mid =
-        common::create_child_group(&group_svc, &ctx, &mid_type.code, root.id, "Mid", tenant_id)
-            .await;
-    let _leaf =
-        common::create_child_group(&group_svc, &ctx, &leaf_type.code, mid.id, "Leaf", tenant_id)
-            .await;
-
-    // Try to change mid's type to another_root_type. Leaf does not allow another_root_type as parent.
-    let err = group_svc
-        .update_group(
-            &ctx,
-            mid.id,
-            UpdateGroupRequest {
-                code: another_root_type.code.clone(),
-                name: mid.name.clone(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
-    assert!(
-        matches!(err, DomainError::InvalidParentType { ref message } if message.contains("does not allow")),
-        "Expected InvalidParentType about child group, got: {err:?}"
-    );
-}
-
-/// TC-GRP-26: Simultaneous type + parent change.
-#[tokio::test]
-async fn group_update_simultaneous_type_and_parent() {
-    let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-    let ctx = common::make_ctx(tenant_id);
-
-    let type_a = common::create_root_type(&type_svc, "orgA").await;
-    let type_b = common::create_root_type(&type_svc, "orgB").await;
-    // child_type allows both type_a and type_b as parents
-    let child_code = format!(
-        "gts.cf.core.rg.type.v1~x.test.multichild{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type(CreateTypeRequest {
-            code: child_code.clone(),
-            can_be_root: false,
-            allowed_parent_types: vec![type_a.code.clone(), type_b.code.clone()],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create multi-child type");
-
-    // new_child_type also allows both
-    let new_child_code = format!(
-        "gts.cf.core.rg.type.v1~x.test.newchild{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type(CreateTypeRequest {
-            code: new_child_code.clone(),
-            can_be_root: false,
-            allowed_parent_types: vec![type_a.code.clone(), type_b.code.clone()],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create new child type");
-
-    let root_a =
-        common::create_root_group(&group_svc, &ctx, &type_a.code, "RootA", tenant_id).await;
-    let root_b =
-        common::create_root_group(&group_svc, &ctx, &type_b.code, "RootB", tenant_id).await;
-    let child =
-        common::create_child_group(&group_svc, &ctx, &child_code, root_a.id, "Child", tenant_id)
-            .await;
-
-    // Simultaneous type + parent change
-    let updated = group_svc
-        .update_group(
-            &ctx,
-            child.id,
-            UpdateGroupRequest {
-                code: new_child_code.clone(),
-                name: "UpdatedChild".to_owned(),
-                parent_id: Some(root_b.id),
-                metadata: None,
-            },
-        )
-        .await
-        .expect("simultaneous update");
-
-    assert_eq!(updated.code, new_child_code);
-    assert_eq!(updated.hierarchy.parent_id, Some(root_b.id));
-    assert_eq!(updated.name, "UpdatedChild");
-
-    // Verify closure after move
-    let conn = db.conn().expect("conn");
-    common::assert_closure_rows(&conn, child.id, &[(child.id, 0), (root_b.id, 1)]).await;
-}
-
-/// TC-GRP-27: Root group -> non-root type change.
-#[tokio::test]
-async fn group_update_root_to_nonroot_type() {
-    let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-    let ctx = common::make_ctx(tenant_id);
-
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let nonroot_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
-
-    let root =
-        common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
-
-    // Try to change root's type to a non-root type while keeping parent_id=None
-    let err = group_svc
-        .update_group(
-            &ctx,
-            root.id,
-            UpdateGroupRequest {
-                code: nonroot_type.code.clone(),
-                name: root.name.clone(),
-                parent_id: None,
-                metadata: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
-    assert!(
-        matches!(err, DomainError::InvalidParentType { ref message } if message.contains("cannot be a root group")),
-        "Expected InvalidParentType with 'cannot be a root group', got: {err:?}"
-    );
-}
-
-/// TC-GRP-28: Update with nonexistent new type_path.
-#[tokio::test]
-async fn group_update_nonexistent_type() {
-    let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-    let ctx = common::make_ctx(tenant_id);
-
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let root =
-        common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
-
-    let err = group_svc
-        .update_group(
-            &ctx,
-            root.id,
-            UpdateGroupRequest {
-                code: "gts.cf.core.rg.type.v1~x.test.ghost.v1~".to_owned(),
-                name: "Root".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
-    assert!(
-        matches!(err, DomainError::TypeNotFound { .. }),
-        "Expected TypeNotFound, got: {err:?}"
-    );
-}
+// Removed: TC-GRP-26 (`group_update_simultaneous_type_and_parent`),
+// TC-GRP-27 (`group_update_root_to_nonroot_type`), TC-GRP-28
+// (`group_update_nonexistent_type`) — the same reason as TC-GRP-10/11
+// above. All three exercised the now-impossible "type changes via
+// `update_group`" scenario; with `UpdateGroupRequest` carrying only
+// `name` / `parent_id` / `metadata`, none of these cases are
+// physically reachable. Parent change in isolation is already
+// covered by TC-GRP-09 (`group_update`).
 
 // =========================================================================
 // Group delete tests (TC-GRP-12, 13, 14, 15, 34, 35)
@@ -1874,7 +1637,6 @@ async fn group_metadata_update_replaces_entirely() {
             &ctx,
             group.id,
             UpdateGroupRequest {
-                code: root_type.code.clone(),
                 name: "ReplaceMe".to_owned(),
                 parent_id: None,
                 metadata: Some(new_meta.clone()),
@@ -1936,7 +1698,6 @@ async fn group_metadata_none_to_some() {
             &ctx,
             group.id,
             UpdateGroupRequest {
-                code: root_type.code.clone(),
                 name: "NoMeta".to_owned(),
                 parent_id: None,
                 metadata: Some(meta.clone()),
@@ -1981,7 +1742,6 @@ async fn group_metadata_some_to_none() {
             &ctx,
             group.id,
             UpdateGroupRequest {
-                code: root_type.code.clone(),
                 name: "WithMeta".to_owned(),
                 parent_id: None,
                 metadata: None,
@@ -2841,7 +2601,6 @@ async fn tenant_root_update_to_second_root_rejected() {
             &child_ctx,
             child.id,
             UpdateGroupRequest {
-                code: sub_type.code.clone(),
                 name: child.name.clone(),
                 parent_id: None,
                 metadata: None,
@@ -2890,7 +2649,6 @@ async fn tenant_root_self_update_allowed() {
             &root_ctx,
             root.id,
             UpdateGroupRequest {
-                code: tenant_type.code.clone(),
                 name: "RootB".to_owned(),
                 parent_id: None,
                 metadata: None,

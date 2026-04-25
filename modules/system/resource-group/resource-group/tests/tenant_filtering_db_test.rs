@@ -469,7 +469,6 @@ async fn tenant_isolation_update_cross_tenant_blocked() {
             &ctx_b,
             ga.id,
             resource_group_sdk::UpdateGroupRequest {
-                code: type_code,
                 name: "Hijacked!".to_owned(),
                 parent_id: None,
                 metadata: None,
