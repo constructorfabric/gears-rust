@@ -41,13 +41,49 @@ pub struct SessionPluginCtx {
     pub call_ctx: PluginCallContext,
 }
 
+/// Context passed to message-handling plugin methods.
+///
+/// `Debug` is implemented manually to redact `messages` — message content is
+/// PII (user prompts, assistant responses) that must never appear in logs.
+/// The summary surfaces `len` and a per-role count so observability is
+/// preserved without leaking text. `call_ctx` keeps its own redaction (see
+/// `PluginCallContext::Debug`).
 #[allow(clippy::module_name_repetitions)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MessagePluginCtx {
     pub session_id: Uuid,
     pub message_id: Uuid,
     pub messages: Vec<Message>,
     pub call_ctx: PluginCallContext,
+}
+
+impl std::fmt::Debug for MessagePluginCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Per-role summary: counts how many user / assistant / system messages
+        // are present so plugins/operators can sanity-check the call shape
+        // without seeing any message content.
+        let mut user = 0_usize;
+        let mut assistant = 0_usize;
+        let mut system = 0_usize;
+        for m in &self.messages {
+            match m.role {
+                crate::models::MessageRole::User => user += 1,
+                crate::models::MessageRole::Assistant => assistant += 1,
+                crate::models::MessageRole::System => system += 1,
+            }
+        }
+        let messages_summary = format_args!(
+            "<redacted: {} message(s); user={user}, assistant={assistant}, system={system}>",
+            self.messages.len()
+        )
+        .to_string();
+        f.debug_struct("MessagePluginCtx")
+            .field("session_id", &self.session_id)
+            .field("message_id", &self.message_id)
+            .field("messages", &messages_summary)
+            .field("call_ctx", &self.call_ctx)
+            .finish()
+    }
 }
 
 /// Shared context attached to every plugin invocation.
@@ -201,6 +237,102 @@ mod plugin_call_context_tests {
         let mut ctx = make_ctx();
         ctx.deadline = Some(Instant::now() - Duration::from_secs(1));
         assert!(ctx.remaining().is_none());
+    }
+}
+
+#[cfg(test)]
+mod message_plugin_ctx_debug_tests {
+    use super::{CancellationToken, MessagePluginCtx, PluginCallContext, TenantId, UserId};
+    use crate::models::{Message, MessageRole};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    fn make_message(role: MessageRole, secret_text: &str) -> Message {
+        let now = OffsetDateTime::now_utc();
+        Message {
+            message_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            parent_message_id: None,
+            variant_index: 0,
+            is_active: true,
+            role,
+            content: serde_json::json!({ "text": secret_text }),
+            file_ids: vec![],
+            metadata: None,
+            is_complete: true,
+            is_hidden_from_user: false,
+            is_hidden_from_backend: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn make_call_ctx() -> PluginCallContext {
+        PluginCallContext {
+            request_id: Uuid::nil(),
+            tenant_id: TenantId::new("t"),
+            user_id: UserId::new("u"),
+            plugin_instance_id: "p".into(),
+            session_type_id: Uuid::nil(),
+            plugin_config: None,
+            enabled_capabilities: None,
+            deadline: None,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn debug_redacts_message_content_but_shows_per_role_summary() {
+        let ctx = MessagePluginCtx {
+            session_id: Uuid::nil(),
+            message_id: Uuid::nil(),
+            messages: vec![
+                make_message(MessageRole::System, "system-secret-prompt"),
+                make_message(MessageRole::User, "i had a heart attack last night"),
+                make_message(MessageRole::Assistant, "private-response-PII"),
+                make_message(MessageRole::User, "another sensitive question"),
+            ],
+            call_ctx: make_call_ctx(),
+        };
+        let printed = format!("{ctx:?}");
+
+        // PII never appears in Debug output.
+        assert!(
+            !printed.contains("system-secret-prompt"),
+            "system content leaked: {printed}"
+        );
+        assert!(
+            !printed.contains("heart attack"),
+            "user PII leaked: {printed}"
+        );
+        assert!(
+            !printed.contains("private-response-PII"),
+            "assistant content leaked: {printed}"
+        );
+        assert!(
+            !printed.contains("sensitive question"),
+            "user content leaked: {printed}"
+        );
+
+        // Summary still gives observability.
+        assert!(printed.contains("4 message(s)"), "got: {printed}");
+        assert!(printed.contains("user=2"), "got: {printed}");
+        assert!(printed.contains("assistant=1"), "got: {printed}");
+        assert!(printed.contains("system=1"), "got: {printed}");
+        assert!(printed.contains("<redacted"), "got: {printed}");
+    }
+
+    #[test]
+    fn debug_shows_zero_counts_for_empty_history() {
+        let ctx = MessagePluginCtx {
+            session_id: Uuid::nil(),
+            message_id: Uuid::nil(),
+            messages: vec![],
+            call_ctx: make_call_ctx(),
+        };
+        let printed = format!("{ctx:?}");
+        assert!(printed.contains("0 message(s)"), "got: {printed}");
+        assert!(printed.contains("user=0"), "got: {printed}");
     }
 }
 
