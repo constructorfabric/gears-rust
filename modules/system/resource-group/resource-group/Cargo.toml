@@ -10,6 +10,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["cyberfabric", "cyberfabric-system", "resource-group"]
 categories = ["web-programming"]
+publish = true
 
 [lints]
 workspace = true

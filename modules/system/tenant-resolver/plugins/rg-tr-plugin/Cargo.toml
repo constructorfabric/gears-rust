@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["cyberfabric", "cyberfabric-system", "tenant-resolver"]
 categories = ["authentication"]
+publish = true
 
 [lib]
 name = "rg_tr_plugin"

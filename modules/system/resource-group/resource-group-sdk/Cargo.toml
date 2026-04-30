@@ -10,6 +10,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["cyberfabric", "cyberfabric-system", "resource-group"]
 categories = ["api-bindings"]
+publish = true
 
 [lints]
 workspace = true

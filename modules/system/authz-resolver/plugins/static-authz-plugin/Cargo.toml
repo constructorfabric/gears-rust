@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["cyberfabric", "cyberfabric-system", "authorization"]
 categories = ["authentication"]
+publish = true
 
 [lib]
 name = "static_authz_plugin"

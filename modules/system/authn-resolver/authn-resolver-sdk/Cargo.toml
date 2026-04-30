@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["cyberfabric", "cyberfabric-system"]
 categories = ["authentication"]
+publish = true
 
 [lib]
 name = "authn_resolver_sdk"

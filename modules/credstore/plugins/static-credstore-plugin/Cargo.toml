@@ -7,6 +7,7 @@ authors.workspace = true
 description = "CredStore plugin with static secret mapping for development and testing"
 repository.workspace = true
 keywords = ["cyberfabric", "cyberfabric-module"]
+publish = true
 
 [lib]
 name = "static_credstore_plugin"

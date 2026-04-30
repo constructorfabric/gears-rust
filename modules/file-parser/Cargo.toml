@@ -10,6 +10,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["cyberfabric", "cyberfabric-system"]
 categories = ["parsing"]
+publish = true
 
 [lib]
 name = "file_parser"

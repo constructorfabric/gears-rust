@@ -10,6 +10,7 @@ description = "ModKit canonical error types based on Google AIP-193 error model"
 readme = "README.md"
 keywords = ["cyberfabric", "cyberfabric-modkit"]
 categories = ["rust-patterns"]
+publish = true
 
 [lib]
 name = "modkit_canonical_errors"

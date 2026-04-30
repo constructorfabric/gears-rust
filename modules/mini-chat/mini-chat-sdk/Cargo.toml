@@ -11,6 +11,7 @@ readme = "README.md"
 keywords = ["cyberfabric", "cyberfabric-modules"]
 categories = ["artificial-intelligence"]
 
+publish = true
 
 [lib]
 name = "mini_chat_sdk"
