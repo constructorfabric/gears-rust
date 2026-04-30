@@ -353,7 +353,7 @@ http-body = "1"
 
 # HTTP client (default-tls = rustls + aws-lc-rs in 0.13)
 reqwest = { version = "0.13", features = ["stream"] }
-rand = "0.9"
+rand = "0.10"
 
 # Synchronous locks for better performance
 parking_lot = "0.12"

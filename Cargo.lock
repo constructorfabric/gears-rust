@@ -1817,7 +1817,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "pin-project-lite",
- "rand 0.9.4",
+ "rand 0.10.1",
  "rustls",
  "rustls-native-certs 0.8.3",
  "rustls-pki-types",
@@ -1949,7 +1949,7 @@ version = "0.6.3"
 dependencies = [
  "anyhow",
  "cf-modkit-security",
- "rand 0.9.4",
+ "rand 0.10.1",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -6518,7 +6518,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91bb5030596a3d442c0866ac68afe29c14ba558e77c726dcdf7016b0dbb359d9"
 dependencies = [
  "arrayvec",
- "hashbrown 0.17.0",
+ "hashbrown 0.12.3",
  "parking_lot",
  "rand 0.8.5",
 ]
@@ -6854,7 +6854,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -8365,7 +8365,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
