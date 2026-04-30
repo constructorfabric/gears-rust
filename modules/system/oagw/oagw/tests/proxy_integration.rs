@@ -4893,7 +4893,7 @@ async fn proxy_response_header_rules_applied() {
 async fn proxy_websocket_handshake_retries_on_early_close() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let attempt = Arc::new(AtomicUsize::new(0));
     let attempt_clone = attempt.clone();
@@ -4913,6 +4913,26 @@ async fn proxy_websocket_handshake_retries_on_early_close() {
             let (mut sock, _) = listener.accept().await.unwrap();
             let n = attempt_clone.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
+                // Drain the client's upgrade request before responding. On
+                // Windows, closesocket() with unread data in the recv buffer
+                // forces a TCP RST, which races the client's read of the 101
+                // response and surfaces as `read error / unexpected EOF`
+                // (WSAECONNABORTED 10053). Linux delivers buffered bytes
+                // before signaling the error, so the test passes there even
+                // without the drain.
+                let mut drain = [0u8; 1024];
+                let mut req = Vec::new();
+                loop {
+                    let nread = sock.read(&mut drain).await.unwrap_or(0);
+                    if nread == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&drain[..nread]);
+                    if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
                 // First connection: send 101 then Close 1001 (simulates bridge not ready).
                 let resp = "HTTP/1.1 101 Switching Protocols\r\n\
                             Upgrade: websocket\r\n\
@@ -4931,6 +4951,17 @@ async fn proxy_websocket_handshake_retries_on_early_close() {
                 frame.extend_from_slice(&close_payload);
                 sock.write_all(&frame).await.unwrap();
                 sock.shutdown().await.ok();
+                // Linger until the client closes so the kernel delivers the
+                // 101 + Close bytes before this socket is dropped (Windows).
+                // Loop to EOF so any trailing bytes the client sends (e.g. a
+                // Close echo) are consumed — a single read could return early
+                // and leave data in the recv buffer, re-triggering the RST.
+                loop {
+                    match sock.read(&mut drain).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
             } else {
                 // Subsequent connections: proxy to the real OAGW server.
                 let mut upstream = tokio::net::TcpStream::connect(real_addr).await.unwrap();

@@ -1,88 +1,54 @@
-use modkit::api::problem::Problem;
+use modkit::api::canonical_prelude::CanonicalProblemMigrationExt;
+use modkit_canonical_errors::{CanonicalError, Problem, resource_error};
 
 use crate::domain::error::DomainError;
-use crate::errors::ErrorCode;
 
-/// Map domain error to RFC9457 Problem using the GTS error catalog
-pub fn domain_error_to_problem(e: &DomainError, instance: &str) -> Problem {
-    let trace_id = tracing::Span::current()
-        .id()
-        .map(|id| id.into_u64().to_string());
+#[resource_error("gts.cf.simple_user_settings.settings.user.v1~")]
+pub struct UserSettingsError;
 
-    match e {
-        DomainError::NotFound => build_not_found_problem(instance, trace_id),
-        DomainError::Validation { field, message } => {
-            build_validation_problem(field, message, instance, trace_id)
+impl From<DomainError> for CanonicalError {
+    // Flat match on the domain enum is the whole point of this conversion;
+    // the structured `tracing::*!` macros count toward cognitive complexity
+    // but splitting the arms into helpers would just hide the mapping.
+    #[allow(clippy::cognitive_complexity)]
+    fn from(e: DomainError) -> Self {
+        // The settings resource is keyed off the caller's identity, so the
+        // resource_name is always the literal "self" — i.e. the authenticated
+        // user's own settings record.
+        match e {
+            DomainError::NotFound => UserSettingsError::not_found("Settings not found")
+                .with_resource("self")
+                .create(),
+            DomainError::Validation { field, message } => UserSettingsError::invalid_argument()
+                .with_field_violation(field, message, "VALIDATION_ERROR")
+                .create(),
+            DomainError::Forbidden(msg) => {
+                tracing::warn!(msg = %msg, "simple-user-settings access forbidden");
+                // Mask as not_found so the response does not disclose that the
+                // resource exists but is out of scope for the caller.
+                UserSettingsError::not_found("Settings not found or not accessible")
+                    .with_resource("self")
+                    .create()
+            }
+            DomainError::Internal(msg) => {
+                tracing::error!(msg = %msg, "simple-user-settings internal error");
+                CanonicalError::internal(msg).create()
+            }
+            DomainError::Database(db_err) => {
+                tracing::error!(error = ?db_err, "simple-user-settings database error");
+                CanonicalError::internal(db_err.to_string()).create()
+            }
         }
-        DomainError::Forbidden(msg) => build_forbidden_problem(e, msg, instance, trace_id),
-        DomainError::Internal(msg) => build_internal_problem(e, msg, instance, trace_id),
-        DomainError::Database(_) => build_database_problem(e, instance, trace_id),
     }
 }
 
-fn build_not_found_problem(instance: &str, trace_id: Option<String>) -> Problem {
-    ErrorCode::settings_simple_user_settings_not_found_v1().with_context(
-        "Settings not found",
-        instance,
-        trace_id,
-    )
-}
-
-fn build_validation_problem(
-    field: &str,
-    message: &str,
-    instance: &str,
-    trace_id: Option<String>,
-) -> Problem {
-    ErrorCode::settings_simple_user_settings_validation_v1().with_context(
-        format!("Validation error on '{field}': {message}"),
-        instance,
-        trace_id,
-    )
-}
-
-fn build_forbidden_problem(
-    e: &DomainError,
-    msg: &str,
-    instance: &str,
-    trace_id: Option<String>,
-) -> Problem {
-    tracing::warn!(error = ?e, "Access forbidden: {}", msg);
-    // TODO: Add settings_simple_user_settings_forbidden_v1 to errors catalog
-    // For now, use not_found to avoid exposing sensitive scope information
-    ErrorCode::settings_simple_user_settings_not_found_v1().with_context(
-        "Settings not found or not accessible",
-        instance,
-        trace_id,
-    )
-}
-
-fn build_internal_problem(
-    e: &DomainError,
-    msg: &str,
-    instance: &str,
-    trace_id: Option<String>,
-) -> Problem {
-    tracing::error!(error = ?e, "Internal error: {}", msg);
-    ErrorCode::settings_simple_user_settings_internal_database_v1().with_context(
-        "An internal error occurred",
-        instance,
-        trace_id,
-    )
-}
-
-fn build_database_problem(e: &DomainError, instance: &str, trace_id: Option<String>) -> Problem {
-    tracing::error!(error = ?e, "Database error occurred");
-    ErrorCode::settings_simple_user_settings_internal_database_v1().with_context(
-        "An internal database error occurred",
-        instance,
-        trace_id,
-    )
-}
-
-/// Implement From<DomainError> for Problem so `?` works in handlers
+// TODO(cpt-cf-errors-component-error-middleware): drop this impl once
+// middleware injects trace_id/instance from request context. The
+// `From<DomainError> for CanonicalError` impl above is the long-lived
+// mapping; this wrapper exists only to keep handler signatures returning
+// `Problem` until middleware lands.
 impl From<DomainError> for Problem {
     fn from(e: DomainError) -> Self {
-        domain_error_to_problem(&e, "/")
+        Problem::from(CanonicalError::from(e)).with_temporary_request_context("/")
     }
 }

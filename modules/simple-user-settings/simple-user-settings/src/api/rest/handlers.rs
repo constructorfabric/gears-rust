@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{Json, extract::Extension};
-use modkit::api::prelude::*;
+use modkit::api::canonical_prelude::*;
 use modkit_security::SecurityContext;
 use simple_user_settings_sdk::models::SimpleUserSettingsUpdate;
 

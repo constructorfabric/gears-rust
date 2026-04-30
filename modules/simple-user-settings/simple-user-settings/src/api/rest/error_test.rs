@@ -1,72 +1,95 @@
 #[cfg(test)]
 mod tests {
-    use super::super::error::domain_error_to_problem;
     use crate::domain::error::DomainError;
-    use axum::http::StatusCode;
-    use modkit::api::problem::Problem;
+    use modkit_canonical_errors::Problem;
 
     #[test]
     fn test_not_found_error_to_problem() {
-        let error = DomainError::NotFound;
-        let problem = domain_error_to_problem(&error, "/test/instance");
+        let problem: Problem = DomainError::NotFound.into();
 
-        assert_eq!(problem.status, StatusCode::NOT_FOUND);
-        assert_eq!(problem.instance, "/test/instance");
+        assert_eq!(problem.status, 404);
+        assert_eq!(problem.instance.as_deref(), Some("/"));
         assert!(problem.detail.contains("Settings not found"));
+        assert_eq!(
+            problem
+                .context
+                .get("resource_type")
+                .and_then(|v| v.as_str()),
+            Some("gts.cf.simple_user_settings.settings.user.v1~"),
+        );
     }
 
     #[test]
     fn test_validation_error_to_problem() {
-        let error = DomainError::Validation {
+        let problem: Problem = DomainError::Validation {
             field: "theme".to_owned(),
             message: "exceeds max length".to_owned(),
-        };
-        let problem = domain_error_to_problem(&error, "/api/settings");
+        }
+        .into();
 
-        assert_eq!(problem.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(problem.instance, "/api/settings");
-        assert!(problem.detail.contains("theme"));
-        assert!(problem.detail.contains("exceeds max length"));
+        // InvalidArgument is 400 in canonical (decision C).
+        assert_eq!(problem.status, 400);
+        assert_eq!(problem.instance.as_deref(), Some("/"));
+
+        // Caller-supplied field + message live in context.field_violations[0].
+        let violation = problem
+            .context
+            .get("field_violations")
+            .and_then(|v| v.get(0))
+            .expect("expected at least one field violation");
+        assert_eq!(
+            violation.get("field").and_then(|v| v.as_str()),
+            Some("theme")
+        );
+        assert_eq!(
+            violation.get("description").and_then(|v| v.as_str()),
+            Some("exceeds max length"),
+        );
+        assert_eq!(
+            violation.get("reason").and_then(|v| v.as_str()),
+            Some("VALIDATION_ERROR"),
+        );
     }
 
     #[test]
-    fn test_database_error_to_problem() {
-        let error = DomainError::Database(modkit_db::DbError::InvalidConfig(
+    fn test_database_arm_maps_to_500() {
+        let problem: Problem = DomainError::Database(modkit_db::DbError::InvalidConfig(
             "connection failed".to_owned(),
-        ));
-        let problem = domain_error_to_problem(&error, "/db/error");
+        ))
+        .into();
 
-        assert_eq!(problem.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(problem.instance, "/db/error");
-        assert!(problem.detail.contains("internal database error"));
+        assert_eq!(problem.status, 500);
+        assert_eq!(problem.instance.as_deref(), Some("/"));
     }
 
     #[test]
-    fn test_from_domain_error_for_problem_not_found() {
-        let error = DomainError::NotFound;
-        let problem: Problem = error.into();
+    fn test_forbidden_arm_masks_as_not_found() {
+        // Pin the disclosure-prevention contract: `Forbidden` must surface
+        // as 404 with no leak of the original forbidden message, otherwise
+        // the response would tell the caller that the resource exists.
+        let raw = "user 42 lacks scope settings:write";
+        let problem: Problem = DomainError::Forbidden(raw.to_owned()).into();
 
-        assert_eq!(problem.status, StatusCode::NOT_FOUND);
-        assert_eq!(problem.instance, "/");
+        assert_eq!(problem.status, 404);
+        assert!(!problem.detail.contains("scope settings:write"));
+        assert!(!problem.detail.contains("user 42"));
+        assert_eq!(
+            problem
+                .context
+                .get("resource_type")
+                .and_then(|v| v.as_str()),
+            Some("gts.cf.simple_user_settings.settings.user.v1~"),
+        );
     }
 
     #[test]
-    fn test_from_domain_error_for_problem_validation() {
-        let error = DomainError::Validation {
-            field: "language".to_owned(),
-            message: "invalid format".to_owned(),
-        };
-        let problem: Problem = error.into();
+    fn test_internal_arm_masks_raw_message() {
+        // The canonical internal mapping replaces caller-supplied diagnostic
+        // text with an opaque public detail; assert the raw msg never reaches
+        // the wire.
+        let problem: Problem = DomainError::Internal("db pool exhausted".to_owned()).into();
 
-        assert_eq!(problem.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(problem.detail.contains("language"));
-    }
-
-    #[test]
-    fn test_from_domain_error_for_problem_database() {
-        let error = DomainError::Database(modkit_db::DbError::InvalidConfig("db error".to_owned()));
-        let problem: Problem = error.into();
-
-        assert_eq!(problem.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.status, 500);
+        assert!(!problem.detail.contains("db pool exhausted"));
     }
 }

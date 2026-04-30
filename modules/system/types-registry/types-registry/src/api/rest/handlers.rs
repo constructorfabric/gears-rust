@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Extension, Path, Query};
-use modkit::api::prelude::*;
-use modkit::api::problem::Problem;
+use modkit::api::canonical_prelude::*;
 
 use super::dto::{
     GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse, RegisterEntitiesRequest,

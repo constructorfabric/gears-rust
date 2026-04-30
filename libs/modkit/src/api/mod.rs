@@ -5,6 +5,7 @@
 //! response are specified.
 
 pub mod api_dto;
+pub mod canonical_trace;
 pub mod error_layer;
 pub mod odata;
 pub mod openapi_registry;
@@ -68,6 +69,10 @@ pub mod canonical_prelude {
     /// Result type alias matching `prelude::ApiResult` but parameterised on
     /// canonical `Problem`.
     pub type ApiResult<T = ()> = std::result::Result<T, Problem>;
+
+    // Migration-time trace/instance helper. See `canonical_trace` module
+    // docs — scheduled for deletion when the canonical error middleware lands.
+    pub use super::canonical_trace::CanonicalProblemMigrationExt;
 
     // Same response sugar / OData / axum re-exports as the legacy prelude
     pub use super::response::{JsonBody, JsonPage, created_json, no_content, ok_json};

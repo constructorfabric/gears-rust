@@ -29,6 +29,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 
 modkit = { workspace = true }
+modkit-canonical-errors = { workspace = true, features = ["axum"] }
 modkit-node-info = { workspace = true }
 modkit-macros = { workspace = true }
 nodes_registry-sdk = { package = "cf-nodes-registry-sdk", version = "0.1.20", path = "../nodes-registry-sdk" }
