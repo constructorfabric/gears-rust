@@ -13,6 +13,98 @@ release-plz updates this file in the Release PR.
 
 ### Other
 
+- release (by @github-actions[bot]) - #1780
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.1.19](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-tr-plugin-v0.1.18...cf-static-tr-plugin-v0.1.19) - 2026-05-01
+
+### Other
+
+- release (by @github-actions[bot]) - #1780
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.1.16](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-credstore-plugin-v0.1.15...cf-static-credstore-plugin-v0.1.16) - 2026-05-01
+
+### Other
+
+- release (by @github-actions[bot]) - #1780
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.1.18](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authz-plugin-v0.1.17...cf-static-authz-plugin-v0.1.18) - 2026-05-01
+
+### Other
+
+- release (by @github-actions[bot]) - #1780
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.2.9](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authn-plugin-v0.2.8...cf-static-authn-plugin-v0.2.9) - 2026-05-01
+
+### Other
+
+- release (by @github-actions[bot]) - #1780
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.1.20](https://github.com/cyberfabric/cyberfabric-core/compare/cf-single-tenant-tr-plugin-v0.1.19...cf-single-tenant-tr-plugin-v0.1.20) - 2026-05-01
+
+### Other
+
+- release (by @github-actions[bot]) - #1780
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.1.1](https://github.com/cyberfabric/cyberfabric-core/compare/cf-rg-tr-plugin-v0.1.0...cf-rg-tr-plugin-v0.1.1) - 2026-05-01
+
+### Other
+
+- release (by @github-actions[bot]) - #1780
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.6.8](https://github.com/cyberfabric/cyberfabric-core/compare/cf-modkit-v0.6.7...cf-modkit-v0.6.8) - 2026-05-01
+
+### Other
+
+- release (by @github-actions[bot]) - #1780
+- Merge pull request #1514 from cyberfabric/dependabot/cargo/nix-0.30.1 (by @Artifizer) - #1514
+
+### Contributors
+
+* @github-actions[bot]
+* @Artifizer
+
+## [0.7.2](https://github.com/cyberfabric/cyberfabric-core/compare/cf-modkit-canonical-errors-v0.7.1...cf-modkit-canonical-errors-v0.7.2) - 2026-05-01
+
+### Other
+
+- release (by @github-actions[bot]) - #1780
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.1.1](https://github.com/cyberfabric/cyberfabric-core/compare/cf-tr-authz-plugin-v0.1.0...cf-tr-authz-plugin-v0.1.1) - 2026-05-01
+
+### Other
+
 - updated the following local packages: cf-modkit, cf-authz-resolver-sdk, cf-tenant-resolver-sdk, cf-types-registry-sdk
 
 ## [0.1.19](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-tr-plugin-v0.1.18...cf-static-tr-plugin-v0.1.19) - 2026-05-01
