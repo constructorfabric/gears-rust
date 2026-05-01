@@ -1,6 +1,6 @@
 [package]
 name = "cf-rg-tr-plugin"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,8 +18,8 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-tenant-resolver-sdk = { package = "cf-tenant-resolver-sdk", version = "0.3.4", path = "../../tenant-resolver-sdk" }
-resource-group-sdk = { package = "cf-resource-group-sdk", version = "0.1.1", path = "../../../resource-group/resource-group-sdk" }
+tenant-resolver-sdk = { package = "cf-tenant-resolver-sdk", version = "0.3.5", path = "../../tenant-resolver-sdk" }
+resource-group-sdk = { package = "cf-resource-group-sdk", version = "0.1.2", path = "../../../resource-group/resource-group-sdk" }
 types-registry-sdk = { package = "cf-types-registry-sdk", version = "0.2.1", path = "../../../types-registry/types-registry-sdk" }
 
 # ModKit dependencies
