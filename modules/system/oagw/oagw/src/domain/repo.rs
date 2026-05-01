@@ -13,8 +13,12 @@ use uuid::Uuid;
 pub enum RepositoryError {
     #[error("{entity} not found: {id}")]
     NotFound { entity: &'static str, id: Uuid },
-    #[error("conflict: {0}")]
-    Conflict(String),
+    #[error("{entity} conflict on {resource}: {detail}")]
+    Conflict {
+        entity: &'static str,
+        resource: String,
+        detail: String,
+    },
     #[error("internal: {0}")]
     #[allow(dead_code)]
     Internal(String),

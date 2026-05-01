@@ -82,6 +82,8 @@ pub async fn proxy_handler(
         let path = parts.uri.path().to_string();
         if parts.method != http::Method::GET {
             return Err(error_response(DomainError::Validation {
+                field: "method",
+                reason: "WS_UPGRADE_REQUIRES_GET",
                 detail: "WebSocket upgrade requires GET method".into(),
                 instance: path,
             }));
@@ -90,6 +92,8 @@ pub async fn proxy_handler(
             || parts.headers.contains_key(http::header::TRANSFER_ENCODING)
         {
             return Err(error_response(DomainError::Validation {
+                field: "body",
+                reason: "WS_UPGRADE_BODY_FORBIDDEN",
                 detail: "WebSocket upgrade request must not contain a body".into(),
                 instance: path,
             }));
@@ -107,6 +111,8 @@ pub async fn proxy_handler(
     let prefix = "/oagw/v1/proxy/";
     let remaining = path.strip_prefix(prefix).ok_or_else(|| {
         error_response(DomainError::Validation {
+            field: "path",
+            reason: "INVALID_PROXY_PATH",
             detail: "invalid proxy path".into(),
             instance: path.to_string(),
         })
@@ -116,6 +122,8 @@ pub async fn proxy_handler(
     let alias_end = remaining.find('/').unwrap_or(remaining.len());
     if alias_end == 0 {
         return Err(error_response(DomainError::Validation {
+            field: "path",
+            reason: "MISSING_ALIAS",
             detail: "missing alias in proxy path".into(),
             instance: path.to_string(),
         }));
@@ -125,12 +133,16 @@ pub async fn proxy_handler(
     if !is_upgrade && let Some(cl) = parts.headers.get(http::header::CONTENT_LENGTH) {
         let cl_str = cl.to_str().map_err(|_| {
             error_response(DomainError::Validation {
+                field: "content-length",
+                reason: "INVALID_CONTENT_LENGTH",
                 detail: "invalid Content-Length header".into(),
                 instance: path.to_string(),
             })
         })?;
         let cl_val: usize = cl_str.parse().map_err(|_| {
             error_response(DomainError::Validation {
+                field: "content-length",
+                reason: "INVALID_CONTENT_LENGTH",
                 detail: format!("Content-Length is not a valid integer: '{cl_str}'"),
                 instance: path.to_string(),
             })
@@ -168,6 +180,8 @@ pub async fn proxy_handler(
     };
     parts.uri = new_uri_str.parse().map_err(|_| {
         error_response(DomainError::Validation {
+            field: "path",
+            reason: "INVALID_REWRITTEN_URI",
             detail: "failed to parse proxy URI".into(),
             instance: path.to_string(),
         })

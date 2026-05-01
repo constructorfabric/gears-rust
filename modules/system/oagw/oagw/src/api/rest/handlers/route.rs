@@ -2,7 +2,7 @@ use axum::Json;
 use axum::extract::{Extension, Path, Query};
 use axum::response::IntoResponse;
 use http::StatusCode;
-use modkit::api::problem::Problem;
+use modkit_canonical_errors::Problem;
 use modkit_security::SecurityContext;
 
 use crate::api::rest::dto::{CreateRouteRequest, RouteResponse, UpdateRouteRequest};

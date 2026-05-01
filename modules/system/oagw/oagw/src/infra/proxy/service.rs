@@ -383,6 +383,8 @@ impl DataPlaneService for DataPlaneServiceImpl {
         // Validate Content-Type format if present.
         if !headers::is_valid_content_type(&req_headers) {
             return Err(DomainError::Validation {
+                field: "content-type",
+                reason: "INVALID_MIME_TYPE",
                 detail: "Content-Type header is not a recognized MIME type".into(),
                 instance: instance_uri,
             });
@@ -391,6 +393,8 @@ impl DataPlaneService for DataPlaneServiceImpl {
         // Validate Transfer-Encoding — only chunked is supported.
         if !headers::is_valid_transfer_encoding(&req_headers) {
             return Err(DomainError::Validation {
+                field: "transfer-encoding",
+                reason: "UNSUPPORTED_TRANSFER_ENCODING",
                 detail: "unsupported Transfer-Encoding; only chunked is accepted".into(),
                 instance: instance_uri,
             });
@@ -457,6 +461,8 @@ impl DataPlaneService for DataPlaneServiceImpl {
             for (key, _) in &query_params {
                 if !http_match.query_allowlist.contains(key) {
                     return Err(DomainError::Validation {
+                        field: "query",
+                        reason: "QUERY_NOT_ALLOWED",
                         detail: format!(
                             "query parameter '{}' is not in the route's query_allowlist",
                             key
@@ -475,6 +481,8 @@ impl DataPlaneService for DataPlaneServiceImpl {
             let extra = path_suffix.strip_prefix(route_path.as_str()).unwrap_or("");
             if !extra.is_empty() {
                 return Err(DomainError::Validation {
+                    field: "path",
+                    reason: "PATH_SUFFIX_NOT_ALLOWED",
                     detail: format!(
                         "path suffix not allowed: route path_suffix_mode is disabled but request has extra path '{}'",
                         extra
@@ -528,6 +536,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             tracing::debug!(plugin = %auth.plugin_type, "executing auth plugin");
             let plugin = self.auth_registry.resolve(&auth.plugin_type).map_err(|e| {
                 DomainError::AuthenticationFailed {
+                    reason: "AUTH_PLUGIN_NOT_FOUND",
                     detail: e.to_string(),
                     instance: instance_uri.clone(),
                 }
@@ -550,13 +559,22 @@ impl DataPlaneService for DataPlaneServiceImpl {
                     crate::domain::plugin::PluginError::Rejected(ref msg)
                     | crate::domain::plugin::PluginError::InvalidConfig(ref msg) => {
                         DomainError::Validation {
+                            field: "plugin",
+                            reason: "INVALID_PLUGIN_CONFIG",
                             detail: msg.clone(),
                             instance: instance_uri.clone(),
                         }
                     }
-                    crate::domain::plugin::PluginError::AuthFailed(_)
-                    | crate::domain::plugin::PluginError::Internal(_) => {
+                    crate::domain::plugin::PluginError::AuthFailed(_) => {
                         DomainError::AuthenticationFailed {
+                            reason: "AUTH_PLUGIN_FAILED",
+                            detail: e.to_string(),
+                            instance: instance_uri.clone(),
+                        }
+                    }
+                    crate::domain::plugin::PluginError::Internal(_) => {
+                        DomainError::AuthenticationFailed {
+                            reason: "AUTH_PLUGIN_INTERNAL",
                             detail: e.to_string(),
                             instance: instance_uri.clone(),
                         }
@@ -602,12 +620,14 @@ impl DataPlaneService for DataPlaneServiceImpl {
                     status,
                     error_code,
                     detail,
+                    resource_id,
                 }) => {
                     return Err(DomainError::GuardRejected {
                         status,
                         error_code,
                         detail,
                         instance: instance_uri,
+                        resource_id,
                     });
                 }
                 Err(e) => {
@@ -689,6 +709,8 @@ impl DataPlaneService for DataPlaneServiceImpl {
         // 5b. Enforce HTTPS-only constraint (cpt-cf-oagw-constraint-https-only).
         if !self.allow_http_upstream && matches!(endpoint.scheme, Scheme::Http) {
             return Err(DomainError::Validation {
+                field: "endpoint.scheme",
+                reason: "HTTP_UPSTREAM_FORBIDDEN",
                 detail: "upstream endpoint uses HTTP; only HTTPS endpoints are permitted".into(),
                 instance: instance_uri,
             });
@@ -1177,12 +1199,14 @@ async fn execute_guard_responses(
                 status,
                 error_code,
                 detail,
+                resource_id,
             }) => {
                 return Err(DomainError::GuardRejected {
                     status,
                     error_code,
                     detail,
                     instance: instance_uri.to_string(),
+                    resource_id,
                 });
             }
             Err(e) => {

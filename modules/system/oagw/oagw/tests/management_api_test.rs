@@ -13,7 +13,7 @@ async fn create_upstream_success() {
             "server": {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "enabled": true,
             "tags": []
         }))
@@ -34,7 +34,7 @@ async fn create_upstream_missing_server_returns_422() {
     h.api_v1()
         .post_upstream()
         .with_body(serde_json::json!({
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1"
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1"
         }))
         .expect_status(422)
         .await;
@@ -57,7 +57,7 @@ async fn get_upstream_by_gts_id() {
                         port: 443,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             )
             .build(),
         )
@@ -84,7 +84,7 @@ async fn get_upstream_invalid_gts_returns_400() {
     let json = resp.json();
     assert_eq!(
         json["type"].as_str().unwrap(),
-        "gts.cf.core.errors.err.v1~cf.oagw.validation.error.v1"
+        "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"
     );
 }
 
@@ -114,7 +114,7 @@ async fn update_upstream_preserves_id() {
                         port: 443,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             )
             .alias("openai")
             .build(),
@@ -131,7 +131,7 @@ async fn update_upstream_preserves_id() {
             "server": {
                 "endpoints": [{"host": "10.0.0.1", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "openai-v2",
             "enabled": true,
             "tags": []
@@ -161,7 +161,7 @@ async fn delete_upstream_returns_204() {
                         port: 443,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             )
             .build(),
         )
@@ -190,7 +190,7 @@ async fn create_route_success() {
                         port: 443,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             )
             .build(),
         )
@@ -242,7 +242,7 @@ async fn list_upstreams_with_pagination() {
                             port: 443,
                         }],
                     },
-                    "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                    "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
                 )
                 .build(),
             )
@@ -291,7 +291,7 @@ async fn get_route_by_gts_id() {
             "server": {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "enabled": true,
             "tags": []
         }))
@@ -346,7 +346,7 @@ async fn update_route_changes_fields() {
             "server": {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "enabled": true,
             "tags": []
         }))
@@ -411,7 +411,7 @@ async fn delete_route_returns_204_then_get_returns_404() {
             "server": {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "enabled": true,
             "tags": []
         }))
@@ -463,7 +463,7 @@ async fn list_routes_filters_by_upstream() {
                 "server": {
                     "endpoints": [{"host": host, "port": 443, "scheme": "https"}]
                 },
-                "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
                 "enabled": true,
                 "tags": []
             }))

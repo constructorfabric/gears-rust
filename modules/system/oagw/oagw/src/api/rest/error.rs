@@ -1,159 +1,465 @@
+//! REST error mapping for the OAGW module.
+//!
+//! Maps `DomainError` to canonical errors (`modkit-canonical-errors`) and
+//! provides:
+//!
+//! * `From<DomainError> for CanonicalError` — long-lived mapping.
+//! * `From<DomainError> for Problem` — temporary shim that fills
+//!   `instance` / `trace_id` until the canonical error middleware lands.
+//! * `domain_error_to_problem` — convenience for management handlers that
+//!   already plumb the request URI through.
+//! * `error_response` — proxy-pipeline helper that produces an axum
+//!   `Response` with the gateway-specific `x-oagw-error-source`,
+//!   `Retry-After`, and `x-ratelimit-*` headers.
+//!
+//! ## `permission_denied` is fixed-detail by design
+//!
+//! `modkit-canonical-errors-macro` generates a zero-argument
+//! `permission_denied()` constructor — the wire `detail` is locked to the
+//! canonical default (`"You do not have permission to perform this
+//! operation"`) regardless of cause (CORS origin, CORS method, RBAC
+//! denial, guard plugin 403, …). This is a deliberate macro contract, not
+//! an oversight. Do not try to splice variable data into the `reason`
+//! field to compensate (earlier revisions of this file did, and the wire
+//! `reason` ended up carrying user-supplied origins/methods/principal
+//! ids).
+//!
+//! The differentiator on the wire is the structured `reason` field —
+//! consumers branch on `reason` (`CORS_ORIGIN_NOT_ALLOWED`,
+//! `CORS_METHOD_NOT_ALLOWED`, `AUTHZ_DENIED`, plugin-supplied codes),
+//! and variable diagnostic data (the actual origin / method / principal /
+//! plugin detail) lives in server-side `tracing::debug!` events
+//! correlated by `trace_id`.
+//!
+//! Future work: if it becomes necessary to surface variable detail on the
+//! wire for a 403, do it via a derived GTS type and the reserved `extra`
+//! field (DESIGN.md §3.8) rather than fighting the macro contract.
+
 use axum::response::{IntoResponse, Response};
-use http::{HeaderValue, StatusCode};
-use modkit::api::problem::Problem;
+use http::HeaderValue;
+use modkit::api::canonical_prelude::CanonicalProblemMigrationExt;
+use modkit_canonical_errors::{CanonicalError, Problem, resource_error};
 
 use crate::domain::error::DomainError;
+use crate::domain::gts_helpers as gts;
 use oagw_sdk::api::ErrorSource;
 
 // ---------------------------------------------------------------------------
-// GTS error type constants
+// Retry-after defaults for `service_unavailable` emissions
+//
+// `categories/14-service-unavailable.md` requires `retry_after_seconds`
+// in the wire context. The values below are coarse heuristics chosen per
+// failure mode — short for transient upstream issues, longer for
+// configuration / circuit-breaker windows where retrying immediately is
+// wasted work.
 // ---------------------------------------------------------------------------
 
-pub(crate) const ERR_VALIDATION: &str = "gts.cf.core.errors.err.v1~cf.oagw.validation.error.v1";
-pub(crate) const ERR_CONFLICT: &str = "gts.cf.core.errors.err.v1~cf.oagw.resource.conflict.v1";
-pub(crate) const ERR_MISSING_TARGET_HOST: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.routing.missing_target_host.v1";
-pub(crate) const ERR_INVALID_TARGET_HOST: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.routing.invalid_target_host.v1";
-pub(crate) const ERR_UNKNOWN_TARGET_HOST: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.routing.unknown_target_host.v1";
-pub(crate) const ERR_AUTH_FAILED: &str = "gts.cf.core.errors.err.v1~cf.oagw.auth.failed.v1";
-pub(crate) const ERR_NOT_FOUND: &str = "gts.cf.core.errors.err.v1~cf.oagw.resource.not_found.v1";
-pub(crate) const ERR_ROUTE_NOT_FOUND: &str = "gts.cf.core.errors.err.v1~cf.oagw.route.not_found.v1";
-pub(crate) const ERR_PAYLOAD_TOO_LARGE: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.payload.too_large.v1";
-pub(crate) const ERR_RATE_LIMIT_EXCEEDED: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.rate_limit.exceeded.v1";
-pub(crate) const ERR_SECRET_NOT_FOUND: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.secret.not_found.v1";
-pub(crate) const ERR_DOWNSTREAM: &str = "gts.cf.core.errors.err.v1~cf.oagw.downstream.error.v1";
-pub(crate) const ERR_PROTOCOL: &str = "gts.cf.core.errors.err.v1~cf.oagw.protocol.error.v1";
-pub(crate) const ERR_UPSTREAM_DISABLED: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.routing.upstream_disabled.v1";
-pub(crate) const ERR_CONNECTION_TIMEOUT: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.timeout.connection.v1";
-pub(crate) const ERR_REQUEST_TIMEOUT: &str = "gts.cf.core.errors.err.v1~cf.oagw.timeout.request.v1";
-pub(crate) const ERR_GUARD_REJECTED: &str = "gts.cf.core.errors.err.v1~cf.oagw.guard.rejected.v1";
-pub(crate) const ERR_CORS_ORIGIN_NOT_ALLOWED: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.cors.origin_not_allowed.v1";
-pub(crate) const ERR_CORS_METHOD_NOT_ALLOWED: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.cors.method_not_allowed.v1";
-pub(crate) const ERR_STREAM_ABORTED: &str = "gts.cf.core.errors.err.v1~cf.oagw.stream.aborted.v1";
-pub(crate) const ERR_LINK_UNAVAILABLE: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.link.unavailable.v1";
-pub(crate) const ERR_CIRCUIT_BREAKER_OPEN: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.circuit_breaker.open.v1";
-pub(crate) const ERR_IDLE_TIMEOUT: &str = "gts.cf.core.errors.err.v1~cf.oagw.timeout.idle.v1";
-pub(crate) const ERR_PLUGIN_NOT_FOUND: &str =
-    "gts.cf.core.errors.err.v1~cf.oagw.plugin.not_found.v1";
-pub(crate) const ERR_PLUGIN_IN_USE: &str = "gts.cf.core.errors.err.v1~cf.oagw.plugin.in_use.v1";
-pub(crate) const ERR_FORBIDDEN: &str = "gts.cf.core.errors.err.v1~cf.oagw.authz.forbidden.v1";
+/// Transient upstream / protocol / stream errors — likely to clear quickly.
+const RETRY_AFTER_TRANSIENT_SECS: u64 = 5;
+
+/// No-route / connect-failure errors — retry once DNS/network settles.
+const RETRY_AFTER_LINK_SECS: u64 = 10;
+
+/// Circuit-breaker-open and admin-disabled upstreams — bounded by the
+/// circuit-breaker recovery window or operator action.
+const RETRY_AFTER_CIRCUIT_BREAKER_SECS: u64 = 30;
+
+/// Upstream-disabled by configuration — operator action required.
+const RETRY_AFTER_ADMIN_SECS: u64 = 30;
+
+/// Unknown 5xx from a guard plugin — conservative default.
+const RETRY_AFTER_GUARD_SECS: u64 = 10;
 
 // ---------------------------------------------------------------------------
-// DomainError → Problem helpers
+// Resource error scopes
+//
+// All four scopes use the GTS identifiers oagw already exposes via
+// `domain::gts_helpers` — clients that recognise the existing
+// upstream/route/proxy/guard_plugin types continue to interpret the
+// `resource_type` field unchanged.
 // ---------------------------------------------------------------------------
 
-fn gts_type(err: &DomainError) -> &str {
-    match err {
-        DomainError::Validation { .. } => ERR_VALIDATION,
-        DomainError::Conflict { .. } => ERR_CONFLICT,
-        DomainError::MissingTargetHost { .. } => ERR_MISSING_TARGET_HOST,
-        DomainError::InvalidTargetHost { .. } => ERR_INVALID_TARGET_HOST,
-        DomainError::UnknownTargetHost { .. } => ERR_UNKNOWN_TARGET_HOST,
-        DomainError::AuthenticationFailed { .. } => ERR_AUTH_FAILED,
-        DomainError::NotFound {
-            entity: "route", ..
-        } => ERR_ROUTE_NOT_FOUND,
-        DomainError::NotFound { .. } => ERR_NOT_FOUND,
-        DomainError::PayloadTooLarge { .. } => ERR_PAYLOAD_TOO_LARGE,
-        DomainError::RateLimitExceeded { .. } => ERR_RATE_LIMIT_EXCEEDED,
-        DomainError::SecretNotFound { .. } => ERR_SECRET_NOT_FOUND,
-        DomainError::DownstreamError { .. } | DomainError::Internal { .. } => ERR_DOWNSTREAM,
-        DomainError::ProtocolError { .. } => ERR_PROTOCOL,
-        DomainError::UpstreamDisabled { .. } => ERR_UPSTREAM_DISABLED,
-        DomainError::ConnectionTimeout { .. } => ERR_CONNECTION_TIMEOUT,
-        DomainError::RequestTimeout { .. } => ERR_REQUEST_TIMEOUT,
-        DomainError::GuardRejected { .. } => ERR_GUARD_REJECTED,
-        DomainError::CorsOriginNotAllowed { .. } => ERR_CORS_ORIGIN_NOT_ALLOWED,
-        DomainError::CorsMethodNotAllowed { .. } => ERR_CORS_METHOD_NOT_ALLOWED,
-        DomainError::StreamAborted { .. } => ERR_STREAM_ABORTED,
-        DomainError::LinkUnavailable { .. } => ERR_LINK_UNAVAILABLE,
-        DomainError::CircuitBreakerOpen { .. } => ERR_CIRCUIT_BREAKER_OPEN,
-        DomainError::IdleTimeout { .. } => ERR_IDLE_TIMEOUT,
-        DomainError::PluginNotFound { .. } => ERR_PLUGIN_NOT_FOUND,
-        DomainError::PluginInUse { .. } => ERR_PLUGIN_IN_USE,
-        DomainError::Forbidden { .. } => ERR_FORBIDDEN,
+/// Errors attributable to the gateway data-plane / proxy as a resource.
+/// Used as the umbrella scope when no more specific resource applies.
+#[resource_error("gts.cf.core.oagw.proxy.v1~")]
+pub struct OagwProxyError;
+
+/// Errors attributable to a specific upstream definition.
+#[resource_error("gts.cf.core.oagw.upstream.v1~")]
+pub struct OagwUpstreamError;
+
+/// Errors attributable to a specific route definition.
+#[resource_error("gts.cf.core.oagw.route.v1~")]
+pub struct OagwRouteError;
+
+/// Errors attributable to a specific authentication plugin instance.
+#[resource_error("gts.cf.core.oagw.auth_plugin.v1~")]
+pub struct OagwAuthPluginError;
+
+/// Errors raised by guard plugins during the proxy pipeline.
+#[resource_error("gts.cf.core.oagw.guard_plugin.v1~")]
+pub struct OagwGuardPluginError;
+
+/// Errors attributable to a specific transform plugin instance.
+#[resource_error("gts.cf.core.oagw.transform_plugin.v1~")]
+pub struct OagwTransformPluginError;
+
+// ---------------------------------------------------------------------------
+// DomainError → CanonicalError
+// ---------------------------------------------------------------------------
+
+// TODO(cpt-cf-errors-component-error-middleware): the per-arm `tracing::warn!` /
+// `error!` / `debug!` calls below are transitional. DESIGN.md §3.6 reserves
+// error logging to the canonical error middleware (deferred per PRD §4.2):
+// once that middleware lands and starts logging WARN/ERROR with the
+// `trace_id`, every `tracing::*` call inside this `From` impl — plus the
+// matching log inside `guard_rejected_to_canonical` — should be removed in the
+// same PR that drops the `From<DomainError> for Problem` shim. Tracked
+// alongside the existing shim TODO further down the file.
+impl From<DomainError> for CanonicalError {
+    fn from(err: DomainError) -> Self {
+        match err {
+            DomainError::Validation {
+                field,
+                reason,
+                detail,
+                ..
+            } => {
+                if field.is_empty() {
+                    // No specific field → use the canonical Format variant
+                    // so the wire response stays accurate (the detail
+                    // surfaces directly without lying about which field
+                    // failed).
+                    OagwProxyError::invalid_argument()
+                        .with_format(detail)
+                        .create()
+                } else {
+                    OagwProxyError::invalid_argument()
+                        .with_field_violation(field, detail, reason)
+                        .create()
+                }
+            }
+
+            // Dispatch on the entity discriminator so the wire
+            // `resource_type` matches the resource the conflict is about
+            // (alias collision → upstream; route-table overlap → route).
+            DomainError::Conflict {
+                entity,
+                resource,
+                detail,
+            } => match entity {
+                "upstream" => OagwUpstreamError::already_exists(detail)
+                    .with_resource(resource)
+                    .create(),
+                "route" => OagwRouteError::already_exists(detail)
+                    .with_resource(resource)
+                    .create(),
+                _ => OagwProxyError::already_exists(detail)
+                    .with_resource(resource)
+                    .create(),
+            },
+
+            DomainError::MissingTargetHost { .. } => OagwProxyError::invalid_argument()
+                .with_field_violation(
+                    "x-target-host",
+                    "target host header required for multi-endpoint upstream",
+                    "MISSING_TARGET_HOST",
+                )
+                .create(),
+
+            DomainError::InvalidTargetHost { .. } => OagwProxyError::invalid_argument()
+                .with_field_violation(
+                    "x-target-host",
+                    "invalid target host header format",
+                    "INVALID_TARGET_HOST",
+                )
+                .create(),
+
+            DomainError::UnknownTargetHost { detail, .. } => OagwProxyError::invalid_argument()
+                .with_field_violation("x-target-host", detail, "UNKNOWN_TARGET_HOST")
+                .create(),
+
+            DomainError::AuthenticationFailed { reason, detail, .. } => {
+                tracing::debug!(reason, detail = %detail, "OAGW authentication failed");
+                CanonicalError::unauthenticated()
+                    .with_reason(reason)
+                    .create()
+            }
+
+            // The `entity` discriminator already encodes which resource
+            // type the missing id belongs to; dispatch on it so the wire
+            // `resource_type` matches the entity oagw exposes.
+            DomainError::NotFound { entity, id } => match entity {
+                "upstream" => OagwUpstreamError::not_found(format!("upstream not found: {id}"))
+                    .with_resource(id.to_string())
+                    .create(),
+                "route" => OagwRouteError::not_found(format!("route not found: {id}"))
+                    .with_resource(id.to_string())
+                    .create(),
+                _ => OagwProxyError::not_found(format!("{entity} not found: {id}"))
+                    .with_resource(id.to_string())
+                    .create(),
+            },
+
+            DomainError::PayloadTooLarge { detail, .. } => {
+                OagwProxyError::out_of_range(detail.clone())
+                    .with_field_violation("content_length", detail, "OUT_OF_RANGE")
+                    .create()
+            }
+
+            DomainError::RateLimitExceeded { detail, .. } => {
+                OagwProxyError::resource_exhausted(detail.clone())
+                    .with_quota_violation("rate_limit", detail)
+                    .create()
+            }
+
+            DomainError::SecretNotFound { detail, .. } => {
+                tracing::error!(reason = %detail, "OAGW secret not found");
+                CanonicalError::internal(detail).create()
+            }
+
+            DomainError::DownstreamError { detail, .. } => {
+                tracing::warn!(reason = %detail, "OAGW downstream error");
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
+                    .create()
+            }
+
+            DomainError::ProtocolError { detail, .. } => {
+                tracing::warn!(reason = %detail, "OAGW upstream protocol error");
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
+                    .create()
+            }
+
+            DomainError::UpstreamDisabled { alias } => {
+                tracing::debug!(upstream = %alias, "OAGW upstream is disabled");
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(RETRY_AFTER_ADMIN_SECS)
+                    .create()
+            }
+
+            DomainError::ConnectionTimeout { detail, .. } => {
+                OagwProxyError::deadline_exceeded(detail).create()
+            }
+
+            DomainError::RequestTimeout { detail, .. } => {
+                OagwProxyError::deadline_exceeded(detail).create()
+            }
+
+            DomainError::Internal { message } => {
+                tracing::error!(reason = %message, "OAGW internal error");
+                CanonicalError::internal(message).create()
+            }
+
+            DomainError::GuardRejected {
+                status,
+                error_code,
+                detail,
+                resource_id,
+                ..
+            } => guard_rejected_to_canonical(status, error_code, detail, resource_id),
+
+            DomainError::CorsOriginNotAllowed { origin, .. } => {
+                tracing::debug!(origin = %origin, "OAGW CORS origin rejected");
+                OagwProxyError::permission_denied()
+                    .with_reason("CORS_ORIGIN_NOT_ALLOWED")
+                    .create()
+            }
+
+            DomainError::CorsMethodNotAllowed { method, .. } => {
+                tracing::debug!(method = %method, "OAGW CORS method rejected");
+                OagwProxyError::permission_denied()
+                    .with_reason("CORS_METHOD_NOT_ALLOWED")
+                    .create()
+            }
+
+            DomainError::StreamAborted { detail, .. } => {
+                tracing::warn!(reason = %detail, "OAGW upstream stream aborted");
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
+                    .create()
+            }
+
+            DomainError::LinkUnavailable { detail, .. } => {
+                tracing::warn!(reason = %detail, "OAGW upstream link unavailable");
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(RETRY_AFTER_LINK_SECS)
+                    .create()
+            }
+
+            DomainError::CircuitBreakerOpen { detail, .. } => {
+                tracing::warn!(reason = %detail, "OAGW circuit breaker open");
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(RETRY_AFTER_CIRCUIT_BREAKER_SECS)
+                    .create()
+            }
+
+            DomainError::IdleTimeout { detail, .. } => {
+                OagwProxyError::deadline_exceeded(detail).create()
+            }
+
+            // The `gts_id` prefix encodes the plugin kind, so dispatch
+            // through the matching per-kind resource scope. The wire
+            // `resource_name` carries the actual plugin GTS identifier.
+            DomainError::PluginNotFound { gts_id, detail } => {
+                plugin_not_found_to_canonical(gts_id, detail)
+            }
+
+            DomainError::PluginInUse { gts_id, detail } => {
+                plugin_in_use_to_canonical(gts_id, detail)
+            }
+
+            DomainError::Forbidden { reason, detail } => {
+                tracing::debug!(reason = %reason, detail = %detail, "OAGW authorization denied");
+                OagwProxyError::permission_denied()
+                    .with_reason(reason)
+                    .create()
+            }
+        }
     }
 }
 
-fn http_status_code(err: &DomainError) -> StatusCode {
-    match err {
-        DomainError::Validation { .. }
-        | DomainError::MissingTargetHost { .. }
-        | DomainError::InvalidTargetHost { .. }
-        | DomainError::UnknownTargetHost { .. } => StatusCode::BAD_REQUEST,
-        DomainError::Conflict { .. } => StatusCode::CONFLICT,
-        DomainError::AuthenticationFailed { .. } => StatusCode::UNAUTHORIZED,
-        DomainError::NotFound { .. } => StatusCode::NOT_FOUND,
-        DomainError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-        DomainError::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
-        DomainError::SecretNotFound { .. } | DomainError::Internal { .. } => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
-        DomainError::DownstreamError { .. } | DomainError::ProtocolError { .. } => {
-            StatusCode::BAD_GATEWAY
-        }
-        DomainError::UpstreamDisabled { .. }
-        | DomainError::LinkUnavailable { .. }
-        | DomainError::CircuitBreakerOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        DomainError::ConnectionTimeout { .. }
-        | DomainError::RequestTimeout { .. }
-        | DomainError::IdleTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
-        DomainError::StreamAborted { .. } => StatusCode::BAD_GATEWAY,
-        DomainError::PluginNotFound { .. } => StatusCode::NOT_FOUND,
-        DomainError::PluginInUse { .. } => StatusCode::CONFLICT,
-        DomainError::GuardRejected { status, .. } => StatusCode::from_u16(*status)
-            .ok()
-            .filter(|code| code.is_client_error() || code.is_server_error())
-            .unwrap_or(StatusCode::BAD_REQUEST),
-        DomainError::CorsOriginNotAllowed { .. } | DomainError::CorsMethodNotAllowed { .. } => {
-            StatusCode::FORBIDDEN
-        }
-        DomainError::Forbidden { .. } => StatusCode::FORBIDDEN,
+/// Route a plugin-not-found error to the resource scope matching the
+/// plugin kind encoded in the GTS identifier prefix. Unknown prefixes
+/// fall back to the proxy umbrella so the canonical category is still
+/// honoured.
+fn plugin_not_found_to_canonical(gts_id: String, detail: String) -> CanonicalError {
+    if gts_id.starts_with(gts::AUTH_PLUGIN_SCHEMA) {
+        OagwAuthPluginError::not_found(detail)
+            .with_resource(gts_id)
+            .create()
+    } else if gts_id.starts_with(gts::GUARD_PLUGIN_SCHEMA) {
+        OagwGuardPluginError::not_found(detail)
+            .with_resource(gts_id)
+            .create()
+    } else if gts_id.starts_with(gts::TRANSFORM_PLUGIN_SCHEMA) {
+        OagwTransformPluginError::not_found(detail)
+            .with_resource(gts_id)
+            .create()
+    } else {
+        OagwProxyError::not_found(detail)
+            .with_resource(gts_id)
+            .create()
     }
 }
 
-fn error_title(err: &DomainError) -> &str {
-    match err {
-        DomainError::Validation { .. } => "Validation Error",
-        DomainError::Conflict { .. } => "Conflict",
-        DomainError::MissingTargetHost { .. } => "Missing Target Host",
-        DomainError::InvalidTargetHost { .. } => "Invalid Target Host",
-        DomainError::UnknownTargetHost { .. } => "Unknown Target Host",
-        DomainError::AuthenticationFailed { .. } => "Authentication Failed",
-        DomainError::NotFound { .. } => "Not Found",
-        DomainError::PayloadTooLarge { .. } => "Payload Too Large",
-        DomainError::RateLimitExceeded { .. } => "Rate Limit Exceeded",
-        DomainError::SecretNotFound { .. } => "Secret Not Found",
-        DomainError::DownstreamError { .. } | DomainError::Internal { .. } => "Downstream Error",
-        DomainError::ProtocolError { .. } => "Protocol Error",
-        DomainError::UpstreamDisabled { .. } => "Upstream Disabled",
-        DomainError::ConnectionTimeout { .. } => "Connection Timeout",
-        DomainError::RequestTimeout { .. } => "Request Timeout",
-        DomainError::GuardRejected { .. } => "Guard Rejected",
-        DomainError::CorsOriginNotAllowed { .. } => "CORS Origin Not Allowed",
-        DomainError::CorsMethodNotAllowed { .. } => "CORS Method Not Allowed",
-        DomainError::StreamAborted { .. } => "Stream Aborted",
-        DomainError::LinkUnavailable { .. } => "Link Unavailable",
-        DomainError::CircuitBreakerOpen { .. } => "Circuit Breaker Open",
-        DomainError::IdleTimeout { .. } => "Idle Timeout",
-        DomainError::PluginNotFound { .. } => "Plugin Not Found",
-        DomainError::PluginInUse { .. } => "Plugin In Use",
-        DomainError::Forbidden { .. } => "Forbidden",
+/// Companion to [`plugin_not_found_to_canonical`] for the in-use case.
+fn plugin_in_use_to_canonical(gts_id: String, detail: String) -> CanonicalError {
+    if gts_id.starts_with(gts::AUTH_PLUGIN_SCHEMA) {
+        OagwAuthPluginError::already_exists(detail)
+            .with_resource(gts_id)
+            .create()
+    } else if gts_id.starts_with(gts::GUARD_PLUGIN_SCHEMA) {
+        OagwGuardPluginError::already_exists(detail)
+            .with_resource(gts_id)
+            .create()
+    } else if gts_id.starts_with(gts::TRANSFORM_PLUGIN_SCHEMA) {
+        OagwTransformPluginError::already_exists(detail)
+            .with_resource(gts_id)
+            .create()
+    } else {
+        OagwProxyError::already_exists(detail)
+            .with_resource(gts_id)
+            .create()
     }
 }
 
-fn error_instance(err: &DomainError) -> &str {
+/// Map a plugin-supplied HTTP status (from `DomainError::GuardRejected`) to
+/// the closest canonical category. Unknown statuses fall back to
+/// `invalid_argument` so the canonical taxonomy is always satisfied.
+///
+/// `resource_id` is the optional identifier of the resource the rejection
+/// refers to. When set, 404/409 rejections route through the canonical
+/// `not_found` / `already_exists` categories with the id as
+/// `resource_name`. When `None`, they fall back to `failed_precondition`
+/// / `aborted` so the wire body stays schema-compliant without a
+/// placeholder identifier.
+fn guard_rejected_to_canonical(
+    status: u16,
+    error_code: String,
+    detail: String,
+    resource_id: Option<String>,
+) -> CanonicalError {
+    match status {
+        400 | 422 => OagwGuardPluginError::invalid_argument()
+            .with_field_violation("guard", detail, error_code)
+            .create(),
+        401 => CanonicalError::unauthenticated()
+            .with_reason(error_code)
+            .create(),
+        403 => {
+            tracing::debug!(reason = %detail, "OAGW guard rejected with 403");
+            OagwGuardPluginError::permission_denied()
+                .with_reason(error_code)
+                .create()
+        }
+        404 => match resource_id {
+            Some(id) => OagwGuardPluginError::not_found(detail)
+                .with_resource(id)
+                .create(),
+            None => OagwGuardPluginError::failed_precondition()
+                .with_precondition_violation(error_code, detail, "STATE")
+                .create(),
+        },
+        409 => match resource_id {
+            Some(id) => OagwGuardPluginError::already_exists(detail)
+                .with_resource(id)
+                .create(),
+            None => OagwGuardPluginError::aborted(detail)
+                .with_reason(error_code)
+                .create(),
+        },
+        413 => OagwGuardPluginError::out_of_range(detail.clone())
+            .with_field_violation("guard", detail, error_code)
+            .create(),
+        429 => OagwGuardPluginError::resource_exhausted(detail.clone())
+            .with_quota_violation("guard", detail)
+            .create(),
+        // The canonical `service_unavailable` schema (categories/14) only
+        // carries `retry_after_seconds` — the upstream-supplied 5xx
+        // status and `error_code` cannot be placed on the wire. Surface
+        // them server-side at WARN (DESIGN §3.6) so operators can
+        // correlate the masked failure via `trace_id` without exposing
+        // upstream internals.
+        500..=599 => {
+            tracing::warn!(
+                upstream_status = status,
+                upstream_error_code = %error_code,
+                detail = %detail,
+                "OAGW guard plugin returned 5xx — masking as service_unavailable",
+            );
+            CanonicalError::service_unavailable()
+                .with_retry_after_seconds(RETRY_AFTER_GUARD_SECS)
+                .create()
+        }
+        _ => OagwGuardPluginError::invalid_argument()
+            .with_field_violation("guard", detail, error_code)
+            .create(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DomainError → Problem (temporary shim)
+// ---------------------------------------------------------------------------
+
+// TODO(cpt-cf-errors-component-error-middleware): drop this impl once
+// middleware injects trace_id/instance from request context. The
+// `From<DomainError> for CanonicalError` impl above is the long-lived
+// mapping; this wrapper exists only to keep handler signatures returning
+// `Problem` until middleware lands.
+impl From<DomainError> for Problem {
+    fn from(err: DomainError) -> Self {
+        let instance = preferred_instance(&err).to_owned();
+        Problem::from(CanonicalError::from(err)).with_temporary_request_context(instance)
+    }
+}
+
+/// Pull the per-variant `instance` field out of the domain error so the
+/// shim above can populate `Problem.instance` with the request URI that
+/// the proxy/data-plane already carries. Falls back to `"/"` for variants
+/// that do not embed an instance (NotFound, Conflict, plugin CRUD, etc.).
+fn preferred_instance(err: &DomainError) -> &str {
     match err {
         DomainError::Validation { instance, .. }
         | DomainError::MissingTargetHost { instance, .. }
@@ -173,32 +479,20 @@ fn error_instance(err: &DomainError) -> &str {
         | DomainError::StreamAborted { instance, .. }
         | DomainError::LinkUnavailable { instance, .. }
         | DomainError::CircuitBreakerOpen { instance, .. }
-        | DomainError::IdleTimeout { instance, .. } => instance,
+        | DomainError::IdleTimeout { instance, .. } => {
+            if instance.is_empty() {
+                "/"
+            } else {
+                instance.as_str()
+            }
+        }
         DomainError::NotFound { .. }
         | DomainError::Conflict { .. }
         | DomainError::UpstreamDisabled { .. }
         | DomainError::Internal { .. }
         | DomainError::PluginNotFound { .. }
         | DomainError::PluginInUse { .. }
-        | DomainError::Forbidden { .. } => "",
-    }
-}
-
-// ---------------------------------------------------------------------------
-// From<DomainError> for Problem
-// ---------------------------------------------------------------------------
-
-impl From<DomainError> for Problem {
-    fn from(err: DomainError) -> Self {
-        let gts = gts_type(&err).to_string();
-        let inst = error_instance(&err).to_string();
-        let status = http_status_code(&err);
-        let t = error_title(&err).to_string();
-        let detail = err.to_string();
-
-        Problem::new(status, t, detail)
-            .with_type(gts)
-            .with_instance(inst)
+        | DomainError::Forbidden { .. } => "/",
     }
 }
 
@@ -206,18 +500,20 @@ impl From<DomainError> for Problem {
 // Convenience functions for handlers
 // ---------------------------------------------------------------------------
 
-/// Convert a `DomainError` into a `Problem`, filling in `instance` for
-/// variants that don't carry their own. Used by management API handlers.
+/// Convert a `DomainError` into a canonical `Problem`, overriding the
+/// default `instance` placeholder with the supplied request URI. Used by
+/// management API handlers that already plumb `instance` through.
 pub(crate) fn domain_error_to_problem(err: DomainError, instance: &str) -> Problem {
-    let mut p = Problem::from(err);
-    if p.instance.is_empty() {
-        p.instance = instance.to_string();
-    }
-    p
+    Problem::from(CanonicalError::from(err)).with_temporary_request_context(instance)
 }
 
 /// Convert a `DomainError` into an axum `Response` with the
-/// `x-oagw-error-source: gateway` header. Used by the proxy handler.
+/// `x-oagw-error-source: gateway` header. Used by the proxy data-plane.
+///
+/// Rate-limit metadata (when present in `DomainError::RateLimitExceeded`)
+/// is converted into wire headers (`Retry-After`, `X-RateLimit-*`) and the
+/// detail is sanitised to avoid leaking internal key structure (resource
+/// IDs, tenant IDs, scope) in the body.
 pub fn error_response(err: DomainError) -> Response {
     let rate_limit_meta = match &err {
         DomainError::RateLimitExceeded {
@@ -232,8 +528,6 @@ pub fn error_response(err: DomainError) -> Response {
 
     let mut problem: Problem = err.into();
 
-    // Sanitize rate-limit detail to avoid leaking internal key structure
-    // (resource IDs, tenant IDs, scope) in the 429 response body.
     if rate_limit_meta.is_some() {
         problem.detail =
             "Rate limit exceeded. Retry after the duration indicated by the Retry-After header."
@@ -277,29 +571,82 @@ pub fn error_response(err: DomainError) -> Response {
 mod tests {
     use super::*;
 
+    const NOT_FOUND_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~";
+    const INVALID_ARGUMENT_TYPE: &str =
+        "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~";
+    const ALREADY_EXISTS_TYPE: &str =
+        "gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~";
+    const RESOURCE_EXHAUSTED_TYPE: &str =
+        "gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~";
+
     #[test]
-    fn validation_error_produces_correct_problem() {
+    fn validation_with_field_emits_field_violation() {
         let err = DomainError::Validation {
+            field: "server",
+            reason: "REQUIRED",
             detail: "missing required field 'server'".into(),
             instance: "/oagw/v1/upstreams".into(),
         };
         let p: Problem = err.into();
-        assert_eq!(p.status, StatusCode::BAD_REQUEST);
-        assert_eq!(p.type_url, ERR_VALIDATION);
-        assert_eq!(p.title, "Validation Error");
-        assert!(p.detail.contains("missing required field"));
-        assert_eq!(p.instance, "/oagw/v1/upstreams");
+        assert_eq!(p.status, 400);
+        assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
+        assert_eq!(p.title, "Invalid Argument");
+        assert_eq!(p.instance.as_deref(), Some("/oagw/v1/upstreams"));
+        // Field-scoped variant carries the violation in
+        // `context.field_violations[]` per the canonical FieldViolations
+        // schema; the top-level detail stays the canonical default.
+        let violations = p
+            .context
+            .get("field_violations")
+            .and_then(|v| v.as_array())
+            .expect("field_violations must be present");
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0]["field"], "server");
+        assert_eq!(violations[0]["reason"], "REQUIRED");
+        assert!(
+            violations[0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("missing required field"),
+        );
+    }
+
+    #[test]
+    fn validation_without_field_uses_format_variant() {
+        // Sites that don't know which field failed (the legacy bulk
+        // case) emit the canonical Format variant so the wire body
+        // doesn't lie about which field was bad.
+        let err = DomainError::validation("alias must be 1-63 chars");
+        let p: Problem = err.into();
+        assert_eq!(p.status, 400);
+        assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
+        // No field_violations array — this is the Format variant.
+        assert!(
+            p.context.get("field_violations").is_none()
+                || p.context["field_violations"].as_array().unwrap().is_empty(),
+            "expected no field_violations on Format variant, got {:?}",
+            p.context,
+        );
+        // The top-level detail surfaces the human-readable message.
+        assert!(
+            p.detail.contains("alias must be 1-63 chars"),
+            "expected detail to carry the validation message, got {:?}",
+            p.detail,
+        );
     }
 
     #[test]
     fn conflict_error_produces_409() {
         let err = DomainError::Conflict {
+            entity: "upstream",
+            resource: "my-alias".into(),
             detail: "alias already exists".into(),
         };
         let p: Problem = err.into();
-        assert_eq!(p.status, StatusCode::CONFLICT);
-        assert_eq!(p.type_url, ERR_CONFLICT);
-        assert_eq!(p.title, "Conflict");
+        assert_eq!(p.status, 409);
+        assert_eq!(p.problem_type, ALREADY_EXISTS_TYPE);
+        assert_eq!(p.context["resource_name"], "my-alias");
+        assert_eq!(p.title, "Already Exists");
     }
 
     #[test]
@@ -313,8 +660,8 @@ mod tests {
             reset_epoch: Some(1706626800),
         };
         let p: Problem = err.into();
-        assert_eq!(p.status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(p.type_url, ERR_RATE_LIMIT_EXCEEDED);
+        assert_eq!(p.status, 429);
+        assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
     }
 
     #[test]
@@ -324,18 +671,171 @@ mod tests {
             id: uuid::Uuid::nil(),
         };
         let p: Problem = err.into();
-        assert_eq!(p.status, StatusCode::NOT_FOUND);
-        assert_eq!(p.type_url, ERR_ROUTE_NOT_FOUND);
+        assert_eq!(p.status, 404);
+        assert_eq!(p.problem_type, NOT_FOUND_TYPE);
+    }
+
+    #[test]
+    fn plugin_not_found_dispatches_on_gts_prefix() {
+        let auth = DomainError::PluginNotFound {
+            gts_id: "gts.cf.core.oagw.auth_plugin.v1~x.core.oagw.apikey.v1".into(),
+            detail: "auth plugin not registered".into(),
+        };
+        let p: Problem = auth.into();
+        assert_eq!(p.status, 404);
+        assert_eq!(p.context["resource_type"], gts::AUTH_PLUGIN_SCHEMA);
+        assert_eq!(
+            p.context["resource_name"],
+            "gts.cf.core.oagw.auth_plugin.v1~x.core.oagw.apikey.v1"
+        );
+
+        let guard = DomainError::PluginNotFound {
+            gts_id: "gts.cf.core.oagw.guard_plugin.v1~x.core.oagw.timeout.v1".into(),
+            detail: "guard plugin not registered".into(),
+        };
+        let p: Problem = guard.into();
+        assert_eq!(p.context["resource_type"], gts::GUARD_PLUGIN_SCHEMA);
+
+        let xform = DomainError::PluginInUse {
+            gts_id: "gts.cf.core.oagw.transform_plugin.v1~x.core.oagw.logging.v1".into(),
+            detail: "transform plugin in use".into(),
+        };
+        let p: Problem = xform.into();
+        assert_eq!(p.status, 409);
+        assert_eq!(p.context["resource_type"], gts::TRANSFORM_PLUGIN_SCHEMA);
+    }
+
+    #[test]
+    fn service_unavailable_emissions_carry_retry_after_seconds() {
+        // Schema in categories/14-service-unavailable.md requires
+        // `retry_after_seconds` on every service_unavailable response;
+        // verify each oagw → service_unavailable path populates it with
+        // the per-failure-mode default.
+        fn assert_retry(err: DomainError, expected: u64, label: &str) {
+            let p: Problem = err.into();
+            assert_eq!(p.status, 503, "{label} should map to 503");
+            assert_eq!(
+                p.context["retry_after_seconds"].as_u64(),
+                Some(expected),
+                "{label} retry_after_seconds mismatch",
+            );
+        }
+
+        let i = || "/i".to_string();
+        assert_retry(
+            DomainError::DownstreamError {
+                detail: "x".into(),
+                instance: i(),
+            },
+            RETRY_AFTER_TRANSIENT_SECS,
+            "DownstreamError",
+        );
+        assert_retry(
+            DomainError::ProtocolError {
+                detail: "x".into(),
+                instance: i(),
+            },
+            RETRY_AFTER_TRANSIENT_SECS,
+            "ProtocolError",
+        );
+        assert_retry(
+            DomainError::UpstreamDisabled {
+                alias: "alias".into(),
+            },
+            RETRY_AFTER_ADMIN_SECS,
+            "UpstreamDisabled",
+        );
+        assert_retry(
+            DomainError::StreamAborted {
+                detail: "x".into(),
+                instance: i(),
+            },
+            RETRY_AFTER_TRANSIENT_SECS,
+            "StreamAborted",
+        );
+        assert_retry(
+            DomainError::LinkUnavailable {
+                detail: "x".into(),
+                instance: i(),
+            },
+            RETRY_AFTER_LINK_SECS,
+            "LinkUnavailable",
+        );
+        assert_retry(
+            DomainError::CircuitBreakerOpen {
+                detail: "x".into(),
+                instance: i(),
+            },
+            RETRY_AFTER_CIRCUIT_BREAKER_SECS,
+            "CircuitBreakerOpen",
+        );
+        assert_retry(
+            DomainError::GuardRejected {
+                status: 503,
+                error_code: "UNAVAILABLE".into(),
+                detail: "x".into(),
+                instance: i(),
+                resource_id: None,
+            },
+            RETRY_AFTER_GUARD_SECS,
+            "GuardRejected 503",
+        );
+    }
+
+    #[test]
+    fn payload_too_large_now_maps_to_400() {
+        let err = DomainError::PayloadTooLarge {
+            detail: "request body exceeds 100MB limit".into(),
+            instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
+        };
+        let p: Problem = err.into();
+        // ⚠ wire change accepted in the migration plan: 413 → 400.
+        assert_eq!(p.status, 400);
+    }
+
+    #[test]
+    fn downstream_error_now_maps_to_503() {
+        let err = DomainError::DownstreamError {
+            detail: "upstream connection refused".into(),
+            instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
+        };
+        let p: Problem = err.into();
+        // ⚠ wire change accepted in the migration plan: 502 → 503.
+        assert_eq!(p.status, 503);
+    }
+
+    #[test]
+    fn protocol_error_now_maps_to_503() {
+        let err = DomainError::ProtocolError {
+            detail: "upstream HTTP/2 error".into(),
+            instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
+        };
+        let p: Problem = err.into();
+        assert_eq!(p.status, 503);
+    }
+
+    #[test]
+    fn stream_aborted_now_maps_to_503() {
+        let err = DomainError::StreamAborted {
+            detail: "upstream stream read error".into(),
+            instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
+        };
+        let p: Problem = err.into();
+        assert_eq!(p.status, 503);
     }
 
     #[test]
     fn all_error_types_produce_valid_json() {
         let errors: Vec<DomainError> = vec![
             DomainError::Validation {
+                field: "",
+                reason: "VALIDATION",
                 detail: "test".into(),
                 instance: "/test".into(),
             },
             DomainError::Conflict {
+                entity: "upstream",
+                resource: "test".into(),
                 detail: "test".into(),
             },
             DomainError::MissingTargetHost {
@@ -349,6 +849,7 @@ mod tests {
                 instance: "/test".into(),
             },
             DomainError::AuthenticationFailed {
+                reason: "AUTH_PLUGIN_FAILED",
                 detail: "test".into(),
                 instance: "/test".into(),
             },
@@ -399,6 +900,7 @@ mod tests {
                 error_code: "MISSING_HEADER".into(),
                 detail: "test".into(),
                 instance: "/test".into(),
+                resource_id: None,
             },
             DomainError::CorsOriginNotAllowed {
                 origin: "https://evil.com".into(),
@@ -425,12 +927,15 @@ mod tests {
                 instance: "/test".into(),
             },
             DomainError::PluginNotFound {
+                gts_id: "gts.cf.core.oagw.auth_plugin.v1~x.core.oagw.apikey.v1".into(),
                 detail: "test".into(),
             },
             DomainError::PluginInUse {
+                gts_id: "gts.cf.core.oagw.guard_plugin.v1~x.core.oagw.timeout.v1".into(),
                 detail: "test".into(),
             },
             DomainError::Forbidden {
+                reason: "AUTHZ_DENIED".into(),
                 detail: "test".into(),
             },
         ];
@@ -442,6 +947,7 @@ mod tests {
             assert!(parsed.get("status").is_some());
             assert!(parsed.get("title").is_some());
             assert!(parsed.get("detail").is_some());
+            assert!(parsed.get("context").is_some());
         }
     }
 
@@ -452,17 +958,22 @@ mod tests {
             id: uuid::Uuid::nil(),
         };
         let p = domain_error_to_problem(err, "/oagw/v1/upstreams/123");
-        assert_eq!(p.instance, "/oagw/v1/upstreams/123");
+        assert_eq!(p.instance.as_deref(), Some("/oagw/v1/upstreams/123"));
     }
 
     #[test]
-    fn domain_error_to_problem_preserves_existing_instance() {
+    fn domain_error_to_problem_overrides_instance() {
+        // `domain_error_to_problem` always sets the instance to the
+        // supplied request URI; per-variant `instance: String` fields are
+        // ignored when the handler plumbs the request URI through.
         let err = DomainError::Validation {
+            field: "",
+            reason: "VALIDATION",
             detail: "bad input".into(),
             instance: "/oagw/v1/upstreams".into(),
         };
         let p = domain_error_to_problem(err, "/fallback");
-        assert_eq!(p.instance, "/oagw/v1/upstreams");
+        assert_eq!(p.instance.as_deref(), Some("/fallback"));
     }
 
     #[test]
@@ -472,9 +983,10 @@ mod tests {
             error_code: "FORBIDDEN".into(),
             detail: "test".into(),
             instance: "/test".into(),
+            resource_id: None,
         };
         let p: Problem = err.into();
-        assert_eq!(p.status, StatusCode::FORBIDDEN);
+        assert_eq!(p.status, 403);
     }
 
     #[test]
@@ -484,9 +996,10 @@ mod tests {
             error_code: "UNAVAILABLE".into(),
             detail: "test".into(),
             instance: "/test".into(),
+            resource_id: None,
         };
         let p: Problem = err.into();
-        assert_eq!(p.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(p.status, 503);
     }
 
     #[test]
@@ -496,9 +1009,10 @@ mod tests {
             error_code: "OK".into(),
             detail: "test".into(),
             instance: "/test".into(),
+            resource_id: None,
         };
         let p: Problem = err.into();
-        assert_eq!(p.status, StatusCode::BAD_REQUEST);
+        assert_eq!(p.status, 400);
     }
 
     #[test]
@@ -508,9 +1022,10 @@ mod tests {
             error_code: "REDIRECT".into(),
             detail: "test".into(),
             instance: "/test".into(),
+            resource_id: None,
         };
         let p: Problem = err.into();
-        assert_eq!(p.status, StatusCode::BAD_REQUEST);
+        assert_eq!(p.status, 400);
     }
 
     #[test]
@@ -520,9 +1035,128 @@ mod tests {
             error_code: "INVALID".into(),
             detail: "test".into(),
             instance: "/test".into(),
+            resource_id: None,
         };
         let p: Problem = err.into();
-        assert_eq!(p.status, StatusCode::BAD_REQUEST);
+        assert_eq!(p.status, 400);
+    }
+
+    #[test]
+    fn guard_rejected_404_with_resource_routes_to_not_found() {
+        let err = DomainError::GuardRejected {
+            status: 404,
+            error_code: "MISSING".into(),
+            detail: "downstream object missing".into(),
+            instance: "/test".into(),
+            resource_id: Some("widget-42".into()),
+        };
+        let p: Problem = err.into();
+        assert_eq!(p.status, 404);
+        assert_eq!(p.problem_type, NOT_FOUND_TYPE);
+        assert_eq!(p.context["resource_name"], "widget-42");
+        assert_eq!(p.context["resource_type"], gts::GUARD_PLUGIN_SCHEMA);
+    }
+
+    #[test]
+    fn guard_rejected_404_without_resource_falls_back_to_failed_precondition() {
+        let err = DomainError::GuardRejected {
+            status: 404,
+            error_code: "STATE_DRIFT".into(),
+            detail: "policy precondition not met".into(),
+            instance: "/test".into(),
+            resource_id: None,
+        };
+        let p: Problem = err.into();
+        assert_eq!(p.status, 400);
+        assert_eq!(
+            p.problem_type,
+            "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~"
+        );
+        // resource_name must be absent — guard didn't supply an id.
+        assert!(p.context.get("resource_name").is_none());
+    }
+
+    #[test]
+    fn guard_rejected_409_with_resource_routes_to_already_exists() {
+        let err = DomainError::GuardRejected {
+            status: 409,
+            error_code: "DUPLICATE".into(),
+            detail: "duplicate detected".into(),
+            instance: "/test".into(),
+            resource_id: Some("invoice-7".into()),
+        };
+        let p: Problem = err.into();
+        assert_eq!(p.status, 409);
+        assert_eq!(p.problem_type, ALREADY_EXISTS_TYPE);
+        assert_eq!(p.context["resource_name"], "invoice-7");
+        assert_eq!(p.context["resource_type"], gts::GUARD_PLUGIN_SCHEMA);
+    }
+
+    #[test]
+    fn guard_rejected_409_without_resource_falls_back_to_aborted() {
+        let err = DomainError::GuardRejected {
+            status: 409,
+            error_code: "CONCURRENCY".into(),
+            detail: "rate-limited concurrent decision".into(),
+            instance: "/test".into(),
+            resource_id: None,
+        };
+        let p: Problem = err.into();
+        assert_eq!(p.status, 409);
+        assert_eq!(
+            p.problem_type,
+            "gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~"
+        );
+        assert!(p.context.get("resource_name").is_none());
+    }
+
+    #[test]
+    fn authentication_failed_carries_structured_reason_on_wire() {
+        // m1: AUTH_PLUGIN_NOT_FOUND / _FAILED / _INTERNAL must reach the
+        // wire context so clients can branch programmatically rather than
+        // parsing the human-readable detail.
+        for reason in [
+            "AUTH_PLUGIN_NOT_FOUND",
+            "AUTH_PLUGIN_FAILED",
+            "AUTH_PLUGIN_INTERNAL",
+        ] {
+            let err = DomainError::AuthenticationFailed {
+                reason,
+                detail: "plugin failed".into(),
+                instance: "/test".into(),
+            };
+            let p: Problem = err.into();
+            assert_eq!(p.status, 401);
+            assert_eq!(
+                p.problem_type,
+                "gts://gts.cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~"
+            );
+            assert_eq!(p.context["reason"], reason, "reason must reach the wire");
+        }
+    }
+
+    #[test]
+    fn forbidden_carries_pep_error_code_as_reason() {
+        // m2: when EnforcerError::Denied carries a deny_reason.error_code,
+        // it lands on the wire as `permission_denied.reason` — the structured
+        // PEP code is no longer collapsed into the prose detail.
+        let err = DomainError::forbidden_with_reason(
+            "TENANT_BOUNDARY_VIOLATION",
+            "subject not allowed to act outside its tenant",
+        );
+        let p: Problem = err.into();
+        assert_eq!(p.status, 403);
+        assert_eq!(p.context["reason"], "TENANT_BOUNDARY_VIOLATION");
+    }
+
+    #[test]
+    fn forbidden_default_reason_is_authz_denied() {
+        // The convenience constructor still works for callers that don't
+        // have a more specific code — the default is the stable
+        // `AUTHZ_DENIED` taxonomy member.
+        let err = DomainError::forbidden("policy denied");
+        let p: Problem = err.into();
+        assert_eq!(p.context["reason"], "AUTHZ_DENIED");
     }
 
     #[test]

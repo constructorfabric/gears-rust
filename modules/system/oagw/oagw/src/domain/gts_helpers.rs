@@ -64,17 +64,23 @@ pub fn format_route_gts(id: Uuid) -> String {
 pub fn parse_resource_gts(s: &str) -> Result<(String, Uuid), DomainError> {
     // Validate the full GTS identifier (anonymous UUID segments supported since 0.8.4).
     gts::GtsID::new(s).map_err(|e| DomainError::Validation {
+        field: "gts_id",
+        reason: "INVALID_GTS_FORMAT",
         detail: format!("invalid GTS identifier: {e}"),
         instance: s.to_string(),
     })?;
 
     let tilde_pos = s.rfind('~').ok_or_else(|| DomainError::Validation {
+        field: "gts_id",
+        reason: "MISSING_GTS_TILDE",
         detail: "missing '~' separator in GTS identifier".into(),
         instance: s.to_string(),
     })?;
 
     let instance = &s[tilde_pos + 1..];
     let uuid = Uuid::parse_str(instance).map_err(|e| DomainError::Validation {
+        field: "gts_id",
+        reason: "INVALID_GTS_UUID",
         detail: format!("invalid UUID in GTS instance: {e}"),
         instance: s.to_string(),
     })?;

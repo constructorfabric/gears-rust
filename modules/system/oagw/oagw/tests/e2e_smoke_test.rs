@@ -22,7 +22,7 @@ async fn e2e_chat_completion_round_trip() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-openai",
             "enabled": true,
             "tags": []
@@ -94,7 +94,7 @@ async fn e2e_sse_streaming() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-sse",
             "enabled": true,
             "tags": []
@@ -154,7 +154,7 @@ async fn e2e_auth_injection() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-auth",
             "enabled": true,
             "tags": [],
@@ -233,7 +233,7 @@ async fn e2e_disabled_upstream_returns_503() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-disabled",
             "enabled": false,
             "tags": []
@@ -261,7 +261,7 @@ async fn e2e_upstream_500_passthrough() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-errors",
             "enabled": true,
             "tags": []
@@ -311,7 +311,7 @@ async fn e2e_rate_limit_returns_429() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-rl",
             "enabled": true,
             "tags": [],
@@ -374,7 +374,7 @@ async fn e2e_management_lifecycle() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "lifecycle",
             "enabled": true,
             "tags": []
@@ -400,7 +400,7 @@ async fn e2e_management_lifecycle() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "lifecycle-v2",
             "enabled": true,
             "tags": []
@@ -460,7 +460,7 @@ async fn e2e_invalid_content_length_returns_400() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-cl",
             "enabled": true,
             "tags": []
@@ -498,9 +498,9 @@ async fn e2e_invalid_content_length_returns_400() {
         .await;
 }
 
-// 8.11: Content-Length exceeding 100MB returns 413.
+// 8.11: Content-Length exceeding 100MB returns 400.
 #[tokio::test]
-async fn e2e_body_exceeding_limit_returns_413() {
+async fn e2e_body_exceeding_limit_returns_400() {
     let h = AppHarness::builder()
         .with_credentials(vec![("cred://openai-key".into(), "sk-e2e-test-key".into())])
         .build()
@@ -513,7 +513,7 @@ async fn e2e_body_exceeding_limit_returns_413() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-big",
             "enabled": true,
             "tags": []
@@ -547,7 +547,7 @@ async fn e2e_body_exceeding_limit_returns_413() {
             http::header::CONTENT_LENGTH,
             http::HeaderValue::from_static("200000000"),
         )
-        .expect_status(413)
+        .expect_status(400)
         .await;
 }
 
@@ -580,7 +580,7 @@ async fn e2e_upstream_timeout_returns_504() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-timeout",
             "enabled": true,
             "tags": []
@@ -633,7 +633,7 @@ async fn e2e_authz_forbidden_returns_403() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-forbidden",
             "enabled": true,
             "tags": []
@@ -670,10 +670,10 @@ async fn e2e_authz_forbidden_returns_403() {
 
     let body = resp.json();
     assert_eq!(body["status"], 403);
-    assert_eq!(body["title"], "Forbidden");
+    assert_eq!(body["title"], "Permission Denied");
     assert_eq!(
         body["type"],
-        "gts.cf.core.errors.err.v1~cf.oagw.authz.forbidden.v1"
+        "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
     );
 }
 
@@ -705,7 +705,7 @@ async fn e2e_authz_request_carries_tenant_context() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-authz-ctx",
             "enabled": true,
             "tags": []
@@ -776,7 +776,7 @@ async fn setup_rate_limited_upstream(
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": alias,
             "enabled": true,
             "tags": [],
@@ -1130,7 +1130,7 @@ async fn e2e_rate_limit_route_level_enforcement() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-rl-route",
             "enabled": true,
             "tags": []
@@ -1188,7 +1188,7 @@ async fn e2e_rate_limit_upstream_and_route_both_applied() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": "gts.cf.core.oagw.protocol.v1~x.core.oagw.http.v1",
             "alias": "e2e-rl-dual",
             "enabled": true,
             "tags": [],

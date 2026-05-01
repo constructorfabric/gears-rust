@@ -81,7 +81,7 @@ async def test_proxy_authz_forbidden_nil_tenant(
             assert resp.headers.get("x-oagw-error-source") == "gateway"
             body = resp.json()
             assert body["status"] == 403
-            assert body["title"] == "Forbidden"
-            assert body["type"] == "gts.cf.core.errors.err.v1~cf.oagw.authz.forbidden.v1"
+            assert body["title"] == "Permission Denied"
+            assert body["type"] == "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
         finally:
             await delete_upstream(client, oagw_base_url, oagw_headers, uid)

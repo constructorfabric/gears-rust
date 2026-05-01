@@ -50,6 +50,8 @@ pub fn validate_cors_config(config: &CorsConfig) -> Result<(), DomainError> {
     // Credentials + wildcard origin is forbidden per the Fetch specification.
     if config.allow_credentials && config.allowed_origins.iter().any(|o| o == "*") {
         return Err(DomainError::Validation {
+            field: "cors.allow_credentials",
+            reason: "CORS_CREDENTIALS_WITH_WILDCARD",
             detail: "allow_credentials cannot be true when allowed_origins contains '*'".into(),
             instance: String::new(),
         });
@@ -63,6 +65,8 @@ pub fn validate_cors_config(config: &CorsConfig) -> Result<(), DomainError> {
         }
         if !is_valid_origin(origin) {
             return Err(DomainError::Validation {
+                field: "cors.allowed_origins",
+                reason: "INVALID_CORS_ORIGIN",
                 detail: format!(
                     "invalid origin '{origin}': must be '*' or a valid origin (e.g. https://example.com)"
                 ),

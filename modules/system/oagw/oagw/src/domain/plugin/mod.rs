@@ -69,6 +69,12 @@ pub enum GuardDecision {
         error_code: String,
         /// Human-readable explanation of the rejection.
         detail: String,
+        /// Identifier of the resource the rejection refers to, when the
+        /// guard can name one. Lets the REST mapping route 404/409
+        /// rejections to the canonical `not_found` / `already_exists`
+        /// categories with a real `resource_name` instead of falling
+        /// back to `failed_precondition` / `aborted`.
+        resource_id: Option<String>,
     },
 }
 

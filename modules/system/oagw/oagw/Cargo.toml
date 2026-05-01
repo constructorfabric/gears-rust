@@ -24,6 +24,7 @@ test-utils = ["axum/ws", "dep:async-stream", "dep:futures", "dep:tower", "dep:ru
 oagw-sdk = { path = "../oagw-sdk", package="cf-oagw-sdk", version = "0.5.0", features = ["axum"] }
 modkit = { workspace = true }
 modkit-auth = { workspace = true }
+modkit-canonical-errors = { workspace = true, features = ["axum"] }
 modkit-http = { workspace = true }
 modkit-security = { workspace = true }
 modkit-macros = { workspace = true }

@@ -195,13 +195,13 @@ fn domain_err_to_sdk(err: DomainError) -> ServiceGatewayError {
             entity: entity.to_string(),
             instance: format!("{entity}/{id}"),
         },
-        DomainError::Conflict { detail } => ServiceGatewayError::ValidationError {
+        DomainError::Conflict { detail, .. } => ServiceGatewayError::ValidationError {
             detail,
             instance: String::new(),
         },
-        DomainError::Validation { detail, instance } => {
-            ServiceGatewayError::ValidationError { detail, instance }
-        }
+        DomainError::Validation {
+            detail, instance, ..
+        } => ServiceGatewayError::ValidationError { detail, instance },
         DomainError::UpstreamDisabled { alias } => ServiceGatewayError::UpstreamDisabled {
             detail: format!("upstream '{alias}' is disabled"),
             instance: String::new(),
@@ -219,9 +219,15 @@ fn domain_err_to_sdk(err: DomainError) -> ServiceGatewayError {
         DomainError::UnknownTargetHost { detail, instance } => {
             ServiceGatewayError::UnknownTargetHost { detail, instance }
         }
-        DomainError::AuthenticationFailed { detail, instance } => {
-            ServiceGatewayError::AuthenticationFailed { detail, instance }
-        }
+        DomainError::AuthenticationFailed {
+            reason,
+            detail,
+            instance,
+        } => ServiceGatewayError::AuthenticationFailed {
+            reason: reason.to_string(),
+            detail,
+            instance,
+        },
         DomainError::PayloadTooLarge { detail, instance } => {
             ServiceGatewayError::PayloadTooLarge { detail, instance }
         }
@@ -255,20 +261,24 @@ fn domain_err_to_sdk(err: DomainError) -> ServiceGatewayError {
             error_code,
             detail,
             instance,
+            resource_id,
         } => ServiceGatewayError::GuardRejected {
             status,
             error_code,
             detail,
             instance,
+            resource_id,
         },
         DomainError::CorsOriginNotAllowed {
             origin, instance, ..
         } => ServiceGatewayError::Forbidden {
+            reason: "CORS_ORIGIN_NOT_ALLOWED".into(),
             detail: format!("CORS origin not allowed: {origin} (instance: {instance})"),
         },
         DomainError::CorsMethodNotAllowed {
             method, instance, ..
         } => ServiceGatewayError::Forbidden {
+            reason: "CORS_METHOD_NOT_ALLOWED".into(),
             detail: format!("CORS method not allowed: {method} (instance: {instance})"),
         },
         DomainError::StreamAborted { detail, instance } => {
@@ -283,9 +293,15 @@ fn domain_err_to_sdk(err: DomainError) -> ServiceGatewayError {
         DomainError::IdleTimeout { detail, instance } => {
             ServiceGatewayError::IdleTimeout { detail, instance }
         }
-        DomainError::PluginNotFound { detail } => ServiceGatewayError::PluginNotFound { detail },
-        DomainError::PluginInUse { detail } => ServiceGatewayError::PluginInUse { detail },
-        DomainError::Forbidden { detail } => ServiceGatewayError::Forbidden { detail },
+        DomainError::PluginNotFound { gts_id, detail } => {
+            ServiceGatewayError::PluginNotFound { gts_id, detail }
+        }
+        DomainError::PluginInUse { gts_id, detail } => {
+            ServiceGatewayError::PluginInUse { gts_id, detail }
+        }
+        DomainError::Forbidden { reason, detail } => {
+            ServiceGatewayError::Forbidden { reason, detail }
+        }
     }
 }
 
@@ -848,6 +864,8 @@ mod tests {
     #[test]
     fn domain_err_validation_maps_to_sdk() {
         let err = DomainError::Validation {
+            field: "",
+            reason: "VALIDATION",
             detail: "bad input".into(),
             instance: "/test".into(),
         };

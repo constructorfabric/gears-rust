@@ -45,6 +45,7 @@ impl GuardPlugin for RequiredHeadersGuardPlugin {
                 status: 400,
                 error_code: "REQUIRED_HEADER_MISSING".into(),
                 detail: format!("Missing required header: {missing}"),
+                resource_id: None,
             });
         }
 
@@ -62,6 +63,7 @@ impl GuardPlugin for RequiredHeadersGuardPlugin {
                 status: 502,
                 error_code: "REQUIRED_HEADER_MISSING".into(),
                 detail: format!("Upstream response missing required header: {missing}"),
+                resource_id: None,
             });
         }
 

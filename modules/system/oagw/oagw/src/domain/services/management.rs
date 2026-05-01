@@ -476,11 +476,15 @@ impl ControlPlaneServiceImpl {
             // Check for any overlapping method.
             for m in &candidate_http.methods {
                 if existing_http.methods.contains(m) {
-                    return Err(DomainError::conflict(format!(
-                        "route overlap: an enabled route already exists on upstream '{}' \
-                         with path '{}', priority {}, method {:?}",
-                        candidate.upstream_id, candidate_http.path, candidate.priority, m
-                    )));
+                    return Err(DomainError::conflict(
+                        "route",
+                        format!("{}{} {:?}", candidate.upstream_id, candidate_http.path, m),
+                        format!(
+                            "route overlap: an enabled route already exists on upstream '{}' \
+                             with path '{}', priority {}, method {:?}",
+                            candidate.upstream_id, candidate_http.path, candidate.priority, m
+                        ),
+                    ));
                 }
             }
         }

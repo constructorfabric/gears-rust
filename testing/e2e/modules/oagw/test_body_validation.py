@@ -74,7 +74,15 @@ async def test_invalid_content_length_returns_400(
 async def test_body_exceeding_limit_returns_413(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
 ):
-    """Content-Length exceeding 100MB returns 413."""
+    """Content-Length exceeding the api-gateway body limit returns 413.
+
+    The rejection happens at the api-gateway's `RequestBodyLimitLayer`
+    (e2e default: 64 MB, see config/e2e-local.yaml) before the request
+    reaches the oagw proxy handler — that layer emits a plain-text 413.
+    A request that hits oagw's own 100 MB body cap surfaces as a
+    canonical-error 400 (`failed_precondition`), but is unreachable here
+    because the gateway limit is lower than oagw's.
+    """
     alias = unique_alias("body-big")
     async with httpx.AsyncClient(timeout=10.0) as client:
         upstream = await create_upstream(

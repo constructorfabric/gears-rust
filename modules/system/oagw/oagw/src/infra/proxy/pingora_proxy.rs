@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::model::{Endpoint, Scheme};
 use crate::domain::services::{EndpointSelector, SelectedEndpoint};
-use modkit::api::Problem;
+use modkit_canonical_errors::Problem;
 
 // ---------------------------------------------------------------------------
 // Internal header names (D9)
@@ -770,7 +770,7 @@ impl ProxyHttp for PingoraProxy {
         };
 
         let problem: Problem = domain_err.into();
-        let status = problem.status.as_u16();
+        let status = problem.status;
         let body_bytes = Bytes::from(serde_json::to_vec(&problem).unwrap_or_default());
 
         if let Ok(mut resp) = ResponseHeader::build(status, Some(body_bytes.len())) {

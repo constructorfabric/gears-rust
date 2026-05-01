@@ -13,8 +13,16 @@ pub enum ServiceGatewayError {
     #[error("{detail}")]
     UnknownTargetHost { detail: String, instance: String },
 
-    #[error("{detail}")]
-    AuthenticationFailed { detail: String, instance: String },
+    #[error("[{reason}] {detail}")]
+    AuthenticationFailed {
+        /// Stable, machine-readable subcategory of the failure
+        /// (`AUTH_PLUGIN_NOT_FOUND`, `AUTH_PLUGIN_FAILED`,
+        /// `AUTH_PLUGIN_INTERNAL`). Mirrors the wire `reason`
+        /// emitted by the canonical `unauthenticated` mapping.
+        reason: String,
+        detail: String,
+        instance: String,
+    },
 
     #[error("{entity} not found")]
     NotFound { entity: String, instance: String },
@@ -57,6 +65,10 @@ pub enum ServiceGatewayError {
         error_code: String,
         detail: String,
         instance: String,
+        /// Optional identifier of the resource the rejection refers to.
+        /// When present, the REST mapping uses it as `resource_name` for
+        /// 404/409 rejections routed through `not_found` / `already_exists`.
+        resource_id: Option<String>,
     },
 
     #[error("{detail}")]
@@ -71,15 +83,21 @@ pub enum ServiceGatewayError {
     #[error("{detail}")]
     IdleTimeout { detail: String, instance: String },
 
-    #[error("plugin not found: {detail}")]
-    PluginNotFound { detail: String },
+    #[error("plugin not found: {gts_id}: {detail}")]
+    PluginNotFound { gts_id: String, detail: String },
 
-    #[error("plugin in use: {detail}")]
-    PluginInUse { detail: String },
+    #[error("plugin in use: {gts_id}: {detail}")]
+    PluginInUse { gts_id: String, detail: String },
 
     /// The caller is authenticated but not authorized to perform the requested action.
-    #[error("access forbidden: {detail}")]
-    Forbidden { detail: String },
+    #[error("access forbidden [{reason}]: {detail}")]
+    Forbidden {
+        /// Machine-readable code identifying the policy rule or subsystem
+        /// that denied the request. Mirrors the wire `permission_denied.reason`
+        /// field; clients branch on this rather than on `detail`.
+        reason: String,
+        detail: String,
+    },
 }
 
 /// Errors produced by the streaming helpers.

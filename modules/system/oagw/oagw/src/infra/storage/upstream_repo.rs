@@ -38,10 +38,11 @@ impl UpstreamRepository for InMemoryUpstreamRepo {
         // Atomic alias uniqueness check via entry API.
         match self.alias_index.entry(alias_key) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
-                return Err(RepositoryError::Conflict(format!(
-                    "alias '{}' already exists for tenant",
-                    upstream.alias
-                )));
+                return Err(RepositoryError::Conflict {
+                    entity: "upstream",
+                    resource: upstream.alias.clone(),
+                    detail: format!("alias '{}' already exists for tenant", upstream.alias),
+                });
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 entry.insert(upstream.id);
@@ -120,10 +121,11 @@ impl UpstreamRepository for InMemoryUpstreamRepo {
         if old.alias != upstream.alias {
             let new_alias_key = (tenant_id, upstream.alias.clone());
             if self.alias_index.contains_key(&new_alias_key) {
-                return Err(RepositoryError::Conflict(format!(
-                    "alias '{}' already exists for tenant",
-                    upstream.alias
-                )));
+                return Err(RepositoryError::Conflict {
+                    entity: "upstream",
+                    resource: upstream.alias.clone(),
+                    detail: format!("alias '{}' already exists for tenant", upstream.alias),
+                });
             }
             self.alias_index.remove(&(tenant_id, old.alias.clone()));
             self.alias_index.insert(new_alias_key, id);
@@ -229,7 +231,7 @@ mod tests {
 
         repo.create(make_upstream(tenant, "openai")).await.unwrap();
         let err = repo.create(make_upstream(tenant, "openai")).await;
-        assert!(matches!(err, Err(RepositoryError::Conflict(_))));
+        assert!(matches!(err, Err(RepositoryError::Conflict { .. })));
     }
 
     #[tokio::test]
@@ -274,7 +276,7 @@ mod tests {
         // Try to rename u2's alias to "openai" (already taken by u1).
         u2.alias = "openai".into();
         let result = repo.update(u2).await;
-        assert!(matches!(result, Err(RepositoryError::Conflict(_))));
+        assert!(matches!(result, Err(RepositoryError::Conflict { .. })));
 
         // Original alias mappings are intact.
         let fetched_u1 = repo.get_by_alias(tenant, "openai").await.unwrap();

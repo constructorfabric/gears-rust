@@ -19,6 +19,8 @@ pub fn build_upstream_url(
         Scheme::Wt => "https",
         Scheme::Grpc => {
             return Err(DomainError::Validation {
+                field: "endpoint.scheme",
+                reason: "UNSUPPORTED_SCHEME",
                 detail: "gRPC scheme is not supported for HTTP proxy".into(),
                 instance: String::new(),
             });

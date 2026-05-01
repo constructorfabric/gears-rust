@@ -1,6 +1,7 @@
-use modkit::api::problem::Problem;
+use modkit_canonical_errors::Problem;
 use uuid::Uuid;
 
+use crate::domain::error::DomainError;
 use crate::domain::gts_helpers;
 use crate::domain::model::ListQuery;
 
@@ -12,13 +13,13 @@ pub fn parse_gts_id(gts_str: &str, expected_schema: &str, instance: &str) -> Res
     let (schema, uuid) = gts_helpers::parse_resource_gts(gts_str).map_err(Problem::from)?;
     let expected_prefix = expected_schema.trim_end_matches('~');
     if schema != expected_prefix {
-        return Err(Problem::new(
-            http::StatusCode::BAD_REQUEST,
-            "Validation Error",
-            format!("expected GTS schema '{expected_schema}' but got '{schema}~'"),
-        )
-        .with_type("gts.cf.core.errors.err.v1~cf.oagw.validation.error.v1")
-        .with_instance(instance));
+        let err = DomainError::Validation {
+            field: "gts_id",
+            reason: "INVALID_GTS_SCHEMA",
+            detail: format!("expected GTS schema '{expected_schema}' but got '{schema}~'"),
+            instance: instance.to_string(),
+        };
+        return Err(err.into());
     }
     Ok(uuid)
 }

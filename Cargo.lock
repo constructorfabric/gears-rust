@@ -2107,6 +2107,7 @@ dependencies = [
  "cf-credstore-sdk",
  "cf-modkit",
  "cf-modkit-auth",
+ "cf-modkit-canonical-errors",
  "cf-modkit-http",
  "cf-modkit-macros",
  "cf-modkit-security",
