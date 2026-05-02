@@ -9,6 +9,96 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/cyberfabric/cyberfabric-core/compare/cf-tr-authz-plugin-v0.1.1...cf-tr-authz-plugin-v0.1.2) - 2026-05-02
+
+### Other
+
+- massive renaming of different artifacts from HyperSport -> CyberFabric to finalize project transition under CyberFabric (by @Artifizer) - #1805
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.20](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-tr-plugin-v0.1.19...cf-static-tr-plugin-v0.1.20) - 2026-05-02
+
+### Other
+
+- massive renaming of different artifacts from HyperSport -> CyberFabric to finalize project transition under CyberFabric (by @Artifizer) - #1805
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.17](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-credstore-plugin-v0.1.16...cf-static-credstore-plugin-v0.1.17) - 2026-05-02
+
+### Other
+
+- massive renaming of different artifacts from HyperSport -> CyberFabric to finalize project transition under CyberFabric (by @Artifizer) - #1805
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.19](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authz-plugin-v0.1.18...cf-static-authz-plugin-v0.1.19) - 2026-05-02
+
+### Other
+
+- massive renaming of different artifacts from HyperSport -> CyberFabric to finalize project transition under CyberFabric (by @Artifizer) - #1805
+
+### Contributors
+
+* @Artifizer
+
+## [0.2.10](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authn-plugin-v0.2.9...cf-static-authn-plugin-v0.2.10) - 2026-05-02
+
+### Other
+
+- massive renaming of different artifacts from HyperSport -> CyberFabric to finalize project transition under CyberFabric (by @Artifizer) - #1805
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.21](https://github.com/cyberfabric/cyberfabric-core/compare/cf-single-tenant-tr-plugin-v0.1.20...cf-single-tenant-tr-plugin-v0.1.21) - 2026-05-02
+
+### Other
+
+- massive renaming of different artifacts from HyperSport -> CyberFabric to finalize project transition under CyberFabric (by @Artifizer) - #1805
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.2](https://github.com/cyberfabric/cyberfabric-core/compare/cf-rg-tr-plugin-v0.1.1...cf-rg-tr-plugin-v0.1.2) - 2026-05-02
+
+### Other
+
+- massive renaming of different artifacts from HyperSport -> CyberFabric to finalize project transition under CyberFabric (by @Artifizer) - #1805
+
+### Contributors
+
+* @Artifizer
+
+## [0.6.5](https://github.com/cyberfabric/cyberfabric-core/compare/cf-modkit-http-v0.6.4...cf-modkit-http-v0.6.5) - 2026-05-02
+
+### Other
+
+- update rand 0.9 -> 0.10 (by @Artifizer) - #1783
+
+### Contributors
+
+* @Artifizer
+
+## [0.6.9](https://github.com/cyberfabric/cyberfabric-core/compare/cf-modkit-v0.6.8...cf-modkit-v0.6.9) - 2026-05-02
+
+### Other
+
+- massive renaming of different artifacts from HyperSport -> CyberFabric to finalize project transition under CyberFabric (by @Artifizer) - #1805
+
+### Contributors
+
+* @Artifizer
+
 ## [0.1.1](https://github.com/cyberfabric/cyberfabric-core/compare/cf-tr-authz-plugin-v0.1.0...cf-tr-authz-plugin-v0.1.1) - 2026-05-01
 
 ### Other
