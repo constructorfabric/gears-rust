@@ -1,6 +1,6 @@
 # ModKit Plugin Architecture
 
-This guide explains how to create **plugin-based modules** in HyperSpot/ModKit. Plugins allow multiple implementations of the same interface to coexist, with the main module selecting the appropriate plugin at runtime based on configuration or
+This guide explains how to create **plugin-based modules** in CyberFabric/ModKit. Plugins allow multiple implementations of the same interface to coexist, with the main module selecting the appropriate plugin at runtime based on configuration or
 context.
 
 ---
@@ -894,4 +894,4 @@ This ensures:
 - [docs/modkit_unified_system/03_clienthub_and_plugins.md](./modkit_unified_system/03_clienthub_and_plugins.md) — Typed ClientHub and plugin architecture
 - [docs/modkit_unified_system/04_rest_operation_builder.md](./modkit_unified_system/04_rest_operation_builder.md) — REST wiring with OperationBuilder
 - [ModKit Unified System](./modkit_unified_system/README.md) — Module creation and development guide
-- [ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md) — HyperSpot architecture overview
+- [ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md) — CyberFabric architecture overview

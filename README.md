@@ -3,7 +3,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cyberfabric/cyberfabric-core/badge)](https://scorecard.dev/viewer/?uri=github.com/cyberfabric/cyberfabric-core)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12050/badge)](https://www.bestpractices.dev/projects/12050)
 
-**Cyber Fabric** is a modular, high-performance platform for building modern enterprise-grade SaaS services in Rust. It provides a comprehensive framework for building scalable AI-powered applications with automatic REST API generation, comprehensive OpenAPI documentation, and a extremely flexible modular architecture.
+**Cyber Fabric** is a modular, high-performance platform for building modern enterprise-grade SaaS services primarily in Rust. It provides a comprehensive framework for building scalable AI-powered applications with automatic REST API generation, comprehensive OpenAPI documentation, and a extremely flexible modular architecture.
 
 **Key Philosophy:**
 - **Modular by Design**: Everything is a Module - composable, independent units with gateway patterns for pluggable workers
@@ -15,7 +15,7 @@
 - **Quality First**: 90%+ test coverage target with unit, integration, E2E, performance, and security testing
 - **Universal Deployment**: Single codebase runs on cloud, on-prem Windows/Linux workstation, or mobile
 - **Developer Friendly**: AI-assisted code generation, automatic OpenAPI docs, DDD-light structure, and type-safe APIs
-- **Written in Rust**: Optimize recurring engineering work with compile-time safety and deep static analysis (including project-specific lints) so more issues are prevented before review/runtime.
+- **Core modules Written in Rust**: Optimize recurring engineering work with compile-time safety and deep static analysis (including project-specific lints) so more issues are prevented before review/runtime.
 - **Keep Monorepo while possible**: Keep core modules and contracts in one place to enable atomic refactors, consistent tooling/CI, and realistic local build + end-to-end testing; split only when scale forces it.
 
 See the full architecture [MANIFEST](docs/ARCHITECTURE_MANIFEST.md) for more details, including rationales behind Rust and Monorepo choice.
@@ -57,13 +57,13 @@ make deny       # License and dependency checks
 make quickstart
 
 # Option 1: Run with SQLite database (recommended for development)
-cargo run --bin hyperspot-server -- --config config/quickstart.yaml run
+cargo run --bin cf-server -- --config config/quickstart.yaml run
 
 # Option 2: Run without database (no-db mode)
-cargo run --bin hyperspot-server -- --config config/no-db.yaml run
+cargo run --bin cf-server -- --config config/no-db.yaml run
 
 # Option 3: Run with mock in-memory database for testing
-cargo run --bin hyperspot-server -- --config config/quickstart.yaml --mock run
+cargo run --bin cf-server -- --config config/quickstart.yaml --mock run
 
 # Check if server is ready (detailed JSON response)
 curl http://127.0.0.1:8087/health
@@ -83,7 +83,7 @@ curl http://127.0.0.1:8087/healthz
 
 # Core server configuration (global section)
 server:
-  home_dir: "~/.hyperspot"
+  home_dir: "~/.cyberfabric"
 
 # Database configuration (global section)
 database:
@@ -95,7 +95,7 @@ database:
 logging:
   default:
     console_level: info
-    file: "logs/hyperspot.log"
+    file: "logs/cyberfabric.log"
     file_level: warn
     max_age_days: 28
     max_backups: 3
@@ -146,7 +146,7 @@ Cyber Fabric uses industry-standard specification templates (IEEE, ISO, MADR) to
 
 # Global server configuration
 server:
-  home_dir: "~/.hyperspot"
+  home_dir: "~/.cyberfabric"
 
 # Database configuration
 database:
@@ -164,7 +164,7 @@ database:
 logging:
   default:
     console_level: info
-    file: "logs/hyperspot.log"
+    file: "logs/cyberfabric.log"
     file_level: warn
     max_age_days: 28
     max_backups: 3
@@ -188,12 +188,12 @@ modules:
 
 ### Environment Variable Overrides
 
-Configuration supports environment variable overrides with `HYPERSPOT_` prefix:
+Configuration supports environment variable overrides with `CYBERFABRIC_` prefix:
 
 ```bash
-export HYPERSPOT_DATABASE_URL="postgres://user:pass@localhost/db"
-export HYPERSPOT_MODULES_api_gateway_BIND_ADDR="0.0.0.0:8080"
-export HYPERSPOT_LOGGING_DEFAULT_CONSOLE_LEVEL="debug"
+export CYBERFABRIC_DATABASE_URL="postgres://user:pass@localhost/db"
+export CYBERFABRIC_MODULES_api_gateway_BIND_ADDR="0.0.0.0:8080"
+export CYBERFABRIC_LOGGING_DEFAULT_CONSOLE_LEVEL="debug"
 ```
 
 ## Testing

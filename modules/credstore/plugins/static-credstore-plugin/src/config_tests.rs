@@ -13,7 +13,7 @@ secrets:
 
     let cfg: StaticCredStorePluginConfig = serde_saphyr::from_str(yaml).unwrap();
 
-    assert_eq!(cfg.vendor, "hyperspot");
+    assert_eq!(cfg.vendor, "cyberfabric");
     assert_eq!(cfg.priority, 100);
     assert_eq!(cfg.secrets.len(), 1);
     assert!(cfg.secrets[0].sharing.is_none());
@@ -71,7 +71,7 @@ secrets:
 #[test]
 fn config_rejects_unknown_fields() {
     let yaml = r#"
-vendor: "hyperspot"
+vendor: "cyberfabric"
 priority: 100
 unexpected: true
 "#;
@@ -90,6 +90,6 @@ fn config_allows_empty_secrets() {
         Err(e) => panic!("failed to parse config: {e}"),
     };
     assert!(cfg.secrets.is_empty());
-    assert_eq!(cfg.vendor, "hyperspot");
+    assert_eq!(cfg.vendor, "cyberfabric");
     assert_eq!(cfg.priority, 100);
 }

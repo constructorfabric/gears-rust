@@ -1,4 +1,4 @@
-// simulated_dir=/hyperspot/modules/example/src/domain/
+// simulated_dir=/cyberfabric/modules/example/src/domain/
 
 // Test: Domain structs without #[domain_model] should trigger lint
 

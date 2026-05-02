@@ -61,7 +61,7 @@ impl Module for StaticAuthNPlugin {
 
         // Generate plugin instance ID
         let instance_id = AuthNResolverPluginSpecV1::gts_make_instance_id(
-            "hyperspot.builtin.static_authn_resolver.plugin.v1",
+            "cf.builtin.static_authn_resolver.plugin.v1",
         );
 
         // Register plugin instance in types-registry

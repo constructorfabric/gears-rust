@@ -34,14 +34,14 @@ Create a configuration file (e.g., `config/with-tracing.yaml`):
 
 ```yaml
 server:
-  home_dir: "~/.hyperspot"
+  home_dir: "~/.cyberfabric"
   host: "127.0.0.1"
   port: 8087
 
 # Enable OpenTelemetry tracing
 tracing:
   enabled: true
-  service_name: "hyperspot-api"
+  service_name: "cyberfabric-api"
 
   exporter:
     kind: "otlp_grpc"
@@ -62,18 +62,18 @@ tracing:
 logging:
   default:
     console_level: "info"
-    file: "logs/hyperspot.log"
+    file: "logs/cyberfabric.log"
 ```
 
 ### 3. Run the Server
 
 ```bash
-cargo run --bin hyperspot-server -- --config config/with-tracing.yaml
+cargo run --bin cf-server -- --config config/with-tracing.yaml
 ```
 
 ### 4. View Traces
 
-Open [http://localhost:16686](http://localhost:16686) and search for service `hyperspot-api`.
+Open [http://localhost:16686](http://localhost:16686) and search for service `cyberfabric-api`.
 
 ---
 
@@ -118,7 +118,7 @@ services:
 ```yaml
 tracing:
   enabled: true
-  service_name: "hyperspot-api"
+  service_name: "cyberfabric-api"
 
   exporter:
     kind: "otlp_grpc"
@@ -133,18 +133,18 @@ tracing:
   resource:
     service.version: "1.3.7"
     deployment.environment: "dev"
-    service.namespace: "hyperspot"
+    service.namespace: "cyberfabric"
 ```
 
 ### 3. Run the Server
 
 ```bash
-cargo run --bin hyperspot-server -- --config config/with-tracing.yaml
+cargo run --bin cf-server -- --config config/with-tracing.yaml
 ```
 
 ### 4. View Traces
 
-Open [http://localhost:14318](http://localhost:14318) and search for service `hyperspot-api`.
+Open [http://localhost:14318](http://localhost:14318) and search for service `cyberfabric-api`.
 
 ---
 
@@ -222,9 +222,9 @@ tracing:
   resource:
     service.version: "1.2.3"
     deployment.environment: "production"
-    service.namespace: "hyperspot"
+    service.namespace: "cyberfabric"
     k8s.cluster.name: "prod-cluster"
-    k8s.namespace.name: "hyperspot-ns"
+    k8s.namespace.name: "cyberfabric-ns"
 ```
 
 ### HTTP Options
@@ -354,7 +354,7 @@ You can override any config via environment variables:
 ```bash
 # Enable tracing
 export APP__TRACING__ENABLED=true
-export APP__TRACING__SERVICE_NAME=hyperspot-prod
+export APP__TRACING__SERVICE_NAME=cyberfabric-prod
 
 # Configure exporter
 export APP__TRACING__EXPORTER__KIND=otlp_grpc

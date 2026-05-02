@@ -214,16 +214,16 @@ pub fn is_in_modkit_db_path(source_map: &SourceMap, span: Span) -> bool {
         || check_span_path(source_map, span, "modkit-db/src/")
 }
 
-/// Check if span is within apps/hyperspot-server - the main server binary
+/// Check if span is within apps/cf-server - the main server binary
 /// This path is excluded from sqlx restrictions as it needs driver linkage workaround
-pub fn is_in_hyperspot_server_path(source_map: &SourceMap, span: Span) -> bool {
+pub fn is_in_cyberfabric_server_path(source_map: &SourceMap, span: Span) -> bool {
     // Multiple checks handle different path contexts:
-    // - "/apps/hyperspot-server/" - absolute path from workspace root
-    // - "apps/hyperspot-server/" - relative path in some contexts
-    // - "hyperspot-server/src/" - simulated_dir paths in tests
-    check_span_path(source_map, span, "/apps/hyperspot-server/")
-        || check_span_path(source_map, span, "apps/hyperspot-server/")
-        || check_span_path(source_map, span, "hyperspot-server/src/")
+    // - "/apps/cf-server/" - absolute path from workspace root
+    // - "apps/cf-server/" - relative path in some contexts
+    // - "cf-server/src/" - simulated_dir paths in tests
+    check_span_path(source_map, span, "/apps/cf-server/")
+        || check_span_path(source_map, span, "apps/cf-server/")
+        || check_span_path(source_map, span, "cf-server/src/")
 }
 
 pub fn check_derive_attrs<F>(item: &rustc_ast::Item, mut f: F)
@@ -540,7 +540,7 @@ fn get_path_str_from_session(source_map: &SourceMap, span: Span) -> Option<Strin
 }
 
 /// Extract simulated directory path from a comment at the start of a file.
-/// Looks for a comment like: `// simulated_dir=/hyperspot/modules/some_module/contract/`
+/// Looks for a comment like: `// simulated_dir=/cyberfabric/modules/some_module/contract/`
 /// Returns None if no such comment is found.
 ///
 /// Only checks files in temporary directories to avoid unnecessary file I/O in production.

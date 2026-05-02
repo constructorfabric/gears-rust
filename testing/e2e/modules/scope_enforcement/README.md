@@ -7,12 +7,12 @@ early rejection of requests based on token scopes without calling the PDP.
 
 1. Build the server with required features:
    ```bash
-   cargo build --release --bin hyperspot-server --features users-info-example,static-authn,static-authz,static-tenants
+   cargo build --release --bin cf-server --features users-info-example,static-authn,static-authz,static-tenants
    ```
 
 2. Start the server with the scope enforcement config:
    ```bash
-   cargo run --release --bin hyperspot-server --features users-info-example,static-authn,static-authz,static-tenants \
+   cargo run --release --bin cf-server --features users-info-example,static-authn,static-authz,static-tenants \
      -- --config config/e2e-scope-enforcement.yaml
    ```
 

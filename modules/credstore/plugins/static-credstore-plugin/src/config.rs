@@ -22,7 +22,7 @@ pub struct StaticCredStorePluginConfig {
 impl Default for StaticCredStorePluginConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             priority: 100,
             secrets: Vec::new(),
         }

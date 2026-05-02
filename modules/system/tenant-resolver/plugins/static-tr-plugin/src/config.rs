@@ -22,7 +22,7 @@ pub struct StaticTrPluginConfig {
 impl Default for StaticTrPluginConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             priority: 100,
             tenants: Vec::new(),
         }

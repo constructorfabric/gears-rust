@@ -17,7 +17,7 @@ pub struct CredStoreConfig {
 impl Default for CredStoreConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
         }
     }
 }

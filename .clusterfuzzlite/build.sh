@@ -1,5 +1,5 @@
 #!/bin/bash -eu
-# Copyright 2026 HyperSpot Contributors
+# Copyright 2026 CyberFabric Foundation
 # SPDX-License-Identifier: Apache-2.0
 
 # Update Rust toolchain to latest nightly (project requires Rust 1.95+)
@@ -12,7 +12,7 @@ rustup component add rust-src --toolchain nightly
 export RUSTUP_TOOLCHAIN=nightly
 echo "Rust version: $(rustc --version)"
 
-cd $SRC/hyperspot
+cd $SRC/cyberfabric
 
 # Build all fuzz targets with optimization
 cargo fuzz build -O --fuzz-dir tools/fuzz

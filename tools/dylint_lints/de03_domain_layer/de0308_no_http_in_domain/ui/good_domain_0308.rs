@@ -1,4 +1,4 @@
-// simulated_dir=/hyperspot/modules/some_module/domain/service.rs
+// simulated_dir=/cyberfabric/modules/some_module/domain/service.rs
 // Test file for DE0308: Good domain code - no HTTP types
 #![allow(unused_imports)]
 #![allow(dead_code)]

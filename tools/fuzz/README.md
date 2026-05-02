@@ -1,4 +1,4 @@
-# Fuzzing Infrastructure for HyperSpot
+# Fuzzing Infrastructure for CyberFabric
 
 This directory contains fuzzing infrastructure using [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) and [ClusterFuzzLite](https://google.github.io/clusterfuzzlite/).
 

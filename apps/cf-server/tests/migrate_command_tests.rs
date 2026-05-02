@@ -3,21 +3,21 @@
 //! End-to-end tests for the `migrate` command
 //!
 //! These tests verify that the migrate CLI command works correctly
-//! by invoking the hyperspot-server binary and checking its output.
+//! by invoking the cf-server binary and checking its output.
 
 use std::process::Command;
 
-/// Helper to get the path to the hyperspot-server binary
-fn hyperspot_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_hyperspot-server")
+/// Helper to get the path to the cf-server binary
+fn cyberfabric_binary() -> &'static str {
+    env!("CARGO_BIN_EXE_cf-server")
 }
 
 #[test]
 fn test_migrate_command_help_text() {
-    let output = Command::new(hyperspot_binary())
+    let output = Command::new(cyberfabric_binary())
         .args(["migrate", "--help"])
         .output()
-        .expect("failed to execute hyperspot-server");
+        .expect("failed to execute cf-server");
 
     assert!(output.status.success());
 
@@ -30,12 +30,12 @@ fn test_migrate_command_help_text() {
 
 #[test]
 fn test_migrate_command_runs_migration_phases() {
-    let output = Command::new(hyperspot_binary())
+    let output = Command::new(cyberfabric_binary())
         .arg("--config")
         .arg("../../config/e2e-local.yaml")
         .arg("migrate")
         .output()
-        .expect("failed to execute hyperspot-server");
+        .expect("failed to execute cf-server");
 
     // Should complete successfully (with or without actual database)
     assert!(

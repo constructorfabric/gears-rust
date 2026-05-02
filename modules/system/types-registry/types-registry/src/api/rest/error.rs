@@ -76,7 +76,7 @@ impl From<DomainError> for Problem {
         };
 
         let mut problem = Problem::new(status, title, detail)
-            .with_type(format!("https://errors.hyperspot.com/{code}"))
+            .with_type(format!("https://errors.cyberfabric.org/{code}"))
             .with_code(code);
 
         if let Some(id) = trace_id {

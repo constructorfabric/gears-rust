@@ -1,4 +1,4 @@
-/// Node represents a deployment unit where Hyperspot is running
+/// Node represents a deployment unit where `CyberFabric` server is running
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub id: uuid::Uuid,

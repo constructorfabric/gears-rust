@@ -21,7 +21,7 @@ Add the plugin section under your module configuration:
 ```yaml
 static-credstore-plugin:
   config:
-    vendor: "hyperspot"   # GTS vendor name (default: "hyperspot")
+    vendor: "cyberfabric"   # GTS vendor name (default: "cyberfabric")
     priority: 100          # Plugin priority, lower = higher (default: 100)
     secrets:
       # Private secret — only accessible by this specific user in this tenant

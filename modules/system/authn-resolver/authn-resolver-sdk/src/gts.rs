@@ -24,13 +24,13 @@ use modkit::gts::BaseModkitPluginV1;
 /// ```ignore
 /// // Plugin generates its instance ID
 /// let instance_id = AuthNResolverPluginSpecV1::gts_make_instance_id(
-///     "hyperspot.builtin.static_authn_resolver.plugin.v1"
+///     "cf.builtin.static_authn_resolver.plugin.v1"
 /// );
 ///
 /// // Plugin creates instance data
 /// let instance = BaseModkitPluginV1::<AuthNResolverPluginSpecV1> {
 ///     id: instance_id.clone(),
-///     vendor: "hyperspot".to_owned(),
+///     vendor: "cyberfabric".to_owned(),
 ///     priority: 100,
 ///     properties: AuthNResolverPluginSpecV1,
 /// };

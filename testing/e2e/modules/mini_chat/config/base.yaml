@@ -5,10 +5,10 @@
 # Based on quickstart.yaml but stripped to essentials.
 #
 # Usage:
-#   cargo run --bin hyperspot-server --features mini-chat -- --config config/mini-chat.yaml run
+#   cargo run --bin cf-server --features mini-chat -- --config config/mini-chat.yaml run
 
 server:
-  home_dir: "~/.hyperspot"
+  home_dir: "~/.cyberfabric"
 
 database:
   servers:
@@ -25,7 +25,7 @@ database:
 logging:
   default:
     console_level: info
-    file: "logs/hyperspot.log"
+    file: "logs/cyberfabric.log"
     file_level: info
   sqlx:
     console_level: debug
@@ -64,19 +64,19 @@ modules:
 
   grpc-hub:
     config:
-      listen_addr: "uds:///tmp/hyperspot-grpc"
+      listen_addr: "uds:///tmp/cyberfabric-grpc"
 
   authn-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
 
   authz-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
 
   static-authn-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
       mode: accept_all
       s2s_credentials:
@@ -85,12 +85,12 @@ modules:
 
   static-authz-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
 
   tenant-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
 
   single-tenant-tr-plugin:
     config: {}
@@ -171,7 +171,7 @@ modules:
 
   static-mini-chat-model-policy-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
       # NOTE: model_id is unique across providers in this test catalog by convention,
       # not by system design. The production model policy plugin could map the same

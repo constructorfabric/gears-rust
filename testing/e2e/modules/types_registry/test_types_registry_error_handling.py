@@ -522,7 +522,7 @@ async def test_service_unavailable_when_module_not_ready(base_url, auth_headers)
     - Body (RFC-9457 Problem Details):
       ```json
       {
-        "type": "https://errors.hyperspot.com/TYPES_REGISTRY_NOT_READY",
+        "type": "https://errors.cyberfabric.org/TYPES_REGISTRY_NOT_READY",
         "title": "Service not ready",
         "status": 503,
         "detail": "The types registry is not yet ready",

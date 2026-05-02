@@ -5107,11 +5107,11 @@ This section compares the Serverless Runtime function model and invocation APIs 
 
 Notes:
 - Public clouds generally split "function" and "workflow/orchestration" into different products.
-- Hyperspot deliberately exposes a unified function definition schema and a single invocation surface, with consistent response shapes.
+- CyberFabric deliberately exposes a unified function definition schema and a single invocation surface, with consistent response shapes.
 
 #### Category: Definition Model and Versioning
 
-| Capability | Hyperspot Serverless Runtime | AWS | Google Cloud | Azure |
+| Capability | CyberFabric Serverless Runtime | AWS | Google Cloud | Azure |
 |---|---|---|---|---|
 | Definition type model | Unified function definition schema (function/workflow) via GTS-identified JSON Schemas | Split: Lambda functions vs Step Functions state machines | Split: Cloud Functions vs Workflows | Split: Functions vs Durable orchestrations |
 | Type system / schema IDs | GTS identifiers for base + derived definition types | No first-class type IDs; resource ARNs + service-specific specs | No first-class type IDs; resource names + service-specific specs | No first-class type IDs; resource IDs + service-specific specs |
@@ -5119,7 +5119,7 @@ Notes:
 
 #### Category: Invocation Semantics and Lifecycle
 
-| Capability | Hyperspot Serverless Runtime | AWS | Google Cloud | Azure |
+| Capability | CyberFabric Serverless Runtime | AWS | Google Cloud | Azure |
 |---|---|---|---|---|
 | Sync invocation | Supported via Invocation API (when `traits.invocation.supported` includes `sync`) | Lambda: `RequestResponse` | HTTP-triggered functions are synchronous by default | HTTP-triggered functions are synchronous by default |
 | Async invocation | Supported via Invocation API (when `traits.invocation.supported` includes `async`) + poll status | Lambda: `Event`; Step Functions: start execution then poll/described execution | Workflows: start execution then poll; Functions: async via events/pubsub | Durable: start orchestration then query status |
@@ -5132,7 +5132,7 @@ Notes:
 
 #### Category: Observability and Timeline
 
-| Capability | Hyperspot Serverless Runtime | AWS | Google Cloud | Azure |
+| Capability | CyberFabric Serverless Runtime | AWS | Google Cloud | Azure |
 |---|---|---|---|---|
 | Timeline / step history | Dedicated timeline endpoint (`/timeline`) | Step Functions execution history | Workflows execution history | Durable Functions history/events |
 | Correlation and tracing | `observability.correlation_id` + `trace_id` fields | CloudWatch + X-Ray trace IDs (service-dependent) | Cloud Logging + Trace IDs | Application Insights correlation/tracing |
@@ -5140,7 +5140,7 @@ Notes:
 
 #### Category: Debugging and Call Trace
 
-| Capability | Hyperspot Serverless Runtime | AWS | Google Cloud | Azure |
+| Capability | CyberFabric Serverless Runtime | AWS | Google Cloud | Azure |
 |---|---|---|---|---|
 | Debug endpoint | `GET /invocations/{id}/debug` returns execution record + `debug` section (`location`, `stack`) | No single universal debug endpoint; relies on logs, traces, and per-service UIs | No single universal debug endpoint; relies on logs/traces/UIs | No single universal debug endpoint; relies on logs/App Insights/Durable history |
 | Execution trace | `GET /invocations/{id}/trace` returns paginated ordered call list including params, duration, and exact response | Achievable via X-Ray subsegments/instrumentation; not a standard structured API output | Achievable via tracing/instrumentation; not a standard structured API output | Achievable via Durable history/instrumentation; not a standard structured API output |
@@ -5148,20 +5148,20 @@ Notes:
 
 #### Category: Error Taxonomy
 
-| Capability | Hyperspot Serverless Runtime | AWS | Google Cloud | Azure |
+| Capability | CyberFabric Serverless Runtime | AWS | Google Cloud | Azure |
 |---|---|---|---|---|
 | Standard error envelope | Base error type `gts.x.core.sless.err.v1~` with `message`, `category`, `details` | Service-specific error payloads (varies) | Service-specific error payloads (varies) | Service-specific error payloads (varies) |
 | Structured error classes | Derived errors: upstream HTTP, runtime limits/timeouts, code errors, validation | Often string-based error+cause (Step Functions) and runtime-specific error types/statuses | Runtime-specific error types/statuses | Runtime-specific error types/statuses |
 
 #### Category: Caching and Client Behavior
 
-| Capability | Hyperspot Serverless Runtime | AWS | Google Cloud | Azure |
+| Capability | CyberFabric Serverless Runtime | AWS | Google Cloud | Azure |
 |---|---|---|---|---|
 | Result caching (TTL) | `traits.caching.max_age_seconds` defines client caching TTL for successful results | No first-class "function result cache TTL"; caching typically external (API gateway/CDN/app cache) | No first-class "function result cache TTL"; caching typically external | No first-class "function result cache TTL"; caching typically external |
 
 #### Category: Protocol Surfaces and AI Integration
 
-| Capability | Hyperspot Serverless Runtime | AWS | Google Cloud | Azure |
+| Capability | CyberFabric Serverless Runtime | AWS | Google Cloud | Azure |
 |---|---|---|---|---|
 | JSON-RPC invocation | Native JSON-RPC 2.0 endpoint with method = GTS function ID, batch support, streaming | Not a standard surface; typically REST or SDK-based | Not a standard surface; typically REST or SDK-based | Not a standard surface; typically REST or SDK-based |
 | MCP server integration | Native MCP 2025-03-26 Streamable HTTP transport; functions exposed as MCP tools with tool discovery, streaming execution, elicitation (HITL), sampling (LLM-in-the-loop) | No native MCP support; Lambda functions accessible via custom MCP server wrappers | No native MCP support; Cloud Functions accessible via custom MCP server wrappers | No native MCP support; Azure Functions accessible via custom MCP server wrappers |

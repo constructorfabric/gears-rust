@@ -32,7 +32,7 @@ This ensures that the Secure ORM receives the tenant scope it needs for queries,
 modules:
   static_authz_plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
 ```
 
@@ -41,7 +41,7 @@ modules:
 The server binary includes this plugin only when built with the `static-authz` feature:
 
 ```bash
-cargo build --bin hyperspot-server --features static-authz
+cargo build --bin cf-server --features static-authz
 ```
 
 The `make example` target enables this feature automatically.

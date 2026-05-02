@@ -14,7 +14,7 @@ AuthZ resolver plugin that resolves tenant hierarchy via `TenantResolverClient`.
 modules:
   tr_authz_plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 50  # Set lower than static-authz (100) to take precedence
 ```
 

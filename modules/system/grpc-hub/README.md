@@ -16,8 +16,8 @@ modules:
   grpc_hub:
     config:
       # TCP example: "0.0.0.0:50051"
-      # Unix example (unix only): "uds:///tmp/hyperspot.sock"
-      # Windows named pipe example (windows only): "pipe://\\\\.\\pipe\\hyperspot"
+      # Unix example (unix only): "uds:///tmp/cyberfabric.sock"
+      # Windows named pipe example (windows only): "pipe://\\\\.\\pipe\\cyberfabric"
       listen_addr: "0.0.0.0:50051"
 ```
 

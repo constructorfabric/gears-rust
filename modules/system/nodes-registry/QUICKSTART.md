@@ -1,6 +1,6 @@
 # Nodes Registry - Quickstart
 
-Tracks and reports information about all HyperSpot server instances in your deployment.
+Tracks and reports information about all CyberFabric server instances in your deployment.
 
 **Provides:**
 - Node identification (ID, hostname, IP address)
@@ -9,7 +9,7 @@ Tracks and reports information about all HyperSpot server instances in your depl
 - Registration timestamps
 
 **Use cases:**
-- Monitor distributed HyperSpot deployments
+- Monitor distributed CyberFabric deployments
 - Load balancing and resource allocation
 - Health checks and diagnostics
 

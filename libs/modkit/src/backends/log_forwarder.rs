@@ -209,7 +209,7 @@ mod tests {
     fn test_detect_log_level_tracing_subscriber_format() {
         // Real tracing-subscriber format examples
         assert_eq!(
-            detect_log_level("2025-12-08T00:10:18.2852399Z  INFO hyperspot_server: shutdown"),
+            detect_log_level("2025-12-08T00:10:18.2852399Z  INFO cyberfabric_server: shutdown"),
             Level::INFO
         );
         assert_eq!(

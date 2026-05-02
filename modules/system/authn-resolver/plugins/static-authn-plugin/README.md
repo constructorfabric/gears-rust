@@ -27,7 +27,7 @@ Provides a simple, config-driven authentication mechanism so that the platform c
 modules:
   static_authn_plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
       mode: accept_all               # or "static_tokens"
       default_identity:
@@ -42,7 +42,7 @@ modules:
 The server binary includes this plugin only when built with the `static-authn` feature:
 
 ```bash
-cargo build --bin hyperspot-server --features static-authn
+cargo build --bin cf-server --features static-authn
 ```
 
 The `make example` target enables this feature automatically.

@@ -19,6 +19,6 @@ Detects the platform and runs the appropriate tool chain:
 - **Windows GNU/MinGW** — falls back to the `objcopy` flow
 
 ```sh
-cargo build --release --bin hyperspot-server
-cargo xtask split-debug hyperspot-server
+cargo build --release --bin cf-server
+cargo xtask split-debug cf-server
 ```

@@ -51,7 +51,7 @@ impl Module for RgTrPlugin {
 
         // Generate plugin instance ID
         let instance_id = TenantResolverPluginSpecV1::gts_make_instance_id(
-            "hyperspot.builtin.rg_tenant_resolver.plugin.v1",
+            "cf.builtin.rg_tenant_resolver.plugin.v1",
         );
 
         // Register plugin instance in types-registry

@@ -47,7 +47,7 @@ make test
 make quickstart
 
 # Start the development server with the example users_info module
-cargo run --bin hyperspot-server --features users-info-example -- --config config/quickstart.yaml run
+cargo run --bin cf-core-server --features users-info-example -- --config config/quickstart.yaml run
 ```
 
 ## 2. Development Workflow

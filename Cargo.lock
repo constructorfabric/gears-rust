@@ -979,7 +979,7 @@ dependencies = [
  "prost-types",
  "tonic",
  "tonic-prost",
- "ureq 3.3.0",
+ "ureq",
 ]
 
 [[package]]
@@ -1369,7 +1369,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "ureq 2.12.1",
+ "ureq",
  "utoipa",
  "uuid",
 ]
@@ -1824,7 +1824,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "pin-project-lite",
- "rand 0.9.4",
+ "rand 0.10.1",
  "rustls",
  "rustls-native-certs 0.8.3",
  "rustls-pki-types",
@@ -1956,7 +1956,7 @@ version = "0.6.3"
 dependencies = [
  "anyhow",
  "cf-modkit-security",
- "rand 0.9.4",
+ "rand 0.10.1",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -2210,6 +2210,47 @@ dependencies = [
  "thrift_codec",
  "tokio",
  "trackable",
+]
+
+[[package]]
+name = "cf-server"
+version = "0.6.1"
+dependencies = [
+ "anyhow",
+ "calculator",
+ "calculator-gateway",
+ "cf-api-gateway",
+ "cf-authn-resolver",
+ "cf-authz-resolver",
+ "cf-credstore",
+ "cf-file-parser",
+ "cf-grpc-hub",
+ "cf-mini-chat",
+ "cf-modkit",
+ "cf-modkit-http",
+ "cf-module-orchestrator",
+ "cf-nodes-registry",
+ "cf-oagw",
+ "cf-resource-group",
+ "cf-rg-tr-plugin",
+ "cf-simple-user-settings",
+ "cf-single-tenant-tr-plugin",
+ "cf-static-authn-plugin",
+ "cf-static-authz-plugin",
+ "cf-static-credstore-plugin",
+ "cf-static-tr-plugin",
+ "cf-tenant-resolver",
+ "cf-tr-authz-plugin",
+ "cf-types-registry",
+ "clap",
+ "mimalloc",
+ "serde-saphyr 0.0.22",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "types",
+ "users-info",
 ]
 
 [[package]]
@@ -4394,47 +4435,6 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tower-service",
-]
-
-[[package]]
-name = "hyperspot-server"
-version = "0.6.1"
-dependencies = [
- "anyhow",
- "calculator",
- "calculator-gateway",
- "cf-api-gateway",
- "cf-authn-resolver",
- "cf-authz-resolver",
- "cf-credstore",
- "cf-file-parser",
- "cf-grpc-hub",
- "cf-mini-chat",
- "cf-modkit",
- "cf-modkit-http",
- "cf-module-orchestrator",
- "cf-nodes-registry",
- "cf-oagw",
- "cf-resource-group",
- "cf-rg-tr-plugin",
- "cf-simple-user-settings",
- "cf-single-tenant-tr-plugin",
- "cf-static-authn-plugin",
- "cf-static-authz-plugin",
- "cf-static-credstore-plugin",
- "cf-static-tr-plugin",
- "cf-tenant-resolver",
- "cf-tr-authz-plugin",
- "cf-types-registry",
- "clap",
- "mimalloc",
- "serde-saphyr 0.0.22",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "types",
- "users-info",
 ]
 
 [[package]]
@@ -9696,33 +9696,19 @@ dependencies = [
 
 [[package]]
 name = "ureq"
-version = "2.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
-dependencies = [
- "base64 0.22.1",
- "flate2",
- "log",
- "once_cell",
- "rustls",
- "rustls-pki-types",
- "url",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "ureq"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
  "base64 0.22.1",
+ "flate2",
  "log",
  "percent-encoding",
  "rustls",
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]

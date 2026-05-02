@@ -1,4 +1,4 @@
-// simulated_dir=/hyperspot/modules/some_module/contract/
+// simulated_dir=/cyberfabric/modules/some_module/contract/
 // Should trigger DE0103 - HTTP types in contract
 use http::StatusCode;
 // Should trigger DE0103 - HTTP types in contract

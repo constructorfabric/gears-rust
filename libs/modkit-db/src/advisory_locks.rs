@@ -308,11 +308,11 @@ impl LockManager {
     fn get_lock_file_path(&self, namespaced_key: &str) -> PathBuf {
         // For ephemeral DSNs (like `memdb`) or tests, use temp dir to avoid global pollution.
         let base_dir = if self.dsn.contains("memdb") || cfg!(test) {
-            std::env::temp_dir().join("hyperspot_test_locks")
+            std::env::temp_dir().join("cyberfabric_test_locks")
         } else {
             // Prefer OS cache dir; fallback to temp dir if None (e.g. in minimal containers).
             let cache = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
-            cache.join("hyperspot").join("locks")
+            cache.join("cyberfabric").join("locks")
         };
 
         let dsn_hash = format!("{:x}", xxh3_64(self.dsn.as_bytes()));

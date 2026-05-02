@@ -2,7 +2,7 @@
 
 # E2E Testing Guide
 
-This directory contains end-to-end tests for the Hyperspot server.
+This directory contains end-to-end tests for the CyberFabric server.
 
 ## Prerequisites
 
@@ -34,7 +34,7 @@ python3 scripts/ci.py e2e-docker
 
 ### Option 2: Local Mode (Faster for Development, advanced usage)
 
-This approach runs tests against a locally running hyperspot-server.
+This approach runs tests against a locally running cf-server.
 `scripts/ci.py e2e-local` will build and start the local server automatically.
 
 ```bash
@@ -134,7 +134,7 @@ async def test_my_endpoint(base_url, auth_headers):
 
 If you see "Server not responding" when running local tests:
 
-1. Check build/startup logs in `logs/hyperspot-e2e.log` and `logs/hyperspot-e2e-error.log`
+1. Check build/startup logs in `logs/cyberfabric-e2e.log` and `logs/cyberfabric-e2e-error.log`
 2. Check that the API is reachable on the configured port (default: 8086)
 3. Verify the health endpoint: `curl http://localhost:8086/healthz`
 4. Rebuild release artifacts: `make build`

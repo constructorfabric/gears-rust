@@ -13,10 +13,10 @@ services:
       start_period: 5s
 
   file-parser-api:
-    image: hyperspot-api:e2e
+    image: cyberfabric-api:e2e
     build:
       context: ../..
-      dockerfile: testing/docker/hyperspot.Dockerfile
+      dockerfile: testing/docker/cyberfabric.Dockerfile
     ports:
       - "8086:8086"
     extra_hosts:

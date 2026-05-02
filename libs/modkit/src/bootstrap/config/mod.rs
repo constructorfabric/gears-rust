@@ -545,9 +545,9 @@ pub fn validate_dsn(dsn: &str) -> Result<()> {
 }
 
 /// Resolves `SQLite` @`file()` syntax in DSN to actual file paths.
-/// - `sqlite://@file(users.sqlite)` → `$HOME/.hyperspot/<module>/users.sqlite`
+/// - `sqlite://@file(users.sqlite)` → `$HOME/.cyberfabric/<module>/users.sqlite`
 /// - `sqlite://@file(/abs/path/file.db)` → use absolute path
-/// - `sqlite://` or `sqlite:///` → `$HOME/.hyperspot/<module>/<module>.sqlite`
+/// - `sqlite://` or `sqlite:///` → `$HOME/.cyberfabric/<module>/<module>.sqlite`
 fn resolve_sqlite_dsn(
     dsn: &str,
     home_dir: &Path,
@@ -1368,7 +1368,7 @@ mod tests {
         // Provide a user path with "~" to ensure expansion and normalization.
         let yaml = r#"
 server:
-  home_dir: "~/.test_hyperspot"
+  home_dir: "~/.test_cyberfabric"
 
 database:
   servers:
@@ -1388,7 +1388,7 @@ logging:
 
         // home_dir should be normalized immediately
         assert!(is_normalized_path(&config.server.home_dir));
-        assert!(config.server.home_dir.ends_with(".test_hyperspot"));
+        assert!(config.server.home_dir.ends_with(".test_cyberfabric"));
 
         // database parsed (TODO: update test to use new config format)
         // For now, since this test uses old format YAML, we skip DB assertions

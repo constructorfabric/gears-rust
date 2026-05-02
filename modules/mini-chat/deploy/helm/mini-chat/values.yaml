@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: hyperspot-mini-chat
+  repository: cyberfabric-mini-chat
   tag: latest
   pullPolicy: Never
 

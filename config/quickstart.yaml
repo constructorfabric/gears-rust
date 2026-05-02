@@ -1,10 +1,10 @@
 # Updated: 2026-04-16 by Constructor Tech
-# HyperSpot Server Configuration
+# CyberFabric Server Configuration
 #
 # Database Architecture Overview:
 # ===============================
 #
-# HyperSpot uses a centralized DbManager that:
+# CyberFabric server uses a centralized DbManager that:
 # 1. Loads global database server templates from `database.servers`
 # 2. For each module, merges server template with module-specific overrides
 # 3. Creates isolated database connections per module
@@ -19,7 +19,7 @@
 
 # Core server configuration (global section)
 server:
-  home_dir: "~/.hyperspot"
+  home_dir: "~/.cyberfabric"
 
 # Database configuration (DbManager architecture)
 #
@@ -65,7 +65,7 @@ logging:
   # global section
   default:
     console_level: info
-    file: "logs/hyperspot.log"
+    file: "logs/cyberfabric.log"
     file_level: info
     max_age_days: 28
     max_backups: 3
@@ -94,9 +94,9 @@ modules:
       prefix_path: "/cf"
       # OpenAPI Documentation Configuration
       openapi:
-        title: "HyperSpot API"
+        title: "CyberFabric Server API"
         version: "0.1.0"
-        description: "HyperSpot Server API Documentation"
+        description: "CyberFabric Server API Documentation"
       defaults:
         body_limit_bytes: 64000000
         rate_limit:
@@ -115,22 +115,22 @@ modules:
   grpc-hub:
     config:
       # Use ephemeral port; OoP modules receive the actual bound address from master host
-      listen_addr: "uds:///tmp/hyperspot-grpc"
+      listen_addr: "uds:///tmp/cyberfabric-grpc"
 
   # AuthN pipeline - used when auth_disabled: false.
   # AuthZ pipeline - used always (with default root SecurityContext when auth is disabled).
   # Requires --features static-authn,static-authz for the static plugins.
   authn-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
 
   authz-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
 
   static-authn-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
       mode: accept_all
       s2s_credentials:
@@ -139,7 +139,7 @@ modules:
 
   static-authz-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
 
   mini-chat:
@@ -219,7 +219,7 @@ modules:
       server: "sqlite_users"               # Inherits params and pool settings from sqlite_users
 
       # Module-specific database file (required for SQLite modules)
-      file: "users_info.db"                # Creates: ~/.hyperspot/users_info/users_info.db
+      file: "users_info.db"                # Creates: ~/.cyberfabric/users_info/users_info.db
 
       # Module can override server settings:
       # params:
@@ -248,10 +248,10 @@ modules:
 
   tenant-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
   static-tr-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 20
       # Tenant tree configuration (example: company with 2 divisions, each with departments)
       tenants:
@@ -320,11 +320,11 @@ modules:
 opentelemetry:
   # Shared resource identity (attached to all traces and metrics)
   resource:
-    service_name: "hyperspot-api"
+    service_name: "cyberfabric-api"
     attributes:
       service.version: "1.3.7"
       deployment.environment: "dev"
-      service.namespace: "hyperspot"
+      service.namespace: "cyberfabric"
 
   # Default exporter shared by tracing and metrics.
   # Per-signal `exporter` fields override this when present.
@@ -379,11 +379,11 @@ opentelemetry:
 #     main_postgres:
 #       host: "localhost"
 #       port: 5432
-#       user: "hyperspot"
+#       user: "cyberfabric"
 #       password: "${POSTGRES_PASSWORD}"  # From environment variable
 #       params:
 #         sslmode: "require"
-#         application_name: "hyperspot"
+#         application_name: "cyberfabric"
 #       pool:
 #         max_conns: 20
 #         acquire_timeout: "30s"

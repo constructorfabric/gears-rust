@@ -1,6 +1,6 @@
-# HyperSpot Server - Quickstart Guide
+# CyberFabric Server - Quickstart Guide
 
-Start HyperSpot server and verify it works. For project overview, see [README.md](../README.md).
+Start CyberFabric server and verify it works. For project overview, see [README.md](../README.md).
 
 ---
 
@@ -54,7 +54,7 @@ Each module has a QUICKSTART.md with minimal curl examples:
 ## Stop the Server
 
 ```bash
-pkill -f hyperspot-server
+pkill -f cf-server
 ```
 
 ---
@@ -63,7 +63,7 @@ pkill -f hyperspot-server
 
 | Issue | Solution |
 |-------|----------|
-| Port 8087 in use | `pkill -f hyperspot-server` |
+| Port 8087 in use | `pkill -f cf-server` |
 | Empty tenant-resolver | Use `make example` instead of `make quickstart` |
 | Connection refused | Server not running - check logs |
 

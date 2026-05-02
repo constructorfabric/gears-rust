@@ -240,7 +240,7 @@ kani:
 ## Run Geiger scanner for unsafe code in dependencies
 geiger:
 	$(call check_tool,cargo-geiger)
-	cd apps/hyperspot-server && cargo geiger --all-features
+	cd apps/cf-server && cargo geiger --all-features
 
 ## Check there are no compile time warnings
 lint:
@@ -337,11 +337,11 @@ security: deny
 
 .PHONY: openapi
 
-# Generate OpenAPI spec from running hyperspot-server
+# Generate OpenAPI spec from running cf-server
 openapi:
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
-	@echo "Starting hyperspot-server to generate OpenAPI spec..."
-	@$(call start_server_and_wait,cargo run --bin hyperspot-server $(E2E_ARGS) -- --config config/quickstart.yaml,$(OPENAPI_URL),300) && \
+	@echo "Starting cf-server to generate OpenAPI spec..."
+	@$(call start_server_and_wait,cargo run --bin cf-server $(E2E_ARGS) -- --config config/quickstart.yaml,$(OPENAPI_URL),300) && \
 	echo "Fetching OpenAPI spec..." && \
 	mkdir -p $$(dirname "$(OPENAPI_OUT)") && \
 	curl -fsS "$(OPENAPI_URL)" -o "$(OPENAPI_OUT)" && \
@@ -478,13 +478,13 @@ e2e-local-smoke:
 MINI_CHAT_FEATURES = mini-chat,static-authn,static-authz,single-tenant,static-credstore
 MINI_CHAT_K8S_FEATURES = $(MINI_CHAT_FEATURES),k8s
 
-MINI_CHAT_IMAGE ?= hyperspot-mini-chat
+MINI_CHAT_IMAGE ?= cf-mini-chat
 MINI_CHAT_TAG   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo latest)
 
 ## Run mini-chat E2E tests (separate binary with mini-chat features)
 e2e-mini-chat:
-	cargo build --bin hyperspot-server --features=$(MINI_CHAT_FEATURES)
-	E2E_BINARY=target/debug/hyperspot-server \
+	cargo build --bin cf-server --features=$(MINI_CHAT_FEATURES)
+	E2E_BINARY=target/debug/cf-server \
 		python3 -m pytest testing/e2e/modules/mini_chat/ --mode offline -vv
 
 # -------- Code coverage --------
@@ -570,20 +570,20 @@ fuzz-corpus: fuzz-install
 # Start server with quickstart config
 quickstart:
 	mkdir -p data
-	cargo run --bin hyperspot-server -- --config config/quickstart.yaml run
+	cargo run --bin cf-server -- --config config/quickstart.yaml run
 
 ## Run server with example module
 example:
-	cargo run --bin hyperspot-server $(E2E_ARGS) -- --config config/quickstart.yaml run
+	cargo run --bin cf-server $(E2E_ARGS) -- --config config/quickstart.yaml run
 
 # mini-chat targets are for running the mini-chat module locally and in Kubernetes, with options for building Docker images and deploying with Helm.
 ## Run server with fips module
 fips:
-	cargo run --bin hyperspot-server --features fips,static-authn,static-authz,single-tenant,static-credstore,otel -- --config config/quickstart.yaml run
+	cargo run --bin cf-server --features fips,static-authn,static-authz,single-tenant,static-credstore,otel -- --config config/quickstart.yaml run
 
 ## Run server with mini-chat module
 mini-chat:
-	cargo run --bin hyperspot-server --features mini-chat,static-authn,static-authz,single-tenant,static-credstore,otel -- --config config/mini-chat.yaml run
+	cargo run --bin cf-server --features mini-chat,static-authn,static-authz,single-tenant,static-credstore,otel -- --config config/mini-chat.yaml run
 
 ## Build mini-chat Docker image for K8s (dev build by default, RELEASE=1 for optimized)
 ## On linux: builds on host (reuses local target/), then packages the binary.
@@ -595,13 +595,13 @@ MINI_CHAT_TARGET_DIR = $(or $(CARGO_TARGET_DIR),target)/$(if $(RELEASE),release,
 mini-chat-docker:
 ifeq ($(shell uname -s),Linux)
 	@echo "==> Linux host: building on host, packaging into image"
-	cargo build $(MINI_CHAT_CARGO_RELEASE_FLAG) --bin hyperspot-server --package=hyperspot-server \
+	cargo build $(MINI_CHAT_CARGO_RELEASE_FLAG) --bin cf-server --package=cf-server \
 		--features "$(MINI_CHAT_K8S_FEATURES)"
 	@mkdir -p .docker-stage
-	@cp $(MINI_CHAT_TARGET_DIR)/hyperspot-server .docker-stage/hyperspot-server
+	@cp $(MINI_CHAT_TARGET_DIR)/cf-server .docker-stage/cf-server
 	DOCKER_BUILDKIT=1 docker build \
 		-f modules/mini-chat/deploy/docker/mini-chat-prebuilt.Dockerfile \
-		--build-arg BINARY_PATH=".docker-stage/hyperspot-server" \
+		--build-arg BINARY_PATH=".docker-stage/cf-server" \
 		-t $(MINI_CHAT_IMAGE):$(MINI_CHAT_TAG) .
 	@rm -rf .docker-stage
 else
@@ -699,7 +699,7 @@ mini-chat-down:
 
 oop-example:
 	cargo build -p calculator --features oop_module
-	cargo run --bin hyperspot-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
+	cargo run --bin cf-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
 check: .setup-stamp fmt cypilot-validate clippy lychee security dylint-test dylint gts-docs test
@@ -711,15 +711,15 @@ ci_docs: lychee
 # Run CI pipeline locally, requires docker
 ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg lychee dylint dylint-test
 
-# Build the hyperspot-server release binary using a toolchain from the rust-toolchain.toml
+# Build the cf-server release binary using a toolchain from the rust-toolchain.toml
 cargo-build:
-	cargo build --release --bin hyperspot-server $(E2E_ARGS)
+	cargo build --release --bin cf-server $(E2E_ARGS)
 
 # Split debug symbols into separate artifact(s) and strip the binary.
 # Requires platform tools: objcopy (Linux), dsymutil+strip (macOS).
 # On Windows MSVC the PDB is already separate; no extra tools needed.
 split-debug:
-	cargo xtask split-debug hyperspot-server
+	cargo xtask split-debug cf-server
 
 # Build the release binary, then split debug symbols.
 # Use 'make cargo-build' if you don't need stripped artifacts or lack

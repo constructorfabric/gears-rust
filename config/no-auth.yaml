@@ -1,4 +1,4 @@
-# Configuration for running HyperSpot with authentication disabled
+# Configuration for running CyberFabric Server with authentication disabled
 # This mode automatically injects SecurityCtx::root_ctx() for all requests
 # WARNING: Only use for single-user on-premise installations
 
@@ -7,20 +7,20 @@ api_gateway:
   bind_addr: "0.0.0.0:8080"
   enable_docs: true
   cors_enabled: true
-  
+
   # DISABLE AUTHENTICATION - All requests get root tenant context
   # This bypasses all tenant isolation and provides full system-level access
   auth_disabled: true
-  
+
   # When auth is disabled, these JWT settings are ignored
   # jwks_uri: "https://auth.example.com/.well-known/jwks.json"
   # issuer: "https://auth.example.com"
-  # audience: "hyperspot-api"
-  
+  # audience: "cyberfabric-api"
+
   # Routes without explicit role annotations will not require authentication
   # (irrelevant when auth_disabled is true, but kept for reference)
   require_auth_by_default: false
-  
+
   defaults:
     rate_limit:
       rps: 100

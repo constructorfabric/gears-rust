@@ -16,7 +16,7 @@ pub struct RgTrPluginConfig {
 impl Default for RgTrPluginConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             priority: 50,
         }
     }

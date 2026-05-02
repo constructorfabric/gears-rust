@@ -45,7 +45,7 @@
 
 ### 1.1 Purpose
 
-File Parser provides document parsing and content extraction capabilities for the HyperSpot platform. It is designed as a **parsing gateway with a plugin architecture**: the gateway exposes a stable REST API and routes each request to the appropriate parser plugin based on file extension. Plugins are self-contained implementations of the `FileParserBackend` trait; adding support for a new format or library requires only adding a new plugin — the gateway and REST API are unchanged.
+File Parser provides document parsing and content extraction capabilities for the CyberFabric platform. It is designed as a **parsing gateway with a plugin architecture**: the gateway exposes a stable REST API and routes each request to the appropriate parser plugin based on file extension. Plugins are self-contained implementations of the `FileParserBackend` trait; adding support for a new format or library requires only adding a new plugin — the gateway and REST API are unchanged.
 
 ### 1.2 Background / Problem Statement
 
@@ -106,7 +106,7 @@ The previous implementation had four separate format-specific plugins (`HtmlPars
 
 > **Note**: Project-wide runtime, OS, architecture, and lifecycle policy are defined in the root PRD. Only module-specific deviations are documented here.
 
-File Parser runs as a stateless HTTP service within the HyperSpot platform. Each request is fully self-contained: the module accepts an uploaded file (or a local path), routes it to the appropriate plugin, extracts content, and returns the result without persisting any state. Temporary files used by individual plugins are cleaned up after each request.
+File Parser runs as a stateless HTTP service within the CyberFabric platform. Each request is fully self-contained: the module accepts an uploaded file (or a local path), routes it to the appropriate plugin, extracts content, and returns the result without persisting any state. Temporary files used by individual plugins are cleaned up after each request.
 
 The module requires an `allowed_local_base_dir` config entry to be set at startup. If the value is missing or unresolvable, the module fails to start.
 

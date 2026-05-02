@@ -81,7 +81,7 @@ Create files in this order (each layer builds on the previous):
 ### Phase 4 — Wire and register
 
 1. Add module crate(s) to workspace `Cargo.toml`
-2. Register module in `apps/hyperspot-server/src/main.rs`
+2. Register module in `apps/cf-server/src/main.rs`
 3. Register client in `init()` via ClientHub
 4. Add feature flag if needed (see existing `static-authn` / `static-authz` pattern)
 

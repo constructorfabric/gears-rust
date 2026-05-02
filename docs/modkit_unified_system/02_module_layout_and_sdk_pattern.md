@@ -449,11 +449,11 @@ impl YourModuleClientV1 for YourModuleLocalClient {
 }
 ```
 
-## Module Registration in HyperSpot Server
+## Module Registration in CyberFabric Server
 
 Every new module MUST be registered in **two places** to be discoverable at runtime:
 
-### 1. Add dependency in `apps/hyperspot-server/Cargo.toml`
+### 1. Add dependency in `apps/cf-server/Cargo.toml`
 
 ```toml
 [dependencies]
@@ -461,7 +461,7 @@ Every new module MUST be registered in **two places** to be discoverable at runt
 your_module = { package = "cf-your-module", path = "../../modules/your-module/your-module" }
 ```
 
-### 2. Import module in `apps/hyperspot-server/src/registered_modules.rs`
+### 2. Import module in `apps/cf-server/src/registered_modules.rs`
 
 ```rust
 #![allow(unused_imports)]
@@ -526,4 +526,4 @@ For additional endpoints, see <http://127.0.0.1:8087/docs>.
 - [ ] Use `SecureConn` + `SecurityContext` for all DB operations.
 - [ ] Register client in `init()`: `ctx.client_hub().register::<dyn MyModuleApi>(api)`.
 - [ ] Export SDK types from module crate `lib.rs`.
-- [ ] Register module in `apps/hyperspot-server/Cargo.toml` and `registered_modules.rs`.
+- [ ] Register module in `apps/cf-server/Cargo.toml` and `registered_modules.rs`.

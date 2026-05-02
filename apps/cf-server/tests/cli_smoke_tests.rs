@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::non_ascii_literal)]
 
-//! CLI smoke tests for hyperspot-server binary
+//! CLI smoke tests for cf-server binary
 //!
 //! These tests verify that the CLI commands work correctly, including
 //! configuration validation, help output, and basic command functionality.
@@ -10,22 +10,22 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-/// Helper to run the hyperspot-server binary with given arguments
-fn run_hyperspot_server(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_hyperspot-server"))
+/// Helper to run the cf-server binary with given arguments
+fn run_cyberfabric_server(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_cf-server"))
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("Failed to execute hyperspot-server")
+        .expect("Failed to execute cf-server")
 }
 
-/// Helper to run the hyperspot-server binary with timeout
-async fn run_hyperspot_server_with_timeout(
+/// Helper to run the cf-server binary with timeout
+async fn run_cyberfabric_server_with_timeout(
     args: &[&str],
     timeout_duration: Duration,
 ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
-    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_hyperspot-server"));
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_cf-server"));
     cmd.args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -44,13 +44,13 @@ async fn run_hyperspot_server_with_timeout(
 
 #[test]
 fn test_cli_help_command() {
-    let output = run_hyperspot_server(&["--help"]);
+    let output = run_cyberfabric_server(&["--help"]);
 
     assert!(output.status.success(), "Help command should succeed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("hyperspot-server") || stdout.contains("HyperSpot"),
+        stdout.contains("cf-server") || stdout.contains("CyberFabric"),
         "Should contain binary name"
     );
     assert!(
@@ -67,15 +67,12 @@ fn test_cli_help_command() {
 
 #[test]
 fn test_cli_version_command() {
-    let output = run_hyperspot_server(&["--version"]);
+    let output = run_cyberfabric_server(&["--version"]);
 
     assert!(output.status.success(), "Version command should succeed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("hyperspot-server"),
-        "Should contain binary name"
-    );
+    assert!(stdout.contains("cf-server"), "Should contain binary name");
     // Version might be 0.1.0 or similar
     assert!(
         stdout.chars().any(|c| c.is_ascii_digit()),
@@ -85,7 +82,7 @@ fn test_cli_version_command() {
 
 #[test]
 fn test_cli_invalid_command() {
-    let output = run_hyperspot_server(&["invalid-command"]);
+    let output = run_cyberfabric_server(&["invalid-command"]);
 
     assert!(!output.status.success(), "Invalid command should fail");
 
@@ -98,7 +95,7 @@ fn test_cli_invalid_command() {
 
 #[test]
 fn test_cli_config_validation_missing_file() {
-    let output = run_hyperspot_server(&["--config", "/nonexistent/config.yaml", "check"]);
+    let output = run_cyberfabric_server(&["--config", "/nonexistent/config.yaml", "check"]);
 
     // The application should fail when an explicitly specified config file doesn't exist
     assert!(
@@ -124,7 +121,7 @@ fn test_cli_config_validation_invalid_yaml() {
     std::fs::write(&config_path, "invalid: yaml: content: [unclosed")
         .expect("Failed to write file");
 
-    let output = run_hyperspot_server(&["--config", config_path.to_str().unwrap(), "check"]);
+    let output = run_cyberfabric_server(&["--config", config_path.to_str().unwrap(), "check"]);
 
     assert!(!output.status.success(), "Should fail with invalid YAML");
 
@@ -151,7 +148,7 @@ logging:
   # global section
   default:
     console_level: info
-    file: "logs/hyperspot.log"
+    file: "logs/cyberfabric.log"
     file_level: info
     max_age_days: 28
     max_backups: 3
@@ -160,7 +157,7 @@ logging:
 
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
-    let output = run_hyperspot_server(&["--config", config_path.to_str().unwrap(), "check"]);
+    let output = run_cyberfabric_server(&["--config", config_path.to_str().unwrap(), "check"]);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -183,7 +180,7 @@ logging:
 }
 
 // Note: test_cli_run_command_with_mock_database was removed because:
-// 1. The --mock flag doesn't exist in the hyperspot-server CLI
+// 1. The --mock flag doesn't exist in the cf-server CLI
 // 2. All modules in registered_modules.rs are always linked, making it difficult
 //    to test server startup without all required features (e.g., SQLite)
 // 3. Other tests already cover CLI functionality adequately
@@ -206,7 +203,7 @@ logging:
 
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
-    let output = run_hyperspot_server(&["--config", config_path.to_str().unwrap(), "run"]);
+    let output = run_cyberfabric_server(&["--config", config_path.to_str().unwrap(), "run"]);
 
     assert!(
         !output.status.success(),
@@ -222,7 +219,7 @@ logging:
 
 #[test]
 fn test_cli_verbose_flag() {
-    let output = run_hyperspot_server(&["--verbose", "--help"]);
+    let output = run_cyberfabric_server(&["--verbose", "--help"]);
 
     assert!(output.status.success(), "Verbose help should succeed");
 
@@ -237,7 +234,7 @@ fn test_cli_verbose_flag() {
 #[test]
 fn test_cli_config_flag_short_form() {
     // Test short form of config flag with missing file
-    let output = run_hyperspot_server(&["-c", "/nonexistent/config.yaml", "check"]);
+    let output = run_cyberfabric_server(&["-c", "/nonexistent/config.yaml", "check"]);
 
     // The application should fail when an explicitly specified config file doesn't exist
     assert!(
@@ -285,7 +282,7 @@ logging:
 
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
-    let output = run_hyperspot_server(&["--config", config_path.to_str().unwrap(), "check"]);
+    let output = run_cyberfabric_server(&["--config", config_path.to_str().unwrap(), "check"]);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -327,7 +324,7 @@ server:
 
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
-    let output = run_hyperspot_server(&["--config", config_path.to_str().unwrap(), "check"]);
+    let output = run_cyberfabric_server(&["--config", config_path.to_str().unwrap(), "check"]);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -346,7 +343,7 @@ server:
 #[test]
 fn test_cli_subcommand_help() {
     // Test help for run subcommand
-    let output = run_hyperspot_server(&["run", "--help"]);
+    let output = run_cyberfabric_server(&["run", "--help"]);
 
     assert!(
         output.status.success(),
@@ -360,7 +357,7 @@ fn test_cli_subcommand_help() {
     );
 
     // Test help for check subcommand
-    let output = run_hyperspot_server(&["check", "--help"]);
+    let output = run_cyberfabric_server(&["check", "--help"]);
 
     assert!(
         output.status.success(),
@@ -389,13 +386,13 @@ database:
 logging:
   default:
     console_level: debug
-    file: "logs/hyperspot.log"
+    file: "logs/cyberfabric.log"
     file_level: debug
 "#;
 
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
-    let output = run_hyperspot_server(&["--config", config_path.to_str().unwrap(), "check"]);
+    let output = run_cyberfabric_server(&["--config", config_path.to_str().unwrap(), "check"]);
 
     assert!(
         output.status.success(),
@@ -407,7 +404,7 @@ logging:
 async fn test_cli_no_arguments() {
     // When no subcommand is provided, the app may default to 'run' and keep running.
     // Use a short timeout and accept timeout as success (server started).
-    match run_hyperspot_server_with_timeout(&[], Duration::from_secs(2)).await {
+    match run_cyberfabric_server_with_timeout(&[], Duration::from_secs(2)).await {
         Err(e) if e.to_string().contains("elapsed") => {
             // Timed out: treated as success because server is running.
         }
@@ -421,7 +418,7 @@ async fn test_cli_no_arguments() {
                     || stderr.contains("subcommand")
                     || stderr.contains("Error")
                     || stdout.contains("help")
-                    || stdout.contains("HyperSpot Server starting"),
+                    || stdout.contains("CyberFabric Server starting"),
                 "Should show usage, help, or run with potential error"
             );
         }
@@ -460,7 +457,7 @@ modules:
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
     let output =
-        run_hyperspot_server(&["--config", config_path.to_str().unwrap(), "--list-modules"]);
+        run_cyberfabric_server(&["--config", config_path.to_str().unwrap(), "--list-modules"]);
 
     assert!(
         output.status.success(),
@@ -506,7 +503,7 @@ database:
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
     let output =
-        run_hyperspot_server(&["--config", config_path.to_str().unwrap(), "--list-modules"]);
+        run_cyberfabric_server(&["--config", config_path.to_str().unwrap(), "--list-modules"]);
 
     assert!(
         output.status.success(),
@@ -548,7 +545,7 @@ modules:
 
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
-    let output = run_hyperspot_server(&[
+    let output = run_cyberfabric_server(&[
         "--config",
         config_path.to_str().unwrap(),
         "--dump-modules-config-yaml",
@@ -627,7 +624,7 @@ modules:
 
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
-    let output = run_hyperspot_server(&[
+    let output = run_cyberfabric_server(&[
         "--config",
         config_path.to_str().unwrap(),
         "--dump-modules-config-json",
@@ -702,7 +699,7 @@ modules:
 
     std::fs::write(&config_path, config_content).expect("Failed to write config file");
 
-    let output = run_hyperspot_server(&[
+    let output = run_cyberfabric_server(&[
         "--config",
         config_path.to_str().unwrap(),
         "--dump-modules-config-json",
@@ -727,7 +724,7 @@ modules:
 #[test]
 fn test_cli_dump_flags_require_config() {
     // Test that dump flags fail gracefully without config
-    let output = run_hyperspot_server(&["--list-modules"]);
+    let output = run_cyberfabric_server(&["--list-modules"]);
 
     // Should fail or show error about missing config
     // The actual behavior depends on whether config is optional

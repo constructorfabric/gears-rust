@@ -4,7 +4,7 @@ edition = "2024"
 license = "Apache-2.0"
 authors = ["Cyber Fabric"]
 repository = "https://github.com/cyberfabric/cyberfabric-core"
-description = "HyperSpot Server"
+description = "CyberFabric Server"
 rust-version = "1.95.0"
 readme = "README.md"
 
@@ -23,7 +23,7 @@ debug = "line-tables-only"
 
 [workspace]
 members = [
-    "apps/hyperspot-server",
+    "apps/cf-server",
     "apps/gts-docs-validator",
     "tools/xtask",
     "libs/modkit",

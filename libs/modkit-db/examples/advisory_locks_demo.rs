@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
 
         // For SQLite, the lock is stored as a file in the cache directory
         if let Some(cache_dir) = dirs::cache_dir() {
-            let lock_dir = cache_dir.join("hyperspot").join("locks");
+            let lock_dir = cache_dir.join("cyberfabric").join("locks");
             println!("  Lock files are stored in: {}", lock_dir.display());
             println!("  Each lock creates a file with PID and timestamp for debugging");
         }

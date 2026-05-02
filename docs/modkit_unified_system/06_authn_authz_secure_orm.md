@@ -645,7 +645,7 @@ The server binary uses feature flags to include static plugins:
 
 ```bash
 # Run with static AuthN + AuthZ plugins (development mode)
-cargo run --bin hyperspot-server --features static-authn,static-authz -- --config config.yaml run
+cargo run --bin cf-server --features static-authn,static-authz -- --config config.yaml run
 
 # Makefile target includes these features
 make example

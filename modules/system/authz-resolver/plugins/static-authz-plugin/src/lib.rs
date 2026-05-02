@@ -11,7 +11,7 @@
 //! modules:
 //!   static_authz_plugin:
 //!     config:
-//!       vendor: "hyperspot"
+//!       vendor: "cyberfabric"
 //!       priority: 100
 //! ```
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]

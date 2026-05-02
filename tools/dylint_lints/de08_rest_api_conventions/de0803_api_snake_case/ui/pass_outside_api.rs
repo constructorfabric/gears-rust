@@ -1,4 +1,4 @@
-// simulated_dir=/hyperspot/modules/some_module/other/structs.rs
+// simulated_dir=/cyberfabric/modules/some_module/other/structs.rs
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]

@@ -43,7 +43,7 @@ impl Module for StaticAuthZPlugin {
 
         // Generate plugin instance ID
         let instance_id = AuthZResolverPluginSpecV1::gts_make_instance_id(
-            "hyperspot.builtin.static_authz_resolver.plugin.v1",
+            "cf.builtin.static_authz_resolver.plugin.v1",
         );
 
         // Register plugin instance in types-registry

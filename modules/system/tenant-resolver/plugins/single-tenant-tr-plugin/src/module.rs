@@ -14,7 +14,7 @@ use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 use crate::domain::Service;
 
 /// Hardcoded vendor name for GTS instance registration.
-const VENDOR: &str = "hyperspot";
+const VENDOR: &str = "cyberfabric";
 
 /// Hardcoded priority (higher value = lower priority).
 /// Set to 1000 so `static_tr_plugin` (priority 100) wins when both are enabled.
@@ -41,7 +41,7 @@ impl Module for SingleTenantTrPlugin {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
         // Generate plugin instance ID
         let instance_id = TenantResolverPluginSpecV1::gts_make_instance_id(
-            "hyperspot.builtin.single_tenant_resolver.plugin.v1",
+            "cf.builtin.single_tenant_resolver.plugin.v1",
         );
 
         // Register plugin instance in types-registry

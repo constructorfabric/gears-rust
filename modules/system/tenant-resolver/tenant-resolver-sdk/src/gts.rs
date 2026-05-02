@@ -24,7 +24,7 @@ use modkit::gts::BaseModkitPluginV1;
 /// ```ignore
 /// // Plugin generates its instance ID
 /// let instance_id = TenantResolverPluginSpecV1::gts_make_instance_id(
-///     "hyperspot.builtin.static_tenant_resolver.plugin.v1"
+///     "cf.builtin.static_tenant_resolver.plugin.v1"
 /// );
 ///
 /// // Plugin creates instance data

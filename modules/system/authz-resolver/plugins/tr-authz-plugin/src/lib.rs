@@ -10,7 +10,7 @@
 //! modules:
 //!   tr_authz_plugin:
 //!     config:
-//!       vendor: "hyperspot"
+//!       vendor: "cyberfabric"
 //!       priority: 50
 //! ```
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]

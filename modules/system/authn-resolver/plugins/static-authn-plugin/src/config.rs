@@ -32,7 +32,7 @@ pub struct StaticAuthNPluginConfig {
 impl Default for StaticAuthNPluginConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             priority: 100,
             mode: AuthNMode::AcceptAll,
             default_identity: IdentityConfig::default(),

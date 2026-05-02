@@ -1,4 +1,4 @@
-// simulated_dir=/hyperspot/modules/some_module/contract/
+// simulated_dir=/cyberfabric/modules/some_module/contract/
 #[allow(dead_code)]
 // Should trigger DE0101 - Serde in contract
 #[derive(Debug, Clone, serde::Serialize)]

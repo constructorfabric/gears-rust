@@ -1,4 +1,4 @@
-// simulated_dir=/hyperspot/modules/some_module/domain/service.rs
+// simulated_dir=/cyberfabric/modules/some_module/domain/service.rs
 #![feature(register_tool)]
 #![register_tool(dylint)]
 #![allow(dead_code)]

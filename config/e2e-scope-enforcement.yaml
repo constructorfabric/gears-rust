@@ -4,7 +4,7 @@
 # allowing us to test the route_policies middleware.
 
 server:
-  home_dir: "~/.hyperspot"
+  home_dir: "~/.cyberfabric"
 
 database:
   servers:
@@ -21,7 +21,7 @@ database:
 logging:
   default:
     console_level: info
-    file: "logs/hyperspot-scope-e2e.log"
+    file: "logs/cyberfabric-scope-e2e.log"
     file_level: debug
 
 modules:
@@ -32,7 +32,7 @@ modules:
       cors_enabled: false
 
       openapi:
-        title: "HyperSpot API - Scope Enforcement E2E"
+        title: "CyberFabric Server API - Scope Enforcement E2E"
         version: "0.1.0"
 
       defaults:
@@ -66,11 +66,11 @@ modules:
   # AuthN pipeline - validates bearer tokens
   authn-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
 
   static-authn-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
       mode: static_tokens
       # Define tokens with specific scopes for testing
@@ -109,21 +109,21 @@ modules:
   # AuthZ pipeline
   authz-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
 
   static-authz-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
 
   # Tenant resolver
   tenant-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
 
   static-tr-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 20
       tenants:
         - id: "00000000-df51-5b42-9538-d2b56b7ee953"
@@ -134,12 +134,12 @@ modules:
   types-registry:
     config: {}
 
-  # File parser module (required by hyperspot-server)
+  # File parser module (required by cf-server)
   file-parser:
     config:
       allowed_local_base_dir: /tmp
 
-  # Simple user settings module (required by hyperspot-server)
+  # Simple user settings module (required by cf-server)
   simple-user-settings:
     database:
       server: "sqlite_users"

@@ -14,7 +14,7 @@
 //! ## Configuration
 //!
 //! No configuration required. The plugin registers itself automatically with:
-//! - Vendor: `hyperspot`
+//! - Vendor: `cyberfabric`
 //! - Priority: `1000` (lower than static plugin, so static wins when both are enabled)
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]

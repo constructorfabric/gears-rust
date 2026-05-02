@@ -86,7 +86,7 @@ Foundation layer that all other OAGW features depend on. Provides the shared dom
 - GTS registration failure (types_registry unavailable)
 
 **Steps**:
-1. [x] - `p1` - Platform operator starts hyperspot-server with OAGW module enabled - `inst-boot-1`
+1. [x] - `p1` - Platform operator starts cf-server with OAGW module enabled - `inst-boot-1`
 2. [x] - `p1` - ModKit invokes OAGW `Module::init()` with application context - `inst-boot-2`
 3. [x] - `p1` - Load `OagwConfig` from configuration file (fields defined in `cpt-cf-oagw-design-overview`) - `inst-boot-3`
 4. [x] - `p1` - DB: RUN all `oagw_*` migrations (SeaORM migrator) - `inst-boot-4`
@@ -303,7 +303,7 @@ The system **MUST** establish the DDD-Light directory structure (`domain/`, `inf
 - [x] Domain entity types compile and enforce field-level validation per `cpt-cf-oagw-algo-domain-entity-validation`
 - [x] `oagw-sdk` crate exports `ServiceGatewayClientV1` trait, all SDK model types, and `ServiceGatewayError`
 - [x] `oagw-sdk` crate compiles with no dependency on infrastructure or transport crates
-- [x] ModKit module starts successfully and registers in hyperspot-server
+- [x] ModKit module starts successfully and registers in cf-server
 - [x] GTS schemas and built-in plugin instances are registered during module startup
 - [ ] Secure ORM scoping is enforced: all repository queries include tenant_id predicate or scoped join
 - [x] Repository traits are defined in domain layer with no infrastructure imports

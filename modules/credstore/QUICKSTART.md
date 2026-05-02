@@ -20,7 +20,7 @@ Full API documentation: <http://127.0.0.1:8087/docs>
 ```yaml
 modules:
   credstore:
-    vendor: "hyperspot"  # Selects backend plugin by vendor name (default: "hyperspot")
+    vendor: "cyberfabric"  # Selects backend plugin by vendor name (default: "cyberfabric")
 ```
 
 ## Examples

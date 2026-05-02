@@ -47,7 +47,7 @@ impl Module for TrAuthZPlugin {
 
         // Generate plugin instance ID
         let instance_id = AuthZResolverPluginSpecV1::gts_make_instance_id(
-            "hyperspot.builtin.tr_authz_resolver.plugin.v1",
+            "cf.builtin.tr_authz_resolver.plugin.v1",
         );
 
         // Resolve Tenant Resolver client from ClientHub first — if it's not

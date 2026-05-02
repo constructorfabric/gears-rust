@@ -1,4 +1,4 @@
-// simulated_dir=/hyperspot/apps/hyperspot-server/src/main.rs
+// simulated_dir=/cyberfabric/apps/cf-server/src/main.rs
 
 fn main() {
     print!("allowed in apps");

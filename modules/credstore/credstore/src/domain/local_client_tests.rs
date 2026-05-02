@@ -15,7 +15,7 @@ use crate::domain::test_support::{MockPlugin, test_ctx};
 
 fn make_client() -> CredStoreLocalClient {
     let hub = Arc::new(ClientHub::default());
-    let svc = Arc::new(Service::new(hub, "hyperspot".into()));
+    let svc = Arc::new(Service::new(hub, "cyberfabric".into()));
     CredStoreLocalClient::new(svc)
 }
 
@@ -30,7 +30,7 @@ fn make_wired_client(plugin: Arc<dyn CredStorePluginClientV1>) -> CredStoreLocal
         &instance_id,
         serde_json::json!({
             "id": instance_id,
-            "vendor": "hyperspot",
+            "vendor": "cyberfabric",
             "priority": 0,
             "properties": {}
         }),
@@ -40,7 +40,7 @@ fn make_wired_client(plugin: Arc<dyn CredStorePluginClientV1>) -> CredStoreLocal
     hub.register::<dyn TypesRegistryClient>(reg);
     hub.register_scoped::<dyn CredStorePluginClientV1>(ClientScope::gts_id(&instance_id), plugin);
 
-    let svc = Arc::new(Service::new(hub, "hyperspot".into()));
+    let svc = Arc::new(Service::new(hub, "cyberfabric".into()));
     CredStoreLocalClient::new(svc)
 }
 

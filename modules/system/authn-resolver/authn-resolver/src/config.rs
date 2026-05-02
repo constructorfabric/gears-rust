@@ -16,7 +16,7 @@ pub struct AuthNResolverConfig {
 impl Default for AuthNResolverConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
         }
     }
 }

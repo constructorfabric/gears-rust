@@ -4,10 +4,10 @@
 # modkit-security/constants.rs (DEFAULT_TENANT_ID).
 #
 # Run with:
-#   cargo run --bin hyperspot-server -- --config config/test-static-tr.yaml run
+#   cargo run --bin cf-server -- --config config/test-static-tr.yaml run
 
 server:
-  home_dir: "~/.hyperspot"
+  home_dir: "~/.cyberfabric"
 
 database:
   servers:
@@ -30,7 +30,7 @@ modules:
 
   static-tr-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
       tenants:
         # Default tenant (used when auth_disabled)
@@ -48,7 +48,7 @@ modules:
 
   tenant-resolver:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
 
   users-info:
     database:

@@ -71,7 +71,7 @@ fn test_error_conversion_mapping() {
         assert!(
             problem
                 .type_url
-                .starts_with("https://errors.hyperspot.com/"),
+                .starts_with("https://errors.cyberfabric.org/"),
             "Type URL should have correct prefix"
         );
     }

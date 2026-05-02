@@ -52,7 +52,7 @@ curl -s http://127.0.0.1:8087/file-parser/v1/info | python3 -m json.tool
 ### Upload and Parse a File
 
 ```bash
-echo "Hello, HyperSpot!" > /tmp/test.txt
+echo "Hello, CyberFabric!" > /tmp/test.txt
 curl -s -X POST "http://127.0.0.1:8087/file-parser/v1/upload?filename=test.txt" \
   -H "Content-Type: application/octet-stream" \
   --data-binary @/tmp/test.txt | python3 -m json.tool
@@ -71,7 +71,7 @@ curl -s -X POST "http://127.0.0.1:8087/file-parser/v1/upload?filename=test.txt" 
         "blocks": [
             {
                 "type": "paragraph",
-                "inlines": [{"type": "text", "text": "Hello, HyperSpot!", "style": {}}]
+                "inlines": [{"type": "text", "text": "Hello, CyberFabric!", "style": {}}]
             }
         ]
     }

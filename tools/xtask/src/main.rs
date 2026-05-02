@@ -30,7 +30,7 @@ Usage: cargo xtask <COMMAND>
 Commands:
   split-debug <NAME>  Split debug symbols out of a release binary
                       using platform-native tools.
-                      NAME is the binary name (e.g. hyperspot-server).
+                      NAME is the binary name (e.g. cf-server).
                       Resolved as target/release/<NAME>.
   help                  Show this message."
     );

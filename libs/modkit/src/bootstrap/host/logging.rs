@@ -98,7 +98,7 @@ impl Write for RoutedWriterHandle {
 }
 
 /// Route log records to different files by target prefix:
-/// keys are *full* prefixes like "`hyperspot::api_gateway`"
+/// keys are *full* prefixes like "`cyberfabric::api_gateway`"
 #[derive(Clone)]
 struct MultiFileRouter {
     default: Option<RotWriter>, // default file (from "default" section), optional
@@ -618,14 +618,14 @@ mod tests {
         let router = MultiFileRouter {
             default: None,
             by_prefix: vec![
-                ("hyperspot::api_gateway".into(), specific),
-                ("hyperspot".into(), broad),
+                ("cyberfabric::api_gateway".into(), specific),
+                ("cyberfabric".into(), broad),
             ],
         };
 
-        // "hyperspot::api_gateway::handler" should match the longer prefix
+        // "cyberfabric::api_gateway::handler" should match the longer prefix
         let mut handle = router
-            .resolve_for("hyperspot::api_gateway::handler")
+            .resolve_for("cyberfabric::api_gateway::handler")
             .expect("should resolve");
         handle.write_all(b"routed\n").unwrap();
         handle.flush().unwrap();
@@ -680,15 +680,15 @@ mod tests {
         let config = ConfigData {
             default_section: None,
             crate_sections: vec![
-                ("hyperspot".to_owned(), &broad_section),
-                ("hyperspot::api_gateway".to_owned(), &specific_section),
+                ("cyberfabric".to_owned(), &broad_section),
+                ("cyberfabric::api_gateway".to_owned(), &specific_section),
             ],
         };
 
         let router = build_file_router(&config, dir.path());
 
         let mut handle = router
-            .resolve_for("hyperspot::api_gateway::handler")
+            .resolve_for("cyberfabric::api_gateway::handler")
             .expect("should resolve");
         handle.write_all(b"routed\n").unwrap();
         handle.flush().unwrap();
@@ -713,22 +713,22 @@ mod tests {
 
         let router = MultiFileRouter {
             default: None,
-            by_prefix: vec![("hyperspot".into(), writer)],
+            by_prefix: vec![("cyberfabric".into(), writer)],
         };
 
         // Exact match
         assert!(
-            router.resolve_for("hyperspot").is_some(),
+            router.resolve_for("cyberfabric").is_some(),
             "exact target should match"
         );
         // Submodule match
         assert!(
-            router.resolve_for("hyperspot::sub").is_some(),
+            router.resolve_for("cyberfabric::sub").is_some(),
             "submodule target should match"
         );
         // Non-prefix string must NOT match
         assert!(
-            router.resolve_for("hyperspot_extra").is_none(),
+            router.resolve_for("cyberfabric_extra").is_none(),
             "non-prefix target should not match"
         );
         assert!(

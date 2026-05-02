@@ -16,7 +16,7 @@
 //! modules:
 //!   static_authn_plugin:
 //!     config:
-//!       vendor: "hyperspot"
+//!       vendor: "cyberfabric"
 //!       priority: 100
 //!       mode: accept_all
 //!       default_identity:

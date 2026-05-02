@@ -2268,7 +2268,7 @@ release-plz updates this file in the Release PR.
 ### Other
 
 - Merge pull request #641 from genericaccount-de/feature/REAL-162-production-hardening-of-cyberfabric-core (by @MikeFalcon77) - #641
-- Add production hardening changes to cyberfabric-core and hyperspot-server, partly REAL-162
+- Add production hardening changes to cyberfabric-core and cf-server, partly REAL-162
 - Merge pull request #540 from KvizadSaderah/feature/500-list-modules-api (by @Artifizer) - #540
 - Merge branch 'main' into fix-oop-example (by @Bechma) - #670
 - - fix oop example (by @Bechma) - #670

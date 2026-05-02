@@ -16,7 +16,7 @@ pub struct StaticAuthZPluginConfig {
 impl Default for StaticAuthZPluginConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             priority: 100,
         }
     }

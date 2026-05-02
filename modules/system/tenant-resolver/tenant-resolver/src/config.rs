@@ -16,7 +16,7 @@ pub struct TenantResolverConfig {
 impl Default for TenantResolverConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
         }
     }
 }

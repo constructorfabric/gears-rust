@@ -65,7 +65,7 @@ fn hub_with_registry_and_plugin(
 
 #[tokio::test]
 async fn get_returns_registry_unavailable_when_hub_empty() {
-    let svc = Service::new(empty_hub(), "hyperspot".into());
+    let svc = Service::new(empty_hub(), "cyberfabric".into());
     let key = SecretRef::new("my-key").unwrap();
     let err = svc.get(&test_ctx(), &key).await.unwrap_err();
     assert!(
@@ -84,7 +84,7 @@ async fn get_retries_resolution_on_each_call_when_registry_absent() {
         MockTypesRegistryClient::new().with_list_error(TypesRegistryError::internal("unavailable")),
     );
     hub.register::<dyn TypesRegistryClient>(registry.clone() as Arc<dyn TypesRegistryClient>);
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let key = SecretRef::new("my-key").unwrap();
     assert!(svc.get(&test_ctx(), &key).await.is_err());
     assert!(svc.get(&test_ctx(), &key).await.is_err());
@@ -99,7 +99,7 @@ async fn resolve_plugin_returns_plugin_not_found_when_no_instances() {
     let registry: Arc<dyn TypesRegistryClient> = Arc::new(MockTypesRegistryClient::new());
     hub.register::<dyn TypesRegistryClient>(registry);
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let err = svc.resolve_plugin().await.unwrap_err();
     assert!(
         matches!(err, DomainError::PluginNotFound { .. }),
@@ -116,7 +116,7 @@ async fn resolve_plugin_returns_plugin_not_found_when_vendor_mismatch() {
         Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
     hub.register::<dyn TypesRegistryClient>(registry);
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let err = svc.resolve_plugin().await.unwrap_err();
     assert!(
         matches!(err, DomainError::PluginNotFound { .. }),
@@ -136,7 +136,7 @@ async fn resolve_plugin_returns_invalid_when_content_malformed() {
         Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
     hub.register::<dyn TypesRegistryClient>(registry);
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let err = svc.resolve_plugin().await.unwrap_err();
     assert!(
         matches!(err, DomainError::InvalidPluginInstance { .. }),
@@ -152,7 +152,7 @@ async fn resolve_plugin_returns_internal_when_registry_list_fails() {
     );
     hub.register::<dyn TypesRegistryClient>(registry);
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let err = svc.resolve_plugin().await.unwrap_err();
     assert!(
         matches!(err, DomainError::Internal(ref msg) if msg.contains("db down")),
@@ -163,9 +163,9 @@ async fn resolve_plugin_returns_internal_when_registry_list_fails() {
 #[tokio::test]
 async fn resolve_plugin_succeeds_with_matching_vendor() {
     let instance_id = test_instance_id();
-    let hub = hub_with_registry_and_plugin(&instance_id, "hyperspot", MockPlugin::returns(None));
+    let hub = hub_with_registry_and_plugin(&instance_id, "cyberfabric", MockPlugin::returns(None));
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let resolved = svc.resolve_plugin().await.unwrap();
     assert_eq!(resolved, instance_id);
 }
@@ -177,12 +177,12 @@ async fn get_plugin_returns_unavailable_when_not_in_hub() {
     // Registry resolves successfully, but the scoped client is absent.
     let instance_id = test_instance_id();
     let hub = Arc::new(ClientHub::default());
-    let instance = make_test_instance(&instance_id, plugin_content(&instance_id, "hyperspot"));
+    let instance = make_test_instance(&instance_id, plugin_content(&instance_id, "cyberfabric"));
     let registry: Arc<dyn TypesRegistryClient> =
         Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
     hub.register::<dyn TypesRegistryClient>(registry);
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let err = svc.get_plugin().await.err().expect("expected Err");
     assert!(
         matches!(err, DomainError::PluginUnavailable { .. }),
@@ -193,10 +193,13 @@ async fn get_plugin_returns_unavailable_when_not_in_hub() {
 #[tokio::test]
 async fn get_plugin_caches_resolved_instance() {
     let instance_id = test_instance_id();
-    let (hub, registry) =
-        hub_with_counting_registry_and_plugin(&instance_id, "hyperspot", MockPlugin::returns(None));
+    let (hub, registry) = hub_with_counting_registry_and_plugin(
+        &instance_id,
+        "cyberfabric",
+        MockPlugin::returns(None),
+    );
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let p1 = svc.get_plugin().await.unwrap();
     let p2 = svc.get_plugin().await.unwrap();
 
@@ -222,10 +225,13 @@ async fn get_returns_some_response_on_success() {
         sharing: SharingMode::Tenant,
         owner_tenant_id: TenantId::nil(),
     };
-    let hub =
-        hub_with_registry_and_plugin(&instance_id, "hyperspot", MockPlugin::returns(Some(&meta)));
+    let hub = hub_with_registry_and_plugin(
+        &instance_id,
+        "cyberfabric",
+        MockPlugin::returns(Some(&meta)),
+    );
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let key = SecretRef::new("my-key").unwrap();
     let resp = svc.get(&test_ctx(), &key).await.unwrap();
 
@@ -239,9 +245,9 @@ async fn get_returns_some_response_on_success() {
 #[tokio::test]
 async fn get_returns_none_when_plugin_returns_none() {
     let instance_id = test_instance_id();
-    let hub = hub_with_registry_and_plugin(&instance_id, "hyperspot", MockPlugin::returns(None));
+    let hub = hub_with_registry_and_plugin(&instance_id, "cyberfabric", MockPlugin::returns(None));
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let key = SecretRef::new("missing-key").unwrap();
     let result = svc.get(&test_ctx(), &key).await.unwrap();
     assert!(result.is_none(), "expected None for missing secret");
@@ -252,11 +258,11 @@ async fn get_propagates_plugin_error() {
     let instance_id = test_instance_id();
     let hub = hub_with_registry_and_plugin(
         &instance_id,
-        "hyperspot",
+        "cyberfabric",
         MockPlugin::errors_internal("backend failure"),
     );
 
-    let svc = Service::new(hub, "hyperspot".into());
+    let svc = Service::new(hub, "cyberfabric".into());
     let key = SecretRef::new("any-key").unwrap();
     let err = svc.get(&test_ctx(), &key).await.unwrap_err();
     assert!(

@@ -1,14 +1,14 @@
-# HyperSpot Architecture Manifest
+# CyberFabric Architecture Manifest
 
 > **NOTE:** This manifest describes our targets and forward-looking architecture. It is not a changelog of the current implementation. Canonical, up-to-date product and API documentation is maintained separately (e.g., module-specific docs, OpenAPI, and design records). Use this document for intent and direction; confirm current behavior in the dedicated docs.
 
-**Welcome to HyperSpot!** This document serves as your architectural and technical reference, explaining the core ideas, design principles, and rules that guide HyperSpot's development. Whether you're a newcomer or contributor, understanding these concepts will help you navigate and extend the platform effectively.
+**Welcome to CyberFabric!** This document serves as your architectural and technical reference, explaining the core ideas, design principles, and rules that guide CyberFabric's development. Whether you're a newcomer or contributor, understanding these concepts will help you navigate and extend the platform effectively.
 
-HyperSpot is a modular Rust-based foundation for building SaaS products where Generative AI capabilities are first-class, alongside enterprise-grade SaaS requirements such as multi-tenancy, access control, governance, auditability, and usage tracking. It is designed to sit between cloud infrastructure (IaaS/PaaS) and vendor-developed SaaS applications, providing reusable building blocks that product teams can assemble into complete end-to-end services.
+CyberFabric is a modular foundation for building XaaS products where Generative AI capabilities are first-class, alongside enterprise-grade XaaS requirements such as multi-tenancy, access control, governance, auditability, and usage tracking. It is designed to sit between cloud infrastructure (IaaS/PaaS) and vendor-developed SaaS applications, providing reusable building blocks that product teams can assemble into complete end-to-end services.
 
 ## Overview
 
-HyperSpot is a **modular, high-performance AI services platform** built in Rust. It provides a framework for building scalable and highly-customizable AI applications with automatic REST API generation, OpenAPI documentation, and a flexible modular architecture.
+CyberFabric is a **modular, high-performance AI services platform** built primarily in Rust. It provides a framework for building scalable and highly-customizable AI applications with automatic REST API generation, OpenAPI documentation, and a flexible modular architecture.
 
 **Key Philosophy:**
 - **Modular by Design**: Everything is a Module - composable, independent units with plugin patterns for pluggable workers
@@ -21,17 +21,17 @@ HyperSpot is a **modular, high-performance AI services platform** built in Rust.
 
 ## Non-goals
 
-1. HyperSpot doesn't optimize for **minimalism** or the lowest barrier to entry
+1. CyberFabric doesn't optimize for **minimalism** or the lowest barrier to entry
 
-HyperSpot does not aim to be the simplest or smallest framework for building SaaS or AI applications. It intentionally prioritizes explicit structure, governance, composability, and long-term evolvability over quick-start simplicity or minimal configuration.
+CyberFabric does not aim to be the simplest or smallest framework for building SaaS or AI applications. It intentionally prioritizes explicit structure, governance, composability, and long-term evolvability over quick-start simplicity or minimal configuration.
 
-2. HyperSpot doesn't Provide a **rich catalog of end-user services** out of the box
+2. CyberFabric doesn't Provide a **rich catalog of end-user services** out of the box
 
-HyperSpot does not aim to ship a comprehensive set of ready-made, end-user SaaS services (e.g. CRM, ticketing, billing products) as part of its core. Its primary focus is the foundational layer—runtime, control plane, GenAI capabilities, workflows, and extensibility—on top of which vendors and product teams build their own complete SaaS offerings.
+CyberFabric does not aim to ship a comprehensive set of ready-made, end-user SaaS services (e.g. CRM, ticketing, billing products) as part of its core. Its primary focus is the foundational layer—runtime, control plane, GenAI capabilities, workflows, and extensibility—on top of which vendors and product teams build their own complete SaaS offerings.
 
-3. HyperSpot doesn't attempt to replace **cloud infrastructure or PaaS layers**
+3. CyberFabric doesn't attempt to replace **cloud infrastructure or PaaS layers**
 
-HyperSpot is not a replacement for cloud providers or infrastructure platforms such as AWS, Azure, GCP, or on-prem orchestration stacks. It does not offer physical infrastructure, networking, container orchestration, or low-level resource scheduling. Instead, HyperSpot intentionally positions itself above IaaS/PaaS and below vendor-developed SaaS, focusing on application-level services, governance, and GenAI enablement.
+CyberFabric is not a replacement for cloud providers or infrastructure platforms such as AWS, Azure, GCP, or on-prem orchestration stacks. It does not offer physical infrastructure, networking, container orchestration, or low-level resource scheduling. Instead, CyberFabric intentionally positions itself above IaaS/PaaS and below vendor-developed SaaS, focusing on application-level services, governance, and GenAI enablement.
 
 ## Why Rust and why Monorepo?
 
@@ -60,7 +60,7 @@ Rust and a monorepo are intentional choices to optimize **recurring engineering 
 ### Why a monorepo (recurring benefits)
 
 - **Atomic changes across modules and contracts**.
-  HyperSpot is modular, but the contracts between modules evolve. A monorepo allows changing a contract and all its consumers in one PR.
+  CyberFabric is modular, but the contracts between modules evolve. A monorepo allows changing a contract and all its consumers in one PR.
 
 - **Short, controllable feedback loops for LLM-generated changes**.
   When generation touches multiple crates, the monorepo makes it practical to run build + lints + targeted tests + E2E in a single workspace context. This reduces "partial correctness" changes and enables rapid iteration on generated patches until the full system is green.
@@ -82,7 +82,7 @@ Monorepo is not dogma: it has to be kept while it improves velocity and correctn
 
 ### 1.1. What is a Module?
 
-A **Module** is a logical component that provides a specific set of functionality. In HyperSpot:
+A **Module** is a logical component that provides a specific set of functionality. In CyberFabric:
 - Every logical component must be a module
 - Each module is a Rust **package** containing:
   - A **library crate** (`lib.rs`) — always present, contains module declaration
@@ -140,7 +140,7 @@ The `ClientHub` provides type-safe client resolution, allowing modules to commun
 
 ## 2. SaaS Readiness
 
-HyperSpot is designed from the ground up for **Software-as-a-Service (SaaS)** deployments with enterprise-grade multi-tenancy, product licensing and security features.
+CyberFabric is designed from the ground up for **Software-as-a-Service (SaaS)** deployments with enterprise-grade multi-tenancy, product licensing and security features.
 
 ### 2.1. Multi-Tenancy
 
@@ -209,7 +209,7 @@ See detailed descriptions in [MODULES.md](MODULES.md).
 
 ## 4. Deployment Targets
 
-HyperSpot supports multiple deployment scenarios to meet different operational needs:
+CyberFabric supports multiple deployment scenarios to meet different operational needs:
 
 - [ ] 4.1. Desktop Application - local AI researchers, offline processing
 - [ ] 4.2. Cloud Server - multi-tenant SaaS, scalable AI services
@@ -222,11 +222,11 @@ HyperSpot supports multiple deployment scenarios to meet different operational n
 
 ### 5.1. Monorepo Structure
 
-HyperSpot uses a **monorepo** approach with multiple crates:
+CyberFabric Server uses a **monorepo** approach with multiple crates:
 
 ```
-hyperspot/
-├── apps/              # Executable applications (hyperspot-server)
+cyberfabric/
+├── apps/              # Executable applications (cf-server)
 ├── config/            # Configuration files
 ├── docs/              # Architecture and development guides
 ├── dylint_lints/      # Project-specific lints (see `make dylint`)
@@ -242,8 +242,8 @@ hyperspot/
 
 ### 5.2. External Integration
 
- The 'main' crates can be located in separate repositories and use HyperSpot modules as dependencies via Cargo. This allows:
- - Custom applications built on HyperSpot by choosing only needed modules
+ The 'main' crates can be located in separate repositories and use CyberFabric modules as dependencies via Cargo. This allows:
+ - Custom applications built on CyberFabric by choosing only needed modules
  - Private modules not in the main repo
  - Vendor-specific extensions (modules, plugins, adapters)
 
@@ -307,7 +307,7 @@ Additional common patterns (see `examples/`):
 
 ### 5.4. ModKit - The Foundation
 
-Every HyperSpot module uses the **ModKit** framework, which provides:
+Every CyberFabric module uses the **ModKit** framework, which provides:
 - **Module lifecycle**: Initialization, configuration, shutdown
 - **REST API builder**: Type-safe route registration with OpenAPI
 - **Database access**: SeaORM and SQLx integration
@@ -337,7 +337,7 @@ Every HyperSpot module uses the **ModKit** framework, which provides:
 
 ### 6.1. DNA - Development Guidelines
 
-[DNA](https://github.com/cyberfabric/DNA) is HyperSpot's collection of development standards and best practices:
+[DNA](https://github.com/cyberfabric/DNA) is CyberFabric's collection of development standards and best practices:
 - **REST API design**: Status codes, pagination, error handling
 
 **Key guidelines:**
@@ -345,7 +345,7 @@ Every HyperSpot module uses the **ModKit** framework, which provides:
 
 ### 6.2. Extension Points (Type System)
 
-HyperSpot uses the [Global Type System](https://github.com/GlobalTypeSystem/gts-rust) ([specification](https://github.com/GlobalTypeSystem/gts-spec)) to implement a powerful **extension point architecture** where virtually everything in the system can be extended without modifying core code.
+CyberFabric Server uses the [Global Type System](https://github.com/GlobalTypeSystem/gts-rust) ([specification](https://github.com/GlobalTypeSystem/gts-spec)) to implement a powerful **extension point architecture** where virtually everything in the system can be extended without modifying core code.
 
 **Core Concept: Extension Points**
 
@@ -377,8 +377,8 @@ An **extension point** is a well-defined interface where new functionality and d
 
 **Benefits:**
 
-- **High customization**: HyperSpot modules can be used as building blocks for custom AI applications or platforms
-- **No Core Modifications**: Add new functionality without changing HyperSpot core
+- **High customization**: CyberFabric modules can be used as building blocks for custom AI applications or platforms
+- **No Core Modifications**: Add new functionality without changing CyberFabric core
 - **Type Safety**: Compile-time checks for extension implementations
 - **Version Compatibility**: Graceful handling of schema evolution
 - **Dynamic Discovery**: Extensions are discovered at runtime via type registry
@@ -391,7 +391,7 @@ An **extension point** is a well-defined interface where new functionality and d
 - A user creates custom FaaS functions or workflows for domain-specific workflows
 - An enterprise integrates a custom search engine for compliance requirements
 
-This extension point architecture makes HyperSpot truly modular and adaptable to diverse use cases while maintaining type safety and system integrity.
+This extension point architecture makes CyberFabric truly modular and adaptable to diverse use cases while maintaining type safety and system integrity.
 
 # 6.3. Rust dependencies
 
@@ -407,7 +407,7 @@ That follows what's specified in [Rust documentation](https://doc.rust-lang.org/
 
 ## 7. Cloud Operations Excellence
 
-HyperSpot modules are built on **ModKit**, which provides enterprise-grade operational capabilities out of the box. Every module automatically inherits these cloud-native patterns without additional implementation effort.
+CyberFabric modules are built on **ModKit**, which provides enterprise-grade operational capabilities out of the box. Every module automatically inherits these cloud-native patterns without additional implementation effort.
 
 ### 7.1. Observability
 
@@ -504,7 +504,7 @@ HyperSpot modules are built on **ModKit**, which provides enterprise-grade opera
 
 **Flexible Configuration:**
 - [ ] **YAML Configuration**: Human-readable configuration files
-- [ ] **Environment Overrides**: Environment variable support with `HYPERSPOT_` prefix
+- [ ] **Environment Overrides**: Environment variable support with `CYBERFABRIC_` prefix
 - [ ] **Type-Safe Config**: Strongly-typed configuration structs with validation
 - [ ] **Defaults**: Sensible defaults for all configuration options
 - [ ] **Hot Reload**: Configuration reload without restart

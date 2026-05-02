@@ -1,6 +1,6 @@
-# Hyperspot Dylint Linters
+# CyberFabric Dylint Linters
 
-Custom [dylint](https://github.com/trailofbits/dylint) linters enforcing Hyperspot's architectural patterns, layer separation, and REST API conventions.
+Custom [dylint](https://github.com/trailofbits/dylint) linters enforcing CyberFabric's architectural patterns, layer separation, and REST API conventions.
 
 ## Quick Start
 

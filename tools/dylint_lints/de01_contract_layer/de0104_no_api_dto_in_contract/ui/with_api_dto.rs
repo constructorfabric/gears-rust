@@ -1,4 +1,4 @@
-// simulated_dir=/hyperspot/modules/some_module/contract/
+// simulated_dir=/cyberfabric/modules/some_module/contract/
 #![allow(dead_code)]
 
 // Should trigger DE0104 - api_dto in contract

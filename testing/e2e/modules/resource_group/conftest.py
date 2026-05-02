@@ -75,7 +75,7 @@ def _seed_root_tenants():
 
     Idempotent: uses INSERT OR IGNORE.
     """
-    home = os.path.expanduser(os.getenv("HYPERSPOT_HOME", "~/.hyperspot"))
+    home = os.path.expanduser(os.getenv("CYBERFABRIC_HOME", "~/.cyberfabric"))
     db_path = pathlib.Path(home) / "resource-group" / "resource_group.db"
     if not db_path.exists():
         return  # server not started or different DB path

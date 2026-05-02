@@ -1,6 +1,6 @@
 # Updated: 2026-04-16 by Constructor Tech
 [package]
-name = "hyperspot-server"
+name = "cf-server"
 version = "0.6.1"
 publish = false
 edition.workspace = true

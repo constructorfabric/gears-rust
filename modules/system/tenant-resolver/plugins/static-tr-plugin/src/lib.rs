@@ -8,7 +8,7 @@
 //! ```yaml
 //! modules:
 //!   static_tr_plugin:
-//!     vendor: "hyperspot"
+//!     vendor: "cyberfabric"
 //!     priority: 100
 //!     tenants:
 //!       - id: "550e8400-e29b-41d4-a716-446655440001"

@@ -367,7 +367,7 @@ The project uses `aws-lc-rs` (via `rustls`) as its primary TLS cryptographic bac
 **FIPS-140-3 support:** the application can be built with FIPS-140-3 approved cryptography by enabling the `fips` feature flag:
 
 ```sh
-cargo build -p hyperspot-server --features fips
+cargo build -p cf-server --features fips
 ```
 
 This switches the underlying cryptographic module from `aws-lc-sys` to `aws-lc-fips-sys` — the FIPS-validated AWS-LC module (NIST Certificate #4816). At startup, the FIPS crypto provider is installed as the process-wide default before any TLS, database, JWT, or other cryptographic operations occur. Runtime assertions verify that TLS configurations are operating in FIPS mode; the application fails fast if FIPS mode is expected but not active.

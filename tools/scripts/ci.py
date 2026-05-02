@@ -219,7 +219,7 @@ def cmd_check(args):
 
 
 def cmd_quickstart(_args):
-    step("Starting HyperSpot in quickstart mode")
+    step("Starting CyberFabric in quickstart mode")
     data_dir = os.path.join(PROJECT_ROOT, "data")
     if not os.path.isdir(data_dir):
         os.makedirs(data_dir, exist_ok=True)
@@ -229,7 +229,7 @@ def cmd_quickstart(_args):
             "cargo",
             "run",
             "--bin",
-            "hyperspot-server",
+            "cf-server",
             "--",
             "--config",
             "config/quickstart.yaml",
@@ -349,9 +349,9 @@ def cmd_e2e(args):
             "docker",
             "build",
             "-f",
-            "testing/docker/hyperspot.Dockerfile",
+            "testing/docker/cyberfabric.Dockerfile",
             "-t",
-            "hyperspot-api:e2e",
+            "cyberfabric-api:e2e",
         ]
 
         # Add build args for cargo features if specified
@@ -395,7 +395,7 @@ def cmd_e2e(args):
     else:
         step("Running E2E tests in local mode")
         server_process = None
-        print("Starting hyperspot-server for local E2E...")
+        print("Starting cf-server for local E2E...")
 
         # Build all required modules and binaries using project build orchestration
         step("Building release artifacts for local E2E")
@@ -403,7 +403,7 @@ def cmd_e2e(args):
 
         # Use the release binary produced by build
         release_bin = str(find_binary(
-            Path(PROJECT_ROOT) / "target", "release", "hyperspot-server"
+            Path(PROJECT_ROOT) / "target", "release", "cf-server"
         ))
 
         if not os.path.isfile(release_bin):
@@ -427,8 +427,8 @@ def cmd_e2e(args):
             config_path,
         ]
 
-        server_log_file = os.path.join(logs_dir, "hyperspot-e2e.log")
-        server_error_file = os.path.join(logs_dir, "hyperspot-e2e-error.log")
+        server_log_file = os.path.join(logs_dir, "cyberfabric-e2e.log")
+        server_error_file = os.path.join(logs_dir, "cyberfabric-e2e-error.log")
 
         with open(server_log_file, "w") as out_file, open(
             server_error_file, "w"
@@ -444,18 +444,18 @@ def cmd_e2e(args):
                     env=server_env,
                 )
             except OSError as e:
-                print(f"ERROR: Failed to start hyperspot-server: {e}")
+                print(f"ERROR: Failed to start cf-server: {e}")
                 _print_log_file(server_error_file, "server stderr")
                 sys.exit(1)
 
-        print(f"Started hyperspot-server (pid={server_process.pid})")
+        print(f"Started cf-server (pid={server_process.pid})")
 
         print("Server logs redirected to:")
         print(f"  - stdout: {server_log_file}")
         print(f"  - stderr: {server_error_file}")
         print(
             "  - application logs: "
-            f"{os.path.join(logs_dir, 'hyperspot-e2e.log')}"
+            f"{os.path.join(logs_dir, 'cyberfabric-e2e.log')}"
         )
         print(f"  - SQL logs: {os.path.join(logs_dir, 'sql.log')}")
         print(f"  - API logs: {os.path.join(logs_dir, 'api.log')}")
@@ -509,7 +509,7 @@ def cmd_e2e(args):
 
     # Stop server if we started it
     if server_process is not None:
-        step("Stopping hyperspot-server")
+        step("Stopping cf-server")
         stop_process_tree(server_process, timeout=10)
 
     print("")
@@ -795,7 +795,7 @@ def cmd_all(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="HyperSpot CI utility (Python, cross-platform)",
+        description="CyberFabric CI utility (Python, cross-platform)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)

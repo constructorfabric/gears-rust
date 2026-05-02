@@ -46,7 +46,7 @@ See [`config.rs`](authn-resolver/src/config.rs)
 ```yaml
 modules:
   authn_resolver:
-    vendor: "hyperspot"  # Selects plugin by matching vendor
+    vendor: "cyberfabric"  # Selects plugin by matching vendor
 ```
 
 ### Static AuthN Plugin
@@ -56,7 +56,7 @@ See [`config.rs`](plugins/static-authn-plugin/src/config.rs)
 ```yaml
 modules:
   static_authn_plugin:
-    vendor: "hyperspot"
+    vendor: "cyberfabric"
     priority: 100
     mode: accept_all          # accept_all | static_tokens
     default_identity:

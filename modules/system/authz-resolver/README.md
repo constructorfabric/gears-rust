@@ -118,7 +118,7 @@ See [`config.rs`](authz-resolver/src/config.rs)
 ```yaml
 modules:
   authz_resolver:
-    vendor: "hyperspot"  # Selects plugin by matching vendor
+    vendor: "cyberfabric"  # Selects plugin by matching vendor
 ```
 
 ### Static AuthZ Plugin
@@ -128,7 +128,7 @@ See [`config.rs`](plugins/static-authz-plugin/src/config.rs)
 ```yaml
 modules:
   static_authz_plugin:
-    vendor: "hyperspot"
+    vendor: "cyberfabric"
     priority: 100
 ```
 

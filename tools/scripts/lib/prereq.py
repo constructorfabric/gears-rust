@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Prerequisite checking module for HyperSpot testing environment.
+Prerequisite checking module for CyberFabric testing environment.
 
 This module provides classes to check various prerequisites needed for testing,
 including services, tools, and dependencies.
@@ -137,9 +137,9 @@ class PrereqLMStudio(Prereq):
 class PrereqHSSrvMock(Prereq):
     def __init__(self):
         super().__init__(
-            name="HyperSpot server is running with mock mode enabled",
+            name="CyberFabric server is running with mock mode enabled",
             remediation=(
-                "Start the HyperSpot server with mock mode enabled "
+                "Start the CyberFabric server with mock mode enabled "
                 "(use -mock option)"
             )
         )
@@ -163,7 +163,7 @@ class PrereqHSSrvMock(Prereq):
 
                 if response.status_code != 200:
                     logging.debug(
-                        f"HyperSpot server responded with status code: "
+                        f"CyberFabric server responded with status code: "
                         f"{response.status_code} (attempt {attempt + 1})"
                     )
                 else:
@@ -178,7 +178,7 @@ class PrereqHSSrvMock(Prereq):
                             if service.get('name') == 'mock':
                                 mock_service_found = True
                                 logging.info(
-                                    "HyperSpot server is running with "
+                                    "CyberFabric server is running with "
                                     "mock mode enabled"
                                 )
                                 break
@@ -187,7 +187,7 @@ class PrereqHSSrvMock(Prereq):
                             return PRECHECK_OK
                         else:
                             logging.debug(
-                                "HyperSpot server is running but mock mode "
+                                "CyberFabric server is running but mock mode "
                                 f"is not enabled (attempt {attempt + 1})"
                             )
                             status = PRECHECK_WARNING
@@ -202,13 +202,13 @@ class PrereqHSSrvMock(Prereq):
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout) as e:
                 logging.debug(
-                    f"Connection error to HyperSpot server: {e} "
+                    f"Connection error to CyberFabric server: {e} "
                     f"(attempt {attempt + 1})"
                 )
                 status = PRECHECK_WARNING
             except Exception as e:
                 logging.debug(
-                    f"Error checking HyperSpot server: {e} "
+                    f"Error checking CyberFabric server: {e} "
                     f"(attempt {attempt + 1})"
                 )
                 status = PRECHECK_WARNING
@@ -235,17 +235,17 @@ class PrereqHSSrvMock(Prereq):
         if status == PRECHECK_WARNING:
             if attempt > 0:
                 logging.warning(
-                    f"Cannot connect to HyperSpot server at {BASE_URL} "
+                    f"Cannot connect to CyberFabric server at {BASE_URL} "
                     f"after {attempt + 1} attempts over "
                     f"{time.time() - start_time:.1f}s"
                 )
             else:
                 logging.warning(
-                    f"Cannot connect to HyperSpot server at {BASE_URL}"
+                    f"Cannot connect to CyberFabric server at {BASE_URL}"
                 )
         elif status == PRECHECK_ERROR:
             logging.error(
-                f"HyperSpot server communication failed after "
+                f"CyberFabric server communication failed after "
                 f"{attempt + 1} attempts"
             )
 

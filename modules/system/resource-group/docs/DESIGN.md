@@ -1415,7 +1415,7 @@ Index-to-data ratio: **2.03×** (reasonable for btree-only indexes with UUID key
 | **Unit** | No DB — in-memory trait mocks | No network | Domain services, invariant logic, error mapping | All repositories (trait-based `InMemory*` impls) |
 | **Integration** | SQLite in-memory (`:memory:`, per-test schema) | No network — direct repo calls | Repositories, closure table SQL, SecureORM tenant scoping, constraints | PostgreSQL-dialect SQL, SERIALIZABLE semantics, `gts_type_path` DOMAIN (covered by E2E) |
 | **API** | SQLite in-memory | No real network — `Router::oneshot()` (in-process HTTP simulation) | REST handlers, OData parsing, domain services, DB | `PolicyEnforcer` / `AuthZResolverClient` (mock Allow/Deny) |
-| **E2E** | Real PostgreSQL (Docker or hosted) | Real HTTP via `httpx` to running `hyperspot-server` | Everything: AuthZ, DB, network, auth modes | Nothing — full production-like stack |
+| **E2E** | Real PostgreSQL (Docker or hosted) | Real HTTP via `httpx` to running `cf-server` | Everything: AuthZ, DB, network, auth modes | Nothing — full production-like stack |
 
 #### Level 1: Unit Tests (Domain Layer)
 
@@ -1541,9 +1541,9 @@ API tests verify HTTP-level behavior: request/response shapes, status codes, ODa
 
 #### Level 4: E2E Tests (Python / pytest)
 
-E2E tests verify the full stack running as `hyperspot-server` with real AuthZ, real DB, and real network requests.
+E2E tests verify the full stack running as `cf-server` with real AuthZ, real DB, and real network requests.
 
-**Infrastructure**: running hyperspot-server (Docker or local), `pytest` + `httpx`.
+**Infrastructure**: running cf-server (Docker or local), `pytest` + `httpx`.
 
 **Location**: `testing/e2e/modules/resource_group/`
 

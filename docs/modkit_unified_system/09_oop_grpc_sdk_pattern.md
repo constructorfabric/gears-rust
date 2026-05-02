@@ -33,7 +33,7 @@ modules:
     runtime:
       type: oop
       execution:
-        executable_path: "~/.hyperspot/bin/calculator-oop.exe"
+        executable_path: "~/.cyberfabric/bin/calculator-oop.exe"
         args: [ ]
         working_directory: null
         environment:
@@ -312,7 +312,7 @@ impl MyModuleService for MyModuleGrpcServer {
         request: Request<DoSomethingRequest>,
     ) -> Result<Response<DoSomethingResponse>, Status> {
         let req = request.into_inner();
-        
+
         let input = Input {
             id: req.id.ok_or_else(|| Status::invalid_argument("id required"))?
                 .parse()
@@ -367,21 +367,21 @@ impl MyModule {
         // Create gRPC server
         let addr = "0.0.0.0:50051".parse()?;
         let grpc_server = MyModuleGrpcServer::new(self.service.clone());
-        
+
         // Start server
         let server_future = tonic::transport::Server::builder()
             .add_service(my_module_sdk::proto::my_module_service_server::MyModuleServiceServer::new(grpc_server))
             .serve_with_shutdown(addr, cancel.cancelled());
-        
+
         ready.notify();
-        
+
         server_future.await?;
         Ok(())
     }
 }
 ```
 
-> The `client = ...` attribute validates the trait at compile time and exposes MODULE_NAME, but does not auto-register the client into ClientHub. You must still register it explicitly in your `init()` method using `ctx.client_hub().register::<dyn my_module_sdk::MyModuleApi>(client)`. 
+> The `client = ...` attribute validates the trait at compile time and exposes MODULE_NAME, but does not auto-register the client into ClientHub. You must still register it explicitly in your `init()` method using `ctx.client_hub().register::<dyn my_module_sdk::MyModuleApi>(client)`.
 
 ## Client Registration (in module)
 
@@ -395,12 +395,12 @@ async fn register_clients(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
         ctx.client_hub().register::<dyn my_module_sdk::MyModuleApi>(local_client);
         return Ok(());
     }
-    
+
     // Fall back to remote client
     let endpoint = "http://127.0.0.1:50051";
     let remote_client = my_module_sdk::wire_client(endpoint).await?;
     ctx.client_hub().register::<dyn my_module_sdk::MyModuleApi>(remote_client);
-    
+
     Ok(())
 }
 ```
@@ -415,16 +415,16 @@ async fn test_grpc_client() {
     // Start mock server
     let mock_server = MockMyModuleServer::new();
     let server_addr = mock_server.start().await;
-    
+
     // Create client
     let client = my_module_sdk::wire_client(&format!("http://{}", server_addr)).await.unwrap();
-    
+
     // Test API
     let input = Input {
         id: Uuid::new_v4(),
         message: "test".to_string(),
     };
-    
+
     let result = client.do_something(input).await.unwrap();
     assert!(!result.result.is_empty());
 }

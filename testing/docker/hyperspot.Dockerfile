@@ -1,4 +1,4 @@
-# Multi-stage build for hyperspot-server API backend
+# Multi-stage build for cf-server API backend
 # Stage 1: Builder
 FROM rust:1.95.0-bookworm@sha256:6bb82db0878825e157664188b319c875de4f1fff5d70f5917b3a3f1974b472e4 AS builder
 
@@ -17,7 +17,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY rust-toolchain.toml ./
 
 # Copy all workspace members
-COPY apps/hyperspot-server ./apps/hyperspot-server
+COPY apps/cf-server ./apps/cf-server
 COPY apps/gts-docs-validator ./apps/gts-docs-validator
 COPY libs ./libs
 COPY modules ./modules
@@ -25,13 +25,13 @@ COPY examples ./examples
 COPY config ./config
 COPY proto ./proto
 
-# Build the hyperspot-server binary in release mode
+# Build the cf-server binary in release mode
 # Using --bin to build only the specific binary
 # Features can be customized via CARGO_FEATURES build arg
 RUN if [ -n "$CARGO_FEATURES" ]; then \
-        cargo build --release --bin hyperspot-server --package=hyperspot-server --features "$CARGO_FEATURES"; \
+        cargo build --release --bin cf-server --package=cf-server --features "$CARGO_FEATURES"; \
     else \
-        cargo build --release --bin hyperspot-server --package=hyperspot-server; \
+        cargo build --release --bin cf-server --package=cf-server; \
     fi
 
 # Stage 2: Runtime - must match builder's base OS
@@ -44,7 +44,7 @@ WORKDIR /app
 RUN mkdir -p /app/data
 
 # Copy the built binary from builder stage
-COPY --from=builder /build/target/release/hyperspot-server /app/hyperspot-server
+COPY --from=builder /build/target/release/cf-server /app/cf-server
 # Copy config used in CMD
 COPY --from=builder /build/config /app/config
 
@@ -55,4 +55,4 @@ EXPOSE 8086
 RUN useradd -U -u 1000 appuser && \
     chown -R 1000:1000 /app
 USER 1000
-CMD ["/app/hyperspot-server", "--config", "/app/config/e2e-local.yaml"]
+CMD ["/app/cf-server", "--config", "/app/config/e2e-local.yaml"]

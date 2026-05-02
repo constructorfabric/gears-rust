@@ -184,7 +184,7 @@ See [`config.rs`](tenant_resolver/src/config.rs)
 ```yaml
 modules:
   tenant_resolver:
-    vendor: "hyperspot"  # Selects plugin by matching vendor
+    vendor: "cyberfabric"  # Selects plugin by matching vendor
 ```
 
 ### Static Plugin
@@ -194,7 +194,7 @@ See [`config.rs`](plugins/static_tr_plugin/src/config.rs)
 ```yaml
 modules:
   static_tr_plugin:
-    vendor: "hyperspot"
+    vendor: "cyberfabric"
     priority: 100           # Lower = higher priority
     tenants:
       - id: "550e8400-e29b-41d4-a716-446655440001"

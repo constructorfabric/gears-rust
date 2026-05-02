@@ -164,7 +164,7 @@ Tenant identity is carried as a custom claim in every access token. The claim na
 
 The gateway exposes a single `authenticate(bearer_token)` method and a single `exchange_client_credentials(request)` method. Plugin-internal complexity (JWKS caching, key rotation, discovery, claim mapping) is hidden from consumers. This keeps the contract simple, easy to mock in tests, and decoupled from IdP-specific details.
 
-**ADRs**: HyperSpot ADR 0003 — AuthN Resolver Minimalist Interface
+**ADRs**: CyberFabric ADR 0003 — AuthN Resolver Minimalist Interface
 
 **Principle conflict resolution**: No conflicts exist among the current five principles. JWT-First and Fail-Closed are complementary — JWT-First defines the happy path optimization, Fail-Closed defines the error behavior. If future design decisions create tension, Fail-Closed takes precedence as the foundational security commitment.
 
@@ -190,7 +190,7 @@ The plugin produces a `SecurityContext` (defined in `modkit-security`) with fiel
 
 - [ ] `p2` - **ID**: `cpt-cf-authn-plugin-constraint-gts-identity`
 
-The plugin is identified by a chained GTS schema ID: `gts.x.core.modkit.plugin.v1~x.core.authn_resolver.plugin.v1~`. The OIDC plugin instance is registered with vendor key `"hyperspot"` via `AuthNResolverPluginSpecV1::gts_make_instance_id(...)`. This identity is used for ClientHub registration and vendor-based plugin selection.
+The plugin is identified by a chained GTS schema ID: `gts.x.core.modkit.plugin.v1~x.core.authn_resolver.plugin.v1~`. The OIDC plugin instance is registered with vendor key `"cyberfabric"` via `AuthNResolverPluginSpecV1::gts_make_instance_id(...)`. This identity is used for ClientHub registration and vendor-based plugin selection.
 
 **ADRs**: Platform convention — GTS schema identity defined by ModKit plugin framework.
 
@@ -727,11 +727,11 @@ flowchart TD
 | Field | Value | Description |
 |-------|-------|-------------|
 | `gts_schema_id` | `gts.x.core.modkit.plugin.v1~x.core.authn_resolver.plugin.v1~` | Plugin type identity |
-| `vendor_key` | `"hyperspot"` | Unique vendor identifier for selection |
+| `vendor_key` | `"cyberfabric"` | Unique vendor identifier for selection |
 | `priority` | `100` | Default priority (lower = preferred); configurable |
 | `display_name` | `"OIDC AuthN Resolver"` | Human-readable name for diagnostics |
 
-**Co-registration note**: The `static-authn-plugin` (development/testing) also registers with vendor key `"hyperspot"`. When both plugins are registered, the gateway selects by priority (lower value wins). In production the static plugin should not be registered; in development the static plugin should use a lower priority value (e.g., `50`) to take precedence over the OIDC plugin, or use a distinct vendor key.
+**Co-registration note**: The `static-authn-plugin` (development/testing) also registers with vendor key `"cyberfabric"`. When both plugins are registered, the gateway selects by priority (lower value wins). In production the static plugin should not be registered; in development the static plugin should use a lower priority value (e.g., `50`) to take precedence over the OIDC plugin, or use a distinct vendor key.
 
 #### Token Scopes
 

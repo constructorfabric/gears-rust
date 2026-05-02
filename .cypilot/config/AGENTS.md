@@ -49,7 +49,7 @@ ALWAYS register new modules under `modules/<module_name>/` as a `children[]` ent
 
 ALWAYS open `docs/modkit_unified_system/01_overview.md` WHEN onboarding to ModKit, understanding core concepts, or reviewing the golden path for module development
 
-ALWAYS open `docs/modkit_unified_system/02_module_layout_and_sdk_pattern.md` WHEN starting to define requirements, architecture design, or implement any module; creating new module directory structure; deciding where to place files; understanding SDK pattern; creating Cargo.toml; naming data types; implementing local client; registering module in hyperspot-server; or creating QUICKSTART.md
+ALWAYS open `docs/modkit_unified_system/02_module_layout_and_sdk_pattern.md` WHEN starting to define requirements, architecture design, or implement any module; creating new module directory structure; deciding where to place files; understanding SDK pattern; creating Cargo.toml; naming data types; implementing local client; registering module in cf-server; or creating QUICKSTART.md
 
 ALWAYS open `docs/modkit_unified_system/03_clienthub_and_plugins.md` WHEN implementing inter-module communication via ClientHub, registering or resolving typed clients, implementing plugin architecture, creating main module with plugins, or registering scoped clients via GTS
 

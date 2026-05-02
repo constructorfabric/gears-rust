@@ -31,7 +31,7 @@ Same as `static-tr-plugin`:
 modules:
   rg_tr_plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 50
 ```
 

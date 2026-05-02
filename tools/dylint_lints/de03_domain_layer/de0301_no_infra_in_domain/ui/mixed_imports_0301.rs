@@ -1,4 +1,4 @@
-// simulated_dir=/hyperspot/modules/another_module/domain/
+// simulated_dir=/cyberfabric/modules/another_module/domain/
 // Test file for DE0301: Mixed imports - some valid, some violating
 #![allow(unused_imports)]
 #![allow(dead_code)]

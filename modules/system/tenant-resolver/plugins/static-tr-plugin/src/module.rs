@@ -58,7 +58,7 @@ impl Module for StaticTrPlugin {
 
         // Generate plugin instance ID
         let instance_id = TenantResolverPluginSpecV1::gts_make_instance_id(
-            "hyperspot.builtin.static_tenant_resolver.plugin.v1",
+            "cf.builtin.static_tenant_resolver.plugin.v1",
         );
 
         // Register plugin instance in types-registry

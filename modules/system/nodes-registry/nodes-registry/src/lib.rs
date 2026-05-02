@@ -1,7 +1,7 @@
 //! Nodes Registry Module
 //!
-//! This module manages node information in the Hyperspot deployment.
-//! A node represents a deployment unit (host, VM, container) where Hyperspot is running.
+//! This module manages node information in the `CyberFabric` deployment.
+//! A node represents a deployment unit (host, VM, container) where `CyberFabric` components are running.
 //!
 //! Each node contains:
 //! - System information (OS, CPU, memory, etc.)

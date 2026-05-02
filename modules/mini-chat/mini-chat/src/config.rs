@@ -910,7 +910,7 @@ fn default_url_prefix() -> String {
 }
 
 fn default_vendor() -> String {
-    "hyperspot".to_owned()
+    "cyberfabric".to_owned()
 }
 
 #[cfg(test)]

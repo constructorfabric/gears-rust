@@ -297,7 +297,7 @@ When `s2s_oauth.default_subject_type` is configured and the obtained S2S token d
 
 - [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-clienthub-registration`
 
-The plugin MUST register `dyn AuthNResolverPluginClient` with CyberFabric ClientHub using GTS schema identity at startup. Registration MUST include vendor key (`"hyperspot"`), priority, and display name.
+The plugin MUST register `dyn AuthNResolverPluginClient` with CyberFabric ClientHub using GTS schema identity at startup. Registration MUST include vendor key (`"cyberfabric"`), priority, and display name.
 
 - **Rationale**: Enables the AuthN Resolver gateway to discover and select the active plugin at runtime via ClientHub lookup.
 - **Actors**: `cpt-cf-authn-plugin-actor-api-gateway`

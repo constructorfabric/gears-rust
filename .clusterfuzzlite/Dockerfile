@@ -1,4 +1,4 @@
-# Copyright 2026 HyperSpot Contributors
+# Copyright 2026 CyberFabric Foundation
 # SPDX-License-Identifier: Apache-2.0
 
 FROM gcr.io/oss-fuzz-base/base-builder-rust
@@ -18,8 +18,8 @@ RUN rustup toolchain install nightly --force && \
     rustup component add rust-src --toolchain nightly
 
 # Copy source code
-COPY . $SRC/hyperspot
-WORKDIR $SRC/hyperspot
+COPY . $SRC/cyberfabric
+WORKDIR $SRC/cyberfabric
 
 # Copy build script
 COPY .clusterfuzzlite/build.sh $SRC/

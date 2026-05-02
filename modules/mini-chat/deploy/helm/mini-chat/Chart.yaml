@@ -1,6 +1,6 @@
 apiVersion: v2
 name: mini-chat
-description: HyperSpot mini-chat module — multi-tenant AI chat
+description: CyberFabric mini-chat module — multi-tenant AI chat
 type: application
 version: 0.1.0
 appVersion: "0.1.20"

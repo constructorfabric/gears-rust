@@ -44,7 +44,7 @@ impl Default for StaticMiniChatPolicyPluginConfig {
 }
 
 fn default_vendor() -> String {
-    "hyperspot".to_owned()
+    "cyberfabric".to_owned()
 }
 
 const fn default_priority() -> i16 {

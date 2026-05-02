@@ -11,7 +11,7 @@ This document defines the philosophy, infrastructure, and patterns for end-to-en
 
 ### What Is an E2E Test in This Project
 
-An E2E test is an HTTP request to a **running** `hyperspot-server` with a **real PostgreSQL** database, traversing the full chain: TCP → HTTP router → AuthN middleware → AuthZ PolicyEnforcer → Service → Repository → PostgreSQL → Response serialization → HTTP response. Pytest sends requests from the outside, exactly like a real client.
+An E2E test is an HTTP request to a **running** `cf-server` with a **real PostgreSQL** database, traversing the full chain: TCP → HTTP router → AuthN middleware → AuthZ PolicyEnforcer → Service → Repository → PostgreSQL → Response serialization → HTTP response. Pytest sends requests from the outside, exactly like a real client.
 
 This is **not** "another way to verify business logic." Business logic is verified by unit/integration tests (see [`12_unit_testing.md`](12_unit_testing.md)). E2E tests verify the **seams between components**, not the components themselves.
 

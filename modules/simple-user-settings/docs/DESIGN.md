@@ -4,7 +4,7 @@
 
 Simple User Settings is implemented as a modkit module with database persistence. It provides a REST API for CRUD operations on user settings.
 
-**System Context**: Operates as a lightweight service module within HyperSpot, using the platform's database layer for storage.
+**System Context**: Operates as a lightweight service module within CyberFabric, using the platform's database layer for storage.
 
 ## 2. Design Principles
 

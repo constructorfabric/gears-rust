@@ -13,7 +13,7 @@ pub struct AuthZResolverConfig {
 impl Default for AuthZResolverConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
         }
     }
 }
