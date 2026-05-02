@@ -979,7 +979,7 @@ dependencies = [
  "prost-types",
  "tonic",
  "tonic-prost",
- "ureq 3.3.0",
+ "ureq",
 ]
 
 [[package]]
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "cf-api-gateway"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1369,14 +1369,14 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "ureq 2.12.1",
+ "ureq",
  "utoipa",
  "uuid",
 ]
 
 [[package]]
 name = "cf-authn-resolver"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "cf-authn-resolver-sdk"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "cf-authz-resolver"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "cf-authz-resolver-sdk"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -1452,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "cf-credstore"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "cf-credstore-sdk"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "cf-file-parser"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1520,7 +1520,7 @@ dependencies = [
 
 [[package]]
 name = "cf-grpc-hub"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "cf-mini-chat"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "cf-mini-chat-sdk"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1676,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-auth"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "aliri_clock",
  "aliri_tokens",
@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-http"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "flate2",
@@ -1824,7 +1824,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "pin-project-lite",
- "rand 0.9.4",
+ "rand 0.10.1",
  "rustls",
  "rustls-native-certs 0.8.3",
  "rustls-pki-types",
@@ -1952,11 +1952,11 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit-transport-grpc"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "cf-modkit-security",
- "rand 0.9.4",
+ "rand 0.10.1",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "cf-module-orchestrator"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "cf-nodes-registry"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "cf-oagw"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "cf-resource-group"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "cf-resource-group-sdk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "cf-rg-tr-plugin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "cf-single-tenant-tr-plugin"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2276,7 +2276,7 @@ dependencies = [
 
 [[package]]
 name = "cf-static-authn-plugin"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "cf-static-authz-plugin"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "cf-static-credstore-plugin"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "cf-static-tr-plugin"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "cf-system-sdk-directory"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2370,14 +2370,14 @@ dependencies = [
 
 [[package]]
 name = "cf-system-sdks"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "cf-system-sdk-directory",
 ]
 
 [[package]]
 name = "cf-tenant-resolver"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "cf-tenant-resolver-sdk"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "cf-tr-authz-plugin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "cf-types-registry"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9696,33 +9696,19 @@ dependencies = [
 
 [[package]]
 name = "ureq"
-version = "2.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
-dependencies = [
- "base64 0.22.1",
- "flate2",
- "log",
- "once_cell",
- "rustls",
- "rustls-pki-types",
- "url",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "ureq"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
  "base64 0.22.1",
+ "flate2",
  "log",
  "percent-encoding",
  "rustls",
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
