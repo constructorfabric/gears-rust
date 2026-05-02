@@ -55,7 +55,7 @@ async fn start_h2_mock() -> (SocketAddr, Arc<H2MockState>, tokio::task::JoinHand
 
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        cert.key_pair.serialize_der().to_vec(),
+        cert.signing_key.serialize_der().to_vec(),
     ));
 
     let mut tls_config = ServerConfig::builder()
