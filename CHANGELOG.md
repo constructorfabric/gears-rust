@@ -9,6 +9,48 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/cyberfabric/cyberfabric-core/compare/cf-tr-authz-plugin-v0.1.1...cf-tr-authz-plugin-v0.1.2) - 2026-05-02
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-authz-resolver-sdk, cf-tenant-resolver-sdk
+
+## [0.1.20](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-tr-plugin-v0.1.19...cf-static-tr-plugin-v0.1.20) - 2026-05-02
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-tenant-resolver-sdk
+
+## [0.1.17](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-credstore-plugin-v0.1.16...cf-static-credstore-plugin-v0.1.17) - 2026-05-02
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-credstore-sdk
+
+## [0.1.19](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authz-plugin-v0.1.18...cf-static-authz-plugin-v0.1.19) - 2026-05-02
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-authz-resolver-sdk
+
+## [0.2.10](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authn-plugin-v0.2.9...cf-static-authn-plugin-v0.2.10) - 2026-05-02
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-authn-resolver-sdk
+
+## [0.1.21](https://github.com/cyberfabric/cyberfabric-core/compare/cf-single-tenant-tr-plugin-v0.1.20...cf-single-tenant-tr-plugin-v0.1.21) - 2026-05-02
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-tenant-resolver-sdk
+
+## [0.1.2](https://github.com/cyberfabric/cyberfabric-core/compare/cf-rg-tr-plugin-v0.1.1...cf-rg-tr-plugin-v0.1.2) - 2026-05-02
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-tenant-resolver-sdk, cf-resource-group-sdk
+
 ## [0.1.1](https://github.com/cyberfabric/cyberfabric-core/compare/cf-tr-authz-plugin-v0.1.0...cf-tr-authz-plugin-v0.1.1) - 2026-05-01
 
 ### Other
