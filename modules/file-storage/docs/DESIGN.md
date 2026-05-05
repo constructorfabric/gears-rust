@@ -35,23 +35,25 @@
 
 ### 1.1 Architectural Vision
 
-FileStorage is a tenant-scoped, backend-pluggable file service delivered as a single ModKit module with a ClientHub SDK and a REST API. It is the only module that owns persistent file state in P1; the future `FileShare` service (P3) — public/tenant/hierarchy shareable links, guest URLs with IP/time restrictions, view-counting proxy mode — is deliberately split off and is **not** delivered in P1.
+FileStorage is a tenant-scoped, backend-pluggable file service delivered as a single ModKit module. **In P1 the only access interface is the in-process Rust SDK** (`FileStorageClient` trait, see [`rust-traits.md`](./rust-traits.md)) — every consuming module (chat backend, llm-gateway, antivirus, file-parser, …) lives inside the same monolith process and obtains the SDK handle through ModKit's ClientHub. **A FileStorage-owned REST/HTTP surface is deferred to P2** (`cpt-cf-file-storage-fr-rest-api`); it lands when the platform splits into separately deployable modules and will mirror the SDK trait 1:1. The full P2 REST contract is published in P1 as the design target ([`openapi.yaml`](./openapi.yaml)) so the SDK shape and the future REST shape stay aligned, but nothing in `openapi.yaml` is exposed over the wire in P1.
 
-P1 is the **first version of the API**; future phases extend, never replace.
+It is the only module that owns persistent file state in P1; the future `FileShare` service (P3) — public/tenant/hierarchy shareable links, guest URLs with IP/time restrictions, view-counting proxy mode — is deliberately split off and is **not** delivered in P1.
 
-**Backend uniformity (architectural invariant, every phase).** Every FileStorage backend speaks S3 protocol over HTTP and respects presigned URLs. Concretely the supported set is any S3-class endpoint — AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe. Native non-S3 transports (POSIX, WebDAV, FTP, NFS, SMB, …) are out-of-scope at the architecture level — not deferred to a later phase, but excluded by design. There is no `BackendKind` discriminator and no `BackendTransport` discriminator: each would only ever hold one value and is therefore not represented. Gateway clients for non-S3 protocols, if anyone needs them, are written as independent modules that consume FileStorage's REST API and presigned URLs as ordinary clients — they are not part of FileStorage's roadmap.
+P1 is the **first version of the API surface (SDK trait)**; future phases extend, never replace. The P2 REST surface is a transport-layer addition over the same operation vocabulary, not a redesign.
 
-Multiple S3-compatible backend instances can coexist within one deployment; each has a stable `backend_id` (UUID) assigned once in the TOML roster, a per-backend tenant access list, a `versioning` flag mirroring the underlying bucket's configuration, and a list of versioned capability tags (P1: `upload.multipart_v1`, `download_private.sigv4_v1`, `download_public.v1`). Tags are validated against the SDK's `KNOWN_CAPABILITIES` whitelist at module init — unknown tag → fail-fast boot. Every backend shares one SQL database owned by the FileStorage module ([ADR-0001](./ADR/0001-cpt-cf-file-storage-adr-s3-no-metadata-db.md)). Rows are discriminated by `backend_id`. There is no per-backend database, no per-backend schema, and no operational deployment that runs FileStorage without the module database.
+**Backend uniformity (architectural invariant, every phase).** Every FileStorage backend speaks S3 protocol over HTTP and respects presigned URLs. Concretely the supported set is any S3-class endpoint — AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe. Native non-S3 transports (POSIX, WebDAV, FTP, NFS, SMB, …) are out-of-scope at the architecture level — not deferred to a later phase, but excluded by design. There is no `BackendKind` discriminator and no `BackendTransport` discriminator: each would only ever hold one value and is therefore not represented. Gateway clients for non-S3 protocols, if anyone needs them, are written as independent modules that consume FileStorage's SDK (P1) or REST API (P2) and presigned URLs as ordinary clients — they are not part of FileStorage's roadmap.
 
-For local-disk deployments where operators do not have an S3-class infrastructure to point at, the recipe is to run **`s3s-fs` (a Rust S3-compatible filesystem-backed server, see DESIGN §4 Testing strategy) as a side-process** and register it in the TOML roster as a regular S3-compatible backend. There is no native POSIX adapter and never will be — that recipe covers the use case end-to-end at the SDK / REST / capability layer with no architecture-level branching.
+Multiple S3-compatible backend instances can coexist within one deployment; each has a stable `backend_id` (UUID) assigned once in the TOML roster, a per-backend tenant access list, and a list of versioned capability tags (P1 ships 5: `upload.s3.multipart.sigv4.v1`, `download.s3.sigv4.v1`, `download.s3.sigv4.versioned.v1`, `download.s3.public.v1`, `download.s3.public.versioned.v1`). Tags are validated against the SDK's `KNOWN_CAPABILITIES` whitelist at module init — unknown tag → fail-fast boot. Every backend shares one SQL database owned by the FileStorage module ([ADR-0001](./ADR/0001-cpt-cf-file-storage-adr-s3-no-metadata-db.md)). Rows are discriminated by `backend_id`. There is no per-backend database, no per-backend schema, and no operational deployment that runs FileStorage without the module database.
+
+For local-disk deployments where operators do not have an S3-class infrastructure to point at, the recipe is to run **`s3s-fs` (a Rust S3-compatible filesystem-backed server, see DESIGN §4 Testing strategy) as a side-process** and register it in the TOML roster as a regular S3-compatible backend. There is no native POSIX adapter and never will be — that recipe covers the use case end-to-end at the SDK / capability layer with no architecture-level branching (and at the REST layer once P2 lands).
 
 Externally, every file is addressed by an **opaque `file_id` (UUID)** ([ADR-0002](./ADR/0002-cpt-cf-file-storage-adr-opaque-file-ids.md)). The logical `file_path` and the display `name` are metadata fields, not URL components — changing the display name (`meta.name`) keeps the `file_id` and the persistent URL untouched. Cross-module handles (chat backend ↔ FileStorage ↔ antivirus ↔ LLM) are `(file_id, etag)` pairs, where `etag` is the raw S3 ETag (content fingerprint only).
 
-**Identifiers are permanently immutable; files cannot be renamed.** Both `file_id` and `file_path` (the logical path inside the backend's tenant scope, also referred to as "file key" in S3 terms) are captured at `create_presigned_upload` and remain fixed for the file's lifetime. **No REST or SDK surface mutates either** — `FileMetaUpdate` does not declare them, no `move` / `rename` operation exists, and no other write path accepts an `update_path` argument. To change the logical address, callers upload a new file at the desired `file_path` and delete the old one. The display label `meta.name` (used for `Content-Disposition` on downloads) IS mutable through `put_file_info` — it is a label, not an identifier; "rename the displayed filename" is a metadata-only operation that does not touch the file_id, file_path, or the S3 object key.
+**Identifiers are permanently immutable; files cannot be renamed.** Both `file_id` and `file_path` (the logical path inside the backend's tenant scope, also referred to as "file key" in S3 terms) are captured at `create_presigned_upload` and remain fixed for the file's lifetime. **No SDK or future-REST surface mutates either** — `FileMetaUpdate` does not declare them, no `move` / `rename` operation exists, and no other write path accepts an `update_path` argument. To change the logical address, callers upload a new file at the desired `file_path` and delete the old one. The display label `meta.name` (used for `Content-Disposition` on downloads) IS mutable through `put_file_info` — it is a label, not an identifier; "rename the displayed filename" is a metadata-only operation that does not touch the file_id, file_path, or the S3 object key.
 
-The default — and the **only** external upload path, in every phase — is **presign-multipart-first**: the application's own backend posts a `presign-batch` upload item (`capability: "upload.multipart_v1"`, `part_count` ≥ 1) and gets back `PresignedUploadHandle { file_id, upload_id, part_urls, expires_at }` — FileStorage has registered a `PendingUpload` row and already executed `CreateMultipartUpload` against the backend. The frontend `PUT`s each part directly to its corresponding URL ([ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-presigned-put-sigv4.md)) and the application's backend commits via `POST /files/{file_id}/upload/{upload_id}` (body: `{parts: [{part_number, etag}]}`). The `complete` handler runs a 3-phase commit: Phase 1 flips `PendingUpload → Completing`, Phase 2 invokes `CompleteMultipartUpload` on the backend and captures the finalized etag/version_id, Phase 3 flips `Completing → Uploaded` with the new `(etag, version_id)`. There is **no separate reconcile primitive** — atomicity of the DB↔S3 commit lives entirely inside `complete`. `gts_file_type` is DB-only and is never written to S3. Bytes never traverse FileStorage on the external upload data plane. Even single-byte files go through the multipart lifecycle (one-part session, last-part rule lets `part_size` be arbitrarily small).
+The default — and the **only** external upload path, in every phase — is **presign-multipart-first**: the application's own backend calls `FileStorageClient.create_presigned_upload(...)` (in P1, in-process SDK; in P2, equivalently via `POST /presign-batch`) and gets back `PresignedUploadHandle { file_id, upload_id, part_urls, expires_at }` — FileStorage has registered a `PendingUpload` row and already executed `CreateMultipartUpload` against the backend. The frontend `PUT`s each part directly to its corresponding URL ([ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-presigned-put-sigv4.md)) and the application's backend commits via `FileStorageClient.complete_upload(file_id, upload_id, parts)` (P1 SDK; in P2 also exposed as `POST /files/{file_id}/upload/{upload_id}`). The `complete` handler runs a 3-phase commit: Phase 1 flips `PendingUpload → Completing`, Phase 2 invokes `CompleteMultipartUpload` on the backend and captures the finalized etag/version_id, Phase 3 flips `Completing → Uploaded` with the new `(etag, version_id)`. There is **no separate reconcile primitive** — atomicity of the DB↔S3 commit lives entirely inside `complete`. `gts_file_type` is DB-only and is never written to S3. Bytes never traverse FileStorage on the external upload data plane. Even single-byte files go through the multipart lifecycle (one-part session, last-part rule lets `part_size` be arbitrarily small).
 
-Re-uploading bytes to an existing `file_id` is a `presign-batch` upload item with `file_id` set; the server pins the row's CURRENT metadata into the part URLs, starts a fresh multipart session against the same backend object key, and the same `complete_upload` REST endpoint finalizes it (`Uploaded → Completing → Uploaded`). Changing metadata is a `PUT /files/{file_id}` call: 2-phase commit DB+S3 sync via `CopyObject` self-copy with `MetadataDirective: REPLACE` (`Uploaded → MetaUpdating → Uploaded`).
+Re-uploading bytes to an existing `file_id` is a `create_presigned_upload(file_id = Some(id), ...)` call; the server pins the row's CURRENT metadata into the part URLs, starts a fresh multipart session against the same backend object key, and the same `complete_upload` SDK call (and P2 REST endpoint) finalizes it (`Uploaded → Completing → Uploaded`). Changing metadata is `put_file_info(...)` (in P1 SDK; in P2 also `PUT /files/{file_id}`): 2-phase commit DB+S3 sync via `CopyObject` self-copy with `MetadataDirective: REPLACE` (`Uploaded → MetaUpdating → Uploaded`).
 
 Authentication and authorization are delegated to the platform's `authn`/`authz` SDKs through ModKit's `SecurityContext`. FileStorage never parses tokens. Every operation requires a `tenant_id + (user_id | app_id)` owner; there are no anonymous or system-wide files.
 
@@ -62,26 +64,27 @@ Authentication and authorization are delegated to the platform's `authn`/`authz`
 | Requirement | Design Response |
 |-------------|-----------------|
 | `cpt-cf-file-storage-fr-upload-file` | Default flow: `create_presigned_upload` registers a `PendingUpload` row, runs `CreateMultipartUpload` against the backend, returns presigned PUT URLs (one per part). The upload is committed by `POST /files/{file_id}/upload/{upload_id}` — a 3-phase commit (`PendingUpload → Completing → Uploaded`) that runs `CompleteMultipartUpload` itself and writes the finalized etag/version_id atomically. Uniqueness of the logical address is structural: `file_path` is derived from `file_id`, so the PRIMARY KEY on `id` is sufficient — there is no separate path-level uniqueness arbitration. Re-uploading bytes always preserves `file_id` (`create_presigned_upload(file_id = Some(id))`): same `file_id`, same backend object key, fresh multipart session, same `complete_upload` finalize. |
-| `cpt-cf-file-storage-fr-download-file` | `read_file` opens a streaming reader (`Stream<Item = Result<Bytes>>`) over the file content for in-process consumers. External callers use `presign_urls` for browser-ready URLs (SigV4-signed via `download_private.sigv4_v1`; bare-HTTPS via `download_public.v1` on backends declaring that tag). |
-| `cpt-cf-file-storage-fr-delete-file` | `delete_file(file_id, etag?)` runs a 2-phase hard delete: Phase 1 flips the row to the transient `Deleting` status; Phase 2 deletes the backend object with inline retries; Phase 3 purges the row. P1 is always a hard delete — `cpt-cf-file-storage-constraint-no-soft-delete`. |
+| `cpt-cf-file-storage-fr-download-file` | `read_file` opens a streaming reader (`Stream<Item = Result<Bytes>>`) over the file content for in-process consumers. Optional `range: Option<ByteRange>` parameter requests a partial read (HTTP `Range: bytes=...` to the backend `GetObject`); `FileReadHandle.range` mirrors the backend's `Content-Range`. External callers use `presign_urls` for browser-ready URLs (SigV4-signed via `download.s3.sigv4.v1`; bare-HTTPS via `download.s3.public.v1` on backends declaring that tag) — clients add `Range` header on the GET themselves; presigned URLs do not need to encode the range. |
+| `cpt-cf-file-storage-fr-delete-file` | `delete_file(file_id, etag?, version_id?)` runs a 2-phase hard delete: Phase 1 flips the row to the transient `Deleting` status (with optional `etag` / `version_id` CAS pins); Phase 2 deletes the backend object with inline retries; Phase 3 purges the row. P1 is always a hard delete — `cpt-cf-file-storage-constraint-no-soft-delete`. |
 | `cpt-cf-file-storage-fr-get-metadata` | `get_file_info(file_id, optional_etag)` returns the FileStorage SQL row as the authoritative metadata view. The backend is **not** consulted on this path (per ADR-0001). |
 | `cpt-cf-file-storage-fr-list-files` | `list_files` is served entirely from the FileStorage SQL database, with mandatory owner scoping. P1 exposes only the `owner_id` filter plus cursor pagination; sort order is fixed to `created_at DESC, id ASC`. Other filters (`mime_type`, `gts_file_type`, date range, `backend_id`) are deferred to P2 — see §4 Future deltas. |
-| `cpt-cf-file-storage-fr-multipart-upload` | **In P1.** Multipart is the only upload path: `create_presigned_upload` runs `CreateMultipartUpload`, presigns N `UploadPart` URLs, returns `PresignedUploadHandle`; the client uploads parts directly to the backend; `POST /files/{file_id}/upload/{upload_id}` runs `CompleteMultipartUpload` and finalizes the row through `Completing → Uploaded`. Single-byte files use a one-part session. The `upload_id` is opaque to FileStorage (returned to the client and round-tripped back through the complete/abort REST endpoints — never persisted in the DB). |
+| `cpt-cf-file-storage-fr-multipart-upload` | **In P1.** S3 multipart is the only upload path implemented in P1 (alternative upload tags such as `upload.gcs.resumable.v1` or `upload.azure.blocks.sas_user.v1` are reserved by the naming scheme but not implemented in any phase): `create_presigned_upload` runs `CreateMultipartUpload`, presigns N `UploadPart` URLs, returns `PresignedUploadHandle`; the client uploads parts directly to the backend; `POST /files/{file_id}/upload/{upload_id}` runs `CompleteMultipartUpload` and finalizes the row through `Completing → Uploaded`. Single-byte files use a one-part session. The `upload_id` is opaque to FileStorage (returned to the client and round-tripped back through the complete/abort REST endpoints — never persisted in the DB). |
 | `cpt-cf-file-storage-fr-content-type-validation` | Direct (presigned) uploads pin `Content-Type` via SigV4 SignedHeaders; the application backend that issued the presigned URL is responsible for trusting its end-client. There is no bytes-through-FileStorage proxy upload path in any phase. |
 | `cpt-cf-file-storage-fr-file-ownership` | `OwnerRef { tenant_id, owner_id }` is captured at `create_presigned_upload` and stored on the row. FileStorage does not distinguish user vs app principals — that distinction is owned by the identity / authz subsystem. Transfer is deferred to P2. |
 | `cpt-cf-file-storage-fr-authorization` | Every operation calls the `authz` SDK with the file's GTS type as resource context. FileStorage never parses tokens; identity is read from `SecurityContext`. |
 | `cpt-cf-file-storage-fr-tenant-boundary` | Every row carries `tenant_id`; mutations require `SecurityContext.tenant_id == row.tenant_id`. The opaque `file_id` URL space is shared across tenants, so a `file_id` from another tenant returns `404 NotFound` (no enumeration oracle) — see ADR-0002. |
 | `cpt-cf-file-storage-fr-data-classification` | FileStorage treats content as opaque. |
 | `cpt-cf-file-storage-fr-file-type-classification` | GTS file type is mandatory at `create_presigned_upload` (initial upload), immutable thereafter, stored on the row, and injected into every authz request. **DB-only — never mirrored to S3** (`cpt-cf-file-storage-constraint-meta-mirrored-via-put-meta`). Structurally immutable: `FileMetaUpdate` does not declare this field. |
-| `cpt-cf-file-storage-fr-signed-urls` | `presign_urls` is the batch entry-point for download URLs (`cpt-cf-file-storage-principle-batch-presigned-urls`). With `capability = "download_private.sigv4_v1"` it returns a SigV4-signed `GetObject` URL with `response-content-type` and `response-content-disposition` overridden from the DB row. With `capability = "download_public.v1"` (backends declaring that tag, paired with `default_public = true`) it returns an eternal bare-HTTPS URL. |
+| `cpt-cf-file-storage-fr-signed-urls` | `presign_urls` is the batch entry-point for download URLs (`cpt-cf-file-storage-principle-batch-presigned-urls`). With `capability = "download.s3.sigv4.v1"` it returns a SigV4-signed `GetObject` URL with `response-content-type` and `response-content-disposition` overridden from the DB row. With `capability = "download.s3.public.v1"` (backends declaring that tag, paired with `default_public = true`) it returns an eternal bare-HTTPS URL. |
 | `cpt-cf-file-storage-fr-direct-transfer` | `create_presigned_upload` issues SigV4 PUT URLs (one per part of a multipart session). The metadata row is registered first (`PendingUpload`) on initial upload; commit is via `POST /files/{file_id}/upload/{upload_id}`. Single-byte files use a one-part session. |
 | `cpt-cf-file-storage-fr-gc-direct-uploads` | The `files` table records `upload_expires_at` for `PendingUpload` rows; an external scheduler (P2) invokes a console command that sweeps expired rows. |
 | `cpt-cf-file-storage-fr-metadata-storage` | System-managed fields and custom metadata both live in the FileStorage SQL row; the row is the authoritative source. For S3-compatible backends, a subset (every field except `gts_file_type`) is mirrored as S3 user-metadata, kept in sync via the 2-phase `PUT /files/{file_id}` `CopyObject self-copy` and via `complete_upload`'s HEAD-and-pull at finalize time. |
-| `cpt-cf-file-storage-fr-update-metadata` | `put_file_info(file_id, FileMetaUpdate, etag?)` replaces `name`, `mime_type`, and `custom_metadata` (omitted fields keep current values) via a 2-phase commit (`Uploaded → MetaUpdating → Uploaded`), atomically synchronizing DB and S3 with `CopyObject` self-copy + `MetadataDirective: REPLACE`. `gts_file_type` is structurally immutable and not declared on `FileMetaUpdate`. |
+| `cpt-cf-file-storage-fr-update-metadata` | `put_file_info(file_id, FileMetaUpdate, etag?, version_id?)` replaces `name`, `mime_type`, and `custom_metadata` (omitted fields keep current values) via a 2-phase commit (`Uploaded → MetaUpdating → Uploaded`), atomically synchronizing DB and S3 with `CopyObject` self-copy + `MetadataDirective: REPLACE`. Optional `etag` and `version_id` act as composable CAS pins (the strong-CAS path verifies both against DB and S3); together they make the path ABA-safe. `gts_file_type` is structurally immutable and not declared on `FileMetaUpdate`. |
 | `cpt-cf-file-storage-fr-retention-indefinite` | No TTL enforcement in P1; rows live until `delete_file`. |
-| `cpt-cf-file-storage-fr-backend-abstraction` | `StorageBackend` adapter trait sits behind the REST endpoint handlers and the SDK facade; the only implementation is the S3-compatible adapter (the only kind on the architectural roadmap). |
-| `cpt-cf-file-storage-fr-backend-capabilities` | Versioned capability tags are declared statically per backend in TOML (P1: `upload.multipart_v1`, `download_private.sigv4_v1`, `download_public.v1`). The SDK validates the list against `KNOWN_CAPABILITIES` at boot — unknown tag → fail-fast init. Presigned URL support is constitutive and is therefore not represented as a separate capability. Mismatches between declared and requested capability fail with `CapabilityUnavailable`. |
-| `cpt-cf-file-storage-fr-rest-api` | REST surface rooted at `/api/file-storage/v1/`, 7 endpoints, fully specified in `openapi.yaml`. |
+| `cpt-cf-file-storage-fr-backend-abstraction` | `pub(crate) struct S3Backend` (no trait) sits behind the SDK facade and is reached through the Backend Router; it is the only adapter on the architectural roadmap (S3-only invariant). The earlier `StorageBackend` trait abstraction was removed because there is no second implementation to abstract over — local-disk deployments use `s3s-fs` registered as a regular S3-compatible backend, not a separate kind. Test fakes use `s3s-fs` running as a child process. |
+| `cpt-cf-file-storage-fr-backend-capabilities` | Versioned capability tags are declared statically per backend in TOML (P1: `upload.s3.multipart.sigv4.v1`, `download.s3.sigv4.v1`, `download.s3.public.v1`). The SDK validates the list against `KNOWN_CAPABILITIES` at boot — unknown tag → fail-fast init. Presigned URL support is constitutive and is therefore not represented as a separate capability. Mismatches between declared and requested capability fail with `CapabilityUnavailable`. |
+| `cpt-cf-file-storage-fr-rest-api` | **Deferred to P2.** P1 ships only the in-process Rust SDK trait `FileStorageClient` (`cpt-cf-file-storage-fr-rust-sdk`); every consumer (chat backend, llm-gateway, antivirus, file-parser, …) runs in the same monolith and obtains the SDK handle through ModKit's ClientHub. The REST surface rooted at `/api/file-storage/v1/` (7 endpoints, fully specified in [`openapi.yaml`](./openapi.yaml)) lands in P2 when modules become separately deployable; it mirrors the SDK trait 1:1. The `openapi.yaml` is published in P1 as the design target so the SDK shape and the future REST shape stay aligned. |
+| `cpt-cf-file-storage-fr-rust-sdk` | The single P1 access interface — `FileStorageClient` trait, async, in-process. Every consuming module calls it directly through ClientHub. Presigned upload/download URLs returned by the SDK methods are still client-direct against the S3 backend (zero bytes through FileStorage). |
 | `cpt-cf-file-storage-fr-conditional-requests` | The `etag` column on `files` is the raw S3 ETag (content fingerprint only). `put_file_info` and `delete_file` honour an optional `If-Match` for optimistic concurrency; on `put_file_info` it becomes a strong DB+S3 CAS (Phase 1 conditional UPDATE + Phase 2 HEAD with `x-amz-copy-source-if-match`). `complete_upload` does not take `If-Match` — Phase 1's transient `Completing` state plus the conditional UPDATE on `(etag, updated_at, version_id[, xmin])` already guard against concurrent finalize. |
 
 #### NFR Allocation
@@ -90,8 +93,8 @@ Authentication and authorization are delegated to the platform's `authn`/`authz`
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-file-storage-nfr-metadata-latency` | Metadata queries ≤25 ms p95 | `cpt-cf-file-storage-component-files-repo` | Indexed SQL lookup keyed on `id` (PK) for `get_file_info`; no backend round-trip on the read path; single authz call. | Load test on `GET /files/{file_id}`; query-planner inspection on the listing index. |
 | `cpt-cf-file-storage-nfr-transfer-latency` | Fixed overhead <50 ms p95 on downloads | `cpt-cf-file-storage-component-backend-router`, `cpt-cf-file-storage-component-s3-backend` | Presigned-URL path: zero data plane through FileStorage, only the signing call counts (in-memory in P1 embedded). In-process `read_file` for SDK consumers: streams chunks straight from `aws-sdk-s3 GetObject`; no full-file buffering. | Synthetic latency probe excluding payload transfer time. |
-| `cpt-cf-file-storage-nfr-url-availability` | URL stability for the retention window | `cpt-cf-file-storage-component-rest-api`, `cpt-cf-file-storage-component-files-repo` | Persistent URL is `/files/{file_id}` — independent of backend layout, display name, and logical path. `file_id` and `file_path` are permanently immutable (renaming files is not supported); only the display `meta.name` is mutable, which touches the metadata row alone. | Stability test: change `meta.name` via `put_file_info` and re-fetch under the same URL. |
-| `cpt-cf-file-storage-nfr-durability` | RPO = 0, RTO ≤15 min | `cpt-cf-file-storage-component-rest-api` (`complete_upload` handler), S3-compatible adapter | The `complete_upload` handler commits `Uploaded` only after `CompleteMultipartUpload` returns success and the row's Phase 3 conditional UPDATE lands; FileStorage uses the etag from S3's response rather than trusting any caller-supplied etag, so the row never claims durability prematurely. Durability is inherited from the S3-class endpoint (AWS S3, MinIO, Ceph RGW, …; for `s3s-fs` the underlying POSIX filesystem). | DR drill: kill the module mid-`complete_upload`, verify a `PendingUpload` / `Completing` row never observes itself as `Uploaded`. |
+| `cpt-cf-file-storage-nfr-url-availability` | URL stability for the retention window | `cpt-cf-file-storage-component-sdk-facade`, `cpt-cf-file-storage-component-files-repo` (in P1; `component-rest-api` adds the same guarantee at the HTTP layer in P2) | Persistent identifier is `file_id` — independent of backend layout, display name, and logical path. `file_id` and `file_path` are permanently immutable (renaming files is not supported); only the display `meta.name` is mutable, which touches the metadata row alone. | Stability test: change `meta.name` via `put_file_info` and re-fetch by `file_id`. |
+| `cpt-cf-file-storage-nfr-durability` | RPO = 0, RTO ≤15 min | `cpt-cf-file-storage-component-sdk-facade` (`complete_upload` method), S3-compatible adapter | `complete_upload` commits `Uploaded` only after `CompleteMultipartUpload` returns success and the row's Phase 3 conditional UPDATE lands; FileStorage uses the etag from S3's response rather than trusting any caller-supplied etag, so the row never claims durability prematurely. Durability is inherited from the S3-class endpoint (AWS S3, MinIO, Ceph RGW, …; for `s3s-fs` the underlying POSIX filesystem). | DR drill: kill the module mid-`complete_upload`, verify a `PendingUpload` / `Completing` row never observes itself as `Uploaded`. |
 | `cpt-cf-file-storage-nfr-scalability` | ≥1000 concurrent ops/instance, linear horizontal scaling | All stateless components | No global locks; per-row `etag` provides optimistic concurrency. The module is stateless aside from the SQL connection pool and adapter handles. | Concurrency soak test; stateless-scaling CI check. |
 | `cpt-cf-file-storage-nfr-audit-completeness` | 100% write audit coverage (P2) | Deferred — audit sink integration lives in P2 | P1 records no audit events; the REST write-path handlers (`presign-batch`, `complete_upload`, `abort_upload`, `delete`, `put_file_info`) carry documented hook points. | P2 milestone. |
 
@@ -103,14 +106,14 @@ Authentication and authorization are delegated to the platform's `authn`/`authz`
 | [ADR-0002](./ADR/0002-cpt-cf-file-storage-adr-opaque-file-ids.md) — `cpt-cf-file-storage-adr-opaque-file-ids` | External addresses use opaque `file_id` (UUID); display name and `file_path` are metadata. Decouples URLs from filenames and bucket layout, eliminates URL-encoding reconciliation issues across HTTP / S3 / SigV4. |
 | [ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-presigned-put-sigv4.md) — `cpt-cf-file-storage-adr-presigned-put-sigv4` | Direct-transfer uploads use presigned PUT with SigV4 header signing (universal S3 compatibility), not POST policy. The metadata row is the authoritative read source. Multipart `UploadPart` URLs follow the same SigV4 pattern. |
 | [ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-self-healing-reconciliation.md) — `cpt-cf-file-storage-adr-self-healing-reconciliation` | **Obsolete in this design.** Will be superseded by a new ADR (separate branch) describing the multi-phase commit model: every DB↔S3 mutation is a 3-phase commit (`Uploaded ↔ Completing/MetaUpdating/Deleting`); rows stuck in transient states are recovered in-band by the SDK on the next call (HEAD the backend, pull the authoritative state, finalize the row). There is no separate `reconcile` primitive, no bytes-through-FileStorage proxy upload path, and no separate "physical key" column. |
-| [ADR-0005](./ADR/0005-cpt-cf-file-storage-adr-versioning-and-aba.md) — `cpt-cf-file-storage-adr-versioning-and-aba` | Per-backend `versioning` flag, declared by the operator. When `true`, the row's `version_id` mirrors S3 VersionId; the strong-CAS variant of `PUT /meta` becomes ABA-safe by verifying both etag and version_id; presign-download items can request historical generations. When `false`, ABA on content is an accepted P1 risk. |
+| [ADR-0005](./ADR/0005-cpt-cf-file-storage-adr-versioning-and-aba.md) — `cpt-cf-file-storage-adr-versioning-and-aba` | Versioning support is declared per-backend via the `*.versioned.*` capability tags (e.g. `download.s3.sigv4.versioned.v1`). The DB `version_id` column is populated from S3 response headers as-is. The strong-CAS variant of `PUT /meta` becomes ABA-safe automatically when S3 returns version IDs (null-safe `(etag, updated_at, version_id[, xmin])` predicate works in both modes). Presign-download items can request historical generations only when the chosen capability is a `*.versioned.*` variant. |
 
 ### 1.3 Architecture Layers
 
 ```mermaid
 graph LR
-    Client[Client / Module via ClientHub]
-    REST[REST API — axum]
+    Client[Module via ClientHub<br/>(in-process, P1)]
+    REST[REST API — axum<br/>P2 only]
     SDK[SDK Facade — FileStorageClient]
     ROUTER[Backend Router]
     REPO[Files Repo]
@@ -118,9 +121,8 @@ graph LR
     S3EP[(S3-compatible endpoint<br/>AWS S3 / MinIO / Ceph / s3s-fs)]
     PG[(SQL DB<br/>file_storage schema)]
 
-    Client --> REST
     Client --> SDK
-    REST --> ROUTER
+    REST -. P2 .-> SDK
     SDK --> ROUTER
     ROUTER --> REPO
     ROUTER --> S3
@@ -132,8 +134,8 @@ graph LR
 
 | Layer | Responsibility | Technology |
 |-------|----------------|------------|
-| Presentation | REST handlers, request/response shaping, ETag handling, streaming bodies; lifecycle write paths (`presign-batch`, `complete_upload`, `abort_upload`, `delete`, `put_file_info`) | axum, `tower-http`, `bytes::Bytes` streams |
-| Application | ClientHub SDK facade | ModKit runtime, `async_trait` |
+| Presentation (**P2 only**) | REST handlers, request/response shaping, ETag handling, streaming bodies; lifecycle write paths (`presign-batch`, `complete_upload`, `abort_upload`, `delete`, `put_file_info`). Not delivered in P1. | axum, `tower-http`, `bytes::Bytes` streams |
+| Application (**P1 sole entry-point**) | ClientHub SDK facade — `FileStorageClient` trait, in-process, async. | ModKit runtime, `async_trait` |
 | Domain | `FileInfo`, `FileMeta`, `Backend`, `OwnerRef`, `FileStatus`, `UrlParams`, `PresignedUploadHandle`, `PresignedDownload` | Pure Rust types (`uuid`, `time`, `bytes`, `serde`) |
 | Infrastructure | S3 client, SQL access | `aws-sdk-s3` (or compatible), `sqlx`/`sea-orm` |
 
@@ -153,9 +155,9 @@ The `file_id` is minted by FileStorage on every initial `create_presigned_url` c
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-principle-presign-first`
 
-The default — and in every phase the **only** — external upload path is **presign-first**: the application's own backend (chat, llm-gateway, …) calls `create_presigned_url`, hands `(file_id, upload_url, etag)` to its frontend, and the frontend uploads bytes directly to the storage backend. FileStorage stays off the data plane on this path. Every backend speaks S3 and respects presigned URLs by definition (§1.1 backend uniformity invariant), so the path is uniformly available everywhere.
+The default — and in every phase the **only** — external upload path is **presign-multipart-first**: the application's own backend (chat, llm-gateway, …) calls `create_presigned_upload(... capability: "upload.s3.multipart.sigv4.v1", part_count: N ...)`, hands `PresignedUploadHandle { file_id, upload_id, part_urls[], expires_at }` to its frontend, and the frontend uploads parts directly to the storage backend. FileStorage stays off the data plane on this path. Every backend speaks S3 and respects presigned URLs by definition (§1.1 backend uniformity invariant), so the path is uniformly available everywhere.
 
-- External clients always use `create_presigned_url` (zero bytes through FileStorage).
+- External clients always use `create_presigned_upload` (zero bytes through FileStorage).
 - In-process callers may use the SDK's `put_file` direct-adapter path, which compresses the same lifecycle into one async call without the presign roundtrip — still no bytes-through-REST.
 
 After upload, downloads follow the symmetric rule: `presign_urls` for client-side, browser-ready URLs (redirect mode); `read_file` for in-process consumers (streaming via the adapter — used by antivirus, llm-gateway, file-parser). FileShare's "proxy mode for tracked downloads" — public links with view-counting and revocation — is a P3 concern in a separate module and is not a FileStorage feature.
@@ -180,11 +182,11 @@ Three invariants govern the roster:
 2. **Per-backend tenant access list** — every backend declares which tenants may use it. Empty list = "all tenants"; a non-empty list restricts visibility and mutation. Tenants may have access to several backends; a backend may serve several tenants or be tenant-exclusive.
 3. **Uniform SDK** — `list_backends(ctx)` returns every backend the caller's tenant can see; all returned backends are reachable through the same `FileStorageClient` trait, and callers select one by `backend_id`. Capability flags are exposed through the declarative `Backend` record, not through specialised traits per kind.
 
-Backends carry up to two **default roles** in P1 — `default_private` and `default_public`. `default_private` selects the backend new private files land in when a caller does not specify `backend_id` (the common case: an S3 bucket with no public-read ACL, presigned downloads only). `default_public` selects the backend new public-read files land in (a bucket / origin combination that issues bare-HTTPS URLs without signing — pairs with the `download_public.v1` capability tag).
+Backends carry up to two **default roles** in P1 — `default_private` and `default_public`. `default_private` selects the backend new private files land in when a caller does not specify `backend_id` (the common case: an S3 bucket with no public-read ACL, presigned downloads only). `default_public` selects the backend new public-read files land in (a bucket / origin combination that issues bare-HTTPS URLs without signing — pairs with the `download.s3.public.v1` capability tag).
 
 At least one backend MUST hold one default role per tenant view. The roles are flagged in the static TOML config in P1; they become per-tenant properties in P2.
 
-Each backend declares a boolean `versioning` flag mirroring the underlying bucket's configuration (see ADR-0005). Operators are responsible for declaring the value correctly; FileStorage trusts the TOML and does NOT probe `GetBucketVersioning` at boot. The flag enables ABA-safe content CAS on the strong-CAS variant of `PUT /meta` and historical-version GET via `presign_urls`.
+Versioning support is declared per-backend through the `*.versioned.*` capability tags (`download.s3.sigv4.versioned.v1`, `download.s3.public.versioned.v1`) — there is no separate `versioning` flag. FileStorage does NOT probe `GetBucketVersioning` at boot; the operator's tag list is the source of truth for "is `version_id` exposed to consumers". The DB `version_id` column is populated from whatever S3 returns in response headers (`x-amz-version-id`), so the column self-organizes regardless of declared tags. ABA-safe content CAS on the strong-CAS variant of `PUT /meta` and historical-version GET via `presign_urls` activate automatically when S3 starts returning version IDs.
 
 A caller that names a slug outside its access list sees `NotFound` with no signal that the slug exists for a different tenant — tenant scoping is enforced without opening an enumeration oracle.
 
@@ -194,7 +196,7 @@ A caller that names a slug outside its access list sees `NotFound` with no signa
 
 Readers never observe content of version N with metadata of version N+1. This is upheld by two complementary mechanisms:
 
-- **`etag` is the raw S3 ETag** (content fingerprint only — `cpt-cf-file-storage-constraint-etag-content-only`). Every content write rotates the etag because the bytes change; bit-identical re-uploads are the ABA corner case ADR-0005 addresses by also tracking `version_id` on versioning-on backends.
+- **`etag` is the raw S3 ETag** (content fingerprint only — `cpt-cf-file-storage-constraint-etag-content-only`). Every content write rotates the etag because the bytes change; bit-identical re-uploads are the ABA corner case ADR-0005 addresses by also tracking `version_id` when S3 returns a `version_id`.
 - **Metadata mutations are atomic across DB and S3** through `PUT /files/{file_id}` (`cpt-cf-file-storage-constraint-meta-mirrored-via-put-meta`). The endpoint runs a multi-phase commit (`Uploaded → MetaUpdating → Uploaded`). **Phase 1** flips the row's STATUS only — `name`, `mime_type`, `custom_metadata` columns still hold the OLD values. **Phase 2** issues `CopyObject` self-copy with `MetadataDirective: REPLACE` against the backend (carrying the merged new metadata), which rotates the object's user-metadata at S3 and yields a fresh `s3_etag` and `s3_version_id`. **Phase 3** flips the row back to `Uploaded` AND writes the new `(name, mime_type, custom_metadata, etag, version_id)` in one conditional UPDATE — the metadata columns and the status transition land atomically. A row stuck in `MetaUpdating` (handler crash between Phase 2 and Phase 3) is recovered in-band by the next SDK call: HEAD the backend, pull whatever metadata S3 holds, run Phase 3 with that. The DB never holds new metadata under a "still updating" status — the row is either fully old (status `MetaUpdating`, columns unchanged) or fully new (status `Uploaded` with new metadata).
 
 The single intentional asymmetry: **`gts_file_type` lives only in the DB** and is never written to S3, even though every other meta field is mirrored. This is documented as a specific exception under `cpt-cf-file-storage-constraint-meta-mirrored-via-put-meta` and motivated in ADR-0004.
@@ -220,7 +222,7 @@ This replaces the earlier "self-healing reconciliation" model documented in ADR-
 Three properties make recovery well-defined:
 
 1. **Bounded drift surface** — only `(content, etag, version_id, S3-mirrored metadata)` can drift. `gts_file_type` cannot drift because it is DB-only and is never written to S3.
-2. **The backend is authoritative for the drifted axes** — every S3-class backend returns `ETag` (and, on versioning-on buckets, `VersionId`) plus the user-visible metadata mirror (`Content-Type`, `Content-Disposition`, every `x-amz-meta-<k>`) on `HeadObject` / `GetObject`. We can always learn the true state with one HEAD or as a side-effect of a GET we'd be doing anyway.
+2. **The backend is authoritative for the drifted axes** — every S3-class backend returns `ETag` (and, when the bucket has S3 versioning enabled, `VersionId`) plus the user-visible metadata mirror (`Content-Type`, `Content-Disposition`, every `x-amz-meta-<k>`) on `HeadObject` / `GetObject`. We can always learn the true state with one HEAD or as a side-effect of a GET we'd be doing anyway.
 3. **Recovery is a single conditional UPDATE** — given the HEAD response, FileStorage knows exactly what every drifted column should be set to. A retry loop bounded at 3 attempts handles concurrent contention.
 
 #### Etag-Based Optimistic Concurrency
@@ -229,8 +231,8 @@ Three properties make recovery well-defined:
 
 FileStorage takes **no advisory locks, no row-level pessimistic locks, and no global locks** for ordinary file operations. Uniqueness of the logical address is structural: `file_path` is derived deterministically from `file_id` at the adapter boundary, so two distinct files cannot collide on the path — the PRIMARY KEY on `id` is the only uniqueness constraint required. Beyond that, all concurrency control on a single `file_id` is expressed through three composable database-level primitives plus the `(file_id, etag)` contract carried by every consumer:
 
-1. **Race detection on UPDATE via `(etag, updated_at, version_id[, xmin])`.** Every conditional mutation captures the row's current `(etag, updated_at, version_id)` (and on Postgres, `xmin`) at SELECT time and includes them in the UPDATE WHERE clause. `version_id` is included **always** — even when it is `NULL` — through null-safe equality (`IS NOT DISTINCT FROM` on Postgres, `IS` on SQLite, or the portable `(version_id = $captured OR (version_id IS NULL AND $captured IS NULL))` form). On `Backend.versioning = false` both sides are always `NULL` and the predicate is a no-op; on `Backend.versioning = true` the column rotates on every backend write (including bit-identical re-uploads where ETag stays the same), which closes the ABA window on content automatically without requiring callers to pass `If-Match`. The number of rows affected is the verdict — `1` is success, `0` is "the row moved underneath you". The coordinator may retry up to 3 times before surfacing `Conflict`. Engines without a transaction-id system column rely on `(etag, updated_at, version_id)` alone; metadata-only mutations under contention then accept the last-write-wins property documented in `cpt-cf-file-storage-constraint-no-meta-cas`.
-2. **Optional `If-Match` on writes.** `PUT /files/{file_id}` and `DELETE /files/{id}` accept an optional `If-Match` header. When supplied, it functions as HTTP `If-Match` semantics (RFC 7232 §3.1) and adds a strong precondition over the row's `etag`. On `PUT /meta` it ALSO becomes a strong CAS over S3 (HEAD-then-CopyObject with `x-amz-copy-source-if-match`); on versioning-on backends, the HEAD additionally verifies `version_id` against the row to close the ABA window (ADR-0005). When omitted, the call is best-effort last-write-wins on metadata; race detection still fires via the `(etag, updated_at, version_id[, xmin])` filter.
+1. **Race detection on UPDATE via `(etag, updated_at, version_id[, xmin])`.** Every conditional mutation captures the row's current `(etag, updated_at, version_id)` (and on Postgres, `xmin`) at SELECT time and includes them in the UPDATE WHERE clause. `version_id` is included **always** — even when it is `NULL` — through null-safe equality (`IS NOT DISTINCT FROM` on Postgres, `IS` on SQLite, or the portable `(version_id = $captured OR (version_id IS NULL AND $captured IS NULL))` form). When S3 versioning is not enabled both sides are always `NULL` and the predicate is a no-op; when S3 versioning is enabled the column rotates on every backend write (including bit-identical re-uploads where ETag stays the same), which closes the ABA window on content automatically without requiring callers to pass `If-Match`. The number of rows affected is the verdict — `1` is success, `0` is "the row moved underneath you". The coordinator may retry up to 3 times before surfacing `Conflict`. Engines without a transaction-id system column rely on `(etag, updated_at, version_id)` alone; metadata-only mutations under contention then accept the last-write-wins property documented in `cpt-cf-file-storage-constraint-no-meta-cas`.
+2. **Optional `If-Match` and `If-Match-VersionId` on writes.** `PUT /files/{file_id}`, `DELETE /files/{id}`, and `GET /files/{file_id}` accept two optional CAS-pin headers — `If-Match` over the row's `etag` (HTTP `If-Match` semantics, RFC 7232 §3.1) and `If-Match-VersionId` over the row's `version_id` (custom FileStorage extension, null-safe via `IS NOT DISTINCT FROM`). The corresponding SDK methods (`put_file_info`, `delete_file`, `get_file_info`, `read_file`, `put_file`, `create_presigned_upload` variant-B) accept the same two pins as `Option<&Etag>` / `Option<&VersionId>` arguments. On `PUT /meta` `If-Match` becomes a strong CAS over S3 (HEAD-then-CopyObject with `x-amz-copy-source-if-match`); when S3 returns a `version_id` `If-Match-VersionId` adds an independent S3-side check against the live `s3_version_id`, closing the ABA window even on bit-identical re-uploads (ADR-0005). When both are omitted, the call is best-effort last-write-wins on metadata; race detection still fires via the `(etag, updated_at, version_id[, xmin])` filter on every conditional UPDATE.
 3. **Status state machine.** The `status` column doubles as a coarse-grained lock — `pending_upload`, `completing`, `uploaded`, `meta_updating`, `deleting`. A mutation declares the status it expects to find via `WHERE status = …` and a row engaged in another transition rejects the new mutation by returning `0` rows. Every commit goes through `create_presigned_upload` → external part PUTs → `POST /files/{file_id}/upload/{upload_id}`; the transient states (`Completing`, `MetaUpdating`, `Deleting`) are recovered in-band on the next SDK call or by the GC sweep (P2).
 
 Together these primitives uphold the rule:
@@ -334,7 +336,7 @@ Rationale: the etag's job is to be the universal content fingerprint that pairs 
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-constraint-meta-mirrored-via-put-meta`
 
-DB.meta and S3 user-metadata are kept in sync atomically through `PUT /files/{file_id}`: the server merges the update, validates the 2 KB user-metadata budget, then issues a `CopyObject` self-copy with `MetadataDirective: REPLACE` to rotate the S3 object's user-metadata in place. The S3 response carries the new ETag (and, on versioning-on backends, the new VersionId); FileStorage writes those alongside the new metadata in a single conditional UPDATE.
+DB.meta and S3 user-metadata are kept in sync atomically through `PUT /files/{file_id}`: the server merges the update, validates the 2 KB user-metadata budget, then issues a `CopyObject` self-copy with `MetadataDirective: REPLACE` to rotate the S3 object's user-metadata in place. The S3 response carries the new ETag (and, when S3 returns a `version_id`, the new VersionId); FileStorage writes those alongside the new metadata in a single conditional UPDATE.
 
 Other paths preserve metadata as pinned by the server: variant-B re-upload pins the row's CURRENT meta into the presigned PUT (so re-uploaded bytes carry whatever metadata the row already had); reconcile pulls metadata FROM S3 (so any drift converges to S3's truth).
 
@@ -346,7 +348,7 @@ Other paths preserve metadata as pinned by the server: variant-B re-upload pins 
 
 `PUT /files/{file_id}` without `If-Match` is best-effort last-write-wins on metadata. The application contract for concurrent metadata patches is: the LAST patch to land's UPDATE survives; race detection via `(etag, updated_at, version_id[, xmin])` plus a 3-attempt retry loop bounds the contention window.
 
-Callers that need strong CAS pass `If-Match: <etag>`; the strong-CAS path verifies both DB.etag and (via HEAD) S3.etag (and on versioning-on backends, S3.version_id) before issuing the `CopyObject` with `x-amz-copy-source-if-match`. Mismatch at any checkpoint returns `412 etag_mismatch`.
+Callers that need strong CAS pass `If-Match: <etag>`; the strong-CAS path verifies both DB.etag and (via HEAD) S3.etag (and when S3 returns a `version_id`, S3.version_id) before issuing the `CopyObject` with `x-amz-copy-source-if-match`. Mismatch at any checkpoint returns `412 etag_mismatch`.
 
 `reconcile` is not subject to this constraint — it is the explicit reconciliation primitive, not a user-driven metadata patch.
 
@@ -354,9 +356,9 @@ Callers that need strong CAS pass `If-Match: <etag>`; the strong-CAS path verifi
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-constraint-versioning-aware-cas`
 
-When `Backend.versioning = true`, the row's `version_id` column mirrors S3 VersionId; the strong-CAS variant of `PUT /meta` becomes ABA-safe because the server's HEAD verifies both `s3_etag` and `s3_version_id` against the row before issuing `CopyObject`. A bit-identical re-upload would have rotated the version_id even though the etag stayed the same, so the CAS detects the missed generation.
+When S3 versioning is enabled, the row's `version_id` column mirrors S3 VersionId; the strong-CAS variant of `PUT /meta` becomes ABA-safe because the server's HEAD verifies both `s3_etag` and `s3_version_id` against the row before issuing `CopyObject`. A bit-identical re-upload would have rotated the version_id even though the etag stayed the same, so the CAS detects the missed generation.
 
-When `Backend.versioning = false`, ABA on content is an accepted P1 risk — bit-identical re-uploads (or restore-after-overwrite patterns) can let a stale `If-Match` succeed even though an intermediate generation existed. The risk is lowest for files with non-trivial size (where bit-identical re-uploads are vanishingly unlikely outside deliberate adversaries) and highest for tiny config-shaped files. See ADR-0005.
+When S3 versioning is not enabled, ABA on content is an accepted P1 risk — bit-identical re-uploads (or restore-after-overwrite patterns) can let a stale `If-Match` succeed even though an intermediate generation existed. The risk is lowest for files with non-trivial size (where bit-identical re-uploads are vanishingly unlikely outside deliberate adversaries) and highest for tiny config-shaped files. See ADR-0005.
 
 #### Presigned Download Headers from DB
 
@@ -366,7 +368,7 @@ Every presigned download URL FileStorage issues sets `response-content-type` and
 
 Two consequences: (1) operators can change the display label (`meta.name`) and have it immediately reflected on every newly-issued URL, without re-uploading bytes — note that the `file_id` and `file_path` are permanently immutable, so this is a display-only "rename"; (2) any drift between DB.meta and S3.meta (closed by the next `PUT /files/{file_id}` recovery handler) does NOT bleed into download experience for clients receiving freshly issued URLs.
 
-For `download_public.v1` outcomes (bare HTTPS, no signing), the URL has no query params — the browser sees whatever `Content-Type` and `Content-Disposition` the S3 object has. Operators of public-read backends should ensure those headers are set correctly at upload time (FileStorage pins them via SigV4 SignedHeaders on the presigned PUT) and refrain from changing them out-of-band.
+For `download.s3.public.v1` outcomes (bare HTTPS, no signing), the URL has no query params — the browser sees whatever `Content-Type` and `Content-Disposition` the S3 object has. Operators of public-read backends should ensure those headers are set correctly at upload time (FileStorage pins them via SigV4 SignedHeaders on the presigned PUT) and refrain from changing them out-of-band.
 
 #### No Soft Delete
 
@@ -403,12 +405,13 @@ This constraint exists to keep DB+S3 sync centralized: every meta change goes th
 | `FileInfo` | Authoritative file view returned by every read and mutation: `file_id`, `backend_id`, `file_path`, `owner`, `meta`, `status`, `etag` (raw S3 ETag), `version_id` (raw S3 VersionId or `None`), `size_bytes`, timestamps, `upload_expires_at`. | [rust-traits.md](./rust-traits.md) |
 | `FileMeta` / `FileMetaUpdate` | `FileMeta` is the caller-provided metadata: `name`, `mime_type`, `gts_file_type`, `size_bytes` (optional), `custom_metadata`. `FileMetaUpdate` is the body for `PUT /files/{file_id}`; `Some(v)` replaces, `None` keeps. **`FileMetaUpdate` does NOT declare `gts_file_type`** — it is structurally immutable. | [rust-traits.md](./rust-traits.md) |
 | `OwnerRef` | `{ tenant_id, owner_id }`. The `owner_id` is the principal's UUID; FileStorage does not distinguish user vs app — that distinction is owned by the identity / authz subsystem. Immutable after creation (transfer → P2). | [rust-traits.md](./rust-traits.md) |
-| `Backend` | Roster entry: `id` (UUID), `default_private`, `default_public`, `capabilities` (versioned `<operation>.<version>` tags — P1: `upload.multipart_v1`, `download_private.sigv4_v1`, `download_public.v1`; P2 adds `upload.multipart_v1`), `max_file_size_bytes` (optional, defaults to S3 5 TiB cap), `max_metadata_bytes` (optional, defaults to S3 2 KiB user-metadata budget), `max_presign_ttl_seconds` (optional, defaults to AWS SigV4 7-day cap), `versioning` (boolean). Presigned URL support is constitutive (not a capability); kind/transport are not represented (only one possible value, by architectural decision). Tags are validated at module init against the SDK's `KNOWN_CAPABILITIES` whitelist — unknown tag → fail-fast boot. | [rust-traits.md](./rust-traits.md) |
+| `Backend` | Roster entry: `id` (UUID), `default_private`, `default_public`, `capabilities` (versioned `<operation>.<protocol>.<algorithm>.<variant>?.v<n>` tags — P1 ships 5: `upload.s3.multipart.sigv4.v1`, `download.s3.sigv4.v1`, `download.s3.sigv4.versioned.v1`, `download.s3.public.v1`, `download.s3.public.versioned.v1`), `max_file_size_bytes` (optional, defaults to S3 5 TiB cap), `max_metadata_bytes` (optional, defaults to S3 2 KiB user-metadata budget), `max_presign_ttl_seconds` (optional, defaults to AWS SigV4 7-day cap). Versioning support is declared via the `*.versioned.*` capability tags rather than a separate flag. Presigned URL support is constitutive (not a capability); kind/transport are not represented (only one possible value, by architectural decision). Tags are validated at module init against the SDK's `KNOWN_CAPABILITIES` whitelist — unknown tag → fail-fast boot. | [rust-traits.md](./rust-traits.md) |
 | `FileStatus` | `PendingUpload` → `Uploaded` → `Deleting`. | [rust-traits.md](./rust-traits.md) |
-| `PresignedUploadHandle` | Output of `create_presigned_url` (both initial-upload and variant-B re-upload via `file_id = Some(id)`): `file_id`, `upload_url`, `etag_pinned`, `expires_at`. | [rust-traits.md](./rust-traits.md) |
+| `PresignedUploadHandle` | Output of `create_presigned_upload` (both initial-upload and variant-B re-upload via `file_id = Some(id)`): `file_id`, `upload_id` (opaque, round-trips through the caller — not persisted in FileStorage DB), `part_urls[]` (one presigned PUT URL per part), `expires_at`. | [rust-traits.md](./rust-traits.md) |
 | `PresignedDownload` | Output of `presign_urls`: `url`, `expires_at`, `is_public`. `is_public = true` for bare-HTTPS URLs from public-read backends; `expires_at` is then a far-future sentinel. | [rust-traits.md](./rust-traits.md) |
-| `PresignDownloadItem` | Input to `presign_urls`: `file_id`, `params`, `etag` (optional, fail-fast), `version_id` (optional historical generation, only honoured on versioning-on backends). | [rust-traits.md](./rust-traits.md) |
+| `PresignDownloadItem` | Input to `presign_urls`: `file_id`, `params`, `etag` (optional, fail-fast), `version_id` (optional historical generation, only honoured when the chosen capability is a `*.versioned.*` variant). | [rust-traits.md](./rust-traits.md) |
 | `UrlParams` | Knobs applied to a presigned URL: `expires_in_seconds`, `content_disposition`, `content_type_override`, `allowed_client_cidrs`. | [rust-traits.md](./rust-traits.md) |
+| `ByteRange` / `ResolvedByteRange` | Byte-range selector for partial `read_file` calls (constitutive S3 feature, no capability tag). `ByteRange` enum: `Inclusive { start, end }`, `From(start)`, `Suffix(n)` — maps 1:1 to HTTP `Range: bytes=...`. `ResolvedByteRange { start, end_inclusive, total }` mirrors the backend's `Content-Range` response and is exposed on `FileReadHandle.range` whenever a range was requested. `FileReadHandle.info` continues to reflect the FULL object metadata; `bytes` carries only the requested diapason. | [rust-traits.md](./rust-traits.md) |
 
 **Relationships**:
 
@@ -420,42 +423,49 @@ This constraint exists to keep DB+S3 sync centralized: every meta change goes th
 
 #### Backend kinds and multiplicity
 
-FileStorage is a single module that hosts many S3-protocol backends. The number of instances is bounded only by configuration. All instances share the FileStorage REST API, SDK, and metadata database (see §3.7). Native non-S3 backend kinds are out-of-scope at the architecture level (§1.1 backend uniformity invariant) — there is no `BackendKind` discriminator, no `BackendTransport` discriminator, and no plan to introduce either.
+FileStorage is a single module that hosts many S3-protocol backends. The number of instances is bounded only by configuration. All instances share the FileStorage SDK (and the P2 REST API once it ships) and metadata database (see §3.7). Native non-S3 backend kinds are out-of-scope at the architecture level (§1.1 backend uniformity invariant) — there is no `BackendKind` discriminator, no `BackendTransport` discriminator, and no plan to introduce either.
 
 | Bytes live on | Capabilities |
 |---------------|--------------|
-| External S3-class endpoint (AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe) | Versioned `<operation>.<version>` tags (P1: `upload.multipart_v1`, `download_private.sigv4_v1`, `download_public.v1`; P2 adds `upload.multipart_v1`) |
+| External S3-class endpoint (AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe; also reachable via S3-compat gateways for WebDAV / FTP / custom non-S3 backends) | Versioned `<operation>.<descriptor>+.v<n>` tags (P1 ships three: `upload.s3.multipart.sigv4.v1`, `download.s3.sigv4.v1`, `download.s3.public.v1`) |
 
-A deployment registers one or more S3-compatible instances (any mix of AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, and `s3s-fs` side-process for local disks). There is no upper bound encoded in code; practical limits are driven by configuration, credential management, and resource budgets. The roster invariants — stable `backend_id` (UUID), per-backend tenant access list, per-backend `versioning` flag, uniform SDK access — are enforced by the Backend Router (see below) and are documented as a principle in §2.1 (`cpt-cf-file-storage-principle-modular-backend-roster`). There is no native `local` POSIX adapter — every local-disk deployment runs `s3s-fs` and is registered as a regular S3-compatible backend.
+A deployment registers one or more S3-compatible instances (any mix of AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, and `s3s-fs` side-process for local disks). There is no upper bound encoded in code; practical limits are driven by configuration, credential management, and resource budgets. The roster invariants — stable `backend_id` (UUID), per-backend tenant access list, per-backend capability list (versioning exposed via `*.versioned.*` tags), uniform SDK access — are enforced by the Backend Router (see below) and are documented as a principle in §2.1 (`cpt-cf-file-storage-principle-modular-backend-roster`). There is no native `local` POSIX adapter — every local-disk deployment runs `s3s-fs` and is registered as a regular S3-compatible backend.
 
 ##### Capability surface (versioned tags)
 
-Each backend declares a list of versioned **capability tags** in TOML — flat strings of the form `<operation>.<version>` (regex `^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,9}$`). Each tag binds one (operation, signing-strategy, version) tuple. Presigned URL support is constitutive (a backend that cannot sign URLs is not a backend by definition) and is therefore **not** represented as a separate capability — every tag implies signing.
+Each backend declares a list of versioned **capability tags** in TOML — flat strings of the form `<operation>.<protocol>.<algorithm>.<variant>?.v<n>` (regex `^[a-z][a-z0-9_]+(\.[a-z][a-z0-9_]+){2,4}\.v\d+$`). The leading segment is the SDK operation (`upload` / `download`); the next is the protocol family (e.g. `s3`, `gcs`, `azure`); the next is the signing/auth flavor (`sigv4`, `sigv4a`, `sas_user`, `multipart`, `public` for anonymous bare-HTTPS, …); the optional fourth descriptor is a variant modifier (currently the only one is `versioned`, marking that the tag accepts a `version_id` selector); the trailing segment is the contract version (`v1`, `v2`, …). Presigned URL support is constitutive (a backend that cannot sign URLs is not a backend by definition) and is therefore **not** represented as a separate capability — every signed tag implies its named signing algorithm; `public` denotes the deliberate absence of a signature (anonymous bare-HTTPS, paired with public-read bucket policy).
 
-**Boot-time validation is the sole correctness mechanism.** The SDK ships with `const KNOWN_CAPABILITIES: &[&str] = &[ ... ]`. At module init, every tag in every `Backend.capabilities` is checked against the whitelist; unknown tags fail-fast initialization with `unknown capability "{tag}" on backend {id}`. Runtime code never has to handle "unknown tag" — the impossibility is enforced at boot. New signing strategies (e.g. AWS SigV4 alg revision, GCS POST-policy variant) ship as a new entry in `KNOWN_CAPABILITIES` and a new branch in the adapter's `match` — no enum migration, no breaking schema change.
+**Boot-time validation is the sole correctness mechanism.** The SDK ships with `const KNOWN_CAPABILITIES: &[&str] = &[ ... ]`. At module init, every tag in every `Backend.capabilities` is checked against the whitelist; unknown tags fail-fast initialization with `unknown capability "{tag}" on backend {id}`. Runtime code never has to handle "unknown tag" — the impossibility is enforced at boot. New signing strategies or new wire protocols ship as a new entry in `KNOWN_CAPABILITIES` and a new branch in the adapter's `match` — no enum migration, no breaking schema change.
 
-**P1 whitelist (3 tags):**
+**P1 whitelist (5 tags) — these cover every supported backend in P1, including non-S3 endpoints exposed through S3-compat gateways (WebDAV, FTP, custom storage):**
 
-- `upload.multipart_v1` — single-shot SigV4 PUT for object upload. Result: `PresignedUploadHandle`.
-- `download_private.sigv4_v1` — SigV4-signed GET for time-limited private downloads (TTL + optional CIDR allowlist). Result: `PresignedDownload` (`is_public = false`).
-- `download_public.v1` — bare-HTTPS public-read URL with no signature and no expiry. Pairs with `Backend.default_public`; the URL is reusable across viewers and is intended for buckets with public-read ACL or an origin behind a CDN. Result: `PresignedDownload` (`is_public = true`).
+- `upload.s3.multipart.sigv4.v1` — **the only upload path implemented in P1.** Recommended for any backend that speaks S3 protocol natively (AWS S3, MinIO, Ceph, Wasabi, GCS S3-compat, `s3s-fs`) or via an S3-compat gateway in front of a non-S3 storage (WebDAV, FTP, custom backends). Alternative upload tags (e.g. `upload.gcs.resumable.v1`, `upload.azure.blocks.sas_user.v1`) are reserved by the naming scheme but not implemented in any phase. `create_presigned_upload` runs `CreateMultipartUpload` against the backend, captures the backend's `upload_id`, and presigns N `UploadPart` PUT URLs in one round trip via SigV4. Result: `PresignedUploadHandle { file_id, upload_id, part_urls[], expires_at }`. **`upload_id` is NOT persisted by FileStorage** — the caller MUST keep it for the companion `complete_upload` (3-phase commit; in P2 also `POST /files/{file_id}/upload/{upload_id}`) and `abort_upload` (in P2 also `DELETE /files/{file_id}/upload/{upload_id}`, aborts one session, does NOT delete the row). Single-byte files use a one-part session (last-part rule lets `part_size` be arbitrarily small). Refers specifically to the chunked S3 multipart-upload protocol (`CreateMultipartUpload` + `UploadPart` + `CompleteMultipartUpload`), **not** to the unrelated `multipart/form-data` POST Policy upload (intentionally not supported, see ADR-0003).
+- `download.s3.sigv4.v1` — SigV4-signed GET for time-limited private downloads (TTL + optional CIDR allowlist). Rejects `version_id` parameter on `presign_urls` items (use the `versioned` variant for that). Result: `PresignedDownload` (`is_public = false`).
+- `download.s3.sigv4.versioned.v1` — version-aware SigV4-signed GET. Identical to `download.s3.sigv4.v1` except it accepts an optional `version_id` on `PresignDownloadItem` and embeds `versionId=<vid>` into the signed URL so the resolved bytes correspond to that historical S3 generation. When `version_id` is omitted, returns the current-version URL (effectively a strict superset of the basic tag). Declared on backends fronting versioning-enabled buckets that wish to expose history to consumers; declaring it implies the bucket has S3 versioning on. Result: `PresignedDownload` (`is_public = false`).
+- `download.s3.public.v1` — bare-HTTPS public-read URL with no signature and no expiry; `public` in the algorithm slot denotes the deliberate absence of a signing algorithm. Pairs with `Backend.default_public`; the URL is reusable across viewers and is intended for buckets with public-read ACL or an origin behind a CDN. Rejects `version_id` parameter (use the `versioned` variant). Result: `PresignedDownload` (`is_public = true`).
+- `download.s3.public.versioned.v1` — version-aware bare-HTTPS public-read URL. Identical to `download.s3.public.v1` except it accepts `version_id` and emits the URL as `https://<host>/<key>?versionId=<vid>` (no signature, no expiry). Requires the bucket policy to grant `s3:GetObjectVersion` to the anonymous principal in addition to `s3:GetObject` — without it, anonymous requests with `?versionId=` return 403. Operators who declare this tag confirm both bucket-versioning is on AND the anonymous policy grants `s3:GetObjectVersion`. Result: `PresignedDownload` (`is_public = true`).
 
-**P2 additions (one tag):**
+No P2 or P3 additions are planned for the capability whitelist — the five P1 tags already cover every supported transport. Cloud-native upload protocols are illustrative examples of how the whitelist would extend if a non-S3 adapter were ever added; **none are planned for any phase** and are listed only to demonstrate the naming scheme:
 
-- `upload.multipart_v1` — the only upload path. The `presign-batch` handler runs `CreateMultipartUpload` against the backend, captures the backend's `upload_id`, and presigns N `UploadPart` URLs in one round trip. Result: `PresignedUploadHandle { file_id, upload_id, part_urls[], expires_at }`. **`upload_id` is NOT persisted by FileStorage** — the caller MUST keep it for the companion REST endpoints `POST /files/{file_id}/upload/{upload_id}` (3-phase commit) and `DELETE /files/{file_id}/upload/{upload_id}` (abort one session, does NOT delete the row). Single-byte files use a one-part session.
+- `upload.gcs.resumable.v1` *(example only, not implemented)* — would correspond to the GCS native resumable-upload session (single session URL, sequential `Content-Range` PUTs, no per-chunk ETag). Currently GCS is supported through its S3-compat XML API and uses `upload.s3.multipart.sigv4.v1` like every other S3-class backend.
+- `upload.azure.blocks.sas_user.v1` *(example only, not implemented)* — would correspond to Azure Block Blob (`PutBlock` + `PutBlockList`) with a User-Delegation SAS. Currently Azure is reachable only through an S3-compat gateway in front of Blob Storage.
 
-**Operator runbook for P2 multipart:** the bucket / endpoint hosting an S3-compatible backend that declares `upload.multipart_v1` MUST configure an `AbortIncompleteMultipartUpload` lifecycle rule (e.g. abort uploads older than 7 days). FileStorage does not persist `upload_id`, so it cannot reap abandoned multipart sessions itself — abandoned sessions are eventually reaped by the bucket lifecycle.
+These tags can be added at any time (P1 / P2 / P3) by appending to `KNOWN_CAPABILITIES` and adding the corresponding adapter branch — schema-compatible, no migration.
+
+**Versioning is declared per backend through the `*.versioned.*` tags, not through a separate flag.** There is no `Backend.versioning: bool` field. The DB `version_id` column is populated from S3 response headers as-is (`x-amz-version-id` on `CompleteMultipartUpload` / `HeadObject` / `CopyObject`) — its presence/absence reflects what S3 actually returned, not what was declared. The `(etag, updated_at, version_id[, xmin])` race-detection predicate is null-safe and works in both modes automatically. Capability dispatch on `presign_urls` validates whether the chosen tag accepts `version_id`: declaring `download.s3.sigv4.versioned.v1` or `download.s3.public.versioned.v1` is the source of truth for "this backend exposes historical versions to consumers". See ADR-0005.
+
+**Operator runbook for multipart:** the bucket / endpoint hosting an S3-compatible backend MUST configure an `AbortIncompleteMultipartUpload` lifecycle rule (e.g. abort uploads older than 7 days). FileStorage does not persist `upload_id`, so it cannot reap abandoned multipart sessions itself — abandoned sessions are eventually reaped by the bucket lifecycle.
 
 There is no `PresignedConditionalPut` capability in P1. Conditional preconditions on the upload presign path (`If-Match` / `If-None-Match: *` pinned via SigV4 SignedHeaders) are deferred — the S3-compat ecosystem is fragmented on conditional-PUT semantics (GCS S3-compat silently ignores the headers, several appliances are inconsistent across versions), and self-healing reconciliation (ADR-0004) provides P1 correctness without them. Note that `PUT /files/{file_id}`'s strong-CAS path DOES use a backend-side precondition (`x-amz-copy-source-if-match` on `CopyObject`); that header is universally honoured by S3 servers for `CopyObject` and does not require a separate capability tag.
 
 ```mermaid
 graph TD
     subgraph External
-      UI[Platform UI / External clients]
-      MOD[CyberFabric modules via ClientHub]
+      UI[Platform UI / External clients<br/>(P2 only — they reach FileStorage<br/>through their application backend in P1)]
+      MOD[CyberFabric modules via ClientHub<br/>(P1 — in-process)]
     end
-    REST[cpt-cf-file-storage-component-rest-api<br/>REST API]
-    SDK[cpt-cf-file-storage-component-sdk-facade<br/>SDK Facade]
+    REST[cpt-cf-file-storage-component-rest-api<br/>REST API<br/>P2 only]
+    SDK[cpt-cf-file-storage-component-sdk-facade<br/>SDK Facade<br/>P1 sole entry-point]
     ROUTER[cpt-cf-file-storage-component-backend-router<br/>Backend Router]
     REPO[cpt-cf-file-storage-component-files-repo<br/>Files Repo]
     S3A[cpt-cf-file-storage-component-s3-backend<br/>S3 Backend Adapter]
@@ -463,25 +473,27 @@ graph TD
     PG[(SQL DB)]
     AUTHZ[authz SDK]
 
-    UI -->|HTTPS| REST
+    UI -. HTTPS, P2 .-> REST
     MOD -->|in-process| SDK
-    REST --> ROUTER
+    REST -. P2 .-> ROUTER
     SDK --> ROUTER
     ROUTER --> REPO
     ROUTER --> S3A
     REPO --> PG
     S3A --> S3
-    REST -.authz.-> AUTHZ
+    REST -. authz, P2 .-> AUTHZ
     SDK -.authz.-> AUTHZ
 ```
 
-#### REST API
+#### REST API (P2 — not delivered in P1)
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-component-rest-api`
 
 ##### Why this component exists
 
-External traffic (platform UI, application backends posting to FileStorage from outside the monolith, future browser-direct flows) needs a stable HTTP surface independent of ClientHub. In-process streaming `read_file` is exposed only through the SDK (no REST surface in P1) — external HTTP callers obtain a presigned GET URL via `POST /presign-batch` and fetch from the backend directly.
+**Not in P1.** P1 ships only the in-process Rust SDK trait `FileStorageClient` — every consumer (chat backend, llm-gateway, antivirus, file-parser, …) lives in the same monolith and obtains the SDK handle through ClientHub. No HTTP surface is published in P1.
+
+In **P2**, when the platform splits into separately deployable modules, this component lights up: external traffic (platform UI, application backends posting to FileStorage from outside the monolith, browser-direct flows) needs a stable HTTP surface independent of ClientHub. The full P2 contract is specified in [`openapi.yaml`](./openapi.yaml) (published in P1 as the design target so the SDK shape and the future REST shape stay aligned). Streaming `read_file` continues to be SDK-only — external HTTP callers in P2 obtain a presigned GET URL via `POST /presign-batch` and fetch from the backend directly.
 
 ##### Responsibility scope
 
@@ -532,11 +544,11 @@ Does NOT expose infrastructure types (no axum, no raw S3 client) to consumers; d
 
 ##### Why this component exists
 
-Both REST and SDK surfaces need a single place that resolves `backend_id → adapter`, enforces tenant access, applies per-backend size limits, and emits `CapabilityUnavailable` errors consistently.
+The SDK surface (and the P2 REST surface, when it lands) needs a single place that resolves `backend_id → adapter`, enforces tenant access, applies per-backend size limits, and emits `CapabilityUnavailable` errors consistently.
 
 ##### Responsibility scope
 
-Hold the immutable backend registry built from TOML at init; **validate every declared capability tag against `KNOWN_CAPABILITIES` and fail-fast on unknown tags** (capability boot-validation principle); expose `resolve(ctx, backend_id) -> &dyn StorageBackend` with tenant-scoping enforcement (returns `NotFound` when the caller's tenant is not on the backend's access list — see §2.1 `cpt-cf-file-storage-principle-modular-backend-roster`); serve `list_backends(ctx)` filtered by the caller's tenant access; enforce `backend_id` uniqueness across the roster at registry load; check `requires_capability(tag)` (storage declared the tag → `Ok(())`; otherwise `CapabilityUnavailable`); look up per-backend configuration (`max_file_size_bytes`, `max_metadata_bytes`, `max_presign_ttl_seconds` — all optional, defaulting to the S3 5 TiB object cap, 2 KiB user-metadata budget, and AWS SigV4 7-day signing cap respectively; tenant access list; `default_private` flag).
+Hold the immutable backend registry built from TOML at init; **validate every declared capability tag against `KNOWN_CAPABILITIES` and fail-fast on unknown tags** (capability boot-validation principle); expose `resolve(ctx, backend_id) -> Arc<S3Backend>` with tenant-scoping enforcement (returns `NotFound` when the caller's tenant is not on the backend's access list — see §2.1 `cpt-cf-file-storage-principle-modular-backend-roster`); serve `list_backends(ctx)` filtered by the caller's tenant access; enforce `backend_id` uniqueness across the roster at registry load; check `requires_capability(tag)` (storage declared the tag → `Ok(())`; otherwise `CapabilityUnavailable`); look up per-backend configuration (`max_file_size_bytes`, `max_metadata_bytes`, `max_presign_ttl_seconds` — all optional, defaulting to the S3 5 TiB object cap, 2 KiB user-metadata budget, and AWS SigV4 7-day signing cap respectively; tenant access list; `default_private` flag).
 
 ##### Responsibility boundaries
 
@@ -555,7 +567,7 @@ The participating entry-points and their per-call flow:
 - **`POST /presign-batch` with `kind: "upload"`, no `file_id`** — initial upload via presigned PUT. INSERT row with `status = PendingUpload`, sentinel `etag`, `upload_expires_at`; ask the adapter for a presigned PUT with `Content-Type` / `Content-Disposition` / `x-amz-meta-<k>` pinned (NOT `x-amz-meta-gts-file-type`).
 - **`POST /presign-batch` with `kind: "upload"`, with `file_id`** — variant-B re-upload via presigned PUT. SELECT row, pin its CURRENT meta into a fresh presigned PUT, MAX-merge `upload_expires_at`.
 - **`POST /files/{file_id}/upload/{upload_id}`** — commit. HEAD the backend for the authoritative `(s3_etag, s3_version_id, content_type, content_disposition, content_length, x-amz-meta-*)`, run a conditional UPDATE that flips `pending_upload → uploaded` (or drift-resyncs an `uploaded` row in place) and pulls all S3-mirrored metadata fields except `gts_file_type`.
-- **SDK `put_file` (in-process, no presign roundtrip)** — same `PendingUpload` row insert; stream bytes through the adapter's `PutObject` with the same pinned headers; HEAD-and-pull commits identically to `reconcile`; on any error between INSERT and the final UPDATE, run a best-effort `DELETE FROM files WHERE id = $file_id AND status = 'pending_upload'` so the call leaves no `PendingUpload` row behind, and let the P2 GC inverse sweep reclaim any orphan backend object.
+- **SDK `put_file` (in-process, no presign roundtrip)** — same `PendingUpload` row insert; the SDK drives the same `S3Backend` adapter as the presigned path (`create_multipart_and_presign_parts` + per-part `UploadPart` + `complete_multipart`), so even small payloads use a 1-part multipart session — there is no single-shot `PutObject` shortcut. The 3-phase commit (`pending_upload → completing → uploaded`) lives inside the SDK call. On any error between INSERT and the final UPDATE, the SDK best-effort calls `abort_multipart` and runs `DELETE FROM files WHERE id = $file_id AND status = 'pending_upload'` so the call leaves no `PendingUpload` row behind, and lets the P2 GC inverse sweep reclaim any orphan backend object.
 - **`PUT /files/{file_id}`** — merge update against current row, validate 2 KB user-metadata budget, optionally HEAD S3 for strong CAS (when `If-Match` supplied), `CopyObject` self-copy with `MetadataDirective: REPLACE` (and optional `x-amz-copy-source-if-match`), conditional UPDATE on the row writing the new `(etag, version_id, meta)`.
 - **`DELETE /files/{file_id}`** — 2-phase flow: Phase 1 conditional UPDATE to `Deleting` (with optional `If-Match`), Phase 2 backend DELETE with inline retries, Phase 3 hard-DELETE the row.
 
@@ -588,11 +600,11 @@ Does NOT touch backend bytes; does NOT call authz; does NOT enforce backend capa
 
 ##### Why this component exists
 
-Native S3-class backends (AWS S3, MinIO, Ceph RGW, Wasabi) already guarantee object durability and offer presigned URLs. The adapter exposes those capabilities behind the common `StorageBackend` trait without dragging their semantics into the domain.
+Native S3-class backends (AWS S3, MinIO, Ceph RGW, Wasabi) already guarantee object durability and offer presigned URLs. The adapter is implemented as a concrete `pub(crate) struct S3Backend` (no trait — there is only one backend kind on the architectural roadmap; see §1.1 backend uniformity invariant); it confines all S3-specific types (`aws-sdk-s3` clients, ByteStream, request IDs) to one module so the rest of the codebase sees only `bytes::Bytes` and `Result<…, FileStorageError>`.
 
 ##### Responsibility scope
 
-`PutObject` / `GetObject` / `HeadObject` / `DeleteObject` / `CopyObject` (self-copy with `MetadataDirective: REPLACE`) on the bucket configured for this backend, keyed by `file_id` (per ADR-0002); generate presigned URLs for download and upload through SigV4 PUT / GET (per ADR-0003); for backends declaring the `download_public.v1` capability tag, generate bare-HTTPS download URLs without signing; translate backend errors into `FileStorageError`. The adapter pins user-visible metadata into the S3 object via SigV4 SignedHeaders on every PUT (`Content-Type`, `Content-Disposition`, every `x-amz-meta-<k>`) and via `MetadataDirective: REPLACE` on every `CopyObject` self-copy. The adapter never writes `x-amz-meta-gts-file-type` — that field is DB-only.
+`CreateMultipartUpload` / `UploadPart` (via presigned URL) / `CompleteMultipartUpload` / `AbortMultipartUpload` (the upload path implemented in P1; alternative upload tags from the naming scheme are reserved but not implemented), `GetObject` (with optional HTTP `Range: bytes=...` header on `read_file` partial reads — constitutive S3 feature, no capability tag) / `HeadObject` / `DeleteObject` / `CopyObject` (self-copy with `MetadataDirective: REPLACE`) on the bucket configured for this backend, keyed by `file_id` (per ADR-0002); generate presigned URLs for upload (per `UploadPart`) and download via SigV4 PUT / GET (per ADR-0003); for backends declaring the `download.s3.public.v1` capability tag, generate bare-HTTPS download URLs without signing; translate backend errors into `FileStorageError` (including `416 Range Not Satisfiable` → `BadRequest`). **No single-shot `PutObject` path** — small in-process uploads use a 1-part multipart session (last-part rule). The adapter pins user-visible metadata into the S3 object via SigV4 SignedHeaders on every part PUT (`Content-Type`, `Content-Disposition`, every `x-amz-meta-<k>`) and via `MetadataDirective: REPLACE` on every `CopyObject` self-copy. The adapter never writes `x-amz-meta-gts-file-type` — that field is DB-only.
 
 ##### Presigned URL issuance modes
 
@@ -617,15 +629,25 @@ FileStorage has **no** native POSIX `local` backend adapter and never will — t
 
 ### 3.3 API Contracts
 
+**P1 — in-process Rust SDK trait** (`cpt-cf-file-storage-fr-rust-sdk`).
+
+- **Technology**: Rust `async_trait` over ClientHub
+- **Location**: [rust-traits.md](./rust-traits.md) — full signatures
+- **Contracts**: `cpt-cf-file-storage-contract-cf-modules`, `cpt-cf-file-storage-contract-authz`
+
+The SDK trait `FileStorageClient` is the **only** access surface in P1. Every consuming module (chat backend, llm-gateway, antivirus, file-parser, …) calls it directly through ClientHub. Methods: `list_backends`, `list_files`, `get_file_info`, `put_file_info`, `delete_file`, `create_presigned_upload`, `complete_upload`, `abort_upload`, `presign_urls`, `read_file`, `put_file`.
+
+**P2 — REST API mirror** (`cpt-cf-file-storage-fr-rest-api`, `cpt-cf-file-storage-interface-rest-api-v1`).
+
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-interface-rest-api-v1`
 
-- **Contracts**: `cpt-cf-file-storage-contract-cf-modules`, `cpt-cf-file-storage-contract-authz`
 - **Technology**: REST / OpenAPI 3.1.0
 - **Location**: [openapi.yaml](./openapi.yaml)
+- **Status**: Published in P1 as the design target; **not exposed over the wire in P1**. Activated when modules become separately deployable (P2).
 
-The SDK trait mirrors the REST surface 1:1; full signatures live in [rust-traits.md](./rust-traits.md).
+The P2 REST surface mirrors the SDK trait 1:1 — same operations, same `(file_id, etag, version_id)` pin model, same error vocabulary. `openapi.yaml` is kept in lock-step with `rust-traits.md` so the SDK shape and the future REST shape stay aligned.
 
-**Endpoints Overview** (full schemas in `openapi.yaml`) — 7 routes total:
+**Endpoints Overview** (full schemas in `openapi.yaml`, **P2 only**) — 7 routes total:
 
 | Method | Path | Description | Stability |
 |--------|------|-------------|-----------|
@@ -643,8 +665,8 @@ Notes:
 - The `If-Match` header carries the `etag` for conditional requests on `PUT /files/{file_id}` and `DELETE /files/{file_id}`. The trait-level `etag` argument and the `If-Match` header are equivalent on the wire. Both are optional in P1 (`cpt-cf-file-storage-constraint-no-meta-cas`).
 - `POST /files/{file_id}/upload/{upload_id}` is the explicit reconciliation command and rejects any precondition header — its HEAD response IS the conditioning input.
 - **Multi-URL `upload_expires_at = MAX` rule**: when a variant-B re-upload presign is issued against a row that already has `upload_expires_at` set (e.g. a prior re-upload presign whose URL has not been used), the server updates the field to `MAX(current, NOW + TTL)`. Multiple outstanding URLs therefore never shorten an already-valid window.
-- The REST surface uses **only PUT** for metadata writes (no PATCH anywhere). The two PUT-shaped writes a caller actually sees are: (a) `PUT /files/{file_id}` against FileStorage REST for metadata replacement (atomic DB+S3); (b) the **direct PUT to the storage backend** via the presigned URL handed back by `POST /presign-batch` for content. **There is no proxied content endpoint in any phase** — every external byte transfer is client ↔ storage backend direct, gated by a FileStorage-issued presigned URL (or a bare-HTTPS URL for public-read backends). In-process modules (antivirus, llm-gateway, file-parser) consume content via the SDK `read_file` method, which streams through the adapter without exposing a REST surface; `read_file` is the lazy self-healing trigger and `POST /reconcile` is the eager equivalent for external callers (ADR-0004).
-- **Explicit deviations from PRD**: `cpt-cf-file-storage-fr-multipart-upload` (multipart upload) is deferred to P2 despite its `p1` priority — see §4 Future deltas.
+- The (future P2) REST surface uses **only PUT** for metadata writes (no PATCH anywhere). The two PUT-shaped writes a caller actually sees are: (a) `PUT /files/{file_id}` for metadata replacement (atomic DB+S3); (b) the **direct PUT to the storage backend** via the presigned URL handed back by `POST /presign-batch` for content. **There is no proxied content endpoint in any phase** — every external byte transfer is client ↔ storage backend direct, gated by a FileStorage-issued presigned URL (or a bare-HTTPS URL for public-read backends). In-process modules (antivirus, llm-gateway, file-parser) — both in P1 and P2 — consume content via the SDK `read_file` method, which streams through the adapter without ever going through HTTP; `read_file` is also the lazy self-healing trigger.
+- **Explicit deviations from PRD**: none in P1 — S3 multipart upload is the only upload path implemented in P1 (`cpt-cf-file-storage-fr-multipart-upload`, P1); alternative upload protocols are reserved by the capability naming scheme but not implemented.
 - (P2) endpoints (multipart upload, policies, audit) are deliberately absent from P1.
 - A user-self-service endpoint `GET /files/{file_id}/get-presigned-url?…` is on the P2 roadmap as a UX shortcut for end-users to obtain download URLs for files they own without going through an application backend.
 
@@ -672,7 +694,7 @@ Notes:
 
 | Dependency | Interface Used | Purpose |
 |------------|----------------|---------|
-| AWS S3 / MinIO / Ceph RGW / Wasabi / GCS (S3-compat) | `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, presigned URL generation (SigV4 PUT / GET) | File bytes; presigned URLs for direct upload and direct download. |
+| AWS S3 / MinIO / Ceph RGW / Wasabi / GCS (S3-compat) | `CreateMultipartUpload`, `UploadPart` (via presigned URL), `CompleteMultipartUpload`, `AbortMultipartUpload`, `GetObject` (with optional `Range: bytes=...` for partial reads), `HeadObject`, `DeleteObject`, `CopyObject` (self-copy with `MetadataDirective: REPLACE`), presigned URL generation (SigV4 PUT / GET) | File bytes via multipart only; presigned URLs for direct upload (per part) and direct download. Range support on `GetObject` is constitutive (no capability tag); presigned download clients add the `Range` header on their GET themselves. |
 
 #### SQL-compatible database (FileStorage module-owned)
 
@@ -719,28 +741,36 @@ sequenceDiagram
 
     U->>APP: POST /chat/v1/threads/{tid}/upload-file (name, mime, size, gts_type)
     APP->>APP: business validation (limits, quotas, permissions)
-    APP->>SDK: create_presigned_url(s3-prod, owner, file_path, meta, params)
-    SDK->>REPO: INSERT files(status=PendingUpload, etag=sentinel, version_id=NULL, expires_at)
-    SDK->>S3A: issue_presigned_put(key, pinned={Content-Type, Content-Disposition, x-amz-meta-*}, params)
-    S3A-->>SDK: upload_url, expires_at
-    SDK-->>APP: PresignedUploadHandle { file_id, upload_url, etag_pinned, expires_at }
+    APP->>SDK: create_presigned_upload(s3-prod, owner, meta,<br/>capability="upload.s3.multipart.sigv4.v1", part_count=N, params)
+    SDK->>REPO: INSERT files(status=PendingUpload, etag=sentinel, version_id=NULL, upload_expires_at)
+    SDK->>S3A: create_multipart_and_presign_parts(key, pinned={Content-Type, Content-Disposition, x-amz-meta-*}, part_count=N, params)
+    S3A->>S3: CreateMultipartUpload
+    S3-->>S3A: upload_id
+    S3A-->>SDK: upload_id, part_urls[], expires_at
+    SDK-->>APP: PresignedUploadHandle { file_id, upload_id, part_urls[], expires_at }
     APP->>APP: persist (thread_id ↔ file_id) link
-    APP-->>U: { file_id, upload_url }
-    U->>S3: PUT {upload_url} (bytes + pinned headers)
-    S3-->>U: 200 OK + ETag header
-    U->>APP: POST /chat/v1/threads/{tid}/files/{file_id} (upload completed)
-    APP->>SDK: reconcile(file_id)
-    SDK->>S3A: head_object(derive(file_id))
-    S3A->>S3: HEAD object
-    S3-->>S3A: ETag, VersionId, Content-Type, Content-Disposition, x-amz-meta-*, Content-Length
-    S3A-->>SDK: BackendObjectMetadata
-    SDK->>REPO: UPDATE files SET status=Uploaded, etag=$s3_etag, version_id=$s3_version_id,<br/>name=$new.name, mime_type=$new.mime_type, custom_metadata=$new.custom_metadata,<br/>size_bytes, updated_at=NOW, upload_expires_at=NULL<br/>WHERE id=file_id AND etag=$captured_etag AND updated_at=$captured_updated<br/>AND version_id IS NOT DISTINCT FROM $captured_version_id
+    APP-->>U: { file_id, upload_id, part_urls[] }
+    loop for each part_number in 1..=N
+      U->>S3: PUT part_urls[i] (bytes + pinned headers)
+      S3-->>U: 200 OK + part ETag
+    end
+    U->>APP: POST /chat/v1/threads/{tid}/files/{file_id} {parts: [{part_number, etag}]}
+    APP->>SDK: complete_upload(file_id, upload_id, parts)
+    Note right of SDK: Phase 1 — DB
+    SDK->>REPO: UPDATE files SET status='completing'<br/>WHERE id=file_id AND status='pending_upload'<br/>AND etag=$captured AND updated_at=$captured<br/>AND version_id IS NOT DISTINCT FROM $captured_version_id
+    Note right of SDK: Phase 2 — S3
+    SDK->>S3A: complete_multipart(key, upload_id, parts)
+    S3A->>S3: CompleteMultipartUpload
+    S3-->>S3A: ETag, VersionId
+    S3A-->>SDK: (s3_etag, s3_version_id)
+    Note right of SDK: Phase 3 — DB
+    SDK->>REPO: UPDATE files SET status='uploaded',<br/>etag=$s3_etag, version_id=$s3_version_id,<br/>size_bytes, updated_at=NOW, upload_expires_at=NULL<br/>WHERE id=file_id AND status='completing'
     REPO-->>SDK: 1 row affected
-    SDK-->>APP: ReconcileResult { info, s3_etag, s3_version_id }
+    SDK-->>APP: FileInfo
     APP-->>U: 200 OK { file_id, etag }
 ```
 
-**Description**: FileStorage never sees the bytes. The SQL row goes from `PendingUpload` to `Uploaded` only after `reconcile` HEADs the backend and confirms the object. FileStorage HEADs S3 itself rather than trusting any caller-supplied etag — the row's etag and metadata are pulled directly from the HEAD response. `gts_file_type` is NOT pulled from S3 — the column is preserved as it was on the row. If the end-client never returns and the application backend never calls `reconcile`, the row times out at `expires_at` and is harvested by the P2 GC sweep.
+**Description**: FileStorage never sees the bytes. The SQL row goes from `pending_upload` through the transient `completing` to `uploaded` inside `complete_upload`'s 3-phase commit. FileStorage uses the etag from S3's `CompleteMultipartUpload` response rather than trusting any caller-supplied value — the row claims durability only after S3 acknowledges the multipart finalize. `gts_file_type` is NOT touched by commit/recovery — the column is preserved as set at `create_presigned_upload`. If the end-client never returns and the application backend never calls `complete_upload`, the row times out at `upload_expires_at` and is harvested by the P2 GC sweep; abandoned multipart sessions on the backend are reaped by the bucket's `AbortIncompleteMultipartUpload` lifecycle rule.
 
 #### Batched presigned downloads (S3 happy path)
 
@@ -776,7 +806,7 @@ sequenceDiagram
     C-->>U: hand over URLs to end users
 ```
 
-**Description**: In the embedded (P1) topology the SDK holds the S3 signing secrets in process; the entire batch is N HMAC signings in memory. Per-item authz failures surface inside the outcome vector; the outer `Result` only fails for whole-batch faults (DB unavailable, etc.). Download URLs are SigV4-signed via `download_private.sigv4_v1` or bare-HTTPS via `download_public.v1` depending on the per-item capability tag.
+**Description**: In the embedded (P1) topology the SDK holds the S3 signing secrets in process; the entire batch is N HMAC signings in memory. Per-item authz failures surface inside the outcome vector; the outer `Result` only fails for whole-batch faults (DB unavailable, etc.). Download URLs are SigV4-signed via `download.s3.sigv4.v1` or bare-HTTPS via `download.s3.public.v1` depending on the per-item capability tag.
 
 #### Streaming in-process read
 
@@ -858,7 +888,7 @@ Reference DDL lives in [`migration.sql`](./migration.sql) — portable SQL that 
 | `mime_type` | `varchar(256)` | Declared MIME. Mirrored to S3 as `Content-Type` (pinned into the SigV4 SignedHeaders of every presigned PUT and synchronized via `CopyObject` self-copy on `PUT /meta`). |
 | `size_bytes` | `bigint` | Final file size; `0` while `status = 'pending_upload'`. Pulled from S3 Content-Length on every `reconcile`. |
 | `etag` | `varchar(128)` | Raw S3 ETag (sans surrounding quotes) for the current bytes. **Content fingerprint only** (`cpt-cf-file-storage-constraint-etag-content-only`) — does NOT track metadata changes. Rotated by content writes and by `CopyObject` self-copy on `PUT /meta` (which rewrites the object at the S3 level). |
-| `version_id` | `varchar(128)` (nullable) | Raw S3 VersionId for the current generation. `NULL` when `Backend.versioning = false`. Used as the ABA-safe extension to etag-CAS on `PUT /meta` and as the historical-version selector on `presign_urls` (see ADR-0005). |
+| `version_id` | `varchar(128)` (nullable) | Raw S3 VersionId for the current generation. `NULL` when S3 versioning is not enabled. Used as the ABA-safe extension to etag-CAS on `PUT /meta` and as the historical-version selector on `presign_urls` (see ADR-0005). |
 | `status` | `varchar(16)` | Core lifecycle `'pending_upload' \| 'uploaded' \| 'deleting'` for P1. No engine-level CHECK; backend-kind-specific extensions allowed without schema changes. |
 | `custom_metadata` | `json` | Default `{}`. Mirrored to S3 as `x-amz-meta-<k>=<v>` headers; aggregate user-metadata size is capped at 2 KB. |
 | `upload_expires_at` | `timestamp` (UTC) | Captured at upload-presign time. For variant-B re-upload, updated to `MAX(current, NOW + TTL)`. `reconcile` rejects `pending_upload` rows past this deadline with `UploadExpired`. `NULL` once `uploaded`. |
@@ -887,17 +917,19 @@ A `(tenant_id, backend_id, owner_id)` index that supported listing within a spec
 
 The P1 schema deliberately omits these; they will be introduced as additive migrations:
 
-- (No multipart sessions table planned.) An earlier draft proposed `file_storage.file_uploads` and `file_storage.file_upload_parts` to persist S3 `UploadId` and per-part state. The current design (§4 Future deltas, "Multipart upload") removes them entirely: S3 stores the multipart session state itself, and the caller carries `upload_id` between `create_multipart_v1` presign and `POST/DELETE /files/{file_id}/multipart/{upload_id}`. Abandoned sessions are reaped by the bucket's `AbortIncompleteMultipartUpload` lifecycle rule.
+- (No multipart sessions table planned.) An earlier draft proposed `file_storage.file_uploads` and `file_storage.file_upload_parts` to persist S3 `UploadId` and per-part state. The current design (§4 Future deltas, "Multipart upload") removes them entirely: S3 stores the multipart session state itself, and the caller carries `upload_id` between the `upload.s3.multipart.sigv4.v1` presign and `POST/DELETE /files/{file_id}/multipart/{upload_id}`. Abandoned sessions are reaped by the bucket's `AbortIncompleteMultipartUpload` lifecycle rule.
 - `file_storage.audit_events` — write-side audit (P2).
 - `file_share.*` — the entire FileShare schema (shareable links, guest URL ledger, view counters) — owned by the P3 module, not by FileStorage.
 
-**Note**: P1 already supports historical versions for backends with `versioning = true` via the `version_id` column on the main `files` table (per-row, current generation only) and via `PresignDownloadItem.version_id` (caller passes a historical VersionId for download). A separate `file_versions` table that materializes every generation as its own row is a P3 candidate behind `cpt-cf-file-storage-fr-file-versioning` if/when version-aware enumeration is required.
+**Note**: P1 already supports historical versions for backends with S3 versioning enabled via the `version_id` column on the main `files` table (per-row, current generation only) and via `PresignDownloadItem.version_id` (caller passes a historical VersionId for download). A separate `file_versions` table that materializes every generation as its own row is a P3 candidate behind `cpt-cf-file-storage-fr-file-versioning` if/when version-aware enumeration is required.
 
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-file-storage-topology-p1`
 
-FileStorage ships as a single stateless ModKit module inside the monolith process. Each deployed instance binds to:
+**P1 — single monolith.** FileStorage ships as a single stateless ModKit module **inside the platform monolith process**, alongside every consuming module (chat backend, llm-gateway, antivirus, file-parser, …). Every consumer obtains its `FileStorageClient` handle through ClientHub and calls FileStorage **in-process**. **No HTTP/REST endpoint of FileStorage's own is published in P1** — the `cpt-cf-file-storage-component-rest-api` component is dormant. External traffic that needs to reach FileStorage in P1 goes through whichever application backend already lives in the monolith (e.g. chat backend), which forwards via the SDK.
+
+Each deployed monolith instance binds to:
 
 - **One SQL-compatible database owned by the FileStorage module**, hosting the shared `file_storage` schema. Every `s3-compatible` backend (per ADR-0001) writes into this single database. Rows are discriminated by `backend_id`.
 - **1..N `s3-compatible` backends**, each reaching an S3-class endpoint over HTTPS with its own credentials. The endpoint can be AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe (see `feature-testkit-and-local-storage-recipe`). Metadata rows live in the shared module database.
@@ -905,9 +937,11 @@ FileStorage ships as a single stateless ModKit module inside the monolith proces
 - Backends are scoped to tenants per `cpt-cf-file-storage-principle-modular-backend-roster`; all `backend_id` values are stable UUIDs assigned in the static TOML roster.
 - At least one backend per tenant view MUST hold `default_private = true`.
 
-There is no module-local mutable state beyond in-memory adapter handles and the SQL connection pool; horizontal scaling adds instances behind the platform load balancer without coordination. No additional external services are required in P1 beyond the SQL database and the configured backends. Metrics endpoints, health checks, and runtime backend configuration are deferred to P2.
+There is no module-local mutable state beyond in-memory adapter handles and the SQL connection pool; horizontal scaling adds monolith instances behind the platform load balancer without coordination. No additional external services are required in P1 beyond the SQL database and the configured backends. Metrics endpoints, health checks, and runtime backend configuration are deferred to P2.
 
-The future `FileShare` service (P3) will be deployed as a separate ModKit module — distinct database, distinct REST surface, distinct authz scope — and will consume FileStorage through the same `FileStorageClient` SDK that any other module uses.
+**P2 — split into separately deployable modules.** When the platform splits modules out of the monolith (chat backend, llm-gateway, … as standalone services), FileStorage publishes the REST API specified in [`openapi.yaml`](./openapi.yaml). The component model gains the `cpt-cf-file-storage-component-rest-api` axum-based handler tier; remote consumers reach FileStorage over HTTPS instead of in-process ClientHub. The SDK trait stays as the canonical operation vocabulary — the REST handlers are thin adapters over the same SDK methods.
+
+The future `FileShare` service (P3) will be deployed as a separate ModKit module — distinct database, distinct REST surface, distinct authz scope — and will consume FileStorage through the same `FileStorageClient` SDK (P1) or the REST API (P2) that any other module uses.
 
 ### 3.9 Concurrency & Race Conditions
 
@@ -923,10 +957,10 @@ The following invariants hold for every successful operation under arbitrary con
 |----|-----------|--------------|
 | **I1** | A reader who pins `etag = e` either receives bytes whose S3 ETag is `e`, or receives `EtagMismatch` / `NotFound`. There is no third outcome on content. | `etag` is the raw S3 ETag for the bytes (`cpt-cf-file-storage-constraint-etag-content-only`). Self-healing reconciles the brief `(content, etag)` desync window after an external PUT (per ADR-0004). |
 | **I2** | A content-mutating writer (re-upload + reconcile, or `PUT /meta` with strong CAS) either commits cleanly or fails fast with a deterministic outcome (`EtagMismatch` / `Conflict`). | `(etag, updated_at, version_id[, xmin])` race detection on every conditional UPDATE; backend-side `x-amz-copy-source-if-match` precondition on `PUT /meta`'s strong CAS. |
-| **I3** | Metadata-only patches without `If-Match` are best-effort last-write-wins (`cpt-cf-file-storage-constraint-no-meta-cas`). With `If-Match`, the strong CAS is enforced over both DB.etag and S3.etag (and S3.version_id on versioning-on backends). | `(etag, updated_at, version_id[, xmin])` filter on the DB UPDATE; HEAD-then-CopyObject with `x-amz-copy-source-if-match` for the strong-CAS path. |
+| **I3** | Metadata-only patches without `If-Match` are best-effort last-write-wins (`cpt-cf-file-storage-constraint-no-meta-cas`). With `If-Match`, the strong CAS is enforced over both DB.etag and S3.etag (and S3.version_id when S3 returns a `version_id`). | `(etag, updated_at, version_id[, xmin])` filter on the DB UPDATE; HEAD-then-CopyObject with `x-amz-copy-source-if-match` for the strong-CAS path. |
 | **I4** | Each `file_id` corresponds to a unique backend object key — `file_path` is derived deterministically from `file_id`, so two distinct files cannot collide on the logical address. Re-uploading bytes preserves `file_id` (variant B). | PRIMARY KEY on `id` plus the deterministic `file_path` derivation; no supersession-via-fresh-file_id flow exists. |
 | **I5** | An in-flight `read_file` stream never observes a partial commit. The reader's bytes correspond to the `(etag, file_id)` pair captured at stream open. | S3 `GetObject` snapshot semantics: a reader who started before a writer's commit sees a coherent view to the end of the stream. |
-| **I6** | A presigned download URL issued at `(file_id, etag = e)` either resolves to bytes whose S3 ETag matches `e` (or to a historical version when `version_id` was supplied), or eventually returns `NotFound` after the file is deleted and the orphan-delete grace period expires. Bare-HTTPS URLs from `download_public.v1`-capable backends have no expiry and continue resolving as long as the underlying object exists. | Presigned URLs are signed against the backend object key for a specific `file_id` at signing time. For in-place overwrites (variant-B re-upload) the URL keeps resolving to whatever bytes are at the key — `reconcile` rotates the row's etag to match. |
+| **I6** | A presigned download URL issued at `(file_id, etag = e)` either resolves to bytes whose S3 ETag matches `e` (or to a historical version when `version_id` was supplied), or eventually returns `NotFound` after the file is deleted and the orphan-delete grace period expires. Bare-HTTPS URLs from `download.s3.public.v1`-capable backends have no expiry and continue resolving as long as the underlying object exists. | Presigned URLs are signed against the backend object key for a specific `file_id` at signing time. For in-place overwrites (variant-B re-upload) the URL keeps resolving to whatever bytes are at the key — `reconcile` rotates the row's etag to match. |
 | **I7** | The system is deadlock-free under concurrent operations. No operation holds a database lock across an external (backend) call. | All SQL is single-statement conditional UPDATEs / DELETEs; no `SELECT … FOR UPDATE` is used on the hot path. The `PUT /meta` strong-CAS path issues HEAD and CopyObject between SELECT and UPDATE without holding a DB lock. |
 
 #### Concurrency primitives in one place
@@ -934,8 +968,8 @@ The following invariants hold for every successful operation under arbitrary con
 | Primitive | Where it lives | What it guarantees | Failure mode |
 |-----------|----------------|--------------------|--------------|
 | **Raw-S3-ETag content fingerprint** | `etag` column = raw S3 ETag (sans quotes) for the row's current bytes ([migration.sql](./migration.sql)). | Content writes rotate the etag (because the bytes change at S3). Metadata-only writes do NOT rotate the etag. | A rotated etag invalidates every concurrent caller's pinned token → next content-CAS by them returns `EtagMismatch`. |
-| **Race-detection conditional UPDATE** | Single statement targeting `file_storage.files` with WHERE on `id`, captured `etag`, captured `updated_at`, captured `version_id` (always — null-safe via `IS NOT DISTINCT FROM`), and optionally captured `xmin` on Postgres, plus the expected `status`. | Detects the row moving underneath us — including ABA on content via `version_id` rotation on versioning-on backends. `1` row affected = success; `0` rows = race detected. The coordinator may retry up to 3 times before surfacing `Conflict`. | `0` rows after 3 retries → `Conflict`. |
-| **Optional If-Match strong CAS** | `PUT /meta` and `DELETE` accept `If-Match`. On `PUT /meta` the strong CAS verifies DB.etag, S3.etag (HEAD), and S3.version_id (on versioning-on backends), then issues `CopyObject` with `x-amz-copy-source-if-match`. | Closes the ABA window on metadata patches by checking S3 truth, not just DB truth. | Mismatch at any checkpoint → `412 etag_mismatch`. |
+| **Race-detection conditional UPDATE** | Single statement targeting `file_storage.files` with WHERE on `id`, captured `etag`, captured `updated_at`, captured `version_id` (always — null-safe via `IS NOT DISTINCT FROM`), and optionally captured `xmin` on Postgres, plus the expected `status`. | Detects the row moving underneath us — including ABA on content via `version_id` rotation when S3 returns a `version_id`. `1` row affected = success; `0` rows = race detected. The coordinator may retry up to 3 times before surfacing `Conflict`. | `0` rows after 3 retries → `Conflict`. |
+| **Optional If-Match strong CAS** | `PUT /meta` and `DELETE` accept `If-Match`. On `PUT /meta` the strong CAS verifies DB.etag, S3.etag (HEAD), and S3.version_id (when S3 returns a `version_id`), then issues `CopyObject` with `x-amz-copy-source-if-match`. | Closes the ABA window on metadata patches by checking S3 truth, not just DB truth. | Mismatch at any checkpoint → `412 etag_mismatch`. |
 | **Status state machine** | `pending_upload → uploaded → deleting`. | A row engaged in one transition rejects another by status filter. | `0` rows affected → `InvalidStatusTransition`. |
 | **Backend atomic write** | S3 `PutObject` (publish-on-ack). | The new bytes become reachable only when the backend acknowledges the PUT. | Backend-specific; surfaces as `BackendFailure`. |
 | **GET-in-flight snapshot** | S3 `GetObject` snapshot semantics. | A reader who started before a writer's commit sees a coherent view to the end of the stream. | None — this is what makes "stream while overwriting" safe at all. |
@@ -956,7 +990,7 @@ Pure application-layer activity; FileStorage is not yet involved. No FileStorage
 | Two concurrent variant-B re-upload calls for the same `file_id`. | Both succeed; both URLs target the same backend object key with the row's current pinned headers. The row's `upload_expires_at` is `MAX`-merged so neither URL's window is shortened by the other. | Variant-B issues new SigV4-signed URLs against the same key; S3's last-write-wins behaviour resolves the eventual byte content. |
 | `create_presigned_url` with parameters that violate per-backend size or capability constraints. | Rejected before any row is inserted. | Pre-INSERT validation. |
 
-Concurrency contract returned to the caller: the `etag_pinned` value is FileStorage's commit-bookkeeping token for *this* `file_id`. The caller's subsequent `complete_upload(file_id, upload_id, parts)` does not require it as a parameter (commit captures the finalized etag from S3's `CompleteMultipartUpload` response); `etag_pinned` is returned for caller bookkeeping only. On variant-B re-upload, `etag_pinned` is the row's pre-overwrite content fingerprint — useful for race-loser detection.
+Concurrency contract returned to the caller: the `PresignedUploadHandle` carries `file_id`, `upload_id` (opaque, MUST be round-tripped through the caller — not persisted in FileStorage DB), and `part_urls[]`. The caller's subsequent `complete_upload(file_id, upload_id, parts)` is what captures the finalized etag and version_id from S3's `CompleteMultipartUpload` response; FileStorage never trusts the caller for the final etag.
 
 **Step 4 — FS persists the `pending_upload` row.**
 Single INSERT. No race; the row's `id` (UUID) is unique by construction (server-minted, per `cpt-cf-file-storage-constraint-server-minted-file-id`).
@@ -964,7 +998,7 @@ Single INSERT. No race; the row's `id` (UUID) is unique by construction (server-
 **Step 5–6 — Frontend receives the handle and PUTs bytes to the storage backend.**
 Bytes flow client ↔ S3 directly. For initial uploads, two concurrent PUTs for two distinct presigned URLs target two distinct backend keys (each derived from its own `file_id`) and never alias at the backend. For variant-B re-uploads to the same `file_id`, both PUTs target the same backend key with the same pinned headers — last-write-wins semantics at S3 resolves the bytes. A PUT past `expires_at` is rejected by the backend's signature check (S3 SigV4) — FileStorage does not need to enforce expiration on the data plane.
 
-A subtle case: the frontend retries the same PUT (network flake). Both PUTs target the same S3 key with the same SigV4 signature; S3's `PutObject` is idempotent on object key, and the second PUT either overwrites with identical bytes or arrives after the URL expires. Either way the resulting bytes match `etag_pinned` exactly (because the SigV4 signature pins the etag-affecting headers — see ADR-0003).
+A subtle case: the frontend retries the same part PUT (network flake). Both PUTs target the same backend key + part-number + SigV4 signature; S3's `UploadPart` is idempotent on `(key, upload_id, part_number)`, and the second PUT either overwrites with identical bytes or arrives after the URL expires. Either way the part's etag (returned from S3) is what the caller passes into `complete_upload` — FileStorage takes the etag from S3's `CompleteMultipartUpload` response, not from the part-PUT response, so even a misreporting client cannot poison the row.
 
 **Step 7 — Frontend reports the upload back to the chat backend.**
 Pure application HTTP; no FileStorage state.
@@ -1037,15 +1071,19 @@ Each operation is analysed below; the underlying primitives are the same. The SD
 | Concurrent `put_file_info` overwrites metadata between the caller's previous read and this call. | If `etag = Some(e_pinned)` is passed, comparison fails → `EtagMismatch`. With `etag = None`, the caller receives whatever was committed last. |
 | Concurrent `delete_file` removes the row. | `NotFound`. |
 
-##### `read_file(file_id, etag = Some(e_pinned))`
+##### `read_file(file_id, etag = Some(e_pinned), version_id = ?)`
 
-The read path is split into a synchronous "open" step (DB SELECT + authz + backend stream open) and an asynchronous "drain" step (chunks flow back to the caller). The reader resolves the backend object via `derive(file_id)` at the moment of the SELECT.
+The read path is split into a synchronous "open" step (DB SELECT + authz + backend stream open) and an asynchronous "drain" step (chunks flow back to the caller). The reader resolves the backend object via `derive(file_id)` at the moment of the SELECT. Both `etag` and `version_id` are optional, with two distinct roles:
+
+- `etag` is a CAS pin against the row's content fingerprint.
+- `version_id` is a **historical selector** on backends with S3 versioning enabled — when supplied, the backend `GetObject` embeds `versionId=<vid>` so the bytes streamed back correspond to that exact S3 generation. The returned `FileInfo` still reflects the row's CURRENT metadata (the DB tracks current generation only). Combined with `etag` it doubles as ABA-safe CAS. On backends without S3 versioning `Some(_)` is a null-safe mismatch against the row's `None` and surfaces `EtagMismatch` immediately.
 
 Open step:
 
 | Race | Outcome |
 |------|---------|
 | `etag` provided and the row's etag has moved. | `EtagMismatch` (no stream opened). |
+| `version_id` provided and the row's `version_id` differs (null-safe). | `EtagMismatch`. |
 | Row is `pending_upload`. | `NotFound`. Pending rows are not yet committed and are not part of the read surface. |
 | Row was deleted between the DB SELECT and the backend `open_read`. | The backend's `open_read` returns `NotFound` (object gone); the SDK forwards `NotFound`. No partial bytes leak. |
 
@@ -1058,7 +1096,7 @@ Drain step:
 
 The read path is therefore **stream-consistent end-to-end**: the caller's pinned etag matches the bytes they receive, with no "old etag, new bytes" or "new etag, partial bytes" intermediate state ever visible. This holds because the row publishes `etag` and the derived backend key as one atomic tuple under read-committed isolation, and `delete_file` queues the previous backend object for orphan-delete with a grace period ≥ `max_signed_url_ttl + safety_margin`.
 
-##### `put_file_info(file_id, update, etag?)` — DB+S3 atomic sync via CopyObject
+##### `put_file_info(file_id, update, etag?, version_id?)` — DB+S3 atomic sync via CopyObject
 
 The full algorithm:
 
@@ -1070,6 +1108,13 @@ The full algorithm:
    - HEAD S3 derive(file_id) → (s3_etag, s3_version_id)
    - S3 check: s3_etag == E1 → mismatch → 412
    - Versioning ON: s3_version_id == version_id_db → mismatch → 412
+   If client provided If-Match-VersionId (= V1):
+   - DB check: version_id_db IS NOT DISTINCT FROM V1 → mismatch → 412
+   - On backends with S3 versioning enabled, HEAD response above is reused:
+     s3_version_id == V1 → mismatch → 412
+   - On backends without S3 versioning V1 = Some(_) is a null-safe mismatch
+     against row's None → 412 immediately
+   Both pins compose; passing both gives ABA-safe CAS.
 3. Compute new_meta = merge(meta_db, body)
 4. Validate aggregate user-metadata size ≤ 2 KB → 413 payload_too_large if exceeded
    (Note: gts_file_type does NOT count toward this budget — not mirrored.)
@@ -1105,11 +1150,11 @@ Concurrent `put_file_info` without `If-Match`: best-effort last-write-wins (`cpt
 
 The `gts_file_type` field is structurally absent from `FileMetaUpdate`; any request body that carries it returns `400 bad_request`. There is no runtime field-validation needed — the type system catches it.
 
-##### `delete_file(file_id, etag?)` — 2-phase
+##### `delete_file(file_id, etag?, version_id?)` — 2-phase
 
-**Phase 1 — claim the row.** Conditional UPDATE: `UPDATE files SET status='deleting', updated_at=NOW() WHERE id=$file_id AND status='uploaded' [AND etag=$If-Match]`. With `If-Match`: `0` rows → `EtagMismatch` (HTTP 412) if etag mismatched, or `NotFound` if row absent. Without `If-Match`: `0` rows → `NotFound`. A row already in `deleting` returns `DeleteInProgress` (HTTP 409).
+**Phase 1 — claim the row.** Conditional UPDATE: `UPDATE files SET status='deleting', updated_at=NOW() WHERE id=$file_id AND status='uploaded' [AND etag=$If-Match] [AND version_id IS NOT DISTINCT FROM $If-Match-VersionId]`. With either pin supplied: `0` rows → `EtagMismatch` (HTTP 412) if pin mismatched, or `NotFound` if row absent. Without either pin: `0` rows → `NotFound`. Both pins compose. A row already in `deleting` returns `DeleteInProgress` (HTTP 409).
 
-**Phase 2 — backend cleanup.** Adapter `delete_object(derive(file_id))`. S3 `DeleteObject` is idempotent (versioning-on backends create a delete marker; non-versioning buckets remove the object). On transient failure (5xx, network): inline retry up to 3 attempts with exponential backoff (e.g. 100ms, 500ms, 2s). On persistent failure: leave the row in `deleting`, return `BackendFailure` (HTTP 502). Subsequent reads on the row return `NotFound` (the row is no longer accessible to callers); the P2 GC sweep retries.
+**Phase 2 — backend cleanup.** Adapter `delete_object(derive(file_id))`. S3 `DeleteObject` is idempotent (backends with S3 versioning enabled create a delete marker; non-versioning buckets remove the object). On transient failure (5xx, network): inline retry up to 3 attempts with exponential backoff (e.g. 100ms, 500ms, 2s). On persistent failure: leave the row in `deleting`, return `BackendFailure` (HTTP 502). Subsequent reads on the row return `NotFound` (the row is no longer accessible to callers); the P2 GC sweep retries.
 
 **Phase 3 — purge the row.** `DELETE FROM files WHERE id=$file_id AND status='deleting'` (no etag check — Phase 1 owns the row in `deleting`).
 
@@ -1124,7 +1169,7 @@ The `gts_file_type` field is structurally absent from `FileMetaUpdate`; any requ
 
 The signed URL is bound to the backend object key for this `file_id` at the moment of the SELECT-then-sign. The backend key is derived deterministically from `file_id`, so a URL signed for `file_id` resolves to whatever bytes are currently at that key. Variant-B re-uploads keep the same key (the bytes change, the URL still resolves). `delete_file` queues the key for orphan-delete with a grace period ≥ `max_signed_url_ttl + safety_margin`, so already-issued URLs remain resolvable for their TTL — invariant **I6**.
 
-For backends with `versioning = true`, callers passing `version_id` in the request item get a URL that resolves to that exact historical generation; this remains valid until the operator's S3 lifecycle expires the generation (independent of FileStorage).
+For backends with S3 versioning enabled, callers passing `version_id` in the request item get a URL that resolves to that exact historical generation; this remains valid until the operator's S3 lifecycle expires the generation (independent of FileStorage).
 
 | Race | Outcome |
 |------|---------|
@@ -1175,8 +1220,8 @@ For the lazy in-process trigger (`read_file`) the UPDATE runs without a `Securit
 | Trigger | When fires | Caller-visible result |
 |---------|------------|-----------------------|
 | `POST /files/{file_id}/upload/{upload_id}` (eager, REST) | Always — explicit reconciliation command. After HEAD, pulls all S3-mirrored fields except `gts_file_type` into the row. On `pending_upload` row: commits to `uploaded`. On `uploaded` row: drift correction. | `Ok(ReconcileResponse { info, s3_etag, s3_version_id })` on success; `DeleteInProgress` on `Deleting` row; `BackendFailure` on backend HEAD failure; `Conflict` after 3 unsuccessful retries; `BadRequest` if the request carried an `If-Match` header. |
-| `read_file(file_id, etag = Some(e_pinned))` (lazy, in-process) | After backend GET, when `s3_etag ≠ row.etag` | `Err(EtagMismatch{ current: s3_etag })` — the row is repaired before returning, so the caller's retry succeeds |
-| `read_file(file_id, etag = None)` (lazy, in-process) | Same condition | `Ok(FileReadHandle { info: refreshed, bytes: stream })` — transparent repair, caller sees no error |
+| `read_file(file_id, etag = Some(e_pinned), version_id = ?)` (lazy, in-process) | After backend GET, when `s3_etag ≠ row.etag` (or, with `version_id` pinned, `s3_version_id ≠ row.version_id`) | `Err(EtagMismatch{ current: s3_etag })` — the row is repaired before returning, so the caller's retry succeeds |
+| `read_file(file_id, etag = None, version_id = ?)` (lazy, in-process) | Same condition | `Ok(FileReadHandle { info: refreshed, bytes: stream })` — transparent repair, caller sees no error |
 | Optional P2 sweeper | Periodically over `pending_upload` rows whose `upload_expires_at + grace` elapsed | Emits `FileCommitted` event so downstream consumers (antivirus, LLM) wake up |
 
 ##### Concurrent `reconcile` is idempotent by construction
@@ -1213,17 +1258,10 @@ The P1 delivery intentionally leaves several concerns to later phases. This note
 
 **P2 (next phase) — capability and feature deltas vs. P1:**
 
-- **Multipart upload (`cpt-cf-file-storage-fr-multipart-upload`) — pre-decided P2 shape.** Explicit deviation from PRD's `p1` priority.
-  - **One new capability tag:** `upload.multipart_v1`. Storages declare it in their `capabilities` list; the SDK adds it to `KNOWN_CAPABILITIES`. No other multipart-related tags — `UploadPart` URLs are NOT separate capabilities, they are presigned in bulk under the umbrella of `create_multipart_v1`.
-  - **`POST /presign-batch` with `capability: "upload.multipart_v1"`:** the handler INSERTs a `PendingUpload` row, calls `CreateMultipartUpload` on the backend, captures the backend-supplied `upload_id`, and presigns N `UploadPart` PUT URLs in one round trip. Returns `PresignedMultipartHandle { file_id, upload_id, part_urls[], expires_at }`. The caller-supplied `part_count` (1..=10000) determines how many URLs are presigned — FileStorage does not pick part size and does not retroactively extend a session.
-  - **`POST /files/{file_id}/multipart/{upload_id}` (complete):** the handler calls `CompleteMultipartUpload` on the backend with the supplied `parts: [{part_number, etag}]`, captures the finalized object's etag and `version_id`, then flips `PendingUpload → Uploaded` in one transaction. **`reconcile` is never invoked on the multipart path** — the commit transaction lives entirely inside this handler. Returns `FileInfo`. A row already in `Uploaded` returns `409 conflict`; `Deleting` → `409 delete_in_progress`; missing → `404 not_found`. The `upload_id` path parameter MUST be URL-encoded (S3 `UploadId` may contain `+`, `/`, `=`).
-  - **`DELETE /files/{file_id}/multipart/{upload_id}` (abort):** the handler calls `AbortMultipartUpload` on the backend for the specified `upload_id` only. **The `PendingUpload` row is NOT deleted** — multiple concurrent multipart sessions may exist against the same `file_id` (retry of a stalled session, parallel client attempts), and aborting one session must not affect the others. To drop the file entirely after aborting, the caller MUST issue `DELETE /files/{file_id}` as a separate second step (the canonical "remove this file" surface); alternatively the row times out at `upload_expires_at` and the P2 GC sweep removes it. Best-effort backend abort: a backend `AbortMultipartUpload` failure leaves the row untouched and the bucket-level `AbortIncompleteMultipartUpload` lifecycle rule eventually reaps the orphan multipart session. A row in `Uploaded` is rejected with `409 conflict` — abort is not a "delete already-committed file" surface; `DELETE /files/{file_id}` is.
-  - **`upload_id` is NOT persisted by FileStorage** — neither in `file_storage.files`, nor in any companion table. The caller (application backend) keeps it for the duration of the multipart session. If the caller crashes / loses it, the row times out at `upload_expires_at` (P2 GC sweep removes it) and the bucket lifecycle rule reaps the orphan multipart on the backend side.
-  - **No `file_storage.file_uploads` / `file_storage.file_upload_parts` tables.** Earlier draft used them; this design removes them entirely because S3 already stores multipart session state and the caller carries `upload_id` between calls.
-  - **Operator runbook:** every backend declaring `upload.multipart_v1` MUST have an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket / endpoint (e.g. abort uploads older than 7 days). Without it, abandoned multipart sessions accumulate cost on the backend side because FileStorage cannot abort them itself (no persisted `upload_id`).
+- **REST API surface activation (`cpt-cf-file-storage-fr-rest-api`).** P1 ships only the in-process Rust SDK trait `FileStorageClient`; the REST endpoints in `openapi.yaml` (rooted at `/api/file-storage/v1/`) are published as a P1 design target but not exposed over the wire. P2 wires them up through axum + tower-http so that modules running outside the monolith process can call FileStorage over HTTPS. The SDK trait stays as the canonical operation vocabulary; the REST handlers are thin adapters.
 
-- **CopyObject ETag rotation on multipart files (theoretical limitation).** S3 multipart-uploaded files have ETags of the form `<hex>-<N>` (where `N` is part count); single-PUT files have `<hex>` of length 32. A `CopyObject` self-copy on a multipart-uploaded file rewrites the bytes as a single PUT (when source size ≤ 5 GB) and consequently rotates the ETag from `<hex>-<N>` format to `<hex>` format. This is a known behavioural quirk; FileStorage handles it transparently because reconcile always pulls the new ETag from the HEAD response.
-- **`upload.sigv4_cond_v1` capability tag (P2)** — opt-in per backend; pins `If-Match: "<etag>"` / `If-None-Match: "*"` into SigV4 SignedHeaders so the backend rejects stale upload PUTs at the wire. Requires a boot-time smoke-test to detect mis-declarations (notably GCS S3-compat silently ignores the headers). Hardening layer on top of `reconcile`-driven reconciliation; not a correctness primitive. Lands as a new entry in `KNOWN_CAPABILITIES` and a new branch in the adapter's signing match — no schema change.
+- **CopyObject ETag rotation on multipart files (theoretical limitation).** S3 multipart-uploaded files have ETags of the form `<hex>-<N>` (where `N` is part count); single-PUT files have `<hex>` of length 32. A `CopyObject` self-copy on a multipart-uploaded file rewrites the bytes as a single PUT (when source size ≤ 5 GB) and consequently rotates the ETag from `<hex>-<N>` format to `<hex>` format. This is a known behavioural quirk; FileStorage handles it transparently because the in-band recovery on the next SDK call always pulls the new ETag from S3.
+- **`upload.s3.multipart.sigv4_cond.v1` capability tag (P2)** — opt-in per backend; variant of `upload.s3.multipart.sigv4.v1` that pins `If-Match: "<etag>"` / `If-None-Match: "*"` into SigV4 SignedHeaders so the backend rejects stale upload PUTs at the wire. Requires a boot-time smoke-test to detect mis-declarations (notably GCS S3-compat silently ignores the headers). Hardening layer on top of `reconcile`-driven reconciliation; not a correctness primitive. Lands as a new entry in `KNOWN_CAPABILITIES` and a new branch in the adapter's signing match — no schema change.
 - **`GET /files` filters** — `backend_id`, `mime_type`, `gts_file_type`, `created_after`, `created_before` (currently P1 exposes only `owner_id`).
 - **`files_tenant_backend_owner_idx` index** — supports `list_files` within a specific backend filtered by owner; lands when `backend_id` filter does.
 - Policies (`cpt-cf-file-storage-fr-allowed-types-policy`, `cpt-cf-file-storage-fr-size-limits-policy`, `cpt-cf-file-storage-fr-sharing-restrictions`) — evaluated in the SDK facade before the coordinator is reached.

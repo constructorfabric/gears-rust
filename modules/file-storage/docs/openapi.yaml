@@ -3,11 +3,30 @@
 openapi: 3.1.0
 info:
   title: File Storage API
-  version: 5.0.0-p1
+  version: 5.0.0-p2-spec
   description: |
-    File Storage REST API — P1 surface. Mirrors the
-    `FileStorageClient` SDK trait 1:1 (see
-    [rust-traits.md](./rust-traits.md)).
+    > **⚠️ P2 contract — NOT exposed in P1.**
+    >
+    > This document specifies the REST surface FileStorage will
+    > publish in **P2**, when the platform splits into separately
+    > deployable modules. **In P1 there is no FileStorage-owned
+    > HTTP endpoint** — the only access interface is the in-process
+    > Rust SDK trait `FileStorageClient` (see
+    > [rust-traits.md](./rust-traits.md)). Every consumer (chat
+    > backend, llm-gateway, antivirus, file-parser, …) lives inside
+    > the same monolith process and calls FileStorage in-process via
+    > ModKit's ClientHub.
+    >
+    > This OpenAPI spec is published in P1 as the **design target**
+    > so that the SDK trait shape and the future REST shape stay
+    > aligned 1:1 — every endpoint here is a thin adapter over an
+    > existing SDK method, with the same `(file_id, etag,
+    > version_id)` pin model and the same error vocabulary.
+    > See `cpt-cf-file-storage-fr-rest-api` (P2) and
+    > `cpt-cf-file-storage-fr-rust-sdk` (P1) in the PRD.
+
+    File Storage REST API. Mirrors the `FileStorageClient` SDK
+    trait 1:1 (see [rust-traits.md](./rust-traits.md)).
 
     ## Lifecycle
 
@@ -19,7 +38,7 @@ info:
     in-band by the SDK on the next call against them.
 
     1. The application's own backend posts an upload item to
-       `POST /presign-batch` (`capability: "upload.multipart_v1"`,
+       `POST /presign-batch` (`capability: "upload.s3.multipart.sigv4.v1"`,
        optional `file_id` for re-upload, `part_count` ≥ 1) and gets
        back `(file_id, upload_id, part_urls[], expires_at)`. The
        FileStorage row is created (or reused for re-upload) in
@@ -39,7 +58,7 @@ info:
        response is the post-commit `FileInfo`.
 
     Re-uploading the same file uses the same `POST /presign-batch`
-    endpoint with `capability: "upload.multipart_v1"` and `file_id`
+    endpoint with `capability: "upload.s3.multipart.sigv4.v1"` and `file_id`
     set. The request item MUST NOT carry `meta` — the server pins
     the row's current metadata into the part URLs.
 
@@ -48,8 +67,15 @@ info:
     - `POST /presign-batch` (download item) — batch of presigned
       download URLs. All byte downloads flow client ↔ storage
       backend directly via presigned URLs (or, for files in
-      `download_public.v1`-capable backends, bare HTTPS URLs);
+      `download.s3.public.v1`-capable backends, bare HTTPS URLs);
       FileStorage never proxies content over its REST surface.
+      Clients may add a standard HTTP `Range: bytes=START-END`
+      header to the GET they issue against a presigned URL — the
+      backend serves a `206 Partial Content` response with the
+      requested diapason. Range is a constitutive S3 feature; the
+      presigned URL does not need to encode the range, and `Range`
+      is not part of the SignedHeaders set, so any client diapason
+      is accepted as long as the URL itself is valid.
 
     Mutations:
     - `PUT /files/{file_id}` — atomic DB + S3 metadata sync via a
@@ -82,28 +108,48 @@ info:
     Presigned PUT / GET URLs are signed by the backend (S3 SigV4)
     and validated by the backend; FileStorage does not authenticate
     the byte transfers themselves. Public-read URLs (issued under
-    the `download_public.v1` capability tag for backends that
+    the `download.s3.public.v1` capability tag for backends that
     declare it, typically paired with `default_public = true`) are
     bare HTTPS URLs with no signing or expiry.
 
     ## Conditional requests
 
-    - `PUT /files/{file_id}` — `If-Match` is **optional**; when
-      supplied it becomes a strong CAS over both DB and S3 (Phase 1
-      conditional UPDATE + Phase 2 HEAD with strong CAS).
-    - `DELETE /files/{file_id}` — `If-Match` is **optional**; when
-      supplied it gates Phase 1 of the 2-phase delete.
-    - `GET /files/{file_id}` — `If-None-Match` is supported and
-      yields `304 Not Modified` when the etag matches.
+    Two CAS-pin headers, both optional and composable:
+
+    - `If-Match: "<etag>"` — pin on the row's content fingerprint
+      (raw S3 ETag).
+    - `If-Match-VersionId: "<vid>"` — pin on the row's S3 VersionId
+      (custom FileStorage extension — not a standard HTTP header).
+      Closes the ABA window on bit-identical re-uploads where the
+      etag did not rotate. When S3 versioning is not enabled sending
+      `If-Match-VersionId: <vid>` is a null-safe mismatch against
+      the row's `null` and returns `412` immediately.
+
+    Per endpoint:
+
+    - `PUT /files/{file_id}` — both headers are **optional**; when
+      supplied, `If-Match` becomes a strong CAS over both DB and S3
+      (Phase 1 conditional UPDATE + Phase 2 HEAD with strong CAS).
+      `If-Match-VersionId` adds an independent CAS pin on `version_id`
+      (Phase 1 UPDATE + Phase 2 HEAD verification). Passing both
+      gives ABA-safe CAS.
+    - `DELETE /files/{file_id}` — both headers are **optional**;
+      when supplied, they gate Phase 1 of the 2-phase delete via
+      conditional UPDATE.
+    - `GET /files/{file_id}` — `If-None-Match` yields
+      `304 Not Modified` when the etag matches (caching). `If-Match`
+      and `If-Match-VersionId` act as CAS pins; mismatch returns
+      `412`.
     - `POST /files/{file_id}/upload/{upload_id}` — does NOT
-      take `If-Match`; the row's transient `Completing` state plus
-      Phase 1's conditional UPDATE on
+      take `If-Match` or `If-Match-VersionId`; the row's transient
+      `Completing` state plus Phase 1's conditional UPDATE on
       `(etag, updated_at, version_id[, xmin])` already guard against
       concurrent finalize. `version_id` participates always —
       null-safe via `IS NOT DISTINCT FROM`; `xmin` adds Postgres-only
       transaction-id race detection.
 
-    Mismatch on a supplied `If-Match` returns `412 etag_mismatch`.
+    Mismatch on a supplied `If-Match` or `If-Match-VersionId` returns
+    `412 etag_mismatch`.
 
     ## User-metadata budget
 
@@ -151,7 +197,7 @@ paths:
         Returns the roster filtered by the caller's tenant access
         list. At least one backend per tenant view is flagged
         `default_private = true`. Backends declaring the
-        `download_public.v1` capability tag and `default_public =
+        `download.s3.public.v1` capability tag and `default_public =
         true` are surfaced too.
       responses:
         '200':
@@ -166,6 +212,7 @@ paths:
                 properties:
                   items:
                     type: array
+                    maxItems: 500
                     items: { $ref: '#/components/schemas/Backend' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '500': { $ref: '#/components/responses/InternalError' }
@@ -224,10 +271,22 @@ paths:
         metadata view. The storage backend is **not** consulted —
         per ADR-0001 the SQL row is the source of truth for reads.
 
-        Optional `If-None-Match` allows the caller to skip the body
-        when the row's etag has not changed.
+        Conditional headers:
+
+        - `If-None-Match` — caching. Returns `304` when the etag
+          matches.
+        - `If-Match` — CAS pin. Returns `412 etag_mismatch` when
+          the row's current etag differs.
+        - `If-Match-VersionId` — CAS pin on the row's S3 VersionId
+          (custom FileStorage extension). Composes with `If-Match`;
+          passing both gives ABA-safe CAS even on bit-identical
+          re-uploads. Returns `412 etag_mismatch` on mismatch
+          (null-safe — `Some(v)` mismatch against `null` on
+          backends without S3 versioning).
       parameters:
         - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatchVersionIdOptional'
       responses:
         '200':
           description: File metadata.
@@ -245,6 +304,14 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '412':
+          description: |
+            `If-Match` or `If-Match-VersionId` precondition failed.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
         '500': { $ref: '#/components/responses/InternalError' }
 
     put:
@@ -299,7 +366,7 @@ paths:
            (`Content-Type` from `mime_type`, `Content-Disposition`
            from `name`, `x-amz-meta-<k>` for every entry in
            `custom_metadata`). The backend's response carries the
-           new ETag and (versioning-on backends only) the new
+           new ETag and (backends with S3 versioning enabled only) the new
            VersionId.
         3. **Phase 3.** Conditional UPDATE flips `MetaUpdating →
            Uploaded` AND writes the new
@@ -323,14 +390,21 @@ paths:
         **`If-Match` is OPTIONAL.** When supplied it becomes a
         strong CAS over both stores: Phase 1's UPDATE includes
         `etag = If-Match`, Phase 2 HEADs S3 to verify the live
-        `s3_etag` (and, on versioning-on backends, `s3_version_id`)
+        `s3_etag` (and, on backends with S3 versioning enabled, `s3_version_id`)
         match the row, then issues `CopyObject` with
         `x-amz-copy-source-if-match` set. Mismatch at any of the
         three checkpoints returns `412 etag_mismatch`. When omitted
         the call is best-effort last-write-wins on metadata
         (`cpt-cf-file-storage-constraint-no-meta-cas`).
+
+        **`If-Match-VersionId` is OPTIONAL** and acts as an
+        independent CAS pin on the row's current `version_id`.
+        Composes with `If-Match`: passing both gives ABA-safe CAS
+        even when the etag did not rotate (bit-identical
+        re-upload). Mismatch returns `412 etag_mismatch`.
       parameters:
         - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatchVersionIdOptional'
       requestBody:
         required: true
         content:
@@ -395,11 +469,14 @@ paths:
         1. **Phase 1 — claim the row.** Conditional UPDATE flips
            `status` from `uploaded` to the transient `deleting`.
            When `If-Match` is supplied, the predicate also requires
-           `etag = <If-Match>`; mismatch returns `412 etag_mismatch`.
-           Without `If-Match` the delete is best-effort
-           last-write-wins (still gated by `status = 'uploaded'`).
-           A row already in `deleting` returns
-           `409 delete_in_progress`.
+           `etag = <If-Match>`. When `If-Match-VersionId` is supplied,
+           the predicate additionally requires
+           `version_id IS NOT DISTINCT FROM <If-Match-VersionId>`
+           (null-safe). Mismatch on either pin returns
+           `412 etag_mismatch`. Without either header the delete is
+           best-effort last-write-wins (still gated by
+           `status = 'uploaded'`). A row already in `deleting`
+           returns `409 delete_in_progress`.
         2. **Phase 2 — backend cleanup.** FileStorage issues
            `DELETE` on the backend object (idempotent on S3) with
            up to 3 inline retries on transient failure. On
@@ -410,9 +487,12 @@ paths:
            = $file_id AND status = 'deleting'` (no etag check —
            the Phase 1 UPDATE owns the row).
 
-        `If-Match: "<etag>"` is **optional**.
+        `If-Match: "<etag>"` and `If-Match-VersionId: "<vid>"` are
+        both **optional** and compose; passing both gives ABA-safe
+        CAS even on bit-identical re-uploads.
       parameters:
         - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatchVersionIdOptional'
       responses:
         '204':
           description: File deleted.
@@ -454,7 +534,7 @@ paths:
         versioned `capability` tag:
 
         - `kind: "upload"`, no `file_id` — **initial upload.**
-          `capability` MUST be `"upload.multipart_v1"`. The handler
+          `capability` MUST be `"upload.s3.multipart.sigv4.v1"`. The handler
           INSERTs a `pending_upload` row, calls
           `CreateMultipartUpload` against the backend, presigns N
           `UploadPart` PUT URLs (one per part — caller-supplied
@@ -474,8 +554,8 @@ paths:
           TTL)` so multiple outstanding sessions do not shorten the
           window.
         - `kind: "download"` — issues a presigned GET URL (when
-          `capability = "download_private.sigv4_v1"`) or a bare-HTTPS
-          URL (when `capability = "download_public.v1"` and the
+          `capability = "download.s3.sigv4.v1"`) or a bare-HTTPS
+          URL (when `capability = "download.s3.public.v1"` and the
           target backend declares that tag, typically paired with
           `default_public = true`). The signed URL always carries
           `response-content-type` and `response-content-disposition`
@@ -483,7 +563,7 @@ paths:
           authorization, NotFound, and EtagMismatch errors surface
           inside the response array. Optional `version_id` requests
           a historical generation when the file's hosting backend
-          has `versioning = true`.
+          has S3 versioning enabled.
 
         Single-shot upload (single PUT) is **not** offered — every
         upload goes through the multipart lifecycle, so even a
@@ -664,7 +744,23 @@ components:
         proceeds only if the row's current etag matches; mismatch
         returns `412`. Strong CAS — for `PUT /files/{file_id}` it
         is also verified against S3's live etag (and version_id on
-        versioning-on backends).
+        backends with S3 versioning enabled).
+      schema: { type: string }
+    IfMatchVersionIdOptional:
+      name: If-Match-VersionId
+      in: header
+      required: false
+      description: |
+        Optional CAS pin on the row's S3 `VersionId` (custom
+        FileStorage extension — not a standard HTTP header). When
+        supplied, the operation proceeds only if the row's current
+        `version_id` matches; mismatch returns `412 etag_mismatch`
+        (the same error class as `If-Match` mismatch). Composes
+        with `If-Match`: passing both gives ABA-safe CAS even on
+        bit-identical re-uploads where the etag did not rotate
+        (per ADR-0005). When S3 versioning is not enabled, sending
+        `If-Match-VersionId: <vid>` is a null-safe mismatch against
+        the row's `null` and returns `412` immediately.
       schema: { type: string }
     IfNoneMatch:
       name: If-None-Match
@@ -707,7 +803,6 @@ components:
         - default_private
         - default_public
         - capabilities
-        - versioning
       properties:
         id:
           type: string
@@ -733,31 +828,66 @@ components:
           type: array
           items:
             type: string
-            pattern: '^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,19}$'
-            maxLength: 50
+            pattern: '^[a-z][a-z0-9_]+(\.[a-z][a-z0-9_]+){2,4}\.v\d+$'
+            maxLength: 80
           description: |
             Versioned capability tags declared by the backend in the
-            TOML roster. Each tag has the shape `<operation>.<version>`
-            (regex `^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,19}$`, version
-            segment ≤20 chars). The list is validated against the
-            SDK's `KNOWN_CAPABILITIES` whitelist at module init;
-            unknown tags fail-fast the boot.
+            TOML roster. Each tag has the shape
+            `<operation>.<protocol>.<algorithm>.<variant>?.v<n>`
+            (regex `^[a-z][a-z0-9_]+(\.[a-z][a-z0-9_]+){2,4}\.v\d+$`).
+            The leading segment is the SDK operation (`upload` /
+            `download`); the next is the protocol family (`s3`,
+            `gcs`, `azure`, …); the next is the signing/auth flavor
+            (`sigv4`, `sigv4a`, `sas_user`, `multipart`, `public` for
+            anonymous bare-HTTPS, …); the optional fourth descriptor
+            is a variant modifier (currently only `versioned`); the
+            trailing segment is the contract version. The list is
+            validated against the SDK's `KNOWN_CAPABILITIES` whitelist
+            at module init; unknown tags fail-fast the boot.
 
-            **P1 whitelist (3 tags):**
-            - `upload.multipart_v1` — server-mediated multipart upload
-              (the only upload path; even single-byte files go
-              through it as a one-part session). Handler runs
-              `CreateMultipartUpload` and presigns N `UploadPart`
-              URLs in one round trip. Companion REST endpoints:
-              `POST /files/{file_id}/upload/{upload_id}`
+            **P1 whitelist (5 tags) — these cover every supported
+            backend, including non-S3 endpoints reached through
+            S3-compat gateways (WebDAV, FTP, custom non-S3 clients):**
+            - `upload.s3.multipart.sigv4.v1` — server-mediated chunked
+              S3 multipart upload (`CreateMultipartUpload` +
+              `UploadPart` + `CompleteMultipartUpload`) signed with
+              SigV4. The only upload path; even single-byte files go
+              through it as a one-part session. Refers specifically to
+              the chunked S3 multipart-upload protocol, **not** to
+              `multipart/form-data` POST Policy uploads. Companion REST
+              endpoints: `POST /files/{file_id}/upload/{upload_id}`
               (commit) and
               `DELETE /files/{file_id}/upload/{upload_id}` (abort
               one session) close out the lifecycle.
-            - `download_private.sigv4_v1` — SigV4-signed GET for
-              time-limited private downloads.
-            - `download_public.v1` — bare-HTTPS public-read URL with
-              no signature and no expiry. Pairs with
-              `default_public`.
+            - `download.s3.sigv4.v1` — SigV4-signed GET for
+              time-limited private downloads. Rejects `version_id`
+              parameter on `presign-batch` items.
+            - `download.s3.sigv4.versioned.v1` — version-aware
+              SigV4-signed GET. Identical to `download.s3.sigv4.v1`
+              but accepts an optional `version_id` selector embedded
+              as `versionId=<vid>` in the signed URL. Declared on
+              backends fronting versioning-enabled S3 buckets.
+            - `download.s3.public.v1` — bare-HTTPS public-read URL
+              with no signature and no expiry (`public` in the
+              algorithm slot denotes the deliberate absence of a
+              signing algorithm). Pairs with `default_public`.
+              Rejects `version_id` parameter.
+            - `download.s3.public.versioned.v1` — version-aware
+              bare-HTTPS public-read URL
+              (`https://<host>/<key>?versionId=<vid>`, no signature).
+              Requires the bucket policy to grant
+              `s3:GetObjectVersion` to the anonymous principal in
+              addition to `s3:GetObject`.
+
+            No P2 or P3 additions to the whitelist are planned.
+            Cloud-native upload tags such as `upload.gcs.resumable.v1`
+            (GCS native resumable session) or
+            `upload.azure.blocks.sas_user.v1` (Azure Block Blob with
+            User-Delegation SAS) are illustrative examples of how the
+            whitelist would extend if a non-S3 adapter were ever
+            added — none are planned. They demonstrate that the naming
+            scheme is open-ended: tags can be appended at any time
+            without schema migration.
         max_file_size_bytes:
           type: [integer, 'null']
           format: int64
@@ -799,19 +929,16 @@ components:
             Operators can lower this for tenancy / security reasons;
             raising it above the AWS hard cap has no effect because
             S3 itself rejects signatures requesting longer expiries.
-            Applied to every signing path; `download_public.v1` is
+            Applied to every signing path; `download.s3.public.v1` is
             unaffected because public URLs carry no expiry. The
             caller's `UrlParams.expires_in_seconds` is capped by
             this value — exceeding it is a `bad_request`.
-        versioning:
-          type: boolean
-          description: |
-            Mirrors the underlying bucket's versioning
-            configuration. When `true`, FileStorage tracks the
-            S3 VersionId per row and exposes ABA-safe content CAS
-            on `PUT /meta` (see ADR-0005). Operator-declared in
-            TOML — FileStorage trusts the value and does NOT probe
-            `GetBucketVersioning` at boot.
+    # Versioning support is declared per-backend through the
+    # `*.versioned.*` capability tags (see `capabilities` above) —
+    # there is no separate `versioning` field. The DB `version_id`
+    # column is populated from S3 response headers as-is; the
+    # null-safe race-detection predicate works in both modes
+    # automatically (see ADR-0005).
 
     # ── Owner ────────────────────────────────────────────────────
 
@@ -851,7 +978,6 @@ components:
             afterwards. Stored in DB only — NEVER mirrored to the
             S3 object.
           readOnly: true
-        size_bytes: { type: [integer, 'null'], format: int64, minimum: 0 }
         custom_metadata: { $ref: '#/components/schemas/CustomMetadata' }
 
     FileMetaUpdate:
@@ -939,7 +1065,7 @@ components:
           type: [string, 'null']
           description: |
             Raw S3 VersionId for the current generation. `null` on
-            backends with `versioning = false`.
+            backends with no S3 versioning.
         size_bytes: { type: integer, format: int64, minimum: 0 }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -999,7 +1125,7 @@ components:
       required: [kind, capability, part_count, params]
       description: |
         Upload presign item. The single canonical upload path is
-        multipart (`capability = "upload.multipart_v1"`); single-byte
+        multipart (`capability = "upload.s3.multipart.sigv4.v1"`); single-byte
         files go through it as a one-part session. Two modes
         discriminated by presence of `file_id`:
 
@@ -1022,11 +1148,11 @@ components:
         kind: { type: string, enum: [upload] }
         capability:
           type: string
-          pattern: '^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,19}$'
-          maxLength: 50
+          pattern: '^[a-z][a-z0-9_]+(\.[a-z][a-z0-9_]+){2,4}\.v\d+$'
+          maxLength: 80
           description: |
             Versioned signing tag. The only valid value is
-            `"upload.multipart_v1"`.
+            `"upload.s3.multipart.sigv4.v1"`.
         part_count:
           type: integer
           minimum: 1
@@ -1074,6 +1200,28 @@ components:
             Required on initial upload. **Forbidden** on re-upload
             — the server uses the row's current metadata.
         params: { $ref: '#/components/schemas/UrlParams' }
+        etag:
+          type: [string, 'null']
+          description: |
+            Optional CAS pin for variant-B re-upload (only meaningful
+            when `file_id` is present). When `Some`, the server
+            verifies the row's current `etag` matches before flipping
+            the row to `Completing` and issuing
+            `CreateMultipartUpload`. Mismatch returns per-item
+            `etag_mismatch`. Ignored on initial upload.
+        version_id:
+          type: [string, 'null']
+          description: |
+            Optional CAS pin for variant-B re-upload (only meaningful
+            when `file_id` is present and the hosting backend has
+            S3 versioning enabled). When `Some`, the server verifies
+            the row's current `version_id` matches before flipping
+            the row to `Completing` — closes the ABA window even on
+            bit-identical re-uploads where the etag did not rotate.
+            When S3 versioning is not enabled, `version_id = Some(_)`
+            is a null-safe mismatch against the row's `null` and
+            returns `etag_mismatch` immediately. Ignored on initial
+            upload.
 
     PresignDownloadItem:
       type: object
@@ -1082,14 +1230,21 @@ components:
         kind: { type: string, enum: [download] }
         capability:
           type: string
-          pattern: '^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,19}$'
-          maxLength: 50
+          pattern: '^[a-z][a-z0-9_]+(\.[a-z][a-z0-9_]+){2,4}\.v\d+$'
+          maxLength: 80
           description: |
-            Versioned signing tag. P1: `download_private.sigv4_v1`
-            (SigV4-signed, time-limited) or `download_public.v1`
-            (bare-HTTPS, no expiry). Server validates against the
-            target backend's declared `capabilities`; mismatch →
-            per-item `capability_unavailable`.
+            Versioned signing tag. P1 download tags:
+            `download.s3.sigv4.v1` (SigV4-signed, time-limited;
+            current version only), `download.s3.sigv4.versioned.v1`
+            (SigV4-signed, version-aware — accepts `version_id`),
+            `download.s3.public.v1` (bare-HTTPS, no expiry;
+            current version only), `download.s3.public.versioned.v1`
+            (bare-HTTPS, version-aware — accepts `version_id`,
+            requires bucket policy to grant `s3:GetObjectVersion` to
+            anonymous). Server validates against the target backend's
+            declared `capabilities`; mismatch →
+            per-item `capability_unavailable`. Passing `version_id`
+            with a non-`versioned` tag is `bad_request`.
         file_id: { type: string, format: uuid }
         params: { $ref: '#/components/schemas/UrlParams' }
         etag:
@@ -1103,10 +1258,10 @@ components:
           type: [string, 'null']
           description: |
             Historical version selector. Honoured only when the
-            file's hosting backend has `versioning = true`; the
+            file's hosting backend has S3 versioning enabled; the
             signed URL embeds `versionId=<vid>` so the caller
             fetches that exact generation. Ignored on
-            non-versioning backends.
+            backends without S3 versioning.
 
     PresignBatchResponse:
       type: object
@@ -1118,11 +1273,12 @@ components:
 
     PresignOutcome:
       type: object
-      required: [kind]
+      required: [kind, ok, error]
       description: |
-        Per-item outcome. Either `ok` is set (with the
-        capability-specific result) or `error` is set (RFC 7807
-        problem details).
+        Per-item outcome. Exactly one of `ok` and `error` is non-null:
+        success → `ok` carries the capability-specific result and
+        `error` is `null`; failure → `error` carries an RFC 7807
+        problem document and `ok` is `null`.
       properties:
         kind: { type: string, enum: [upload, download] }
         ok:
@@ -1140,8 +1296,10 @@ components:
       required: [file_id, upload_id, part_urls, expires_at]
       description: |
         Outcome of a presign-batch item with
-        `capability = "upload.multipart_v1"` — the only upload
-        presign path. The server has already executed
+        `capability = "upload.s3.multipart.sigv4.v1"` — the only upload
+        presign path implemented in P1 (alternative upload tags such
+        as `upload.gcs.resumable.v1` or `upload.azure.blocks.sas_user.v1`
+        are reserved by the naming scheme but not implemented). The server has already executed
         `CreateMultipartUpload` against the backend; `upload_id`
         is **not** persisted by FileStorage — the caller MUST keep
         it for the subsequent commit
@@ -1282,8 +1440,9 @@ components:
           schema: { $ref: '#/components/schemas/ProblemDetails' }
     EtagMismatch:
       description: |
-        The `If-Match` etag did not match the row's current etag
-        (or, for `PUT /meta` with strong CAS, S3's live etag /
+        The `If-Match` (or `If-Match-VersionId`) precondition did not
+        match the row's current etag / version_id (or, for
+        `PUT /files/{file_id}` with strong CAS, S3's live etag /
         version_id).
       headers:
         ETag: { $ref: '#/components/headers/ETag' }

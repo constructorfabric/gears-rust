@@ -63,10 +63,18 @@ download, metadata management, access control, and sharing capabilities for any 
 
 The service supports pluggable S3-protocol storage backends (any S3-class endpoint, plus the `s3s-fs` recipe for
 local-disk deployments), tenant-scoped access control with an ownership model, and policy-driven governance for
-file types, sizes, and sharing. Access is via FileStorage's REST API plus client-direct PUT/GET against the storage
-backend over presigned URLs. Native non-S3 transports (WebDAV, FTP, SMB, NFS, raw POSIX) are out-of-scope for
-FileStorage at the architecture level — gateway clients for those protocols, if anyone needs them, are written as
-independent modules that consume FileStorage as ordinary REST + presigned-URL clients.
+file types, sizes, and sharing.
+
+**Access interface — phasing.** In **P1** the sole access interface is the in-process Rust SDK
+(`FileStorageClient`), consumed by every other module in the same monolith via ModKit's ClientHub. The
+`presigned-URL` data plane (client-direct PUT/GET against the S3 backend) is fully part of P1 — only the
+FileStorage-owned REST surface is deferred. **P2** adds the REST API
+(`cpt-cf-file-storage-fr-rest-api`, specified in [`openapi.yaml`](./openapi.yaml)) when the platform splits into
+separately deployable modules; the REST surface mirrors the SDK trait 1:1.
+
+Native non-S3 transports (WebDAV, FTP, SMB, NFS, raw POSIX) are out-of-scope for FileStorage at the architecture
+level — gateway clients for those protocols, if anyone needs them, are written as independent modules that
+consume FileStorage through the SDK (or the future REST API in P2) plus presigned URLs.
 
 ### 1.2 Background / Problem Statement
 
@@ -79,8 +87,8 @@ payloads (bloating requests and hitting size limits), provider-generated URLs ex
 links, and there is no unified access control or policy enforcement across the platform.
 
 FileStorage solves this by providing a centralized, tenant-aware storage service with persistent URLs, pluggable
-S3-protocol backends, and a uniform REST + presigned-URL access pattern within the CyberFabric security and
-governance model.
+S3-protocol backends, and a uniform SDK + presigned-URL access pattern (REST in P2) within the CyberFabric security
+and governance model.
 
 ### 1.3 Goals (Business Outcomes)
 
@@ -164,12 +172,12 @@ roles) from the platform authentication middleware.
 - Audit trail for all write operations and optional read audit logging
 - Policies (file types, size limits, events, sharing restrictions) at tenant and user levels
 - Pluggable S3-protocol storage backend abstraction
-- Multipart (chunked) upload for large files (optional per backend)
+- Multipart (chunked) upload — the only upload data path implemented in P1; single-byte uploads use a one-part session. Every upload-capable backend MUST declare at least one `upload.*` capability tag from the SDK whitelist. In P1 the only such implemented tag is `upload.s3.multipart.sigv4.v1`, which is the recommended choice for AWS S3, MinIO, Ceph, GCS S3-compat, and any non-S3 backend (WebDAV / FTP / custom) reached through an S3-compat gateway. Alternative upload protocols — for example `upload.gcs.resumable.v1` (GCS native resumable session) or `upload.azure.blocks.sas_user.v1` (Azure Block Blob with User-Delegation SAS) — are valid in the naming scheme and may be appended to `KNOWN_CAPABILITIES` at any time without schema migration; none are implemented in P1, P2, or P3.
 - Content-type validation against actual file content
 - Direct-to-backend upload via presigned URLs (the only upload data plane)
 - Garbage collection for unconfirmed direct uploads
 - File retention and lifecycle management
-- REST API access interface
+- In-process Rust SDK access interface (P1) and REST API (P2 — see `cpt-cf-file-storage-fr-rest-api`)
 - Streaming and range requests
 - Runtime tenant-configurable storage backends
 - Storage quota enforcement via Quota Enforcement service
@@ -207,10 +215,19 @@ replication.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-download-file`
 
-The system **MUST** retrieve file content and metadata by URL for consumption by requesting actors.
+The system **MUST** retrieve file content and metadata by URL for consumption by requesting actors. The system
+**MUST** support partial reads via HTTP byte-range semantics: in-process consumers via the `read_file` SDK method
+that accepts an optional `range` parameter (`Inclusive { start, end }` / `From(start)` / `Suffix(n)`),
+external consumers via standard `Range: bytes=...` header on the GET issued against a presigned download URL.
+Range support is constitutive on every S3-compatible backend (no capability tag) and does NOT change the row's
+metadata semantics: `etag`, `version_id`, and `size_bytes` reflect the FULL object regardless of range; the
+served diapason and full object size are surfaced separately via `FileReadHandle.range` on SDK reads or via
+the backend's `Content-Range` header on direct GETs.
 
 **Rationale**: All platform modules and users need to retrieve stored files — modules fetch media and documents, users
-download files directly.
+download files directly. Range support enables video/audio streaming with seek, parallel multi-range downloads,
+resumable downloads after network interruption, and footer-only inspection of large files (Parquet / ZIP central
+directory / MP4 moov-atom) without buffering the whole object.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Delete File
@@ -275,9 +292,9 @@ allows arbitrarily small parts on the final part). A multipart upload **MUST**:
 - Apply the same authorization, metadata, and audit requirements regardless of part count
 
 **Multipart shape (server-mediated, presign-bundled).** Multipart is the canonical upload mode and lives behind the
-`upload.multipart_v1` capability tag (mandatory for any upload-capable backend). Lifecycle:
+`upload.s3.multipart.sigv4.v1` capability tag (mandatory for any upload-capable backend). Lifecycle:
 
-- `POST /presign-batch` with `capability: "upload.multipart_v1"` and `part_count: N` → server INSERTs (or reuses
+- `POST /presign-batch` with `capability: "upload.s3.multipart.sigv4.v1"` and `part_count: N` → server INSERTs (or reuses
   for re-upload) a `PendingUpload` row, calls `CreateMultipartUpload` on the backend, captures the backend's
   `upload_id`, presigns N `UploadPart` URLs, returns `PresignedUploadHandle { file_id, upload_id, part_urls[],
   expires_at }`.
@@ -297,36 +314,42 @@ the complete/abort REST endpoints. Lost `upload_id`s are reaped by the bucket-le
 
 **Rationale**: Single-request uploads are impractical for large files (video, datasets, backups) due to timeouts,
 memory constraints, and network reliability. Multipart enables reliable transfer of arbitrarily large files.
-Deferred to P2 because the design requires two new REST endpoints (`complete` / `abort`), a new outcome shape
-(`PresignedMultipartHandle`), and three additional adapter methods — complexity intentionally out of scope
-for P1. Backends that do not natively support multipart simply do not advertise the capability tag; clients
-adapt to per-backend availability.  
+
+**Phasing.** The SDK methods (`create_presigned_upload` / `complete_upload` / `abort_upload`) and the 3-phase commit
+inside `complete_upload` ship in **P1**. The companion REST endpoints
+(`POST /files/{file_id}/upload/{upload_id}`, `DELETE /files/{file_id}/upload/{upload_id}`) ship in **P2**, because
+the FileStorage-owned REST surface itself is P2 (`cpt-cf-file-storage-fr-rest-api`). Multipart is the **only**
+upload path in P1 — there is no non-multipart fallback; backends that cannot declare `upload.s3.multipart.sigv4.v1` cannot
+serve uploads.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Content-Type Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-content-type-validation`
+- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-content-type-validation`
 
-The system **MUST** validate the declared mime_type against the actual file content (magic bytes / file signature) on
-proxied uploads (where file content passes through FileStorage). If the declared type does not match the detected type,
-the system **MUST** reject the upload with an error indicating the mismatch.
+**Not delivered in P1.** Every upload in P1 is presign-multipart-only (`cpt-cf-file-storage-fr-multipart-upload`) —
+the application backend gets a presigned PUT URL per part and the end-client uploads bytes directly to the S3
+endpoint. FileStorage never sees file bytes, so it cannot inspect magic bytes against the declared `mime_type`.
+SigV4 SignedHeaders pin the declared `Content-Type` into the upload URL (any deviation invalidates the signature),
+which prevents the client from declaring one type and getting S3 to label the object with another, but does NOT
+prevent the client from uploading bytes whose actual content disagrees with the declared type.
 
-For proxied multipart uploads (`cpt-cf-file-storage-fr-multipart-upload`, P2), the system **MUST** validate the
-declared mime_type against the content of the **first uploaded part**, which contains the file's magic bytes / file
-signature. Validation **MUST** occur when the first part is received — before subsequent parts are accepted. If the
-detected type does not match the declared mime_type, the system **MUST** abort the multipart upload
-(`abortMultipartUpload`) and reject all subsequent parts. This requirement lands with P2 when multipart ships.
+In P2, when proxied uploads are added (a hypothetical bytes-through-FileStorage REST path for tenants that prefer to
+trade efficiency for content inspection — currently NOT on the P2 roadmap and may stay deferred indefinitely), the
+system **MUST** validate the declared mime_type against the actual file content (magic bytes / file signature). For
+proxied multipart uploads, validation **MUST** happen on the first received part (which contains the file's magic
+bytes); on mismatch the system **MUST** call `AbortMultipartUpload` and reject subsequent parts. Backends that
+support multipart upload enforce a minimum part size (e.g. 5 MiB on AWS S3) that far exceeds the longest
+magic-byte sequence (~12 bytes), so first-part validation is sufficient.
 
-Content-type validation does not apply to direct uploads (single-part or multipart) via presigned URLs because
+Content-type validation does not apply to direct uploads via presigned URLs (the only upload path in P1) because
 FileStorage does not receive the file content in that flow.
 
 **Rationale**: Without content inspection, a client can declare `image/png` but upload an executable, trivially
-bypassing file type policies. Content-type validation ensures declared types are trustworthy for downstream consumers
-and policy enforcement. First-part validation for multipart uploads provides the same level of guarantee as single-part
-validation — magic bytes reside at the start of the file and are always contained in the first part because backends
-that support multipart upload (`cpt-cf-file-storage-fr-backend-capabilities`) enforce a minimum part size (e.g., 5 MB
-for S3) that far exceeds the longest magic-byte sequence (~12 bytes). Backends without native multipart support reject
-multipart uploads entirely, so no fallback is needed. Post-assembly re-validation would require downloading the
+bypassing file type policies — but doing the inspection requires routing bytes through FileStorage, which doubles
+bandwidth and breaks the presign-first principle. Tenants who need content inspection today layer it as a P3
+post-upload scanner (antivirus / file-parser) that calls `read_file` and writes a verdict via `put_file_info`'s
+custom_metadata. Post-assembly re-validation server-side would require downloading the assembled file from the
 assembled file from the backend, negating the efficiency benefits of multipart upload. Direct uploads trade server-side
 content validation for transfer efficiency — consumers relying on strict type guarantees should use proxied uploads.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
@@ -547,16 +570,24 @@ URLs, and Azure SAS tokens — where the service with backend credentials signs 
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-gc-direct-uploads`
 
-The system **MUST** automatically detect and remove orphaned records from direct uploads that were never completed.
-An unconfirmed or incomplete upload **MUST** become eligible for garbage collection after the expiration of the
-pre-signed URL plus a configurable grace period. After the eligibility window has passed, the system **MUST** reconcile
-file metadata records against actual backend object existence — remove records with no corresponding backend object,
-and confirm records whose corresponding backend object exists but was never acknowledged.
+The system **MUST** track, on every `pending_upload` row, an `upload_expires_at` deadline derived from the presigned
+URL TTL plus a configurable grace period (P1 deliverable: column populated at `create_presigned_upload` and
+queryable). After the eligibility window has passed, the system **MUST** be able to reconcile file metadata records
+against actual backend object existence — remove records with no corresponding backend object, and confirm records
+whose corresponding backend object exists but was never acknowledged.
+
+**Phasing of the sweep tooling.** The metadata side of garbage collection (the `upload_expires_at` column, the
+status state machine that transitions through `pending_upload → completing → uploaded`, and the in-band recovery on
+the next SDK call against a stuck row) ships in **P1**. The **operational sweep itself** — a scheduled console
+command that walks rows past their deadline, HEADs the backend, and resolves them — ships in **P2**. Rationale:
+in-band recovery on the next SDK call already handles every row that any consumer ever touches; the P2 sweep is the
+safety net for rows that no consumer ever reads (e.g. user closed the tab and the chat backend forgot the
+`file_id`). Both layers reference the same `upload_expires_at` column.
 
 **Rationale**: Since metadata is registered before the presigned URL is issued, failed or abandoned uploads leave
 metadata records pointing to non-existent backend objects. The presigned URL expiration bounds the upload window but
-does not guarantee upload outcome, so garbage collection prevents stale metadata accumulation and
-ensures consistency between FileStorage records and backend state.
+does not guarantee upload outcome, so garbage collection prevents stale metadata accumulation and ensures
+consistency between FileStorage records and backend state.
 **Actors**: `cpt-cf-file-storage-actor-cf-modules`
 
 ### 5.5 Policies (Phase 2)
@@ -846,7 +877,12 @@ The system **MUST** abstract the storage layer behind a common S3-protocol inter
 AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, and `s3s-fs` (for local-disk deployments) — every backend speaks S3
 and respects presigned URLs. Native non-S3 transports (POSIX, WebDAV, FTP, SMB, NFS, Azure Blob native) are
 out-of-scope for FileStorage at the architecture level — gateway clients for those protocols, if needed, are
-implemented as independent modules consuming FileStorage as ordinary REST + presigned-URL clients.
+implemented as independent modules consuming FileStorage through the SDK (P1) or REST API (P2) plus presigned URLs.
+
+The "abstraction" lives at the **protocol** level (every endpoint speaks S3 over HTTPS), not at the **trait** level
+inside the FileStorage codebase: there is one concrete adapter (`pub(crate) struct S3Backend`) and no
+`StorageBackend: Send + Sync` trait — adding a trait without a second implementation would be boilerplate without
+abstraction value.
 
 **Rationale**: A single S3-protocol substrate gives one code path, one capability surface, and one mental model for
 every backend. Local-disk deployments are handled by the `s3s-fs` recipe at the infrastructure layer rather than by
@@ -859,28 +895,47 @@ branching.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-capabilities`
 
 The system **MUST** define a versioned capability model for storage backends. Each backend **MUST** declare a list
-of versioned capability **tags** of the form `<operation>.<version>` (e.g. `upload.multipart_v1`,
-`download_private.sigv4_v1`, `download_public.v1`). Each tag binds one (operation,
-signing-strategy, version) tuple. A new signing strategy or vendor-specific variant lands as a new tag string —
-no enum migration, no breaking schema change.
+of versioned capability **tags** of the form `<operation>.<descriptor>+.v<n>` (e.g. `upload.s3.multipart.sigv4.v1`,
+`download.s3.sigv4.v1`, `download.s3.public.v1`). The leading segment is the SDK operation (`upload` /
+`download`); intermediate segments name the protocol family, optional protocol variant, and signing algorithm;
+the trailing segment is the contract version. A new signing strategy or vendor-specific variant lands as a new
+tag string — no enum migration, no breaking schema change.
 
 **Boot-time validation is constitutive.** The SDK ships with a compile-time whitelist of known capability tags.
 At module init the system **MUST** validate every declared tag against this whitelist; any unknown tag **MUST**
 fail-fast initialization with a clear error. Runtime code never has to handle "unknown tag" — the impossibility
 is enforced at boot.
 
-P1 system MUST support these tags:
+P1 system MUST support these tags. They are the **only** tags shipped in P1 and cover every supported backend,
+including non-S3 endpoints reached through S3-compat gateways (WebDAV, FTP, custom non-S3 clients):
 
-- `upload.multipart_v1` — server-mediated multipart upload (the only upload path — see
-  `cpt-cf-file-storage-fr-multipart-upload`; mandatory for any upload-capable backend).
-- `download_private.sigv4_v1` — SigV4-signed GET for time-limited private downloads (TTL + optional CIDR
-  allowlist).
-- `download_public.v1` — bare-HTTPS public-read URL with no signature and no expiry; pairs with the per-backend
-  `default_public` flag.
+- `upload.s3.multipart.sigv4.v1` — server-mediated chunked S3 multipart upload (`CreateMultipartUpload` +
+  `UploadPart` + `CompleteMultipartUpload`) signed with SigV4. The only upload path — see
+  `cpt-cf-file-storage-fr-multipart-upload`; mandatory for any upload-capable backend. Refers specifically to
+  the chunked S3 multipart-upload protocol, **not** to `multipart/form-data` POST Policy uploads.
+- `download.s3.sigv4.v1` — SigV4-signed GET for time-limited private downloads (TTL + optional CIDR
+  allowlist). Rejects `version_id` parameter on `presign_urls` items.
+- `download.s3.sigv4.versioned.v1` — version-aware SigV4-signed GET. Identical to `download.s3.sigv4.v1` but
+  accepts an optional `version_id` selector; embeds `versionId=<vid>` into the signed URL. Declared on
+  backends fronting versioning-enabled S3 buckets that wish to expose history to consumers.
+- `download.s3.public.v1` — bare-HTTPS public-read URL with no signature and no expiry (`public` in the
+  algorithm slot denotes the deliberate absence of a signing algorithm); pairs with the per-backend
+  `default_public` flag. Rejects `version_id` parameter.
+- `download.s3.public.versioned.v1` — version-aware bare-HTTPS public-read URL
+  (`https://<host>/<key>?versionId=<vid>`, no signature). Requires the bucket policy to grant
+  `s3:GetObjectVersion` to the anonymous principal in addition to `s3:GetObject` — without it, anonymous
+  requests with `?versionId=` return 403.
 
-Other capabilities described in this PRD (file versioning, server-side encryption) are tracked through their own
-FRs and may land as additional tags or as out-of-band features (e.g. `versioning` is a per-backend flag in TOML,
-not a capability tag).
+No P2 or P3 additions to the whitelist are planned. Cloud-native upload protocols such as
+`upload.gcs.resumable.v1` (GCS native resumable session) or `upload.azure.blocks.sas_user.v1` (Azure Block Blob
+with User-Delegation SAS) are illustrative examples of how the whitelist would extend if a non-S3 adapter were
+ever added — none are planned for any phase. They demonstrate that the naming scheme is open-ended:
+`KNOWN_CAPABILITIES` can grow at any time by appending the new tag and adding the corresponding adapter branch,
+schema-compatible, no migration.
+
+Other capabilities described in this PRD (P3 file versioning, server-side encryption) are tracked through their own
+FRs and may land as additional tags. Bucket-level S3 versioning is exposed in P1 through the `*.versioned.*` capability
+tag variants (`download.s3.sigv4.versioned.v1`, `download.s3.public.versioned.v1`) — there is no separate boolean flag.
 
 Each declared capability **MUST** be independently configurable as enabled or disabled per backend. A capability that is
 A capability that is supported by the backend but not declared in TOML **MUST** behave identically to an
@@ -895,7 +950,7 @@ Capability declarations **MUST** be part of the backend configuration — not in
 capability-tag model lets FileStorage extend without breaking existing clients (new tag strings, no enum
 migration), lets consumers explicitly negotiate per-call (no implicit downgrade), and pushes correctness to
 boot time (unknown tag fails the boot, never runtime). Per-backend tag declarations allow administrators to
-disable features for security or operational reasons — e.g., omitting `download_public.v1` on a sensitive
+disable features for security or operational reasons — e.g., omitting `download.s3.public.v1` on a sensitive
 backend to force all reads through SigV4-signed URLs.
 **Actors**: `cpt-cf-file-storage-actor-cf-modules`
 
@@ -912,13 +967,41 @@ or geographic requirements.
 
 ### 5.10 Access Interfaces
 
-#### REST API
+#### In-Process Rust SDK (P1)
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-rest-api`
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-rust-sdk`
 
-The system **MUST** expose a REST API for all file operations (upload, download, delete, metadata, link management).
+In P1 the **only** access interface to FileStorage is the in-process Rust SDK trait `FileStorageClient`
+(see `rust-traits.md`). All consuming modules — chat backend, llm-gateway, antivirus, file-parser,
+all UI/REST adapters — run inside the same monolith process and obtain the SDK handle through ModKit's
+ClientHub. There is no FileStorage-owned HTTP/REST endpoint shipped in P1.
 
-**Rationale**: REST is the standard access interface for CyberFabric modules and platform UI.
+**Presigned URLs remain a first-class part of the contract** — `create_presigned_upload` and
+`presign_urls` return URLs that the application's own backend hands to its frontend, and the frontend
+PUTs/GETs bytes directly against the S3-class endpoint. The only thing missing in P1 is a
+FileStorage-owned REST surface that external (out-of-process) modules could call directly.
+
+**Rationale**: P1 ships as a single monolith — every consumer is in-process, so the SDK is sufficient
+and avoids serialising local calls through HTTP. Adding a REST surface in P1 would mean maintaining two
+parallel call paths (in-process trait + HTTP handler) for every operation, doubling the test matrix and
+introducing transport-layer concerns (auth tokens, content negotiation, error mapping) that are not
+required to ship the feature. The REST surface is the natural follow-up when modules become separately
+deployable in P2.
+**Actors**: `cpt-cf-file-storage-actor-cf-modules`
+
+#### REST API (P2)
+
+- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-rest-api`
+
+The system **MUST** expose a REST API for all file operations (upload, download, delete, metadata, link management)
+**when modules become separately deployable**. The REST surface is a 1:1 mirror of the SDK trait surface — same
+operations, same error vocabulary, same `(file_id, etag, version_id)` pin model.
+
+The full P2 REST contract is specified in [`openapi.yaml`](./openapi.yaml). It is published as the design target so
+P1 SDK shapes match what the P2 REST will expose; nothing in `openapi.yaml` is shipped over the wire in P1.
+
+**Rationale**: REST is the standard access interface for CyberFabric modules and platform UI **once the platform
+adopts a multi-process / multi-service deployment topology**. Until then, the in-process SDK covers every consumer.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Non-S3 protocol gateways (out-of-scope)
@@ -1093,13 +1176,15 @@ The following NFR categories from the platform checklist are **not applicable** 
 **Description**: Async trait providing upload, download, delete, metadata, and link management operations.
 **Breaking Change Policy**: Major version bump required for trait signature changes.
 
-#### REST API
+#### REST API (P2)
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-rest-api`
+- [ ] `p2` - **ID**: `cpt-cf-file-storage-interface-rest-api`
 
 **Type**: REST API (OpenAPI 3.0)
-**Stability**: unstable
-**Description**: HTTP REST API for all file operations, metadata management, and link management.
+**Stability**: unstable; **not exposed in P1** — published as a P2 design target so the P1 SDK shape matches the
+future REST surface.
+**Description**: HTTP REST API for all file operations, metadata management, and link management. Activated when
+the platform splits into separately deployable modules (P2). Mirrors the SDK trait surface 1:1.
 **Breaking Change Policy**: Major version bump required for endpoint removal or request/response schema incompatible
 changes.
 
@@ -1290,23 +1375,32 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 
 **Preconditions**:
 
-- Client is authenticated with a valid API token
+- Client is authenticated with a valid API token against the application backend (chat backend, etc.)
 - Storage backend supports presigned URLs (e.g., S3, GCS, Azure Blob)
 
-**Main Flow**:
+**Main Flow** (P1 — application backend mediates the SDK call; the FileStorage REST surface that would let the
+client call FileStorage directly is deferred to P2 — `cpt-cf-file-storage-fr-rest-api`):
 
-1. Client requests a direct transfer URL for upload from FileStorage, providing file metadata (name, mime_type, size,
+1. Client requests an upload URL from the application backend, providing file metadata (name, mime_type, size,
    GTS file type)
-2. FileStorage validates the GTS file type format
-3. FileStorage checks authorization for write on `gts.cf.fstorage.file.type.v1~` with the file type in resource context
-4. *(Phase 2)* FileStorage validates file against policies (type, size); in phase 1 all uploads are accepted
-5. FileStorage registers the file metadata (including GTS file type) and ownership, assigns the target backend path
-6. FileStorage generates a presigned upload URL using its own backend credentials (e.g., AWS access key), scoped to the
-   assigned path and time-limited
-7. *(Phase 2)* FileStorage emits audit record for the upload
-8. FileStorage returns the presigned URL and file identifier to the client
-9. Client uploads file content directly to the storage backend using the presigned URL
-10. Storage backend validates the signature against its own key material and accepts the upload
+2. The application backend authenticates the client and applies its own business validations
+3. The application backend calls `FileStorageClient.create_presigned_upload(...)` via the in-process SDK,
+   forwarding the `SecurityContext` it derived from the client's token
+4. FileStorage validates the GTS file type format
+5. FileStorage checks authorization for write on `gts.cf.fstorage.file.type.v1~` with the file type in resource context
+6. *(Phase 2)* FileStorage validates file against policies (type, size); in phase 1 all uploads are accepted
+7. FileStorage registers the file metadata (including GTS file type) and ownership, derives the target backend path
+   from `file_id`
+8. FileStorage generates presigned upload URLs using its own backend credentials (e.g., AWS access key), scoped to the
+   target backend object key and time-limited
+9. *(Phase 2)* FileStorage emits audit record for the upload
+10. The application backend returns the `PresignedUploadHandle { file_id, upload_id, part_urls[], expires_at }` to the
+    client
+11. Client uploads file content directly to the storage backend using the presigned URL(s)
+12. Storage backend validates the signature against its own key material and accepts the upload
+
+In **P2**, with the REST API in place, the client may call FileStorage directly (`POST /presign-batch`) without
+going through the application backend — the rest of the flow is identical.
 
 **Postconditions**:
 

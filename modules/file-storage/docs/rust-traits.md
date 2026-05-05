@@ -9,13 +9,15 @@ Related specs: [DESIGN.md](./DESIGN.md) · [openapi.yaml](./openapi.yaml) · [mi
 
 ## Overview
 
-The FileStorage SDK exposes one consumer-facing trait — `FileStorageClient` — registered in the ModKit `ClientHub`. The shape of the trait follows the in-process SDK convention used by `simple-user-settings-sdk::SimpleUserSettingsClientV1`: every method takes a `&SecurityContext` first, every method is `async`, every method returns `Result<_, FileStorageError>`.
+The FileStorage SDK exposes one consumer-facing trait — `FileStorageClient` — registered in the ModKit `ClientHub`. **In P1 this trait is the sole access interface to FileStorage** (`cpt-cf-file-storage-fr-rust-sdk`); every consumer (chat backend, llm-gateway, antivirus, file-parser, …) lives in the same monolith process and calls it in-process. **A FileStorage-owned REST surface is deferred to P2** (`cpt-cf-file-storage-fr-rest-api`) and will mirror this trait 1:1 — see [openapi.yaml](./openapi.yaml). Throughout this document, references to `POST /…` / `PUT /…` / etc. describe the P2 REST mapping that the P1 SDK shape is designed to feed into.
+
+The shape of the trait follows the in-process SDK convention used by `simple-user-settings-sdk::SimpleUserSettingsClientV1`: every method takes a `&SecurityContext` first, every method is `async`, every method returns `Result<_, FileStorageError>`.
 
 The trait is built around the **opaque `FileId` (UUID)** as the canonical handle, per [ADR-0002](./ADR/0002-cpt-cf-file-storage-adr-opaque-file-ids.md). All operations on an existing file address it by `file_id`. There is one upload entry-point — `create_presigned_upload` — which accepts an optional `file_id` (when present, it overwrites an existing row in place; when absent, it mints a fresh `file_id` and registers a new `PendingUpload` row).
 
-**Identifiers are immutable; files cannot be renamed.** Both `file_id` and `file_path` (the logical path / file key inside the backend's tenant scope) are captured at `create_presigned_upload` and remain fixed for the file's lifetime. There is no REST or SDK surface that mutates either — `FileMetaUpdate` does not declare them, and no other operation accepts an `update_path` / `move` / `rename` argument. To change the logical address, callers upload a new file at the desired `file_path` and delete the old one. The display label `meta.name` (used in `Content-Disposition` on downloads) IS mutable through `put_file_info` — it is a label, not an identifier.
+**Identifiers are immutable; files cannot be renamed.** Both `file_id` and `file_path` (the logical path / file key inside the backend's tenant scope) are captured at `create_presigned_upload` and remain fixed for the file's lifetime. There is no SDK or future-REST surface that mutates either — `FileMetaUpdate` does not declare them, and no other operation accepts an `update_path` / `move` / `rename` argument. To change the logical address, callers upload a new file at the desired `file_path` and delete the old one. The display label `meta.name` (used in `Content-Disposition` on downloads) IS mutable through `put_file_info` — it is a label, not an identifier.
 
-`read_file` and `put_file` both use an idiomatic async byte-chunk stream (`Stream<Item = Result<Bytes, _>>`) — the same shape that axum, reqwest, and tonic use for HTTP request/response bodies, so adapters can pipe bytes between FileStorage and the backend without intermediate buffering. `put_file` is the in-process SDK upload entry-point: it drives the adapter directly (e.g. `aws-sdk-s3 PutObject`) and commits the row in one async call, with no presigned URL roundtrip. External frontends always use the `create_presigned_upload` → client-direct PUT (per part) → `complete_upload` triad over REST and ship bytes straight to the backend over the presigned URL — there is no bytes-through-FileStorage proxy upload path in any phase.
+`read_file` and `put_file` both use an idiomatic async byte-chunk stream (`Stream<Item = Result<Bytes, _>>`) — the same shape that axum, reqwest, and tonic use for HTTP request/response bodies, so adapters can pipe bytes between FileStorage and the backend without intermediate buffering. `put_file` is the in-process SDK upload entry-point: it drives the same `S3Backend` adapter as the presigned path (`create_multipart_and_presign_parts` → per-part `UploadPart` → `complete_multipart`) and commits the row in one async call without the presign roundtrip. **There is no single-shot `PutObject` path** anywhere in the design — even small in-process uploads use a 1-part multipart session (one part of arbitrary size, last-part rule). External frontends always use the `create_presigned_upload` → client-direct PUT (per part) → `complete_upload` triad — in P1 the application backend invokes those SDK methods in-process and ships bytes straight to the backend over the presigned URLs; in P2, the same triad is also reachable over the REST API. There is no bytes-through-FileStorage proxy upload path in any phase.
 
 **Upload is always multipart.** Even one-byte files go through the multipart lifecycle (single part, last-part rule lets `part_size = 0..` work). This is intentional: a single canonical write path means a single set of state transitions to reason about, no `<hex>` vs `<hex>-N` ETag-format split, and no second protocol to test/maintain.
 
@@ -25,7 +27,7 @@ The companion [ADR-0001](./ADR/0001-cpt-cf-file-storage-adr-s3-no-metadata-db.md
 
 ## SDK Models
 
-Defined in `file-storage-sdk/src/models.rs`. Aligned with REST API schemas ([openapi.yaml](./openapi.yaml)) and follow the platform DDD pattern observed in `simple-user-settings-sdk/src/models.rs`.
+Defined in `file-storage-sdk/src/models.rs`. Aligned with the future-P2 REST API schemas ([openapi.yaml](./openapi.yaml)) — the REST shape mirrors these models 1:1 — and follow the platform DDD pattern observed in `simple-user-settings-sdk/src/models.rs`.
 
 ```rust
 use bytes::Bytes;
@@ -54,14 +56,40 @@ pub type BackendId = Uuid;
 /// on routes that opt in.
 pub type Etag = String;
 
+/// Raw S3 VersionId (opaque, up to 1024 bytes) for the file's current
+/// generation. `Some` only when S3 returned a `x-amz-version-id`
+/// header on the relevant write (per ADR-0005). FileStorage treats
+/// the value as opaque — no parsing, sorting, or monotonicity
+/// assumptions.
+///
+/// Two roles on SDK methods:
+///
+/// - **Historical selector** on `read_file` and `presign_urls`
+///   (download): the bytes returned correspond to that exact S3
+///   generation (`GetObject?versionId=<vid>`).
+/// - **CAS pin** on `get_file_info`, `put_file_info`, `delete_file`,
+///   `put_file`, `create_presigned_upload` (variant-B re-upload): the
+///   call asserts the row's current `version_id` matches before
+///   committing. Mismatch surfaces as `EtagMismatch` (the same error
+///   variant covers etag-mismatch and version_id-mismatch — they are
+///   both content-pin failures from the caller's perspective).
+///
+/// Combined with `etag`, the two pins are independent: `etag` checks
+/// content fingerprint, `version_id` checks generation identity.
+/// Passing both gives ABA-safe CAS even on bit-identical re-uploads.
+/// When S3 versioning is not enabled `version_id` is always `None` on
+/// the row; passing `Some(v)` to a CAS path on such a backend
+/// surfaces `EtagMismatch` immediately (`None` ≠ `Some(v)` under
+/// null-safe comparison).
+pub type VersionId = String;
+
 // ── Backend descriptors ─────────────────────────────────────────────────
 
 /// One backend declared in the FileStorage roster (`GET /storages`).
-/// The descriptor declares the role flags, the supported optional
-/// capabilities, and whether the underlying S3 bucket has versioning
-/// turned on. Operators are responsible for declaring `versioning`
-/// correctly; FileStorage trusts the TOML and does NOT probe
-/// `GetBucketVersioning` at boot
+/// The descriptor declares the role flags and the supported optional
+/// capabilities. Versioning support is expressed through the
+/// `*.versioned.*` capability tags rather than a separate flag;
+/// FileStorage does NOT probe `GetBucketVersioning` at boot
 /// (`cpt-cf-file-storage-constraint-no-bootstrap-connectivity-check`).
 ///
 /// **Backend uniformity (architectural invariant).** Every backend
@@ -83,16 +111,17 @@ pub struct Backend {
     /// backend per tenant view MUST hold one default role.
     pub default_private: bool,
     /// `true` when this backend is the tenant's default for new
-    /// **public-read** files. Implies the `download_public.*`
+    /// **public-read** files. Implies the `download.s3.public.*`
     /// capability — every file in this backend gets an eternal
     /// bare-HTTPS URL.
     pub default_public: bool,
     /// Versioned capability tags declared by the backend in the
     /// TOML roster (see `CapabilityTag`). Each tag has the shape
-    /// `<operation>.<version>` — for example `upload.multipart_v1`,
-    /// `upload.multipart_v1`, `download_public.v1`. The list is
-    /// validated against the SDK's `KNOWN_CAPABILITIES` whitelist at
-    /// module init; unknown tags fail the boot.
+    /// `<operation>.<descriptor>+.v<n>` — for example
+    /// `upload.s3.multipart.sigv4.v1`, `download.s3.sigv4.v1`,
+    /// `download.s3.public.v1`. The list is validated against the
+    /// SDK's `KNOWN_CAPABILITIES` whitelist at module init; unknown
+    /// tags fail the boot.
     pub capabilities: Vec<CapabilityTag>,
     /// Per-backend hard ceiling on object size in bytes. Optional in
     /// the TOML roster — when omitted, FileStorage falls back to the
@@ -122,37 +151,45 @@ pub struct Backend {
     /// can lower this for tenancy / security reasons; raising it above
     /// the AWS hard cap has no effect because S3 itself rejects
     /// signatures requesting longer expiries. Applied to every
-    /// signing path (`upload.multipart_v1` part URLs,
-    /// `download_private.sigv4_v1`) — `download_public.v1` is
+    /// signing path (`upload.s3.multipart.sigv4.v1` part URLs,
+    /// `download.s3.sigv4.v1`) — `download.s3.public.v1` is
     /// unaffected because public URLs carry no expiry. Caller's
     /// `UrlParams.expires_in_seconds` is capped by this value;
     /// exceeding it is a `BadRequest`.
     pub max_presign_ttl_seconds: Option<u64>,
-    /// Mirrors the underlying bucket's versioning configuration.
-    /// `true` enables ABA-safe content CAS via `version_id` and lets
-    /// callers request historical versions on `presign_urls`.
-    /// Operator-declared in TOML — FileStorage trusts the value, no
-    /// runtime probe (see ADR-0005).
-    pub versioning: bool,
+    // Versioning support is declared per-backend through the
+    // `*.versioned.*` capability tags (e.g.
+    // `download.s3.sigv4.versioned.v1`,
+    // `download.s3.public.versioned.v1`) — there is no separate
+    // `Backend.versioning` flag. The DB `version_id` column is populated
+    // from S3 response headers as-is; the null-safe race-detection
+    // predicate works in both modes (see ADR-0005).
 }
 
 /// Versioned capability identifier — a flat string of the form
-/// `<operation>.<version>`. Each tag describes one (operation,
-/// signing-strategy, version) tuple that a backend can serve.
-/// Examples: `upload.multipart_v1`, `download_private.sigv4_v1`,
-/// `download_public.v1`.
+/// `<operation>.<protocol>.<algorithm>.<variant>?.v<n>`. Each tag
+/// describes one (operation, protocol, signing-strategy, optional
+/// modifier, version) tuple that a backend can serve. Examples:
+/// `upload.s3.multipart.sigv4.v1`, `download.s3.sigv4.v1`,
+/// `download.s3.sigv4.versioned.v1`, `download.s3.public.v1`,
+/// `download.s3.public.versioned.v1`.
 ///
-/// **Grammar.** Regex `^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,19}$`. The
-/// version segment (after the dot) is capped at 20 characters so
-/// the whole tag stays compact. There is no nesting — exactly one
-/// dot separates operation from version.
+/// **Grammar.** Regex `^[a-z][a-z0-9_]+(\.[a-z][a-z0-9_]+){2,4}\.v\d+$`.
+/// The leading segment is the SDK operation (`upload` / `download`).
+/// The next segment is the protocol family (`s3`, `gcs`, `azure`, …).
+/// The next is the signing/auth flavor (`sigv4`, `sigv4a`,
+/// `sas_user`, `multipart`, `public` — the last denotes anonymous
+/// bare-HTTPS, no signature). The optional fourth descriptor is a
+/// variant modifier (currently only `versioned`, marking that the
+/// tag accepts an optional `version_id` selector). The trailing
+/// segment is the contract version (`v1`, `v2`, …).
 ///
 /// **Why flat strings instead of an enum.** Each tag is constant data
-/// from the SDK's perspective: when a new signing strategy is added
-/// (e.g. AWS SigV4 alg revision, GCS POST-policy variant), it lands
-/// as a new string in `KNOWN_CAPABILITIES` and a new branch in the
-/// adapter's `match` — no enum migration, no breaking schema change.
-/// Operators write tags as-is in TOML.
+/// from the SDK's perspective: when a new signing strategy or wire
+/// protocol is added, it lands as a new string in
+/// `KNOWN_CAPABILITIES` and a new branch in the adapter's `match` —
+/// no enum migration, no breaking schema change. Operators write
+/// tags as-is in TOML.
 ///
 /// **Boot-time validation (constitutive).** The SDK ships with
 /// `const KNOWN_CAPABILITIES: &[&str] = &[ ... ]` listing every tag
@@ -164,21 +201,51 @@ pub struct Backend {
 /// boot. Adapters use `match tag.as_str()` with `_ => unreachable!()`
 /// as a defensive default.
 ///
-/// **P1 whitelist (3 tags).**
-/// - `upload.multipart_v1` — server-mediated multipart upload (the
-///   only upload path; even single-byte files go through it as a
-///   one-part session). Handler runs `CreateMultipartUpload`
-///   against the backend, presigns N `UploadPart` URLs in one round
-///   trip, and exposes the companion REST endpoints
-///   `POST /files/{file_id}/upload/{upload_id}` (commit)
-///   and `DELETE /files/{file_id}/upload/{upload_id}` (abort one
-///   session) for the rest of the lifecycle. There is no
-///   single-shot SigV4 PUT path.
-/// - `download_private.sigv4_v1` — SigV4-signed GET for time-limited
-///   private downloads (TTL + optional CIDR allowlist).
-/// - `download_public.v1` — bare-HTTPS public-read URL with no
-///   signature and no expiry (for buckets with public-read ACL or
-///   an origin behind a CDN; pairs with `Backend.default_public`).
+/// **P1 whitelist (5 tags).** These are the only tags shipped in P1
+/// and cover every supported backend, including non-S3 endpoints
+/// reached through S3-compat gateways (WebDAV, FTP, custom non-S3
+/// clients).
+/// - `upload.s3.multipart.sigv4.v1` — server-mediated chunked S3
+///   multipart upload (`CreateMultipartUpload` + `UploadPart` +
+///   `CompleteMultipartUpload`) signed with SigV4. The only upload
+///   path; even single-byte files go through it as a one-part
+///   session. Handler presigns N `UploadPart` URLs in one round trip
+///   and exposes the companion REST endpoints
+///   `POST /files/{file_id}/upload/{upload_id}` (commit) and
+///   `DELETE /files/{file_id}/upload/{upload_id}` (abort one
+///   session). Refers specifically to the chunked S3 multipart-upload
+///   protocol, **not** to `multipart/form-data` POST Policy uploads.
+///   There is no single-shot SigV4 PUT path.
+/// - `download.s3.sigv4.v1` — SigV4-signed GET for time-limited
+///   private downloads (TTL + optional CIDR allowlist). Rejects
+///   `version_id` parameter (use the `versioned` variant for that).
+/// - `download.s3.sigv4.versioned.v1` — version-aware SigV4-signed
+///   GET. Identical to `download.s3.sigv4.v1` but accepts an optional
+///   `version_id` selector embedded as `versionId=<vid>` in the
+///   signed URL. Declared on backends fronting versioning-enabled
+///   buckets that wish to expose history to consumers; declaring it
+///   implies bucket S3 versioning is enabled.
+/// - `download.s3.public.v1` — bare-HTTPS public-read URL with no
+///   signature and no expiry (`public` in the algorithm slot denotes
+///   the deliberate absence of a signing algorithm). For buckets with
+///   public-read ACL or an origin behind a CDN; pairs with
+///   `Backend.default_public`. Rejects `version_id` parameter.
+/// - `download.s3.public.versioned.v1` — version-aware bare-HTTPS
+///   public-read URL (`https://<host>/<key>?versionId=<vid>`, no
+///   signature). Requires bucket policy to grant
+///   `s3:GetObjectVersion` to the anonymous principal in addition to
+///   `s3:GetObject` — without it, anonymous requests with
+///   `?versionId=` return 403. Declaring it implies the operator has
+///   confirmed both.
+///
+/// **Forward-looking examples (NOT planned for P1, P2, or P3).** The
+/// following tags illustrate how the whitelist would extend if a
+/// non-S3 cloud-native adapter were ever added; they are listed only
+/// to demonstrate the naming scheme and may be appended at any time.
+/// - `upload.gcs.resumable.v1` — GCS native resumable-upload session
+///   (single session URL, sequential `Content-Range` PUTs).
+/// - `upload.azure.blocks.sas_user.v1` — Azure Block Blob
+///   (`PutBlock` + `PutBlockList`) with a User-Delegation SAS.
 pub type CapabilityTag = String;
 
 // ── Owner ───────────────────────────────────────────────────────────────
@@ -226,16 +293,18 @@ pub struct FileMeta {
     /// immutable: `FileMetaUpdate` does not declare this field, so
     /// `PUT /files/{id}` cannot change it.
     pub gts_file_type: String,
-    /// Caller's expected size in bytes when known up-front. The row's
-    /// committed `size_bytes` is read from S3 Content-Length when
-    /// `complete_upload` finalizes the row (Phase 3).
-    pub size_bytes: Option<u64>,
     /// Application-defined key/value tags
     /// (`cpt-cf-file-storage-fr-metadata-storage`). Mirrored as
     /// `x-amz-meta-<k>=<v>` on the S3 object. The aggregate 2 KB
     /// user-metadata budget is enforced by FileStorage.
     pub custom_metadata: CustomMetadata,
 }
+
+// `size_bytes` is system-managed and lives only on `FileInfo`
+// (top-level). The caller never sets it; it is captured from S3's
+// `Content-Length` at `complete_upload` (Phase 3). Keeping it off
+// `FileMeta` removes the duplication / nullability mismatch the API
+// shape used to carry.
 
 /// Body for `put_file_info` — every field is optional. `Some(v)`
 /// replaces the row's current value; `None` keeps it unchanged.
@@ -287,8 +356,8 @@ pub struct FileInfo {
     /// Content fingerprint only.
     pub etag: Etag,
     /// Raw S3 VersionId for the current generation. `Some` when the
-    /// hosting backend has `versioning = true`; `None` otherwise.
-    pub version_id: Option<String>,
+    /// hosting backend has S3 versioning enabled; `None` otherwise.
+    pub version_id: Option<VersionId>,
     pub size_bytes: u64,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
@@ -395,8 +464,8 @@ pub enum FileStatus {
 pub struct UrlParams {
     /// Requested TTL. Capped server-side by the backend's configured
     /// maximum; exceeding the cap is a `BadRequest`. Ignored for
-    /// `download_public.*` outcomes — public URLs have no expiry.
-    /// On `upload.multipart_v1` the same TTL applies uniformly to
+    /// `download.s3.public.*` outcomes — public URLs have no expiry.
+    /// On `upload.s3.multipart.sigv4.v1` the same TTL applies uniformly to
     /// every part URL in the issued batch.
     pub expires_in_seconds: u64,
     /// Optional override for the presigned download's
@@ -418,10 +487,13 @@ pub struct UrlParams {
     pub allowed_client_cidrs: Vec<String>,
 }
 
-/// Result of `create_presigned_upload` — the only upload presign
-/// path. Every upload is multipart-shaped (single-part for small
-/// files), so the handle always carries a backend-supplied
-/// `upload_id` and a list of part URLs.
+/// Result of `create_presigned_upload` — the upload presign path
+/// implemented in P1. Every P1 upload uses S3 multipart and is
+/// multipart-shaped (single-part for small files), so the handle
+/// always carries a backend-supplied `upload_id` and a list of part
+/// URLs. Alternative upload tags (e.g. `upload.gcs.resumable.v1`,
+/// `upload.azure.blocks.sas_user.v1`) are reserved by the naming
+/// scheme but not implemented in any phase.
 ///
 /// The server has already executed `CreateMultipartUpload` against
 /// the backend and presigned every part URL — the caller does not
@@ -478,13 +550,13 @@ pub struct UploadPartCompletion {
 /// at the moment they resolve.
 ///
 /// `version_id` is optional and only meaningful when the file's
-/// hosting backend has `versioning = true`. When set, the server
+/// hosting backend has S3 versioning enabled. When set, the server
 /// includes `versionId=<vid>` in the signed URL so the caller fetches
 /// a historical generation. When unset, the URL resolves to the
 /// current bytes.
 ///
 /// `capability` is the versioned tag the caller wants (e.g.
-/// `download_private.sigv4_v1` or `download_public.v1`). The server
+/// `download.s3.sigv4.v1` or `download.s3.public.v1`). The server
 /// rejects with `capability_unavailable` if the resolved backend has
 /// not declared that tag.
 #[domain_model]
@@ -493,8 +565,21 @@ pub struct PresignDownloadItem {
     pub file_id: FileId,
     pub capability: CapabilityTag,
     pub params: UrlParams,
+    /// Optional CAS pin: when `Some`, server verifies the row's
+    /// current `etag` matches (DB-only check) before signing —
+    /// mismatch returns per-item `EtagMismatch`.
     pub etag: Option<Etag>,
-    pub version_id: Option<String>,
+    /// Two roles, depending on what's pinned:
+    ///
+    /// - **Historical selector.** When S3 versioning is enabled,
+    ///   the signed URL embeds `versionId=<vid>` so the caller
+    ///   fetches that exact generation. Ignored on
+    ///   backends without S3 versioning.
+    /// - **CAS pin** (when paired with `etag`). When both are
+    ///   `Some`, the server verifies the row's current
+    ///   `(etag, version_id)` matches — closes the ABA window on
+    ///   bit-identical re-uploads.
+    pub version_id: Option<VersionId>,
 }
 
 /// Per-item outcome inside a batched presigned-download response. The
@@ -512,13 +597,13 @@ pub struct PresignDownloadOutcome {
 pub struct PresignedDownload {
     pub url: String,
     /// Time at which the URL stops resolving. For
-    /// `download_public.v1` outcomes (`is_public == true`) this is
+    /// `download.s3.public.v1` outcomes (`is_public == true`) this is
     /// set to a far-future sentinel ("never expires").
     pub expires_at: OffsetDateTime,
     /// `true` when the URL is a bare-HTTPS public-read URL issued
-    /// under the `download_public.v1` capability tag (no presigning,
+    /// under the `download.s3.public.v1` capability tag (no presigning,
     /// no expiry). `false` for SigV4 GET URLs from
-    /// `download_private.sigv4_v1`.
+    /// `download.s3.sigv4.v1`.
     pub is_public: bool,
 }
 
@@ -538,14 +623,81 @@ pub struct PresignedDownload {
 pub type FileByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, FileStorageError>> + Send + 'static>>;
 
+/// Byte-range selector for partial reads on `read_file`. Maps 1:1
+/// onto the HTTP `Range: bytes=...` header (RFC 7233), which every
+/// S3-class backend honours on `GetObject` (constitutive S3 feature
+/// — does not require a capability tag). Range is constructed at
+/// the SDK boundary; the adapter forwards it as-is to the backend.
+///
+/// The bytes streamed back through `FileReadHandle.bytes` cover
+/// **only** the requested range; `FileReadHandle.info` still
+/// reflects the FULL object metadata (`size_bytes`, `etag`,
+/// `version_id`). The actual resolved range (what the backend
+/// returned, including the full object size) is exposed on
+/// `FileReadHandle.range` as `ResolvedByteRange`.
+///
+/// **Semantics on bit-identical re-reads.** The backend's `ETag`
+/// header on a range response is the FULL object ETag, not a
+/// per-range hash; this is what lets in-band reconciliation
+/// (ADR-0004) keep working unchanged on range reads.
+///
+/// **Out-of-range** (e.g. `Inclusive { start: u, end: v }` with
+/// `u > total_size`) surfaces as `FileStorageError::BadRequest` —
+/// the backend returns `416 Range Not Satisfiable` and the SDK
+/// maps it onto `BadRequest` with a message that includes the
+/// actual object size.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRange {
+    /// `Range: bytes=START-END` — both bounds inclusive. Validated
+    /// at the SDK boundary: `start > end` is a `BadRequest` before
+    /// the backend is contacted.
+    Inclusive { start: u64, end: u64 },
+    /// `Range: bytes=START-` — from offset to end of object.
+    From(u64),
+    /// `Range: bytes=-N` — last N bytes of the object (suffix
+    /// range). Useful for footer reads (Parquet, ZIP central
+    /// directory, video moov-atom). `N == 0` is `BadRequest`.
+    Suffix(u64),
+}
+
+/// Resolved byte range that the backend actually served, captured
+/// from the `Content-Range: bytes START-END/TOTAL` response header.
+/// Returned on `FileReadHandle.range` whenever a range was
+/// requested; lets the caller know the exact served diapason and
+/// the full object size in one shot.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedByteRange {
+    /// First byte of the served range (inclusive).
+    pub start: u64,
+    /// Last byte of the served range (inclusive).
+    pub end_inclusive: u64,
+    /// Full object size in bytes (the `TOTAL` part of
+    /// `Content-Range`). Equal to `FileInfo.size_bytes`, repeated
+    /// here so callers do not have to thread the snapshot to
+    /// downstream consumers.
+    pub total: u64,
+}
+
 /// Reader-side handle returned by `read_file`. The caller polls
 /// `bytes` to receive chunks and treats the stream end as EOF; the
 /// `info` snapshot is cheap to clone and lets callers inspect MIME,
 /// size, etc. without an extra round-trip.
+///
+/// When the call requested a partial read (`range = Some(_)`), the
+/// streamed bytes cover only the requested diapason and `range` is
+/// populated with the resolved bounds and total object size; `info`
+/// still reflects the FULL object (size, etag, version_id).
 #[derive(Debug)]
 pub struct FileReadHandle {
     pub info: FileInfo,
     pub bytes: FileByteStream,
+    /// `Some` iff the caller passed `range = Some(_)`. Mirrors the
+    /// HTTP `Content-Range` header from the backend (`start`,
+    /// `end_inclusive`, `total`). On full reads (`range = None` on
+    /// the call) this is `None`.
+    pub range: Option<ResolvedByteRange>,
 }
 
 // ── Listing / filtering ─────────────────────────────────────────────────
@@ -755,10 +907,22 @@ pub trait FileStorageClient: Send + Sync {
     ///   status). Server flips the row to `Completing` (Phase 1 of
     ///   the upload commit, reused for re-uploads), reads the row's
     ///   CURRENT metadata and pins those exact values into the
-    ///   presigned part URLs. **`owner`, `file_path`, `meta`,
-    ///   `backend_id` are ignored** when `file_id` is supplied — to
-    ///   change metadata, call `put_file_info` either before
-    ///   `create_presigned_upload` or after `complete_upload`.
+    ///   presigned part URLs. **`owner`, `meta`, `backend_id` are
+    ///   ignored** when `file_id` is supplied — to change metadata,
+    ///   call `put_file_info` either before `create_presigned_upload`
+    ///   or after `complete_upload`. The optional `etag` and
+    ///   `version_id` arguments act as variant-B CAS pins:
+    ///   - `etag = Some(e)` → mismatch fails the call with
+    ///     `EtagMismatch` *before* `CreateMultipartUpload` is
+    ///     issued (the row is not flipped to `Completing`).
+    ///   - `version_id = Some(v)` (when S3 versioning is enabled) →
+    ///     mismatch likewise fails with `EtagMismatch` (closes the
+    ///     ABA window even when bytes are bit-identical and the
+    ///     etag did not rotate). When S3 versioning is not enabled
+    ///     `version_id = Some(_)` is a null-safe mismatch against
+    ///     the row's `None` and returns `EtagMismatch` immediately.
+    ///   - Both pins compose. Both default to `None` (last-write-
+    ///     wins re-upload).
     ///
     /// **Pinned headers (always, every part URL).** SigV4
     /// SignedHeaders pin:
@@ -769,7 +933,7 @@ pub trait FileStorageClient: Send + Sync {
     /// **`gts_file_type` is NOT pinned to the backend object** — it
     /// is DB-only (specific exception to the meta-mirror rule).
     ///
-    /// **`capability`** MUST be `"upload.multipart_v1"`. Validated
+    /// **`capability`** MUST be `"upload.s3.multipart.sigv4.v1"`. Validated
     /// against the resolved backend's `capabilities` list — unknown
     /// / undeclared tag → `CapabilityUnavailable`.
     ///
@@ -802,15 +966,17 @@ pub trait FileStorageClient: Send + Sync {
         backend_id: Option<BackendId>,
         file_id: Option<FileId>,
         owner: OwnerRef,
-        file_path: &str,
         meta: FileMeta,
         capability: &CapabilityTag,
         part_count: u32,
         params: UrlParams,
+        etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
     ) -> Result<PresignedUploadHandle, FileStorageError>;
 
-    /// **Complete an upload (initial or re-upload).** Backs the REST
-    /// `POST /files/{file_id}/upload/{upload_id}` endpoint.
+    /// **Complete an upload (initial or re-upload).** In P1 this is
+    /// invoked in-process; in P2 it also backs
+    /// `POST /files/{file_id}/upload/{upload_id}`.
     /// Multi-phase commit:
     ///
     /// 1. **Phase 1.** Conditional UPDATE flips the row from
@@ -852,8 +1018,8 @@ pub trait FileStorageClient: Send + Sync {
         parts: Vec<UploadPartCompletion>,
     ) -> Result<FileInfo, FileStorageError>;
 
-    /// **Abort an upload session.** Backs the REST
-    /// `DELETE /files/{file_id}/upload/{upload_id}` endpoint. The
+    /// **Abort an upload session.** In P1 invoked in-process; in P2
+    /// also backs `DELETE /files/{file_id}/upload/{upload_id}`. The
     /// server calls `AbortMultipartUpload` on the backend for the
     /// specified `upload_id` only.
     ///
@@ -886,14 +1052,22 @@ pub trait FileStorageClient: Send + Sync {
     /// authoritative metadata view from the FileStorage database
     /// without touching the storage backend.
     ///
-    /// `etag` is optional: when supplied, the call returns
-    /// `EtagMismatch` if the row's etag has rotated. The REST
-    /// equivalent supports `If-None-Match` → `304 Not Modified`.
+    /// `etag` and `version_id` are optional CAS pins:
+    /// - `etag = Some(e)` → returns `EtagMismatch` if the row's etag
+    ///   has rotated.
+    /// - `version_id = Some(v)` → when S3 versioning is enabled, returns
+    ///   `EtagMismatch` if the row's `version_id` has rotated
+    ///   (null-safe — `Some(v)` ≠ `None` if the backend has
+    ///   S3 versioning not enabled).
+    /// Both pins compose: passing both gives ABA-safe CAS over
+    /// content + generation. The REST equivalent supports
+    /// `If-None-Match` → `304 Not Modified` on the etag side.
     async fn get_file_info(
         &self,
         ctx: &SecurityContext,
         file_id: FileId,
         etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
     ) -> Result<FileInfo, FileStorageError>;
 
     /// `PUT /api/file-storage/v1/files/{file_id}` — atomic
@@ -922,7 +1096,7 @@ pub trait FileStorageClient: Send + Sync {
     ///    `MetadataDirective = REPLACE`, and the new `Content-Type`,
     ///    `Content-Disposition`, and `x-amz-meta-<k>` headers. The
     ///    backend's response carries the new `ETag` and (if
-    ///    versioning is on) the new `VersionId`.
+    ///    S3 versioning is enabled) the new `VersionId`.
     /// 3. **Phase 3.** Conditional UPDATE flips `MetaUpdating →
     ///    Uploaded` AND writes the new
     ///    `(name, mime_type, custom_metadata, etag, version_id)`
@@ -930,17 +1104,27 @@ pub trait FileStorageClient: Send + Sync {
     ///    transition land atomically. The row never holds new
     ///    metadata under a "still updating" status.
     ///
-    /// **Optional `If-Match` = strong CAS on DB + S3.** When the
-    /// caller passes `etag = Some(E1)`:
-    /// - Phase 1's UPDATE includes `etag = E1` (412 on mismatch).
-    /// - Phase 2 HEADs S3 to verify the live `s3_etag` and
-    ///   `s3_version_id` (versioning-on backends only) match the
-    ///   row (412 on mismatch — closes the ABA race per ADR-0005).
-    /// - The `CopyObject` is issued with
-    ///   `x-amz-copy-source-if-match: E1` for backend-side
-    ///   precondition enforcement.
+    /// **Optional `etag` / `version_id` = strong CAS on DB + S3.**
     ///
-    /// When `etag = None` the call is best-effort
+    /// - `etag = Some(E1)`:
+    ///   - Phase 1's UPDATE includes `etag = E1` (412 on mismatch).
+    ///   - Phase 2 HEADs S3 to verify the live `s3_etag` matches the
+    ///     row (412 on mismatch).
+    ///   - The `CopyObject` is issued with
+    ///     `x-amz-copy-source-if-match: E1` for backend-side
+    ///     precondition enforcement.
+    /// - `version_id = Some(V1)` (when S3 versioning is enabled):
+    ///   - Phase 1's UPDATE includes `version_id IS NOT DISTINCT FROM V1`
+    ///     (412 on mismatch).
+    ///   - Phase 2's HEAD additionally verifies `s3_version_id == V1`
+    ///     (412 on mismatch — closes the ABA race per ADR-0005, even
+    ///     when bytes are bit-identical and `etag` did not rotate).
+    ///   - When S3 versioning is not enabled `version_id = Some(_)`
+    ///     unconditionally returns 412 (the row's `version_id` is
+    ///     `None`, the pin is `Some(v)` — null-safe mismatch).
+    /// - Both pins compose; the strongest CAS uses both.
+    ///
+    /// When BOTH are `None` the call is best-effort
     /// last-write-wins on metadata
     /// (`cpt-cf-file-storage-constraint-no-meta-cas`).
     ///
@@ -959,24 +1143,25 @@ pub trait FileStorageClient: Send + Sync {
         file_id: FileId,
         update: FileMetaUpdate,
         etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
     ) -> Result<FileInfo, FileStorageError>;
 
     /// `DELETE /api/file-storage/v1/files/{file_id}` — 2-phase hard
     /// delete in P1.
     ///
-    /// `etag` is optional. When supplied, Phase 1's conditional
-    /// UPDATE includes it — protects against deleting a file that
-    /// has been overwritten between read and delete. When omitted,
-    /// the delete is best-effort last-write-wins (still gated by
-    /// `status = 'uploaded'`).
+    /// `etag` and `version_id` are optional CAS pins. When supplied,
+    /// Phase 1's conditional UPDATE includes them — protects against
+    /// deleting a file that has been overwritten between read and
+    /// delete. When both are omitted, the delete is best-effort
+    /// last-write-wins (still gated by `status = 'uploaded'`).
     ///
     /// **Phases**:
     ///
     /// 1. Conditional UPDATE: `SET status = 'deleting' WHERE id =
-    ///    $1 AND status = 'uploaded' [AND etag = $2]`. `0` rows →
-    ///    `EtagMismatch` (when If-Match supplied) or `NotFound` (no
-    ///    If-Match). Row already in `Deleting` →
-    ///    `DeleteInProgress`.
+    ///    $1 AND status = 'uploaded' [AND etag = $2]
+    ///    [AND version_id IS NOT DISTINCT FROM $3]`. `0` rows →
+    ///    `EtagMismatch` (when either pin supplied) or `NotFound`
+    ///    (neither). Row already in `Deleting` → `DeleteInProgress`.
     /// 2. Backend DELETE on `derive(file_id)` (S3 idempotent). On
     ///    transient failure: inline retry up to 3 attempts with
     ///    exponential backoff (e.g. 100 ms, 500 ms, 2 s). On
@@ -997,6 +1182,7 @@ pub trait FileStorageClient: Send + Sync {
         ctx: &SecurityContext,
         file_id: FileId,
         etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
     ) -> Result<(), FileStorageError>;
 
     /// `GET /api/file-storage/v1/files` — paginated owner-scoped
@@ -1027,11 +1213,28 @@ pub trait FileStorageClient: Send + Sync {
     /// the in-memory adapter handle (no extra hop, snapshot-isolated
     /// stream, in-band recovery for rows stuck in transient states).
     ///
-    /// `etag` is optional: when supplied, the stream is opened only
-    /// if the row currently matches; otherwise `EtagMismatch`. This
-    /// is the equivalent of `If-Match` and is intended for
-    /// in-process modules that pinned an etag earlier and want to
-    /// fail fast on drift.
+    /// **`etag` (CAS pin)** is optional: when supplied, the stream
+    /// is opened only if the row's `etag` currently matches;
+    /// otherwise `EtagMismatch`. This is the equivalent of `If-Match`
+    /// and is intended for in-process modules that pinned an etag
+    /// earlier and want to fail fast on drift.
+    ///
+    /// **`version_id` (historical selector + optional CAS)** is
+    /// optional and has two roles, depending on what's pinned:
+    ///
+    /// - **Historical selector.** When S3 versioning is enabled,
+    ///   `version_id = Some(v)` opens the stream against that exact
+    ///   S3 generation (`GetObject?versionId=v`); the bytes
+    ///   correspond to the historical version, while the returned
+    ///   `FileInfo` still reflects the row's CURRENT metadata (the
+    ///   DB tracks current generation only — see ADR-0005). On
+    ///   backends without S3 versioning `version_id = Some(_)`
+    ///   returns `EtagMismatch` (the row's `version_id` is `None`,
+    ///   the pin is `Some(v)` — null-safe mismatch).
+    /// - **CAS pin (when paired with `etag`).** Passing both
+    ///   `etag` and `version_id` checks both axes against the row
+    ///   before opening the stream — closes the ABA window on
+    ///   bit-identical re-uploads.
     ///
     /// **In-band recovery for transient states.** The SDK is the
     /// only surface that can recover a row stuck in `Completing` /
@@ -1074,6 +1277,21 @@ pub trait FileStorageClient: Send + Sync {
     /// extra copy and is the opposite of what most callers want
     /// (zero-copy passthrough into another `Stream<Bytes>` sink).
     ///
+    /// **`range` (partial read)** is optional and maps directly to
+    /// the HTTP `Range: bytes=...` header on the backend
+    /// `GetObject`. Range is a constitutive S3 feature — no
+    /// capability tag is required, every supported backend honours
+    /// it. When `Some`, `FileReadHandle.bytes` carries only the
+    /// requested diapason and `FileReadHandle.range` mirrors the
+    /// `Content-Range` header from the backend (`start`,
+    /// `end_inclusive`, `total`). `FileReadHandle.info` still
+    /// reflects the FULL object metadata (`size_bytes`, `etag`,
+    /// `version_id`) — the row is not split per range; CAS pins on
+    /// `etag` / `version_id` apply to the full object regardless of
+    /// range. Out-of-range requests surface as `BadRequest`. Common
+    /// uses: video / audio streaming with seek, parallel multi-range
+    /// download, footer reads (Parquet, ZIP, MP4 moov-atom).
+    ///
     /// Typical pattern in an in-process consumer:
     ///
     /// ```ignore
@@ -1081,7 +1299,7 @@ pub trait FileStorageClient: Send + Sync {
     /// use sha2::{Digest, Sha256};
     /// use tokio::io::AsyncWriteExt;
     ///
-    /// let mut handle = files.read_file(&ctx, file_id, Some(&etag)).await?;
+    /// let mut handle = files.read_file(&ctx, file_id, Some(&etag), None, None).await?;
     /// let mut hasher = Sha256::new();
     /// let mut sink = tokio::fs::File::create("/tmp/scan.bin").await?;
     /// while let Some(chunk) = handle.bytes.next().await {
@@ -1089,12 +1307,21 @@ pub trait FileStorageClient: Send + Sync {
     ///     hasher.update(&chunk);
     ///     sink.write_all(&chunk).await?;
     /// }
+    ///
+    /// // Footer-only partial read (last 64 KiB):
+    /// let footer = files.read_file(
+    ///     &ctx, file_id, None, None,
+    ///     Some(ByteRange::Suffix(65_536)),
+    /// ).await?;
+    /// assert!(footer.range.is_some());
     /// ```
     async fn read_file(
         &self,
         ctx: &SecurityContext,
         file_id: FileId,
         etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
+        range: Option<ByteRange>,
     ) -> Result<FileReadHandle, FileStorageError>;
 
     /// In-process SDK only — **no REST surface in P1**. Single-call
@@ -1103,11 +1330,11 @@ pub trait FileStorageClient: Send + Sync {
     ///
     /// **Fully implemented in P1.** Does NOT mint presigned URLs:
     /// in-process callers share the FileStorage runtime, so the SDK
-    /// drives the adapter directly. For `s3-compatible` backends
-    /// the implementation chooses between single-shot `PutObject`
-    /// (small payloads) and a `CreateMultipartUpload` /
-    /// `UploadPart` × N / `CompleteMultipartUpload` cycle (large
-    /// payloads); the row goes through the same
+    /// drives the adapter directly. **No single-shot `PutObject`
+    /// path** — every in-process upload uses a multipart session
+    /// (one part of arbitrary size for small payloads, last-part
+    /// rule; N parts for larger payloads), the same shape the
+    /// presigned path uses externally. The row goes through the same
     /// `PendingUpload → Completing → Uploaded` transitions as the
     /// REST path. There is no bytes-through-FileStorage REST proxy
     /// in any phase; external frontends always use the
@@ -1125,16 +1352,23 @@ pub trait FileStorageClient: Send + Sync {
     ///    For variant-B re-upload (`file_id = Some(id)`, `etag = Some(e)`),
     ///    SELECT the existing row by `id`, verify `etag = e` (412 on
     ///    mismatch), reuse its `file_path` and pin its current meta.
-    /// 2. Stream `bytes` to the adapter's `PutObject` against
-    ///    `derive(file_id)`, pinning `Content-Type`,
+    /// 2. Start a multipart session against `derive(file_id)` via
+    ///    `S3Backend::create_multipart_and_presign_parts` (the SDK
+    ///    just consumes the resulting per-part URLs in-process —
+    ///    no presign hop to the caller). Pin `Content-Type`,
     ///    `Content-Disposition`, and `x-amz-meta-<k>` (NOT
-    ///    `x-amz-meta-gts-file-type`) on the request.
-    /// 3. HEAD the backend for authoritative
-    ///    `(s3_etag, s3_version_id, content_length, mirrored meta)`.
-    /// 4. Conditional UPDATE flips `pending_upload → uploaded` and
-    ///    pulls the HEAD-derived fields in one transaction. Race
-    ///    detection is via `(etag, updated_at, version_id[, xmin])` on the
-    ///    UPDATE WHERE clause. Logical-address uniqueness is
+    ///    `x-amz-meta-gts-file-type`). Pull bytes off the input
+    ///    stream and `UploadPart` them one part at a time; collect
+    ///    `(part_number, etag)` pairs.
+    /// 3. Run the same 3-phase commit as `complete_upload`:
+    ///    Phase 1 conditional UPDATE flips `pending_upload →
+    ///    completing` (capturing `(etag, updated_at, version_id[, xmin])`
+    ///    for race detection); Phase 2 invokes
+    ///    `S3Backend::complete_multipart` and captures the finalized
+    ///    `(s3_etag, s3_version_id)`; Phase 3 conditional UPDATE
+    ///    flips `completing → uploaded` and writes the new
+    ///    `(etag, version_id, size_bytes)` along with
+    ///    `upload_expires_at = NULL`. Logical-address uniqueness is
     ///    structural (PRIMARY KEY on `id`); no path-level index
     ///    arbitration is required.
     ///
@@ -1154,23 +1388,35 @@ pub trait FileStorageClient: Send + Sync {
     /// MIME sniff (which buffers only the first chunk) are the only
     /// buffering points.
     ///
-    /// **`etag` parameter.**
-    /// - `None`: initial upload. A fresh `file_id` is minted; if the
-    ///   `(tenant_id, backend_id, file_path)` slot already holds an
-    ///   `Uploaded` row, the call supersedes it on commit (the loser
-    ///   becomes a backend orphan reclaimed by P2 GC).
-    /// - `Some(e)`: variant-B re-upload — same `file_id`, same backend
-    ///   object key. Overwrite-in-place against pinned `etag`.
-    ///   Mismatch returns `EtagMismatch`.
+    /// **Two modes (discriminated by `file_id`).**
+    /// - `file_id = None`: initial upload. A fresh `file_id` is minted
+    ///   server-side; the backend object key is derived from it. The
+    ///   `etag` and `version_id` arguments are ignored on this path
+    ///   (no row exists yet). `owner` and `meta` are required;
+    ///   `backend_id` is optional and falls back to
+    ///   `default_private`.
+    /// - `file_id = Some(id)`: variant-B re-upload — same `file_id`,
+    ///   same backend object key. The row's CURRENT metadata is
+    ///   preserved (the `meta` argument is ignored on this path).
+    ///   `etag` and `version_id` act as optional CAS pins:
+    ///   - `etag = Some(e)` → mismatch returns `EtagMismatch`.
+    ///   - `version_id = Some(v)` (when S3 versioning is enabled) →
+    ///     mismatch returns `EtagMismatch` (closes the ABA window
+    ///     on bit-identical re-uploads). On backends without S3 versioning
+    ///     backends `version_id = Some(_)` is a null-safe mismatch
+    ///     against the row's `None` and returns `EtagMismatch`
+    ///     immediately.
+    ///   - Both pins compose; the strongest CAS uses both.
     async fn put_file(
         &self,
         ctx: &SecurityContext,
+        file_id: Option<FileId>,
         backend_id: Option<BackendId>,
         owner: OwnerRef,
-        file_path: &str,
         meta: FileMeta,
         bytes: FileByteStream,
         etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
     ) -> Result<FileInfo, FileStorageError>;
 
     // ── Presigned download URLs (batch-first) ──────────────────────
@@ -1200,15 +1446,15 @@ pub trait FileStorageClient: Send + Sync {
     /// (`cpt-cf-file-storage-constraint-presigned-download-headers-from-db`).
     ///
     /// **Public-read backends** — when the per-item `capability` is
-    /// `download_public.v1` and the resolved backend declares that
+    /// `download.s3.public.v1` and the resolved backend declares that
     /// tag (typically paired with `default_public = true`), the
     /// outcome carries `is_public = true` and a bare HTTPS URL with
-    /// no expiry. SigV4 GET URLs (`download_private.sigv4_v1`) are
+    /// no expiry. SigV4 GET URLs (`download.s3.sigv4.v1`) are
     /// returned for
     /// every other backend.
     ///
     /// **Historical version GET** — when the hosting backend has
-    /// `versioning = true` and the caller passes
+    /// S3 versioning enabled and the caller passes
     /// `PresignDownloadItem.version_id`, the signed URL embeds
     /// `versionId=<vid>` and resolves to the requested historical
     /// generation.
@@ -1230,20 +1476,20 @@ pub trait FileStorageClient: Send + Sync {
 }
 ```
 
-## Internal Adapter Trait — `StorageBackend`
+## Internal S3 Adapter — `pub(crate) struct S3Backend`
 
-Lives inside the implementation crate (`file-storage/src/infra/backend.rs`), not in the public SDK. Captured here so implementers can plan the split described in DESIGN §3.2.
+Lives inside the implementation crate (`file-storage/src/infra/s3_backend.rs`), not in the public SDK. **Concrete struct, no trait** — `S3Backend` is the single backend kind on the architectural roadmap (S3-only invariant, DESIGN §1.1) so the trait abstraction served only as a unit-test seam, and that role is covered by integration tests against `s3s-fs` running as a child process (DESIGN §4 Testing strategy). The earlier `StorageBackend: Send + Sync` trait has been removed; `Backend Router` holds `Arc<S3Backend>` directly.
 
-The adapter trait is the seam between the FileStorage core (which owns the `file_storage` SQL schema, the lifecycle write paths in REST handlers and the in-process `put_file` SDK, and authz integration) and a concrete byte store. It deliberately does **not** know about `file_id`, `OwnerRef`, or authz — those are resolved one layer up. The adapter only ever sees a `BackendObjectKey` (an opaque `String` minted by the core) and bytes. It also does NOT know about `gts_file_type` — that field is DB-only and never crosses the adapter boundary.
+Documented here so implementers can match the SQL-side contract (transient-state recovery, strong-CAS, presigned URLs).
+
+The adapter is the seam between the FileStorage core (which owns the `file_storage` SQL schema, the lifecycle write paths in the SDK facade and the in-process `put_file` SDK, and authz integration) and the S3-compatible byte store. It deliberately does **not** know about `file_id`, `OwnerRef`, or authz — those are resolved one layer up. The adapter only ever sees a `BackendObjectKey` (an opaque `String` minted by the core, derived deterministically from `file_id` per ADR-0002) and bytes. It also does NOT know about `gts_file_type` — that field is DB-only and never crosses the adapter boundary.
 
 ```rust
-use async_trait::async_trait;
 use bytes::Bytes;
 
-/// Opaque per-backend object key, minted by the FileStorage core. For
-/// `s3-compatible` backends it is derived deterministically from the
-/// file's `file_id` (per ADR-0002). The adapter treats it as an opaque
-/// string.
+/// Opaque per-backend object key, minted by the FileStorage core,
+/// derived deterministically from the file's `file_id` (per ADR-0002).
+/// The adapter treats it as an opaque string.
 pub type BackendObjectKey = String;
 
 /// Backend-side metadata returned by `head_object` and by the
@@ -1272,54 +1518,89 @@ pub struct PinnedObjectHeaders {
     pub user_metadata: BTreeMap<String, String>,
 }
 
-#[async_trait]
-pub trait StorageBackend: Send + Sync {
-    fn descriptor(&self) -> &Backend;
+/// The single S3-compatible adapter. Holds the `aws-sdk-s3` client,
+/// the configured `Backend` descriptor, and signing secrets. Wired
+/// once at module init, kept behind `Arc<S3Backend>` for cheap clone.
+pub(crate) struct S3Backend {
+    client: aws_sdk_s3::Client,
+    descriptor: Backend,
+    // signing secrets / endpoint / region — held internally
+}
 
-    /// Stream the object's bytes. Returned stream MUST yield chunks
-    /// in arrival order from the backend; the FileStorage layer
-    /// adds the `FileInfo` snapshot from its own database. The
-    /// metadata struct is captured from the GET response headers so
-    /// the SDK facade can run in-band recovery for rows stuck in
-    /// transient states without an extra HEAD round-trip.
-    async fn open_read(
+impl S3Backend {
+    pub(crate) fn descriptor(&self) -> &Backend { &self.descriptor }
+
+    /// Stream the object's bytes, optionally constrained to a byte
+    /// range. Returned stream MUST yield chunks in arrival order
+    /// from the backend; the FileStorage layer adds the `FileInfo`
+    /// snapshot from its own database. The metadata struct is
+    /// captured from the GET response headers so the SDK facade can
+    /// run in-band recovery for rows stuck in transient states
+    /// without an extra HEAD round-trip.
+    ///
+    /// `range = Some(_)` adds an HTTP `Range: bytes=...` header to
+    /// the backend `GetObject` and returns `Some(ResolvedByteRange)`
+    /// alongside the metadata, mirroring the backend's
+    /// `Content-Range` response. `range = None` is a full-object
+    /// read with `range_resolved = None`.
+    pub(crate) async fn open_read(
         &self,
         key: &BackendObjectKey,
-    ) -> Result<(FileByteStream, BackendObjectMetadata), FileStorageError>;
+        range: Option<ByteRange>,
+    ) -> Result<(FileByteStream, BackendObjectMetadata, Option<ResolvedByteRange>), FileStorageError>;
 
     /// Read backend-side metadata without streaming the body. Used
-    /// by `reconcile` and by the strong-CAS variant of
+    /// by transient-state recovery and by the strong-CAS variant of
     /// `put_file_info` to verify S3's live etag/version_id.
-    async fn head_object(
+    pub(crate) async fn head_object(
         &self,
         key: &BackendObjectKey,
     ) -> Result<BackendObjectMetadata, FileStorageError>;
 
-    async fn delete_object(
+    pub(crate) async fn delete_object(
         &self,
         key: &BackendObjectKey,
     ) -> Result<(), FileStorageError>;
 
-    /// Issue a presigned PUT URL (per ADR-0003 — SigV4 PUT). Pins
-    /// `Content-Type`, `Content-Disposition`, and every
-    /// `x-amz-meta-<k>` header from the supplied
-    /// `PinnedObjectHeaders` into the SigV4 SignedHeaders set.
-    /// FileStorage NEVER pins `x-amz-meta-gts-file-type` here — it
-    /// is DB-only.
-    async fn issue_presigned_put(
+    /// Initiate a multipart upload session and presign N `UploadPart`
+    /// PUT URLs (per ADR-0003 — SigV4 PUT). Pins `Content-Type`,
+    /// `Content-Disposition`, and every `x-amz-meta-<k>` header from
+    /// the supplied `PinnedObjectHeaders` into the SigV4
+    /// SignedHeaders set on every part URL. FileStorage NEVER pins
+    /// `x-amz-meta-gts-file-type` here — it is DB-only.
+    pub(crate) async fn create_multipart_and_presign_parts(
         &self,
         key: &BackendObjectKey,
         pinned: &PinnedObjectHeaders,
+        part_count: u32,
         params: &UrlParams,
-    ) -> Result<(String /* upload_url */, OffsetDateTime /* expires_at */), FileStorageError>;
+    ) -> Result<(String /* upload_id */, Vec<UploadPartUrl>, OffsetDateTime), FileStorageError>;
+
+    /// Finalize a multipart upload session — calls
+    /// `CompleteMultipartUpload` on the backend with the supplied
+    /// `(part_number, etag)` list and returns the finalized
+    /// `(s3_etag, s3_version_id)`.
+    pub(crate) async fn complete_multipart(
+        &self,
+        key: &BackendObjectKey,
+        upload_id: &str,
+        parts: &[UploadPartCompletion],
+    ) -> Result<(String, Option<String>), FileStorageError>;
+
+    /// Abort a multipart upload session.
+    pub(crate) async fn abort_multipart(
+        &self,
+        key: &BackendObjectKey,
+        upload_id: &str,
+    ) -> Result<(), FileStorageError>;
 
     /// `CopyObject self-copy` with `MetadataDirective: REPLACE` —
     /// rotates the object's user-metadata in place. When `if_match`
     /// is `Some(e)`, the request carries
     /// `x-amz-copy-source-if-match: e` and the backend rejects
     /// stale sources with `412`. Returns the new `s3_etag` and the
-    /// new `s3_version_id` (if versioning is on).
-    async fn copy_object_self(
+    /// new `s3_version_id` (if S3 versioning is enabled).
+    pub(crate) async fn copy_object_self(
         &self,
         key: &BackendObjectKey,
         new_pinned: &PinnedObjectHeaders,
@@ -1331,10 +1612,10 @@ pub trait StorageBackend: Send + Sync {
     /// inside the outcome vector. The adapter sets
     /// `response-content-type` and `response-content-disposition`
     /// query params from the per-item hints (sourced from DB).
-    /// For per-item capability `download_public.v1` (declared by the
+    /// For per-item capability `download.s3.public.v1` (declared by the
     /// backend), the adapter returns a bare-HTTPS URL with no signing
     /// (`is_public = true`).
-    async fn issue_presigned_gets(
+    pub(crate) async fn issue_presigned_gets(
         &self,
         items: Vec<PresignedGetItem>,
     ) -> Result<Vec<PresignedGetOutcome>, FileStorageError>;
@@ -1346,9 +1627,10 @@ pub struct PresignedGetItem {
     pub params: UrlParams,
     pub mime_type_hint: String,
     pub display_name_hint: String,
-    /// When `Some` and the adapter's backend has `versioning =
-    /// true`, the signed URL embeds `versionId=<vid>` so the
-    /// caller fetches that historical generation.
+    /// When `Some` and the chosen capability is a `*.versioned.*`
+    /// variant (i.e. the bucket has S3 versioning enabled), the
+    /// signed URL embeds `versionId=<vid>` so the caller fetches
+    /// that historical generation.
     pub version_id: Option<String>,
 }
 
@@ -1391,7 +1673,6 @@ let meta = FileMeta {
     name: "plan.pdf".into(),
     mime_type: "application/pdf".into(),
     gts_file_type: "gts.cf.fstorage.file.type.v1~vendor.docmgmt.reports.file.v1~".into(),
-    size_bytes: Some(18_274),
     custom_metadata: BTreeMap::new(),
 };
 let handle = files
@@ -1400,9 +1681,8 @@ let handle = files
         Some(s3_prod_backend_id),  // or None to land on the tenant's default_private backend
         None,                      // None = initial upload; Some(file_id) = re-upload
         owner.clone(),
-        "chat/threads/abc/plan.pdf",
         meta,
-        &"upload.multipart_v1".to_string(),
+        &"upload.s3.multipart.sigv4.v1".to_string(),
         1,                         // part_count — 1 for small files (single last-part upload)
         UrlParams {
             expires_in_seconds: 600,
@@ -1410,6 +1690,8 @@ let handle = files
             content_type_override: None,
             allowed_client_cidrs: vec![],
         },
+        None,                      // etag pin — initial upload, no row to pin
+        None,                      // version_id pin — initial upload, no row to pin
     )
     .await?;
 // Frontend PUTs each part to handle.part_urls[i].url; collects (part_number, etag).
@@ -1427,18 +1709,18 @@ let info = files
     )
     .await?;
 // `info.etag` is the raw S3 ETag for the finalized object; `info.version_id`
-// matches whatever S3 returned (None on non-versioning backends).
+// matches whatever S3 returned (None on backends without S3 versioning).
 
 // 3. Later, another module asks for downloadable URLs. The URL is
 //    SigV4-signed (or a bare HTTPS URL if the file lives in a
-//    download_public.v1-capable backend) and time-limited per
+//    download.s3.public.v1-capable backend) and time-limited per
 //    `params.expires_in_seconds`.
 let outcomes = files
     .presign_urls(
         &ctx,
         vec![PresignDownloadItem {
             file_id: info.file_id,
-            capability: "download_private.sigv4_v1".to_string(),
+            capability: "download.s3.sigv4.v1".to_string(),
             params: UrlParams {
                 expires_in_seconds: 300,
                 content_disposition: None,
@@ -1465,9 +1747,8 @@ let handle = files
         None,                          // backend_id ignored on re-upload
         Some(existing_file_id),        // re-upload mode
         owner.clone(),                 // ignored on re-upload
-        "",                            // ignored on re-upload
         FileMeta::default(),           // ignored on re-upload — server pins the row's CURRENT meta
-        &"upload.multipart_v1".to_string(),
+        &"upload.s3.multipart.sigv4.v1".to_string(),
         4,                             // 4-part upload
         UrlParams {
             expires_in_seconds: 600,
@@ -1475,6 +1756,8 @@ let handle = files
             content_type_override: None,
             allowed_client_cidrs: vec![],
         },
+        Some(&pinned_etag),            // CAS pin: only proceed if row's etag still matches
+        pinned_version_id.as_ref(),    // ABA-safe pin (backends with S3 versioning enabled): both must match
     )
     .await?;
 // Frontend PUTs each part to handle.part_urls[i].url with the headers
@@ -1490,7 +1773,7 @@ let info = files
 ```rust
 use futures::StreamExt;
 
-let mut handle = files.read_file(&ctx, file_id, Some(&etag)).await?;
+let mut handle = files.read_file(&ctx, file_id, Some(&etag), None, None).await?;
 println!("downloading {} ({} bytes)", handle.info.meta.name, handle.info.size_bytes);
 while let Some(chunk) = handle.bytes.next().await {
     let chunk = chunk?;
@@ -1503,22 +1786,22 @@ while let Some(chunk) = handle.bytes.next().await {
 | OpenAPI operationId | Trait method | Request type | Response type |
 |---------------------|--------------|--------------|---------------|
 | `listBackends` | `list_backends` | — | `Vec<Backend>` |
-| `presignBatch` (upload item) | `create_presigned_upload` | `Option<BackendId> + Option<FileId> + OwnerRef + file_path + FileMeta + capability + part_count + UrlParams` | `PresignedUploadHandle` |
+| `presignBatch` (upload item) | `create_presigned_upload` | `Option<BackendId> + Option<FileId> + OwnerRef + FileMeta + capability + part_count + UrlParams + Option<Etag> + Option<VersionId>` | `PresignedUploadHandle` |
 | `presignBatch` (download item) | `presign_urls` | `Vec<PresignDownloadItem>` | `Vec<PresignDownloadOutcome>` |
 | `completeUpload` | `complete_upload` | `FileId + upload_id + Vec<UploadPartCompletion>` | `FileInfo` |
 | `abortUpload` | `abort_upload` | `FileId + upload_id` | `()` |
-| `getFile` | `get_file_info` | `Option<Etag>` | `FileInfo` |
-| `updateFile` | `put_file_info` | `FileMetaUpdate + Option<Etag>` | `FileInfo` |
-| `deleteFile` | `delete_file` | `Option<Etag>` | `()` |
+| `getFile` | `get_file_info` | `Option<Etag> + Option<VersionId>` | `FileInfo` |
+| `updateFile` | `put_file_info` | `FileMetaUpdate + Option<Etag> + Option<VersionId>` | `FileInfo` |
+| `deleteFile` | `delete_file` | `Option<Etag> + Option<VersionId>` | `()` |
 | `listFiles` | `list_files` | `ListFilesQuery` | `FileList` |
-| — (in-process SDK only, no REST) | `read_file` | `Option<Etag>` | `FileReadHandle` (streaming) |
-| — (in-process SDK only, no REST) | `put_file` | `OwnerRef + file_path + FileMeta + FileByteStream + Option<Etag>` | `FileInfo` |
+| — (in-process SDK only, no REST) | `read_file` | `Option<Etag> + Option<VersionId>` | `FileReadHandle` (streaming) |
+| — (in-process SDK only, no REST) | `put_file` | `Option<FileId> + Option<BackendId> + OwnerRef + FileMeta + FileByteStream + Option<Etag> + Option<VersionId>` | `FileInfo` |
 
 ## Trait Hierarchy Summary
 
 | Trait | Methods | Consumers | ClientHub key |
 |-------|---------|-----------|---------------|
 | `FileStorageClient` | 11 (full P1 surface: backends, single canonical upload via `create_presigned_upload` + `complete_upload` / `abort_upload`, batched presigned downloads, file lifecycle including `put_file_info` (2-phase) and `delete_file` (2-phase), streaming I/O including the in-process direct-upload `put_file`) | CyberFabric modules via ClientHub, REST adapter | `dyn FileStorageClient` |
-| `StorageBackend` (internal) | 6 (adapter boundary; `head_object` is required by transient-state recovery (`Completing` / `MetaUpdating`) and the strong-CAS variant of `put_file_info`; `copy_object_self` is required by `put_file_info`'s DB+S3 sync; presigned URLs are batch-first on the GET side, presigned per part on the PUT side via `CreateMultipartUpload`) | `BackendRouter`, REST endpoint handlers (`presign-batch`, `complete`, `abort`, `delete`, `put_file_info`) and the in-process `put_file` / `read_file` SDK paths | — (not registered in ClientHub) |
+| `S3Backend` (internal `pub(crate) struct`, no trait) | 8 methods (adapter boundary; `head_object` is required by transient-state recovery (`Completing` / `MetaUpdating`) and the strong-CAS variant of `put_file_info`; `copy_object_self` is required by `put_file_info`'s DB+S3 sync; multipart upload via `create_multipart_and_presign_parts` / `complete_multipart` / `abort_multipart`; presigned downloads batch-first via `issue_presigned_gets`) | `BackendRouter` and the SDK facade methods (`create_presigned_upload`, `complete_upload`, `abort_upload`, `delete_file`, `put_file_info`, `read_file`, `put_file`) | — (not exposed in SDK) |
 
-The 11 SDK methods are: `list_backends`, `create_presigned_upload`, `complete_upload`, `abort_upload`, `get_file_info`, `put_file_info`, `delete_file`, `list_files`, `read_file`, `put_file`, `presign_urls` (REST counterpart `presign-batch` carries upload and download items together; `complete_upload` / `abort_upload` are dedicated REST endpoints under `/files/{file_id}/upload/{upload_id}`). The internal adapter declares `open_read`, `head_object`, `delete_object`, `issue_presigned_put`, `copy_object_self`, and `issue_presigned_gets`.
+The 11 SDK methods are: `list_backends`, `create_presigned_upload`, `complete_upload`, `abort_upload`, `get_file_info`, `put_file_info`, `delete_file`, `list_files`, `read_file`, `put_file`, `presign_urls` (in P2 also exposed over REST: `presign-batch` carries upload and download items together; `complete_upload` / `abort_upload` are dedicated REST endpoints under `/files/{file_id}/upload/{upload_id}`). The internal `S3Backend` struct declares `open_read`, `head_object`, `delete_object`, `create_multipart_and_presign_parts`, `complete_multipart`, `abort_multipart`, `copy_object_self`, and `issue_presigned_gets`.
