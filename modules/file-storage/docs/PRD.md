@@ -1,5 +1,59 @@
 # PRD — File Storage
 
+<!-- toc -->
+
+- [1. Overview](#1-overview)
+  - [1.1 Purpose](#11-purpose)
+  - [1.2 Background / Problem Statement](#12-background--problem-statement)
+  - [1.3 Goals (Business Outcomes)](#13-goals-business-outcomes)
+  - [1.4 Success Metrics](#14-success-metrics)
+  - [1.5 Glossary](#15-glossary)
+- [2. Actors](#2-actors)
+  - [2.1 Human Actors](#21-human-actors)
+  - [2.2 System Actors](#22-system-actors)
+- [3. Operational Concept & Environment](#3-operational-concept--environment)
+  - [3.1 Module-Specific Environment Constraints](#31-module-specific-environment-constraints)
+- [4. Scope](#4-scope)
+  - [4.1 In Scope](#41-in-scope)
+  - [4.2 Out of Scope](#42-out-of-scope)
+- [5. Functional Requirements](#5-functional-requirements)
+  - [5.1 Core File Operations](#51-core-file-operations)
+  - [5.2 Ownership & Access Control](#52-ownership--access-control)
+  - [5.3 Link Management & Sharing](#53-link-management--sharing)
+  - [5.4 Direct-to-Backend Transfer](#54-direct-to-backend-transfer)
+  - [5.5 Policies (Phase 2)](#55-policies-phase-2)
+  - [5.6 Metadata](#56-metadata)
+  - [5.7 File Retention & Lifecycle](#57-file-retention--lifecycle)
+  - [5.8 Audit](#58-audit)
+  - [5.9 Pluggable Storage Backends](#59-pluggable-storage-backends)
+  - [5.10 Access Interfaces](#510-access-interfaces)
+  - [5.11 Cache & Idempotency](#511-cache--idempotency)
+- [6. Non-Functional Requirements](#6-non-functional-requirements)
+  - [6.1 Module-Specific NFRs](#61-module-specific-nfrs)
+  - [6.2 NFR Exclusions](#62-nfr-exclusions)
+  - [6.3 Applicability Notes](#63-applicability-notes)
+- [7. Public Library Interfaces](#7-public-library-interfaces)
+  - [7.1 Public API Surface](#71-public-api-surface)
+  - [7.2 External Integration Contracts](#72-external-integration-contracts)
+- [8. Use Cases](#8-use-cases)
+  - [Upload and Share a File](#upload-and-share-a-file)
+  - [Fetch File for Module Processing](#fetch-file-for-module-processing)
+  - [Generate and Access Signed URL](#generate-and-access-signed-url)
+  - [Validate File Metadata Before Processing](#validate-file-metadata-before-processing)
+  - [Direct Upload from External Client](#direct-upload-from-external-client)
+  - [Delete a File](#delete-a-file)
+  - [Manage Shareable Links](#manage-shareable-links)
+  - [Multi-Backend Deployment](#multi-backend-deployment)
+  - [Configure Policy](#configure-policy)
+- [9. Acceptance Criteria](#9-acceptance-criteria)
+- [10. Dependencies](#10-dependencies)
+- [11. Assumptions](#11-assumptions)
+- [12. Risks](#12-risks)
+- [13. Open Questions](#13-open-questions)
+- [14. Traceability](#14-traceability)
+
+<!-- /toc -->
+
 ## 1. Overview
 
 ### 1.1 Purpose
@@ -206,22 +260,29 @@ filtering prevents unbounded queries across all files and aligns with the owners
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
 
-The system **MUST** support multipart (chunked) upload for large files. Multipart upload requires the multipart
-upload backend capability (`cpt-cf-file-storage-fr-backend-capabilities`). A multipart upload **MUST**:
+The system **MUST** support multipart (chunked) upload for large files. Multipart upload is delivered in P1 because
+the only P1 backend kind — `s3-compatible` — exposes multipart natively (S3 `CreateMultipartUpload` /
+`UploadPart` / `CompleteMultipartUpload`). FileStorage surfaces this through the same presign-first contract used
+for single-part uploads (each part gets a presigned PUT URL; finalization is `change_status` once all parts are
+acknowledged). A multipart upload **MUST**:
 
 - Allow the client to split a file into multiple parts and upload them independently
 - Support resumable uploads — if a part fails, only that part needs re-uploading
 - Assemble parts into a complete file upon finalization
 - Apply the same authorization, metadata, and audit requirements as single-part uploads
 
-For backends that do not declare the multipart upload capability, the system **MUST** reject multipart upload requests
-with a clear error indicating the capability is unavailable. There is no FileStorage-level fallback for multipart —
-clients must use single-part upload for backends without native multipart support.
+Multipart support is gated by the `cpt-cf-file-storage-fr-backend-capabilities` capability declaration. Every
+S3-compatible backend declares it and is expected to honour it. Future non-S3 backend kinds (e.g. the P3 `webdav`
+proxy adapter) may or may not gain multipart support; the work is deferred to "far future / never" because protocols
+without native multipart (WebDAV, plain HTTP PUT) cannot be retrofitted at the FileStorage layer without full content
+buffering, which negates multipart's scalability benefits. Backends that do not declare the capability **MUST**
+reject multipart requests with `CapabilityUnavailable`; clients fall back to single-part upload.
 
 **Rationale**: Single-request uploads are impractical for large files (video, datasets, backups) due to timeouts,
-memory constraints, and network reliability. Multipart upload enables reliable transfer of arbitrarily large files.
-Implementing multipart at the FileStorage layer without backend support would require full content buffering, negating
-the scalability benefits. Rejecting with a clear error lets clients adapt their upload strategy per backend.
+memory constraints, and network reliability. Multipart enables reliable transfer of arbitrarily large files and
+ships in P1 by virtue of S3 multipart being free at the adapter layer. Buffering parts in FileStorage to emulate
+multipart on a non-multipart backend would re-introduce the very memory/throughput costs multipart is designed to
+avoid; rejecting with a clear error lets clients adapt their strategy per backend.  
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Content-Type Validation

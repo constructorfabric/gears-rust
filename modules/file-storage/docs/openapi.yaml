@@ -1,0 +1,1059 @@
+# Created: 2026-04-20 by Constructor Tech
+
+openapi: 3.1.0
+info:
+  title: File Storage API
+  version: 5.0.0-p1
+  description: |
+    File Storage REST API — P1 surface. Mirrors the
+    `FileStorageClient` SDK trait 1:1 (see
+    [rust-traits.md](./rust-traits.md)).
+
+    ## Lifecycle
+
+    1. The application's own backend posts a single-item upload to
+       `POST /presign-batch` (`kind: "upload"`, no `file_id`) and gets
+       back `(file_id, upload_url, etag_pinned, expires_at)`. The
+       FileStorage row is created in `pending_upload` status.
+    2. The end-client uploads bytes directly to the storage backend
+       (S3-compatible) using the presigned URL.
+    3. The application's backend confirms the upload via
+       `POST /files/{file_id}/meta/reconcile`. FileStorage HEADs
+       the backend, pulls the authoritative `s3_etag` /
+       `s3_version_id` and the user-visible metadata mirror
+       (Content-Type, Content-Disposition, every `x-amz-meta-<k>`),
+       and writes the row in one atomic step. The response carries
+       the post-reconcile `FileInfo` plus the raw `s3_etag` and
+       `s3_version_id`.
+
+    Re-uploading the same file uses the same `POST /presign-batch`
+    endpoint with `kind: "upload"` and `file_id` set. The request
+    item MUST NOT carry `meta` — the server pins the row's current
+    metadata into the presigned PUT.
+
+    Reads:
+    - `GET /files/{file_id}/meta` — authoritative metadata (no
+      bytes).
+    - `POST /presign-batch` (`kind: "download"`) — batch of presigned
+      download URLs. All byte downloads in P1 flow client ↔ storage
+      backend directly via presigned URLs (or, for files in
+      public-read backends, bare HTTPS URLs); FileStorage never
+      proxies content over its REST surface.
+
+    Mutations:
+    - `PUT /files/{file_id}/meta` — atomic DB + S3 metadata sync via
+      `CopyObject` self-copy (`MetadataDirective: REPLACE`). Body
+      declares `name`, `mime_type`, `custom_metadata` only —
+      `gts_file_type` is structurally immutable. `If-Match` is
+      optional; when supplied it becomes a strong CAS over both DB
+      and S3 (HEAD-then-CopyObject with `x-amz-copy-source-if-match`).
+    - `POST /files/{file_id}/meta/reconcile` — explicit
+      reconciliation. **Rejects** `If-Match` with `400`. Empty body.
+    - `DELETE /files/{file_id}` — 2-phase hard delete with a
+      transient `deleting` status. `If-Match` is optional.
+
+    ## Addressing
+
+    External addresses are opaque `file_id` (UUID) — see ADR-0002.
+    `tenant_id` is read from the caller's bearer token
+    (`SecurityContext`) and never appears in the URL. A `file_id`
+    from another tenant returns `404 not_found` so the API does not
+    act as an enumeration oracle. Backends are addressed by
+    `backend_id` (UUID), assigned once in the static TOML roster.
+
+    ## Authentication
+
+    `bearerAuth` everywhere. FileStorage never parses tokens —
+    identity arrives via ModKit middleware as `SecurityContext`.
+    Presigned PUT / GET URLs are signed by the backend (S3 SigV4)
+    and validated by the backend; FileStorage does not authenticate
+    the byte transfers themselves. Public-read URLs (issued for
+    files in `PublicReadUrls`-capable backends with `default_public
+    = true`) are bare HTTPS URLs with no signing or expiry.
+
+    ## Conditional requests
+
+    - `PUT /files/{file_id}/meta` — `If-Match` is **optional**;
+      when supplied it becomes a strong CAS over both DB and S3.
+    - `DELETE /files/{file_id}` — `If-Match` is **optional**; when
+      supplied it gates Phase 1 of the 2-phase delete.
+    - `POST /files/{file_id}/meta/reconcile` — `If-Match` is
+      **rejected** with `400 bad_request`. `reconcile` IS the
+      explicit reconciliation primitive.
+    - `GET /files/{file_id}/meta` — `If-None-Match` is supported
+      and yields `304 Not Modified` when the etag matches.
+
+    Mismatch on a supplied `If-Match` returns `412 etag_mismatch`.
+
+    ## User-metadata budget
+
+    AWS S3 caps aggregate user-metadata at 2 KB (Content-Type +
+    Content-Disposition + every `x-amz-meta-<k>=<v>`). FileStorage
+    enforces the same cap at presign and at `PUT /meta`; oversize
+    requests return `413 payload_too_large` with the
+    `max_metadata_bytes` extension. `gts_file_type` does NOT count
+    toward the budget — it is DB-only.
+
+    ## Errors
+
+    RFC 7807 `application/problem+json` via the `ProblemDetails`
+    schema, with extensions `code`, `correlation_id`, and
+    (for `payload_too_large`) `max_metadata_bytes`.
+
+servers:
+  - url: /api/file-storage/v1
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Backends
+    description: Backend roster.
+  - name: Files
+    description: File lifecycle operations (delete).
+  - name: FilesMeta
+    description: File metadata read, replace, and HEAD-reconcile.
+  - name: Presign
+    description: Batch presigned URL issuance (upload + download).
+
+paths:
+
+  /storages:
+    get:
+      operationId: listBackends
+      tags: [Backends]
+      summary: List backends visible to the caller's tenant
+      description: |
+        Returns the roster filtered by the caller's tenant access
+        list. At least one backend per tenant view is flagged
+        `default_private = true`. Backends with `PublicReadUrls`
+        capability and `default_public = true` are surfaced too.
+      responses:
+        '200':
+          description: Backend roster.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Backend' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /files:
+    get:
+      operationId: listFiles
+      tags: [Files]
+      summary: Paginated owner-scoped file listing
+      description: |
+        Returns files visible to the caller in the current tenant.
+        Authorization on the `owner_id` filter is applied by the
+        AuthZ layer — callers without the right scope see only their
+        own files even if they request a wider filter.
+
+        Sort order is fixed to `created_at DESC, id ASC`. Other
+        filters (`mime_type`, `gts_file_type`, date range,
+        `backend_id`) are deferred to P2.
+      parameters:
+        - in: query
+          name: owner_id
+          required: false
+          description: |
+            Filter by owner principal UUID. When omitted the server
+            returns the caller's own files (the default safe scope).
+          schema: { type: string, format: uuid }
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200 }
+      responses:
+        '200':
+          description: Paginated file list.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /files/{file_id}/meta:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    get:
+      operationId: getFileMeta
+      tags: [FilesMeta]
+      summary: Get authoritative file metadata
+      description: |
+        Returns the FileStorage SQL row as the authoritative
+        metadata view. The storage backend is **not** consulted —
+        per ADR-0001 the SQL row is the source of truth for reads.
+
+        Optional `If-None-Match` allows the caller to skip the body
+        when the row's etag has not changed.
+      parameters:
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: File metadata.
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileInfo' }
+        '304':
+          description: Not Modified.
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+    put:
+      operationId: updateFileMeta
+      tags: [FilesMeta]
+      summary: Atomic DB + S3 metadata sync (CopyObject REPLACE)
+      description: |
+        Replaces the mutable subset of `FileMeta`: `name`,
+        `mime_type`, `custom_metadata`. Omitted fields keep their
+        current value; fields present overwrite them. There is no
+        separate PATCH endpoint.
+
+        **Body must NOT include `gts_file_type`** — it is
+        structurally immutable (the field is not declared on
+        `FileMetaUpdate`). Any request that carries that field is
+        rejected with `400 bad_request`. System-managed fields
+        (`size_bytes`, `etag`, `version_id`, timestamps, owner,
+        `backend_id`, `file_path`) are likewise immutable and not
+        exposed here.
+
+        **DB + S3 atomic sync.** The server merges the update,
+        validates the 2 KB user-metadata budget (error: `413
+        payload_too_large`), then issues a `CopyObject` self-copy
+        on the file's backend object with
+        `MetadataDirective: REPLACE` and the new headers
+        (`Content-Type` from `mime_type`, `Content-Disposition` from
+        `name`, `x-amz-meta-<k>` for every entry in
+        `custom_metadata`). The S3 response carries the new ETag
+        and (versioning-on backends only) the new VersionId; both
+        are written into the row in a single conditional UPDATE.
+
+        Status transitions are NOT driven through this endpoint —
+        `pending_upload → uploaded` is the responsibility of
+        `POST /files/{file_id}/meta/reconcile`.
+
+        **`If-Match` is OPTIONAL.** When supplied it becomes a
+        strong CAS over both stores: the server first verifies
+        `DB.etag == If-Match`, then HEADs S3 to verify the live
+        `s3_etag` (and, on versioning-on backends, `s3_version_id`)
+        match the row, then issues `CopyObject` with
+        `x-amz-copy-source-if-match` set. Mismatch at any of the
+        three checkpoints returns `412 etag_mismatch`. When omitted
+        the call is best-effort last-write-wins on metadata
+        (`cpt-cf-file-storage-constraint-no-meta-cas`).
+      parameters:
+        - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileMetaUpdate' }
+      responses:
+        '200':
+          description: Update applied.
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileInfo' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            The row is in the transient `deleting` status (Phase 1
+            of the 2-phase delete). The `code` is
+            `delete_in_progress`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '412': { $ref: '#/components/responses/EtagMismatch' }
+        '413':
+          description: |
+            Aggregate user-metadata exceeds 2 KB. The `code` is
+            `payload_too_large`; the response body extension
+            `max_metadata_bytes` reports the cap.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '502':
+          description: |
+            Backend `CopyObject` failed (network, 5xx, or other).
+            The `code` is `backend_failure`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /files/{file_id}/meta/reconcile:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    post:
+      operationId: reconcileFileMeta
+      tags: [FilesMeta]
+      summary: HEAD the backend and reconcile the row's etag + metadata
+      description: |
+        Explicit reconciliation primitive. FileStorage runs HEAD
+        against the storage backend, captures the authoritative
+        `s3_etag`, `s3_version_id`, `Content-Type`,
+        `Content-Disposition`, and every `x-amz-meta-<k>` header,
+        and updates the row in one atomic step:
+
+        - On a `pending_upload` row: commits to `uploaded`. Pulls
+          the etag, version_id, content type, content disposition,
+          custom metadata, and content length from the HEAD
+          response into the row.
+        - On an `uploaded` row: drift correction. Same pull as
+          above. The row converges to whatever S3 currently holds.
+        - On a `deleting` row: returns `409 delete_in_progress`.
+
+        `gts_file_type` is NEVER pulled from S3 — it is DB-only,
+        the field is preserved as-is on the row.
+
+        **`If-Match` header is rejected with `400 bad_request`.**
+        `reconcile` is the explicit reconciliation command — it
+        always reads S3 first, then writes the row. Adding a
+        precondition would make `reconcile` itself fail under
+        exactly the conditions where it is most useful.
+
+        The request body MUST be empty.
+
+        The endpoint is concurrent-safe by construction: multiple
+        concurrent `reconcile` calls converge on the same
+        post-reconcile state. The first to land the conditional
+        UPDATE wins; the others observe `0` rows affected,
+        re-SELECT, see the row already converged, and return the
+        same `Ok`. After 3 unsuccessful attempts the call returns
+        `409 conflict` with a correlation_id for diagnostics.
+
+        The response carries the raw `s3_etag` and the raw
+        `s3_version_id` (or `null` on non-versioning backends)
+        alongside the updated `FileInfo`. Clients can compare the
+        raw etag against what S3 returned on their PUT to detect
+        race-loser scenarios.
+      responses:
+        '200':
+          description: Row reconciled.
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconcileResponse' }
+        '400':
+          description: |
+            Request validation failed. The `code` is `bad_request`.
+            Notable cases: `If-Match` header was supplied; request
+            body was non-empty.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            Either the row is in the transient `deleting` status
+            (`code = delete_in_progress`) or the conditional UPDATE
+            failed three times under concurrent contention
+            (`code = conflict`).
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '410':
+          description: |
+            The presigned URL TTL elapsed before `reconcile`
+            arrived; the row was still `pending_upload`. The `code`
+            is `upload_expired`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '502':
+          description: |
+            Backend HEAD failed (network, 5xx, or object missing).
+            The `code` is `backend_failure`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /files/{file_id}:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    delete:
+      operationId: deleteFile
+      tags: [Files]
+      summary: 2-phase hard-delete a file
+      description: |
+        Removes the metadata row and the backend object in a
+        2-phase flow:
+
+        1. **Phase 1 — claim the row.** Conditional UPDATE flips
+           `status` from `uploaded` to the transient `deleting`.
+           When `If-Match` is supplied, the predicate also requires
+           `etag = <If-Match>`; mismatch returns `412 etag_mismatch`.
+           Without `If-Match` the delete is best-effort
+           last-write-wins (still gated by `status = 'uploaded'`).
+           A row already in `deleting` returns
+           `409 delete_in_progress`.
+        2. **Phase 2 — backend cleanup.** FileStorage issues
+           `DELETE` on the backend object (idempotent on S3) with
+           up to 3 inline retries on transient failure. On
+           persistent failure: leave the row in `deleting`, return
+           `502 backend_failure`. Subsequent reads return
+           `404 not_found`; the P2 GC sweep retries.
+        3. **Phase 3 — purge the row.** `DELETE FROM files WHERE id
+           = $file_id AND status = 'deleting'` (no etag check —
+           the Phase 1 UPDATE owns the row).
+
+        `If-Match: "<etag>"` is **optional**.
+      parameters:
+        - $ref: '#/components/parameters/IfMatchOptional'
+      responses:
+        '204':
+          description: File deleted.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            The row is already in the transient `deleting` status —
+            another delete is in progress. The `code` is
+            `delete_in_progress`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '412': { $ref: '#/components/responses/EtagMismatch' }
+        '502':
+          description: |
+            Phase 2 backend DELETE failed after retries; row left
+            in `deleting`. The `code` is `backend_failure`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /presign-batch:
+    post:
+      operationId: presignBatch
+      tags: [Presign]
+      summary: Batch-issue presigned upload and/or download URLs
+      description: |
+        Single batch entry-point for both upload and download
+        presigning. Each item carries a `kind` discriminator:
+
+        - `kind: "upload"`, no `file_id` — **initial upload**.
+          Registers a `pending_upload` row and returns
+          `(file_id, upload_url, etag_pinned, expires_at)`. The
+          presigned PUT pins, via SigV4 SignedHeaders,
+          `Content-Type` (from `meta.mime_type`),
+          `Content-Disposition` (from `meta.name`), and every
+          `x-amz-meta-<k>` (from `meta.custom_metadata`).
+          `gts_file_type` is NOT pinned to the S3 object.
+        - `kind: "upload"`, with `file_id` — **variant-B re-upload**.
+          The item MUST NOT carry `meta` (rejected with `400
+          bad_request`); the server pins the row's CURRENT metadata
+          into the presigned PUT. The row's `upload_expires_at` is
+          updated to `MAX(current, NOW + TTL)` so multiple
+          outstanding URLs do not shorten the window.
+        - `kind: "download"` — issues a presigned GET URL (or a
+          bare-HTTPS URL for files in `PublicReadUrls`-capable
+          backends with `default_public = true`). The signed URL
+          always carries `response-content-type` and
+          `response-content-disposition` query params from the DB
+          row's metadata. Per-item authorization, NotFound, and
+          EtagMismatch errors surface inside the response array.
+          Optional `version_id` requests a historical generation
+          when the file's hosting backend has `versioning = true`.
+
+        Mixed batches are allowed. The outer `200` only fails for
+        whole-batch transport errors.
+
+        Single-URL callers send a one-element array.
+
+        Aggregate user-metadata across `Content-Type`,
+        `Content-Disposition`, and every `x-amz-meta-<k>=<v>` is
+        capped at 2 KB; oversize upload items return per-item
+        `payload_too_large` with `max_metadata_bytes`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PresignBatchRequest' }
+      responses:
+        '200':
+          description: Per-item outcomes.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PresignBatchResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+components:
+
+  parameters:
+    FileId:
+      name: file_id
+      in: path
+      required: true
+      description: Opaque file identifier (UUID) — see ADR-0002.
+      schema: { type: string, format: uuid }
+    IfMatchOptional:
+      name: If-Match
+      in: header
+      required: false
+      description: |
+        Optional conditional header. When supplied, the operation
+        proceeds only if the row's current etag matches; mismatch
+        returns `412`. Strong CAS — for `PUT /meta` it is also
+        verified against S3's live etag (and version_id on
+        versioning-on backends).
+      schema: { type: string }
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: |
+        Conditional read — return `304` when the etag matches.
+      schema: { type: string }
+
+  headers:
+    RequestId:
+      description: Correlation identifier echoed on every response.
+      schema: { type: string }
+    ETag:
+      description: |
+        Raw S3 ETag (sans surrounding quotes) for the file's
+        current bytes; equal to the `etag` field in `FileInfo`.
+      schema: { type: string }
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+
+    # ── Backend descriptors ──────────────────────────────────────
+
+    Backend:
+      type: object
+      required:
+        - id
+        - kind
+        - default_private
+        - default_public
+        - transport
+        - capabilities
+        - versioning
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: |
+            Stable backend identity, assigned once in the static
+            TOML roster. Used in `FileInfo.backend_id` and as the
+            optional `backend_id` field on upload requests.
+        kind:
+          type: string
+          enum: [s3-compatible]
+          description: |
+            P1 ships only `s3-compatible`. The S3-class endpoint
+            can be AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat,
+            or `s3s-fs` running side-by-side as the local-disk
+            recipe.
+        default_private:
+          type: boolean
+          description: |
+            This backend is the tenant's default for new
+            **private** files (presigned downloads only). At least
+            one default role per tenant view MUST be set.
+        default_public:
+          type: boolean
+          description: |
+            This backend is the tenant's default for new
+            **public-read** files. Implies the `PublicReadUrls`
+            capability — every download URL issued for a file
+            here is a bare-HTTPS URL with no expiry.
+        transport:
+          type: string
+          enum: [redirect]
+          description: |
+            P1 backends are all `redirect` — bytes flow client ↔
+            backend directly via presigned URLs (or bare HTTPS for
+            public-read backends).
+        capabilities:
+          type: array
+          items:
+            type: string
+            enum:
+              - presigned_urls
+              - public_read_urls
+          description: |
+            P1 capabilities:
+            - `presigned_urls` — backend can sign time-limited
+              URLs for client-direct PUT/GET. Mandatory.
+            - `public_read_urls` — backend serves objects through
+              bare-HTTPS URLs without presigning (e.g. an S3 bucket
+              with public-read ACL or an origin behind a CDN).
+              Optional in P1; pairs with `default_public`.
+        max_file_size_bytes:
+          type: [integer, 'null']
+          format: int64
+        versioning:
+          type: boolean
+          description: |
+            Mirrors the underlying bucket's versioning
+            configuration. When `true`, FileStorage tracks the
+            S3 VersionId per row and exposes ABA-safe content CAS
+            on `PUT /meta` (see ADR-0005). Operator-declared in
+            TOML — FileStorage trusts the value and does NOT probe
+            `GetBucketVersioning` at boot.
+
+    # ── Owner ────────────────────────────────────────────────────
+
+    OwnerRef:
+      type: object
+      required: [tenant_id, owner_id]
+      description: |
+        Owner principal of a file. `owner_id` is the principal's
+        UUID (a user or an app — FileStorage does not distinguish;
+        the kind is tracked in the identity / authz subsystem).
+      properties:
+        tenant_id: { type: string, format: uuid }
+        owner_id: { type: string, format: uuid }
+
+    # ── File metadata ────────────────────────────────────────────
+
+    CustomMetadata:
+      type: object
+      additionalProperties: { type: string }
+
+    FileMeta:
+      type: object
+      required: [name, mime_type, gts_file_type, custom_metadata]
+      description: |
+        File metadata. Aggregate user-metadata size (Content-Type +
+        Content-Disposition + every `x-amz-meta-<k>=<v>`) is capped
+        at 2 KB by AWS S3; FileStorage enforces the same cap.
+        `gts_file_type` does NOT count toward this budget.
+      properties:
+        name: { type: string, maxLength: 512 }
+        mime_type: { type: string, maxLength: 256 }
+        gts_file_type:
+          type: string
+          maxLength: 256
+          description: |
+            GTS file type. Mandatory at creation; immutable
+            afterwards. Stored in DB only — NEVER mirrored to the
+            S3 object.
+          readOnly: true
+        size_bytes: { type: [integer, 'null'], format: int64, minimum: 0 }
+        custom_metadata: { $ref: '#/components/schemas/CustomMetadata' }
+
+    FileMetaUpdate:
+      type: object
+      description: |
+        Mutable subset of `FileMeta`. All fields optional: omitted
+        fields keep their current value, fields present replace it.
+        `gts_file_type` is NOT declared here — it is structurally
+        immutable. Any request body that carries `gts_file_type` is
+        rejected with `400 bad_request`.
+      properties:
+        name: { type: [string, 'null'], maxLength: 512 }
+        mime_type: { type: [string, 'null'], maxLength: 256 }
+        custom_metadata:
+          oneOf:
+            - $ref: '#/components/schemas/CustomMetadata'
+            - type: 'null'
+      additionalProperties: false
+
+    FileStatus:
+      type: string
+      enum: [pending_upload, uploaded, deleting]
+      description: |
+        File lifecycle:
+        - `pending_upload` — row created by upload presign; bytes
+          not confirmed yet.
+        - `uploaded` — committed by `reconcile` after HEAD against
+          the backend. The only state in which `read_file` /
+          `presign_urls` succeed.
+        - `deleting` — Phase 1 of `delete_file` flipped the row;
+          Phase 2 reaps the backend object; Phase 3 purges the
+          row. Reads return `not_found`; mutations return
+          `delete_in_progress`. Transient operational state, NOT
+          a soft-delete tombstone.
+
+    FileInfo:
+      type: object
+      required:
+        - file_id
+        - backend_id
+        - file_path
+        - owner
+        - meta
+        - status
+        - etag
+        - version_id
+        - size_bytes
+        - created_at
+        - updated_at
+      properties:
+        file_id: { type: string, format: uuid }
+        backend_id: { type: string, format: uuid }
+        file_path: { type: string, maxLength: 1024 }
+        owner: { $ref: '#/components/schemas/OwnerRef' }
+        meta: { $ref: '#/components/schemas/FileMeta' }
+        status: { $ref: '#/components/schemas/FileStatus' }
+        etag:
+          type: string
+          description: |
+            Raw S3 ETag for the file's current bytes (sans
+            surrounding quotes). Content fingerprint only — does
+            not track metadata changes.
+        version_id:
+          type: [string, 'null']
+          description: |
+            Raw S3 VersionId for the current generation. `null` on
+            backends with `versioning = false`.
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        upload_expires_at: { type: [string, 'null'], format: date-time }
+
+    FileList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/FileInfo' }
+        next_cursor: { type: [string, 'null'] }
+
+    # ── Reconcile response ───────────────────────────────────────
+
+    ReconcileResponse:
+      type: object
+      required: [info, s3_etag, s3_version_id]
+      description: |
+        Result of `POST /files/{file_id}/meta/reconcile`.
+      properties:
+        info: { $ref: '#/components/schemas/FileInfo' }
+        s3_etag:
+          type: string
+          description: |
+            Raw S3 ETag (sans surrounding quotes) returned by the
+            backend's HEAD response. Identical to `info.etag`;
+            exposed in raw form so callers can correlate against
+            what S3 returned on their own PUT to detect race-loser
+            scenarios.
+        s3_version_id:
+          type: [string, 'null']
+          description: |
+            Raw S3 VersionId from the HEAD response. `null` when
+            the backend has `versioning = false`. Identical to
+            `info.version_id`.
+
+    # ── Presign batch (upload + download) ────────────────────────
+
+    UrlParams:
+      type: object
+      required: [expires_in_seconds]
+      properties:
+        expires_in_seconds:
+          type: integer
+          minimum: 1
+          maximum: 604800
+          description: |
+            Requested URL TTL in seconds. Capped server-side by
+            the backend's configured maximum. Ignored for
+            public-read URL outcomes.
+        content_disposition: { type: [string, 'null'] }
+        content_type_override: { type: [string, 'null'] }
+        allowed_client_cidrs:
+          type: array
+          items: { type: string }
+
+    PresignBatchRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/PresignItem' }
+
+    PresignItem:
+      oneOf:
+        - $ref: '#/components/schemas/PresignUploadItem'
+        - $ref: '#/components/schemas/PresignDownloadItem'
+      discriminator:
+        propertyName: kind
+        mapping:
+          upload: '#/components/schemas/PresignUploadItem'
+          download: '#/components/schemas/PresignDownloadItem'
+
+    PresignUploadItem:
+      type: object
+      required: [kind, params]
+      description: |
+        Upload presign item. Two variants:
+
+        - **Initial upload** — `file_id` absent. `owner`,
+          `file_path`, `meta` are required; `backend_id` is
+          optional and falls back to `default_private`.
+        - **Variant-B re-upload** — `file_id` present. `meta` MUST
+          be absent (rejected with `400 bad_request`); the server
+          pins the row's CURRENT metadata into the presigned PUT.
+          `owner`, `file_path`, `backend_id` are ignored if
+          present (or rejected — implementations MAY enforce
+          stricter validation).
+      properties:
+        kind: { type: string, enum: [upload] }
+        file_id:
+          type: [string, 'null']
+          format: uuid
+          description: |
+            When present, switches this item into variant-B
+            re-upload mode. `meta` is then forbidden.
+        backend_id:
+          type: [string, 'null']
+          format: uuid
+          description: |
+            Optional. When omitted (or `null`), the server falls
+            back to the caller's tenant `default_private` backend.
+            Ignored on variant-B re-upload.
+        owner:
+          oneOf:
+            - $ref: '#/components/schemas/OwnerRef'
+            - type: 'null'
+          description: |
+            Required on initial upload, ignored on variant-B
+            re-upload.
+        file_path:
+          type: [string, 'null']
+          maxLength: 1024
+          description: |
+            Required on initial upload, ignored on variant-B
+            re-upload.
+        meta:
+          oneOf:
+            - $ref: '#/components/schemas/FileMeta'
+            - type: 'null'
+          description: |
+            Required on initial upload. **Forbidden** on variant-B
+            re-upload — the server uses the row's current metadata.
+        params: { $ref: '#/components/schemas/UrlParams' }
+
+    PresignDownloadItem:
+      type: object
+      required: [kind, file_id, params]
+      properties:
+        kind: { type: string, enum: [download] }
+        file_id: { type: string, format: uuid }
+        params: { $ref: '#/components/schemas/UrlParams' }
+        etag:
+          type: [string, 'null']
+          description: |
+            Optional but strongly recommended. When present the
+            server verifies the row's current `etag` matches
+            (DB-only check; no HEAD against S3) before signing; on
+            mismatch the per-item outcome is `etag_mismatch`.
+        version_id:
+          type: [string, 'null']
+          description: |
+            Historical version selector. Honoured only when the
+            file's hosting backend has `versioning = true`; the
+            signed URL embeds `versionId=<vid>` so the caller
+            fetches that exact generation. Ignored on
+            non-versioning backends.
+
+    PresignBatchResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PresignOutcome' }
+
+    PresignOutcome:
+      type: object
+      required: [kind]
+      description: |
+        Per-item outcome. Either `ok` is set (with the kind-specific
+        result) or `error` is set (RFC 7807 problem details).
+      properties:
+        kind: { type: string, enum: [upload, download] }
+        ok:
+          oneOf:
+            - $ref: '#/components/schemas/PresignedUploadHandle'
+            - $ref: '#/components/schemas/PresignedDownload'
+            - type: 'null'
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/ProblemDetails'
+            - type: 'null'
+
+    PresignedUploadHandle:
+      type: object
+      required: [file_id, upload_url, etag_pinned, expires_at]
+      properties:
+        file_id: { type: string, format: uuid }
+        upload_url: { type: string, format: uri }
+        etag_pinned:
+          type: string
+          description: |
+            For an initial upload this is a sentinel value; for a
+            variant-B re-upload it is the row's CURRENT etag (the
+            pre-overwrite content fingerprint), so callers can
+            correlate against `reconcile`'s post-overwrite etag for
+            race-loser detection.
+        expires_at: { type: string, format: date-time }
+
+    PresignedDownload:
+      type: object
+      required: [url, expires_at, is_public]
+      properties:
+        url: { type: string, format: uri }
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            URL expiry. For public-read backends
+            (`is_public = true`), set to a far-future sentinel
+            ("never expires").
+        is_public:
+          type: boolean
+          description: |
+            `true` when the URL is a bare-HTTPS public-read URL
+            (no signing, no expiry). `false` for SigV4 GET URLs.
+
+    # ── Errors ──────────────────────────────────────────────────
+
+    ProblemDetails:
+      type: object
+      required: [type, title, status, code]
+      description: RFC 7807 Problem Details with FileStorage extensions.
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: |
+            Stable error code. Values: `not_found`,
+            `access_denied`, `bad_request`, `etag_mismatch`,
+            `delete_in_progress`, `invalid_status_transition`,
+            `capability_unavailable`, `payload_too_large`,
+            `upload_expired`, `backend_failure`, `conflict`,
+            `internal`.
+        correlation_id:
+          type: string
+          description: Mirrors `X-Request-Id`.
+        max_metadata_bytes:
+          type: [integer, 'null']
+          description: |
+            Present only on `payload_too_large` errors caused by
+            the user-metadata budget. Reports the cap (2048).
+
+  responses:
+    BadRequest:
+      description: Request validation failed.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Forbidden:
+      description: Authorization denied.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    NotFound:
+      description: |
+        File or backend not found. Returned identically for "absent"
+        and "not visible to this tenant" — see ADR-0002.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    EtagMismatch:
+      description: |
+        The `If-Match` etag did not match the row's current etag
+        (or, for `PUT /meta` with strong CAS, S3's live etag /
+        version_id).
+      headers:
+        ETag: { $ref: '#/components/headers/ETag' }
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    InternalError:
+      description: Unexpected server error.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
