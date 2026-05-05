@@ -79,12 +79,51 @@ pub struct Backend {
     /// backend per tenant view MUST hold one default role.
     pub default_private: bool,
     /// `true` when this backend is the tenant's default for new
-    /// **public-read** files. Implies the `PublicReadUrls` capability
-    /// — every file in this backend gets an eternal bare-HTTPS URL.
+    /// **public-read** files. Implies the `download_public.*`
+    /// capability — every file in this backend gets an eternal
+    /// bare-HTTPS URL.
     pub default_public: bool,
-    pub capabilities: Vec<BackendCapability>,
-    /// Per-backend hard ceiling, configured statically in P1.
+    /// Versioned capability tags declared by the backend in the
+    /// TOML roster (see `CapabilityTag`). Each tag has the shape
+    /// `<operation>.<version>` — for example `upload.sigv4_v1`,
+    /// `download_private.sigv4_v1`, `download_public.v1`. The list
+    /// is validated against the SDK's `KNOWN_CAPABILITIES` whitelist
+    /// at module init; unknown tags fail the boot.
+    pub capabilities: Vec<CapabilityTag>,
+    /// Per-backend hard ceiling on object size in bytes. Optional in
+    /// the TOML roster — when omitted, FileStorage falls back to the
+    /// S3 single-object maximum of **5 TiB** (`5 * 1024^4` =
+    /// `5_497_558_138_880`), per
+    /// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html>.
+    /// Operators can lower this for tenancy / quota reasons; raising
+    /// it above the S3 hard cap has no effect because S3 itself
+    /// rejects oversize PUTs.
     pub max_file_size_bytes: Option<u64>,
+    /// Per-backend hard ceiling on aggregate user-metadata size in
+    /// bytes. Optional — when omitted, FileStorage falls back to the
+    /// S3 user-metadata budget of **2 KiB** (`2048`), per
+    /// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html>
+    /// ("Within the PUT request header, the user-defined metadata is
+    /// limited to 2 KB in size."). The cap covers `Content-Type`,
+    /// `Content-Disposition` (derived from `meta.name`), and every
+    /// `x-amz-meta-<k>=<v>` mirrored entry; `gts_file_type` is DB-only
+    /// and does NOT count toward this budget. Enforced at presign
+    /// time and at `put_file_info`.
+    pub max_metadata_bytes: Option<u64>,
+    /// Per-backend hard ceiling on presigned-URL TTL in seconds.
+    /// Optional — when omitted, FileStorage falls back to the AWS
+    /// SigV4 maximum of **7 days** (`604_800` seconds), per
+    /// <https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html>
+    /// ("X-Amz-Expires: A maximum of 604800 (seven days)."). Operators
+    /// can lower this for tenancy / security reasons; raising it above
+    /// the AWS hard cap has no effect because S3 itself rejects
+    /// signatures requesting longer expiries. Applied to every
+    /// signing path (`upload.sigv4_v1`, `download_private.sigv4_v1`,
+    /// `upload.create_multipart_v1` part URLs) — `download_public.v1`
+    /// is unaffected because public URLs carry no expiry. Caller's
+    /// `UrlParams.expires_in_seconds` is capped by this value;
+    /// exceeding it is a `BadRequest`.
+    pub max_presign_ttl_seconds: Option<u64>,
     /// Mirrors the underlying bucket's versioning configuration.
     /// `true` enables ABA-safe content CAS via `version_id` and lets
     /// callers request historical versions on `presign_urls`.
@@ -93,30 +132,51 @@ pub struct Backend {
     pub versioning: bool,
 }
 
-/// Optional capabilities a backend may advertise. These are
-/// **variations** between already-S3-protocol-compatible backends, not
-/// gates on whether something qualifies as a backend in the first
-/// place. Presigned URL support is constitutive — a backend that
-/// cannot sign `PUT/GET` URLs is not a FileStorage backend by
-/// definition — so it is not represented as a capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendCapability {
-    /// Backend serves objects through bare-HTTPS URLs without
-    /// presigning (e.g. an S3 bucket with public-read ACL or an
-    /// origin behind a CDN). Pairs with `Backend.default_public`.
-    /// When this capability is present and a download is issued for
-    /// a file in such a backend, `PresignedDownload.is_public` is
-    /// `true` and the URL has no expiry — it is eternal for the
-    /// file's lifetime.
-    PublicReadUrls,
-    /// Backend honours S3-style multipart upload
-    /// (`CreateMultipartUpload` / `UploadPart` /
-    /// `CompleteMultipartUpload` / `AbortMultipartUpload`). Optional
-    /// — clients fall back to single-shot presigned PUT when absent.
-    /// (P2 — see DESIGN §4 Future deltas for the server-mediated
-    /// design.)
-    Multipart,
-}
+/// Versioned capability identifier — a flat string of the form
+/// `<operation>.<version>`. Each tag describes one (operation,
+/// signing-strategy, version) tuple that a backend can serve.
+/// Examples: `upload.sigv4_v1`, `download_private.sigv4_v1`,
+/// `download_public.v1`, `upload.create_multipart_v1`.
+///
+/// **Grammar.** Regex `^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,9}$`. The
+/// version segment (after the dot) is capped at 10 characters so
+/// the whole tag stays compact. There is no nesting — exactly one
+/// dot separates operation from version.
+///
+/// **Why flat strings instead of an enum.** Each tag is constant data
+/// from the SDK's perspective: when a new signing strategy is added
+/// (e.g. AWS SigV4 alg revision, GCS POST-policy variant), it lands
+/// as a new string in `KNOWN_CAPABILITIES` and a new branch in the
+/// adapter's `match` — no enum migration, no breaking schema change.
+/// Operators write tags as-is in TOML.
+///
+/// **Boot-time validation (constitutive).** The SDK ships with
+/// `const KNOWN_CAPABILITIES: &[&str] = &[ ... ]` listing every tag
+/// it knows how to sign. At module init, every tag in every
+/// `Backend.capabilities` is checked against the whitelist; unknown
+/// tags → fail-fast initialization with `unknown capability "{tag}"
+/// on backend {id}`. Because of this, runtime code never has to
+/// handle "unknown capability" — the impossibility is enforced at
+/// boot. Adapters use `match tag.as_str()` with `_ => unreachable!()`
+/// as a defensive default.
+///
+/// **P1 whitelist (3 tags).**
+/// - `upload.sigv4_v1` — single-shot SigV4 PUT for object upload.
+/// - `download_private.sigv4_v1` — SigV4-signed GET for time-limited
+///   private downloads (TTL + optional CIDR allowlist).
+/// - `download_public.v1` — bare-HTTPS public-read URL with no
+///   signature and no expiry (for buckets with public-read ACL or
+///   an origin behind a CDN; pairs with `Backend.default_public`).
+///
+/// **P2 whitelist additions.**
+/// - `upload.create_multipart_v1` — server-mediated multipart
+///   initiation: handler issues `CreateMultipartUpload` against S3,
+///   captures the backend's `upload_id`, and presigns N `UploadPart`
+///   URLs in one round trip. Companion REST endpoints
+///   `POST /files/{file_id}/multipart/{upload_id}` (complete) and
+///   `DELETE /files/{file_id}/multipart/{upload_id}` (abort) finish
+///   the lifecycle without ever requiring `reconcile`.
+pub type CapabilityTag = String;
 
 // ── Owner ───────────────────────────────────────────────────────────────
 
@@ -265,7 +325,9 @@ pub enum FileStatus {
 pub struct UrlParams {
     /// Requested TTL. Capped server-side by the backend's configured
     /// maximum; exceeding the cap is a `BadRequest`. Ignored for
-    /// `PublicReadUrls` outcomes — public URLs have no expiry.
+    /// `download_public.*` outcomes — public URLs have no expiry.
+    /// On `upload.create_multipart_v1` the same TTL applies uniformly
+    /// to every part URL in the issued batch.
     pub expires_in_seconds: u64,
     /// Optional override for the presigned download's
     /// `Content-Disposition`. When `None`, FileStorage builds it
@@ -286,7 +348,8 @@ pub struct UrlParams {
     pub allowed_client_cidrs: Vec<String>,
 }
 
-/// Result of `create_presigned_url` and `create_presigned_overwrite_url`.
+/// Result of `create_presigned_url` and `create_presigned_overwrite_url`
+/// for the single-shot `upload.sigv4_v1` capability.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresignedUploadHandle {
@@ -300,6 +363,55 @@ pub struct PresignedUploadHandle {
     /// later by `reconcile` after HEAD against the backend.
     pub etag_pinned: Etag,
     pub expires_at: OffsetDateTime,
+}
+
+/// (P2) Result of a presign call against `upload.create_multipart_v1`.
+///
+/// The server has already executed `CreateMultipartUpload` against
+/// the backend and presigned every part URL — the caller does not
+/// negotiate the multipart session with S3 directly. After the
+/// client uploads each part to its corresponding URL it commits via
+/// `POST /files/{file_id}/multipart/{upload_id}` (or aborts via
+/// `DELETE /files/{file_id}/multipart/{upload_id}`); `reconcile` is
+/// **never** called on the multipart path because `complete` flips
+/// `PendingUpload → Uploaded` in one transaction with the etag from
+/// `CompleteMultipartUpload`'s response.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresignedMultipartHandle {
+    pub file_id: FileId,
+    /// Backend-supplied multipart session id (e.g. S3
+    /// `UploadId`). FileStorage does NOT persist this value — the
+    /// caller MUST keep it for `complete` / `abort`. If lost, the
+    /// row times out at `upload_expires_at` and the bucket's
+    /// `AbortIncompleteMultipartUpload` lifecycle rule reaps the
+    /// orphan multipart on the backend side.
+    pub upload_id: String,
+    /// Presigned PUT URLs, one per part, in `part_number` order
+    /// (1-indexed). Length equals the `part_count` requested by the
+    /// caller in the presign item.
+    pub part_urls: Vec<MultipartPartUrl>,
+    /// Common expiry across every part URL (uniform TTL from the
+    /// caller's `UrlParams.expires_in_seconds`).
+    pub expires_at: OffsetDateTime,
+}
+
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartPartUrl {
+    pub part_number: u32,
+    pub url: String,
+}
+
+/// (P2) Caller-supplied entry of a `complete_multipart_upload` body.
+/// `etag` is whatever the backend returned in the `ETag` header of
+/// the corresponding `UploadPart` response — opaque to FileStorage,
+/// passed straight to `CompleteMultipartUpload`.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartPartCompletion {
+    pub part_number: u32,
+    pub etag: String,
 }
 
 /// One entry of a batched download request.
@@ -316,10 +428,16 @@ pub struct PresignedUploadHandle {
 /// includes `versionId=<vid>` in the signed URL so the caller fetches
 /// a historical generation. When unset, the URL resolves to the
 /// current bytes.
+///
+/// `capability` is the versioned tag the caller wants (e.g.
+/// `download_private.sigv4_v1` or `download_public.v1`). The server
+/// rejects with `capability_unavailable` if the resolved backend has
+/// not declared that tag.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresignDownloadItem {
     pub file_id: FileId,
+    pub capability: CapabilityTag,
     pub params: UrlParams,
     pub etag: Option<Etag>,
     pub version_id: Option<String>,
@@ -340,12 +458,13 @@ pub struct PresignDownloadOutcome {
 pub struct PresignedDownload {
     pub url: String,
     /// Time at which the URL stops resolving. For
-    /// `PublicReadUrls` outcomes (`is_public == true`) this is set
-    /// to a far-future sentinel ("never expires").
+    /// `download_public.v1` outcomes (`is_public == true`) this is
+    /// set to a far-future sentinel ("never expires").
     pub expires_at: OffsetDateTime,
-    /// `true` when the URL is a bare-HTTPS public-read URL backed by
-    /// a `PublicReadUrls` backend (no presigning, no expiry). `false`
-    /// for SigV4 GET URLs.
+    /// `true` when the URL is a bare-HTTPS public-read URL issued
+    /// under the `download_public.v1` capability tag (no presigning,
+    /// no expiry). `false` for SigV4 GET URLs from
+    /// `download_private.sigv4_v1`.
     pub is_public: bool,
 }
 
@@ -565,7 +684,7 @@ pub trait FileStorageClient: Send + Sync {
     /// **Initial upload.** Validates input, registers a row with
     /// `status = PendingUpload`, and returns a presigned PUT URL the
     /// caller hands to the end-client. The presigned URL pins, via
-    /// SigV4 SignedHeaders:
+    /// SigV4 SignedHeaders (when `capability = "upload.sigv4_v1"`):
     /// - `Content-Type` = `meta.mime_type`
     /// - `Content-Disposition` = `attachment; filename="<URL-encoded meta.name>"`
     /// - `x-amz-meta-<k>` = `<v>` for each entry in `meta.custom_metadata`
@@ -581,6 +700,14 @@ pub trait FileStorageClient: Send + Sync {
     /// backend. When `Some`, the UUID is resolved through the
     /// per-tenant access list (`NotFound` if the caller's tenant
     /// cannot see it).
+    ///
+    /// **`capability`** selects the signing strategy and is
+    /// validated against the resolved backend's `capabilities`
+    /// list — unknown / undeclared tag → `CapabilityUnavailable`.
+    /// In P1 the only valid tag for this method is `"upload.sigv4_v1"`.
+    /// `"upload.create_multipart_v1"` (P2) goes through
+    /// `create_presigned_multipart` instead, because its result type
+    /// (`PresignedMultipartHandle`) differs.
     async fn create_presigned_url(
         &self,
         ctx: &SecurityContext,
@@ -588,6 +715,7 @@ pub trait FileStorageClient: Send + Sync {
         owner: OwnerRef,
         file_path: &str,
         meta: FileMeta,
+        capability: &CapabilityTag,
         params: UrlParams,
     ) -> Result<PresignedUploadHandle, FileStorageError>;
 
@@ -608,12 +736,112 @@ pub trait FileStorageClient: Send + Sync {
     ///
     /// A row in `PendingUpload` (no committed bytes yet) is rejected
     /// with `NotFound`; a row in `Deleting` returns `DeleteInProgress`.
+    ///
+    /// `capability` follows the same rules as `create_presigned_url` —
+    /// validated against the row's hosting backend's `capabilities`
+    /// list; in P1 the only valid tag is `"upload.sigv4_v1"`.
     async fn create_presigned_overwrite_url(
         &self,
         ctx: &SecurityContext,
         file_id: FileId,
+        capability: &CapabilityTag,
         params: UrlParams,
     ) -> Result<PresignedUploadHandle, FileStorageError>;
+
+    /// (P2) **Server-mediated multipart initiation.** P1 ships this
+    /// method as `unimplemented!()` — the trait surface is reserved
+    /// for forward compatibility; the actual logic ships in P2
+    /// alongside the `upload.create_multipart_v1` capability and the
+    /// `POST/DELETE /files/{file_id}/multipart/{upload_id}` REST
+    /// endpoints. Validates input, registers a row with
+    /// `status = PendingUpload`, calls `CreateMultipartUpload` on
+    /// the backend, presigns one PUT URL per part, and returns the
+    /// bundle in a single round trip.
+    /// `capability` MUST be `"upload.create_multipart_v1"`; the
+    /// resolved backend MUST declare it (otherwise
+    /// `CapabilityUnavailable`).
+    ///
+    /// `part_count` is supplied by the caller (1..=10000 per S3's
+    /// hard cap on multipart-parts-per-object). The caller is
+    /// responsible for choosing a part size consistent with the
+    /// backend's minimum (5 MiB on AWS S3 except the final part).
+    /// FileStorage does not pick `part_size` and does not retroactively
+    /// extend a session — if the file turns out larger than the
+    /// initial `part_count` covers, the caller aborts and re-inits.
+    ///
+    /// `params.expires_in_seconds` defines a uniform TTL across every
+    /// part URL; the field also caps the time window in which the
+    /// caller can finalize via `POST /files/{file_id}/multipart/{upload_id}`.
+    ///
+    /// **`upload_id` is NOT persisted by FileStorage.** It is
+    /// returned in `PresignedMultipartHandle.upload_id` and the
+    /// caller MUST keep it for the subsequent `complete` / `abort`
+    /// REST calls. If the caller loses it, the row times out at
+    /// `upload_expires_at` and the bucket-level
+    /// `AbortIncompleteMultipartUpload` lifecycle rule reaps the
+    /// orphan multipart on the backend.
+    ///
+    /// **Reconcile is never invoked on the multipart path.** The
+    /// `complete` REST endpoint runs `CompleteMultipartUpload`
+    /// itself, captures the final etag and `version_id`, and flips
+    /// `PendingUpload → Uploaded` in one transaction.
+    async fn create_presigned_multipart(
+        &self,
+        ctx: &SecurityContext,
+        backend_id: Option<BackendId>,
+        owner: OwnerRef,
+        file_path: &str,
+        meta: FileMeta,
+        capability: &CapabilityTag,
+        part_count: u32,
+        params: UrlParams,
+    ) -> Result<PresignedMultipartHandle, FileStorageError>;
+
+    /// (P2 — `unimplemented!()` in P1.) **Complete a multipart upload.** Backs the REST
+    /// `POST /files/{file_id}/multipart/{upload_id}` endpoint. The
+    /// server calls `CompleteMultipartUpload` on the backend with
+    /// the supplied `(part_number, etag)` list, captures the
+    /// finalized object's etag and `version_id`, then runs the same
+    /// HEAD-and-pull commit transaction `reconcile` would run —
+    /// flipping `PendingUpload → Uploaded` atomically.
+    ///
+    /// `upload_id` is the value previously returned by
+    /// `create_presigned_multipart`; FileStorage forwards it to S3
+    /// and never persists it. A row already in `Uploaded` returns
+    /// `Conflict`; a row in `Deleting` returns `DeleteInProgress`;
+    /// a missing row returns `NotFound`.
+    async fn complete_multipart_upload(
+        &self,
+        ctx: &SecurityContext,
+        file_id: FileId,
+        upload_id: &str,
+        parts: Vec<MultipartPartCompletion>,
+    ) -> Result<FileInfo, FileStorageError>;
+
+    /// (P2 — `unimplemented!()` in P1.) **Abort a multipart upload.** Backs the REST
+    /// `DELETE /files/{file_id}/multipart/{upload_id}` endpoint.
+    /// The server calls `AbortMultipartUpload` on the backend for
+    /// the specified `upload_id` only.
+    ///
+    /// **Does NOT remove the `PendingUpload` row.** Multiple
+    /// multipart sessions may run in parallel against the same
+    /// `file_id` (retry of a stalled session, concurrent client
+    /// attempts), and aborting one of them must not affect the
+    /// others. To drop the file entirely after aborting, the
+    /// caller MUST follow up with `delete_file(file_id, …)` (the
+    /// canonical "remove this file" surface); alternatively the
+    /// row times out at `upload_expires_at` and the P2 GC sweep
+    /// removes it.
+    ///
+    /// A row in `Uploaded` is rejected (`Conflict`) — abort is
+    /// not a "delete already-committed file" surface; use
+    /// `delete_file` for that.
+    async fn abort_multipart_upload(
+        &self,
+        ctx: &SecurityContext,
+        file_id: FileId,
+        upload_id: &str,
+    ) -> Result<(), FileStorageError>;
 
     /// **Explicit reconciliation primitive.** HEADs the backend to
     /// learn the authoritative `s3_etag`, `s3_version_id`,
@@ -977,10 +1205,12 @@ pub trait FileStorageClient: Send + Sync {
     /// happens to be on the object
     /// (`cpt-cf-file-storage-constraint-presigned-download-headers-from-db`).
     ///
-    /// **Public-read backends** — when the file's hosting backend
-    /// has the `PublicReadUrls` capability and `default_public =
-    /// true`, the outcome carries `is_public = true` and a bare
-    /// HTTPS URL with no expiry. SigV4 GET URLs are returned for
+    /// **Public-read backends** — when the per-item `capability` is
+    /// `download_public.v1` and the resolved backend declares that
+    /// tag (typically paired with `default_public = true`), the
+    /// outcome carries `is_public = true` and a bare HTTPS URL with
+    /// no expiry. SigV4 GET URLs (`download_private.sigv4_v1`) are
+    /// returned for
     /// every other backend.
     ///
     /// **Historical version GET** — when the hosting backend has
@@ -1106,8 +1336,8 @@ pub trait StorageBackend: Send + Sync {
     /// inside the outcome vector. The adapter sets
     /// `response-content-type` and `response-content-disposition`
     /// query params from the per-item hints (sourced from DB).
-    /// For backends with the `PublicReadUrls` capability, the
-    /// adapter MAY return a bare-HTTPS URL with no signing instead
+    /// For per-item capability `download_public.v1` (declared by the
+    /// backend), the adapter returns a bare-HTTPS URL with no signing
     /// (`is_public = true`).
     async fn issue_presigned_gets(
         &self,
@@ -1271,7 +1501,7 @@ while let Some(chunk) = handle.bytes.next().await {
 
 | Trait | Methods | Consumers | ClientHub key |
 |-------|---------|-----------|---------------|
-| `FileStorageClient` | 11 (full P1 surface: backends, file lifecycle including `reconcile`, both initial and variant-B presign, streaming I/O including the in-process direct-upload `put_file`, batched presign) | CyberFabric modules via ClientHub, REST adapter | `dyn FileStorageClient` |
+| `FileStorageClient` | 14 (full P1 surface — 11 implemented methods: backends, file lifecycle including `reconcile`, both initial and variant-B presign, streaming I/O including the in-process direct-upload `put_file`, batched presign — plus 3 P2-reserved multipart methods (`create_presigned_multipart`, `complete_multipart_upload`, `abort_multipart_upload`) shipped as `unimplemented!()` stubs in P1 for forward-compatible trait shape) | CyberFabric modules via ClientHub, REST adapter | `dyn FileStorageClient` |
 | `StorageBackend` (internal) | 6 (adapter boundary; `head_object` is required by `reconcile` and the strong-CAS variant of `put_file_info`; `copy_object_self` is required by `put_file_info`'s DB+S3 sync; presigned URLs are batch-first on the GET side, single-shot on the PUT side per ADR-0003) | `BackendRouter`, REST endpoint handlers (`presign-batch`, `reconcile`, `delete`, `put_file_info`) and the in-process `put_file` SDK path | — (not registered in ClientHub) |
 
-The 11 SDK methods are: `list_backends`, `create_presigned_url`, `create_presigned_overwrite_url`, `reconcile`, `get_file_info`, `put_file_info`, `delete_file`, `list_files`, `read_file`, `put_file`, `presign_urls` (REST counterpart `presign-batch` aggregates the two upload variants and the download variant). The internal adapter declares `open_read`, `head_object`, `delete_object`, `issue_presigned_put`, `copy_object_self`, and `issue_presigned_gets`.
+The 11 P1 SDK methods are: `list_backends`, `create_presigned_url`, `create_presigned_overwrite_url`, `reconcile`, `get_file_info`, `put_file_info`, `delete_file`, `list_files`, `read_file`, `put_file`, `presign_urls` (REST counterpart `presign-batch` aggregates the two upload variants and the download variant). P2 adds 3 multipart methods (`create_presigned_multipart`, `complete_multipart_upload`, `abort_multipart_upload`) — present in the trait as `unimplemented!()` stubs in P1. The internal adapter declares `open_read`, `head_object`, `delete_object`, `issue_presigned_put`, `copy_object_self`, and `issue_presigned_gets`.

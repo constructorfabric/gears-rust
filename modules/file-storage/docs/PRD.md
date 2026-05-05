@@ -263,26 +263,44 @@ filtering prevents unbounded queries across all files and aligns with the owners
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
 
 The system **MUST** support multipart (chunked) upload for large files. Multipart upload is deferred to P2 — see
-DESIGN §4 Future deltas for the pre-decided Variant 2 (server-mediated) design: server-issued `CreateMultipartUpload`
-/ `AbortMultipartUpload`, per-part presigned PUTs, and server-mediated `CompleteMultipartUpload`. P1 ships only
-single-shot presigned PUT (`create_presigned_url` / `create_presigned_overwrite_url`). A multipart upload **MUST**:
+DESIGN §4 Future deltas for the pre-decided shape, summarised below. P1 ships only single-shot presigned PUT
+(`create_presigned_url` / `create_presigned_overwrite_url` against `upload.sigv4_v1`). A multipart upload **MUST**:
 
 - Allow the client to split a file into multiple parts and upload them independently
 - Support resumable uploads — if a part fails, only that part needs re-uploading
 - Assemble parts into a complete file upon finalization
 - Apply the same authorization, metadata, and audit requirements as single-part uploads
 
-Multipart support is an optional `BackendCapability` (`Multipart`) declared per backend. Most S3-class endpoints
-(AWS S3, MinIO, Ceph RGW, Wasabi) declare it; specific recipes (notably `s3s-fs` for local-disk deployments) may
-not. Backends that do not declare the capability **MUST** reject multipart requests with `CapabilityUnavailable`;
-clients fall back to single-part presigned PUT.
+**P2 multipart shape (server-mediated, presign-bundled).** Multipart support is an optional capability tag
+`upload.create_multipart_v1` that a backend may declare in its `capabilities` list. Lifecycle:
+
+- `POST /presign-batch` with `capability: "upload.create_multipart_v1"` and `part_count: N` → server INSERTs
+  a `PendingUpload` row, calls `CreateMultipartUpload` on the backend, captures the backend's `upload_id`,
+  presigns N `UploadPart` URLs, returns `PresignedMultipartHandle { file_id, upload_id, part_urls[],
+  expires_at }`.
+- Client uploads parts directly to the backend over the presigned URLs and collects `(part_number, etag)`
+  pairs.
+- `POST /files/{file_id}/multipart/{upload_id}` with body `{ parts: [{part_number, etag}] }` → server calls
+  `CompleteMultipartUpload`, captures the finalized etag, flips `PendingUpload → Uploaded` in one
+  transaction. **No `reconcile` call is required on the multipart path.**
+- `DELETE /files/{file_id}/multipart/{upload_id}` → server calls `AbortMultipartUpload` on the backend for that
+  `upload_id` only. **Does NOT delete the file row** — multiple multipart sessions may run in parallel against the
+  same `file_id`, so aborting one session must not affect the others. To drop the file entirely after aborting,
+  the caller MUST issue `DELETE /files/{file_id}` as a separate second step.
+
+`upload_id` is **not persisted** by FileStorage — it round-trips through the client between presign-batch
+and the complete/abort REST endpoints. Lost `upload_id`s are reaped by the bucket-level
+`AbortIncompleteMultipartUpload` lifecycle rule (operator runbook).
+
+Backends that do not declare `upload.create_multipart_v1` **MUST** reject multipart requests with
+`CapabilityUnavailable`; clients fall back to single-part presigned PUT.
 
 **Rationale**: Single-request uploads are impractical for large files (video, datasets, backups) due to timeouts,
 memory constraints, and network reliability. Multipart enables reliable transfer of arbitrarily large files.
-Deferred to P2 because the server-mediated design requires additional REST endpoints, companion DB tables
-(`file_uploads`, `file_upload_parts`), and careful session lifecycle management — complexity intentionally out of
-scope for P1. Backends that do not natively support multipart simply do not advertise the capability; clients adapt
-to per-backend availability.  
+Deferred to P2 because the design requires two new REST endpoints (`complete` / `abort`), a new outcome shape
+(`PresignedMultipartHandle`), and three additional adapter methods — complexity intentionally out of scope
+for P1. Backends that do not natively support multipart simply do not advertise the capability tag; clients
+adapt to per-backend availability.  
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Content-Type Validation
@@ -560,9 +578,12 @@ executable files).
 
 The system **MUST** enforce file size limits from two sources:
 
-- **Backend limit** — each storage backend declares its maximum supported file size in configuration. This is a hard
-  ceiling that no policy can override.
-- **Policy limits** — tenants and users define a global maximum size and optional per-mime-type overrides (e.g., 100 MB
+- **Backend limits** — each storage backend declares two optional ceilings in TOML configuration:
+  - `max_file_size_bytes` — maximum object size; defaults to the [S3 single-object limit of 5 TiB](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html) when omitted.
+  - `max_metadata_bytes` — maximum aggregate user-metadata size (Content-Type + Content-Disposition + every `x-amz-meta-<k>=<v>` entry combined; `gts_file_type` is DB-only and excluded from the budget); defaults to the [S3 user-metadata limit of 2 KiB](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html) when omitted.
+
+  Both are hard ceilings that no policy can override.
+- **Policy limits** — tenants and users define a global maximum file size and optional per-mime-type overrides (e.g., 100 MB
   general, 1 GB for `video/*`). When both tenant and user policies apply, the most restrictive value wins.
 
 Uploads exceeding any applicable limit **MUST** be rejected with an error identifying which limit was violated.
@@ -826,34 +847,48 @@ branching.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-capabilities`
 
-The system **MUST** define a capability model for storage backends. Each backend **MUST** declare which optional
-capabilities it supports. Capabilities are *variations* among backends that already speak S3 protocol and respect
-presigned URLs (presigned URL support itself is constitutive — a backend that cannot sign URLs is not a backend by
-definition — so it is not represented as a capability). The system **MUST** support at least the following:
+The system **MUST** define a versioned capability model for storage backends. Each backend **MUST** declare a list
+of versioned capability **tags** of the form `<operation>.<version>` (e.g. `upload.sigv4_v1`,
+`download_private.sigv4_v1`, `download_public.v1`, `upload.create_multipart_v1`). Each tag binds one (operation,
+signing-strategy, version) tuple. A new signing strategy or vendor-specific variant lands as a new tag string —
+no enum migration, no breaking schema change.
 
-- **Public-Read URLs** — the backend serves objects through bare-HTTPS URLs without presigning (S3 buckets with
-  public-read ACLs or origins behind a CDN); pairs with the per-backend `default_public` flag.
-- **Versioning** — the backend can maintain multiple versions of a file, identified by opaque version identifiers.
-- **Multipart Upload** — the backend natively supports S3-style chunked upload with independent part transfers and
-  server-side assembly. Optional — clients fall back to single-shot presigned PUT when absent.
-- **Server-Side Encryption** — the backend can encrypt file content at rest using backend-managed or customer-provided
-  keys.
+**Boot-time validation is constitutive.** The SDK ships with a compile-time whitelist of known capability tags.
+At module init the system **MUST** validate every declared tag against this whitelist; any unknown tag **MUST**
+fail-fast initialization with a clear error. Runtime code never has to handle "unknown tag" — the impossibility
+is enforced at boot.
+
+P1 system MUST support these tags:
+
+- `upload.sigv4_v1` — single-shot SigV4 PUT for object upload (mandatory for any usable backend).
+- `download_private.sigv4_v1` — SigV4-signed GET for time-limited private downloads (TTL + optional CIDR
+  allowlist).
+- `download_public.v1` — bare-HTTPS public-read URL with no signature and no expiry; pairs with the per-backend
+  `default_public` flag.
+
+P2 adds:
+
+- `upload.create_multipart_v1` — server-mediated multipart initiation (see `cpt-cf-file-storage-fr-multipart-upload`).
+
+Other capabilities described in this PRD (file versioning, server-side encryption) are tracked through their own
+FRs and may land as additional tags or as out-of-band features (e.g. `versioning` is a per-backend flag in TOML,
+not a capability tag).
 
 Each declared capability **MUST** be independently configurable as enabled or disabled per backend. A capability that is
-supported by the backend but disabled by configuration **MUST** behave identically to an unsupported capability — the
-system **MUST NOT** expose or use it. Only capabilities that are both declared by the backend and enabled in
-configuration are considered available.
+A capability that is supported by the backend but not declared in TOML **MUST** behave identically to an
+unsupported capability — the system **MUST NOT** expose or use it.
 
-The system **MUST** expose the set of available (declared and enabled) capabilities per backend so that consumers can
-discover them at runtime. When a consumer requests an operation that depends on an unavailable capability, the system
-**MUST** return a clear error indicating the capability is unavailable. Capability declarations **MUST** be part of the
-backend configuration — not inferred at runtime from probing.
+The system **MUST** expose the set of declared capability tags per backend through `list_backends` /
+`GET /storages` so that consumers can discover them at runtime. When a consumer requests an operation with a
+capability tag the resolved backend has not declared, the system **MUST** return `capability_unavailable`.
+Capability declarations **MUST** be part of the backend configuration — not inferred at runtime from probing.
 
-**Rationale**: Storage backends vary widely in feature support. A formal capability model enables FileStorage to adapt
-behavior per backend, allows consumers to discover and handle feature availability, and replaces ad-hoc fallback logic
-with a consistent, extensible pattern. Per-backend capability toggling allows administrators to disable features for
-security or operational reasons — e.g., disabling presigned URLs to force all traffic through FileStorage for audit
-visibility, even when the backend supports them.
+**Rationale**: Storage backends vary widely in feature support and signing-strategy variations. A versioned
+capability-tag model lets FileStorage extend without breaking existing clients (new tag strings, no enum
+migration), lets consumers explicitly negotiate per-call (no implicit downgrade), and pushes correctness to
+boot time (unknown tag fails the boot, never runtime). Per-backend tag declarations allow administrators to
+disable features for security or operational reasons — e.g., omitting `download_public.v1` on a sensitive
+backend to force all reads through SigV4-signed URLs.
 **Actors**: `cpt-cf-file-storage-actor-cf-modules`
 
 #### Runtime Backend Configuration

@@ -67,9 +67,10 @@ info:
     identity arrives via ModKit middleware as `SecurityContext`.
     Presigned PUT / GET URLs are signed by the backend (S3 SigV4)
     and validated by the backend; FileStorage does not authenticate
-    the byte transfers themselves. Public-read URLs (issued for
-    files in `PublicReadUrls`-capable backends with `default_public
-    = true`) are bare HTTPS URLs with no signing or expiry.
+    the byte transfers themselves. Public-read URLs (issued under
+    the `download_public.v1` capability tag for backends that
+    declare it, typically paired with `default_public = true`) are
+    bare HTTPS URLs with no signing or expiry.
 
     ## Conditional requests
 
@@ -126,8 +127,9 @@ paths:
       description: |
         Returns the roster filtered by the caller's tenant access
         list. At least one backend per tenant view is flagged
-        `default_private = true`. Backends with `PublicReadUrls`
-        capability and `default_public = true` are surfaced too.
+        `default_private = true`. Backends declaring the
+        `download_public.v1` capability tag and `default_public =
+        true` are surfaced too.
       responses:
         '200':
           description: Backend roster.
@@ -501,9 +503,11 @@ paths:
           into the presigned PUT. The row's `upload_expires_at` is
           updated to `MAX(current, NOW + TTL)` so multiple
           outstanding URLs do not shorten the window.
-        - `kind: "download"` — issues a presigned GET URL (or a
-          bare-HTTPS URL for files in `PublicReadUrls`-capable
-          backends with `default_public = true`). The signed URL
+        - `kind: "download"` — issues a presigned GET URL (when
+          `capability = "download_private.sigv4_v1"`) or a bare-HTTPS
+          URL (when `capability = "download_public.v1"` and the
+          target backend declares that tag, typically paired with
+          `default_public = true`). The signed URL
           always carries `response-content-type` and
           `response-content-disposition` query params from the DB
           row's metadata. Per-item authorization, NotFound, and
@@ -536,6 +540,114 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '500': { $ref: '#/components/responses/InternalError' }
+
+  # ── P2 multipart endpoints ────────────────────────────────────
+  # Both endpoints land in P2 alongside the
+  # `upload.create_multipart_v1` capability tag. They consume the
+  # `upload_id` returned by `POST /presign-batch` (in
+  # `PresignedMultipartHandle.upload_id`) — FileStorage does not
+  # persist `upload_id`, the caller passes it back here.
+  /files/{file_id}/multipart/{upload_id}:
+    post:
+      operationId: completeMultipartUpload
+      tags: [Multipart]
+      summary: (P2) Complete a server-mediated multipart upload
+      description: |
+        Calls `CompleteMultipartUpload` on the backend with the
+        supplied `(part_number, etag)` pairs, captures the
+        finalized object's etag and `version_id`, then flips
+        `PendingUpload → Uploaded` in one transaction. **Does
+        NOT** invoke `reconcile` — multipart commit is its own
+        terminal step.
+
+        Idempotency: if the row is already `Uploaded` (someone
+        else completed the same `(file_id, upload_id)`), returns
+        `409 conflict`. A row in `Deleting` returns `409
+        delete_in_progress`. A missing row returns `404 not_found`.
+
+        The `upload_id` path parameter MUST be URL-encoded — S3
+        `UploadId` values may contain base64 special characters
+        (`+`, `/`, `=`).
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+        - name: upload_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: |
+            URL-encoded backend `UploadId` from
+            `PresignedMultipartHandle.upload_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MultipartCompleteRequest' }
+      responses:
+        '200':
+          description: Multipart upload committed.
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileInfo' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BackendFailure' }
+    delete:
+      operationId: abortMultipartUpload
+      tags: [Multipart]
+      summary: (P2) Abort a server-mediated multipart upload
+      description: |
+        Calls `AbortMultipartUpload` on the backend for the
+        specified `upload_id` only. **Does NOT delete the
+        `PendingUpload` row.** Multiple multipart sessions may run
+        in parallel against the same `file_id` (e.g. retry on a
+        stalled session, concurrent client attempts), and aborting
+        one session must not affect the others — the row remains
+        until either:
+
+        - the caller explicitly removes it by calling
+          `DELETE /files/{file_id}` (the canonical "remove this
+          file" surface — clients that want to drop the file
+          entirely after aborting MUST call it as a second step);
+        - or `upload_expires_at` elapses and the P2 GC sweep
+          removes it.
+
+        Best-effort: if the `AbortMultipartUpload` call fails on
+        the backend, the row stays untouched and the bucket-level
+        `AbortIncompleteMultipartUpload` lifecycle rule eventually
+        reaps the orphan multipart session.
+
+        A row already in `Uploaded` returns `409 conflict` —
+        abort is not a "delete already-committed file" surface;
+        use `DELETE /files/{file_id}` for that.
+
+        The `upload_id` path parameter MUST be URL-encoded.
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+        - name: upload_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: |
+            URL-encoded backend `UploadId` from
+            `PresignedMultipartHandle.upload_id`.
+      responses:
+        '204':
+          description: |
+            Multipart session aborted on the backend. The
+            `PendingUpload` row is preserved — call
+            `DELETE /files/{file_id}` to remove the file.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BackendFailure' }
 
 components:
 
@@ -624,27 +736,78 @@ components:
           type: array
           items:
             type: string
-            enum:
-              - public_read_urls
-              - multipart
+            pattern: '^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,9}$'
+            maxLength: 50
           description: |
-            Optional capabilities — variations among
-            already-S3-protocol-compatible backends. Presigned URL
-            support is constitutive (a backend that cannot sign URLs
-            is not a backend by definition) and is therefore NOT
-            represented as a capability.
-            - `public_read_urls` — backend serves objects through
-              bare-HTTPS URLs without presigning (e.g. an S3 bucket
-              with public-read ACL or an origin behind a CDN).
-              Pairs with `default_public`.
-            - `multipart` (P2) — backend honours S3-style multipart
-              upload (`CreateMultipartUpload` / `UploadPart` /
-              `CompleteMultipartUpload` / `AbortMultipartUpload`).
-              When absent, clients fall back to single-shot
-              presigned PUT.
+            Versioned capability tags declared by the backend in the
+            TOML roster. Each tag has the shape `<operation>.<version>`
+            (regex `^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,9}$`, version
+            segment ≤10 chars). The list is validated against the
+            SDK's `KNOWN_CAPABILITIES` whitelist at module init;
+            unknown tags fail-fast the boot.
+
+            **P1 whitelist (3 tags):**
+            - `upload.sigv4_v1` — single-shot SigV4 PUT for object
+              upload.
+            - `download_private.sigv4_v1` — SigV4-signed GET for
+              time-limited private downloads.
+            - `download_public.v1` — bare-HTTPS public-read URL with
+              no signature and no expiry. Pairs with
+              `default_public`.
+
+            **P2 additions:**
+            - `upload.create_multipart_v1` — server-mediated multipart
+              initiation (handler runs `CreateMultipartUpload` and
+              presigns N `UploadPart` URLs in one round trip;
+              companion REST endpoints
+              `POST /files/{file_id}/multipart/{upload_id}` (complete)
+              and `DELETE /files/{file_id}/multipart/{upload_id}`
+              (abort) finalize the lifecycle without `reconcile`).
         max_file_size_bytes:
           type: [integer, 'null']
           format: int64
+          description: |
+            Per-backend hard ceiling on object size in bytes.
+            Optional in the TOML roster — when omitted, FileStorage
+            falls back to the S3 single-object maximum of **5 TiB**
+            (5 * 1024^4 = 5497558138880), per
+            https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html.
+            Operators can lower this for tenancy / quota reasons;
+            raising it above the S3 hard cap has no effect because
+            S3 itself rejects oversize PUTs.
+        max_metadata_bytes:
+          type: [integer, 'null']
+          format: int64
+          description: |
+            Per-backend hard ceiling on aggregate user-metadata size
+            in bytes. Optional — when omitted, FileStorage falls
+            back to the S3 user-metadata budget of **2 KiB** (2048),
+            per
+            https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html
+            ("Within the PUT request header, the user-defined
+            metadata is limited to 2 KB in size."). The cap covers
+            `Content-Type`, `Content-Disposition` (derived from
+            `meta.name`), and every `x-amz-meta-<k>=<v>` mirrored
+            entry; `gts_file_type` is DB-only and does NOT count
+            toward this budget. Enforced at presign time and at
+            `put_file_info`.
+        max_presign_ttl_seconds:
+          type: [integer, 'null']
+          format: int64
+          description: |
+            Per-backend hard ceiling on presigned-URL TTL in
+            seconds. Optional — when omitted, FileStorage falls
+            back to the AWS SigV4 maximum of **7 days** (604800),
+            per
+            https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+            ("X-Amz-Expires: A maximum of 604800 (seven days).").
+            Operators can lower this for tenancy / security reasons;
+            raising it above the AWS hard cap has no effect because
+            S3 itself rejects signatures requesting longer expiries.
+            Applied to every signing path; `download_public.v1` is
+            unaffected because public URLs carry no expiry. The
+            caller's `UrlParams.expires_in_seconds` is capped by
+            this value — exceeding it is a `bad_request`.
         versioning:
           type: boolean
           description: |
@@ -838,21 +1001,50 @@ components:
 
     PresignUploadItem:
       type: object
-      required: [kind, params]
+      required: [kind, capability, params]
       description: |
-        Upload presign item. Two variants:
+        Upload presign item. Two single-shot variants plus one P2
+        multipart variant, discriminated by `capability`:
 
-        - **Initial upload** — `file_id` absent. `owner`,
-          `file_path`, `meta` are required; `backend_id` is
+        - **`upload.sigv4_v1`, `file_id` absent** — initial upload.
+          `owner`, `file_path`, `meta` required; `backend_id` is
           optional and falls back to `default_private`.
-        - **Variant-B re-upload** — `file_id` present. `meta` MUST
-          be absent (rejected with `400 bad_request`); the server
-          pins the row's CURRENT metadata into the presigned PUT.
-          `owner`, `file_path`, `backend_id` are ignored if
-          present (or rejected — implementations MAY enforce
-          stricter validation).
+        - **`upload.sigv4_v1`, `file_id` present** — variant-B
+          re-upload. `meta` MUST be absent (rejected with
+          `400 bad_request`); server pins the row's CURRENT
+          metadata into the presigned PUT. `owner`, `file_path`,
+          `backend_id` are ignored if present.
+        - **`upload.create_multipart_v1` (P2), `file_id` absent** —
+          server-mediated multipart initiation. Same fields as
+          initial upload **plus** required `part_count`. Outcome
+          is `PresignedMultipartHandle` (not `PresignedUploadHandle`).
+
+        Server validates `capability` against the resolved backend's
+        declared `capabilities` list — unknown / undeclared tag →
+        per-item `capability_unavailable`.
       properties:
         kind: { type: string, enum: [upload] }
+        capability:
+          type: string
+          pattern: '^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,9}$'
+          maxLength: 50
+          description: |
+            Versioned signing tag. P1: only `upload.sigv4_v1`.
+            P2 adds `upload.create_multipart_v1`.
+        part_count:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 10000
+          description: |
+            (P2 — required only when `capability =
+            "upload.create_multipart_v1"`.) Number of parts to
+            presign in this multipart session. Caller is
+            responsible for choosing a part size consistent with
+            the backend's minimum (5 MiB on AWS S3 except the final
+            part). FileStorage does not pick `part_size` and does
+            not retroactively extend a session — if the file turns
+            out larger than `part_count` covers, the caller aborts
+            and re-inits.
         file_id:
           type: [string, 'null']
           format: uuid
@@ -890,9 +1082,19 @@ components:
 
     PresignDownloadItem:
       type: object
-      required: [kind, file_id, params]
+      required: [kind, file_id, capability, params]
       properties:
         kind: { type: string, enum: [download] }
+        capability:
+          type: string
+          pattern: '^[a-z][a-z0-9_]+\.[a-z][a-z0-9_]{0,9}$'
+          maxLength: 50
+          description: |
+            Versioned signing tag. P1: `download_private.sigv4_v1`
+            (SigV4-signed, time-limited) or `download_public.v1`
+            (bare-HTTPS, no expiry). Server validates against the
+            target backend's declared `capabilities`; mismatch →
+            per-item `capability_unavailable`.
         file_id: { type: string, format: uuid }
         params: { $ref: '#/components/schemas/UrlParams' }
         etag:
@@ -923,13 +1125,15 @@ components:
       type: object
       required: [kind]
       description: |
-        Per-item outcome. Either `ok` is set (with the kind-specific
-        result) or `error` is set (RFC 7807 problem details).
+        Per-item outcome. Either `ok` is set (with the
+        capability-specific result) or `error` is set (RFC 7807
+        problem details).
       properties:
         kind: { type: string, enum: [upload, download] }
         ok:
           oneOf:
             - $ref: '#/components/schemas/PresignedUploadHandle'
+            - $ref: '#/components/schemas/PresignedMultipartHandle'
             - $ref: '#/components/schemas/PresignedDownload'
             - type: 'null'
         error:
@@ -952,6 +1156,68 @@ components:
             correlate against `reconcile`'s post-overwrite etag for
             race-loser detection.
         expires_at: { type: string, format: date-time }
+
+    PresignedMultipartHandle:
+      type: object
+      required: [file_id, upload_id, part_urls, expires_at]
+      description: |
+        (P2) Outcome of a presign-batch item with
+        `capability = "upload.create_multipart_v1"`. The server
+        has already executed `CreateMultipartUpload` against the
+        backend; `upload_id` is **not** persisted by FileStorage —
+        the caller MUST keep it for the subsequent `complete`
+        (`POST /files/{file_id}/multipart/{upload_id}`) or `abort`
+        (`DELETE /files/{file_id}/multipart/{upload_id}`) call.
+        `reconcile` is NEVER invoked on the multipart path —
+        `complete` runs `CompleteMultipartUpload` itself and flips
+        the row in one transaction.
+      properties:
+        file_id: { type: string, format: uuid }
+        upload_id:
+          type: string
+          description: |
+            Backend-supplied multipart session id (e.g. S3
+            `UploadId`). Opaque, may contain base64 special
+            characters — clients MUST URL-encode when embedding
+            in path parameters.
+        part_urls:
+          type: array
+          items:
+            type: object
+            required: [part_number, url]
+            properties:
+              part_number: { type: integer, minimum: 1, maximum: 10000 }
+              url: { type: string, format: uri }
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Common expiry across every part URL (uniform TTL
+            from `UrlParams.expires_in_seconds`).
+
+    MultipartCompleteRequest:
+      type: object
+      required: [parts]
+      description: |
+        (P2) Body for `POST /files/{file_id}/multipart/{upload_id}`.
+        Mirrors the `CompletedMultipartUpload` payload S3 expects.
+      properties:
+        parts:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          items:
+            type: object
+            required: [part_number, etag]
+            properties:
+              part_number: { type: integer, minimum: 1, maximum: 10000 }
+              etag:
+                type: string
+                description: |
+                  Whatever the backend returned in the `ETag`
+                  response header of the corresponding `UploadPart`
+                  call. Opaque to FileStorage; passed straight to
+                  `CompleteMultipartUpload`.
 
     PresignedDownload:
       type: object
@@ -999,7 +1265,10 @@ components:
           type: [integer, 'null']
           description: |
             Present only on `payload_too_large` errors caused by
-            the user-metadata budget. Reports the cap (2048).
+            the user-metadata budget. Reports the backend's effective
+            cap — usually `2048` (the S3 default) but may be lower
+            when the operator configured `Backend.max_metadata_bytes`
+            below the S3 ceiling.
 
   responses:
     BadRequest:
@@ -1045,6 +1314,27 @@ components:
           schema: { $ref: '#/components/schemas/ProblemDetails' }
     InternalError:
       description: Unexpected server error.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Conflict:
+      description: |
+        Conflicting state. Possible `code` values: `conflict`
+        (optimistic concurrency retries exhausted, or row already
+        in a terminal state — e.g. multipart `complete` against an
+        already-`Uploaded` row), `delete_in_progress` (row in
+        `Deleting`).
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    BackendFailure:
+      description: |
+        Wrapped error from the storage backend (S3 5xx, network,
+        signature rejection, etc.). The `code` is `backend_failure`.
       headers:
         X-Request-Id: { $ref: '#/components/headers/RequestId' }
       content:

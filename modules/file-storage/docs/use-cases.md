@@ -37,7 +37,7 @@
    - **Fresh `file_id` (supersession)** — the application calls `FileStorageClient.create_presigned_url(...)` again with the same `file_path` (yielding a fresh `file_id`), the end-client PUTs to the new URL, and the application commits via `FileStorageClient.reconcile(ctx, new_file_id)`. The partial unique index `files_tenant_backend_path_uploaded_uq` (over `WHERE status = 'uploaded'`) is the canonical race arbiter: at most one `uploaded` row exists per `(tenant_id, backend_id, file_path)`. When two supersessions race on the same address, one `reconcile` wins; the other gets `Conflict` and its backend object becomes an orphan reclaimed by the P2 GC inverse sweep (DESIGN §3.6). After a successful supersession, readers holding the old `file_id` see `NotFound` — the previous row is either rolled into orphan-delete queue or replaced by the supersession transaction. See DESIGN §3.6 "Supersession transaction" for the SQL contract.
 
 10. **Chat Backend → `FileStorageClient.presign_urls(ctx, items: Vec<PresignDownloadItem { file_id, params: UrlParams, etag: Option<Etag>, version_id: Option<String> }>)`.**
-    Obtains URLs to give the frontend for display/download. The method is batch-first by design (one DB SELECT for the whole list, one RTT in a future remote topology), and a single-URL caller simply passes a one-element vector. Per item: when `etag` is present, the server verifies the row's current `etag` matches (DB-only; no HEAD against S3) before signing — mismatch returns `EtagMismatch` for that item. When `version_id` is present and the file's hosting backend has `versioning = true`, the signed URL embeds `versionId=<vid>` so the URL resolves to that historical generation. Every issued URL sets `response-content-type` and `response-content-disposition` query params from the DB row's metadata, so the user-visible download experience tracks DB.meta independent of any S3-side drift. Backends with `PublicReadUrls` capability and `default_public = true` issue bare-HTTPS URLs with no expiry (`is_public = true` on the outcome).
+    Obtains URLs to give the frontend for display/download. The method is batch-first by design (one DB SELECT for the whole list, one RTT in a future remote topology), and a single-URL caller simply passes a one-element vector. Per item: when `etag` is present, the server verifies the row's current `etag` matches (DB-only; no HEAD against S3) before signing — mismatch returns `EtagMismatch` for that item. When `version_id` is present and the file's hosting backend has `versioning = true`, the signed URL embeds `versionId=<vid>` so the URL resolves to that historical generation. Every issued URL sets `response-content-type` and `response-content-disposition` query params from the DB row's metadata, so the user-visible download experience tracks DB.meta independent of any S3-side drift. Backends declaring the `download_public.v1` capability tag (typically paired with `default_public = true`) issue bare-HTTPS URLs with no expiry (`is_public = true` on the outcome) when the per-item `capability` is `download_public.v1`.
 
 11. **Authorized Owner → FS REST (`GET /files/{file_id}/meta` / `POST /presign-batch`).**
     By default the File Storage REST API allows readonly access to a user's/owner's files using standard `authn + authz + filestorage` authorization, so an authorized user can request the metadata and a download URL of their own file knowing only the `file_id`:
@@ -357,16 +357,19 @@ When the hosting backend has `versioning = false`, the `version_id` field on the
 
 ## 11.11 Component diagram
 
-Two client surfaces (in-process Rust SDK, REST) front the same `File Storage Service`, which owns its SQL DB and routes byte-plane operations to one of N S3-compatible backends declared in the static roster. Bytes never proxy through FS in P1 — end-clients PUT/GET directly against S3 using SigV4 presigned URLs (or bare HTTPS for public-read backends).
+Two client surfaces (in-process Rust SDK, REST) front the same `File Storage Service`. The service owns its SQL metadata DB and exposes its byte plane through an `S3 Adapter` that talks to one of N **physical S3-compatible endpoints** (the roster of which is loaded from a static TOML configuration at boot — implementation detail, not shown as a separate node). Bytes never proxy through FS — external clients PUT/GET directly against the S3 endpoint using SigV4 presigned URLs (or bare HTTPS for `download_public.v1`-capable endpoints); in-process streaming readers (`read_file`) consume bytes through the adapter without going through a presigned URL.
 
 ```mermaid
 flowchart TB
-    subgraph SDK["Rust SDK Clients (in-process modules)"]
-        direction LR
+    subgraph SDK_W["Rust SDK Writers (in-process)"]
         SDKChat["chat-backend<br/>writer / orchestrator"]
-        SDKAv["antivirus<br/>streaming reader"]
-        SDKLlm["llm-gateway<br/>streaming reader"]
-        SDKFp["file-parser<br/>streaming reader"]
+    end
+
+    subgraph SDK_R["Rust SDK Streaming Readers (in-process)"]
+        direction LR
+        SDKAv["antivirus"]
+        SDKLlm["llm-gateway"]
+        SDKFp["file-parser"]
     end
 
     subgraph HTTP["HTTP Clients (REST)"]
@@ -378,38 +381,48 @@ flowchart TB
 
     subgraph FS["File Storage Service"]
         direction TB
-        REST["REST adapter (axum)<br/>• race-detection conditional UPDATE<br/>• partial-unique-index guard<br/>• reconcile (HEAD-and-pull)<br/>• PUT /meta DB+S3 sync (CopyObject)<br/>• 2-phase delete<br/>• status state machine"]
+        REST["REST adapter (axum)<br/>• race-detection conditional UPDATE<br/>• partial-unique-index guard<br/>• reconcile (HEAD-and-pull)<br/>• PUT /meta DB+S3 sync (CopyObject)<br/>• 2-phase delete<br/>• status state machine<br/>• POST/DELETE multipart (P2)"]
         SDKImpl["FileStorageClient impl<br/>(SDK trait)"]
         AUTHZ["AuthZ integration<br/>gts.cf.fstorage.file.type.v1~…"]
-        BR["Backend Router<br/>backend_id → StorageBackend"]
+        BR["Backend Router<br/>backend_id → StorageBackend<br/>(roster loaded from TOML at boot)"]
+        ADAPTER["S3 Adapter<br/>(impl StorageBackend)<br/>• issue_presigned_put / gets<br/>• head_object<br/>• copy_object_self<br/>• delete_object<br/>• open_read (streaming)<br/>• CreateMultipartUpload (P2)<br/>• CompleteMultipartUpload (P2)<br/>• AbortMultipartUpload (P2)"]
         REST --> AUTHZ
         REST --> BR
         SDKImpl --> AUTHZ
         SDKImpl --> BR
+        BR --> ADAPTER
     end
 
     DB[("FileStorage DB (SQL)<br/>schema: file_storage<br/>files + indexes<br/>partial-unique on uploaded")]
 
-    subgraph ROSTER["Storage Backend Roster (static TOML)"]
+    subgraph BACKENDS["Storage Backends (S3-compatible endpoints)"]
         direction TB
-        B1["S3-compatible<br/>endpoint, creds, versioning, capabilities=[]"]
-        B2["S3-compatible<br/>capabilities=[PublicReadUrls]"]
-        B3["S3-compatible<br/>capabilities=[Multipart]"]
+        B1["AWS S3 / MinIO / Ceph / Wasabi / s3s-fs<br/>capabilities=[upload.sigv4_v1,<br/>download_private.sigv4_v1]"]
+        B2["S3 with public-read ACL / origin behind CDN<br/>capabilities=[upload.sigv4_v1,<br/>download_private.sigv4_v1,<br/>download_public.v1]"]
+        B3["S3-class with multipart support (P2)<br/>capabilities=[upload.sigv4_v1,<br/>upload.create_multipart_v1,<br/>download_private.sigv4_v1]"]
     end
 
-    EC["End-clients<br/>(browsers, mobile,<br/>external services)"]
+    EC["External clients<br/>(browsers, mobile, application<br/>backends, external services)"]
 
-    SDK ==>|"ClientHub.get::&lt;dyn FileStorageClient&gt;()"| SDKImpl
+    SDK_W ==>|"ClientHub.get::&lt;dyn FileStorageClient&gt;()"| SDKImpl
+    SDK_R ==>|"ClientHub.get::&lt;dyn FileStorageClient&gt;()"| SDKImpl
     HTTP ==>|"/api/file-storage/v1"| REST
     REST --> DB
     SDKImpl --> DB
-    BR --> ROSTER
-    ROSTER <-->|"Direct PUT / GET via SigV4 presigned URLs<br/>(or bare HTTPS for public-read backends)"| EC
+    ADAPTER -->|"server-side S3 API<br/>(presign / HEAD / CopyObject /<br/>DeleteObject / GetObject stream /<br/>CreateMultipartUpload (P2) /<br/>CompleteMultipartUpload (P2) /<br/>AbortMultipartUpload (P2))"| BACKENDS
+    EC <-->|"Direct PUT / GET via SigV4 presigned URLs<br/>(or bare HTTPS for download_public.v1)"| BACKENDS
 ```
+
+**Reading the diagram.**
+
+- **Control plane** — every metadata mutation (presign issuance, reconcile, PUT /meta CAS, delete, multipart complete/abort) flows through `REST` or `SDKImpl` → `AUTHZ` + `BR` → `ADAPTER` → `BACKENDS`, with concurrent SQL writes/reads against `DB`.
+- **External byte plane** — once `REST` returns a `PresignedUploadHandle` / `PresignedDownload` / `PresignedMultipartHandle`, the URL travels back to whichever HTTP client requested it. The actual bytes flow **directly between the client and the S3 endpoint** (the `EC ↔ BACKENDS` arrow), bypassing the FileStorage service entirely. `download_public.v1` URLs require no signing and have no expiry; everything else is SigV4-signed and TTL-capped.
+- **In-process byte plane** — `read_file` for SDK streaming readers (antivirus / llm-gateway / file-parser) does NOT hand back a presigned URL; the byte stream is opened by the adapter (`open_read`) and forwarded back through `SDKImpl` to the caller as a `Stream<Bytes>`. The path is `SDK_R → SDKImpl → BR → ADAPTER → BACKENDS` and bytes return along the same path.
+- **`ROSTER`** — not drawn as a separate node. It is a static TOML configuration loaded once at boot; the `BR` reads it to resolve `backend_id` to an `S3 Adapter` instance and to enforce per-backend tenant access lists. The architectural invariant (§1.1) is that every entry declares only versioned capability tags — the SDK's `KNOWN_CAPABILITIES` whitelist validates them at init and fails-fast on unknown tags.
 
 ### 11.11.1 `file-storage-sdk` public surface
 
-Consumer-facing trait `FileStorageClient` (registered in `ClientHub`). 11 methods total.
+Consumer-facing trait `FileStorageClient` (registered in `ClientHub`). 11 P1 methods + 3 P2-reserved multipart methods (`unimplemented!()` stubs in P1) = 14 total surface.
 
 **Streaming read**
 
@@ -444,7 +457,7 @@ Consumer-facing trait `FileStorageClient` (registered in `ClientHub`). 11 method
 
 - IDs: `FileId`, `BackendId`, `Etag`
 - File: `FileInfo`, `FileMeta`, `FileMetaUpdate`, `FileStatus` (`PendingUpload | Uploaded | Deleting`), `CustomMetadata`, `FileList`, `ListFilesQuery`, `OwnerRef`
-- Backends: `Backend` (with `default_private`, `default_public`, `versioning`, `capabilities`), `BackendCapability` (optional `PublicReadUrls`, optional `Multipart`). Presigned URL support is constitutive (every backend speaks S3 and respects presigned URLs by definition); `kind` and `transport` discriminators are not represented (only one possible value each, by architectural decision).
+- Backends: `Backend` (with `default_private`, `default_public`, `versioning`, `capabilities: Vec<CapabilityTag>`, `max_file_size_bytes`, `max_metadata_bytes`, `max_presign_ttl_seconds`). `CapabilityTag` is a flat string `<operation>.<version>` (P1: `upload.sigv4_v1`, `download_private.sigv4_v1`, `download_public.v1`; P2 adds `upload.create_multipart_v1`). Validated at boot against the SDK's `KNOWN_CAPABILITIES` whitelist — unknown tag → fail-fast init. Presigned URL support is constitutive; `kind` and `transport` discriminators are not represented (only one possible value each, by architectural decision).
 - Presign: `UrlParams`, `PresignedUploadHandle`, `PresignedDownload` (with `is_public`), `PresignDownloadItem` (with optional `version_id`), `PresignDownloadOutcome`
 - Reconcile: `ReconcileResult`
 - Streaming: `FileByteStream`, `FileReadHandle`
