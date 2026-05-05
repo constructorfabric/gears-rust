@@ -415,9 +415,9 @@ Consumer-facing trait `FileStorageClient` (registered in `ClientHub`). 12 method
 
 - `read_file(ctx, file_id, etag?) -> FileReadHandle { info, bytes: Stream<Bytes> }` — lazy in-process self-healing trigger.
 
-**Streaming write** (P1 — Rust SDK only; not exposed via HTTP API in P1; **stub in P1**)
+**Streaming write** (P1 — Rust SDK only; not exposed via HTTP API in P1)
 
-- `put_file(ctx, backend_id?, owner, file_path, meta, bytes: Stream<Bytes>, etag?) -> FileInfo` — single-call in-process upload, future implementation drives `create_presigned_url` → backend PUT → `reconcile` from a byte stream. P1 implementation: `unimplemented!()`.
+- `put_file(ctx, backend_id?, owner, file_path, meta, bytes: Stream<Bytes>, etag?) -> FileInfo` — single-call in-process upload. Drives the adapter directly (`PutObject` for `s3-compatible`); does NOT issue a presigned URL and does NOT reuse the REST `reconcile` endpoint. Internally: INSERT `PendingUpload` row → stream bytes via adapter `PutObject` (pinning `Content-Type` / `Content-Disposition` / `x-amz-meta-<k>`, never `gts_file_type`) → HEAD-and-pull authoritative `(s3_etag, s3_version_id, mirrored meta)` → conditional UPDATE flips to `Uploaded`. On any error between the INSERT and the final UPDATE the SDK best-effort runs `DELETE FROM files WHERE id = $file_id AND status = 'pending_upload'` so the call leaves no `PendingUpload` row behind; if the failure occurred after `PutObject` succeeded, the orphan backend object is reclaimed by the P2 GC inverse sweep. `etag = None` is initial upload (fresh `file_id`, supersedes any existing `Uploaded` row on the same address); `etag = Some(e)` is variant-B re-upload (same `file_id` and backend object key, mismatch → `EtagMismatch`). The REST proxy upload path (`POST /files` with bytes-through-FileStorage) is the separate P3 concern for HTTP clients that cannot speak the presign-first protocol.
 
 **Presign-first write (bytes flow client ↔ S3 directly, no SDK byte stream)**
 
