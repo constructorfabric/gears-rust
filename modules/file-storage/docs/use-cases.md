@@ -34,7 +34,7 @@
 
    **Re-uploading file content** can be done in two ways:
    - **Variant B (preserve `file_id`)** — the application backend calls `FileStorageClient.create_presigned_overwrite_url(ctx, file_id, params)`. The server pins the row's CURRENT metadata into the presigned PUT (the caller MUST NOT supply `meta`); the end-client `PUT`s new bytes to the same backend object key; the application calls `FileStorageClient.reconcile(ctx, file_id)` to refresh the row's `etag` and `version_id`. The `file_id` is preserved; consumers holding the old `file_id` see the new bytes after the next `reconcile` (or via the lazy self-heal on `read_file`).
-   - **Fresh `file_id` (supersession)** — the application calls `FileStorageClient.create_presigned_url(...)` again with the same `file_path` (yielding a fresh `file_id`), the end-client PUTs to the new URL, and the application commits via `FileStorageClient.reconcile(ctx, new_file_id)`. The partial unique index `files_tenant_backend_path_uploaded_uq` enforces last-write-wins: the previously-uploaded sibling row is deleted in the same supersession transaction, and any reader holding the old `file_id` sees `NotFound`.
+   - **Fresh `file_id` (supersession)** — the application calls `FileStorageClient.create_presigned_url(...)` again with the same `file_path` (yielding a fresh `file_id`), the end-client PUTs to the new URL, and the application commits via `FileStorageClient.reconcile(ctx, new_file_id)`. The partial unique index `files_tenant_backend_path_uploaded_uq` (over `WHERE status = 'uploaded'`) is the canonical race arbiter: at most one `uploaded` row exists per `(tenant_id, backend_id, file_path)`. When two supersessions race on the same address, one `reconcile` wins; the other gets `Conflict` and its backend object becomes an orphan reclaimed by the P2 GC inverse sweep (DESIGN §3.6). After a successful supersession, readers holding the old `file_id` see `NotFound` — the previous row is either rolled into orphan-delete queue or replaced by the supersession transaction. See DESIGN §3.6 "Supersession transaction" for the SQL contract.
 
 10. **Chat Backend → `FileStorageClient.presign_urls(ctx, items: Vec<PresignDownloadItem { file_id, params: UrlParams, etag: Option<Etag>, version_id: Option<String> }>)`.**
     Obtains URLs to give the frontend for display/download. The method is batch-first by design (one DB SELECT for the whole list, one RTT in a future remote topology), and a single-URL caller simply passes a one-element vector. Per item: when `etag` is present, the server verifies the row's current `etag` matches (DB-only; no HEAD against S3) before signing — mismatch returns `EtagMismatch` for that item. When `version_id` is present and the file's hosting backend has `versioning = true`, the signed URL embeds `versionId=<vid>` so the URL resolves to that historical generation. Every issued URL sets `response-content-type` and `response-content-disposition` query params from the DB row's metadata, so the user-visible download experience tracks DB.meta independent of any S3-side drift. Backends with `PublicReadUrls` capability and `default_public = true` issue bare-HTTPS URLs with no expiry (`is_public = true` on the outcome).
@@ -378,38 +378,38 @@ flowchart TB
 
     subgraph FS["File Storage Service"]
         direction TB
-        REST["REST adapter (axum)"]
+        REST["REST adapter (axum)<br/>• race-detection conditional UPDATE<br/>• partial-unique-index guard<br/>• reconcile (HEAD-and-pull)<br/>• PUT /meta DB+S3 sync (CopyObject)<br/>• 2-phase delete<br/>• status state machine"]
         SDKImpl["FileStorageClient impl<br/>(SDK trait)"]
-        UC["Upload Coordinator<br/>• race-detection conditional UPDATE<br/>• partial-unique-index guard<br/>• reconcile (HEAD-and-pull)<br/>• PUT /meta DB+S3 sync (CopyObject)<br/>• 2-phase delete<br/>• status state machine"]
         AUTHZ["AuthZ integration<br/>gts.cf.fstorage.file.type.v1~…"]
         BR["Backend Router<br/>backend_id → StorageBackend"]
-        REST --> UC
-        SDKImpl --> UC
-        UC --> AUTHZ
-        UC --> BR
+        REST --> AUTHZ
+        REST --> BR
+        SDKImpl --> AUTHZ
+        SDKImpl --> BR
     end
 
     DB[("FileStorage DB (SQL)<br/>schema: file_storage<br/>files + indexes<br/>partial-unique on uploaded")]
 
     subgraph ROSTER["Storage Backend Roster (static TOML)"]
         direction TB
-        B1["id=…  kind=s3-compatible<br/>endpoint, creds, versioning, capabilities=[PresignedUrls]"]
-        B2["id=…  kind=s3-compatible<br/>capabilities=[PresignedUrls, PublicReadUrls]"]
-        B3["id=…  kind=s3-compatible"]
+        B1["S3-compatible<br/>endpoint, creds, versioning, capabilities=[]"]
+        B2["S3-compatible<br/>capabilities=[PublicReadUrls]"]
+        B3["S3-compatible<br/>capabilities=[Multipart]"]
     end
 
     EC["End-clients<br/>(browsers, mobile,<br/>external services)"]
 
     SDK ==>|"ClientHub.get::&lt;dyn FileStorageClient&gt;()"| SDKImpl
     HTTP ==>|"/api/file-storage/v1"| REST
-    UC --> DB
+    REST --> DB
+    SDKImpl --> DB
     BR --> ROSTER
     ROSTER <-->|"Direct PUT / GET via SigV4 presigned URLs<br/>(or bare HTTPS for public-read backends)"| EC
 ```
 
 ### 11.11.1 `file-storage-sdk` public surface
 
-Consumer-facing trait `FileStorageClient` (registered in `ClientHub`). 12 methods total.
+Consumer-facing trait `FileStorageClient` (registered in `ClientHub`). 11 methods total.
 
 **Streaming read**
 
@@ -417,7 +417,7 @@ Consumer-facing trait `FileStorageClient` (registered in `ClientHub`). 12 method
 
 **Streaming write** (P1 — Rust SDK only; not exposed via HTTP API in P1)
 
-- `put_file(ctx, backend_id?, owner, file_path, meta, bytes: Stream<Bytes>, etag?) -> FileInfo` — single-call in-process upload. Drives the adapter directly (`PutObject` for `s3-compatible`); does NOT issue a presigned URL and does NOT reuse the REST `reconcile` endpoint. Internally: INSERT `PendingUpload` row → stream bytes via adapter `PutObject` (pinning `Content-Type` / `Content-Disposition` / `x-amz-meta-<k>`, never `gts_file_type`) → HEAD-and-pull authoritative `(s3_etag, s3_version_id, mirrored meta)` → conditional UPDATE flips to `Uploaded`. On any error between the INSERT and the final UPDATE the SDK best-effort runs `DELETE FROM files WHERE id = $file_id AND status = 'pending_upload'` so the call leaves no `PendingUpload` row behind; if the failure occurred after `PutObject` succeeded, the orphan backend object is reclaimed by the P2 GC inverse sweep. `etag = None` is initial upload (fresh `file_id`, supersedes any existing `Uploaded` row on the same address); `etag = Some(e)` is variant-B re-upload (same `file_id` and backend object key, mismatch → `EtagMismatch`). The REST proxy upload path (`POST /files` with bytes-through-FileStorage) is the separate P3 concern for HTTP clients that cannot speak the presign-first protocol.
+- `put_file(ctx, backend_id?, owner, file_path, meta, bytes: Stream<Bytes>, etag?) -> FileInfo` — single-call in-process upload. Drives the S3 adapter directly (`PutObject`); does NOT issue a presigned URL and does NOT reuse the REST `reconcile` endpoint. Internally: INSERT `PendingUpload` row → stream bytes via adapter `PutObject` (pinning `Content-Type` / `Content-Disposition` / `x-amz-meta-<k>`, never `gts_file_type`) → HEAD-and-pull authoritative `(s3_etag, s3_version_id, mirrored meta)` → conditional UPDATE flips to `Uploaded`. On any error between the INSERT and the final UPDATE the SDK best-effort runs `DELETE FROM files WHERE id = $file_id AND status = 'pending_upload'` so the call leaves no `PendingUpload` row behind; if the failure occurred after `PutObject` succeeded, the orphan backend object is reclaimed by the P2 GC inverse sweep. `etag = None` is initial upload (fresh `file_id`, supersedes any existing `Uploaded` row on the same address); `etag = Some(e)` is variant-B re-upload (same `file_id` and backend object key, mismatch → `EtagMismatch`). There is no bytes-through-FileStorage REST proxy upload in any phase — external clients always go presign-first.
 
 **Presign-first write (bytes flow client ↔ S3 directly, no SDK byte stream)**
 
@@ -444,7 +444,7 @@ Consumer-facing trait `FileStorageClient` (registered in `ClientHub`). 12 method
 
 - IDs: `FileId`, `BackendId`, `Etag`
 - File: `FileInfo`, `FileMeta`, `FileMetaUpdate`, `FileStatus` (`PendingUpload | Uploaded | Deleting`), `CustomMetadata`, `FileList`, `ListFilesQuery`, `OwnerRef`
-- Backends: `Backend` (with `default_private`, `default_public`, `versioning`), `BackendKind` (`S3Compatible`), `BackendTransport` (`Redirect`), `BackendCapability` (`PresignedUrls`, `PublicReadUrls`)
+- Backends: `Backend` (with `default_private`, `default_public`, `versioning`, `capabilities`), `BackendCapability` (optional `PublicReadUrls`, optional `Multipart`). Presigned URL support is constitutive (every backend speaks S3 and respects presigned URLs by definition); `kind` and `transport` discriminators are not represented (only one possible value each, by architectural decision).
 - Presign: `UrlParams`, `PresignedUploadHandle`, `PresignedDownload` (with `is_public`), `PresignDownloadItem` (with optional `version_id`), `PresignDownloadOutcome`
 - Reconcile: `ReconcileResult`
 - Streaming: `FileByteStream`, `FileReadHandle`

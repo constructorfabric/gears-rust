@@ -587,12 +587,16 @@ components:
 
     Backend:
       type: object
+      description: |
+        Every FileStorage backend speaks S3 protocol over HTTP and
+        respects presigned URLs. The descriptor therefore carries no
+        `kind` or `transport` discriminator (each would only ever
+        hold one value, by architectural decision). Native non-S3
+        transports are out-of-scope.
       required:
         - id
-        - kind
         - default_private
         - default_public
-        - transport
         - capabilities
         - versioning
       properties:
@@ -603,14 +607,6 @@ components:
             Stable backend identity, assigned once in the static
             TOML roster. Used in `FileInfo.backend_id` and as the
             optional `backend_id` field on upload requests.
-        kind:
-          type: string
-          enum: [s3-compatible]
-          description: |
-            P1 ships only `s3-compatible`. The S3-class endpoint
-            can be AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat,
-            or `s3s-fs` running side-by-side as the local-disk
-            recipe.
         default_private:
           type: boolean
           description: |
@@ -621,31 +617,31 @@ components:
           type: boolean
           description: |
             This backend is the tenant's default for new
-            **public-read** files. Implies the `PublicReadUrls`
+            **public-read** files. Implies the `public_read_urls`
             capability — every download URL issued for a file
             here is a bare-HTTPS URL with no expiry.
-        transport:
-          type: string
-          enum: [redirect]
-          description: |
-            P1 backends are all `redirect` — bytes flow client ↔
-            backend directly via presigned URLs (or bare HTTPS for
-            public-read backends).
         capabilities:
           type: array
           items:
             type: string
             enum:
-              - presigned_urls
               - public_read_urls
+              - multipart
           description: |
-            P1 capabilities:
-            - `presigned_urls` — backend can sign time-limited
-              URLs for client-direct PUT/GET. Mandatory.
+            Optional capabilities — variations among
+            already-S3-protocol-compatible backends. Presigned URL
+            support is constitutive (a backend that cannot sign URLs
+            is not a backend by definition) and is therefore NOT
+            represented as a capability.
             - `public_read_urls` — backend serves objects through
               bare-HTTPS URLs without presigning (e.g. an S3 bucket
               with public-read ACL or an origin behind a CDN).
-              Optional in P1; pairs with `default_public`.
+              Pairs with `default_public`.
+            - `multipart` (P2) — backend honours S3-style multipart
+              upload (`CreateMultipartUpload` / `UploadPart` /
+              `CompleteMultipartUpload` / `AbortMultipartUpload`).
+              When absent, clients fall back to single-shot
+              presigned PUT.
         max_file_size_bytes:
           type: [integer, 'null']
           format: int64
@@ -709,12 +705,9 @@ components:
         immutable. Any request body that carries `gts_file_type` is
         rejected with `400 bad_request`.
       properties:
-        name: { type: [string, 'null'], maxLength: 512 }
-        mime_type: { type: [string, 'null'], maxLength: 256 }
-        custom_metadata:
-          oneOf:
-            - $ref: '#/components/schemas/CustomMetadata'
-            - type: 'null'
+        name: { type: string, maxLength: 512 }
+        mime_type: { type: string, maxLength: 256 }
+        custom_metadata: { $ref: '#/components/schemas/CustomMetadata' }
       additionalProperties: false
 
     FileStatus:

@@ -39,13 +39,15 @@ FileStorage is a tenant-scoped, backend-pluggable file service delivered as a si
 
 P1 is the **first version of the API**; future phases extend, never replace.
 
-The module hosts a roster of backends of a **single P1 kind** — `s3-compatible` (bytes in an S3-class endpoint, whether AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe). There is no native `local` POSIX backend kind: the `s3s-fs` recipe covers local-disk deployments end-to-end and removes any architectural reason to introduce one. Multiple `s3-compatible` instances can coexist within one deployment; each has a stable `backend_id` (UUID) assigned once in the TOML roster, a per-backend tenant access list, a `versioning` flag mirroring the underlying bucket's configuration, and a static set of capability flags (`PresignedUrls` mandatory; optional `PublicReadUrls`). Every backend shares one SQL database owned by the FileStorage module ([ADR-0001](./ADR/0001-cpt-cf-file-storage-adr-s3-no-metadata-db.md)). Rows are discriminated by `backend_id`. There is no per-backend database, no per-backend schema, and no operational deployment that runs FileStorage without the module database.
+**Backend uniformity (architectural invariant, every phase).** Every FileStorage backend speaks S3 protocol over HTTP and respects presigned URLs. Concretely the supported set is any S3-class endpoint — AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe. Native non-S3 transports (POSIX, WebDAV, FTP, NFS, SMB, …) are out-of-scope at the architecture level — not deferred to a later phase, but excluded by design. There is no `BackendKind` discriminator and no `BackendTransport` discriminator: each would only ever hold one value and is therefore not represented. Gateway clients for non-S3 protocols, if anyone needs them, are written as independent modules that consume FileStorage's REST API and presigned URLs as ordinary clients — they are not part of FileStorage's roadmap.
 
-For local-disk deployments where operators do not have an S3-class infrastructure to point at, the **P1 recipe is to run `s3s-fs` (a Rust S3-compatible filesystem-backed server, see DESIGN §4 Testing strategy) as a side-process** and register it in the TOML roster as a regular `s3-compatible` backend. There is no native POSIX adapter in P1 because that recipe covers the use case end-to-end at the SDK / REST / capability layer with no architecture-level branching.
+Multiple S3-compatible backend instances can coexist within one deployment; each has a stable `backend_id` (UUID) assigned once in the TOML roster, a per-backend tenant access list, a `versioning` flag mirroring the underlying bucket's configuration, and an optional capability set (`PublicReadUrls` for bare-HTTPS reads, `Multipart` for S3-style multipart upload). Presigned URL support is constitutive — a backend that cannot sign URLs is not a backend, so it is not represented as a capability. Every backend shares one SQL database owned by the FileStorage module ([ADR-0001](./ADR/0001-cpt-cf-file-storage-adr-s3-no-metadata-db.md)). Rows are discriminated by `backend_id`. There is no per-backend database, no per-backend schema, and no operational deployment that runs FileStorage without the module database.
+
+For local-disk deployments where operators do not have an S3-class infrastructure to point at, the recipe is to run **`s3s-fs` (a Rust S3-compatible filesystem-backed server, see DESIGN §4 Testing strategy) as a side-process** and register it in the TOML roster as a regular S3-compatible backend. There is no native POSIX adapter and never will be — that recipe covers the use case end-to-end at the SDK / REST / capability layer with no architecture-level branching.
 
 Externally, every file is addressed by an **opaque `file_id` (UUID)** ([ADR-0002](./ADR/0002-cpt-cf-file-storage-adr-opaque-file-ids.md)). The logical `file_path` and the display `name` are metadata fields, not URL components — a renamed file keeps its `file_id` and its persistent URL. Cross-module handles (chat backend ↔ FileStorage ↔ antivirus ↔ LLM) are `(file_id, etag)` pairs, where `etag` is the raw S3 ETag (content fingerprint only).
 
-The default — and in P1 the **only** — upload path is **presign-first**: the application's own backend calls `create_presigned_url`, hands the resulting `(file_id, upload_url, etag_pinned)` to its frontend, the frontend `PUT`s bytes directly to the storage backend ([ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-presigned-put-sigv4.md)), and the application's backend calls `POST /files/{file_id}/meta/reconcile` to commit. The `reconcile` endpoint HEADs the storage backend, pulls the authoritative `s3_etag`, `s3_version_id`, and S3-mirrored metadata (Content-Type, Content-Disposition, every `x-amz-meta-<k>`) into the row in one atomic step. `gts_file_type` is DB-only and is never pulled from S3. Bytes never traverse FileStorage on the upload data plane in P1.
+The default — and the **only** external upload path, in every phase — is **presign-first**: the application's own backend calls `create_presigned_url`, hands the resulting `(file_id, upload_url, etag_pinned)` to its frontend, the frontend `PUT`s bytes directly to the storage backend ([ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-presigned-put-sigv4.md)), and the application's backend calls `POST /files/{file_id}/meta/reconcile` to commit. The `reconcile` endpoint HEADs the storage backend, pulls the authoritative `s3_etag`, `s3_version_id`, and S3-mirrored metadata (Content-Type, Content-Disposition, every `x-amz-meta-<k>`) into the row in one atomic step. `gts_file_type` is DB-only and is never pulled from S3. Bytes never traverse FileStorage on the external upload data plane.
 
 Re-uploading bytes to an existing `file_id` is a `presign-batch` upload item with `file_id` set (variant B); the server pins the row's CURRENT metadata into the presigned PUT, the client re-PUTs to the same backend object key, and the application calls `reconcile` to refresh the row. Changing metadata is a `PUT /files/{file_id}/meta` call: an atomic DB+S3 sync via `CopyObject self-copy` with `MetadataDirective: REPLACE`.
 
@@ -63,20 +65,20 @@ Authentication and authorization are delegated to the platform's `authn`/`authz`
 | `cpt-cf-file-storage-fr-get-metadata` | `get_file_info(file_id, optional_etag)` returns the FileStorage SQL row as the authoritative metadata view. The backend is **not** consulted on this path (per ADR-0001). |
 | `cpt-cf-file-storage-fr-list-files` | `list_files` is served entirely from the FileStorage SQL database, with mandatory owner scoping. P1 exposes only the `owner_id` filter plus cursor pagination; sort order is fixed to `created_at DESC, id ASC`. Other filters (`mime_type`, `gts_file_type`, date range, `backend_id`) are deferred to P2 — see §4 Future deltas. |
 | `cpt-cf-file-storage-fr-multipart-upload` | **Deferred to P2** — explicit deviation from PRD's `p1` priority. See §4 Future deltas for the pre-decided Variant 2 design (server-mediated init/abort + multipart presign URLs). P1 ships only single-shot presigned PUT (`create_presigned_url` / `create_presigned_overwrite_url`). |
-| `cpt-cf-file-storage-fr-content-type-validation` | Direct (presigned) uploads pin `Content-Type` via SigV4 SignedHeaders; the application backend that issued the presigned URL is responsible for trusting its end-client. There is no proxy upload path in P1. |
+| `cpt-cf-file-storage-fr-content-type-validation` | Direct (presigned) uploads pin `Content-Type` via SigV4 SignedHeaders; the application backend that issued the presigned URL is responsible for trusting its end-client. There is no bytes-through-FileStorage proxy upload path in any phase. |
 | `cpt-cf-file-storage-fr-file-ownership` | `OwnerRef { tenant_id, owner_id }` is captured at `create_presigned_url` and stored on the row. FileStorage does not distinguish user vs app principals — that distinction is owned by the identity / authz subsystem. Transfer is deferred to P2. |
 | `cpt-cf-file-storage-fr-authorization` | Every operation calls the `authz` SDK with the file's GTS type as resource context. FileStorage never parses tokens; identity is read from `SecurityContext`. |
 | `cpt-cf-file-storage-fr-tenant-boundary` | Every row carries `tenant_id`; mutations require `SecurityContext.tenant_id == row.tenant_id`. The opaque `file_id` URL space is shared across tenants, so a `file_id` from another tenant returns `404 NotFound` (no enumeration oracle) — see ADR-0002. |
 | `cpt-cf-file-storage-fr-data-classification` | FileStorage treats content as opaque. |
 | `cpt-cf-file-storage-fr-file-type-classification` | GTS file type is mandatory at `create_presigned_url`, immutable thereafter, stored on the row, and injected into every authz request. **DB-only — never mirrored to S3** (`cpt-cf-file-storage-constraint-meta-mirrored-via-put-meta`). Structurally immutable: `FileMetaUpdate` does not declare this field. |
-| `cpt-cf-file-storage-fr-signed-urls` | `presign_urls` is the batch entry-point for download URLs (`cpt-cf-file-storage-principle-batch-presigned-urls`). For S3-compatible backends with `PresignedUrls` capability it returns a SigV4-signed `GetObject` URL with `response-content-type` and `response-content-disposition` overridden from the DB row. Backends with `PublicReadUrls` capability and `default_public = true` issue eternal bare-HTTPS URLs instead. |
-| `cpt-cf-file-storage-fr-direct-transfer` | `create_presigned_url` (initial upload) and `create_presigned_overwrite_url` (variant-B re-upload) issue SigV4 PUT URLs on backends with `PresignedUrls`. The metadata row is registered first (`PendingUpload`) on initial upload; commit is via `POST /files/{id}/meta/reconcile`. |
+| `cpt-cf-file-storage-fr-signed-urls` | `presign_urls` is the batch entry-point for download URLs (`cpt-cf-file-storage-principle-batch-presigned-urls`). It returns a SigV4-signed `GetObject` URL with `response-content-type` and `response-content-disposition` overridden from the DB row. Backends with `PublicReadUrls` capability and `default_public = true` issue eternal bare-HTTPS URLs instead. |
+| `cpt-cf-file-storage-fr-direct-transfer` | `create_presigned_url` (initial upload) and `create_presigned_overwrite_url` (variant-B re-upload) issue SigV4 PUT URLs. The metadata row is registered first (`PendingUpload`) on initial upload; commit is via `POST /files/{id}/meta/reconcile`. |
 | `cpt-cf-file-storage-fr-gc-direct-uploads` | The `files` table records `upload_expires_at` for `PendingUpload` rows; an external scheduler (P2) invokes a console command that sweeps expired rows. |
 | `cpt-cf-file-storage-fr-metadata-storage` | System-managed fields and custom metadata both live in the FileStorage SQL row; the row is the authoritative source. For `s3-compatible` backends, a subset (every field except `gts_file_type`) is mirrored as S3 user-metadata, kept in sync via PUT /meta's `CopyObject self-copy` and reconcile's HEAD-and-pull. |
 | `cpt-cf-file-storage-fr-update-metadata` | `put_file_info(file_id, FileMetaUpdate, etag?)` replaces `name`, `mime_type`, and `custom_metadata` (omitted fields keep current values), atomically synchronizing DB and S3 via `CopyObject` self-copy with `MetadataDirective: REPLACE`. `gts_file_type` is structurally immutable and not declared on `FileMetaUpdate`. |
 | `cpt-cf-file-storage-fr-retention-indefinite` | No TTL enforcement in P1; rows live until `delete_file`. |
-| `cpt-cf-file-storage-fr-backend-abstraction` | `StorageBackend` adapter trait sits behind the upload coordinator and the SDK facade; in P1 only `s3-compatible` implements it. |
-| `cpt-cf-file-storage-fr-backend-capabilities` | P1 declares two capabilities: `PresignedUrls` (mandatory) and `PublicReadUrls` (optional), statically per backend in TOML. Mismatches fail with `CapabilityUnavailable`. |
+| `cpt-cf-file-storage-fr-backend-abstraction` | `StorageBackend` adapter trait sits behind the REST endpoint handlers and the SDK facade; the only implementation is the S3-compatible adapter (the only kind on the architectural roadmap). |
+| `cpt-cf-file-storage-fr-backend-capabilities` | Optional capabilities are declared statically per backend in TOML: `PublicReadUrls` (eternal bare-HTTPS reads) and `Multipart` (S3-style multipart upload, P2). Presigned URL support is constitutive and is therefore not represented as a capability. Mismatches between declared and requested capability fail with `CapabilityUnavailable`. |
 | `cpt-cf-file-storage-fr-rest-api` | REST surface rooted at `/api/file-storage/v1/`, 7 endpoints, fully specified in `openapi.yaml`. |
 | `cpt-cf-file-storage-fr-conditional-requests` | The `etag` column on `files` is the raw S3 ETag (content fingerprint only). `put_file_info` and `delete_file` honour an optional `If-Match` for optimistic concurrency; on `put_file_info` it becomes a strong DB+S3 CAS (HEAD-then-CopyObject with `x-amz-copy-source-if-match`). `reconcile` is the explicit reconciliation primitive and **rejects** `If-Match` with `400`. |
 
@@ -87,9 +89,9 @@ Authentication and authorization are delegated to the platform's `authn`/`authz`
 | `cpt-cf-file-storage-nfr-metadata-latency` | Metadata queries ≤25 ms p95 | `cpt-cf-file-storage-component-files-repo` | Indexed SQL lookup keyed on `id` (PK) for `get_file_info`; no backend round-trip on the read path; single authz call. | Load test on `GET /files/{file_id}`; query-planner inspection on the listing index. |
 | `cpt-cf-file-storage-nfr-transfer-latency` | Fixed overhead <50 ms p95 on downloads | `cpt-cf-file-storage-component-backend-router`, `cpt-cf-file-storage-component-s3-backend` | Presigned-URL path: zero data plane through FileStorage, only the signing call counts (in-memory in P1 embedded). In-process `read_file` for SDK consumers: streams chunks straight from `aws-sdk-s3 GetObject`; no full-file buffering. | Synthetic latency probe excluding payload transfer time. |
 | `cpt-cf-file-storage-nfr-url-availability` | URL stability for the retention window | `cpt-cf-file-storage-component-rest-api`, `cpt-cf-file-storage-component-files-repo` | Persistent URL is `/files/{file_id}` — independent of backend layout, display name, and logical path. Renames touch only the metadata row. | Stability test: rename the file via `put_file_info` and re-fetch under the same URL. |
-| `cpt-cf-file-storage-nfr-durability` | RPO = 0, RTO ≤15 min | `cpt-cf-file-storage-component-upload-coordinator`, S3-compatible adapter | Coordinator commits `Uploaded` only after `reconcile` HEADs the backend and confirms the object exists; FileStorage HEADs S3 itself rather than trusting any caller-supplied etag, so the row never claims durability prematurely. Durability is inherited from the S3-class endpoint (AWS S3, MinIO, Ceph RGW, …; for `s3s-fs` the underlying POSIX filesystem). | DR drill: kill the module mid-`reconcile`, verify a `PendingUpload` row never observes itself as `Uploaded`. |
+| `cpt-cf-file-storage-nfr-durability` | RPO = 0, RTO ≤15 min | `cpt-cf-file-storage-component-rest-api` (`reconcile` handler), S3-compatible adapter | The `reconcile` handler commits `Uploaded` only after HEADing the backend and confirming the object exists; FileStorage HEADs S3 itself rather than trusting any caller-supplied etag, so the row never claims durability prematurely. Durability is inherited from the S3-class endpoint (AWS S3, MinIO, Ceph RGW, …; for `s3s-fs` the underlying POSIX filesystem). | DR drill: kill the module mid-`reconcile`, verify a `PendingUpload` row never observes itself as `Uploaded`. |
 | `cpt-cf-file-storage-nfr-scalability` | ≥1000 concurrent ops/instance, linear horizontal scaling | All stateless components | No global locks; per-row `etag` provides optimistic concurrency. The module is stateless aside from the SQL connection pool and adapter handles. | Concurrency soak test; stateless-scaling CI check. |
-| `cpt-cf-file-storage-nfr-audit-completeness` | 100% write audit coverage (P2) | Deferred — audit sink integration lives in P2 | P1 records no audit events; the upload coordinator carries a documented hook point. | P2 milestone. |
+| `cpt-cf-file-storage-nfr-audit-completeness` | 100% write audit coverage (P2) | Deferred — audit sink integration lives in P2 | P1 records no audit events; the REST write-path handlers (`presign-batch`, `reconcile`, `delete`, `put_file_info`) carry documented hook points. | P2 milestone. |
 
 #### Key ADRs
 
@@ -98,7 +100,7 @@ Authentication and authorization are delegated to the platform's `authn`/`authz`
 | [ADR-0001](./ADR/0001-cpt-cf-file-storage-adr-s3-no-metadata-db.md) — `cpt-cf-file-storage-adr-s3-no-metadata-db` | The `s3-compatible` adapter shares the FileStorage-owned SQL metadata index alongside S3 bytes. The DB is module-owned, not adapter-owned. |
 | [ADR-0002](./ADR/0002-cpt-cf-file-storage-adr-opaque-file-ids.md) — `cpt-cf-file-storage-adr-opaque-file-ids` | External addresses use opaque `file_id` (UUID); display name and `file_path` are metadata. Decouples URLs from filenames and bucket layout, eliminates URL-encoding reconciliation issues across HTTP / S3 / SigV4. |
 | [ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-presigned-put-sigv4.md) — `cpt-cf-file-storage-adr-presigned-put-sigv4` | Direct-transfer uploads use presigned PUT with SigV4 header signing (universal S3 compatibility), not POST policy. The metadata row is the authoritative read source. P1 ships PUT-SigV4 without any backend-side preconditions on the upload presign path; correctness comes from FileStorage's own primitives plus self-healing (ADR-0004). |
-| [ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-self-healing-reconciliation.md) — `cpt-cf-file-storage-adr-self-healing-reconciliation` | Self-healing reconciliation via HEAD-and-pull is the **base correctness mechanism** for the presign-first lifecycle in P1. The eager primitive is `POST /files/{id}/meta/reconcile` (HEAD-then-pull, concurrent-safe by construction); the lazy in-process trigger is `read_file`, which repairs the row through a conditional UPDATE before returning the bytes. There is no proxy upload path in P1 and no separate "physical key" column. |
+| [ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-self-healing-reconciliation.md) — `cpt-cf-file-storage-adr-self-healing-reconciliation` | Self-healing reconciliation via HEAD-and-pull is the **base correctness mechanism** for the presign-first lifecycle. The eager primitive is `POST /files/{id}/meta/reconcile` (HEAD-then-pull, concurrent-safe by construction); the lazy in-process trigger is `read_file`, which repairs the row through a conditional UPDATE before returning the bytes. There is no bytes-through-FileStorage proxy upload path in any phase, and no separate "physical key" column. |
 | [ADR-0005](./ADR/0005-cpt-cf-file-storage-adr-versioning-and-aba.md) — `cpt-cf-file-storage-adr-versioning-and-aba` | Per-backend `versioning` flag, declared by the operator. When `true`, the row's `version_id` mirrors S3 VersionId; the strong-CAS variant of `PUT /meta` becomes ABA-safe by verifying both etag and version_id; presign-download items can request historical generations. When `false`, ABA on content is an accepted P1 risk. |
 
 ### 1.3 Architecture Layers
@@ -109,7 +111,6 @@ graph LR
     REST[REST API — axum]
     SDK[SDK Facade — FileStorageClient]
     ROUTER[Backend Router]
-    COORD[Upload Coordinator]
     REPO[Files Repo]
     S3[S3-Compatible Backend Adapter]
     S3EP[(S3-compatible endpoint<br/>AWS S3 / MinIO / Ceph / s3s-fs)]
@@ -119,12 +120,9 @@ graph LR
     Client --> SDK
     REST --> ROUTER
     SDK --> ROUTER
-    ROUTER --> COORD
     ROUTER --> REPO
     ROUTER --> S3
     REPO --> PG
-    COORD --> REPO
-    COORD --> S3
     S3 --> S3EP
 ```
 
@@ -132,8 +130,8 @@ graph LR
 
 | Layer | Responsibility | Technology |
 |-------|----------------|------------|
-| Presentation | REST handlers, request/response shaping, ETag handling, streaming bodies | axum, `tower-http`, `bytes::Bytes` streams |
-| Application | Lifecycle coordinator, ClientHub SDK facade | ModKit runtime, `async_trait` |
+| Presentation | REST handlers, request/response shaping, ETag handling, streaming bodies; lifecycle write paths (`presign-batch`, `reconcile`, `delete`, `put_file_info`) | axum, `tower-http`, `bytes::Bytes` streams |
+| Application | ClientHub SDK facade | ModKit runtime, `async_trait` |
 | Domain | `FileInfo`, `FileMeta`, `Backend`, `OwnerRef`, `FileStatus`, `UrlParams`, `PresignedUploadHandle`, `PresignedDownload` | Pure Rust types (`uuid`, `time`, `bytes`, `serde`) |
 | Infrastructure | S3 client, SQL access | `aws-sdk-s3` (or compatible), `sqlx`/`sea-orm` |
 
@@ -153,9 +151,10 @@ The `file_id` is generated by FileStorage on every `create_presigned_url` call (
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-principle-presign-first`
 
-The default — and in P1 the **only** — upload path is **presign-first**: the application's own backend (chat, llm-gateway, …) calls `create_presigned_url`, hands `(file_id, upload_url, etag)` to its frontend, and the frontend uploads bytes directly to the storage backend. FileStorage stays off the data plane on this path. Every P1 backend is `s3-compatible` and declares `PresignedUrls`, so this path is uniformly available.
+The default — and in every phase the **only** — external upload path is **presign-first**: the application's own backend (chat, llm-gateway, …) calls `create_presigned_url`, hands `(file_id, upload_url, etag)` to its frontend, and the frontend uploads bytes directly to the storage backend. FileStorage stays off the data plane on this path. Every backend speaks S3 and respects presigned URLs by definition (§1.1 backend uniformity invariant), so the path is uniformly available everywhere.
 
-- P1: every backend has `PresignedUrls`; callers always use `create_presigned_url` (zero bytes through FileStorage).
+- External clients always use `create_presigned_url` (zero bytes through FileStorage).
+- In-process callers may use the SDK's `put_file` direct-adapter path, which compresses the same lifecycle into one async call without the presign roundtrip — still no bytes-through-REST.
 
 After upload, downloads follow the symmetric rule: `presign_urls` for client-side, browser-ready URLs (redirect mode); `read_file` for in-process consumers (streaming via the adapter — used by antivirus, llm-gateway, file-parser). FileShare's "proxy mode for tracked downloads" — public links with view-counting and revocation — is a P3 concern in a separate module and is not a FileStorage feature.
 
@@ -171,7 +170,7 @@ The `OwnerRef::App` variant is what makes this principle non-trivial: autonomous
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-principle-modular-backend-roster`
 
-The FileStorage module hosts a dynamic roster of backends. P1 supports only `s3-compatible`. Multiple instances can coexist in one deployment — five S3 buckets, an `s3s-fs` side-process for local disk — all served by the same SDK and REST API.
+The FileStorage module hosts a dynamic roster of S3-protocol backends (the only kind on the architectural roadmap, §1.1). Multiple instances can coexist in one deployment — five S3 buckets, an `s3s-fs` side-process for local disk — all served by the same SDK and REST API.
 
 Three invariants govern the roster:
 
@@ -223,7 +222,7 @@ Self-healing fires at exactly two trigger points (both detailed in §3.9):
 
 `reconcile` is concurrent-safe by construction: HEAD-then-conditional-UPDATE with retry, no mutual exclusion required. The application backend never has to plumb an S3-observed etag through its own status surface — any chat-frontend hint about the observed S3 ETag is irrelevant; FileStorage trusts only its own HEAD.
 
-In P1 self-healing is the universal correctness mechanism for **every** content commit and overwrite, because the only P1 backend kind (`s3-compatible`) is fully presign-first.
+Self-healing is the universal correctness mechanism for **every** content commit and overwrite, because the only backend kind on the architectural roadmap (S3-compatible, §1.1) is fully presign-first.
 
 #### Etag-Based Optimistic Concurrency
 
@@ -252,9 +251,9 @@ The single exception is **`reconcile(file_id)`** — it takes no `etag` argument
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-principle-stream-by-default`
 
-`read_file` and `put_file` use `Stream<Item = Result<Bytes>>` end-to-end — the same shape that axum, reqwest, and tonic already speak — so an HTTP request body (P3 REST proxy upload, when it lands) or an in-process producer (P1 SDK `put_file`) can flow through FileStorage to the backend without intermediate buffering. The module never materialises a full file in RAM; per-backend size limits and the magic-byte sniff (which only buffers the first chunk) are the only buffering points.
+`read_file` and `put_file` use `Stream<Item = Result<Bytes>>` end-to-end — the same shape that axum, reqwest, and tonic already speak. In-process producers (the SDK `put_file` path) feed bytes straight to the adapter without intermediate buffering; the module never materialises a full file in RAM. There is no bytes-through-REST proxy upload path in any phase — external clients always ship bytes directly to the backend over a presigned URL.
 
-Redirect-capable backends (S3 with `PresignedUrls`) bypass the data plane entirely — `create_presigned_url` and `presign_urls` issue URLs the client uses against the backend directly.
+Backends bypass the FileStorage data plane entirely — `create_presigned_url` and `presign_urls` issue URLs the client uses against the backend directly.
 
 #### Batch-First Presigned URL Issuance
 
@@ -287,13 +286,13 @@ In P1 the backend roster is a static TOML section loaded at module init. Runtime
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-constraint-opaque-content`
 
-The module never introspects file content. Classification, transformation, and transcoding are out of scope (PRD §4.2) and would introduce per-backend buffering that breaks the streaming principle. Magic-byte MIME validation on proxy uploads is reserved for the P3 REST proxy upload path and has no consumer in P1; presigned PUT pins `Content-Type` via SigV4 SignedHeaders, and the in-process P1 `put_file` SDK path trusts the caller-declared `mime_type` (the in-process consumer is the FileStorage runtime's tenant code, not an external client).
+The module never introspects file content. Classification, transformation, and transcoding are out of scope (PRD §4.2) and would introduce per-backend buffering that breaks the streaming principle. There is no proxy upload path that would benefit from magic-byte MIME validation: presigned PUT pins `Content-Type` via SigV4 SignedHeaders (the application backend that issued the URL is responsible for trusting its end-client), and the in-process `put_file` SDK path trusts the caller-declared `mime_type` because the caller is the FileStorage runtime's tenant code, not an external client.
 
 #### File ID is Generated by FileStorage Only
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-constraint-server-minted-file-id`
 
-The `file_id` is minted by FileStorage at `create_presigned_url` time, at `put_file` time for the in-process P1 SDK path, and at the P3 REST proxy upload entry-point when that lands. Clients cannot supply their own UUIDs. This keeps the addressing space disjoint by construction (no client-side collisions across tenants) and lets the partial unique index on `(tenant_id, backend_id, file_path) WHERE status = 'uploaded'` rely on server-side ordering for last-write-wins.
+The `file_id` is minted by FileStorage at `create_presigned_url` time and at `put_file` time for the in-process SDK path. Clients cannot supply their own UUIDs. This keeps the addressing space disjoint by construction (no client-side collisions across tenants) and lets the partial unique index on `(tenant_id, backend_id, file_path) WHERE status = 'uploaded'` rely on server-side ordering for last-write-wins.
 
 #### No Migration or Rename Between Backends
 
@@ -406,7 +405,7 @@ This constraint exists to keep DB+S3 sync centralized: every meta change goes th
 | `FileInfo` | Authoritative file view returned by every read and mutation: `file_id`, `backend_id`, `file_path`, `owner`, `meta`, `status`, `etag` (raw S3 ETag), `version_id` (raw S3 VersionId or `None`), `size_bytes`, timestamps, `upload_expires_at`. | [rust-traits.md](./rust-traits.md) |
 | `FileMeta` / `FileMetaUpdate` | `FileMeta` is the caller-provided metadata: `name`, `mime_type`, `gts_file_type`, `size_bytes` (optional), `custom_metadata`. `FileMetaUpdate` is the body for `PUT /files/{file_id}/meta`; `Some(v)` replaces, `None` keeps. **`FileMetaUpdate` does NOT declare `gts_file_type`** — it is structurally immutable. | [rust-traits.md](./rust-traits.md) |
 | `OwnerRef` | `{ tenant_id, owner_id }`. The `owner_id` is the principal's UUID; FileStorage does not distinguish user vs app — that distinction is owned by the identity / authz subsystem. Immutable after creation (transfer → P2). | [rust-traits.md](./rust-traits.md) |
-| `Backend` | Roster entry: `id` (UUID), `kind` (`S3Compatible`), `default_private`, `default_public`, `transport` (`Redirect`), `capabilities` (`PresignedUrls`, optional `PublicReadUrls`), `max_file_size_bytes`, `versioning` (boolean). | [rust-traits.md](./rust-traits.md) |
+| `Backend` | Roster entry: `id` (UUID), `default_private`, `default_public`, `capabilities` (optional `PublicReadUrls`, optional `Multipart`), `max_file_size_bytes`, `versioning` (boolean). Presigned URL support is constitutive (not a capability); kind/transport are not represented (only one possible value, by architectural decision). | [rust-traits.md](./rust-traits.md) |
 | `FileStatus` | `PendingUpload` → `Uploaded` → `Deleting`. | [rust-traits.md](./rust-traits.md) |
 | `ReconcileResult` | Output of `reconcile`: `{ info: FileInfo, s3_etag: String, s3_version_id: Option<String> }`. The raw values are exposed alongside `info` so callers can correlate against what S3 returned on their own PUT. | [rust-traits.md](./rust-traits.md) |
 | `PresignedUploadHandle` | Output of `create_presigned_url` and `create_presigned_overwrite_url`: `file_id`, `upload_url`, `etag_pinned`, `expires_at`. | [rust-traits.md](./rust-traits.md) |
@@ -424,21 +423,22 @@ This constraint exists to keep DB+S3 sync centralized: every meta change goes th
 
 #### Backend kinds and multiplicity
 
-FileStorage is a single module that hosts many backends of a single kind in P1. The kind defines the integration surface; the number of instances per kind is bounded only by configuration. All instances share the FileStorage REST API, SDK, and metadata database (see §3.7).
+FileStorage is a single module that hosts many S3-protocol backends. The number of instances is bounded only by configuration. All instances share the FileStorage REST API, SDK, and metadata database (see §3.7). Native non-S3 backend kinds are out-of-scope at the architecture level (§1.1 backend uniformity invariant) — there is no `BackendKind` discriminator, no `BackendTransport` discriminator, and no plan to introduce either.
 
-| Kind | Name prefix convention | Bytes live on | Transport | Capabilities | Phase |
-|------|------------------------|---------------|-----------|--------------|-------|
-| `s3-compatible` | `s3-…` | External S3-class endpoint (AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe) | `Redirect` | `PresignedUrls` (mandatory), `PublicReadUrls` (optional) | **P1 — only kind in P1** |
+| Bytes live on | Capabilities |
+|---------------|--------------|
+| External S3-class endpoint (AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe) | `PublicReadUrls` (optional), `Multipart` (optional, P2) |
 
-A P1 deployment registers one or more `s3-compatible` instances (any mix of AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, and `s3s-fs` side-process for local disks). There is no upper bound encoded in code; practical limits are driven by configuration, credential management, and resource budgets. The roster invariants — stable `backend_id` (UUID), per-backend tenant access list, per-backend `versioning` flag, uniform SDK access — are enforced by the Backend Router (see below) and are documented as a principle in §2.1 (`cpt-cf-file-storage-principle-modular-backend-roster`). There is no native `local` POSIX backend kind: every local-disk deployment runs `s3s-fs` and is registered as a regular `s3-compatible` backend.
+A deployment registers one or more S3-compatible instances (any mix of AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, and `s3s-fs` side-process for local disks). There is no upper bound encoded in code; practical limits are driven by configuration, credential management, and resource budgets. The roster invariants — stable `backend_id` (UUID), per-backend tenant access list, per-backend `versioning` flag, uniform SDK access — are enforced by the Backend Router (see below) and are documented as a principle in §2.1 (`cpt-cf-file-storage-principle-modular-backend-roster`). There is no native `local` POSIX adapter — every local-disk deployment runs `s3s-fs` and is registered as a regular S3-compatible backend.
 
-##### Capability surface in P1
+##### Capability surface
 
-P1 backends declare:
-- `PresignedUrls` (mandatory) — backend can sign time-limited URLs for client-direct PUT/GET.
+Backends declare optional capabilities — variations among already-S3-protocol-compatible endpoints. Presigned URL support is constitutive (a backend that cannot sign URLs is not a backend by definition) and is therefore **not** represented as a capability.
+
 - `PublicReadUrls` (optional) — backend serves objects through bare-HTTPS URLs without presigning (e.g. an S3 bucket with public-read ACL or an origin behind a CDN). Pairs with `Backend.default_public`. When this capability is present and a download is issued for a file in such a backend, `PresignedDownload.is_public` is `true` and the URL has no expiry.
+- `Multipart` (optional, P2) — backend honours S3-style multipart upload. Clients fall back to single-shot presigned PUT when absent.
 
-P1 does NOT have a `PresignedConditionalPut` capability. Conditional preconditions on the upload presign path (`If-Match` / `If-None-Match: *` pinned via SigV4 SignedHeaders) are deferred — the `s3-compat` ecosystem is fragmented on conditional-PUT semantics (GCS S3-compat silently ignores the headers, several appliances are inconsistent across versions), and self-healing reconciliation (ADR-0004) provides P1 correctness without them. Note that `PUT /files/{id}/meta`'s strong-CAS path DOES use a backend-side precondition (`x-amz-copy-source-if-match` on `CopyObject`); that header is universally honoured by S3 servers for `CopyObject` and does not require a separate capability.
+There is no `PresignedConditionalPut` capability in P1. Conditional preconditions on the upload presign path (`If-Match` / `If-None-Match: *` pinned via SigV4 SignedHeaders) are deferred — the S3-compat ecosystem is fragmented on conditional-PUT semantics (GCS S3-compat silently ignores the headers, several appliances are inconsistent across versions), and self-healing reconciliation (ADR-0004) provides P1 correctness without them. Note that `PUT /files/{id}/meta`'s strong-CAS path DOES use a backend-side precondition (`x-amz-copy-source-if-match` on `CopyObject`); that header is universally honoured by S3 servers for `CopyObject` and does not require a separate capability.
 
 ```mermaid
 graph TD
@@ -449,7 +449,6 @@ graph TD
     REST[cpt-cf-file-storage-component-rest-api<br/>REST API]
     SDK[cpt-cf-file-storage-component-sdk-facade<br/>SDK Facade]
     ROUTER[cpt-cf-file-storage-component-backend-router<br/>Backend Router]
-    COORD[cpt-cf-file-storage-component-upload-coordinator<br/>Upload Coordinator]
     REPO[cpt-cf-file-storage-component-files-repo<br/>Files Repo]
     S3A[cpt-cf-file-storage-component-s3-backend<br/>S3 Backend Adapter]
     S3[(S3-compatible endpoint<br/>AWS S3 / MinIO / Ceph / s3s-fs)]
@@ -461,11 +460,8 @@ graph TD
     REST --> ROUTER
     SDK --> ROUTER
     ROUTER --> REPO
-    ROUTER --> COORD
     ROUTER --> S3A
     REPO --> PG
-    COORD --> REPO
-    COORD --> S3A
     S3A --> S3
     REST -.authz.-> AUTHZ
     SDK -.authz.-> AUTHZ
@@ -520,7 +516,6 @@ Does NOT expose infrastructure types (no axum, no raw S3 client) to consumers; d
 ##### Related components (by ID)
 
 - `cpt-cf-file-storage-component-backend-router`
-- `cpt-cf-file-storage-component-upload-coordinator`
 - `cpt-cf-file-storage-component-files-repo`
 
 #### Backend Router
@@ -533,7 +528,7 @@ Both REST and SDK surfaces need a single place that resolves `backend_id → ada
 
 ##### Responsibility scope
 
-Hold the immutable P1 backend registry built from TOML at init, populated with backend instances of the supported kind (`s3-compatible`); expose `resolve(ctx, backend_id) -> &dyn StorageBackend` with tenant-scoping enforcement (returns `NotFound` when the caller's tenant is not on the backend's access list — see §2.1 `cpt-cf-file-storage-principle-modular-backend-roster`); serve `list_backends(ctx)` filtered by the caller's tenant access; enforce `backend_id` uniqueness across the roster at registry load; check `requires_capability(cap)`; look up per-backend configuration (`max_file_size_bytes`, tenant access list, `default_private` flag).
+Hold the immutable backend registry built from TOML at init; expose `resolve(ctx, backend_id) -> &dyn StorageBackend` with tenant-scoping enforcement (returns `NotFound` when the caller's tenant is not on the backend's access list — see §2.1 `cpt-cf-file-storage-principle-modular-backend-roster`); serve `list_backends(ctx)` filtered by the caller's tenant access; enforce `backend_id` uniqueness across the roster at registry load; check `requires_capability(cap)`; look up per-backend configuration (`max_file_size_bytes`, tenant access list, `default_private` flag).
 
 ##### Responsibility boundaries
 
@@ -543,26 +538,20 @@ Does NOT know about specific backend protocols (S3 headers, SQL queries) — tho
 
 - `cpt-cf-file-storage-component-s3-backend`
 
-#### Upload Coordinator
+#### Lifecycle write paths (REST handlers and SDK facade)
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-component-upload-coordinator`
+There is no separate "Upload Coordinator" component. The lifecycle write paths — `PendingUpload → Uploaded` transitions, supersession on logical-address overwrites, etag pinning, conditional UPDATEs, 2-phase delete — live directly inside the relevant entry-points and share the underlying SQL primitives via the Files Repo and the S3 adapter via the Backend Router.
 
-##### Why this component exists
+The participating entry-points and their per-call flow:
 
-Uploads need atomicity guarantees beyond what a plain adapter call provides — the `PendingUpload → Uploaded` transition for presign-first flows, the supersession transaction on logical-address overwrites, and etag pinning across all paths.
+- **`POST /presign-batch` with `kind: "upload"`, no `file_id`** — initial upload via presigned PUT. INSERT row with `status = PendingUpload`, sentinel `etag`, `upload_expires_at`; ask the adapter for a presigned PUT with `Content-Type` / `Content-Disposition` / `x-amz-meta-<k>` pinned (NOT `x-amz-meta-gts-file-type`).
+- **`POST /presign-batch` with `kind: "upload"`, with `file_id`** — variant-B re-upload via presigned PUT. SELECT row, pin its CURRENT meta into a fresh presigned PUT, MAX-merge `upload_expires_at`.
+- **`POST /files/{file_id}/meta/reconcile`** — commit. HEAD the backend for the authoritative `(s3_etag, s3_version_id, content_type, content_disposition, content_length, x-amz-meta-*)`, run a conditional UPDATE that flips `pending_upload → uploaded` (or drift-resyncs an `uploaded` row in place) and pulls all S3-mirrored metadata fields except `gts_file_type`.
+- **SDK `put_file` (in-process, no presign roundtrip)** — same `PendingUpload` row insert; stream bytes through the adapter's `PutObject` with the same pinned headers; HEAD-and-pull commits identically to `reconcile`; on any error between INSERT and the final UPDATE, run a best-effort `DELETE FROM files WHERE id = $file_id AND status = 'pending_upload'` so the call leaves no `PendingUpload` row behind, and let the P2 GC inverse sweep reclaim any orphan backend object.
+- **`PUT /files/{file_id}/meta`** — merge update against current row, validate 2 KB user-metadata budget, optionally HEAD S3 for strong CAS (when `If-Match` supplied), `CopyObject` self-copy with `MetadataDirective: REPLACE` (and optional `x-amz-copy-source-if-match`), conditional UPDATE on the row writing the new `(etag, version_id, meta)`.
+- **`DELETE /files/{file_id}`** — 2-phase flow: Phase 1 conditional UPDATE to `Deleting` (with optional `If-Match`), Phase 2 backend DELETE with inline retries, Phase 3 hard-DELETE the row.
 
-##### Responsibility scope
-
-For initial upload (presigned, REST): insert row with `status = PendingUpload`, pin sentinel `etag`, persist `upload_expires_at`, ask the adapter for a presigned PUT with `Content-Type` / `Content-Disposition` / `x-amz-meta-<k>` pinned (NOT `x-amz-meta-gts-file-type`). For variant-B re-upload (presigned, REST): SELECT row, pin its CURRENT meta into a fresh presigned PUT, MAX-merge `upload_expires_at`. On `POST /files/{id}/meta/reconcile`, HEAD the backend for the authoritative `(s3_etag, s3_version_id, content_type, content_disposition, content_length, x-amz-meta-*)`, run a conditional UPDATE that flips `pending_upload → uploaded` (or drift-resyncs an `uploaded` row in place) and pulls all S3-mirrored metadata fields except `gts_file_type`. For SDK `put_file` (in-process, no presign, P1): same `PendingUpload` row insert; stream bytes to the adapter's `PutObject` with the same pinned headers; HEAD-and-pull commits identically to the `reconcile` path; on any error between INSERT and the final UPDATE, run a best-effort `DELETE FROM files WHERE id = $file_id AND status = 'pending_upload'` so the in-process call leaves no `PendingUpload` row behind, and let the P2 GC inverse sweep reclaim any orphan backend object. For `PUT /meta`: merge update against current row, validate 2 KB user-metadata budget, optionally HEAD S3 for strong CAS (when `If-Match` supplied), `CopyObject` self-copy with `MetadataDirective: REPLACE` (and optional `x-amz-copy-source-if-match`), conditional UPDATE on the row writing the new `(etag, version_id, meta)`. For `delete_file`: 2-phase flow — Phase 1 conditional UPDATE to `Deleting` (with optional `If-Match`), Phase 2 backend DELETE with inline retries, Phase 3 hard-DELETE the row.
-
-##### Responsibility boundaries
-
-Does NOT orchestrate authorization (the SDK facade does); does NOT make backend-protocol-specific calls directly (delegates to adapters); does NOT run GC (that is a P2 external scheduled command — see §4 Roadmap).
-
-##### Related components (by ID)
-
-- `cpt-cf-file-storage-component-files-repo` — owns the `file_storage.files` table
-- `cpt-cf-file-storage-component-s3-backend`
+These paths share documented hook points for P2 audit / events emission. They do NOT orchestrate authorization (the SDK facade does), do NOT make backend-protocol-specific calls directly (delegate to adapters via the Backend Router), and do NOT run GC (that is a P2 external scheduled command — see §4 Roadmap).
 
 #### Files Repo
 
@@ -570,7 +559,7 @@ Does NOT orchestrate authorization (the SDK facade does); does NOT make backend-
 
 ##### Why this component exists
 
-Every component that touches metadata — the SDK facade for reads, the coordinator for writes, future P2 workers (audit, GC, quota) — needs a single typed interface to the `file_storage.files` table. Centralising this avoids ad-hoc SQL leaking into the SDK facade and the adapters.
+Every component that touches metadata — the SDK facade for reads, REST handlers for writes, future P2 workers (audit, GC, quota) — needs a single typed interface to the `file_storage.files` table. Centralising this avoids ad-hoc SQL leaking into the SDK facade, REST handlers, and the adapters.
 
 ##### Responsibility scope
 
@@ -578,11 +567,11 @@ CRUD on the `file_storage.files` table; partial unique index conflict handling f
 
 ##### Responsibility boundaries
 
-Does NOT touch backend bytes; does NOT call authz; does NOT enforce backend capabilities — those live in the router / coordinator / facade.
+Does NOT touch backend bytes; does NOT call authz; does NOT enforce backend capabilities — those live in the router / REST handlers / facade.
 
 ##### Related components (by ID)
 
-- `cpt-cf-file-storage-component-upload-coordinator`
+- `cpt-cf-file-storage-component-rest-api`
 - `cpt-cf-file-storage-component-sdk-facade`
 
 #### S3-Compatible Backend Adapter
@@ -608,15 +597,15 @@ The adapter's presigned-URL methods are batch-first on the GET side (`issue_pres
 
 ##### Responsibility boundaries
 
-Does NOT consult the SQL index for reads (the FileStorage core does that); does NOT emit events (P2); does NOT validate magic bytes (only the proxy path does); does NOT use POST-policy uploads (per ADR-0003); does NOT see `gts_file_type` (that field never crosses the adapter boundary).
+Does NOT consult the SQL index for reads (the FileStorage core does that); does NOT emit events (P2); does NOT validate magic bytes (no proxy upload path exists in any phase); does NOT use POST-policy uploads (per ADR-0003); does NOT see `gts_file_type` (that field never crosses the adapter boundary).
 
 ##### Related components (by ID)
 
-- `cpt-cf-file-storage-component-backend-router` — registered with capability flag `PresignedUrls = true`
+- `cpt-cf-file-storage-component-backend-router`
 
 #### Local-disk recipe (`s3s-fs` side-process)
 
-FileStorage has **no** native POSIX `local` backend adapter — there is no plan to add one. Operators that need local-disk storage run **`s3s-fs`** (an Apache-2.0 Rust S3-compatible filesystem-backed server, see §4 Testing strategy) as a side-process and register it in the static TOML roster as a regular `s3-compatible` backend. From the FileStorage code path this is indistinguishable from any other S3-compatible endpoint — same SigV4 signing, same presigned URLs, same capability declarations. The recipe is documented in `feature-testkit-and-local-storage-recipe` and is the same fixture used by the e2e test suite.
+FileStorage has **no** native POSIX `local` backend adapter and never will — that is the §1.1 backend uniformity invariant applied to local disks. Operators that need local-disk storage run **`s3s-fs`** (an Apache-2.0 Rust S3-compatible filesystem-backed server, see §4 Testing strategy) as a side-process and register it in the static TOML roster as a regular S3-compatible backend. From the FileStorage code path this is indistinguishable from any other S3-compatible endpoint — same SigV4 signing, same presigned URLs, same capability declarations. The recipe is documented in `feature-testkit-and-local-storage-recipe` and is the same fixture used by the e2e test suite.
 
 ### 3.3 API Contracts
 
@@ -646,9 +635,9 @@ Notes:
 - The `If-Match` header carries the `etag` for conditional requests on `PUT /files/{file_id}/meta` and `DELETE /files/{file_id}`. The trait-level `etag` argument and the `If-Match` header are equivalent on the wire. Both are optional in P1 (`cpt-cf-file-storage-constraint-no-meta-cas`).
 - `POST /files/{file_id}/meta/reconcile` is the explicit reconciliation command and rejects any precondition header — its HEAD response IS the conditioning input.
 - **Multi-URL `upload_expires_at = MAX` rule**: when a variant-B re-upload presign is issued against a row that already has `upload_expires_at` set (e.g. a prior re-upload presign whose URL has not been used), the server updates the field to `MAX(current, NOW + TTL)`. Multiple outstanding URLs therefore never shorten an already-valid window.
-- The REST surface uses **only PUT** for metadata writes (no PATCH anywhere). The two PUT-shaped writes a caller actually sees are: (a) `PUT /files/{file_id}/meta` against FileStorage REST for metadata replacement (atomic DB+S3); (b) the **direct PUT to the storage backend** via the presigned URL handed back by `POST /presign-batch` for content. **There is no proxied content endpoint in P1** — every byte transfer is client ↔ storage backend direct, gated by a FileStorage-issued presigned URL (or a bare-HTTPS URL for public-read backends). In-process modules (antivirus, llm-gateway, file-parser) consume content via the SDK `read_file` method, which streams through the adapter without exposing a REST surface; `read_file` is the lazy self-healing trigger and `POST /reconcile` is the eager equivalent for external callers (ADR-0004).
+- The REST surface uses **only PUT** for metadata writes (no PATCH anywhere). The two PUT-shaped writes a caller actually sees are: (a) `PUT /files/{file_id}/meta` against FileStorage REST for metadata replacement (atomic DB+S3); (b) the **direct PUT to the storage backend** via the presigned URL handed back by `POST /presign-batch` for content. **There is no proxied content endpoint in any phase** — every external byte transfer is client ↔ storage backend direct, gated by a FileStorage-issued presigned URL (or a bare-HTTPS URL for public-read backends). In-process modules (antivirus, llm-gateway, file-parser) consume content via the SDK `read_file` method, which streams through the adapter without exposing a REST surface; `read_file` is the lazy self-healing trigger and `POST /reconcile` is the eager equivalent for external callers (ADR-0004).
 - **Explicit deviations from PRD**: `cpt-cf-file-storage-fr-multipart-upload` (multipart upload) is deferred to P2 despite its `p1` priority — see §4 Future deltas.
-- (P2) endpoints (multipart upload, policies, audit, S3-compat / WebDAV façade APIs) are deliberately absent from P1.
+- (P2) endpoints (multipart upload, policies, audit) are deliberately absent from P1.
 - A user-self-service endpoint `GET /files/{file_id}/get-presigned-url?…` is on the P2 roadmap as a UX shortcut for end-users to obtain download URLs for files they own without going through an application backend.
 
 ### 3.4 Internal Dependencies
@@ -716,7 +705,6 @@ sequenceDiagram
     participant U as End user (browser)
     participant APP as App backend (chat)
     participant SDK as FileStorageClient SDK
-    participant CO as Upload Coordinator
     participant REPO as Files Repo
     participant S3A as S3 Adapter
     participant S3 as S3 endpoint
@@ -724,27 +712,23 @@ sequenceDiagram
     U->>APP: POST /chat/v1/threads/{tid}/upload-file (name, mime, size, gts_type)
     APP->>APP: business validation (limits, quotas, permissions)
     APP->>SDK: create_presigned_url(s3-prod, owner, file_path, meta, params)
-    SDK->>CO: register initial upload
-    CO->>REPO: INSERT files(status=PendingUpload, etag=sentinel, version_id=NULL, expires_at)
-    CO->>S3A: issue_presigned_put(key, pinned={Content-Type, Content-Disposition, x-amz-meta-*}, params)
-    S3A-->>CO: upload_url, expires_at
-    CO-->>SDK: PresignedUploadHandle { file_id, upload_url, etag_pinned, expires_at }
-    SDK-->>APP: PresignedUploadHandle
+    SDK->>REPO: INSERT files(status=PendingUpload, etag=sentinel, version_id=NULL, expires_at)
+    SDK->>S3A: issue_presigned_put(key, pinned={Content-Type, Content-Disposition, x-amz-meta-*}, params)
+    S3A-->>SDK: upload_url, expires_at
+    SDK-->>APP: PresignedUploadHandle { file_id, upload_url, etag_pinned, expires_at }
     APP->>APP: persist (thread_id ↔ file_id) link
     APP-->>U: { file_id, upload_url }
     U->>S3: PUT {upload_url} (bytes + pinned headers)
     S3-->>U: 200 OK + ETag header
     U->>APP: POST /chat/v1/threads/{tid}/files/{file_id} (upload completed)
     APP->>SDK: reconcile(file_id)
-    SDK->>CO: HEAD-then-pull
-    CO->>S3A: head_object(derive(file_id))
+    SDK->>S3A: head_object(derive(file_id))
     S3A->>S3: HEAD object
     S3-->>S3A: ETag, VersionId, Content-Type, Content-Disposition, x-amz-meta-*, Content-Length
-    S3A-->>CO: BackendObjectMetadata
-    CO->>REPO: UPDATE files SET status=Uploaded, etag=$s3_etag, version_id=$s3_version_id,<br/>name=$new.name, mime_type=$new.mime_type, custom_metadata=$new.custom_metadata,<br/>size_bytes, updated_at=NOW, upload_expires_at=NULL<br/>WHERE id=file_id AND etag=$captured_etag AND updated_at=$captured_updated
-    REPO-->>CO: 1 row affected
-    CO-->>SDK: ReconcileResult { info, s3_etag, s3_version_id }
-    SDK-->>APP: ReconcileResult
+    S3A-->>SDK: BackendObjectMetadata
+    SDK->>REPO: UPDATE files SET status=Uploaded, etag=$s3_etag, version_id=$s3_version_id,<br/>name=$new.name, mime_type=$new.mime_type, custom_metadata=$new.custom_metadata,<br/>size_bytes, updated_at=NOW, upload_expires_at=NULL<br/>WHERE id=file_id AND etag=$captured_etag AND updated_at=$captured_updated
+    REPO-->>SDK: 1 row affected
+    SDK-->>APP: ReconcileResult { info, s3_etag, s3_version_id }
     APP-->>U: 200 OK { file_id, etag }
 ```
 
@@ -910,7 +894,7 @@ FileStorage ships as a single stateless ModKit module inside the monolith proces
 
 - **One SQL-compatible database owned by the FileStorage module**, hosting the shared `file_storage` schema. Every `s3-compatible` backend (per ADR-0001) writes into this single database. Rows are discriminated by `backend_id`.
 - **1..N `s3-compatible` backends**, each reaching an S3-class endpoint over HTTPS with its own credentials. The endpoint can be AWS S3, MinIO, Ceph RGW, Wasabi, GCS S3-compat, or `s3s-fs` running side-by-side as the local-disk recipe (see `feature-testkit-and-local-storage-recipe`). Metadata rows live in the shared module database.
-- The roster contains only `s3-compatible` backends in P1. There is no native `local` POSIX backend kind on the roadmap — local-disk deployments use `s3s-fs` registered as a regular `s3-compatible` backend.
+- The roster contains only S3-compatible backends, in every phase (§1.1 backend uniformity invariant). There is no native `local` POSIX backend kind on the roadmap — local-disk deployments use `s3s-fs` registered as a regular S3-compatible backend.
 - Backends are scoped to tenants per `cpt-cf-file-storage-principle-modular-backend-roster`; all `backend_id` values are stable UUIDs assigned in the static TOML roster.
 - At least one backend per tenant view MUST hold `default_private = true`.
 
@@ -1240,7 +1224,7 @@ The P1 delivery intentionally leaves several concerns to later phases. This note
 - **`GET /files` filters** — `backend_id`, `mime_type`, `gts_file_type`, `created_after`, `created_before` (currently P1 exposes only `owner_id`).
 - **`files_tenant_backend_owner_idx` index** — supports `list_files` within a specific backend filtered by owner; lands when `backend_id` filter does.
 - Policies (`cpt-cf-file-storage-fr-allowed-types-policy`, `cpt-cf-file-storage-fr-size-limits-policy`, `cpt-cf-file-storage-fr-sharing-restrictions`) — evaluated in the SDK facade before the coordinator is reached.
-- File events (`cpt-cf-file-storage-fr-file-events`) and audit trail (`cpt-cf-file-storage-fr-audit-trail`) wired through the upload coordinator.
+- File events (`cpt-cf-file-storage-fr-file-events`) and audit trail (`cpt-cf-file-storage-fr-audit-trail`) wired through the lifecycle write paths in REST handlers and the SDK facade.
 - Usage reporting + quota enforcement (`cpt-cf-file-storage-fr-usage-reporting`, `cpt-cf-file-storage-fr-storage-quota`) pre-checked before the coordinator accepts a write.
 - Retention policies (`cpt-cf-file-storage-fr-retention-policies`), owner deletion workflows (`cpt-cf-file-storage-fr-owner-deletion`), ownership transfer (`cpt-cf-file-storage-fr-ownership-transfer`).
 - Custom metadata limits (`cpt-cf-file-storage-fr-metadata-limits`).
@@ -1254,9 +1238,7 @@ The P1 delivery intentionally leaves several concerns to later phases. This note
 - File versioning (`cpt-cf-file-storage-fr-file-versioning`) with opaque version identifiers and soft-delete markers.
 - Server-side encryption (`cpt-cf-file-storage-fr-file-encryption`) via backend capability.
 - Read audit (`cpt-cf-file-storage-fr-read-audit`).
-- WebDAV backend kind — bytes on a remote RFC 4918 server, metadata in the shared FileStorage database. Brings a proxy-mode `put_file` write path and any companion DDL it requires when it lands. The `BackendKind::WebDav` enum variant and the `BackendTransport::Proxy` value are introduced when this work begins; they are intentionally absent from P1.
-- A separate `FileShare` module providing public/tenant/hierarchy shareable links (`cpt-cf-file-storage-fr-shareable-links`, `cpt-cf-file-storage-fr-link-expiration`, `cpt-cf-file-storage-fr-manage-links`), guest URL ledger with IP / time / view-counter constraints, and a proxy-mode download path for tracked downloads.
-- S3-compatible API façade (`cpt-cf-file-storage-fr-s3-api`) and WebDAV API façade (`cpt-cf-file-storage-fr-webdav-api`).
+- A separate `FileShare` module providing public/tenant/hierarchy shareable links (`cpt-cf-file-storage-fr-shareable-links`, `cpt-cf-file-storage-fr-link-expiration`, `cpt-cf-file-storage-fr-manage-links`), guest URL ledger with IP / time / view-counter constraints, and a proxy-mode download path for tracked downloads. FileShare consumes FileStorage as an ordinary client (any backend, including S3) — it is not tied to non-S3 transports and does not bridge protocols. It is a separate service motivated by sharing business logic, not by storage backend variety.
 
 ### Testing strategy
 

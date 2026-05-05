@@ -80,7 +80,7 @@
 --                                [AND xmin = ?]            -- Postgres only
 --        The number of rows affected (0 or 1) decides the outcome:
 --        1 = caller wins, 0 = the row moved underneath them. The
---        coordinator may retry up to 3 times before surfacing an
+--        write handler may retry up to 3 times before surfacing an
 --        error. Engines without a transaction-id system column use
 --        the (etag, updated_at) pair alone, accepting the
 --        last-write-wins property documented in
@@ -295,7 +295,7 @@ CREATE TABLE IF NOT EXISTS file_storage.files (
 -- path. Keyed on (tenant_id, backend_id, file_path) so two different
 -- backends may legitimately host the same file_path for the same
 -- tenant. Engines without partial-index support must emulate this via
--- an application-level uniqueness check on the coordinator path.
+-- an application-level uniqueness check on the write handler path.
 CREATE UNIQUE INDEX IF NOT EXISTS files_tenant_backend_path_uploaded_uq
     ON file_storage.files (tenant_id, backend_id, file_path)
     WHERE status = 'uploaded';
