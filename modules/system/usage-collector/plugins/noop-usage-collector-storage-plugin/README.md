@@ -22,7 +22,7 @@ Add the plugin section under your module configuration:
 modules:
   noop-usage-collector-storage-plugin:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       priority: 100
 ```
 

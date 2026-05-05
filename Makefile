@@ -416,7 +416,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector
 
 # Run E2E tests in Docker (default)
 e2e: e2e-docker
@@ -454,6 +454,14 @@ e2e-mini-chat:
 	cargo build --bin cf-server --features=$(MINI_CHAT_FEATURES)
 	E2E_BINARY=target/debug/cf-server \
 		python3 -m pytest testing/e2e/modules/mini_chat/ --mode offline -vv
+
+USAGE_COLLECTOR_FEATURES = static-tenants,static-authn,static-authz,static-credstore,usage-collector,timescaledb-usage-collector-storage-plugin
+
+## Run usage-collector E2E tests (separate binary with TimescaleDB plugin)
+e2e-usage-collector:
+	cargo build --bin cf-server --features=$(USAGE_COLLECTOR_FEATURES)
+	E2E_BINARY=target/debug/cf-server \
+		python3 -m pytest testing/e2e/modules/usage_collector/ -vv
 
 # -------- Code coverage --------
 

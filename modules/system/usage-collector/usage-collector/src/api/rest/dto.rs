@@ -72,7 +72,7 @@ pub struct AggregatedQueryParams {
     /// End of the time range (RFC 3339 UTC, exclusive upper bound).
     pub to: DateTime<Utc>,
     /// Dimensions to group by.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_group_by")]
     pub group_by: Vec<GroupByDimension>,
     /// Required when `group_by` includes `TimeBucket`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,4 +173,49 @@ pub struct RawQueryParams {
     /// Filter by resource type string. Max length: `MAX_FILTER_STRING_LEN` bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
+}
+
+/// Deserialize `Vec<GroupByDimension>` from either a single string (`serde_urlencoded` delivers
+/// query-param values as strings, not sequences) or a JSON array.
+///
+/// A single string is split on commas so that `group_by=resource,usage_type` also works.
+fn deserialize_group_by<'de, D>(d: D) -> Result<Vec<GroupByDimension>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, IntoDeserializer, Visitor};
+
+    struct GroupByVecVisitor;
+
+    impl<'de> Visitor<'de> for GroupByVecVisitor {
+        type Value = Vec<GroupByDimension>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a group-by dimension or comma-separated list of dimensions")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<GroupByDimension>, E> {
+            use serde::Deserialize as _;
+            v.split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    let owned: String = s.trim().to_owned();
+                    GroupByDimension::deserialize(owned.into_deserializer())
+                })
+                .collect()
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Vec<GroupByDimension>, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(item) = seq.next_element()? {
+                vec.push(item);
+            }
+            Ok(vec)
+        }
+    }
+
+    d.deserialize_any(GroupByVecVisitor)
 }

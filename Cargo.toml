@@ -267,6 +267,8 @@ usage-collector = { package = "cf-usage-collector", version = "0.1.0", path = "m
 usage-collector-rest-client = { package = "cf-usage-collector-rest-client", version = "0.1.0", path = "modules/system/usage-collector/usage-collector-rest-client" }
 usage-collector-sdk = { package = "cf-usage-collector-sdk", version = "0.1.0", path = "modules/system/usage-collector/usage-collector-sdk" }
 usage-emitter = { package = "cf-usage-emitter", version = "0.1.0", path = "modules/system/usage-collector/usage-emitter" }
+noop-usage-collector-storage-plugin = { package = "cf-noop-usage-collector-storage-plugin", version = "0.1.0", path = "modules/system/usage-collector/plugins/noop-usage-collector-storage-plugin" }
+timescaledb-usage-collector-storage-plugin = { package = "cf-timescaledb-usage-collector-storage-plugin", version = "0.1.0", path = "modules/system/usage-collector/plugins/timescaledb-usage-collector-storage-plugin" }
 
 # system modules
 grpc_hub = { package = "cf-grpc-hub", version = "0.2.4", path = "modules/system/grpc-hub" }

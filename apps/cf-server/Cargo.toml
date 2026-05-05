@@ -26,6 +26,8 @@ static-credstore = ["dep:static-credstore-plugin"]
 mini-chat = ["dep:mini-chat"]
 k8s = ["mini-chat/k8s"]
 otel = ["modkit/otel"]
+usage-collector = ["dep:usage-collector", "dep:noop-usage-collector-storage-plugin"]
+timescaledb-usage-collector-storage-plugin = ["dep:timescaledb-usage-collector-storage-plugin"]
 
 [dependencies]
 mimalloc = { version = "0.1" }
@@ -77,6 +79,11 @@ mini-chat = { package = "cf-mini-chat", path = "../../modules/mini-chat/mini-cha
 users-info = { path = "../../examples/modkit/users-info/users-info", optional = true }
 calculator-gateway = { path = "../../examples/oop-modules/calculator-gateway/calculator-gateway", optional = true }
 calculator = { path = "../../examples/oop-modules/calculator/calculator", optional = true }
+
+# Optional usage-collector module and storage plugins
+usage-collector = { workspace = true, optional = true }
+noop-usage-collector-storage-plugin = { workspace = true, optional = true }
+timescaledb-usage-collector-storage-plugin = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

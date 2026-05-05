@@ -9,7 +9,7 @@ fn vendor_can_be_overridden_via_serde() {
 
 #[test]
 fn priority_can_be_overridden_via_serde() {
-    let json = r#"{"vendor": "hyperspot", "priority": 10}"#;
+    let json = r#"{"vendor": "cyberfabric", "priority": 10}"#;
     let cfg: NoopUsageCollectorStorageConfig = serde_json::from_str(json).unwrap();
     assert_eq!(cfg.priority, 10);
 }
@@ -18,7 +18,7 @@ fn priority_can_be_overridden_via_serde() {
 fn serde_default_applies_default_vendor_and_priority() {
     let cfg: NoopUsageCollectorStorageConfig = serde_json::from_str("{}").unwrap();
     assert_eq!(
-        cfg.vendor, "hyperspot",
+        cfg.vendor, "cyberfabric",
         "serde(default) must use Default impl"
     );
     assert_eq!(cfg.priority, 100, "serde(default) must use Default impl");

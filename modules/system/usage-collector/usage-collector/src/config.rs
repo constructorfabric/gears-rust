@@ -118,7 +118,7 @@ impl UsageCollectorConfig {
 impl Default for UsageCollectorConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             plugin_timeout: Duration::from_secs(5),
             circuit_breaker_failure_threshold: 5,
             circuit_breaker_window: Duration::from_secs(10),

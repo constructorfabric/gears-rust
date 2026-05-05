@@ -176,7 +176,7 @@ fn make_client() -> UsageCollectorLocalClient {
         UsageCollectorStoragePluginSpecV1::gts_schema_id()
     );
     let hub = Arc::new(ClientHub::default());
-    let instance = make_test_instance(&instance_id, plugin_content(&instance_id, "hyperspot"));
+    let instance = make_test_instance(&instance_id, plugin_content(&instance_id, "cyberfabric"));
     let reg: Arc<dyn TypesRegistryClient> = Arc::new(MockRegistry::new(vec![instance]));
     hub.register::<dyn TypesRegistryClient>(reg);
     hub.register_scoped::<dyn UsageCollectorPluginClientV1>(
@@ -287,10 +287,10 @@ async fn plugin_timeout_returns_plugin_timeout_error() {
         "{}test.usage.mock.lc_test.v1",
         UsageCollectorStoragePluginSpecV1::gts_schema_id()
     );
-    let hub = hub_with_plugin(&instance_id, "hyperspot", Arc::new(SlowPlugin));
+    let hub = hub_with_plugin(&instance_id, "cyberfabric", Arc::new(SlowPlugin));
     let client = UsageCollectorLocalClient::new(
         UsageCollectorConfig {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             plugin_timeout: Duration::from_millis(1),
             ..UsageCollectorConfig::default()
         },
@@ -312,7 +312,7 @@ async fn gts_plugin_selector_calls_registry_only_once_across_multiple_create_usa
     );
     let reg = Arc::new(MockRegistry::new(vec![make_test_instance(
         &instance_id,
-        plugin_content(&instance_id, "hyperspot"),
+        plugin_content(&instance_id, "cyberfabric"),
     )]));
     let hub = Arc::new(ClientHub::default());
     hub.register::<dyn TypesRegistryClient>(Arc::clone(&reg) as Arc<dyn TypesRegistryClient>);
@@ -320,7 +320,7 @@ async fn gts_plugin_selector_calls_registry_only_once_across_multiple_create_usa
         ClientScope::gts_id(&instance_id),
         Arc::new(OkPlugin),
     );
-    let client = make_client_with_vendor(hub, "hyperspot");
+    let client = make_client_with_vendor(hub, "cyberfabric");
     let tenant = Uuid::new_v4();
 
     let rec1 = record(tenant);
@@ -347,11 +347,11 @@ async fn no_plugin_client_in_hub_returns_unavailable_error() {
     );
     // Register the entity in types-registry but deliberately omit the plugin client.
     let hub = Arc::new(ClientHub::default());
-    let instance = make_test_instance(&instance_id, plugin_content(&instance_id, "hyperspot"));
+    let instance = make_test_instance(&instance_id, plugin_content(&instance_id, "cyberfabric"));
     let reg: Arc<dyn TypesRegistryClient> = Arc::new(MockRegistry::new(vec![instance]));
     hub.register::<dyn TypesRegistryClient>(reg);
     // plugin client NOT registered
-    let client = make_client_with_vendor(hub, "hyperspot");
+    let client = make_client_with_vendor(hub, "cyberfabric");
     let tenant = Uuid::new_v4();
     let rec = record(tenant);
     let err = client.create_usage_record(rec).await.unwrap_err();
@@ -567,10 +567,10 @@ fn make_cb_client(
         "{}test.usage.mock.cb_test.v1",
         UsageCollectorStoragePluginSpecV1::gts_schema_id()
     );
-    let hub = hub_with_plugin(&instance_id, "hyperspot", plugin);
+    let hub = hub_with_plugin(&instance_id, "cyberfabric", plugin);
     UsageCollectorLocalClient::new(
         UsageCollectorConfig {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             circuit_breaker_failure_threshold: threshold,
             circuit_breaker_window: window,
             circuit_breaker_recovery_timeout: recovery,
@@ -700,10 +700,10 @@ async fn half_open_admits_exactly_one_concurrent_probe_others_rejected() {
         "{}test.usage.mock.cb_halfopen.v1",
         UsageCollectorStoragePluginSpecV1::gts_schema_id()
     );
-    let hub = hub_with_plugin(&instance_id, "hyperspot", toggle_plugin);
+    let hub = hub_with_plugin(&instance_id, "cyberfabric", toggle_plugin);
     let client = Arc::new(UsageCollectorLocalClient::new(
         UsageCollectorConfig {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             circuit_breaker_failure_threshold: threshold,
             circuit_breaker_window: Duration::from_secs(10),
             circuit_breaker_recovery_timeout: Duration::from_millis(1),
@@ -802,14 +802,14 @@ async fn successful_probe_closes_circuit() {
     );
     let hub = hub_with_plugin(
         &instance_id,
-        "hyperspot",
+        "cyberfabric",
         Arc::new(TogglePlugin {
             fail: Arc::clone(&fail_flag),
         }),
     );
     let client = UsageCollectorLocalClient::new(
         UsageCollectorConfig {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             circuit_breaker_failure_threshold: threshold,
             circuit_breaker_window: Duration::from_secs(10),
             circuit_breaker_recovery_timeout: Duration::from_millis(1),
@@ -902,11 +902,11 @@ async fn test_query_aggregated_plugin_not_found_returns_error() {
         UsageCollectorStoragePluginSpecV1::gts_schema_id()
     );
     let hub = Arc::new(ClientHub::default());
-    let instance = make_test_instance(&instance_id, plugin_content(&instance_id, "hyperspot"));
+    let instance = make_test_instance(&instance_id, plugin_content(&instance_id, "cyberfabric"));
     let reg: Arc<dyn TypesRegistryClient> = Arc::new(MockRegistry::new(vec![instance]));
     hub.register::<dyn TypesRegistryClient>(reg);
     // plugin client NOT registered
-    let client = Arc::new(make_client_with_vendor(hub, "hyperspot"));
+    let client = Arc::new(make_client_with_vendor(hub, "cyberfabric"));
     let proxy = UsageCollectorLocalClient::as_plugin_client(Arc::clone(&client));
     let result = proxy.query_aggregated(minimal_agg_query()).await;
     assert!(result.is_err());
@@ -963,10 +963,10 @@ async fn test_query_aggregated_scope_propagated_to_plugin() {
         "{}test.mock._.capturing.v1",
         UsageCollectorStoragePluginSpecV1::gts_schema_id()
     );
-    let hub = hub_with_plugin(&instance_id, "hyperspot", plugin);
+    let hub = hub_with_plugin(&instance_id, "cyberfabric", plugin);
     let client = Arc::new(UsageCollectorLocalClient::new(
         UsageCollectorConfig {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             ..UsageCollectorConfig::default()
         },
         hub,
@@ -1031,10 +1031,10 @@ async fn proxy_timeout_trips_circuit_breaker() {
         "{}test.mock._.proxy_timeout_cb.v1",
         UsageCollectorStoragePluginSpecV1::gts_schema_id()
     );
-    let hub = hub_with_plugin(&instance_id, "hyperspot", Arc::new(SlowQueryPlugin));
+    let hub = hub_with_plugin(&instance_id, "cyberfabric", Arc::new(SlowQueryPlugin));
     let client = Arc::new(UsageCollectorLocalClient::new(
         UsageCollectorConfig {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             plugin_timeout: Duration::from_millis(1),
             circuit_breaker_failure_threshold: threshold,
             circuit_breaker_window: Duration::from_secs(10),

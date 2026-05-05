@@ -29,7 +29,7 @@ struct NoopUsageCollectorStoragePlugin;
 #[async_trait]
 impl Module for NoopUsageCollectorStoragePlugin {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
-        let cfg: NoopUsageCollectorStorageConfig = ctx.config()?;
+        let cfg: NoopUsageCollectorStorageConfig = ctx.config_or_default()?;
         info!(
             %cfg.vendor,
             cfg.priority,

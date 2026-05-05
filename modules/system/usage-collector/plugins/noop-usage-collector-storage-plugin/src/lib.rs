@@ -10,7 +10,7 @@
 //! modules:
 //!   noop_usage_collector_storage_plugin:
 //!     config:
-//!       vendor: "hyperspot"
+//!       vendor: "cyberfabric"
 //!       priority: 100
 //! ```
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]

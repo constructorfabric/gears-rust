@@ -127,7 +127,7 @@ fn vendor_can_be_overridden_via_serde() {
 fn serde_default_applies_default_vendor() {
     let cfg: UsageCollectorConfig = serde_json::from_str("{}").unwrap();
     assert_eq!(
-        cfg.vendor, "hyperspot",
+        cfg.vendor, "cyberfabric",
         "serde(default) must use Default impl"
     );
 }

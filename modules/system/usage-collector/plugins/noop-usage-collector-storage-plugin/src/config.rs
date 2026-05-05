@@ -16,7 +16,7 @@ pub struct NoopUsageCollectorStorageConfig {
 impl Default for NoopUsageCollectorStorageConfig {
     fn default() -> Self {
         Self {
-            vendor: "hyperspot".to_owned(),
+            vendor: "cyberfabric".to_owned(),
             priority: 100,
         }
     }

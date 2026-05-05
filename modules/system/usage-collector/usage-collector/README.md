@@ -27,7 +27,7 @@ Source modules should emit through **`usage-emitter`** (PDP + outbox). This crat
 modules:
   usage-collector:
     config:
-      vendor: "hyperspot"
+      vendor: "cyberfabric"
       plugin_timeout: "5s"
       emitter:
         # UsageEmitterConfig fields (outbox, auth tuning)

@@ -1,3 +1,13 @@
+# !! KEEP THIS FILE IDENTICAL TO e2e-local.yaml EXCEPT for the
+# !! usage-collector-specific overrides below.
+#
+# Differences from e2e-local.yaml:
+#   * usage-collector: added config section — vendor="virtuozzo",
+#     plugin_timeout, circuit-breaker settings, and e2e test metrics
+#     (e2e.gauge, e2e.counter)
+#   * timescaledb-usage-collector-storage-plugin: added with database_url
+#     pointing to the TimescaleDB sidecar at localhost:5433
+#
 # Updated: 2026-04-16 by Constructor Tech
 # CyberFabric Server Configuration
 #
@@ -307,6 +317,17 @@ modules:
     database:
       server: "sqlite_users"
       file: "usage_collector.db"
+    config:
+      vendor: "virtuozzo"
+      metrics:
+        e2e.gauge:
+          kind: gauge
+        e2e.counter:
+          kind: counter
+
+  timescaledb-usage-collector-storage-plugin:
+    config:
+      database_url: "postgresql://postgres:password@localhost:5433/postgres?sslmode=require"
 
 # OpenTelemetry configuration (resource identity, tracing, metrics)
 opentelemetry:

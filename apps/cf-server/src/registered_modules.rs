@@ -42,6 +42,18 @@ use tr_authz_plugin as _;
 #[cfg(feature = "static-credstore")]
 use static_credstore_plugin as _;
 
+#[cfg(feature = "usage-collector")]
+use usage_collector as _;
+
+#[cfg(all(
+    feature = "usage-collector",
+    not(feature = "timescaledb-usage-collector-storage-plugin")
+))]
+use noop_usage_collector_storage_plugin as _;
+
+#[cfg(feature = "timescaledb-usage-collector-storage-plugin")]
+use timescaledb_usage_collector_storage_plugin as _;
+
 // === Optional Modules ===
 
 #[cfg(feature = "mini-chat")]

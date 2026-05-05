@@ -75,6 +75,9 @@ jobs:
       - name: Run RG + AuthZ E2E tests (tr-authz-plugin, AuthZ -> TR -> RG chain)
         run: make e2e-tr-authz
 
+      - name: Run usage-collector E2E tests (TimescaleDB storage plugin)
+        run: make e2e-usage-collector
+
       - name: Upload E2E logs
         if: failure()
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
