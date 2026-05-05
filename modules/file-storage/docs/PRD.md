@@ -258,13 +258,12 @@ filtering prevents unbounded queries across all files and aligns with the owners
 
 #### Multipart Upload
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
+- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
 
-The system **MUST** support multipart (chunked) upload for large files. Multipart upload is delivered in P1 because
-the only P1 backend kind — `s3-compatible` — exposes multipart natively (S3 `CreateMultipartUpload` /
-`UploadPart` / `CompleteMultipartUpload`). FileStorage surfaces this through the same presign-first contract used
-for single-part uploads (each part gets a presigned PUT URL; finalization is `change_status` once all parts are
-acknowledged). A multipart upload **MUST**:
+The system **MUST** support multipart (chunked) upload for large files. Multipart upload is deferred to P2 — see
+DESIGN §4 Future deltas for the pre-decided Variant 2 (server-mediated) design: server-issued `CreateMultipartUpload`
+/ `AbortMultipartUpload`, per-part presigned PUTs, and server-mediated `CompleteMultipartUpload`. P1 ships only
+single-shot presigned PUT (`create_presigned_url` / `create_presigned_overwrite_url`). A multipart upload **MUST**:
 
 - Allow the client to split a file into multiple parts and upload them independently
 - Support resumable uploads — if a part fails, only that part needs re-uploading
@@ -279,10 +278,12 @@ buffering, which negates multipart's scalability benefits. Backends that do not 
 reject multipart requests with `CapabilityUnavailable`; clients fall back to single-part upload.
 
 **Rationale**: Single-request uploads are impractical for large files (video, datasets, backups) due to timeouts,
-memory constraints, and network reliability. Multipart enables reliable transfer of arbitrarily large files and
-ships in P1 by virtue of S3 multipart being free at the adapter layer. Buffering parts in FileStorage to emulate
-multipart on a non-multipart backend would re-introduce the very memory/throughput costs multipart is designed to
-avoid; rejecting with a clear error lets clients adapt their strategy per backend.  
+memory constraints, and network reliability. Multipart enables reliable transfer of arbitrarily large files.
+Deferred to P2 because the server-mediated design requires additional REST endpoints, companion DB tables
+(`file_uploads`, `file_upload_parts`), and careful session lifecycle management — complexity intentionally out of
+scope for P1. Buffering parts in FileStorage to emulate multipart on a non-multipart backend would re-introduce the
+very memory/throughput costs multipart is designed to avoid; rejecting with a clear error lets clients adapt their
+strategy per backend.  
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Content-Type Validation
@@ -293,11 +294,11 @@ The system **MUST** validate the declared mime_type against the actual file cont
 proxied uploads (where file content passes through FileStorage). If the declared type does not match the detected type,
 the system **MUST** reject the upload with an error indicating the mismatch.
 
-For proxied multipart uploads (`cpt-cf-file-storage-fr-multipart-upload`), the system **MUST** validate the declared
-mime_type against the content of the **first uploaded part**, which contains the file's magic bytes / file signature.
-Validation **MUST** occur when the first part is received — before subsequent parts are accepted. If the detected type
-does not match the declared mime_type, the system **MUST** abort the multipart upload (`abortMultipartUpload`) and
-reject all subsequent parts.
+For proxied multipart uploads (`cpt-cf-file-storage-fr-multipart-upload`, P2), the system **MUST** validate the
+declared mime_type against the content of the **first uploaded part**, which contains the file's magic bytes / file
+signature. Validation **MUST** occur when the first part is received — before subsequent parts are accepted. If the
+detected type does not match the declared mime_type, the system **MUST** abort the multipart upload
+(`abortMultipartUpload`) and reject all subsequent parts. This requirement lands with P2 when multipart ships.
 
 Content-type validation does not apply to direct uploads (single-part or multipart) via presigned URLs because
 FileStorage does not receive the file content in that flow.
