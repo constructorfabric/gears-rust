@@ -234,7 +234,10 @@ version-targeted operation.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-get-metadata`
 
 The system **MUST** return file metadata (name, size, mime_type, GTS file type, created date, modified date, owner,
-download availability, and custom metadata) without transferring file content.
+and custom metadata) without transferring file content. Download availability gating (`download_availability`
+flag, owner-toggleable) is **out of FileStorage scope** — it lives in the P3 `FileShare` service alongside
+shareable links, guest URL ledger, and view-counter proxy mode; FileStorage itself does not expose or enforce a
+download-availability field.
 
 **Rationale**: Consumers validate file properties (size limits, type compatibility) and read custom metadata before
 initiating downloads, avoiding wasted bandwidth on incompatible files.
@@ -260,40 +263,37 @@ filtering prevents unbounded queries across all files and aligns with the owners
 
 #### Multipart Upload
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
 
-The system **MUST** support multipart (chunked) upload for large files. Multipart upload is deferred to P2 — see
-DESIGN §4 Future deltas for the pre-decided shape, summarised below. P1 ships only single-shot presigned PUT
-(`create_presigned_url` / `create_presigned_overwrite_url` against `upload.sigv4_v1`). A multipart upload **MUST**:
+The system **MUST** support multipart (chunked) upload for files of any size. Multipart is the **only** upload
+path — even single-byte files go through the multipart lifecycle as a one-part session (the last-part rule
+allows arbitrarily small parts on the final part). A multipart upload **MUST**:
 
 - Allow the client to split a file into multiple parts and upload them independently
 - Support resumable uploads — if a part fails, only that part needs re-uploading
 - Assemble parts into a complete file upon finalization
-- Apply the same authorization, metadata, and audit requirements as single-part uploads
+- Apply the same authorization, metadata, and audit requirements regardless of part count
 
-**P2 multipart shape (server-mediated, presign-bundled).** Multipart support is an optional capability tag
-`upload.create_multipart_v1` that a backend may declare in its `capabilities` list. Lifecycle:
+**Multipart shape (server-mediated, presign-bundled).** Multipart is the canonical upload mode and lives behind the
+`upload.multipart_v1` capability tag (mandatory for any upload-capable backend). Lifecycle:
 
-- `POST /presign-batch` with `capability: "upload.create_multipart_v1"` and `part_count: N` → server INSERTs
-  a `PendingUpload` row, calls `CreateMultipartUpload` on the backend, captures the backend's `upload_id`,
-  presigns N `UploadPart` URLs, returns `PresignedMultipartHandle { file_id, upload_id, part_urls[],
+- `POST /presign-batch` with `capability: "upload.multipart_v1"` and `part_count: N` → server INSERTs (or reuses
+  for re-upload) a `PendingUpload` row, calls `CreateMultipartUpload` on the backend, captures the backend's
+  `upload_id`, presigns N `UploadPart` URLs, returns `PresignedUploadHandle { file_id, upload_id, part_urls[],
   expires_at }`.
-- Client uploads parts directly to the backend over the presigned URLs and collects `(part_number, etag)`
-  pairs.
-- `POST /files/{file_id}/multipart/{upload_id}` with body `{ parts: [{part_number, etag}] }` → server calls
-  `CompleteMultipartUpload`, captures the finalized etag, flips `PendingUpload → Uploaded` in one
-  transaction. **No `reconcile` call is required on the multipart path.**
-- `DELETE /files/{file_id}/multipart/{upload_id}` → server calls `AbortMultipartUpload` on the backend for that
+- Client uploads parts directly to the backend over the presigned URLs and collects `(part_number, etag)` pairs.
+- `POST /files/{file_id}/upload/{upload_id}` with body `{ parts: [{part_number, etag}] }` → server runs
+  the 3-phase commit (`PendingUpload → Completing → Uploaded`): Phase 1 flips the row to `Completing`, Phase 2
+  invokes `CompleteMultipartUpload` and captures the finalized etag/version_id, Phase 3 flips back to `Uploaded`
+  with the new etag. **No separate `reconcile` call is required** — atomicity lives entirely inside `complete`.
+- `DELETE /files/{file_id}/upload/{upload_id}` → server calls `AbortMultipartUpload` on the backend for that
   `upload_id` only. **Does NOT delete the file row** — multiple multipart sessions may run in parallel against the
   same `file_id`, so aborting one session must not affect the others. To drop the file entirely after aborting,
   the caller MUST issue `DELETE /files/{file_id}` as a separate second step.
 
-`upload_id` is **not persisted** by FileStorage — it round-trips through the client between presign-batch
-and the complete/abort REST endpoints. Lost `upload_id`s are reaped by the bucket-level
+`upload_id` is **not persisted** by FileStorage — it round-trips through the client between `presign-batch` and
+the complete/abort REST endpoints. Lost `upload_id`s are reaped by the bucket-level
 `AbortIncompleteMultipartUpload` lifecycle rule (operator runbook).
-
-Backends that do not declare `upload.create_multipart_v1` **MUST** reject multipart requests with
-`CapabilityUnavailable`; clients fall back to single-part presigned PUT.
 
 **Rationale**: Single-request uploads are impractical for large files (video, datasets, backups) due to timeouts,
 memory constraints, and network reliability. Multipart enables reliable transfer of arbitrarily large files.
@@ -676,13 +676,24 @@ Blob metadata.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-update-metadata`
 
-The file owner **MUST** be able to update custom metadata (user-defined key-value pairs) and download availability on
-an existing file. All other system-managed metadata (name, size, mime_type, GTS file type, creation date, last modified
-date, owner) is **NOT** updatable by users — it is maintained by the system. Updating custom metadata or download
-availability **MUST** update the file's last modified date.
+The file owner **MUST** be able to update mutable metadata fields (`name` — display label only, `mime_type`,
+`custom_metadata`) on an existing file. All other system-managed fields (`size`, `gts_file_type`, creation date,
+last modified date, owner, `etag`, `version_id`) are **NOT** updatable by users — they are maintained by the system.
+Updating mutable metadata **MUST** update the file's last modified date.
 
-**Rationale**: Custom metadata evolves as files are processed, categorized, or annotated by consuming modules. System
-metadata reflects the immutable physical properties of the file and must remain authoritative.
+**Identifiers are permanently immutable; renaming files is not supported.** `file_id` (the opaque UUID handle) and
+`file_path` (the logical path / file key inside the backend's tenant scope) are captured at upload and remain fixed
+for the file's lifetime. The system **MUST NOT** expose any REST or SDK surface that mutates `file_id` or
+`file_path` — there is no `move`, no `rename`, no `update_path`. To change the logical address, callers upload a new
+file at the desired path and delete the old one. The display label `meta.name` IS mutable through this FR — it is a
+display field used for `Content-Disposition` on downloads, not an identifier; updating it does NOT change the
+`file_id`, `file_path`, or the underlying backend object key.
+
+**Rationale**: Custom metadata and display labels evolve as files are processed, categorized, or annotated by
+consuming modules. Identifiers (`file_id`, `file_path`) are durable handles cross-module consumers rely on — making
+them mutable would require coordinated invalidation across every cached handle, audit record, and shareable link.
+The "upload new + delete old" workflow keeps the contract simple and lets retention/audit treat each logical
+address as a stable timeline.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Custom Metadata Limits
@@ -848,8 +859,8 @@ branching.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-capabilities`
 
 The system **MUST** define a versioned capability model for storage backends. Each backend **MUST** declare a list
-of versioned capability **tags** of the form `<operation>.<version>` (e.g. `upload.sigv4_v1`,
-`download_private.sigv4_v1`, `download_public.v1`, `upload.create_multipart_v1`). Each tag binds one (operation,
+of versioned capability **tags** of the form `<operation>.<version>` (e.g. `upload.multipart_v1`,
+`download_private.sigv4_v1`, `download_public.v1`). Each tag binds one (operation,
 signing-strategy, version) tuple. A new signing strategy or vendor-specific variant lands as a new tag string —
 no enum migration, no breaking schema change.
 
@@ -860,15 +871,12 @@ is enforced at boot.
 
 P1 system MUST support these tags:
 
-- `upload.sigv4_v1` — single-shot SigV4 PUT for object upload (mandatory for any usable backend).
+- `upload.multipart_v1` — server-mediated multipart upload (the only upload path — see
+  `cpt-cf-file-storage-fr-multipart-upload`; mandatory for any upload-capable backend).
 - `download_private.sigv4_v1` — SigV4-signed GET for time-limited private downloads (TTL + optional CIDR
   allowlist).
 - `download_public.v1` — bare-HTTPS public-read URL with no signature and no expiry; pairs with the per-backend
   `default_public` flag.
-
-P2 adds:
-
-- `upload.create_multipart_v1` — server-mediated multipart initiation (see `cpt-cf-file-storage-fr-multipart-upload`).
 
 Other capabilities described in this PRD (file versioning, server-side encryption) are tracked through their own
 FRs and may land as additional tags or as out-of-band features (e.g. `versioning` is a per-backend flag in TOML,
@@ -1508,7 +1516,7 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - [ ] Upload rejected when declared mime_type does not match actual file content
 - [ ] Orphaned metadata records from unconfirmed direct uploads are detected, reconciled against backend state, and
   cleaned up automatically
-- [ ] File owner can toggle download availability via metadata update
+- [ ] (P3 — FileShare scope, not FileStorage) File owner can toggle download availability via metadata update
 - [ ] Each backend declares its supported capabilities (presigned URLs, versioning, multipart upload)
 - [ ] Consumers can discover backend capabilities at runtime
 - [ ] Operations requiring an unsupported capability return a clear error

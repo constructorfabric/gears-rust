@@ -9,14 +9,14 @@
 3. **Chat Frontend → `POST /api/chat/v1/threads/{thread_id}/upload-file`.**
    Passes the file's main parameters (name, size, type), but not its content.
 
-4. **Chat Backend → `FileStorageClient.create_presigned_url(ctx, backend_id?, owner: OwnerRef { tenant_id, owner_id }, file_path, meta: FileMeta, params: UrlParams)`.**
-   Performs all the application's business validations, checks the limits of its own service, of the given thread, of the user, etc., and decides what `file_path` the new file will have. The `ctx: SecurityContext` carries the caller's tenant; `backend_id` is optional — when omitted, FileStorage falls back to the tenant's `default_private` backend. In response it receives a `PresignedUploadHandle { file_id (uuid), upload_url, etag_pinned, expires_at }`. FS persists the row in `file_storage.files` with `status = 'pending_upload'`, the sentinel pinned `etag`, `version_id = NULL`, and `upload_expires_at` derived from `params.expires_in_seconds` (capped by the backend's max URL TTL). In the future a Garbage Collector can be run that finds expired pending rows for which the file was never actually uploaded. The handler also persists the link to the new `file_id` in its own `threads` table.
+4. **Chat Backend → `FileStorageClient.create_presigned_url(ctx, backend_id?, owner: OwnerRef { tenant_id, owner_id }, meta: FileMeta, params: UrlParams)`.**
+   Performs all the application's business validations, checks the limits of its own service, of the given thread, of the user, etc. The `ctx: SecurityContext` carries the caller's tenant; `backend_id` is optional — when omitted, FileStorage falls back to the tenant's `default_private` backend. In response it receives a `PresignedUploadHandle { file_id (uuid), upload_url, etag_pinned, expires_at }`. FS mints a fresh opaque `file_id`, derives the backend object key (`file_path`) deterministically from it, persists the row in `file_storage.files` with `status = 'pending_upload'`, the sentinel pinned `etag`, `version_id = NULL`, and `upload_expires_at` derived from `params.expires_in_seconds` (capped by the backend's max URL TTL). In the future a Garbage Collector can be run that finds expired pending rows for which the file was never actually uploaded. The handler also persists the link to the new `file_id` in its own `threads` table.
 
 5. **Chat Frontend ← `(file_id, upload_url, etag_pinned, expires_at)`.**
    The client cannot modify the parameters in the `upload_url` because they are SigV4-signed (hash of canonical params + backend secret), so any change to the URL makes it invalid. The signed headers include `Content-Type` (from `meta.mime_type`), `Content-Disposition` (from `meta.name`), and every `x-amz-meta-<k>` (from `meta.custom_metadata`). They do NOT include `x-amz-meta-gts-file-type` — that field is DB-only.
 
 6. **Chat Frontend → `PUT <upload_url>` (direct to backend, e.g. S3).**
-   Uploads the file content directly to the specific storage backend. P1 ships PUT-SigV4 without any backend-side preconditions on the upload presign — correctness is upheld entirely by FileStorage's own primitives (`reconcile`-driven HEAD-and-pull, `(etag, updated_at)` race-detection on UPDATE, partial unique index, lazy self-healing on `read_file`).
+   Uploads the file content directly to the specific storage backend. P1 ships PUT-SigV4 without any backend-side preconditions on the upload presign — correctness is upheld entirely by FileStorage's own primitives (`reconcile`-driven HEAD-and-pull, `(etag, updated_at, version_id[, xmin])` race-detection on UPDATE — `version_id` participates always, null-safe via `IS NOT DISTINCT FROM`, closing the ABA window on versioning-on backends; `xmin` adds Postgres-only transaction-id race detection — the status state machine, lazy self-healing on `read_file`). Logical-address uniqueness is structural — `file_path` is derived from `file_id`, so collisions are impossible by construction.
 
 7. **Chat Frontend → `POST /api/chat/v1/threads/{thread_id}/files/{file_id}/status`.**
    Signals that the upload completed (success / failure). The frontend MAY include the S3 `ETag` it observed in the PUT response, but FileStorage never plumbs that hint into the row — the value can be stale, wrong, or forged.
@@ -32,9 +32,9 @@
    - `FileStorageClient.delete_file(ctx, file_id, etag?)` — 2-phase hard delete (Phase 1 `uploaded → deleting`, Phase 2 backend DELETE with retries, Phase 3 hard-DELETE the row). `If-Match` is optional.
    - `FileStorageClient.reconcile(ctx, file_id)` — explicit reconciliation of the row against the backend (e.g. after an out-of-band overwrite the caller knows about). Always safe to invoke.
 
-   **Re-uploading file content** can be done in two ways:
-   - **Variant B (preserve `file_id`)** — the application backend calls `FileStorageClient.create_presigned_overwrite_url(ctx, file_id, params)`. The server pins the row's CURRENT metadata into the presigned PUT (the caller MUST NOT supply `meta`); the end-client `PUT`s new bytes to the same backend object key; the application calls `FileStorageClient.reconcile(ctx, file_id)` to refresh the row's `etag` and `version_id`. The `file_id` is preserved; consumers holding the old `file_id` see the new bytes after the next `reconcile` (or via the lazy self-heal on `read_file`).
-   - **Fresh `file_id` (supersession)** — the application calls `FileStorageClient.create_presigned_url(...)` again with the same `file_path` (yielding a fresh `file_id`), the end-client PUTs to the new URL, and the application commits via `FileStorageClient.reconcile(ctx, new_file_id)`. The partial unique index `files_tenant_backend_path_uploaded_uq` (over `WHERE status = 'uploaded'`) is the canonical race arbiter: at most one `uploaded` row exists per `(tenant_id, backend_id, file_path)`. When two supersessions race on the same address, one `reconcile` wins; the other gets `Conflict` and its backend object becomes an orphan reclaimed by the P2 GC inverse sweep (DESIGN §3.6). After a successful supersession, readers holding the old `file_id` see `NotFound` — the previous row is either rolled into orphan-delete queue or replaced by the supersession transaction. See DESIGN §3.6 "Supersession transaction" for the SQL contract.
+   **Re-uploading file content** is a single flow — variant B, preserving `file_id`:
+   - The application backend calls `FileStorageClient.create_presigned_url(ctx, file_id = Some(id), params)`. The server pins the row's CURRENT metadata into the presigned PUT (the caller MUST NOT supply `meta` on this variant); the end-client `PUT`s new bytes to the same backend object key (deterministically derived from `file_id`); the application calls `complete_upload` (or `reconcile` on the legacy single-PUT path) to refresh the row's `etag` and `version_id`. The `file_id` is preserved; consumers holding the `file_id` see the new bytes after the next finalize (or via the lazy self-heal on `read_file`).
+   - There is **no fresh-`file_id` supersession flow**: minting a new `file_id` always creates an independent file with its own backend object key (`file_path` is derived from `file_id`), not an "overwrite" of any existing file. To replace a file in place, use variant B above; to discard the old file and create a new one, call `delete_file` followed by a fresh `create_presigned_url`.
 
 10. **Chat Backend → `FileStorageClient.presign_urls(ctx, items: Vec<PresignDownloadItem { file_id, params: UrlParams, etag: Option<Etag>, version_id: Option<String> }>)`.**
     Obtains URLs to give the frontend for display/download. The method is batch-first by design (one DB SELECT for the whole list, one RTT in a future remote topology), and a single-URL caller simply passes a one-element vector. Per item: when `etag` is present, the server verifies the row's current `etag` matches (DB-only; no HEAD against S3) before signing — mismatch returns `EtagMismatch` for that item. When `version_id` is present and the file's hosting backend has `versioning = true`, the signed URL embeds `versionId=<vid>` so the URL resolves to that historical generation. Every issued URL sets `response-content-type` and `response-content-disposition` query params from the DB row's metadata, so the user-visible download experience tracks DB.meta independent of any S3-side drift. Backends declaring the `download_public.v1` capability tag (typically paired with `default_public = true`) issue bare-HTTPS URLs with no expiry (`is_public = true` on the outcome) when the per-item `capability` is `download_public.v1`.
@@ -78,7 +78,7 @@ sequenceDiagram
     BE->>FS: 8. reconcile(ctx, file_id)
     FS->>S3: HEAD derive(file_id)
     S3-->>FS: ETag, VersionId, Content-Type,<br/>Content-Disposition, x-amz-meta-*, Content-Length
-    FS->>DB: UPDATE files SET status='uploaded', etag=$s3_etag,<br/>version_id=$s3_version_id, name, mime_type,<br/>custom_metadata, size_bytes,<br/>updated_at=NOW, upload_expires_at=NULL<br/>WHERE id=file_id AND etag=$captured AND updated_at=$captured
+    FS->>DB: UPDATE files SET status='uploaded', etag=$s3_etag,<br/>version_id=$s3_version_id, name, mime_type,<br/>custom_metadata, size_bytes,<br/>updated_at=NOW, upload_expires_at=NULL<br/>WHERE id=file_id AND etag=$captured AND updated_at=$captured<br/>AND version_id IS NOT DISTINCT FROM $captured_version_id
     FS-->>BE: ReconcileResult { info, s3_etag, s3_version_id }
 
     Note over BE,Mod: Step 8′. Chat triggers downstream business operations
@@ -94,7 +94,7 @@ sequenceDiagram
     FS-->>Mod: FileReadHandle { info, bytes }
 
     Mod->>FS: 9c. put_file_info / delete_file<br/>(etag optional)
-    FS->>DB: UPDATE / DELETE WHERE etag, updated_at, …
+    FS->>DB: UPDATE / DELETE WHERE etag, updated_at, version_id [, xmin], …
 
     BE->>FS: 10. presign_urls(ctx,<br/>[{file_id, params, etag?, version_id?}])
     FS->>DB: SELECT batch
@@ -122,7 +122,7 @@ Initial in-sync state:
 Steps that produce a desync:
 
 1. The frontend asks chat-backend for permission to overwrite `f1` in place.
-2. Chat-backend calls `FileStorageClient.create_presigned_overwrite_url(ctx, f1, params)` (variant B). The row is unaffected at this stage; the server pins the row's current metadata into the presigned PUT.
+2. Chat-backend calls `FileStorageClient.create_presigned_url(ctx, file_id = Some(f1), params)` (variant-B re-upload). The row is unaffected at this stage; the server pins the row's current metadata into the presigned PUT.
 3. The frontend successfully `PUT`s `content_new` directly to S3 against the same backend object key. S3 acks with `ETag = e_new` (and assigns `VersionId = v_new` on versioning-on backends).
 4. **The browser dies / the connection drops / the user closes the tab.**
 5. `reconcile(...)` never reaches FileStorage.
@@ -166,6 +166,7 @@ reconcile_primitive(file_id):
          WHERE id = file_id
            AND etag = etag_db
            AND updated_at = updated_at_db
+           AND version_id IS NOT DISTINCT FROM version_id_db   -- null-safe; participates always
            [AND xmin = xmin_db]      -- on Postgres
         if 1 row: return Ok(refreshed_FileInfo)
         # 0 rows: race detected, retry
@@ -188,10 +189,10 @@ The REST counterpart `POST /files/{file_id}/meta/reconcile` rejects `If-Match` w
 
 Algorithm:
 
-1. SELECT row → `(etag_db, …)`.
+1. SELECT row → `(etag_db, version_id_db, updated_at_db, …)`.
 2. If caller pinned `Some(e_pinned)` and `e_pinned != etag_db` → return `EtagMismatch{ current: etag_db }` (legitimate version drift; no self-heal needed).
 3. Open backend GET on `derive(file_id)`. S3 returns ETag, VersionId, body stream.
-4. If `s3.etag != etag_db` → desync detected. Run system-context UPDATE pulling the same fields the eager `reconcile` pulls (etag, version_id, mirrored metadata, size).
+4. If `s3.etag != etag_db` OR (on versioning-on backends) `s3.version_id != version_id_db` → desync detected. Run system-context UPDATE pulling the same fields the eager `reconcile` pulls (etag, version_id, mirrored metadata, size). The UPDATE WHERE clause carries the captured `(etag_db, updated_at_db, version_id_db)` for race detection (`version_id` null-safe).
 5. Branch:
    - If caller pinned `Some(e_pinned)`: return `Err(EtagMismatch{ current: s3.etag })` — DB is now repaired; caller's retry will succeed.
    - If caller pinned `None`: re-SELECT, return `Ok(FileReadHandle { info: refreshed, bytes: stream })` transparently — the caller never learns of the repair.
@@ -282,7 +283,7 @@ sequenceDiagram
 
 Re-uploading bytes to an existing `file_id` preserves the file's identity and reuses the backend object key. The flow:
 
-1. Application backend calls `FileStorageClient.create_presigned_overwrite_url(ctx, file_id, params)`. **No `meta` argument.** The server SELECTs the row, pins the current `name`, `mime_type`, `custom_metadata` into a fresh presigned PUT URL, and updates `upload_expires_at` to `MAX(coalesce(current, ε), NOW + TTL)` so multiple outstanding URLs do not shorten the existing window.
+1. Application backend calls `FileStorageClient.create_presigned_url(ctx, file_id = Some(file_id), params)`. **No `meta` argument** on this variant. The server SELECTs the row, pins the current `name`, `mime_type`, `custom_metadata` into a fresh presigned PUT URL, and updates `upload_expires_at` to `MAX(coalesce(current, ε), NOW + TTL)` so multiple outstanding URLs do not shorten the existing window.
 2. The end-client `PUT`s the new bytes to the same backend object key with the SigV4-pinned headers.
 3. After the PUT completes (or the application backend polls / receives a notification), the application calls `FileStorageClient.reconcile(ctx, file_id)` to refresh the row's `etag` and `version_id` from S3.
 
@@ -327,6 +328,7 @@ The flow:
     WHERE id = $file_id
       AND etag = $etag_db
       AND updated_at = $updated_at_db
+      AND version_id IS NOT DISTINCT FROM $version_id_db   -- null-safe; participates always
       [AND xmin = $xmin_db]
    ```
    `0` rows → race detected, retry from step 1 up to 3 times. After 3 unsuccessful attempts → `Conflict`.
@@ -430,12 +432,11 @@ Consumer-facing trait `FileStorageClient` (registered in `ClientHub`). 11 P1 met
 
 **Streaming write** (P1 — Rust SDK only; not exposed via HTTP API in P1)
 
-- `put_file(ctx, backend_id?, owner, file_path, meta, bytes: Stream<Bytes>, etag?) -> FileInfo` — single-call in-process upload. Drives the S3 adapter directly (`PutObject`); does NOT issue a presigned URL and does NOT reuse the REST `reconcile` endpoint. Internally: INSERT `PendingUpload` row → stream bytes via adapter `PutObject` (pinning `Content-Type` / `Content-Disposition` / `x-amz-meta-<k>`, never `gts_file_type`) → HEAD-and-pull authoritative `(s3_etag, s3_version_id, mirrored meta)` → conditional UPDATE flips to `Uploaded`. On any error between the INSERT and the final UPDATE the SDK best-effort runs `DELETE FROM files WHERE id = $file_id AND status = 'pending_upload'` so the call leaves no `PendingUpload` row behind; if the failure occurred after `PutObject` succeeded, the orphan backend object is reclaimed by the P2 GC inverse sweep. `etag = None` is initial upload (fresh `file_id`, supersedes any existing `Uploaded` row on the same address); `etag = Some(e)` is variant-B re-upload (same `file_id` and backend object key, mismatch → `EtagMismatch`). There is no bytes-through-FileStorage REST proxy upload in any phase — external clients always go presign-first.
+- `put_file(ctx, file_id?, backend_id?, owner, meta, bytes: Stream<Bytes>, etag?) -> FileInfo` — single-call in-process upload. Drives the S3 adapter directly (`PutObject`); does NOT issue a presigned URL and does NOT reuse the REST `reconcile` endpoint. Internally: INSERT `PendingUpload` row (or SELECT existing on variant-B re-upload) → stream bytes via adapter `PutObject` against the deterministic `derive(file_id)` key (pinning `Content-Type` / `Content-Disposition` / `x-amz-meta-<k>`, never `gts_file_type`) → HEAD-and-pull authoritative `(s3_etag, s3_version_id, mirrored meta)` → conditional UPDATE flips to `Uploaded`. On any error between the INSERT and the final UPDATE the SDK best-effort runs `DELETE FROM files WHERE id = $file_id AND status = 'pending_upload'` so the call leaves no `PendingUpload` row behind; if the failure occurred after `PutObject` succeeded, the orphan backend object is reclaimed by the P2 GC inverse sweep. `file_id = None` is initial upload (fresh server-minted `file_id`); `file_id = Some(id), etag = Some(e)` is variant-B re-upload (same `file_id` and backend object key, mismatch → `EtagMismatch`). There is no bytes-through-FileStorage REST proxy upload in any phase — external clients always go presign-first.
 
 **Presign-first write (bytes flow client ↔ S3 directly, no SDK byte stream)**
 
-- `create_presigned_url(ctx, backend_id?, owner, file_path, meta, params) -> PresignedUploadHandle` — initial upload
-- `create_presigned_overwrite_url(ctx, file_id, params) -> PresignedUploadHandle` — variant-B re-upload
+- `create_presigned_url(ctx, file_id?, backend_id?, owner, meta, params) -> PresignedUploadHandle` — initial upload (`file_id = None`) or variant-B re-upload (`file_id = Some(id)`, `meta` MUST be omitted)
 - `reconcile(ctx, file_id) -> ReconcileResult { info, s3_etag, s3_version_id }` — explicit reconciliation primitive (HEAD + conditional UPDATE)
 - `delete_file(ctx, file_id, etag?) -> ()` — 2-phase hard delete
 

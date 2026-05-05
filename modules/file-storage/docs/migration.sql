@@ -17,41 +17,66 @@
 --   engine in production). UUIDs are generated in the application
 --   layer — no engine-specific extensions or default-value functions
 --   are used. JSON is stored via the generic `json` type (or `text`
---   on engines without native JSON). Partial unique indexes are
---   supported by SQLite and most mainstream engines; engines without
---   partial-index support require an application-level uniqueness
---   check.
+--   on engines without native JSON).
 --
 -- File lifecycle (P1):
---   pending_upload → uploaded → deleting → (purged)
---                       │
---                       └──── uploaded → uploaded   (drift resync via reconcile,
---                                                    or DB+S3 sync via PUT /meta)
+--   pending_upload → completing → uploaded
+--                                     │
+--                                     ├── uploaded → meta_updating → uploaded
+--                                     │                              (PUT /files/{id})
+--                                     ├── uploaded → completing → uploaded
+--                                     │                              (re-upload)
+--                                     └── uploaded → deleting → (purged)
 --
---     pending_upload : row created by `presign-batch` upload item without
---                      `file_id`. The bytes have not been confirmed at the
---                      backend yet; the row's `etag` is the sentinel
---                      FileStorage pinned at presign time.
---     uploaded       : authoritative finalized state — set by the
---                      `reconcile` operation after HEAD against the
---                      backend confirms the object's S3 ETag and reads
---                      the authoritative metadata (Content-Type,
---                      Content-Disposition, x-amz-meta-*). Subject to
---                      the partial unique index
---                      files_tenant_backend_path_uploaded_uq. Self-resync
---                      (uploaded → uploaded) is performed by `reconcile`
---                      on a row whose backend object's S3 ETag has
---                      drifted from the row (e.g. a presigned re-upload
---                      to the same key); the row's `etag` and other
---                      mirrored metadata are pulled from S3 directly.
---                      `gts_file_type` is DB-only — never mirrored to
---                      S3, and never overwritten by reconcile.
+--     pending_upload : row created by `presign-batch` upload item
+--                      (initial upload, no `file_id`). The bytes have
+--                      not been finalized at the backend yet; the
+--                      row's `etag` is the sentinel FileStorage pinned
+--                      at presign time. The server has already invoked
+--                      `CreateMultipartUpload` on the backend; the
+--                      caller holds `upload_id` for the subsequent
+--                      `complete` / `abort` REST calls.
+--     completing     : transient state set by Phase 1 of
+--                      `complete_upload` (initial finalize) or by a
+--                      re-upload (overwrite-in-place). Phase 2 invokes
+--                      `CompleteMultipartUpload` on the backend; Phase
+--                      3 flips back to `uploaded` with the backend's
+--                      finalized etag/version_id. A row stuck in
+--                      `completing` after handler crash is recovered
+--                      in-band on the next SDK call (HEAD the backend,
+--                      pull authoritative state, run Phase 3 alone).
+--     uploaded       : authoritative finalized state — set by Phase 3
+--                      of `complete_upload`. `gts_file_type` is DB-only —
+--                      never mirrored to S3, and never overwritten by
+--                      recovery handlers.
+--     meta_updating  : transient state set by Phase 1 of
+--                      `PUT /files/{file_id}`. Phase 1 flips the
+--                      row's STATUS only — `name`, `mime_type`,
+--                      `custom_metadata` columns still hold the
+--                      OLD values. Phase 2 issues `CopyObject`
+--                      self-copy with `MetadataDirective: REPLACE`
+--                      against the backend (carrying the merged
+--                      new metadata derived from the request body
+--                      + the row's current values for omitted
+--                      fields). Phase 3 flips back to `uploaded`
+--                      AND writes the new
+--                      `(name, mime_type, custom_metadata, etag,
+--                      version_id)` in a single conditional UPDATE.
+--                      A row stuck in `meta_updating` after a
+--                      handler crash between Phase 2 and Phase 3
+--                      is recovered in-band on the next SDK call:
+--                      the SDK HEADs the backend, pulls the
+--                      authoritative metadata mirror that
+--                      `CopyObject` already wrote (or the old
+--                      mirror if Phase 2 never landed), and runs
+--                      Phase 3 with whatever S3 holds. The DB
+--                      always converges to the backend's truth.
 --     deleting       : transient operational state set by Phase 1 of
 --                      `delete_file`. This is NOT a soft delete or a
 --                      tombstone — see
 --                      cpt-cf-file-storage-constraint-no-soft-delete.
---                      Subsequent `reconcile` / `put_file_info` /
---                      `delete_file` on a `deleting` row return
+--                      Subsequent `complete_upload` / `put_file_info`
+--                      / `delete_file` on a `deleting` row return
 --                      `delete_in_progress` (HTTP 409); reads return
 --                      `NotFound`. Phase 2 best-effort deletes the
 --                      backend object (with inline retries); Phase 3
@@ -69,21 +94,42 @@
 -- Concurrency contract (see DESIGN §2.1
 -- cpt-cf-file-storage-principle-optimistic-concurrency and §3.9):
 --   The schema relies on database-level primitives — no advisory or
---   pessimistic locks — to coordinate concurrent writers:
+--   pessimistic locks — to coordinate concurrent writers. Uniqueness
+--   of the logical address is structural: `file_path` is derived
+--   deterministically from `id` (the opaque `file_id`) at the adapter
+--   boundary, so two different files cannot collide on `file_path` —
+--   the PRIMARY KEY on `id` is sufficient. There is no separate partial
+--   unique index, no supersession-via-fresh-file_id story, and no
+--   last-write-wins arbitration on logical paths: re-uploading bytes
+--   always preserves `file_id` (variant B), and there is only ever one
+--   row per logical file.
 --
---     1. (etag, updated_at[, xmin]) race detection on UPDATE.
+--     1. (etag, updated_at, version_id[, xmin]) race detection on UPDATE.
 --        Every mutation that targets an existing row is a single
 --        statement of the form
 --          UPDATE files SET … WHERE id = ?
 --                                AND etag = ?
 --                                AND updated_at = ?
+--                                AND version_id IS NOT DISTINCT FROM ?  -- null-safe
 --                                [AND xmin = ?]            -- Postgres only
+--        `version_id` is included in EVERY conditional UPDATE, even
+--        when it is NULL — the comparison uses null-safe equality
+--        (`IS NOT DISTINCT FROM` on Postgres, `IS` on SQLite, or the
+--        portable `(version_id = ? OR (version_id IS NULL AND ?
+--        IS NULL))` form). On `Backend.versioning = false` the
+--        column is always NULL on both sides and the predicate is a
+--        no-op; on `Backend.versioning = true` the column rotates
+--        on every backend write (including bit-identical re-uploads
+--        where ETag stays the same), which closes the ABA window
+--        on content automatically — without requiring callers to
+--        pass `If-Match` (cpt-cf-file-storage-constraint-versioning-
+--        aware-cas).
 --        The number of rows affected (0 or 1) decides the outcome:
 --        1 = caller wins, 0 = the row moved underneath them. The
 --        write handler may retry up to 3 times before surfacing an
 --        error. Engines without a transaction-id system column use
---        the (etag, updated_at) pair alone, accepting the
---        last-write-wins property documented in
+--        the (etag, updated_at, version_id) tuple alone, accepting
+--        the last-write-wins property documented in
 --        cpt-cf-file-storage-constraint-no-meta-cas.
 --     2. Optional ABA-safe content CAS. When `Backend.versioning`
 --        is `true` the row's `version_id` mirrors S3's per-object
@@ -94,35 +140,20 @@
 --        identical S3 ETag). When `Backend.versioning = false`,
 --        ABA on content is an accepted P1 risk — see
 --        cpt-cf-file-storage-constraint-versioning-aware-cas.
---     3. Partial unique index files_tenant_backend_path_uploaded_uq —
---        at most one row with a given (tenant_id, backend_id,
---        file_path) is in status='uploaded' at any instant. Concurrent
---        presign-first uploads for the same logical address race; the
---        partial predicate excludes pending_upload and deleting rows
---        so they never block each other, and only the commit step
---        (transition to 'uploaded') is serialised by the index.
---     4. Status state machine. The status column doubles as a
+--     3. Status state machine. The status column doubles as a
 --        coarse-grained lock: pending_upload → uploaded → deleting.
 --        A mutation declares the status it expects to find via WHERE
 --        status=…; a row engaged in another transition rejects the
 --        new mutation by returning 0 rows.
 --
---   Last-write-wins on a logical address (per ADR-0004):
---
---     - Same file_id re-upload (presigned-first overwrite via the
---       presign-batch upload item with `file_id` set): the client PUTs
---       new bytes to the same backend key with the headers FileStorage
---       pinned from the row's current meta; the next `reconcile(file_id)`
---       call HEADs S3 and pulls the authoritative etag (and metadata).
---       If `reconcile` is never called (browser-died scenario), the row
---       stays at its prior etag until a `read_file` triggers lazy
---       in-process self-healing.
---
---     - Different file_id collision on the same logical address (two
---       distinct initial-upload presigns for the same (tenant_id,
---       backend_id, file_path)): the partial unique index admits
---       exactly one — the loser's `reconcile` rolls back on the index
---       conflict and surfaces Conflict.
+--   Re-uploading bytes (variant B): the application backend issues a
+--   presign-batch upload item with `file_id` set; FileStorage starts a
+--   fresh multipart session against the SAME backend object key
+--   (deterministically derived from `id`), and `complete_upload`
+--   finalizes through `uploaded → completing → uploaded`. The
+--   `file_id` is preserved; consumers holding it observe the new
+--   bytes. Recovery from a stuck `completing` row uses the same
+--   in-band HEAD-and-finalize machinery as initial uploads.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 BEGIN;
@@ -158,11 +189,11 @@ CREATE TABLE IF NOT EXISTS file_storage.files (
 
 -- file_storage.files: one row per logical file managed by any backend
 -- in the FileStorage module (discriminated by backend_id). Realizes
--- cpt-cf-file-storage-dbtable-files. Finalized rows (status=uploaded)
--- are uniquely addressable by (tenant_id, backend_id, file_path)
--- through the partial unique index files_tenant_backend_path_uploaded_uq;
--- transient rows (pending_upload, deleting) may coexist for the same
--- logical path.
+-- cpt-cf-file-storage-dbtable-files. Files are uniquely addressed by
+-- `id` (the opaque file_id, PRIMARY KEY); `file_path` is derived from
+-- `id` at the adapter boundary, so logical-address collisions are
+-- structurally impossible. Re-uploading bytes always preserves
+-- `file_id` — there is no supersession-via-fresh-file_id flow.
 --
 -- Column notes:
 --   id                    — opaque, app-generated file_id (UUID v7).
@@ -179,9 +210,14 @@ CREATE TABLE IF NOT EXISTS file_storage.files (
 --                           operators assign it once in the static
 --                           TOML roster (cpt-cf-file-storage-principle-
 --                           modular-backend-roster).
---   file_path             — logical path captured at upload-presign
---                           time. Used for filtering / listing; not
---                           part of the URL surface.
+--   file_path             — S3 object key derived deterministically
+--                           from `id` at the adapter boundary; stored
+--                           explicitly for operability/debuggability and
+--                           for backend object lookups, but never the
+--                           source of uniqueness — that role belongs to
+--                           the PRIMARY KEY on `id`. Not part of the
+--                           URL surface (cpt-cf-file-storage-adr-opaque-
+--                           file-ids).
 --   owner_id              — UUID of the principal that owns this file
 --                           (a user or an app — FileStorage does not
 --                           distinguish; the kind is tracked in the
@@ -290,15 +326,10 @@ CREATE TABLE IF NOT EXISTS file_storage.files (
 --                           account-management, mini-chat, oagw —
 --                           all use `updated_at`).
 
--- Partial unique index upholds last-write-wins for finalized rows
--- while tolerating concurrent in-flight uploads for the same logical
--- path. Keyed on (tenant_id, backend_id, file_path) so two different
--- backends may legitimately host the same file_path for the same
--- tenant. Engines without partial-index support must emulate this via
--- an application-level uniqueness check on the write handler path.
-CREATE UNIQUE INDEX IF NOT EXISTS files_tenant_backend_path_uploaded_uq
-    ON file_storage.files (tenant_id, backend_id, file_path)
-    WHERE status = 'uploaded';
+-- Uniqueness of the logical address is enforced structurally via the
+-- PRIMARY KEY on `id` (and the deterministic derivation of `file_path`
+-- from `id` at the adapter boundary). No partial unique index is
+-- required, and no supersession-on-shared-path flow exists.
 
 -- Supports list_files by owner across every backend the caller can
 -- see (the only listing filter exposed in P1 — see DESIGN §3.3).
