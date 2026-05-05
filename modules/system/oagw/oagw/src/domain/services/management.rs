@@ -8,6 +8,7 @@ use crate::domain::model::{
     UpdateRouteRequest, UpdateUpstreamRequest, Upstream,
 };
 use crate::domain::repo::{RouteRepository, UpstreamRepository};
+use crate::domain::ssrf;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
@@ -40,6 +41,7 @@ pub(crate) struct ControlPlaneServiceImpl {
     tenant_resolver: Arc<dyn TenantResolverClient>,
     policy_enforcer: PolicyEnforcer,
     credstore: Arc<dyn CredStoreClientV1>,
+    ssrf_protection: bool,
 }
 
 impl ControlPlaneServiceImpl {
@@ -50,6 +52,7 @@ impl ControlPlaneServiceImpl {
         tenant_resolver: Arc<dyn TenantResolverClient>,
         policy_enforcer: PolicyEnforcer,
         credstore: Arc<dyn CredStoreClientV1>,
+        ssrf_protection: bool,
     ) -> Self {
         Self {
             upstreams,
@@ -57,6 +60,7 @@ impl ControlPlaneServiceImpl {
             tenant_resolver,
             policy_enforcer,
             credstore,
+            ssrf_protection,
         }
     }
 }
@@ -75,6 +79,9 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         req: CreateUpstreamRequest,
     ) -> Result<Upstream, DomainError> {
         validate_endpoints(&req.server.endpoints)?;
+        if self.ssrf_protection {
+            validate_endpoints_ssrf(&req.server.endpoints)?;
+        }
         if let Some(ref cors) = req.cors {
             crate::domain::cors::validate_cors_config(cors)?;
         }
@@ -168,6 +175,9 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
 
         // Full replacement: validate and apply server.
         validate_endpoints(&req.server.endpoints)?;
+        if self.ssrf_protection {
+            validate_endpoints_ssrf(&req.server.endpoints)?;
+        }
         existing.server = req.server;
         existing.protocol = req.protocol;
 
@@ -931,15 +941,10 @@ fn validate_endpoints(endpoints: &[Endpoint]) -> Result<(), DomainError> {
         ));
     }
 
-    // TODO(hardening): add configurable SSRF deny-list for private IPv4 ranges
-    // (loopback, RFC 1918, link-local, 169.254.169.254 metadata). Should be
-    // opt-in (many deployments legitimately proxy to internal services) and also
-    // enforced at DNS resolution time in DnsDiscovery::resolve() to cover
-    // hostnames that resolve to private IPs.
-
     // IPv6 endpoints are not yet supported — reject early with a clear message.
-    // Enabling IPv6 requires SSRF protections (deny-lists for link-local, private
-    // ranges, IPv4-mapped addresses).
+    // SSRF protections for IPv6 (link-local, ULA, IPv4-mapped, etc.) are in
+    // place (`ssrf.rs`), but the proxy and endpoint infrastructure has not been
+    // tested with IPv6 upstream addresses yet.
     for (i, ep) in endpoints.iter().enumerate() {
         if ep.normalized_host().parse::<std::net::Ipv6Addr>().is_ok() {
             return Err(DomainError::validation(format!(
@@ -984,6 +989,32 @@ fn validate_endpoints(endpoints: &[Endpoint]) -> Result<(), DomainError> {
         }
     }
 
+    Ok(())
+}
+
+/// Validate endpoints against SSRF deny-lists.
+///
+/// Rejects endpoints whose host is a known SSRF hostname (e.g. `localhost`,
+/// cloud metadata services) or parses as a blocked IP address.
+fn validate_endpoints_ssrf(endpoints: &[Endpoint]) -> Result<(), DomainError> {
+    for (i, ep) in endpoints.iter().enumerate() {
+        let host = ep.normalized_host();
+        if let Some(blocked) = ssrf::is_ssrf_blocked_hostname(&host) {
+            return Err(DomainError::validation(format!(
+                "endpoint[{i}] hostname '{}' is blocked by SSRF protection (matches '{blocked}')",
+                ep.host,
+            )));
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>()
+            && ssrf::is_ssrf_blocked_ip(ip)
+        {
+            return Err(DomainError::validation(format!(
+                "endpoint[{i}] IP address '{}' is blocked by SSRF protection: {}",
+                ep.host,
+                ssrf::ssrf_block_reason(ip),
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1925,6 +1956,7 @@ mod tests {
             Arc::new(MockTenantResolverClient::single_tenant()),
             allow_all_enforcer(),
             Arc::new(MockCredStoreClient::empty()),
+            false,
         )
     }
 
@@ -1935,6 +1967,7 @@ mod tests {
             Arc::new(resolver),
             allow_all_enforcer(),
             Arc::new(MockCredStoreClient::empty()),
+            false,
         )
     }
 
@@ -1948,6 +1981,7 @@ mod tests {
             Arc::new(resolver),
             allow_all_enforcer(),
             Arc::new(MockCredStoreClient::with_secrets(creds)),
+            false,
         )
     }
 
@@ -6147,5 +6181,288 @@ mod tests {
             effective_rl.pool_owner_id, None,
             "pool_owner_id should NOT be set for allocated budget"
         );
+    }
+
+    // -- validate_endpoints_ssrf tests --
+
+    #[test]
+    fn ssrf_rejects_loopback_ip() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "127.0.0.1".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+        match err {
+            DomainError::Validation { detail, .. } => {
+                assert!(
+                    detail.contains("SSRF") && detail.contains("loopback"),
+                    "expected SSRF loopback error, got: {detail}"
+                );
+            }
+            _ => panic!("expected Validation, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn ssrf_rejects_private_10_x() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.0.1".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn ssrf_rejects_private_172_16() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "172.16.0.1".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn ssrf_rejects_private_192_168() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "192.168.1.1".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn ssrf_rejects_link_local_metadata() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Http,
+            host: "169.254.169.254".into(),
+            port: 80,
+        }];
+        let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+        match err {
+            DomainError::Validation { detail, .. } => {
+                assert!(
+                    detail.contains("link-local"),
+                    "expected link-local error, got: {detail}"
+                );
+            }
+            _ => panic!("expected Validation, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn ssrf_allows_public_ip() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "8.8.8.8".into(),
+            port: 443,
+        }];
+        assert!(validate_endpoints_ssrf(&endpoints).is_ok());
+    }
+
+    #[test]
+    fn ssrf_allows_hostname_endpoints() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "api.openai.com".into(),
+            port: 443,
+        }];
+        assert!(validate_endpoints_ssrf(&endpoints).is_ok());
+    }
+
+    #[test]
+    fn ssrf_rejects_localhost() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "localhost".into(),
+            port: 443,
+        }];
+        let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+        match err {
+            DomainError::Validation { detail, .. } => {
+                assert!(detail.contains("SSRF protection"), "got: {detail}");
+                assert!(detail.contains("localhost"), "got: {detail}");
+            }
+            _ => panic!("expected Validation, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn ssrf_rejects_localhost_localdomain() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "localhost.localdomain".into(),
+            port: 443,
+        }];
+        assert!(matches!(
+            validate_endpoints_ssrf(&endpoints),
+            Err(DomainError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn ssrf_rejects_metadata_google_internal() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Http,
+            host: "metadata.google.internal".into(),
+            port: 80,
+        }];
+        let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+        match err {
+            DomainError::Validation { detail, .. } => {
+                assert!(detail.contains("metadata.google.internal"), "got: {detail}");
+            }
+            _ => panic!("expected Validation, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn ssrf_rejects_localhost_case_insensitive() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "LocalHost".into(),
+            port: 443,
+        }];
+        assert!(matches!(
+            validate_endpoints_ssrf(&endpoints),
+            Err(DomainError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn ssrf_rejects_localhost_trailing_dot() {
+        let endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "localhost.".into(),
+            port: 443,
+        }];
+        assert!(matches!(
+            validate_endpoints_ssrf(&endpoints),
+            Err(DomainError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn ssrf_rejects_second_endpoint_in_list() {
+        let endpoints = vec![
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "8.8.8.8".into(),
+                port: 443,
+            },
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "10.0.0.1".into(),
+                port: 443,
+            },
+        ];
+        let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+        match err {
+            DomainError::Validation { detail, .. } => {
+                assert!(
+                    detail.contains("endpoint[1]"),
+                    "expected endpoint[1] index, got: {detail}"
+                );
+            }
+            _ => panic!("expected Validation, got: {err:?}"),
+        }
+    }
+
+    // -- SSRF integration tests (through ControlPlaneService trait) --
+
+    fn make_service_ssrf_enabled() -> ControlPlaneServiceImpl {
+        ControlPlaneServiceImpl::new(
+            Arc::new(InMemoryUpstreamRepo::new()),
+            Arc::new(InMemoryRouteRepo::new()),
+            Arc::new(MockTenantResolverClient::single_tenant()),
+            allow_all_enforcer(),
+            Arc::new(MockCredStoreClient::empty()),
+            true,
+        )
+    }
+
+    fn make_create_upstream_with_ip(ip: &str, alias: &str) -> CreateUpstreamRequest {
+        CreateUpstreamRequest {
+            id: None,
+            server: Server {
+                endpoints: vec![Endpoint {
+                    scheme: Scheme::Https,
+                    host: ip.into(),
+                    port: 443,
+                }],
+            },
+            protocol: "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1".into(),
+            alias: Some(alias.into()),
+            auth: None,
+            headers: None,
+            plugins: None,
+            rate_limit: None,
+            cors: None,
+            tags: vec![],
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_upstream_ssrf_enabled_blocks_private_ip() {
+        let svc = make_service_ssrf_enabled();
+        let ctx = test_ctx(Uuid::new_v4());
+        let req = make_create_upstream_with_ip("10.0.0.1", "internal");
+
+        let err = svc.create_upstream(&ctx, req).await.unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_upstream_ssrf_enabled_allows_public_ip() {
+        let svc = make_service_ssrf_enabled();
+        let ctx = test_ctx(Uuid::new_v4());
+        let req = make_create_upstream_with_ip("8.8.8.8", "dns");
+
+        let result = svc.create_upstream(&ctx, req).await;
+        assert!(result.is_ok(), "public IP should be allowed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn create_upstream_ssrf_disabled_allows_private_ip() {
+        let svc = make_service(); // ssrf_protection=false
+        let ctx = test_ctx(Uuid::new_v4());
+        let req = make_create_upstream_with_ip("10.0.0.1", "internal");
+
+        let result = svc.create_upstream(&ctx, req).await;
+        assert!(
+            result.is_ok(),
+            "private IP should be allowed when SSRF is disabled: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_upstream_ssrf_enabled_blocks_private_ip() {
+        let svc = make_service_ssrf_enabled();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        let req = make_create_upstream_with_ip("8.8.8.8", "dns");
+        let upstream = svc.create_upstream(&ctx, req).await.unwrap();
+
+        let mut update = make_update_from_upstream(&upstream);
+        update.server.endpoints = vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "10.0.0.1".into(),
+            port: 443,
+        }];
+        update.alias = Some("internal".into());
+
+        let err = svc
+            .update_upstream(&ctx, upstream.id, update)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }));
     }
 }

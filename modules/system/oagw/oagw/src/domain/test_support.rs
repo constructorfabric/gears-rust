@@ -525,6 +525,7 @@ impl TestCpBuilder {
             tenant_resolver,
             allow_all_enforcer(),
             credstore,
+            false,
         ));
 
         cp
@@ -665,6 +666,7 @@ impl TestDpBuilder {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(3600),
+            false,
         )
         .with_skip_upstream_tls_verify(self.skip_upstream_tls_verify);
         let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
@@ -674,7 +676,7 @@ impl TestDpBuilder {
 
         let backend_selector: Arc<dyn EndpointSelector> =
             self.backend_selector.unwrap_or_else(|| {
-                Arc::new(crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new())
+                Arc::new(crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(false))
             });
 
         let mut svc = DataPlaneServiceImpl::new(
@@ -731,7 +733,7 @@ pub fn build_test_app_state(
     dp_builder: TestDpBuilder,
 ) -> TestAppState {
     let backend_selector: Arc<dyn EndpointSelector> =
-        Arc::new(crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new());
+        Arc::new(crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(false));
     let cp = cp_builder.build_and_register(hub);
     let dp = dp_builder
         .with_backend_selector(backend_selector.clone())

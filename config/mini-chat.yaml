@@ -385,6 +385,7 @@ modules:
   oagw:
     config:
       proxy_timeout_secs: 60
+      ssrf_protection: false # Disabled for local dev (mock upstreams use 127.0.0.1)
 
 # OpenTelemetry configuration (resource identity, tracing, metrics)
 opentelemetry:

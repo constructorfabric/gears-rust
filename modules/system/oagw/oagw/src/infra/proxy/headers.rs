@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::domain::error::DomainError;
 use crate::domain::model::{PassthroughMode, RequestHeaderRules, ResponseHeaderRules};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use oagw_sdk::api::ErrorSource;
@@ -239,38 +240,100 @@ pub fn apply_response_header_rules(headers: &mut HeaderMap, rules: &ResponseHead
     apply_rules(headers, rules);
 }
 
-/// Returns `true` if the Content-Type header (when present) is a valid MIME type.
-/// Returns `false` if duplicates exist, the value is not valid UTF-8, or it
-/// cannot be parsed as a MIME type. Returns `true` if the header is absent.
-pub fn is_valid_content_type(headers: &HeaderMap) -> bool {
+/// Validates that the `Content-Type` header (when present) is a valid MIME type.
+/// Returns `Ok(())` if absent or valid; returns a `DomainError::Validation` if
+/// duplicates exist, the value is not valid UTF-8, or it cannot be parsed.
+pub fn validate_content_type(headers: &HeaderMap) -> Result<(), DomainError> {
     let mut iter = headers.get_all(http::header::CONTENT_TYPE).iter();
     let Some(ct) = iter.next() else {
-        return true;
+        return Ok(());
     };
     // Reject duplicate Content-Type headers.
     if iter.next().is_some() {
-        return false;
+        return Err(DomainError::validation_for(
+            "content-type",
+            "DUPLICATE_HEADER",
+            "duplicate Content-Type headers",
+        ));
     }
     ct.to_str()
         .ok()
         .and_then(|v| v.parse::<mime::Mime>().ok())
-        .is_some()
+        .map(|_| ())
+        .ok_or_else(|| {
+            DomainError::validation_for(
+                "content-type",
+                "INVALID_MIME_TYPE",
+                "Content-Type header is not a recognized MIME type",
+            )
+        })
 }
 
-/// Returns `true` if the Transfer-Encoding header is absent or exactly `chunked`.
-/// Returns `false` for duplicates or any encoding other than `chunked`.
-pub fn is_valid_transfer_encoding(headers: &HeaderMap) -> bool {
-    let mut iter = headers.get_all(http::header::TRANSFER_ENCODING).iter();
-    let Some(val) = iter.next() else {
-        return true;
+/// Rejects duplicate or malformed `Content-Length` / `Transfer-Encoding`
+/// headers and CL+TE co-existence.
+pub fn validate_smuggling_headers(headers: &HeaderMap) -> Result<(), DomainError> {
+    let mut cl_iter = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    let has_cl = if let Some(val) = cl_iter.next() {
+        if cl_iter.next().is_some() {
+            return Err(DomainError::validation_for(
+                "content-length",
+                "DUPLICATE_HEADER",
+                "duplicate Content-Length headers",
+            ));
+        }
+        let Ok(s) = val.to_str() else {
+            return Err(DomainError::validation_for(
+                "content-length",
+                "INVALID_VALUE",
+                "Content-Length is not a valid integer",
+            ));
+        };
+        if s.trim().parse::<u64>().is_err() {
+            return Err(DomainError::validation_for(
+                "content-length",
+                "INVALID_VALUE",
+                "Content-Length is not a valid integer",
+            ));
+        }
+        true
+    } else {
+        false
     };
-    // Reject duplicate Transfer-Encoding headers (HTTP smuggling vector).
-    if iter.next().is_some() {
-        return false;
+
+    let mut te_iter = headers.get_all(http::header::TRANSFER_ENCODING).iter();
+    let has_te = if let Some(val) = te_iter.next() {
+        if te_iter.next().is_some() {
+            return Err(DomainError::validation_for(
+                "transfer-encoding",
+                "DUPLICATE_HEADER",
+                "duplicate Transfer-Encoding headers",
+            ));
+        }
+        let ok = val
+            .to_str()
+            .ok()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("chunked"));
+        if !ok {
+            return Err(DomainError::validation_for(
+                "transfer-encoding",
+                "UNSUPPORTED_VALUE",
+                "unsupported Transfer-Encoding; only chunked is accepted",
+            ));
+        }
+        true
+    } else {
+        false
+    };
+
+    if has_cl && has_te {
+        return Err(DomainError::validation_for(
+            "transfer-encoding",
+            "CL_TE_COEXISTENCE",
+            "request contains both Content-Length and Transfer-Encoding",
+        ));
     }
-    val.to_str()
-        .ok()
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("chunked"))
+
+    Ok(())
 }
 
 /// Set the Host header to match the upstream endpoint.
@@ -863,61 +926,33 @@ mod tests {
     fn valid_content_type_accepted() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
-        assert!(is_valid_content_type(&headers));
+        assert!(validate_content_type(&headers).is_ok());
     }
 
     #[test]
     fn valid_content_type_with_charset_accepted() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
-        assert!(is_valid_content_type(&headers));
+        assert!(validate_content_type(&headers).is_ok());
     }
 
     #[test]
     fn missing_content_type_accepted() {
         let headers = HeaderMap::new();
-        assert!(is_valid_content_type(&headers));
+        assert!(validate_content_type(&headers).is_ok());
     }
 
     #[test]
     fn invalid_content_type_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "not a valid mime type!!!".parse().unwrap());
-        assert!(!is_valid_content_type(&headers));
-    }
-
-    #[test]
-    fn transfer_encoding_absent_is_valid() {
-        let headers = HeaderMap::new();
-        assert!(is_valid_transfer_encoding(&headers));
-    }
-
-    #[test]
-    fn transfer_encoding_chunked_is_valid() {
-        let mut headers = HeaderMap::new();
-        headers.insert("transfer-encoding", "chunked".parse().unwrap());
-        assert!(is_valid_transfer_encoding(&headers));
-    }
-
-    #[test]
-    fn transfer_encoding_chunked_case_insensitive() {
-        let mut headers = HeaderMap::new();
-        headers.insert("transfer-encoding", "Chunked".parse().unwrap());
-        assert!(is_valid_transfer_encoding(&headers));
-    }
-
-    #[test]
-    fn transfer_encoding_gzip_rejected() {
-        let mut headers = HeaderMap::new();
-        headers.insert("transfer-encoding", "gzip".parse().unwrap());
-        assert!(!is_valid_transfer_encoding(&headers));
-    }
-
-    #[test]
-    fn transfer_encoding_mixed_rejected() {
-        let mut headers = HeaderMap::new();
-        headers.insert("transfer-encoding", "gzip, chunked".parse().unwrap());
-        assert!(!is_valid_transfer_encoding(&headers));
+        match validate_content_type(&headers).unwrap_err() {
+            DomainError::Validation { field, reason, .. } => {
+                assert_eq!(field, "content-type");
+                assert_eq!(reason, "INVALID_MIME_TYPE");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -925,15 +960,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append("content-type", "application/json".parse().unwrap());
         headers.append("content-type", "text/html".parse().unwrap());
-        assert!(!is_valid_content_type(&headers));
-    }
-
-    #[test]
-    fn duplicate_transfer_encoding_rejected() {
-        let mut headers = HeaderMap::new();
-        headers.append("transfer-encoding", "chunked".parse().unwrap());
-        headers.append("transfer-encoding", "chunked".parse().unwrap());
-        assert!(!is_valid_transfer_encoding(&headers));
+        match validate_content_type(&headers).unwrap_err() {
+            DomainError::Validation { field, reason, .. } => {
+                assert_eq!(field, "content-type");
+                assert_eq!(reason, "DUPLICATE_HEADER");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -969,5 +1002,213 @@ mod tests {
     fn extract_client_ip_none() {
         let headers = HeaderMap::new();
         assert_eq!(extract_client_ip(&headers), None);
+    }
+
+    // -- validate_smuggling_headers tests --
+
+    #[test]
+    fn smuggling_safe_no_cl_no_te() {
+        let headers = HeaderMap::new();
+        assert!(validate_smuggling_headers(&headers).is_ok());
+    }
+
+    #[test]
+    fn smuggling_safe_only_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "42".parse().unwrap());
+        assert!(validate_smuggling_headers(&headers).is_ok());
+    }
+
+    #[test]
+    fn smuggling_safe_content_length_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "0".parse().unwrap());
+        assert!(validate_smuggling_headers(&headers).is_ok());
+    }
+
+    #[test]
+    fn smuggling_safe_content_length_with_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", " 42 ".parse().unwrap());
+        assert!(validate_smuggling_headers(&headers).is_ok());
+    }
+
+    #[test]
+    fn smuggling_safe_only_transfer_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+        assert!(validate_smuggling_headers(&headers).is_ok());
+    }
+
+    #[test]
+    fn smuggling_safe_te_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert("transfer-encoding", "Chunked".parse().unwrap());
+        assert!(validate_smuggling_headers(&headers).is_ok());
+    }
+
+    #[test]
+    fn smuggling_reject_both_cl_and_te() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "42".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+        match validate_smuggling_headers(&headers).unwrap_err() {
+            DomainError::Validation {
+                field,
+                reason,
+                detail,
+                ..
+            } => {
+                assert_eq!(field, "transfer-encoding");
+                assert_eq!(reason, "CL_TE_COEXISTENCE");
+                assert_eq!(
+                    detail,
+                    "request contains both Content-Length and Transfer-Encoding"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smuggling_reject_duplicate_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.append("content-length", "42".parse().unwrap());
+        headers.append("content-length", "99".parse().unwrap());
+        match validate_smuggling_headers(&headers).unwrap_err() {
+            DomainError::Validation {
+                field,
+                reason,
+                detail,
+                ..
+            } => {
+                assert_eq!(field, "content-length");
+                assert_eq!(reason, "DUPLICATE_HEADER");
+                assert_eq!(detail, "duplicate Content-Length headers");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smuggling_reject_duplicate_content_length_same_value() {
+        let mut headers = HeaderMap::new();
+        headers.append("content-length", "42".parse().unwrap());
+        headers.append("content-length", "42".parse().unwrap());
+        match validate_smuggling_headers(&headers).unwrap_err() {
+            DomainError::Validation {
+                field,
+                reason,
+                detail,
+                ..
+            } => {
+                assert_eq!(field, "content-length");
+                assert_eq!(reason, "DUPLICATE_HEADER");
+                assert_eq!(detail, "duplicate Content-Length headers");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smuggling_reject_negative_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "-1".parse().unwrap());
+        match validate_smuggling_headers(&headers).unwrap_err() {
+            DomainError::Validation {
+                field,
+                reason,
+                detail,
+                ..
+            } => {
+                assert_eq!(field, "content-length");
+                assert_eq!(reason, "INVALID_VALUE");
+                assert_eq!(detail, "Content-Length is not a valid integer");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smuggling_reject_non_integer_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "abc".parse().unwrap());
+        match validate_smuggling_headers(&headers).unwrap_err() {
+            DomainError::Validation {
+                field,
+                reason,
+                detail,
+                ..
+            } => {
+                assert_eq!(field, "content-length");
+                assert_eq!(reason, "INVALID_VALUE");
+                assert_eq!(detail, "Content-Length is not a valid integer");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smuggling_reject_te_gzip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("transfer-encoding", "gzip".parse().unwrap());
+        match validate_smuggling_headers(&headers).unwrap_err() {
+            DomainError::Validation {
+                field,
+                reason,
+                detail,
+                ..
+            } => {
+                assert_eq!(field, "transfer-encoding");
+                assert_eq!(reason, "UNSUPPORTED_VALUE");
+                assert_eq!(
+                    detail,
+                    "unsupported Transfer-Encoding; only chunked is accepted"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smuggling_reject_te_mixed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("transfer-encoding", "gzip, chunked".parse().unwrap());
+        match validate_smuggling_headers(&headers).unwrap_err() {
+            DomainError::Validation {
+                field,
+                reason,
+                detail,
+                ..
+            } => {
+                assert_eq!(field, "transfer-encoding");
+                assert_eq!(reason, "UNSUPPORTED_VALUE");
+                assert_eq!(
+                    detail,
+                    "unsupported Transfer-Encoding; only chunked is accepted"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smuggling_reject_duplicate_te() {
+        let mut headers = HeaderMap::new();
+        headers.append("transfer-encoding", "chunked".parse().unwrap());
+        headers.append("transfer-encoding", "chunked".parse().unwrap());
+        match validate_smuggling_headers(&headers).unwrap_err() {
+            DomainError::Validation {
+                field,
+                reason,
+                detail,
+                ..
+            } => {
+                assert_eq!(field, "transfer-encoding");
+                assert_eq!(reason, "DUPLICATE_HEADER");
+                assert_eq!(detail, "duplicate Transfer-Encoding headers");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

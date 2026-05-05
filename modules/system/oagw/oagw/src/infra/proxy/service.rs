@@ -321,8 +321,8 @@ impl DataPlaneServiceImpl {
         self.backend_selector
             .select(upstream.id, endpoints)
             .await
-            .ok_or_else(|| DomainError::DownstreamError {
-                detail: "all backends are unhealthy".into(),
+            .map_err(|e| DomainError::DownstreamError {
+                detail: e.to_string(),
                 instance: instance_uri.to_string(),
             })
     }
@@ -381,24 +381,11 @@ impl DataPlaneService for DataPlaneServiceImpl {
         let is_upgrade = headers::is_websocket_upgrade(&req_headers);
 
         // Validate Content-Type format if present.
-        if !headers::is_valid_content_type(&req_headers) {
-            return Err(DomainError::Validation {
-                field: "content-type",
-                reason: "INVALID_MIME_TYPE",
-                detail: "Content-Type header is not a recognized MIME type".into(),
-                instance: instance_uri,
-            });
-        }
+        headers::validate_content_type(&req_headers)?;
 
-        // Validate Transfer-Encoding — only chunked is supported.
-        if !headers::is_valid_transfer_encoding(&req_headers) {
-            return Err(DomainError::Validation {
-                field: "transfer-encoding",
-                reason: "UNSUPPORTED_TRANSFER_ENCODING",
-                detail: "unsupported Transfer-Encoding; only chunked is accepted".into(),
-                instance: instance_uri,
-            });
-        }
+        // HTTP smuggling prevention (RFC 7230 §3.3.3): validate CL, TE, and
+        // reject CL/TE co-existence.
+        headers::validate_smuggling_headers(&req_headers)?;
 
         // Conditional body conversion — keep streams for streaming request bodies.
         let max_body = self.max_body_size;
@@ -1424,7 +1411,7 @@ fn normalize_path(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::domain::model::{Endpoint, Scheme, Server, Upstream};
-    use crate::domain::services::EndpointSelector;
+    use crate::domain::services::{EndpointSelector, SelectionError};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
 
@@ -1505,9 +1492,9 @@ mod tests {
             &self,
             _upstream_id: Uuid,
             endpoints: &[Endpoint],
-        ) -> Option<SelectedEndpoint> {
+        ) -> Result<SelectedEndpoint, SelectionError> {
             let idx = self.call_count.fetch_add(1, Ordering::Relaxed) % endpoints.len();
-            Some(SelectedEndpoint {
+            Ok(SelectedEndpoint {
                 endpoint: endpoints[idx].clone(),
                 resolved_addr: None,
             })
@@ -1647,6 +1634,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(3600),
+            false,
         );
         let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
             &server_conf,

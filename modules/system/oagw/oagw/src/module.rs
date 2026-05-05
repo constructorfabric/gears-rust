@@ -81,6 +81,7 @@ impl Module for OutboundApiGatewayModule {
             tenant_resolver,
             policy_enforcer.clone(),
             credstore.clone(),
+            cfg.ssrf_protection,
         ));
 
         // -- Data Plane init (Pingora proxy engine) --
@@ -95,13 +96,15 @@ impl Module for OutboundApiGatewayModule {
             connect_timeout,
             read_timeout,
             protocol_cache_ttl,
+            cfg.ssrf_protection,
         );
         let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
             &server_conf,
             pingora_proxy,
         ));
-        let backend_selector: Arc<dyn EndpointSelector> =
-            Arc::new(crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new());
+        let backend_selector: Arc<dyn EndpointSelector> = Arc::new(
+            crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(cfg.ssrf_protection),
+        );
 
         let token_http_config = if cfg.allow_http_upstream {
             tracing::warn!("allow_http_upstream is enabled — HTTP token endpoints also allowed");

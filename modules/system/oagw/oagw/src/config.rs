@@ -54,6 +54,12 @@ pub struct OagwConfig {
     /// (create / update / delete) are omitted. Default: `true`.
     #[serde(default = "default_true")]
     pub management_api_enabled: bool,
+    /// Enable SSRF protection: block DNS-resolved and statically-configured
+    /// IP addresses in private/loopback/link-local ranges. Disable for
+    /// deployments that legitimately proxy to internal services.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub ssrf_protection: bool,
 }
 
 impl Default for OagwConfig {
@@ -70,6 +76,7 @@ impl Default for OagwConfig {
             streaming_idle_timeout_secs: default_streaming_idle_timeout_secs(),
             protocol_cache_ttl_secs: default_protocol_cache_ttl_secs(),
             management_api_enabled: true,
+            ssrf_protection: true,
         }
     }
 }
@@ -204,6 +211,7 @@ impl fmt::Debug for OagwConfig {
             )
             .field("protocol_cache_ttl_secs", &self.protocol_cache_ttl_secs)
             .field("management_api_enabled", &self.management_api_enabled)
+            .field("ssrf_protection", &self.ssrf_protection)
             .finish()
     }
 }

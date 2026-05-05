@@ -18,16 +18,6 @@ use crate::domain::model::{
     UpdateUpstreamRequest, Upstream,
 };
 
-/// Result of endpoint selection: the domain endpoint plus an optional
-/// pre-resolved socket address from the load balancer's DNS cache.
-#[domain_model]
-#[derive(Debug, Clone)]
-pub(crate) struct SelectedEndpoint {
-    pub endpoint: Endpoint,
-    /// When set, `upstream_peer` can skip DNS and connect directly.
-    pub resolved_addr: Option<SocketAddr>,
-}
-
 /// Internal Control Plane service trait — configuration management and resolution.
 #[async_trait]
 pub(crate) trait ControlPlaneService: Send + Sync {
@@ -121,14 +111,40 @@ pub(crate) trait DataPlaneService: Send + Sync {
     fn remove_rate_limit_keys_for_route(&self, route_id: Uuid);
 }
 
+/// Why endpoint selection failed (multi-endpoint LB path).
+#[domain_model]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SelectionError {
+    /// All resolved backends failed health checks.
+    #[error("all backends are unhealthy")]
+    AllBackendsUnhealthy,
+    /// DNS resolution produced no usable addresses (DNS failure, empty result, or SSRF-filtered).
+    #[error("no backend addresses could be resolved")]
+    NoBackendsResolved,
+}
+
+/// Result of endpoint selection: the domain endpoint plus an optional
+/// pre-resolved socket address from the load balancer's DNS cache.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub(crate) struct SelectedEndpoint {
+    pub endpoint: Endpoint,
+    /// When set, `upstream_peer` can skip DNS and connect directly.
+    pub resolved_addr: Option<SocketAddr>,
+}
+
 /// Endpoint selection abstraction for multi-endpoint load balancing.
 ///
 /// Implementations select the next healthy endpoint for a given upstream.
 #[async_trait]
 pub(crate) trait EndpointSelector: Send + Sync {
     /// Select the next healthy endpoint for the given upstream.
-    /// Returns `None` if all backends are unhealthy or the endpoint list is empty.
-    async fn select(&self, upstream_id: Uuid, endpoints: &[Endpoint]) -> Option<SelectedEndpoint>;
+    /// Returns a [`SelectionError`] explaining *why* selection failed.
+    async fn select(
+        &self,
+        upstream_id: Uuid,
+        endpoints: &[Endpoint],
+    ) -> Result<SelectedEndpoint, SelectionError>;
 
     /// Invalidate cached state for the given upstream (called on CRUD).
     fn invalidate(&self, upstream_id: Uuid);
