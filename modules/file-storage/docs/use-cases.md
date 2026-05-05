@@ -44,7 +44,7 @@
     - `GET /api/file-storage/v1/files/{file_id}/meta` — returns the authoritative `FileInfo` with `meta`.
     - `POST /api/file-storage/v1/presign-batch` with `{ "items": [{ "kind": "download", "file_id": "...", "params": {...} }] }` — presigned download URL; the user then `GET`s bytes directly from the storage backend (S3) via that URL. FileStorage never proxies file content over its REST surface in P1 — every byte download goes client ↔ S3 directly through a presigned URL (or bare HTTPS for public-read backends).
 
-    This is done for convenience, so the user can easily access their own files from any service. The exact owner-self-service convenience surface is P2 scope; the underlying mechanism is already present in P1 through these endpoints plus the standard authz model on `gts.x.fstorage.file.type.v1~{type}`.
+    This is done for convenience, so the user can easily access their own files from any service. The exact owner-self-service convenience surface is P2 scope; the underlying mechanism is already present in P1 through these endpoints plus the standard authz model on `gts.cf.fstorage.file.type.v1~{type}`.
 
 12. **External Consumer → Application Backend → `FileStorageClient.presign_urls(...)`.**
     To access another user's files you must go through the specific application's API — for example, the chat backend itself must check whether specific users have access rights to specific files, and if access is granted, it must itself call `presign_urls` for the required files and return them to the user. In that case the user will be able to download files uploaded by another user, but only because the chat application allows it.
@@ -381,7 +381,7 @@ flowchart TB
         REST["REST adapter (axum)"]
         SDKImpl["FileStorageClient impl<br/>(SDK trait)"]
         UC["Upload Coordinator<br/>• race-detection conditional UPDATE<br/>• partial-unique-index guard<br/>• reconcile (HEAD-and-pull)<br/>• PUT /meta DB+S3 sync (CopyObject)<br/>• 2-phase delete<br/>• status state machine"]
-        AUTHZ["AuthZ integration<br/>gts.x.fstorage.file.type.v1~…"]
+        AUTHZ["AuthZ integration<br/>gts.cf.fstorage.file.type.v1~…"]
         BR["Backend Router<br/>backend_id → StorageBackend"]
         REST --> UC
         SDKImpl --> UC

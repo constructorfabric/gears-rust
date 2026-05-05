@@ -159,7 +159,7 @@ pub struct FileMeta {
     /// re-upload) and the `response-content-type` query param on
     /// every presigned download.
     pub mime_type: String,
-    /// Mandatory GTS file type (`gts.x.fstorage.file.type.v1~…`).
+    /// Mandatory GTS file type (`gts.cf.fstorage.file.type.v1~…`).
     /// Immutable after creation. Injected into every authz request
     /// as the resource type. Stored in DB only — NOT mirrored to S3
     /// (specific exception to the meta-mirror rule). Structurally
@@ -1092,7 +1092,7 @@ let owner = OwnerRef {
 let meta = FileMeta {
     name: "plan.pdf".into(),
     mime_type: "application/pdf".into(),
-    gts_file_type: "gts.x.fstorage.file.type.v1~x.docmgmt.reports.file.v1~".into(),
+    gts_file_type: "gts.cf.fstorage.file.type.v1~vendor.docmgmt.reports.file.v1~".into(),
     size_bytes: Some(18_274),
     custom_metadata: BTreeMap::new(),
 };

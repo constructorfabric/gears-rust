@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS file_storage.files (
 --                           cpt-cf-file-storage-constraint-presigned-
 --                           download-headers-from-db).
 --   gts_file_type         — GTS file type
---                           (gts.x.fstorage.file.type.v1~...) —
+--                           (gts.cf.fstorage.file.type.v1~...) —
 --                           mandatory at creation, immutable.
 --                           Structurally immutable: not present in
 --                           FileMetaUpdate. Stored in DB only — NEVER

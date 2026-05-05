@@ -502,7 +502,7 @@ In-process consumers (`chat-engine`, `llm-gateway`, future `file-parser`) need a
 
 ##### Responsibility scope
 
-Present an `async_trait` mirroring the lifecycle described in [rust-traits.md](./rust-traits.md); accept `&SecurityContext` first; orchestrate authz (resource = `gts.x.fstorage.file.type.v1~{file_type}`) plus the underlying call to the coordinator / repo / adapter; convert internal errors into `FileStorageError`.
+Present an `async_trait` mirroring the lifecycle described in [rust-traits.md](./rust-traits.md); accept `&SecurityContext` first; orchestrate authz (resource = `gts.cf.fstorage.file.type.v1~{file_type}`) plus the underlying call to the coordinator / repo / adapter; convert internal errors into `FileStorageError`.
 
 ##### Presigned URL issuance modes
 
@@ -656,7 +656,7 @@ Notes:
 | Dependency Module | Interface Used | Purpose |
 |-------------------|----------------|---------|
 | ModKit runtime | `Module`, `ModuleCtx`, `ClientHub`, `SecurityContext` propagation, `config_or_default`, `DatabaseCapability`, `RestApiCapability` | Module lifecycle, config loading, SDK registration, request-context propagation, DB wiring. |
-| `authz-resolver` SDK | `AuthZResolverClient` via `ClientHub` | Access decisions on `gts.x.fstorage.file.type.v1~` resources (`cpt-cf-file-storage-fr-authorization`). |
+| `authz-resolver` SDK | `AuthZResolverClient` via `ClientHub` | Access decisions on `gts.cf.fstorage.file.type.v1~` resources (`cpt-cf-file-storage-fr-authorization`). |
 | ModKit auth/middleware | `SecurityContext` in every handler | Identity propagation — FileStorage never parses tokens (`cpt-cf-file-storage-constraint-no-ambient-authn`). |
 
 **Dependency Rules** (per project conventions):
@@ -770,7 +770,7 @@ sequenceDiagram
     loop for each file_id
         SDK->>REPO: SELECT * FROM files WHERE id=$1 AND status=Uploaded
         REPO-->>SDK: FileInfo (or NotFound)
-        SDK->>AZ: authorize(ctx, read, gts.x.fstorage.file.type.v1~{file_type})
+        SDK->>AZ: authorize(ctx, read, gts.cf.fstorage.file.type.v1~{file_type})
         AZ-->>SDK: ALLOW / DENY
         alt allowed
             SDK->>S3A: sign_get(key=derive(file_id), params, mime_hint, name_hint)
@@ -862,7 +862,7 @@ Reference DDL lives in [`migration.sql`](./migration.sql) — portable SQL that 
 | `file_path` | `text` | Logical path captured at upload-presign time (NOT NULL). Used for filtering / listing; not part of the URL surface. |
 | `owner_id` | `uuid` | UUID of the principal that owns this file. FileStorage does not distinguish user vs app — the kind is tracked in the identity / authz subsystem. |
 | `name` | `varchar(512)` | Display name (the file's human filename). Mirrored to S3 as `Content-Disposition: attachment; filename="<name>"`. |
-| `gts_file_type` | `varchar(256)` | `gts.x.fstorage.file.type.v1~…`. Mandatory, immutable. Injected into every authz request as the resource type. **DB-only — never mirrored to S3 (`cpt-cf-file-storage-constraint-meta-mirrored-via-put-meta`).** Structurally immutable: not declared on `FileMetaUpdate`. |
+| `gts_file_type` | `varchar(256)` | `gts.cf.fstorage.file.type.v1~…`. Mandatory, immutable. Injected into every authz request as the resource type. **DB-only — never mirrored to S3 (`cpt-cf-file-storage-constraint-meta-mirrored-via-put-meta`).** Structurally immutable: not declared on `FileMetaUpdate`. |
 | `mime_type` | `varchar(256)` | Declared MIME. Mirrored to S3 as `Content-Type` (pinned into the SigV4 SignedHeaders of every presigned PUT and synchronized via `CopyObject` self-copy on `PUT /meta`). |
 | `size_bytes` | `bigint` | Final file size; `0` while `status = 'pending_upload'`. Pulled from S3 Content-Length on every `reconcile`. |
 | `etag` | `varchar(128)` | Raw S3 ETag (sans surrounding quotes) for the current bytes. **Content fingerprint only** (`cpt-cf-file-storage-constraint-etag-content-only`) — does NOT track metadata changes. Rotated by content writes and by `CopyObject` self-copy on `PUT /meta` (which rewrites the object at the S3 level). |
