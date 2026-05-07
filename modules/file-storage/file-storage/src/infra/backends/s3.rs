@@ -41,12 +41,16 @@ pub struct S3BackendConfig {
     pub secret_key: String,
 }
 
+// @cpt-begin:cpt-cf-file-storage-component-s3-backend:p1:inst-s3-backend-struct
+// @cpt-begin:cpt-cf-file-storage-adr-presigned-put-sigv4:p1:inst-s3-backend-struct
 pub struct S3Backend {
     descriptor: BackendDescriptor,
     bucket: String,
     endpoint: String,
     client: S3Client,
 }
+// @cpt-end:cpt-cf-file-storage-component-s3-backend:p1:inst-s3-backend-struct
+// @cpt-end:cpt-cf-file-storage-adr-presigned-put-sigv4:p1:inst-s3-backend-struct
 
 impl S3Backend {
     pub fn new(cfg: S3BackendConfig) -> Self {

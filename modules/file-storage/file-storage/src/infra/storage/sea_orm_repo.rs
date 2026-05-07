@@ -21,7 +21,11 @@ use crate::domain::repo::{
 use super::entity::{self, Column, Entity as FilesEntity};
 use super::mapper::{entity_to_file_info, status_sdk_to_str};
 
+// @cpt-begin:cpt-cf-file-storage-component-files-repo:p1:inst-sea-orm-repo
+// @cpt-begin:cpt-cf-file-storage-adr-s3-no-metadata-db:p1:inst-sea-orm-repo
 pub struct SeaOrmFilesRepository;
+// @cpt-end:cpt-cf-file-storage-component-files-repo:p1:inst-sea-orm-repo
+// @cpt-end:cpt-cf-file-storage-adr-s3-no-metadata-db:p1:inst-sea-orm-repo
 
 impl SeaOrmFilesRepository {
     #[must_use]

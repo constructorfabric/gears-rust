@@ -20,11 +20,15 @@ use crate::domain::error::DomainError;
 /// `file_id` (per ADR-0002 / DESIGN §3.x).
 pub type BackendObjectKey = String;
 
+// @cpt-begin:cpt-cf-file-storage-principle-file-id-address:p1:inst-derive-s3-key
+// @cpt-begin:cpt-cf-file-storage-adr-opaque-file-ids:p1:inst-derive-s3-key
 /// Derive the deterministic S3 object key for a given `file_id`.
 #[must_use]
 pub fn derive_s3_key(file_id: uuid::Uuid) -> String {
     format!("f/{}", file_id.simple())
 }
+// @cpt-end:cpt-cf-file-storage-principle-file-id-address:p1:inst-derive-s3-key
+// @cpt-end:cpt-cf-file-storage-adr-opaque-file-ids:p1:inst-derive-s3-key
 
 /// Shared descriptor for a backend, augmented with non-SDK fields the
 /// router needs.

@@ -172,6 +172,21 @@ name = "Tests"
 path = "{system_root}/tests"
 extensions = [".rs"]
 
+[[systems.autodetect.codebase]]
+name = "Nested Modules"
+path = "{system_root}/{system}/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested Tests"
+path = "{system_root}/{system}/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested SDK"
+path = "{system_root}/{system}-sdk/src"
+extensions = [".rs"]
+
 [[systems.autodetect]]
 kit = "sdlc"
 system_root = "{project_root}/modules/system/$system"

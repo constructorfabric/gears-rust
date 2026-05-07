@@ -48,6 +48,7 @@ pub struct OrphanEntry {
 
 pub type OrphanQueue = Arc<tokio::sync::Mutex<std::collections::VecDeque<OrphanEntry>>>;
 
+// @cpt-begin:cpt-cf-file-storage-component-sdk-facade:p1:inst-service-struct
 pub struct Service<R: FilesRepo + 'static> {
     db: Arc<DbProvider>,
     repo: Arc<R>,
@@ -56,6 +57,7 @@ pub struct Service<R: FilesRepo + 'static> {
     registry: Arc<BackendRegistry>,
     orphan_queue: OrphanQueue,
 }
+// @cpt-end:cpt-cf-file-storage-component-sdk-facade:p1:inst-service-struct
 
 impl<R: FilesRepo + 'static> Service<R> {
     pub fn new(
@@ -92,6 +94,10 @@ impl<R: FilesRepo + 'static> Service<R> {
 
     // ── create_presigned_upload ─────────────────────────────────────────────
 
+    // @cpt-begin:cpt-cf-file-storage-fr-multipart-upload:p1:inst-create-presigned-upload
+    // @cpt-begin:cpt-cf-file-storage-fr-upload-file:p1:inst-create-presigned-upload
+    // @cpt-begin:cpt-cf-file-storage-principle-presign-first:p1:inst-create-presigned-upload
+    // @cpt-begin:cpt-cf-file-storage-fr-direct-transfer:p1:inst-create-presigned-upload
     pub async fn create_presigned_upload(
         &self,
         ctx: &SecurityContext,
@@ -225,9 +231,15 @@ impl<R: FilesRepo + 'static> Service<R> {
             expires_at,
         })
     }
+    // @cpt-end:cpt-cf-file-storage-fr-multipart-upload:p1:inst-create-presigned-upload
+    // @cpt-end:cpt-cf-file-storage-fr-upload-file:p1:inst-create-presigned-upload
+    // @cpt-end:cpt-cf-file-storage-principle-presign-first:p1:inst-create-presigned-upload
+    // @cpt-end:cpt-cf-file-storage-fr-direct-transfer:p1:inst-create-presigned-upload
 
     // ── complete_upload (3-phase commit) ────────────────────────────────────
 
+    // @cpt-begin:cpt-cf-file-storage-principle-multi-phase-commit:p1:inst-complete-upload-3phase
+    // @cpt-begin:cpt-cf-file-storage-principle-atomic-metadata:p1:inst-complete-upload-3phase
     pub async fn complete_upload(
         &self,
         ctx: &SecurityContext,
@@ -305,6 +317,8 @@ impl<R: FilesRepo + 'static> Service<R> {
             ChangeStatusOutcome::NoMatch => Err(DomainError::Conflict),
         }
     }
+    // @cpt-end:cpt-cf-file-storage-principle-multi-phase-commit:p1:inst-complete-upload-3phase
+    // @cpt-end:cpt-cf-file-storage-principle-atomic-metadata:p1:inst-complete-upload-3phase
 
     // ── abort_upload ───────────────────────────────────────────────────────
 
@@ -349,6 +363,7 @@ impl<R: FilesRepo + 'static> Service<R> {
 
     // ── get_file_info ──────────────────────────────────────────────────────
 
+    // @cpt-begin:cpt-cf-file-storage-fr-get-metadata:p1:inst-get-file-info
     pub async fn get_file_info(
         &self,
         ctx: &SecurityContext,
@@ -374,9 +389,12 @@ impl<R: FilesRepo + 'static> Service<R> {
         check_pins(&row, etag, version_id)?;
         Ok(row)
     }
+    // @cpt-end:cpt-cf-file-storage-fr-get-metadata:p1:inst-get-file-info
 
     // ── put_file_info (2-phase commit) ─────────────────────────────────────
 
+    // @cpt-begin:cpt-cf-file-storage-fr-metadata-storage:p1:inst-put-file-info-meta-update
+    // @cpt-begin:cpt-cf-file-storage-fr-conditional-requests:p1:inst-put-file-info-cas
     pub async fn put_file_info(
         &self,
         ctx: &SecurityContext,
@@ -470,9 +488,12 @@ impl<R: FilesRepo + 'static> Service<R> {
             ChangeStatusOutcome::NoMatch => Err(DomainError::Conflict),
         }
     }
+    // @cpt-end:cpt-cf-file-storage-fr-metadata-storage:p1:inst-put-file-info-meta-update
+    // @cpt-end:cpt-cf-file-storage-fr-conditional-requests:p1:inst-put-file-info-cas
 
     // ── delete_file (2-phase hard delete) ──────────────────────────────────
 
+    // @cpt-begin:cpt-cf-file-storage-fr-delete-file:p1:inst-delete-file-2phase
     pub async fn delete_file(
         &self,
         ctx: &SecurityContext,
@@ -543,9 +564,11 @@ impl<R: FilesRepo + 'static> Service<R> {
             .await?;
         Ok(())
     }
+    // @cpt-end:cpt-cf-file-storage-fr-delete-file:p1:inst-delete-file-2phase
 
     // ── list_files ─────────────────────────────────────────────────────────
 
+    // @cpt-begin:cpt-cf-file-storage-fr-list-files:p1:inst-list-files
     pub async fn list_files(
         &self,
         ctx: &SecurityContext,
@@ -571,9 +594,13 @@ impl<R: FilesRepo + 'static> Service<R> {
             next_cursor: page.next_cursor,
         })
     }
+    // @cpt-end:cpt-cf-file-storage-fr-list-files:p1:inst-list-files
 
     // ── read_file (with range support) ─────────────────────────────────────
 
+    // @cpt-begin:cpt-cf-file-storage-fr-download-file:p1:inst-read-file-stream
+    // @cpt-begin:cpt-cf-file-storage-fr-range-requests:p1:inst-read-file-range
+    // @cpt-begin:cpt-cf-file-storage-principle-stream-by-default:p1:inst-read-file-stream
     pub async fn read_file(
         &self,
         ctx: &SecurityContext,
@@ -643,6 +670,9 @@ impl<R: FilesRepo + 'static> Service<R> {
             range: read.range,
         })
     }
+    // @cpt-end:cpt-cf-file-storage-fr-download-file:p1:inst-read-file-stream
+    // @cpt-end:cpt-cf-file-storage-fr-range-requests:p1:inst-read-file-range
+    // @cpt-end:cpt-cf-file-storage-principle-stream-by-default:p1:inst-read-file-stream
 
     async fn rollforward(
         &self,
@@ -691,6 +721,8 @@ impl<R: FilesRepo + 'static> Service<R> {
 
     // ── presign_urls (batch download) ──────────────────────────────────────
 
+    // @cpt-begin:cpt-cf-file-storage-fr-signed-urls:p1:inst-presign-urls-batch
+    // @cpt-begin:cpt-cf-file-storage-principle-batch-presigned-urls:p1:inst-presign-urls-batch
     pub async fn presign_urls(
         &self,
         ctx: &SecurityContext,
@@ -785,6 +817,8 @@ impl<R: FilesRepo + 'static> Service<R> {
         }
         Ok(out)
     }
+    // @cpt-end:cpt-cf-file-storage-fr-signed-urls:p1:inst-presign-urls-batch
+    // @cpt-end:cpt-cf-file-storage-principle-batch-presigned-urls:p1:inst-presign-urls-batch
 
     // ── helpers ─────────────────────────────────────────────────────────────
 
@@ -808,6 +842,7 @@ impl<R: FilesRepo + 'static> Service<R> {
 
 // ── validators ──────────────────────────────────────────────────────────────
 
+// @cpt-begin:cpt-cf-file-storage-principle-tenant-owner:p1:inst-validate-owner
 fn validate_owner_against_ctx(ctx: &SecurityContext, owner: &OwnerRef) -> Result<(), DomainError> {
     if owner.tenant_id != ctx.subject_tenant_id() {
         return Err(DomainError::AccessDenied(
@@ -816,6 +851,7 @@ fn validate_owner_against_ctx(ctx: &SecurityContext, owner: &OwnerRef) -> Result
     }
     Ok(())
 }
+// @cpt-end:cpt-cf-file-storage-principle-tenant-owner:p1:inst-validate-owner
 
 fn validate_meta(meta: &FileMeta) -> Result<(), DomainError> {
     if meta.name.is_empty() {
@@ -834,6 +870,8 @@ fn validate_meta(meta: &FileMeta) -> Result<(), DomainError> {
     Ok(())
 }
 
+// @cpt-begin:cpt-cf-file-storage-principle-optimistic-concurrency:p1:inst-check-pins-cas
+// @cpt-begin:cpt-cf-file-storage-constraint-etag-content-only:p1:inst-check-pins-cas
 fn check_pins(
     row: &FileInfo,
     etag: Option<&Etag>,
@@ -852,6 +890,8 @@ fn check_pins(
     }
     Ok(())
 }
+// @cpt-end:cpt-cf-file-storage-principle-optimistic-concurrency:p1:inst-check-pins-cas
+// @cpt-end:cpt-cf-file-storage-constraint-etag-content-only:p1:inst-check-pins-cas
 
 fn file_path_from_meta(meta: &FileMeta, file_id: FileId) -> String {
     // For P1, file_path mirrors the deterministic backend object key. This

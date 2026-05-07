@@ -11,9 +11,15 @@ use crate::domain::error::DomainError;
 
 use super::r#trait::SharedBackend;
 
+// @cpt-begin:cpt-cf-file-storage-component-backend-router:p1:inst-backend-registry
+// @cpt-begin:cpt-cf-file-storage-principle-modular-backend-roster:p1:inst-backend-registry
+// @cpt-begin:cpt-cf-file-storage-fr-backend-abstraction:p1:inst-backend-registry
 pub struct BackendRegistry {
     backends: HashMap<BackendId, SharedBackend>,
 }
+// @cpt-end:cpt-cf-file-storage-component-backend-router:p1:inst-backend-registry
+// @cpt-end:cpt-cf-file-storage-principle-modular-backend-roster:p1:inst-backend-registry
+// @cpt-end:cpt-cf-file-storage-fr-backend-abstraction:p1:inst-backend-registry
 
 impl BackendRegistry {
     pub fn new(backends: HashMap<BackendId, SharedBackend>) -> Self {

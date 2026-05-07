@@ -78,6 +78,7 @@ pub type CapabilityTag = String;
 /// Adding a new signing strategy or wire protocol is a new entry here plus a
 /// new branch in the adapter's `match` — no enum migration, no breaking
 /// schema change.
+// @cpt-begin:cpt-cf-file-storage-fr-backend-capabilities:p1:inst-known-capabilities-whitelist
 pub const KNOWN_CAPABILITIES: &[&str] = &[
     "upload.s3.multipart.sigv4.v1",
     "download.s3.sigv4.v1",
@@ -85,6 +86,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "download.s3.public.v1",
     "download.s3.public.versioned.v1",
 ];
+// @cpt-end:cpt-cf-file-storage-fr-backend-capabilities:p1:inst-known-capabilities-whitelist
 
 // ── Backend descriptors ─────────────────────────────────────────────────────
 
@@ -192,6 +194,7 @@ pub struct FileInfo {
 ///
 /// Stable terminal: `Uploaded`. Transient (phases of multi-phase commits):
 /// `PendingUpload`, `Completing`, `MetaUpdating`, `Deleting`.
+// @cpt-begin:cpt-cf-file-storage-state-files-schema-and-repo-row:p1:inst-file-status-enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
     /// Initial: row inserted by `create_presigned_upload`. Bytes have not
@@ -210,6 +213,7 @@ pub enum FileStatus {
     /// the backend `DeleteObject`; Phase 3 hard-deletes the row.
     Deleting,
 }
+// @cpt-end:cpt-cf-file-storage-state-files-schema-and-repo-row:p1:inst-file-status-enum
 
 // ── Presigned URLs ──────────────────────────────────────────────────────────
 

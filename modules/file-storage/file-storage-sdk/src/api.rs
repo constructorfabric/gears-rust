@@ -18,6 +18,7 @@ use crate::models::{
 /// Public API trait for the `FileStorage` module.
 ///
 /// Registered in `ClientHub` by the `file-storage` module.
+// @cpt-begin:cpt-cf-file-storage-fr-rust-sdk:p1:inst-file-storage-client-trait
 #[async_trait]
 pub trait FileStorageClient: Send + Sync {
     // ── Backends ────────────────────────────────────────────────────────────
@@ -193,3 +194,4 @@ pub trait FileStorageClient: Send + Sync {
         items: Vec<PresignDownloadItem>,
     ) -> Result<Vec<PresignDownloadOutcome>, FileStorageError>;
 }
+// @cpt-end:cpt-cf-file-storage-fr-rust-sdk:p1:inst-file-storage-client-trait
