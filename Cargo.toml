@@ -71,6 +71,8 @@ members = [
     "modules/system/types",
     "modules/simple-user-settings/simple-user-settings-sdk",
     "modules/simple-user-settings/simple-user-settings",
+    "modules/file-storage/file-storage-sdk",
+    "modules/file-storage/file-storage",
     "modules/system/tenant-resolver/tenant-resolver-sdk",
     "modules/system/tenant-resolver/tenant-resolver",
     "modules/system/tenant-resolver/plugins/static-tr-plugin",
@@ -339,6 +341,7 @@ utoipa = { version = "5.4", features = [
     "openapi_extensions",
     "chrono",
     "uuid",
+    "time",
 ] }
 
 # HTTP stack dependencies
@@ -443,6 +446,13 @@ time = { version = "0.3.47", features = ["serde", "formatting", "parsing"] }
 # Cryptographic utilities
 sha2 = "0.10"
 hex = "0.4"
+
+# AWS SDK for S3-compatible storage backends (file-storage module)
+aws-sdk-s3 = { version = "1.110", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-config = { version = "1.8", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-credential-types = { version = "1.2", default-features = false }
+aws-smithy-runtime-api = { version = "1.10", default-features = false }
+aws-smithy-types = { version = "1.4", default-features = false }
 
 # JWT and authentication
 jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }

@@ -1,0 +1,67 @@
+[package]
+name = "cf-file-storage"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FileStorage module — P1 implementation"
+repository.workspace = true
+readme = "README.md"
+keywords = ["cyberfabric", "cyberfabric-system", "file-storage"]
+categories = ["web-programming"]
+
+[lib]
+name = "file_storage"
+
+[lints]
+workspace = true
+
+[dependencies]
+file-storage-sdk = { package = "cf-file-storage-sdk", version = "0.1.0", path = "../file-storage-sdk" }
+
+# AuthZ resolver for authorization (PEP flow)
+authz-resolver-sdk = { package = "cf-authz-resolver-sdk", path = "../../../modules/system/authz-resolver/authz-resolver-sdk" }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
+uuid = { workspace = true }
+time = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+
+# Database — SeaORM (driver features come from modkit-db)
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+thiserror = { workspace = true }
+
+# Modkit
+modkit = { workspace = true }
+modkit-db = { workspace = true, features = ["sqlite"] }
+modkit-db-macros = { workspace = true }
+modkit-errors = { workspace = true }
+modkit-security = { workspace = true }
+modkit-macros = { workspace = true }
+
+# AWS SDK for S3 backend
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
+
+# Hashing for composite etag computation
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }

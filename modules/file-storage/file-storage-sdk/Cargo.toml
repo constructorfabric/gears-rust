@@ -1,0 +1,30 @@
+[package]
+name = "cf-file-storage-sdk"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for the FileStorage module: API trait, types, and error definitions"
+repository.workspace = true
+readme = "README.md"
+keywords = ["cyberfabric", "cyberfabric-system", "file-storage"]
+categories = ["web-programming"]
+
+[lib]
+name = "file_storage_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+modkit = { workspace = true }
+modkit-macros = { workspace = true }
+modkit-security = { workspace = true }

@@ -1,0 +1,157 @@
+//! Static TOML configuration for the FileStorage module (P1).
+//!
+//! Mirrors the shape declared in DESIGN §3.5 / DECOMPOSITION 2.1. The roster
+//! is loaded once at boot — runtime backend registration is P2.
+
+use serde::Deserialize;
+use uuid::Uuid;
+
+/// Top-level FileStorage config block.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileStorageConfig {
+    /// Optional UUID of the backend that should serve "public" files. When
+    /// `None`, public files have no default home.
+    #[serde(default)]
+    pub default_public_storage_id: Option<Uuid>,
+
+    /// Required UUID of the default-private backend. Used when the SDK
+    /// caller passes `backend_id = None` to `create_presigned_url`.
+    /// `None` here means "no default configured".
+    #[serde(default)]
+    pub default_private_storage_id: Option<Uuid>,
+
+    /// Orphan-delete grace period (seconds).
+    #[serde(default = "default_orphan_grace")]
+    pub orphan_delete_grace_seconds: u64,
+
+    /// Safety margin added to the orphan-delete grace period.
+    #[serde(default = "default_clock_skew_margin")]
+    pub signed_url_clock_skew_margin_seconds: u64,
+
+    /// Roster of statically configured backends. Empty in tests; non-empty
+    /// in any deployment that actually serves files.
+    #[serde(default)]
+    pub backends: Vec<BackendConfig>,
+}
+
+impl Default for FileStorageConfig {
+    fn default() -> Self {
+        Self {
+            default_public_storage_id: None,
+            default_private_storage_id: None,
+            orphan_delete_grace_seconds: default_orphan_grace(),
+            signed_url_clock_skew_margin_seconds: default_clock_skew_margin(),
+            backends: Vec::new(),
+        }
+    }
+}
+
+/// One row of the backend roster.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackendConfig {
+    /// Stable backend identity, assigned once by the deployer.
+    pub id: Uuid,
+
+    /// Backend kind. Only `"s3-compatible"` is accepted in P1.
+    pub kind: BackendKindCfg,
+
+    #[serde(default)]
+    pub default_public: bool,
+
+    #[serde(default)]
+    pub default_private: bool,
+
+    /// S3-compatible endpoint URL.
+    pub endpoint: String,
+
+    pub region: String,
+    pub bucket: String,
+
+    pub access_key: String,
+    pub secret_key: String,
+
+    /// Optional per-backend size cap.
+    #[serde(default)]
+    pub max_file_size_bytes: Option<u64>,
+
+    /// Maximum signed-URL TTL the backend will sign (seconds).
+    #[serde(default = "default_max_signed_url_ttl")]
+    pub max_signed_url_ttl_seconds: u64,
+
+    /// Bucket exposes a public-read URL.
+    #[serde(default)]
+    pub public_read_urls: bool,
+
+    /// Backend honours `If-Match` / `If-None-Match` on `PutObject`.
+    #[serde(default)]
+    pub presigned_conditional_put: bool,
+
+    /// Per-backend tenant access list. Empty = visible to every tenant.
+    #[serde(default)]
+    pub tenant_access: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum BackendKindCfg {
+    /// The only kind accepted by P1 config validation.
+    #[serde(rename = "s3-compatible")]
+    S3Compatible,
+}
+
+fn default_orphan_grace() -> u64 {
+    86_400
+}
+
+fn default_clock_skew_margin() -> u64 {
+    60
+}
+
+fn default_max_signed_url_ttl() -> u64 {
+    86_400
+}
+
+/// Validate a fully loaded config at boot.
+pub fn validate_config(cfg: &FileStorageConfig) -> Result<(), String> {
+    let mut public_default_count = 0usize;
+    let mut private_default_count = 0usize;
+    let mut max_signed_url_ttl = 0u64;
+
+    for backend in &cfg.backends {
+        if backend.default_public {
+            public_default_count += 1;
+        }
+        if backend.default_private {
+            private_default_count += 1;
+        }
+        if backend.max_signed_url_ttl_seconds > max_signed_url_ttl {
+            max_signed_url_ttl = backend.max_signed_url_ttl_seconds;
+        }
+    }
+
+    if public_default_count > 1 {
+        return Err("at most one backend may set default_public = true".to_owned());
+    }
+    if private_default_count > 1 {
+        return Err("exactly one backend per tenant view must set default_private (P1: globally one)".to_owned());
+    }
+
+    if !cfg.backends.is_empty() && private_default_count == 0 {
+        return Err(
+            "at least one backend must set default_private = true when the roster is non-empty"
+                .to_owned(),
+        );
+    }
+
+    let min_grace = max_signed_url_ttl
+        .saturating_add(cfg.signed_url_clock_skew_margin_seconds);
+    if cfg.orphan_delete_grace_seconds < min_grace {
+        return Err(format!(
+            "orphan_delete_grace_seconds ({}) must be >= max_signed_url_ttl_seconds ({}) + clock_skew ({})",
+            cfg.orphan_delete_grace_seconds,
+            max_signed_url_ttl,
+            cfg.signed_url_clock_skew_margin_seconds,
+        ));
+    }
+
+    Ok(())
+}

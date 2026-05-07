@@ -6,6 +6,31 @@ reason = "Ignore rust-traits.md — reference document for planned Rust SDK cont
 patterns = ["modules/system/resource-group/docs/rust-traits.md"]
 
 [[ignore]]
+reason = "Ignore resource-group codebase and features — code traceability markers added incrementally across PR train. Remove after all PRs merged."
+patterns = [
+  "modules/system/resource-group/resource-group/src/*",
+  "modules/system/resource-group/resource-group/tests/*",
+  "modules/system/resource-group/resource-group-sdk/src/*",
+  "modules/system/resource-group/docs/features/*",
+]
+
+[[ignore]]
+reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Cypilot SDLC artifact."
+patterns = ["modules/file-storage/docs/rust-traits.md"]
+
+[[ignore]]
+reason = "Ignore migration.sql — Postgres DDL companion of DESIGN.md (local+db backend), not a Cypilot SDLC artifact."
+patterns = ["modules/file-storage/docs/migration.sql"]
+
+[[ignore]]
+reason = "Ignore openapi.yaml — REST API spec companion of DESIGN.md, not a Cypilot SDLC artifact."
+patterns = ["modules/file-storage/docs/openapi.yaml"]
+
+[[ignore]]
+reason = "Ignore use-cases.md — narrative use-case companion of PRD.md (PRD already has §8 Use Cases), not a Cypilot SDLC artifact kind."
+patterns = ["modules/file-storage/docs/use-cases.md"]
+
+[[ignore]]
 reason = "Ignore 'modules/system' parent directory — not a module, only a grouping for system submodules."
 patterns = ["modules/system"]
 
@@ -66,10 +91,6 @@ patterns = ["modules/system/types-sdk/*"]
 [[ignore]]
 reason = "Ignore module 'simple-user-settings' (not SDLC-documented yet: missing required PRD/DESIGN)."
 patterns = ["modules/simple-user-settings/*"]
-
-[[ignore]]
-reason = "Ignore module 'file-storage' (not SDLC-documented yet: missing required PRD/DESIGN)."
-patterns = ["modules/file-storage/*"]
 
 [[ignore]]
 reason = "Ignore module 'types-registry' (not SDLC-documented yet: missing required PRD/DESIGN)."
