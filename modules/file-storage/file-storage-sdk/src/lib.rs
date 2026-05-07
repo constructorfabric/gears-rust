@@ -1,7 +1,7 @@
 //! `FileStorage` SDK
 //!
-//! Public trait, models, and errors for the `FileStorage` module. Mirrors the
-//! contract defined in `modules/file-storage/docs/rust-traits.md`.
+//! Public trait, models, and errors for the `FileStorage` module. Mirrors
+//! the contract defined in `modules/file-storage/docs/rust-traits.md`.
 //!
 //! Consumers obtain the client from `ClientHub`:
 //!
@@ -22,8 +22,8 @@ mod models_test;
 pub use api::FileStorageClient;
 pub use errors::FileStorageError;
 pub use models::{
-    Backend, BackendCapability, BackendId, BackendKind, BackendTransport, CustomMetadata, Etag,
-    FileByteStream, FileId, FileInfo, FileList, FileMeta, FileMetaUpdate, FileReadHandle,
-    FileStatus, ListFilesQuery, OwnerRef, PresignDownloadItem, PresignDownloadOutcome,
-    PresignedDownload, PresignedUploadHandle, UrlParams,
+    Backend, BackendId, ByteRange, CapabilityTag, CustomMetadata, Etag, FileByteStream, FileId,
+    FileInfo, FileList, FileMeta, FileMetaUpdate, FileReadHandle, FileStatus, KNOWN_CAPABILITIES,
+    ListFilesQuery, OwnerRef, PresignDownloadItem, PresignDownloadOutcome, PresignedDownload,
+    PresignedUploadHandle, ResolvedByteRange, UploadedPart, UrlParams, VersionId,
 };

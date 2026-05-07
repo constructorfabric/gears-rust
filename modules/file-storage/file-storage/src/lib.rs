@@ -5,10 +5,11 @@
 //! surface (`cpt-cf-file-storage-fr-rest-api`) is P2.
 
 pub use file_storage_sdk::{
-    Backend, BackendId, FileByteStream, FileId, FileInfo, FileList, FileMeta, FileMetaUpdate,
-    FileReadHandle, FileStatus, FileStorageClient, FileStorageError, ListFilesQuery, OwnerRef,
-    PresignDownloadItem, PresignDownloadOutcome, PresignedDownload, PresignedUploadHandle,
-    UrlParams,
+    Backend, BackendId, ByteRange, CapabilityTag, Etag, FileByteStream, FileId, FileInfo,
+    FileList, FileMeta, FileMetaUpdate, FileReadHandle, FileStatus, FileStorageClient,
+    FileStorageError, KNOWN_CAPABILITIES, ListFilesQuery, OwnerRef, PresignDownloadItem,
+    PresignDownloadOutcome, PresignedDownload, PresignedUploadHandle, ResolvedByteRange,
+    UploadedPart, UrlParams, VersionId,
 };
 
 pub mod module;
