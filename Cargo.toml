@@ -73,6 +73,7 @@ members = [
     "modules/simple-user-settings/simple-user-settings",
     "modules/file-storage/file-storage-sdk",
     "modules/file-storage/file-storage",
+    "modules/file-storage/microchat-test",
     "modules/system/tenant-resolver/tenant-resolver-sdk",
     "modules/system/tenant-resolver/tenant-resolver",
     "modules/system/tenant-resolver/plugins/static-tr-plugin",
@@ -556,3 +557,21 @@ gts-macros = "0.9.0"
 
 # GTS validator
 gts-validator = "0.9.0"
+
+# TEMPORARY override of `s3s` / `s3s-fs` to a fork branch that combines
+# two separate upstream fixes. Without these, the file-storage e2e
+# microchat tests cannot validate metadata-update flows end-to-end —
+# s3s-fs's `CopyObject` zeroes the destination on self-replace and
+# ignores `MetadataDirective::Replace`. See:
+#
+#   - https://github.com/Nugine/s3s/issues/583  (BUG: CopyObject self-replace zeroes the destination file)
+#   - https://github.com/Nugine/s3s/pull/585    (fix(s3s-fs): preserve content on CopyObject self-replace)
+#   - https://github.com/Nugine/s3s/issues/584  (BUG: CopyObject ignores MetadataDirective::Replace)
+#   - https://github.com/Nugine/s3s/pull/586    (fix(s3s-fs): honor MetadataDirective::Replace in copy_object)
+#
+# Once both PRs merge and a release with the fixes ships to crates.io,
+# delete this `[patch.crates-io]` block and bump the dep version in
+# `modules/file-storage/file-storage/Cargo.toml`.
+[patch.crates-io]
+s3s = { git = "https://github.com/ffedoroff/s3s.git", branch = "combined/copy-object-both-fixes" }
+s3s-fs = { git = "https://github.com/ffedoroff/s3s.git", branch = "combined/copy-object-both-fixes" }

@@ -65,3 +65,16 @@ hex = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util = { workspace = true }
+
+# E2E harness — in-process S3 server (s3s + s3s-fs) and a plain HTTP client
+# to PUT bytes through real presigned URLs.
+s3s = "0.13"
+s3s-fs = "0.13"
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["server-auto", "tokio"] }
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+
+# Test-only microchat module — a real consumer of cf-file-storage-sdk
+# that drives the integration test suite (validators, lifecycle, race).
+cf-microchat-test = { path = "../microchat-test" }

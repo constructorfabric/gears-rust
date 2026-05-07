@@ -1,0 +1,32 @@
+[package]
+name = "cf-microchat-test"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Test-only microchat module — exercises cf-file-storage end-to-end through s3s-fs over loopback. Never ships in any binary."
+repository.workspace = true
+
+[lib]
+name = "microchat_test"
+
+[lints]
+workspace = true
+
+[dependencies]
+file-storage-sdk = { package = "cf-file-storage-sdk", version = "0.1.0", path = "../file-storage-sdk" }
+
+modkit-db = { workspace = true, features = ["sqlite"] }
+modkit-db-macros = { workspace = true }
+modkit-security = { workspace = true }
+
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

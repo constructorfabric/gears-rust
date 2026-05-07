@@ -338,7 +338,7 @@ dev: dev-fmt dev-clippy dev-test
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-file-storage test-file-storage-e2e
 
 # Run all tests
 test: install-tools
@@ -370,6 +370,19 @@ test-db: test-sqlite test-pg test-mysql
 ## Run users-info module integration tests
 test-users-info-pg: install-tools
 	cargo nextest run -p users-info --features "integration"
+
+## Run file-storage module tests (SDK unit + service unit + repo race tests on SQLite :memory:)
+test-file-storage: install-tools
+	cargo nextest run -p cf-file-storage -p cf-file-storage-sdk
+
+## Run cf-file-storage end-to-end tests through the test-only microchat module
+## (real s3s-fs over loopback ephemeral port, parallel-safe, SQLite :memory:).
+test-file-storage-e2e: install-tools
+	cargo nextest run -p cf-file-storage \
+	    --test microchat_validators_test \
+	    --test microchat_harness_layout_test \
+	    --test microchat_lifecycle_test \
+	    --test microchat_race_test
 
 # -------- Benchmarks --------
 

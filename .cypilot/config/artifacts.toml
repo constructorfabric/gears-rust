@@ -31,6 +31,21 @@ reason = "Ignore use-cases.md — narrative use-case companion of PRD.md (PRD al
 patterns = ["modules/file-storage/docs/use-cases.md"]
 
 [[ignore]]
+reason = "Ignore unit-microchat.md — implementation plan for the test-only microchat crate + e2e harness, not a Cypilot SDLC artifact kind."
+patterns = ["modules/file-storage/docs/unit-microchat.md"]
+
+[[ignore]]
+reason = "Ignore microchat-test crate + microchat e2e tests — test-only infrastructure that exercises cf-file-storage end-to-end through s3s-fs; never shipped in any binary, no SDLC artifacts."
+patterns = [
+  "modules/file-storage/microchat-test/*",
+  "modules/file-storage/file-storage/tests/microchat_validators_test.rs",
+  "modules/file-storage/file-storage/tests/microchat_lifecycle_test.rs",
+  "modules/file-storage/file-storage/tests/microchat_race_test.rs",
+  "modules/file-storage/file-storage/tests/microchat_harness_layout_test.rs",
+  "modules/file-storage/file-storage/tests/e2e_common/microchat.rs",
+]
+
+[[ignore]]
 reason = "Ignore 'modules/system' parent directory — not a module, only a grouping for system submodules."
 patterns = ["modules/system"]
 
