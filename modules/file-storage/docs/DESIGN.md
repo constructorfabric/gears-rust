@@ -1202,7 +1202,7 @@ The GC sweep runs **without locks** — every reconciliation step is itself a ra
 
 #### Self-healing reconciliation — base correctness for the presign-first lifecycle
 
-Per [ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-self-healing-reconciliation.md) and §2.1 (`cpt-cf-file-storage-principle-self-healing`), the presigned-first lifecycle uses **in-place key reuse** (variant B) plus **explicit reconciliation via `reconcile` (eager)** or **lazy repair on next read** (`read_file`). The row's backend object key does not change on variant-B re-upload — both the old and new content live at the same physical key, with the old version replaced in place by the client's PUT. The row's `etag` (and any other S3-mirrored field that can drift) may briefly disagree with the actual S3 state between successful PUT and the next FileStorage operation that touches both; that operation reconciles the row.
+Per [ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-self-healing-reconciliation.md) and §2.1 (`cpt-cf-file-storage-principle-multi-phase-commit`), the presigned-first lifecycle uses **in-place key reuse** (variant B) plus **explicit reconciliation via `reconcile` (eager)** or **lazy repair on next read** (`read_file`). The row's backend object key does not change on variant-B re-upload — both the old and new content live at the same physical key, with the old version replaced in place by the client's PUT. The row's `etag` (and any other S3-mirrored field that can drift) may briefly disagree with the actual S3 state between successful PUT and the next FileStorage operation that touches both; that operation reconciles the row.
 
 ##### The repair primitive
 
