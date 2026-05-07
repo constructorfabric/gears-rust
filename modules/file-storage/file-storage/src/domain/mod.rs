@@ -11,7 +11,6 @@ pub mod error;
 pub mod etag;
 pub mod local_client;
 pub mod repo;
-pub mod self_heal;
 pub mod service;
 
 #[cfg(test)]
@@ -20,7 +19,5 @@ mod error_test;
 mod etag_test;
 #[cfg(test)]
 mod local_client_test;
-#[cfg(test)]
-mod self_heal_test;
 #[cfg(test)]
 mod service_test;

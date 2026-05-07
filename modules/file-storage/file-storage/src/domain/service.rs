@@ -31,7 +31,8 @@ use super::repo::{
     ChangeStatusOutcome, DeleteOutcome, FilesRepo, InsertPendingArgs, ListFilesArgs,
     MutationOutcome,
 };
-use super::self_heal;
+// self_heal removed (ADR-0004 obsolete in P1 spec; in-band recovery now lives
+// inside multi-phase commits in complete_upload / put_file_info / read_file).
 
 pub(crate) type DbProvider = DBProvider<modkit_db::DbError>;
 
@@ -476,7 +477,10 @@ impl<R: FilesRepo + 'static> Service<R> {
             .registry
             .resolve_visible(row.backend_id, row.owner.tenant_id)?;
 
-        let persistence = self
+        // P1 spec: in-band recovery for transient states lives inside the
+        // SDK methods (Completing / MetaUpdating). Reading an Uploaded row
+        // streams bytes against the row's pinned etag — no self-heal pass.
+        let _persistence = self
             .repo
             .get_persistence_fields(&conn, row.file_id)
             .await?
@@ -484,39 +488,10 @@ impl<R: FilesRepo + 'static> Service<R> {
         let backend_object_key = derive_s3_key(row.file_id);
         let BackendReadResult {
             bytes,
-            content_hash,
+            content_hash: _,
         } = backend.open_read(&backend_object_key).await?;
 
-        let outcome = self_heal::sync_etag_from_backend(
-            &*self.repo,
-            &conn,
-            file_id,
-            &row.etag,
-            &content_hash,
-            persistence.meta_revision,
-        )
-        .await?;
-
-        let final_info = match outcome {
-            self_heal::SelfHealOutcome::AlreadyConsistent => row,
-            self_heal::SelfHealOutcome::Repaired { derived } => {
-                if let Some(pinned) = etag {
-                    if *pinned != derived {
-                        return Err(DomainError::EtagMismatch);
-                    }
-                }
-                self.repo
-                    .get_by_id(&conn, ctx.subject_tenant_id(), file_id)
-                    .await?
-                    .ok_or(DomainError::NotFound)?
-            }
-            self_heal::SelfHealOutcome::Raced => {
-                self.repo
-                    .get_by_id(&conn, ctx.subject_tenant_id(), file_id)
-                    .await?
-                    .ok_or(DomainError::NotFound)?
-            }
-        };
+        let final_info = row;
 
         if let Some(pinned) = etag {
             if *pinned != final_info.etag {

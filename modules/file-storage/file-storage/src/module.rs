@@ -3,8 +3,6 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use axum::Router;
-use modkit::api::OpenApiRegistry;
 use modkit::{Module, ModuleCtx};
 use modkit_db::DBProvider;
 use modkit_db::DbError;
@@ -15,14 +13,12 @@ use tracing::{info, warn};
 use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
 use file_storage_sdk::{BackendId, FileStorageClient};
 
-use crate::api::rest::routes;
 use crate::config::{BackendKindCfg, FileStorageConfig, validate_config};
 use crate::domain::local_client::LocalClient;
 use crate::domain::service::{OrphanQueue, Service};
 use crate::errors::InitError;
 use crate::infra::backends::registry::BackendRegistry;
 use crate::infra::backends::s3::{S3Backend, S3BackendConfig};
-use crate::infra::backends::smoke;
 use crate::infra::backends::r#trait::{
     BackendDescriptor, SharedBackend, StorageBackend, derive_s3_key,
 };
@@ -34,7 +30,7 @@ type ConcreteService = Service<SeaOrmFilesRepository>;
 #[modkit::module(
     name = "file-storage",
     deps = ["authz-resolver"],
-    capabilities = [rest, db]
+    capabilities = [db]
 )]
 pub struct FileStorageModule {
     service: OnceLock<Arc<ConcreteService>>,
@@ -65,8 +61,8 @@ impl Module for FileStorageModule {
         let db: Arc<DBProvider<DbError>> = Arc::new(ctx.db_required()?);
 
         let registry = build_registry(&cfg).map_err(InitError::BackendRoster)?;
-        let backend_pairs: Vec<(BackendId, &SharedBackend)> = registry.iter().collect();
-        smoke::run_smoke_tests(&backend_pairs).await?;
+        // P1: no boot-time S3 connectivity probe — see
+        // `cpt-cf-file-storage-constraint-no-bootstrap-connectivity-check`.
         let registry = Arc::new(registry);
 
         let repo: Arc<SeaOrmFilesRepository> = Arc::new(SeaOrmFilesRepository::new());
@@ -107,24 +103,9 @@ impl Module for FileStorageModule {
     }
 }
 
-#[async_trait]
-impl modkit::contracts::RestApiCapability for FileStorageModule {
-    fn register_rest(
-        &self,
-        _ctx: &ModuleCtx,
-        router: Router,
-        openapi: &dyn OpenApiRegistry,
-    ) -> anyhow::Result<Router> {
-        info!("FileStorage module: register_rest called");
-        let service = self
-            .service
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("Service not initialized"))?
-            .clone();
-        let router = routes::register_routes(router, openapi, service);
-        Ok(router)
-    }
-}
+// P1: REST surface is intentionally not exposed (`cpt-cf-file-storage-fr-rest-api`
+// is P2). Modules consume FileStorage through the in-process SDK
+// trait `FileStorageClient` registered above in ClientHub.
 
 fn build_registry(cfg: &FileStorageConfig) -> Result<BackendRegistry, String> {
     let mut backends: HashMap<BackendId, SharedBackend> = HashMap::new();
