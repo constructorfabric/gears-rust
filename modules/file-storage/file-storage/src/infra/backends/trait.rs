@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use file_storage_sdk::{Backend, BackendId, FileByteStream, FileMeta, PresignedDownload, UrlParams};
+use file_storage_sdk::{
+    Backend, BackendId, ByteRange, CapabilityTag, FileByteStream, FileMeta, ResolvedByteRange,
+    UploadedPart,
+};
 
 use crate::domain::error::DomainError;
 
@@ -18,16 +21,13 @@ use crate::domain::error::DomainError;
 pub type BackendObjectKey = String;
 
 /// Derive the deterministic S3 object key for a given `file_id`.
-///
-/// Per DESIGN §3 example: `f/{id_hex}` (no per-row randomness — the column
-/// itself is dropped from the schema).
 #[must_use]
 pub fn derive_s3_key(file_id: uuid::Uuid) -> String {
     format!("f/{}", file_id.simple())
 }
 
 /// Shared descriptor for a backend, augmented with non-SDK fields the
-/// router needs (max signed-URL TTL).
+/// router needs.
 #[derive(Debug, Clone)]
 pub struct BackendDescriptor {
     pub sdk: Backend,
@@ -47,77 +47,156 @@ impl BackendDescriptor {
     pub fn max_file_size_bytes(&self) -> Option<u64> {
         self.sdk.max_file_size_bytes
     }
-    pub fn capabilities(&self) -> &[file_storage_sdk::BackendCapability] {
+    pub fn capabilities(&self) -> &[CapabilityTag] {
         &self.sdk.capabilities
+    }
+    pub fn declares(&self, cap: &str) -> bool {
+        self.sdk.capabilities.iter().any(|c| c == cap)
     }
     pub fn is_visible_to(&self, tenant_id: uuid::Uuid) -> bool {
         self.tenant_access.is_empty() || self.tenant_access.contains(&tenant_id)
     }
 }
 
-/// Result of a backend `open_read` — the byte stream plus the backend-side
-/// content fingerprint (S3 ETag header) needed for self-healing.
-pub struct BackendReadResult {
-    pub bytes: FileByteStream,
-    /// Backend-reported content hash. For S3 this is the unquoted ETag
-    /// from the GET response.
-    pub content_hash: String,
+/// Backend-side metadata captured from S3 response headers.
+#[derive(Debug, Clone)]
+pub struct BackendObjectMetadata {
+    /// Raw ETag (sans surrounding quotes).
+    pub etag: String,
+    /// Backend-side `x-amz-version-id`. `Some` when bucket has S3 versioning.
+    pub version_id: Option<String>,
+    pub size_bytes: u64,
+    pub content_type: Option<String>,
+    pub content_disposition: Option<String>,
+    /// `x-amz-meta-*` user-metadata mirror.
+    pub user_metadata: std::collections::BTreeMap<String, String>,
 }
 
+/// Result of a backend `open_read` — the byte stream plus the metadata
+/// captured from the response headers, plus the resolved range when a
+/// partial read was requested.
+pub struct BackendReadResult {
+    pub bytes: FileByteStream,
+    pub metadata: BackendObjectMetadata,
+    /// `Some` iff caller passed `range = Some(_)`. Mirrors the
+    /// `Content-Range` response header.
+    pub range: Option<ResolvedByteRange>,
+}
+
+/// Output of a successful `complete_multipart_upload`.
+#[derive(Debug, Clone)]
+pub struct MultipartCompleteResult {
+    pub etag: String,
+    pub version_id: Option<String>,
+    pub size_bytes: u64,
+}
+
+/// Output of a successful `copy_object_self_replace_meta`.
+#[derive(Debug, Clone)]
+pub struct CopyObjectResult {
+    pub etag: String,
+    pub version_id: Option<String>,
+}
+
+/// Per-item input to `issue_presigned_gets`.
 #[derive(Debug, Clone)]
 pub struct PresignedGetItem {
     pub key: BackendObjectKey,
-    pub params: UrlParams,
+    pub capability: CapabilityTag,
+    pub params: file_storage_sdk::UrlParams,
     pub mime_type_hint: Option<String>,
     pub display_name_hint: Option<String>,
     pub expires_in_seconds: u64,
+    /// Honoured only when the chosen capability is a `*.versioned.*` variant.
+    pub version_id: Option<String>,
 }
 
+/// Per-item outcome of `issue_presigned_gets`.
 #[derive(Debug, Clone)]
 pub struct PresignedGetOutcome {
     pub key: BackendObjectKey,
-    pub result: Result<PresignedDownload, DomainError>,
+    pub result: Result<file_storage_sdk::PresignedDownload, DomainError>,
 }
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     fn descriptor(&self) -> &BackendDescriptor;
 
-    /// Stream the object's bytes. Returns `BackendReadResult` so the
-    /// caller can run self-healing reconciliation against the backend's
-    /// fingerprint before returning to the consumer.
-    async fn open_read(
-        &self,
-        key: &BackendObjectKey,
-    ) -> Result<BackendReadResult, DomainError>;
+    // ── Multipart upload (the only upload path in P1) ───────────────────────
 
-    /// Best-effort delete — used by the orphan-delete worker.
-    async fn delete_object(&self, key: &BackendObjectKey) -> Result<(), DomainError>;
-
-    /// Issue a presigned PUT URL.
-    async fn issue_presigned_put(
+    /// Open an S3 multipart-upload session. Returns the backend-supplied
+    /// opaque `upload_id`. The session expires per the bucket lifecycle
+    /// configuration; FileStorage does NOT persist the `upload_id`.
+    async fn create_multipart_upload(
         &self,
         key: &BackendObjectKey,
         meta: &FileMeta,
-        params: &UrlParams,
-        expected_etag: &str,
-        ttl_seconds: u64,
     ) -> Result<String, DomainError>;
+
+    /// Issue presigned PUT URLs for `part_count` parts of a multipart
+    /// session. Returns one URL per part in ascending part_number order
+    /// (1..=part_count).
+    async fn presign_upload_parts(
+        &self,
+        key: &BackendObjectKey,
+        upload_id: &str,
+        part_count: u32,
+        ttl_seconds: u64,
+    ) -> Result<Vec<String>, DomainError>;
+
+    /// Finalize a multipart upload. Captures the final `(etag, version_id,
+    /// size_bytes)` from the backend response.
+    async fn complete_multipart_upload(
+        &self,
+        key: &BackendObjectKey,
+        upload_id: &str,
+        parts: &[UploadedPart],
+    ) -> Result<MultipartCompleteResult, DomainError>;
+
+    /// Best-effort abort of a multipart session. Idempotent.
+    async fn abort_multipart_upload(
+        &self,
+        key: &BackendObjectKey,
+        upload_id: &str,
+    ) -> Result<(), DomainError>;
+
+    // ── Read / metadata ─────────────────────────────────────────────────────
+
+    /// Stream the object's bytes, optionally constrained to a byte range.
+    /// `range = Some(_)` adds an HTTP `Range: bytes=...` header.
+    async fn open_read(
+        &self,
+        key: &BackendObjectKey,
+        range: Option<ByteRange>,
+    ) -> Result<BackendReadResult, DomainError>;
+
+    /// HEAD against the backend. Used by transient-state recovery and the
+    /// strong-CAS path of `put_file_info`.
+    async fn head_object(
+        &self,
+        key: &BackendObjectKey,
+    ) -> Result<BackendObjectMetadata, DomainError>;
+
+    /// `CopyObject` self-copy with `MetadataDirective: REPLACE`. Optional
+    /// `if_match_etag` adds the `x-amz-copy-source-if-match` precondition
+    /// for strong-CAS metadata updates.
+    async fn copy_object_self_replace_meta(
+        &self,
+        key: &BackendObjectKey,
+        meta: &FileMeta,
+        if_match_etag: Option<&str>,
+    ) -> Result<CopyObjectResult, DomainError>;
+
+    /// `DeleteObject` on the backend. Idempotent (returns `Ok(())` on 404).
+    async fn delete_object(&self, key: &BackendObjectKey) -> Result<(), DomainError>;
+
+    // ── Presigned download URLs ─────────────────────────────────────────────
 
     /// Batched presigned-GET URL issuance.
     async fn issue_presigned_gets(
         &self,
         items: Vec<PresignedGetItem>,
     ) -> Result<Vec<PresignedGetOutcome>, DomainError>;
-
-    /// HEAD against the backend.
-    async fn head_object(&self, key: &BackendObjectKey) -> Result<HeadResult, DomainError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct HeadResult {
-    pub content_hash: String,
-    pub size_bytes: u64,
 }
 
 /// Type-erased backend instance shared by the registry.

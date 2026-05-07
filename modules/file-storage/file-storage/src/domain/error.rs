@@ -18,8 +18,8 @@ pub enum DomainError {
     #[error("etag mismatch")]
     EtagMismatch,
 
-    #[error("invalid status transition: {0}")]
-    InvalidStatusTransition(String),
+    #[error("delete in progress")]
+    DeleteInProgress,
 
     #[error("capability unavailable: {0}")]
     CapabilityUnavailable(String),
@@ -32,6 +32,9 @@ pub enum DomainError {
 
     #[error("backend failure: {0}")]
     BackendFailure(String),
+
+    #[error("conflict on conditional update")]
+    Conflict,
 
     #[error("internal: {0}")]
     Internal(String),
@@ -96,15 +99,13 @@ impl From<DomainError> for FileStorageError {
             DomainError::AccessDenied(_) => Self::AccessDenied,
             DomainError::BadRequest(s) => Self::BadRequest(s),
             DomainError::EtagMismatch => Self::EtagMismatch,
-            DomainError::InvalidStatusTransition(s) => Self::InvalidStatusTransition(s),
+            DomainError::DeleteInProgress => Self::DeleteInProgress,
             DomainError::CapabilityUnavailable(s) => Self::CapabilityUnavailable(s),
             DomainError::PayloadTooLarge { max_bytes } => Self::PayloadTooLarge { max_bytes },
             DomainError::UploadExpired => Self::UploadExpired,
             DomainError::BackendFailure(s) => Self::BackendFailure(s),
+            DomainError::Conflict => Self::BackendFailure("conflict on conditional update".into()),
             DomainError::Internal(_) | DomainError::Database(_) => Self::Internal,
         }
     }
 }
-
-#[allow(dead_code)]
-fn _unused_dberr_marker(_: DbError) {}

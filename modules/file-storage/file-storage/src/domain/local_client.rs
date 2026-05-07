@@ -1,15 +1,18 @@
-//! `LocalClient` — bridges the public SDK trait to the in-process
-//! `Service`.
+//! In-process implementation of `FileStorageClient` — a thin adapter that
+//! forwards SDK-level calls to the `Service` and translates `DomainError`
+//! into `FileStorageError`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use file_storage_sdk::{
-    Backend, BackendId, Etag, FileByteStream, FileId, FileInfo, FileList, FileMeta, FileMetaUpdate,
-    FileReadHandle, FileStatus, FileStorageClient, FileStorageError, ListFilesQuery, OwnerRef,
-    PresignDownloadItem, PresignDownloadOutcome, PresignedUploadHandle, UrlParams,
-};
 use modkit_security::SecurityContext;
+
+use file_storage_sdk::{
+    Backend, BackendId, ByteRange, CapabilityTag, Etag, FileByteStream, FileId, FileInfo,
+    FileList, FileMeta, FileMetaUpdate, FileReadHandle, FileStorageClient, FileStorageError,
+    ListFilesQuery, OwnerRef, PresignDownloadItem, PresignDownloadOutcome, PresignedUploadHandle,
+    UploadedPart, UrlParams, VersionId,
+};
 
 use super::repo::FilesRepo;
 use super::service::Service;
@@ -19,7 +22,6 @@ pub struct LocalClient<R: FilesRepo + 'static> {
 }
 
 impl<R: FilesRepo + 'static> LocalClient<R> {
-    #[must_use]
     pub fn new(service: Arc<Service<R>>) -> Self {
         Self { service }
     }
@@ -34,31 +36,46 @@ impl<R: FilesRepo + 'static> FileStorageClient for LocalClient<R> {
         self.service.list_backends(ctx).await.map_err(Into::into)
     }
 
-    async fn create_presigned_url(
+    async fn create_presigned_upload(
         &self,
         ctx: &SecurityContext,
+        file_id: Option<FileId>,
         backend_id: Option<BackendId>,
         owner: OwnerRef,
-        file_path: &str,
         meta: FileMeta,
+        capability: &CapabilityTag,
+        part_count: u32,
         params: UrlParams,
     ) -> Result<PresignedUploadHandle, FileStorageError> {
         self.service
-            .create_presigned_url(ctx, backend_id, owner, file_path, meta, params)
+            .create_presigned_upload(
+                ctx, file_id, backend_id, owner, meta, capability, part_count, params,
+            )
             .await
             .map_err(Into::into)
     }
 
-    async fn change_status(
+    async fn complete_upload(
         &self,
         ctx: &SecurityContext,
         file_id: FileId,
-        target: FileStatus,
-        old_etag: Etag,
-        new_etag: Etag,
+        upload_id: &str,
+        parts: Vec<UploadedPart>,
     ) -> Result<FileInfo, FileStorageError> {
         self.service
-            .change_status(ctx, file_id, target, old_etag, new_etag)
+            .complete_upload(ctx, file_id, upload_id, parts)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn abort_upload(
+        &self,
+        ctx: &SecurityContext,
+        file_id: FileId,
+        upload_id: &str,
+    ) -> Result<(), FileStorageError> {
+        self.service
+            .abort_upload(ctx, file_id, upload_id)
             .await
             .map_err(Into::into)
     }
@@ -68,9 +85,10 @@ impl<R: FilesRepo + 'static> FileStorageClient for LocalClient<R> {
         ctx: &SecurityContext,
         file_id: FileId,
         etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
     ) -> Result<FileInfo, FileStorageError> {
         self.service
-            .get_file_info(ctx, file_id, etag)
+            .get_file_info(ctx, file_id, etag, version_id)
             .await
             .map_err(Into::into)
     }
@@ -80,10 +98,11 @@ impl<R: FilesRepo + 'static> FileStorageClient for LocalClient<R> {
         ctx: &SecurityContext,
         file_id: FileId,
         update: FileMetaUpdate,
-        etag: Etag,
+        etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
     ) -> Result<FileInfo, FileStorageError> {
         self.service
-            .put_file_info(ctx, file_id, update, etag)
+            .put_file_info(ctx, file_id, update, etag, version_id)
             .await
             .map_err(Into::into)
     }
@@ -92,10 +111,11 @@ impl<R: FilesRepo + 'static> FileStorageClient for LocalClient<R> {
         &self,
         ctx: &SecurityContext,
         file_id: FileId,
-        etag: Etag,
+        etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
     ) -> Result<(), FileStorageError> {
         self.service
-            .delete_file(ctx, file_id, etag)
+            .delete_file(ctx, file_id, etag, version_id)
             .await
             .map_err(Into::into)
     }
@@ -113,9 +133,11 @@ impl<R: FilesRepo + 'static> FileStorageClient for LocalClient<R> {
         ctx: &SecurityContext,
         file_id: FileId,
         etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
+        range: Option<ByteRange>,
     ) -> Result<FileReadHandle, FileStorageError> {
         self.service
-            .read_file(ctx, file_id, etag)
+            .read_file(ctx, file_id, etag, version_id, range)
             .await
             .map_err(Into::into)
     }
@@ -123,15 +145,16 @@ impl<R: FilesRepo + 'static> FileStorageClient for LocalClient<R> {
     async fn put_file(
         &self,
         ctx: &SecurityContext,
+        file_id: Option<FileId>,
         backend_id: Option<BackendId>,
         owner: OwnerRef,
-        file_path: &str,
         meta: FileMeta,
         bytes: FileByteStream,
         etag: Option<&Etag>,
+        version_id: Option<&VersionId>,
     ) -> Result<FileInfo, FileStorageError> {
         self.service
-            .put_file(ctx, backend_id, owner, file_path, meta, bytes, etag)
+            .put_file(ctx, file_id, backend_id, owner, meta, bytes, etag, version_id)
             .await
             .map_err(Into::into)
     }
@@ -141,9 +164,6 @@ impl<R: FilesRepo + 'static> FileStorageClient for LocalClient<R> {
         ctx: &SecurityContext,
         items: Vec<PresignDownloadItem>,
     ) -> Result<Vec<PresignDownloadOutcome>, FileStorageError> {
-        self.service
-            .presign_urls(ctx, items)
-            .await
-            .map_err(Into::into)
+        self.service.presign_urls(ctx, items).await.map_err(Into::into)
     }
 }

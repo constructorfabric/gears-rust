@@ -112,21 +112,14 @@ fn build_registry(cfg: &FileStorageConfig) -> Result<BackendRegistry, String> {
     for entry in &cfg.backends {
         let BackendKindCfg::S3Compatible = entry.kind;
 
-        let mut capabilities = vec![file_storage_sdk::BackendCapability::PresignedUrls];
-        if entry.public_read_urls {
-            capabilities.push(file_storage_sdk::BackendCapability::PublicReadUrls);
-        }
-        if entry.presigned_conditional_put {
-            capabilities.push(file_storage_sdk::BackendCapability::PresignedConditionalPut);
-        }
         let sdk = file_storage_sdk::Backend {
             id: entry.id,
-            kind: file_storage_sdk::BackendKind::S3Compatible,
             default_public: entry.default_public,
             default_private: entry.default_private,
-            transport: file_storage_sdk::BackendTransport::Redirect,
-            capabilities,
+            capabilities: entry.capabilities.clone(),
             max_file_size_bytes: entry.max_file_size_bytes,
+            max_metadata_bytes: entry.max_metadata_bytes,
+            max_presign_ttl_seconds: Some(entry.max_signed_url_ttl_seconds),
         };
         let descriptor = BackendDescriptor {
             sdk,
@@ -141,7 +134,6 @@ fn build_registry(cfg: &FileStorageConfig) -> Result<BackendRegistry, String> {
             bucket: entry.bucket.clone(),
             access_key: entry.access_key.clone(),
             secret_key: entry.secret_key.clone(),
-            public_read_urls: entry.public_read_urls,
         }));
         if backends.insert(entry.id, backend).is_some() {
             return Err(format!("duplicate backend id {:?}", entry.id));

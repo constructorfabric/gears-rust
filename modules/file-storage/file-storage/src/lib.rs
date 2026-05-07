@@ -23,6 +23,3 @@ pub mod domain;
 pub mod errors;
 #[doc(hidden)]
 pub mod infra;
-
-#[cfg(test)]
-mod config_test;

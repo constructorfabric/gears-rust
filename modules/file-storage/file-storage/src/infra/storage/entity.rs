@@ -1,6 +1,4 @@
 //! SeaORM entity for `file_storage.files`.
-//!
-//! Mirrors the DDL in `modules/file-storage/docs/migration.sql`.
 
 use modkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
@@ -21,15 +19,18 @@ pub struct Model {
     pub gts_file_type: String,
     pub mime_type: String,
     pub size_bytes: i64,
+    /// Raw S3 ETag (unquoted) of the current bytes.
     pub etag: String,
-    pub meta_revision: i64,
-    /// `"pending_upload"` | `"uploaded"`.
+    /// Raw S3 VersionId of the current generation. `Some` when bucket has
+    /// S3 versioning enabled.
+    pub version_id: Option<String>,
+    /// `pending_upload | completing | uploaded | meta_updating | deleting`.
     pub status: String,
     /// JSON-serialised `BTreeMap<String, String>`.
     pub custom_metadata: String,
     pub upload_expires_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
-    pub modified_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

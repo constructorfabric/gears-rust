@@ -6,10 +6,13 @@ use super::entity;
 
 pub fn status_str_to_sdk(s: &str) -> FileStatus {
     match s {
+        "pending_upload" => FileStatus::PendingUpload,
+        "completing" => FileStatus::Completing,
         "uploaded" => FileStatus::Uploaded,
-        // Anything else (including "pending_upload" and unknown adapter-
-        // specific extensions) collapses to PendingUpload at the SDK
-        // boundary.
+        "meta_updating" => FileStatus::MetaUpdating,
+        "deleting" => FileStatus::Deleting,
+        // Unknown statuses collapse to PendingUpload — caller-facing path
+        // never sees adapter-specific extensions.
         _ => FileStatus::PendingUpload,
     }
 }
@@ -17,7 +20,10 @@ pub fn status_str_to_sdk(s: &str) -> FileStatus {
 pub fn status_sdk_to_str(status: FileStatus) -> &'static str {
     match status {
         FileStatus::PendingUpload => "pending_upload",
+        FileStatus::Completing => "completing",
         FileStatus::Uploaded => "uploaded",
+        FileStatus::MetaUpdating => "meta_updating",
+        FileStatus::Deleting => "deleting",
     }
 }
 
@@ -37,11 +43,6 @@ pub fn entity_to_file_info(m: entity::Model) -> FileInfo {
         name: m.name,
         mime_type: m.mime_type,
         gts_file_type: m.gts_file_type,
-        size_bytes: if m.size_bytes >= 0 {
-            Some(u64::try_from(m.size_bytes).unwrap_or(0))
-        } else {
-            None
-        },
         custom_metadata: parse_custom_metadata(&m.custom_metadata),
     };
     FileInfo {
@@ -52,9 +53,10 @@ pub fn entity_to_file_info(m: entity::Model) -> FileInfo {
         meta,
         status: status_str_to_sdk(&m.status),
         etag: m.etag,
+        version_id: m.version_id,
         size_bytes: u64::try_from(m.size_bytes).unwrap_or(0),
         created_at: m.created_at,
-        modified_at: m.modified_at,
+        updated_at: m.updated_at,
         upload_expires_at: m.upload_expires_at,
     }
 }

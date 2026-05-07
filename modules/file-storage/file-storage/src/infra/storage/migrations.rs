@@ -1,6 +1,4 @@
-//! SeaORM migrations for the FileStorage module.
-//!
-//! P1 ships a single migration that mirrors `modules/file-storage/docs/migration.sql`.
+//! SeaORM migrations for the FileStorage module (P1).
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
@@ -23,6 +21,8 @@ impl MigrationTrait for InitialV1 {
         let backend = manager.get_database_backend();
         let conn = manager.get_connection();
 
+        // P1 status set: pending_upload | completing | uploaded |
+        // meta_updating | deleting (5 states; transient + stable terminal).
         let create_table = match backend {
             sea_orm::DatabaseBackend::Postgres => {
                 r#"
@@ -37,12 +37,12 @@ CREATE TABLE IF NOT EXISTS files (
     mime_type                     VARCHAR(256) NOT NULL,
     size_bytes                    BIGINT NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
     etag                          VARCHAR(128) NOT NULL,
-    meta_revision                 BIGINT NOT NULL DEFAULT 0 CHECK (meta_revision >= 0),
+    version_id                    VARCHAR(1024),
     status                        VARCHAR(16) NOT NULL DEFAULT 'pending_upload',
     custom_metadata               JSONB NOT NULL,
     upload_expires_at             TIMESTAMPTZ,
     created_at                    TIMESTAMPTZ NOT NULL,
-    modified_at                   TIMESTAMPTZ NOT NULL
+    updated_at                    TIMESTAMPTZ NOT NULL
 );
 "#
             }
@@ -59,12 +59,12 @@ CREATE TABLE IF NOT EXISTS files (
     mime_type                     VARCHAR(256) NOT NULL,
     size_bytes                    BIGINT NOT NULL DEFAULT 0,
     etag                          VARCHAR(128) NOT NULL,
-    meta_revision                 BIGINT NOT NULL DEFAULT 0,
+    version_id                    VARCHAR(1024) NULL,
     status                        VARCHAR(16) NOT NULL DEFAULT 'pending_upload',
     custom_metadata               JSON NOT NULL,
     upload_expires_at             DATETIME(6) NULL,
     created_at                    DATETIME(6) NOT NULL,
-    modified_at                   DATETIME(6) NOT NULL
+    updated_at                    DATETIME(6) NOT NULL
 );
 "#
             }
@@ -81,35 +81,17 @@ CREATE TABLE IF NOT EXISTS files (
     mime_type                     TEXT NOT NULL,
     size_bytes                    INTEGER NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
     etag                          TEXT NOT NULL,
-    meta_revision                 INTEGER NOT NULL DEFAULT 0 CHECK (meta_revision >= 0),
+    version_id                    TEXT,
     status                        TEXT NOT NULL DEFAULT 'pending_upload',
     custom_metadata               TEXT NOT NULL,
     upload_expires_at             TEXT,
     created_at                    TEXT NOT NULL,
-    modified_at                   TEXT NOT NULL
+    updated_at                    TEXT NOT NULL
 );
 "#
             }
         };
         conn.execute_unprepared(create_table).await?;
-
-        // Partial unique index — supported by Postgres and SQLite.
-        let partial_uq = match backend {
-            sea_orm::DatabaseBackend::Postgres => {
-                "CREATE UNIQUE INDEX IF NOT EXISTS files_tenant_backend_path_uploaded_uq \
-                 ON files (tenant_id, backend_id, file_path) \
-                 WHERE status = 'uploaded';"
-            }
-            sea_orm::DatabaseBackend::Sqlite => {
-                "CREATE UNIQUE INDEX IF NOT EXISTS files_tenant_backend_path_uploaded_uq \
-                 ON files (tenant_id, backend_id, file_path) \
-                 WHERE status = 'uploaded';"
-            }
-            sea_orm::DatabaseBackend::MySql => "",
-        };
-        if !partial_uq.is_empty() {
-            conn.execute_unprepared(partial_uq).await?;
-        }
 
         let other_indexes = [
             "CREATE INDEX IF NOT EXISTS files_tenant_backend_owner_idx \

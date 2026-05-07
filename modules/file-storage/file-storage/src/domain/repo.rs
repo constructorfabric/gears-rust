@@ -1,12 +1,4 @@
-//! `FilesRepo` trait — the persistence boundary for FileStorage.
-//!
-//! Owns every read/write against `file_storage.files` so the service layer
-//! never touches SeaORM directly. The contract is shaped around the
-//! optimistic-concurrency primitive — every mutation is a single
-//! etag-conditional UPDATE that returns the row count (0 → caller lost the
-//! race; 1 → caller won) — plus the partial unique index that uniqueness-
-//! enforces last-write-wins on `(tenant_id, backend_id, file_path)` for
-//! `status = 'uploaded'` rows.
+//! `FilesRepo` trait — the persistence boundary for FileStorage (P1).
 
 use async_trait::async_trait;
 use file_storage_sdk::{FileInfo, FileMetaUpdate, FileStatus};
@@ -16,7 +8,7 @@ use uuid::Uuid;
 
 use super::error::DomainError;
 
-/// Outcome of an etag-conditional UPDATE/DELETE.
+/// Outcome of a conditional UPDATE / DELETE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationOutcome {
     /// Row updated. Caller wins.
@@ -25,7 +17,6 @@ pub enum MutationOutcome {
     NoMatch,
 }
 
-/// Snapshot the repo returns when it inserts a new pending-upload row.
 #[derive(Debug, Clone)]
 pub struct InsertPendingArgs {
     pub file_id: Uuid,
@@ -45,14 +36,7 @@ pub struct InsertPendingArgs {
 #[derive(Debug, Clone)]
 pub struct ListFilesArgs {
     pub tenant_id: Uuid,
-    /// Filter by owner principal. `None` = caller-default scope (caller
-    /// resolves this before invoking the repo).
     pub owner_id: Option<Uuid>,
-    pub backend_id: Option<Uuid>,
-    pub mime_type: Option<String>,
-    pub gts_file_type: Option<String>,
-    pub created_after: Option<OffsetDateTime>,
-    pub created_before: Option<OffsetDateTime>,
     pub cursor: Option<String>,
     pub limit: u32,
 }
@@ -63,28 +47,11 @@ pub struct ListFilesPage {
     pub next_cursor: Option<String>,
 }
 
-/// Tag for the kind of late-arrival branch chosen by `change_status`.
+/// Outcome of a status / etag transition.
 #[derive(Debug, Clone)]
 pub enum ChangeStatusOutcome {
-    /// Standard etag-conditional UPDATE matched 1 row — caller wins.
     Applied(FileInfo),
-    /// 0 rows matched the standard UPDATE.
     NoMatch,
-}
-
-#[derive(Debug, Clone)]
-pub struct DeleteOutcome {
-    pub outcome: MutationOutcome,
-    /// `(backend_id, file_id)` of the deleted row, when the delete was
-    /// applied. Used by the orphan-delete worker to derive the S3 key.
-    pub backend_id: Option<Uuid>,
-}
-
-/// Internal-only projection over the row's persistence-layer fields.
-#[derive(Debug, Clone)]
-pub struct PersistenceFields {
-    pub backend_id: Uuid,
-    pub meta_revision: i64,
 }
 
 #[async_trait]
@@ -108,48 +75,95 @@ pub trait FilesRepo: Send + Sync {
         file_id: Uuid,
     ) -> Result<Option<FileInfo>, DomainError>;
 
-    async fn get_persistence_fields<C: DBRunner>(
-        &self,
-        runner: &C,
-        file_id: Uuid,
-    ) -> Result<Option<PersistenceFields>, DomainError>;
-
-    async fn update_metadata_etag_conditional<C: DBRunner>(
+    /// Phase 1 of `complete_upload`: `pending_upload → completing` via
+    /// conditional UPDATE on `(file_id, status='pending_upload')`.
+    async fn begin_complete_upload<C: DBRunner>(
         &self,
         runner: &C,
         tenant_id: Uuid,
         file_id: Uuid,
-        old_etag: &str,
-        update: &FileMetaUpdate,
-        new_content_hash: Option<&str>,
         now: OffsetDateTime,
-    ) -> Result<ChangeStatusOutcome, DomainError>;
+    ) -> Result<MutationOutcome, DomainError>;
 
-    async fn change_status_with_supersession<C: DBRunner>(
+    /// Phase 3 of `complete_upload`: `completing → uploaded` writing the
+    /// finalized `(etag, version_id, size_bytes)` and clearing
+    /// `upload_expires_at`.
+    async fn finish_complete_upload<C: DBRunner>(
         &self,
         runner: &C,
         tenant_id: Uuid,
         file_id: Uuid,
-        old_etag: &str,
-        target: FileStatus,
-        new_content_hash: &str,
-        now: OffsetDateTime,
-    ) -> Result<ChangeStatusOutcome, DomainError>;
-
-    async fn delete_etag_conditional<C: DBRunner>(
-        &self,
-        runner: &C,
-        tenant_id: Uuid,
-        file_id: Uuid,
-        old_etag: &str,
-    ) -> Result<DeleteOutcome, DomainError>;
-
-    async fn repair_etag_system_context<C: DBRunner>(
-        &self,
-        runner: &C,
-        file_id: Uuid,
-        old_etag: &str,
         new_etag: &str,
+        new_version_id: Option<&str>,
+        new_size_bytes: u64,
+        now: OffsetDateTime,
+    ) -> Result<ChangeStatusOutcome, DomainError>;
+
+    /// Phase 1 of `put_file_info`: `uploaded → meta_updating` via
+    /// conditional UPDATE that captures the row's current etag/version_id.
+    async fn begin_meta_update<C: DBRunner>(
+        &self,
+        runner: &C,
+        tenant_id: Uuid,
+        file_id: Uuid,
+        old_etag: Option<&str>,
+        old_version_id: Option<&str>,
+        update: &FileMetaUpdate,
+        now: OffsetDateTime,
+    ) -> Result<ChangeStatusOutcome, DomainError>;
+
+    /// Phase 3 of `put_file_info`: `meta_updating → uploaded` writing the
+    /// new `(etag, version_id)` (whatever S3 returned from the
+    /// `CopyObject` self-copy).
+    async fn finish_meta_update<C: DBRunner>(
+        &self,
+        runner: &C,
+        tenant_id: Uuid,
+        file_id: Uuid,
+        new_etag: &str,
+        new_version_id: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<ChangeStatusOutcome, DomainError>;
+
+    /// Phase 1 of `delete_file`: `uploaded → deleting`.
+    async fn begin_delete<C: DBRunner>(
+        &self,
+        runner: &C,
+        tenant_id: Uuid,
+        file_id: Uuid,
+        old_etag: Option<&str>,
+        old_version_id: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<MutationOutcome, DomainError>;
+
+    /// Phase 3 of `delete_file`: hard DELETE of a `deleting` row.
+    async fn finish_delete<C: DBRunner>(
+        &self,
+        runner: &C,
+        tenant_id: Uuid,
+        file_id: Uuid,
+    ) -> Result<MutationOutcome, DomainError>;
+
+    /// Hard DELETE used by `abort_upload` (initial-upload variant).
+    async fn delete_pending_upload<C: DBRunner>(
+        &self,
+        runner: &C,
+        tenant_id: Uuid,
+        file_id: Uuid,
+    ) -> Result<MutationOutcome, DomainError>;
+
+    /// Roll a row's status and (etag, version_id) atomically — used by
+    /// in-band recovery to flip transient states (`Completing` /
+    /// `MetaUpdating`) back to `Uploaded` after a successful HEAD-and-sync.
+    async fn rollforward_to_uploaded_system<C: DBRunner>(
+        &self,
+        runner: &C,
+        file_id: Uuid,
+        from_status: FileStatus,
+        new_etag: &str,
+        new_version_id: Option<&str>,
+        new_size_bytes: u64,
+        now: OffsetDateTime,
     ) -> Result<MutationOutcome, DomainError>;
 
     async fn list_paginated<C: DBRunner>(
