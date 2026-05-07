@@ -21,3 +21,39 @@ pub fn compose(content_hash: &str, meta_revision: i64) -> Etag {
     hasher.update(meta_revision.to_string().as_bytes());
     hex::encode(hasher.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_is_deterministic_for_same_inputs() {
+        let a = compose("abc123", 7);
+        let b = compose("abc123", 7);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compose_differs_for_different_content() {
+        assert_ne!(compose("aaa", 1), compose("bbb", 1));
+    }
+
+    #[test]
+    fn compose_differs_for_different_revision() {
+        assert_ne!(compose("aaa", 1), compose("aaa", 2));
+    }
+
+    #[test]
+    fn compose_returns_hex_sha256_64_chars() {
+        let e = compose("anything", 0);
+        assert_eq!(e.len(), 64, "sha256 hex is 64 chars: got {e}");
+        assert!(e.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn compose_handles_empty_content_hash() {
+        // Sentinel state for fresh `pending_upload` rows.
+        let e = compose("", 0);
+        assert_eq!(e.len(), 64);
+    }
+}

@@ -16,9 +16,6 @@ pub mod api;
 pub mod errors;
 pub mod models;
 
-#[cfg(test)]
-mod models_test;
-
 pub use api::FileStorageClient;
 pub use errors::FileStorageError;
 pub use models::{

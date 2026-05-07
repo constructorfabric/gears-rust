@@ -109,3 +109,96 @@ impl From<DomainError> for FileStorageError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(e: DomainError) -> FileStorageError {
+        e.into()
+    }
+
+    #[test]
+    fn domain_errors_map_to_sdk_variants() {
+        let cases: Vec<(DomainError, &str)> = vec![
+            (DomainError::NotFound, "NotFound"),
+            (DomainError::AccessDenied("x".into()), "AccessDenied"),
+            (DomainError::BadRequest("bad".into()), "BadRequest"),
+            (DomainError::EtagMismatch, "EtagMismatch"),
+            (DomainError::DeleteInProgress, "DeleteInProgress"),
+            (
+                DomainError::CapabilityUnavailable("c".into()),
+                "CapabilityUnavailable",
+            ),
+            (
+                DomainError::PayloadTooLarge { max_bytes: 1 },
+                "PayloadTooLarge",
+            ),
+            (DomainError::UploadExpired, "UploadExpired"),
+            (DomainError::BackendFailure("b".into()), "BackendFailure"),
+            (DomainError::Internal("x".into()), "Internal"),
+            (DomainError::Database("x".into()), "Internal"),
+            (DomainError::Conflict, "BackendFailure"),
+        ];
+        for (input, expected_kind) in cases {
+            let actual = map(input);
+            let actual_kind = match &actual {
+                FileStorageError::NotFound => "NotFound",
+                FileStorageError::AccessDenied => "AccessDenied",
+                FileStorageError::BadRequest(_) => "BadRequest",
+                FileStorageError::EtagMismatch => "EtagMismatch",
+                FileStorageError::DeleteInProgress => "DeleteInProgress",
+                FileStorageError::CapabilityUnavailable(_) => "CapabilityUnavailable",
+                FileStorageError::PayloadTooLarge { .. } => "PayloadTooLarge",
+                FileStorageError::UploadExpired => "UploadExpired",
+                FileStorageError::BackendFailure(_) => "BackendFailure",
+                FileStorageError::Internal => "Internal",
+            };
+            assert_eq!(actual_kind, expected_kind, "for: {actual:?}");
+        }
+    }
+
+    #[test]
+    fn payload_too_large_preserves_max_bytes() {
+        let mapped = map(DomainError::PayloadTooLarge { max_bytes: 4096 });
+        assert!(matches!(
+            mapped,
+            FileStorageError::PayloadTooLarge { max_bytes: 4096 }
+        ));
+    }
+
+    #[test]
+    fn bad_request_preserves_message() {
+        let mapped = map(DomainError::BadRequest("invalid x".into()));
+        match mapped {
+            FileStorageError::BadRequest(s) => assert_eq!(s, "invalid x"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conflict_collapses_to_backend_failure() {
+        let mapped = map(DomainError::Conflict);
+        assert!(matches!(mapped, FileStorageError::BackendFailure(_)));
+    }
+
+    #[test]
+    fn helper_constructors_set_variants() {
+        assert!(matches!(
+            DomainError::bad_request("x"),
+            DomainError::BadRequest(_)
+        ));
+        assert!(matches!(
+            DomainError::capability("x"),
+            DomainError::CapabilityUnavailable(_)
+        ));
+        assert!(matches!(
+            DomainError::backend("x"),
+            DomainError::BackendFailure(_)
+        ));
+        assert!(matches!(
+            DomainError::internal("x"),
+            DomainError::Internal(_)
+        ));
+    }
+}

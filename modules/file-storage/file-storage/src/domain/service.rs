@@ -913,3 +913,157 @@ impl OwnerSubject for SecurityContext {
         self.subject_tenant_id()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use file_storage_sdk::CustomMetadata;
+    use uuid::Uuid;
+
+    fn meta_ok() -> FileMeta {
+        FileMeta {
+            name: "doc.pdf".into(),
+            mime_type: "application/pdf".into(),
+            gts_file_type: "gts.cf.fstorage.file.type.v1~document".into(),
+            custom_metadata: CustomMetadata::new(),
+        }
+    }
+
+    fn make_info(etag: &str, version_id: Option<&str>) -> FileInfo {
+        FileInfo {
+            file_id: Uuid::nil(),
+            backend_id: Uuid::nil(),
+            file_path: "f/00000000000000000000000000000000".into(),
+            owner: OwnerRef {
+                tenant_id: Uuid::nil(),
+                owner_id: Uuid::nil(),
+            },
+            meta: meta_ok(),
+            status: FileStatus::Uploaded,
+            etag: etag.into(),
+            version_id: version_id.map(String::from),
+            size_bytes: 0,
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+            upload_expires_at: None,
+        }
+    }
+
+    // ── validate_meta ───────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_meta_accepts_well_formed() {
+        assert!(validate_meta(&meta_ok()).is_ok());
+    }
+
+    #[test]
+    fn validate_meta_rejects_empty_name() {
+        let mut m = meta_ok();
+        m.name = String::new();
+        assert!(matches!(
+            validate_meta(&m).unwrap_err(),
+            DomainError::BadRequest(_)
+        ));
+    }
+
+    #[test]
+    fn validate_meta_rejects_empty_mime() {
+        let mut m = meta_ok();
+        m.mime_type = String::new();
+        assert!(matches!(
+            validate_meta(&m).unwrap_err(),
+            DomainError::BadRequest(_)
+        ));
+    }
+
+    #[test]
+    fn validate_meta_rejects_empty_gts() {
+        let mut m = meta_ok();
+        m.gts_file_type = String::new();
+        assert!(matches!(
+            validate_meta(&m).unwrap_err(),
+            DomainError::BadRequest(_)
+        ));
+    }
+
+    // ── check_pins ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn check_pins_no_pins_passes() {
+        let row = make_info("abc", None);
+        assert!(check_pins(&row, None, None).is_ok());
+    }
+
+    #[test]
+    fn check_pins_etag_match_passes() {
+        let row = make_info("abc", None);
+        let etag = "abc".to_string();
+        assert!(check_pins(&row, Some(&etag), None).is_ok());
+    }
+
+    #[test]
+    fn check_pins_etag_mismatch_fails() {
+        let row = make_info("abc", None);
+        let etag = "wrong".to_string();
+        assert!(matches!(
+            check_pins(&row, Some(&etag), None).unwrap_err(),
+            DomainError::EtagMismatch
+        ));
+    }
+
+    #[test]
+    fn check_pins_version_match_passes() {
+        let row = make_info("abc", Some("v1"));
+        let v = "v1".to_string();
+        assert!(check_pins(&row, None, Some(&v)).is_ok());
+    }
+
+    #[test]
+    fn check_pins_version_pin_against_no_version_fails() {
+        // Backend without versioning: row.version_id is None, pin is Some.
+        let row = make_info("abc", None);
+        let v = "v1".to_string();
+        assert!(matches!(
+            check_pins(&row, None, Some(&v)).unwrap_err(),
+            DomainError::EtagMismatch
+        ));
+    }
+
+    #[test]
+    fn check_pins_version_mismatch_fails() {
+        let row = make_info("abc", Some("v1"));
+        let v = "v2".to_string();
+        assert!(matches!(
+            check_pins(&row, None, Some(&v)).unwrap_err(),
+            DomainError::EtagMismatch
+        ));
+    }
+
+    #[test]
+    fn check_pins_both_match_passes() {
+        let row = make_info("abc", Some("v1"));
+        let etag = "abc".to_string();
+        let v = "v1".to_string();
+        assert!(check_pins(&row, Some(&etag), Some(&v)).is_ok());
+    }
+
+    // ── file_path_from_meta ─────────────────────────────────────────────────
+
+    #[test]
+    fn file_path_from_meta_includes_file_id_and_name() {
+        let id = Uuid::parse_str("11112222-3333-4444-5555-666677778888").unwrap();
+        let m = meta_ok();
+        let path = file_path_from_meta(&m, id);
+        assert!(path.starts_with("f/11112222333344445555666677778888/"));
+        assert!(path.ends_with("doc.pdf"));
+    }
+
+    #[test]
+    fn file_path_from_meta_is_deterministic() {
+        let id = Uuid::new_v4();
+        let m = meta_ok();
+        let a = file_path_from_meta(&m, id);
+        let b = file_path_from_meta(&m, id);
+        assert_eq!(a, b);
+    }
+}

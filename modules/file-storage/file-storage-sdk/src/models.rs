@@ -395,3 +395,143 @@ pub struct FileList {
     pub items: Vec<FileInfo>,
     pub next_cursor: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_capabilities_p1_whitelist_has_5_entries() {
+        assert_eq!(
+            KNOWN_CAPABILITIES.len(),
+            5,
+            "P1 whitelist must list exactly 5 capability tags"
+        );
+    }
+
+    #[test]
+    fn known_capabilities_contain_expected_tags() {
+        let expected = [
+            "upload.s3.multipart.sigv4.v1",
+            "download.s3.sigv4.v1",
+            "download.s3.sigv4.versioned.v1",
+            "download.s3.public.v1",
+            "download.s3.public.versioned.v1",
+        ];
+        for tag in expected {
+            assert!(
+                KNOWN_CAPABILITIES.contains(&tag),
+                "missing P1 tag: {tag} (whitelist: {KNOWN_CAPABILITIES:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn known_capabilities_have_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for tag in KNOWN_CAPABILITIES {
+            assert!(seen.insert(*tag), "duplicate capability: {tag}");
+        }
+    }
+
+    #[test]
+    fn known_capabilities_match_grammar() {
+        // operation . protocol . algo (.variant)? . v<n>
+        let re_segments = |t: &&&str| -> bool {
+            let segments: Vec<&str> = t.split('.').collect();
+            // operation + 2..=4 descriptors + version = 4..=6 segments
+            if !(4..=6).contains(&segments.len()) {
+                return false;
+            }
+            // last segment is v<n>
+            let last = segments.last().unwrap();
+            if !last.starts_with('v') {
+                return false;
+            }
+            if !last[1..].chars().all(|c| c.is_ascii_digit()) || last.len() < 2 {
+                return false;
+            }
+            // each segment lowercase alphanumeric / underscore
+            segments.iter().all(|s| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            })
+        };
+        for tag in KNOWN_CAPABILITIES.iter() {
+            assert!(re_segments(&tag), "tag does not match grammar: {tag}");
+        }
+    }
+
+    #[test]
+    fn url_params_default_is_sane() {
+        let p = UrlParams::default();
+        assert!(p.expires_in_seconds > 0, "default TTL must be positive");
+        assert!(p.expires_in_seconds <= 7 * 24 * 3600, "default TTL ≤ 7 days");
+        assert!(p.content_disposition.is_none());
+        assert!(p.content_type_override.is_none());
+        assert!(p.allowed_client_cidrs.is_empty());
+    }
+
+    #[test]
+    fn byte_range_inclusive_construction() {
+        let r = ByteRange::Inclusive { start: 0, end: 99 };
+        match r {
+            ByteRange::Inclusive { start, end } => {
+                assert_eq!(start, 0);
+                assert_eq!(end, 99);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn byte_range_from_construction() {
+        let r = ByteRange::From(1024);
+        assert!(matches!(r, ByteRange::From(1024)));
+    }
+
+    #[test]
+    fn byte_range_suffix_construction() {
+        let r = ByteRange::Suffix(64);
+        assert!(matches!(r, ByteRange::Suffix(64)));
+    }
+
+    #[test]
+    fn file_status_all_variants_distinct() {
+        let all = vec![
+            FileStatus::PendingUpload,
+            FileStatus::Completing,
+            FileStatus::Uploaded,
+            FileStatus::MetaUpdating,
+            FileStatus::Deleting,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for s in &all {
+            seen.insert(format!("{s:?}"));
+        }
+        assert_eq!(seen.len(), all.len(), "FileStatus variants must be distinct");
+    }
+
+    #[test]
+    fn resolved_byte_range_construction() {
+        let r = ResolvedByteRange {
+            start: 0,
+            end_inclusive: 99,
+            total: 1000,
+        };
+        assert_eq!(r.start, 0);
+        assert_eq!(r.end_inclusive, 99);
+        assert_eq!(r.total, 1000);
+    }
+
+    #[test]
+    fn uploaded_part_construction() {
+        let p = UploadedPart {
+            part_number: 1,
+            etag: "abc".into(),
+        };
+        assert_eq!(p.part_number, 1);
+        assert_eq!(p.etag, "abc");
+    }
+}

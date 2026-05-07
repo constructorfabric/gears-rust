@@ -171,3 +171,110 @@ pub fn validate_config(cfg: &FileStorageConfig) -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s3cfg(default_private: bool) -> BackendConfig {
+        BackendConfig {
+            id: Uuid::new_v4(),
+            kind: BackendKindCfg::S3Compatible,
+            default_public: false,
+            default_private,
+            endpoint: "https://s3.example.com".into(),
+            region: "us-east-1".into(),
+            bucket: "bkt".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+            max_file_size_bytes: None,
+            max_metadata_bytes: None,
+            max_signed_url_ttl_seconds: 3600,
+            capabilities: vec!["upload.s3.multipart.sigv4.v1".into()],
+            tenant_access: vec![],
+        }
+    }
+
+    #[test]
+    fn empty_config_is_valid() {
+        let cfg = FileStorageConfig::default();
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn config_with_one_default_private_is_valid() {
+        let cfg = FileStorageConfig {
+            backends: vec![s3cfg(true)],
+            ..Default::default()
+        };
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn missing_default_private_with_nonempty_roster_fails() {
+        let cfg = FileStorageConfig {
+            backends: vec![s3cfg(false)],
+            ..Default::default()
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn two_default_private_fails() {
+        let cfg = FileStorageConfig {
+            backends: vec![s3cfg(true), s3cfg(true)],
+            ..Default::default()
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn two_default_public_fails() {
+        let mut a = s3cfg(true);
+        a.default_public = true;
+        let mut b = s3cfg(false);
+        b.default_public = true;
+        let cfg = FileStorageConfig {
+            backends: vec![a, b],
+            ..Default::default()
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn unknown_capability_tag_fails() {
+        let mut b = s3cfg(true);
+        b.capabilities.push("not.a.real.tag.v1".into());
+        let cfg = FileStorageConfig {
+            backends: vec![b],
+            ..Default::default()
+        };
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.contains("unknown capability"), "got: {err}");
+    }
+
+    #[test]
+    fn all_p1_capability_tags_are_accepted() {
+        let mut b = s3cfg(true);
+        b.capabilities = KNOWN_CAPABILITIES.iter().map(|s| s.to_string()).collect();
+        let cfg = FileStorageConfig {
+            backends: vec![b],
+            ..Default::default()
+        };
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn ttl_grace_invariant_enforced() {
+        let mut b = s3cfg(true);
+        b.max_signed_url_ttl_seconds = 1_000_000; // huge
+        let cfg = FileStorageConfig {
+            backends: vec![b],
+            orphan_delete_grace_seconds: 1, // tiny
+            signed_url_clock_skew_margin_seconds: 60,
+            ..Default::default()
+        };
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.contains("orphan_delete_grace_seconds"), "got: {err}");
+    }
+}

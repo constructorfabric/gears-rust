@@ -205,3 +205,40 @@ pub trait StorageBackend: Send + Sync {
 
 /// Type-erased backend instance shared by the registry.
 pub type SharedBackend = Arc<dyn StorageBackend>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn derive_s3_key_uses_simple_hex_prefix() {
+        let id = Uuid::nil();
+        assert_eq!(derive_s3_key(id), "f/00000000000000000000000000000000");
+    }
+
+    #[test]
+    fn derive_s3_key_is_deterministic() {
+        let id = Uuid::parse_str("11112222-3333-4444-5555-666677778888").unwrap();
+        let a = derive_s3_key(id);
+        let b = derive_s3_key(id);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_s3_key_differs_per_file_id() {
+        let a = derive_s3_key(Uuid::new_v4());
+        let b = derive_s3_key(Uuid::new_v4());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_s3_key_no_dashes() {
+        // simple format = no hyphens, lowercase hex only.
+        let id = Uuid::new_v4();
+        let key = derive_s3_key(id);
+        assert!(key.starts_with("f/"));
+        assert!(!key.contains('-'), "key should use simple format: {key}");
+        assert_eq!(key.len(), 2 + 32);
+    }
+}
