@@ -264,7 +264,7 @@ The File Storage P1 design (DESIGN.md, ADR-0001..0005) is decomposed into nine i
   - [ ] `p2` - `cpt-cf-file-storage-principle-presign-first`
   - [ ] `p2` - `cpt-cf-file-storage-principle-stream-by-default`
   - [ ] `p2` - `cpt-cf-file-storage-principle-batch-presigned-urls`
-  - [ ] `p2` - `cpt-cf-file-storage-principle-self-healing`
+  - [ ] `p2` - `cpt-cf-file-storage-principle-multi-phase-commit`
 
 - **Design Constraints Covered**:
 
@@ -344,7 +344,7 @@ The File Storage P1 design (DESIGN.md, ADR-0001..0005) is decomposed into nine i
 
 - **Design Components**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-component-upload-coordinator`
+  - [ ] `p2` - `cpt-cf-file-storage-component-sdk-facade`
 
 - **API**:
   - SDK: `create_presigned_url`, `create_presigned_overwrite_url`, `reconcile`
@@ -397,7 +397,7 @@ The File Storage P1 design (DESIGN.md, ADR-0001..0005) is decomposed into nine i
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-self-healing`
+  - [ ] `p2` - `cpt-cf-file-storage-principle-multi-phase-commit`
 
 - **Design Constraints Covered**:
 

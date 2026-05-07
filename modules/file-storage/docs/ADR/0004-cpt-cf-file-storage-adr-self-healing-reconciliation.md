@@ -188,7 +188,7 @@ The cost is asymmetry inside reconcile: every other meta field is pulled from S3
 ## Traceability
 
 - **PRD**: [PRD.md](../PRD.md)
-- **DESIGN**: [DESIGN.md](../DESIGN.md) §2.1 (`cpt-cf-file-storage-principle-optimistic-concurrency`, `cpt-cf-file-storage-principle-self-healing`), §3.9 ("Self-healing reconciliation").
+- **DESIGN**: [DESIGN.md](../DESIGN.md) §2.1 (`cpt-cf-file-storage-principle-optimistic-concurrency`, `cpt-cf-file-storage-principle-multi-phase-commit`), §3.9 ("Self-healing reconciliation").
 - **Related ADRs**: [ADR-0001](./0001-cpt-cf-file-storage-adr-s3-no-metadata-db.md), [ADR-0002](./0002-cpt-cf-file-storage-adr-opaque-file-ids.md), [ADR-0003](./0003-cpt-cf-file-storage-adr-presigned-put-sigv4.md) (P1 ships PUT-SigV4 without any backend-side preconditions; this ADR carries the full correctness load), [ADR-0005](./0005-cpt-cf-file-storage-adr-versioning-and-aba.md) (versioning and ABA-CAS strategy).
 - **Companion specs**: [rust-traits.md](../rust-traits.md) (`read_file`, `reconcile`, `create_presigned_url`, `create_presigned_overwrite_url` doc-comments)
 

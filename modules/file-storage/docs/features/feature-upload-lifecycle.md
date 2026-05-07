@@ -48,7 +48,7 @@ This feature is the heart of the chat-frontend → chat-backend → FileStorage 
 
 **Requirements**: `cpt-cf-file-storage-fr-upload-file`, `cpt-cf-file-storage-fr-file-ownership`, `cpt-cf-file-storage-fr-authorization`, `cpt-cf-file-storage-fr-file-type-classification`, `cpt-cf-file-storage-fr-data-classification`, `cpt-cf-file-storage-nfr-durability`, `cpt-cf-file-storage-nfr-url-availability`
 
-**Principles**: `cpt-cf-file-storage-principle-presign-first`, `cpt-cf-file-storage-principle-self-healing`, `cpt-cf-file-storage-principle-tenant-owner`
+**Principles**: `cpt-cf-file-storage-principle-presign-first`, `cpt-cf-file-storage-principle-multi-phase-commit`, `cpt-cf-file-storage-principle-tenant-owner`
 
 ### 1.3 Actors
 

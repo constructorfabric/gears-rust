@@ -43,7 +43,7 @@ This feature is the externally-visible HTTP contract of FileStorage. Every consu
 
 **Requirements**: `cpt-cf-file-storage-fr-rest-api`, `cpt-cf-file-storage-interface-rest-api`
 
-**Principles**: `cpt-cf-file-storage-principle-presign-first`, `cpt-cf-file-storage-principle-stream-by-default`, `cpt-cf-file-storage-principle-self-healing`
+**Principles**: `cpt-cf-file-storage-principle-presign-first`, `cpt-cf-file-storage-principle-stream-by-default`, `cpt-cf-file-storage-principle-multi-phase-commit`
 
 ### 1.3 Actors
 

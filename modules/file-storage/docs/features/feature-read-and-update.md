@@ -52,7 +52,7 @@ The eager equivalent of `read_file`'s self-healing — `reconcile(file_id)` — 
 
 **Requirements**: `cpt-cf-file-storage-fr-download-file`, `cpt-cf-file-storage-fr-delete-file`, `cpt-cf-file-storage-fr-get-metadata`, `cpt-cf-file-storage-fr-list-files`, `cpt-cf-file-storage-fr-update-metadata`, `cpt-cf-file-storage-fr-retention-indefinite`, `cpt-cf-file-storage-nfr-transfer-latency`, `cpt-cf-file-storage-nfr-scalability`
 
-**Principles**: `cpt-cf-file-storage-principle-self-healing`, `cpt-cf-file-storage-principle-stream-by-default`, `cpt-cf-file-storage-principle-optimistic-concurrency`, `cpt-cf-file-storage-principle-atomic-metadata`
+**Principles**: `cpt-cf-file-storage-principle-multi-phase-commit`, `cpt-cf-file-storage-principle-stream-by-default`, `cpt-cf-file-storage-principle-optimistic-concurrency`, `cpt-cf-file-storage-principle-atomic-metadata`
 
 ### 1.3 Actors
 
