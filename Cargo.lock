@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "cf-account-management"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "cf-account-management-sdk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "cf-modkit-canonical-errors",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "cf-api-gateway"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "cf-authn-resolver"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "cf-authn-resolver-sdk"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "cf-authz-resolver"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "cf-authz-resolver-sdk"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -1530,7 +1530,7 @@ dependencies = [
 
 [[package]]
 name = "cf-credstore"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "cf-credstore-sdk"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "cf-file-parser"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "cf-grpc-hub"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "cf-mini-chat"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "cf-mini-chat-sdk"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "cf-modkit"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2057,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "cf-module-orchestrator"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "cf-nodes-registry"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2111,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "cf-oagw"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2191,7 +2191,7 @@ dependencies = [
 
 [[package]]
 name = "cf-resource-group"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "cf-resource-group-sdk"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -2243,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "cf-rg-tr-plugin"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2375,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "cf-single-tenant-tr-plugin"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "cf-static-authn-plugin"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "cf-static-authz-plugin"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "cf-static-credstore-plugin"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "cf-static-tr-plugin"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "cf-tenant-resolver"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2517,7 +2517,7 @@ dependencies = [
 
 [[package]]
 name = "cf-tenant-resolver-sdk"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-trait",
  "cf-modkit",
@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "cf-tr-authz-plugin"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "cf-types-registry"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "cf-types-registry-sdk"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "gts",

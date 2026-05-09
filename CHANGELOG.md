@@ -9,6 +9,48 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/cyberfabric/cyberfabric-core/compare/cf-tr-authz-plugin-v0.1.3...cf-tr-authz-plugin-v0.1.4) - 2026-05-09
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-authz-resolver-sdk, cf-tenant-resolver-sdk, cf-types-registry-sdk
+
+## [0.1.22](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-tr-plugin-v0.1.21...cf-static-tr-plugin-v0.1.22) - 2026-05-09
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-tenant-resolver-sdk, cf-types-registry-sdk
+
+## [0.1.19](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-credstore-plugin-v0.1.18...cf-static-credstore-plugin-v0.1.19) - 2026-05-09
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-credstore-sdk, cf-types-registry-sdk
+
+## [0.1.21](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authz-plugin-v0.1.20...cf-static-authz-plugin-v0.1.21) - 2026-05-09
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-authz-resolver-sdk, cf-types-registry-sdk
+
+## [0.3.1](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authn-plugin-v0.3.0...cf-static-authn-plugin-v0.3.1) - 2026-05-09
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-types-registry-sdk, cf-authn-resolver-sdk
+
+## [0.1.23](https://github.com/cyberfabric/cyberfabric-core/compare/cf-single-tenant-tr-plugin-v0.1.22...cf-single-tenant-tr-plugin-v0.1.23) - 2026-05-09
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-tenant-resolver-sdk, cf-types-registry-sdk
+
+## [0.1.4](https://github.com/cyberfabric/cyberfabric-core/compare/cf-rg-tr-plugin-v0.1.3...cf-rg-tr-plugin-v0.1.4) - 2026-05-09
+
+### Other
+
+- updated the following local packages: cf-modkit, cf-tenant-resolver-sdk, cf-types-registry-sdk, cf-resource-group-sdk
+
 ## [0.1.1](https://github.com/cyberfabric/cyberfabric-core/compare/cf-account-management-v0.1.0...cf-account-management-v0.1.1) - 2026-05-07
 
 ### Other
