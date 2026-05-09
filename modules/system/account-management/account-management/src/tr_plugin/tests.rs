@@ -255,14 +255,10 @@ async fn insert_closure(
         barrier: ActiveValue::Set(barrier),
         descendant_status: ActiveValue::Set(descendant_status),
     };
-    secure_insert::<tenant_closure::Entity>(am, &allow_all(), &conn)
+    secure_insert::<tenant_closure::Entity>(am, &AccessScope::allow_all(), &conn)
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     Ok(())
-}
-
-fn allow_all() -> AccessScope {
-    AccessScope::allow_all()
 }
 
 /// Seed a single-root tenant with its self-row.
@@ -671,15 +667,21 @@ async fn is_ancestor_missing_endpoint_yields_not_found() {
 
 // ── Tests: barrier semantics ──────────────────────────────────────────────
 //
-// Hierarchy: A (root) → B (self_managed=true, barrier boundary) → C
+// Hierarchy: A (root) → B → C, where the A→B edge carries barrier=1
+// (simulating a self_managed tenant boundary as AM's writer would set it).
+//
+// The plugin only reads `tenant_closure.barrier`; it never inspects
+// `tenants.self_managed` directly. Tests therefore seed the correct
+// barrier values in the closure rows and leave `self_managed=false` on
+// the tenant rows without loss of fidelity.
 //
 // Closure rows:
 //   (A, A, barrier=0)  — self-row
 //   (B, B, barrier=0)  — self-row
 //   (C, C, barrier=0)  — self-row
-//   (A, B, barrier=1)  — barrier=1 because B is self_managed
-//   (B, C, barrier=0)  — within B's subtree, no extra barrier
-//   (A, C, barrier=1)  — A→C crosses the self_managed boundary
+//   (A, B, barrier=1)  — barrier set by AM writer at tenant-B creation
+//   (B, C, barrier=0)  — within B's subtree, no additional barrier
+//   (A, C, barrier=1)  — A→C inherits the barrier from the A→B edge
 
 async fn seed_barrier_tree(db: &Db) -> Result<(Uuid, Uuid, Uuid)> {
     let a = Uuid::new_v4();
@@ -1039,8 +1041,7 @@ async fn registry_fail_get_tenants_yields_internal() {
 #[tokio::test]
 async fn registry_fail_get_ancestors_yields_internal() {
     let db = setup().await.unwrap();
-    let (root, child) = seed_two_level(&db, ACTIVE, ACTIVE).await.unwrap();
-    let _ = root;
+    let (_root, child) = seed_two_level(&db, ACTIVE, ACTIVE).await.unwrap();
 
     let plugin = make_plugin(db, true);
     let err = plugin
@@ -1075,4 +1076,27 @@ async fn registry_fail_get_descendants_yields_internal() {
         .await
         .unwrap_err();
     assert!(matches!(err, TenantResolverError::Internal(_)));
+}
+
+#[tokio::test]
+async fn is_ancestor_not_affected_by_registry_failure() {
+    // `is_ancestor` probes `tenants` for visibility and `tenant_closure` for
+    // the edge — it never calls TypesRegistryClient. A failing registry must
+    // not affect the result.
+    let db = setup().await.unwrap();
+    let (root, child) = seed_two_level(&db, ACTIVE, ACTIVE).await.unwrap();
+
+    let plugin = make_plugin(db, true); // registry always fails
+    let ok = plugin
+        .is_ancestor(
+            &ctx(),
+            TenantId(root),
+            TenantId(child),
+            &IsAncestorOptions {
+                barrier_mode: BarrierMode::Ignore,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ok, "is_ancestor must not depend on TypesRegistry");
 }
