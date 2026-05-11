@@ -1,0 +1,45 @@
+# SEEK rejects an offset above the high-water mark
+
+The upper bound of the valid last-processed range is `HWM`. A value above it is rejected `400 InvalidInitialPosition` (it would claim to have processed events that don't exist yet).
+
+## Setup
+
+- Run [Cold JOIN against a fresh group](../subscriptions/positive-2.1-cold-join-fresh-group.md) → `{sub_id}`, assigned `("acme.orders.v1", 0)`.
+- Partition `("acme.orders.v1", 0)`: `RF = 100`, `HWM = 5000` → valid range `[99, 5000]`.
+
+## Request
+
+```http
+POST /v1/subscriptions/{sub_id}/positions HTTP/1.1
+Host: broker.example.com
+Authorization: Bearer <tenant-token>
+Content-Type: application/json
+
+{
+  "partition_positions": {
+    "gts.cf.core.events.topic.v1~acme.orders.v1:0": 100000
+  }
+}
+```
+
+## Expected response
+
+- `400 Bad Request` (`PD`)
+
+```json
+{
+  "type": "https://errors.cf.core/events/invalid-initial-position",
+  "title": "InvalidInitialPosition",
+  "status": 400,
+  "detail": "offset 100000 for acme.orders.v1:0 is above the valid range [99, 5000]",
+  "instance": "/v1/subscriptions/{sub_id}/positions",
+  "topic": "gts.cf.core.events.topic.v1~acme.orders.v1",
+  "partition": 0,
+  "requested": "100000",
+  "valid_range": [99, 5000]
+}
+```
+
+## Side effects
+
+- `evbk_group_offsets(group, "acme.orders.v1", 0)` is absent (rejected request commits nothing).

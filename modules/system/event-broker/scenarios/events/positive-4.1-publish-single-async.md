@@ -1,0 +1,42 @@
+# Publish a single event (async, default)
+
+A producer enqueues one event into the per-topic ingest outbox. The default response is `202 Accepted` once durably enqueued; the offset is assigned asynchronously by the storage backend and is never returned inline.
+
+## Setup
+
+- Topic `gts.cf.core.events.topic.v1~acme.orders.v1` is registered.
+- Event type `gts.cf.core.events.event.v1~acme.orders.created.v1` is registered with a `data_schema` requiring `order_id` and `total_cents`.
+
+## Request
+
+```http
+POST /v1/events HTTP/1.1
+Host: broker.example.com
+Authorization: Bearer <tenant-token>
+Content-Type: application/json
+
+{
+  "id": "a1b2c3d4-0000-0000-0000-000000000001",
+  "type": "gts.cf.core.events.event.v1~acme.orders.created.v1",
+  "topic": "gts.cf.core.events.topic.v1~acme.orders.v1",
+  "tenant_id": "<tenant-uuid>",
+  "source": "order-service",
+  "subject": "order-42",
+  "subject_type": "gts.cf.core.events.subject.v1~acme.order.v1",
+  "occurred_at": "2026-05-29T10:00:00Z",
+  "data": { "order_id": "order-42", "total_cents": 4299 }
+}
+```
+
+## Expected response
+
+- `202 Accepted`
+- No `partition` / `sequence` / `offset` in the response — those are server-stamped asynchronously and surfaced only on read.
+
+## Side effects
+
+- The event is durably enqueued in the per-topic ingest outbox.
+- Partition is computed at ingest as `murmur3_32(ascii_bytes("order-42")) % 4` (subject is the hash input since no `partition_key` is set) — see [ADR/0001](../../docs/ADR).
+- `evbk_event` for the resolved `(topic, partition)` gains the event with a server-assigned `sequence` once the backend persists it.
+- `subsequent GET /v1/events:stream` for a subscription assigned that partition, seeded at or before this event's offset, emits the event as one `MP` part.
+- Supplying a read-only field (`partition`, `sequence`, `sequence_time`) on publish would instead return `400 BadRequest` — see [events/negative-4.7](negative-4.7-schema-validation-failure.md) for the validation envelope.
