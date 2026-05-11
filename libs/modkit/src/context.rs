@@ -60,8 +60,8 @@ impl ModuleContextBuilder {
     /// Attach a `DbManager` used by [`for_module`](Self::for_module) to resolve
     /// per-module database handles.
     #[cfg(feature = "db")]
-    pub fn with_db_manager(mut self, db_manager: Option<Arc<DbManager>>) -> Self {
-        self.db_manager = db_manager;
+    pub fn with_db_manager(mut self, db_manager: Arc<DbManager>) -> Self {
+        self.db_manager = Some(db_manager);
         self
     }
 
