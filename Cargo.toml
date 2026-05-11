@@ -91,6 +91,7 @@ members = [
     "gears/system/oagw/oagw-sdk",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
+    "gears/system/event-broker/event-broker-sdk",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
@@ -277,6 +278,9 @@ credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.1.25", path =
 
 # mini-chat
 mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.7", path = "gears/mini-chat/mini-chat-sdk" }
+
+# event-broker
+event-broker-sdk = { package = "cyberware-event-broker-sdk", version = "0.1.0", path = "gears/system/event-broker/event-broker-sdk" }
 
 # System gears
 grpc_hub = { package = "cf-gears-grpc-hub", version = "0.2.7", path = "gears/system/grpc-hub" }
