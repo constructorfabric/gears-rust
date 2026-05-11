@@ -1,0 +1,807 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+use crate::error::{ConsumerError, EventBrokerError};
+use crate::ids::{ConsumerGroupId, EventTypeId, TopicId};
+
+/// Raw event delivered to v1 handlers. `data` is untyped JSON;
+/// typed dispatch is deferred to v2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawEvent {
+    pub id: Uuid,
+    pub type_id: String,
+    pub topic: String,
+    pub tenant_id: Uuid,
+    pub subject: String,
+    pub subject_type: String,
+    pub partition: u32,
+    pub sequence: i64,
+    pub offset: i64,
+    pub occurred_at: DateTime<Utc>,
+    pub sequence_time: DateTime<Utc>,
+    pub trace_parent: Option<String>,
+    pub data: serde_json::Value,
+}
+
+/// Handler outcome without DLQ - `Reject` is structurally absent.
+#[derive(Debug, Clone)]
+pub enum HandlerOutcome {
+    Success,
+    Retry { reason: String },
+}
+
+/// Handler outcome when DLQ is configured - adds `Reject`.
+#[derive(Debug, Clone)]
+pub enum RejectableOutcome {
+    Success,
+    Retry { reason: String },
+    Reject { reason: String },
+}
+
+/// Batch cursor over events from one topic partition.
+pub struct EventBatch<'a> {
+    events: &'a [RawEvent],
+    cursor: usize,
+    processed: usize,
+}
+
+impl<'a> EventBatch<'a> {
+    pub fn new(events: &'a [RawEvent]) -> Self {
+        Self {
+            events,
+            cursor: 0,
+            processed: 0,
+        }
+    }
+
+    pub fn next_event(&self) -> Option<&'a RawEvent> {
+        self.events.get(self.cursor)
+    }
+
+    pub fn next_chunk(&self, n: usize) -> &'a [RawEvent] {
+        let end = self.cursor.saturating_add(n).min(self.events.len());
+        &self.events[self.cursor..end]
+    }
+
+    pub fn ack(&mut self) {
+        self.ack_chunk(1);
+    }
+
+    pub fn ack_chunk(&mut self, count: usize) {
+        let remaining = self.events.len().saturating_sub(self.cursor);
+        let advanced = count.min(remaining);
+        self.cursor += advanced;
+        self.processed += advanced;
+    }
+
+    pub fn reject(&mut self, _reason: impl Into<String>) {
+        self.ack();
+    }
+
+    pub fn processed(&self) -> usize {
+        self.processed
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+/// Topic reference accepted by the consumer builder before registry resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TopicRef {
+    Id(TopicId),
+    Gts(String),
+}
+
+impl TopicRef {
+    pub fn id(id: TopicId) -> Self {
+        Self::Id(id)
+    }
+
+    pub fn gts(gts: impl Into<String>) -> Self {
+        Self::Gts(gts.into())
+    }
+}
+
+impl From<TopicId> for TopicRef {
+    fn from(value: TopicId) -> Self {
+        Self::Id(value)
+    }
+}
+
+/// Event-type reference accepted by the consumer builder before registry resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EventTypeRef {
+    Id(EventTypeId),
+    Gts(String),
+    GtsPattern(String),
+}
+
+impl EventTypeRef {
+    pub fn id(id: EventTypeId) -> Self {
+        Self::Id(id)
+    }
+
+    pub fn gts(gts: impl Into<String>) -> Self {
+        Self::Gts(gts.into())
+    }
+
+    pub fn gts_pattern(pattern: impl Into<String>) -> Self {
+        Self::GtsPattern(pattern.into())
+    }
+}
+
+impl From<EventTypeId> for EventTypeRef {
+    fn from(value: EventTypeId) -> Self {
+        Self::Id(value)
+    }
+}
+
+/// Consumer-group reference for the builder.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConsumerGroupRef {
+    Id(ConsumerGroupId),
+    Gts(String),
+    AutoAnonymous { alias: String },
+}
+
+impl ConsumerGroupRef {
+    pub fn id(id: ConsumerGroupId) -> Self {
+        Self::Id(id)
+    }
+
+    pub fn existing(id: ConsumerGroupId) -> Self {
+        Self::Id(id)
+    }
+
+    pub fn gts(gts: impl Into<String>) -> Self {
+        Self::Gts(gts.into())
+    }
+
+    pub fn auto_anonymous(alias: impl Into<String>) -> Self {
+        Self::AutoAnonymous {
+            alias: alias.into(),
+        }
+    }
+}
+
+impl From<ConsumerGroupId> for ConsumerGroupRef {
+    fn from(value: ConsumerGroupId) -> Self {
+        Self::Id(value)
+    }
+}
+
+/// Broker-side filter engine reference accepted before registry resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FilterEngineRef {
+    Id(Uuid),
+    Gts(String),
+}
+
+impl FilterEngineRef {
+    pub fn id(id: Uuid) -> Self {
+        Self::Id(id)
+    }
+
+    pub fn gts(gts: impl Into<String>) -> Self {
+        Self::Gts(gts.into())
+    }
+}
+
+/// Per-interest imperative subscription filter.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SubscriptionFilterRef {
+    pub engine: FilterEngineRef,
+    pub expression: String,
+}
+
+impl SubscriptionFilterRef {
+    pub fn new(engine: FilterEngineRef, expression: impl Into<String>) -> Self {
+        Self {
+            engine,
+            expression: expression.into(),
+        }
+    }
+
+    pub fn cel(expression: impl Into<String>) -> Self {
+        Self::new(
+            FilterEngineRef::gts("gts.cf.core.events.filter.v1~cf.core.expression.cel.v1"),
+            expression,
+        )
+    }
+}
+
+/// Topic-scoped consumer interest. Event type selectors and filters belong to
+/// exactly one topic.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SubscriptionInterest {
+    pub topic: TopicRef,
+    pub event_types: Vec<EventTypeRef>,
+    pub filter: Option<SubscriptionFilterRef>,
+}
+
+impl SubscriptionInterest {
+    pub fn builder() -> SubscriptionInterestBuilder {
+        SubscriptionInterestBuilder::default()
+    }
+}
+
+#[derive(Default)]
+pub struct SubscriptionInterestBuilder {
+    topic: Option<TopicRef>,
+    event_types: Vec<EventTypeRef>,
+    filter: Option<SubscriptionFilterRef>,
+}
+
+impl SubscriptionInterestBuilder {
+    pub fn topic(mut self, topic: impl Into<TopicRef>) -> Self {
+        self.topic = Some(topic.into());
+        self
+    }
+
+    pub fn types<I>(mut self, event_types: I) -> Self
+    where
+        I: IntoIterator<Item = EventTypeRef>,
+    {
+        self.event_types.extend(event_types);
+        self
+    }
+
+    pub fn filter(mut self, filter: SubscriptionFilterRef) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    pub fn build(self) -> Result<SubscriptionInterest, EventBrokerError> {
+        let topic = self
+            .topic
+            .ok_or_else(|| EventBrokerError::InvalidConsumerOptions {
+                detail: "subscription interest requires a topic".to_owned(),
+                instance: String::new(),
+            })?;
+        if self.event_types.is_empty() {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "subscription interest requires at least one event type selector"
+                    .to_owned(),
+                instance: String::new(),
+            });
+        }
+        Ok(SubscriptionInterest {
+            topic,
+            event_types: self.event_types,
+            filter: self.filter,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventTypeSelector {
+    Exact(Vec<EventTypeId>),
+    RegistryPattern(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FilterEngineId(pub Uuid);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledFilterRef(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSubscriptionFilter {
+    pub engine_id: FilterEngineId,
+    pub compiled: CompiledFilterRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSubscriptionInterest {
+    pub topic_id: TopicId,
+    pub event_type_selectors: Vec<EventTypeSelector>,
+    pub filter: Option<ResolvedSubscriptionFilter>,
+}
+
+#[async_trait::async_trait]
+pub trait TypeRegistryResolver: Send + Sync {
+    async fn resolve_topic(&self, topic: &TopicRef) -> Result<TopicId, EventBrokerError>;
+
+    async fn resolve_event_type(
+        &self,
+        event_type: &EventTypeRef,
+    ) -> Result<EventTypeSelector, EventBrokerError>;
+
+    async fn resolve_consumer_group(
+        &self,
+        group: &ConsumerGroupRef,
+    ) -> Result<ConsumerGroupId, EventBrokerError>;
+
+    async fn resolve_subscription_interest(
+        &self,
+        interest: &SubscriptionInterest,
+    ) -> Result<ResolvedSubscriptionInterest, EventBrokerError> {
+        let topic_id = self.resolve_topic(&interest.topic).await?;
+        let mut event_type_selectors = Vec::with_capacity(interest.event_types.len());
+        for event_type in &interest.event_types {
+            event_type_selectors.push(self.resolve_event_type(event_type).await?);
+        }
+        Ok(ResolvedSubscriptionInterest {
+            topic_id,
+            event_type_selectors,
+            filter: None,
+        })
+    }
+}
+
+pub struct CachedTypeRegistryResolver<R> {
+    inner: Arc<R>,
+    topics: RwLock<HashMap<TopicRef, TopicId>>,
+    event_types: RwLock<HashMap<EventTypeRef, EventTypeSelector>>,
+    groups: RwLock<HashMap<ConsumerGroupRef, ConsumerGroupId>>,
+    interests: RwLock<HashMap<SubscriptionInterest, ResolvedSubscriptionInterest>>,
+}
+
+impl<R> CachedTypeRegistryResolver<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            topics: RwLock::new(HashMap::new()),
+            event_types: RwLock::new(HashMap::new()),
+            groups: RwLock::new(HashMap::new()),
+            interests: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<R> TypeRegistryResolver for CachedTypeRegistryResolver<R>
+where
+    R: TypeRegistryResolver,
+{
+    async fn resolve_topic(&self, topic: &TopicRef) -> Result<TopicId, EventBrokerError> {
+        if let Some(cached) = self.topics.read().await.get(topic).copied() {
+            return Ok(cached);
+        }
+        let resolved = self.inner.resolve_topic(topic).await?;
+        self.topics.write().await.insert(topic.clone(), resolved);
+        Ok(resolved)
+    }
+
+    async fn resolve_event_type(
+        &self,
+        event_type: &EventTypeRef,
+    ) -> Result<EventTypeSelector, EventBrokerError> {
+        if let Some(cached) = self.event_types.read().await.get(event_type).cloned() {
+            return Ok(cached);
+        }
+        let resolved = self.inner.resolve_event_type(event_type).await?;
+        self.event_types
+            .write()
+            .await
+            .insert(event_type.clone(), resolved.clone());
+        Ok(resolved)
+    }
+
+    async fn resolve_consumer_group(
+        &self,
+        group: &ConsumerGroupRef,
+    ) -> Result<ConsumerGroupId, EventBrokerError> {
+        if let Some(cached) = self.groups.read().await.get(group).cloned() {
+            return Ok(cached);
+        }
+        let resolved = self.inner.resolve_consumer_group(group).await?;
+        self.groups
+            .write()
+            .await
+            .insert(group.clone(), resolved.clone());
+        Ok(resolved)
+    }
+
+    async fn resolve_subscription_interest(
+        &self,
+        interest: &SubscriptionInterest,
+    ) -> Result<ResolvedSubscriptionInterest, EventBrokerError> {
+        if let Some(cached) = self.interests.read().await.get(interest).cloned() {
+            return Ok(cached);
+        }
+        let resolved = self.inner.resolve_subscription_interest(interest).await?;
+        self.interests
+            .write()
+            .await
+            .insert(interest.clone(), resolved.clone());
+        Ok(resolved)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerProfile {
+    pub buffering: ConsumerBuffering,
+    pub batching: ConsumerBatching,
+    pub slow_detection: ConsumerSlowDetection,
+    pub retry: ConsumerRetry,
+    pub listener: ConsumerListenerSettings,
+}
+
+impl ConsumerProfile {
+    pub fn default_profile() -> Self {
+        Self {
+            buffering: ConsumerBuffering {
+                partition_capacity: 256,
+                high_watermark: 205,
+                low_watermark: 128,
+            },
+            batching: ConsumerBatching {
+                max_events: 1,
+                max_wait: Duration::from_millis(0),
+            },
+            slow_detection: ConsumerSlowDetection {
+                handler_latency: Duration::from_secs(5),
+                handler_strikes: 3,
+            },
+            retry: ConsumerRetry {
+                base_delay: Duration::from_secs(1),
+                max_delay: Duration::from_secs(60),
+            },
+            listener: ConsumerListenerSettings {
+                timeout: Duration::from_millis(250),
+                channel_capacity: 1024,
+            },
+        }
+    }
+
+    pub fn low_latency() -> Self {
+        Self {
+            buffering: ConsumerBuffering {
+                partition_capacity: 128,
+                high_watermark: 96,
+                low_watermark: 48,
+            },
+            batching: ConsumerBatching {
+                max_events: 1,
+                max_wait: Duration::from_millis(0),
+            },
+            slow_detection: ConsumerSlowDetection {
+                handler_latency: Duration::from_secs(1),
+                handler_strikes: 2,
+            },
+            retry: ConsumerRetry {
+                base_delay: Duration::from_millis(100),
+                max_delay: Duration::from_secs(5),
+            },
+            listener: ConsumerListenerSettings {
+                timeout: Duration::from_millis(100),
+                channel_capacity: 2048,
+            },
+        }
+    }
+
+    pub fn high_throughput() -> Self {
+        Self {
+            buffering: ConsumerBuffering {
+                partition_capacity: 1024,
+                high_watermark: 819,
+                low_watermark: 512,
+            },
+            batching: ConsumerBatching {
+                max_events: 128,
+                max_wait: Duration::from_millis(500),
+            },
+            slow_detection: ConsumerSlowDetection {
+                handler_latency: Duration::from_secs(10),
+                handler_strikes: 5,
+            },
+            retry: ConsumerRetry {
+                base_delay: Duration::from_secs(1),
+                max_delay: Duration::from_secs(120),
+            },
+            listener: ConsumerListenerSettings {
+                timeout: Duration::from_millis(500),
+                channel_capacity: 4096,
+            },
+        }
+    }
+
+    pub fn replay() -> Self {
+        Self {
+            buffering: ConsumerBuffering {
+                partition_capacity: 4096,
+                high_watermark: 3584,
+                low_watermark: 2048,
+            },
+            batching: ConsumerBatching {
+                max_events: 512,
+                max_wait: Duration::from_secs(1),
+            },
+            slow_detection: ConsumerSlowDetection {
+                handler_latency: Duration::from_secs(60),
+                handler_strikes: 10,
+            },
+            retry: ConsumerRetry {
+                base_delay: Duration::from_secs(2),
+                max_delay: Duration::from_secs(300),
+            },
+            listener: ConsumerListenerSettings {
+                timeout: Duration::from_millis(500),
+                channel_capacity: 1024,
+            },
+        }
+    }
+
+    pub fn relaxed() -> Self {
+        Self {
+            buffering: ConsumerBuffering {
+                partition_capacity: 128,
+                high_watermark: 102,
+                low_watermark: 64,
+            },
+            batching: ConsumerBatching {
+                max_events: 16,
+                max_wait: Duration::from_secs(2),
+            },
+            slow_detection: ConsumerSlowDetection {
+                handler_latency: Duration::from_secs(30),
+                handler_strikes: 5,
+            },
+            retry: ConsumerRetry {
+                base_delay: Duration::from_secs(5),
+                max_delay: Duration::from_secs(300),
+            },
+            listener: ConsumerListenerSettings {
+                timeout: Duration::from_millis(250),
+                channel_capacity: 256,
+            },
+        }
+    }
+}
+
+impl Default for ConsumerProfile {
+    fn default() -> Self {
+        Self::default_profile()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerSettings {
+    pub buffering: ConsumerBuffering,
+    pub batching: ConsumerBatching,
+    pub slow_detection: ConsumerSlowDetection,
+    pub retry: ConsumerRetry,
+    pub listener: ConsumerListenerSettings,
+}
+
+impl ConsumerSettings {
+    pub fn from_profile(profile: ConsumerProfile) -> Self {
+        Self {
+            buffering: profile.buffering,
+            batching: profile.batching,
+            slow_detection: profile.slow_detection,
+            retry: profile.retry,
+            listener: profile.listener,
+        }
+    }
+
+    pub fn resolve(profile: ConsumerProfile, overrides: ConsumerSettingsOverrides) -> Self {
+        Self {
+            buffering: overrides.buffering.unwrap_or(profile.buffering),
+            batching: overrides.batching.unwrap_or(profile.batching),
+            slow_detection: overrides.slow_detection.unwrap_or(profile.slow_detection),
+            retry: overrides.retry.unwrap_or(profile.retry),
+            listener: overrides.listener.unwrap_or(profile.listener),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), EventBrokerError> {
+        if self.buffering.partition_capacity == 0 {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "partition buffer capacity must be greater than zero".to_owned(),
+                instance: String::new(),
+            });
+        }
+        if self.buffering.high_watermark > self.buffering.partition_capacity {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "buffer high watermark must not exceed partition capacity".to_owned(),
+                instance: String::new(),
+            });
+        }
+        if self.buffering.low_watermark > self.buffering.high_watermark {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "buffer low watermark must not exceed high watermark".to_owned(),
+                instance: String::new(),
+            });
+        }
+        if self.batching.max_events == 0 {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "batching max_events must be greater than zero".to_owned(),
+                instance: String::new(),
+            });
+        }
+        if self.slow_detection.handler_strikes == 0 {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "slow detection handler_strikes must be greater than zero".to_owned(),
+                instance: String::new(),
+            });
+        }
+        if self.retry.max_delay < self.retry.base_delay {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "retry max_delay must be greater than or equal to base_delay".to_owned(),
+                instance: String::new(),
+            });
+        }
+        if self.listener.channel_capacity == 0 {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "listener channel capacity must be greater than zero".to_owned(),
+                instance: String::new(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConsumerSettingsOverrides {
+    pub buffering: Option<ConsumerBuffering>,
+    pub batching: Option<ConsumerBatching>,
+    pub slow_detection: Option<ConsumerSlowDetection>,
+    pub retry: Option<ConsumerRetry>,
+    pub listener: Option<ConsumerListenerSettings>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumerBuffering {
+    pub partition_capacity: usize,
+    pub high_watermark: usize,
+    pub low_watermark: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumerBatching {
+    pub max_events: usize,
+    pub max_wait: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumerSlowDetection {
+    pub handler_latency: Duration,
+    pub handler_strikes: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumerRetry {
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerCommitMode {
+    Auto { interval: Duration },
+    Manual,
+}
+
+impl ConsumerCommitMode {
+    pub fn auto(interval: Duration) -> Self {
+        Self::Auto { interval }
+    }
+
+    pub fn manual() -> Self {
+        Self::Manual
+    }
+}
+
+impl Default for ConsumerCommitMode {
+    fn default() -> Self {
+        Self::Auto {
+            interval: Duration::from_secs(20),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumerListenerSettings {
+    pub timeout: Duration,
+    pub channel_capacity: usize,
+}
+
+/// Payload passed to the `on_dead_letter` callback.
+#[derive(Debug, Clone)]
+pub struct DeadLetterEvent {
+    pub event: RawEvent,
+    pub reason: String,
+    pub attempts: u16,
+}
+
+/// Generic handler trait. The `Commit` and `Outcome` type parameters are bound by
+/// the builder's typestate, ensuring compile-time enforcement of DLQ and in-tx commit.
+#[async_trait::async_trait]
+pub trait EventHandler<Commit, Outcome>: Send + Sync {
+    async fn handle(
+        &self,
+        event: RawEvent,
+        attempts: u16,
+        commit: Commit,
+    ) -> Result<Outcome, ConsumerError>;
+}
+
+#[async_trait::async_trait]
+pub trait BatchEventHandler<Commit, Outcome>: Send + Sync {
+    async fn handle_batch(
+        &self,
+        batch: &mut EventBatch<'_>,
+        attempts: u16,
+        commit: Commit,
+    ) -> Result<Outcome, ConsumerError>;
+}
+
+/// Adapts a single-event handler to the batch-first runtime.
+pub struct SingleEventHandlerAdapter<H> {
+    inner: Arc<H>,
+}
+
+impl<H> SingleEventHandlerAdapter<H> {
+    pub fn new(inner: Arc<H>) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner(&self) -> &Arc<H> {
+        &self.inner
+    }
+}
+
+#[async_trait::async_trait]
+impl<H, Commit> BatchEventHandler<Commit, HandlerOutcome> for SingleEventHandlerAdapter<H>
+where
+    H: EventHandler<Commit, HandlerOutcome> + 'static,
+    Commit: Send + 'static,
+{
+    async fn handle_batch(
+        &self,
+        batch: &mut EventBatch<'_>,
+        attempts: u16,
+        commit: Commit,
+    ) -> Result<HandlerOutcome, ConsumerError> {
+        let Some(event) = batch.next_event().cloned() else {
+            let _ = commit;
+            return Ok(HandlerOutcome::Success);
+        };
+
+        let outcome = self.inner.handle(event, attempts, commit).await?;
+        if matches!(outcome, HandlerOutcome::Success) {
+            batch.ack();
+        }
+        Ok(outcome)
+    }
+}
+
+#[async_trait::async_trait]
+impl<H, Commit> BatchEventHandler<Commit, RejectableOutcome> for SingleEventHandlerAdapter<H>
+where
+    H: EventHandler<Commit, RejectableOutcome> + 'static,
+    Commit: Send + 'static,
+{
+    async fn handle_batch(
+        &self,
+        batch: &mut EventBatch<'_>,
+        attempts: u16,
+        commit: Commit,
+    ) -> Result<RejectableOutcome, ConsumerError> {
+        let Some(event) = batch.next_event().cloned() else {
+            let _ = commit;
+            return Ok(RejectableOutcome::Success);
+        };
+
+        let outcome = self.inner.handle(event, attempts, commit).await?;
+        match &outcome {
+            RejectableOutcome::Success => batch.ack(),
+            RejectableOutcome::Reject { reason } => batch.reject(reason.clone()),
+            RejectableOutcome::Retry { .. } => {}
+        }
+        Ok(outcome)
+    }
+}

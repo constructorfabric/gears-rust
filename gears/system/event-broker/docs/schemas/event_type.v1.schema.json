@@ -1,0 +1,31 @@
+{
+  "$id": "gts://gts.cf.core.events.event_type.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Event type resource. Defines the payload contract for events published on a topic. Identified by a GTS event-type identifier and bound to a topic.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "topic", "data_schema"],
+  "properties": {
+    "id": {
+      "description": "Full GTS event-type identifier (e.g., gts.cf.core.events.event_type.v1~vendor.users.created.v1).",
+      "type": "string",
+      "readOnly": true
+    },
+    "topic": {
+      "description": "Full GTS topic identifier this event type belongs to.",
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "data_schema": {
+      "description": "JSON Schema for the event payload. v1 treats event types as immutable: any change requires a new event type with a new GTS identifier.",
+      "type": "object"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "readOnly": true
+    }
+  }
+}

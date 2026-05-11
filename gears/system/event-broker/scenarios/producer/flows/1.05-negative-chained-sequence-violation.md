@@ -1,0 +1,61 @@
+# Chained-mode sequence violation
+
+When `meta.previous` does not match the broker's stored `last_sequence` for `(producer_id, topic, partition)`, the publish is rejected `412 SequenceViolation`. The response carries the broker's current `last_sequence` so the producer can resync.
+
+## Setup
+
+- Producer `{producer_id}` registered in chained mode; `last_sequence` for `({producer_id}, "acme.orders.v1", 0)` is `7`.
+
+## Request
+
+The producer sends `meta.previous = 3` (stale — should be `7`):
+
+```http
+POST /v1/events HTTP/1.1
+Host: broker.example.com
+Authorization: Bearer <tenant-token>
+Content-Type: application/json
+
+{
+  "id": "c0000000-0000-0000-0000-000000000099",
+  "type": "gts.cf.core.events.event.v1~acme.orders.created.v1",
+  "topic": "gts.cf.core.events.topic.v1~acme.orders.v1",
+  "tenant_id": "<tenant-uuid>",
+  "source": "order-service",
+  "subject": "order-chain",
+  "subject_type": "gts.cf.core.events.subject.v1~acme.order.v1",
+  "occurred_at": "2026-05-29T10:08:00Z",
+  "data": { "order_id": "order-chain", "total_cents": 700 },
+  "meta": { "version": 1, "producer_id": "{producer_id}", "previous": 3, "sequence": 4 }
+}
+```
+
+## Expected response
+
+- `412 Precondition Failed` (`PD`)
+- Body includes the broker's current `last_sequence` for resync.
+
+```json
+{
+  "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+  "title": "Failed Precondition",
+  "status": 412,
+  "detail": "meta.previous=3 does not match broker last_sequence=7 for ({producer_id}, acme.orders.v1, 0)",
+  "instance": "/v1/events",
+  "trace_id": "<request-trace-id>",
+  "context": {
+    "violations": [
+      {
+        "type": "sequence_mismatch",
+        "subject": "(producer)",
+        "description": "expected_previous=7"
+      }
+    ]
+  }
+}
+```
+
+## Side effects
+
+- No event is admitted; the producer chain's `last_sequence` stays at `7`.
+- For `:batch`, a sequence violation on any event rejects the whole batch atomically (`412`).
