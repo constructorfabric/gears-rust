@@ -47,40 +47,40 @@ Chosen option: "`for_module()` scoped client bound once at module init", because
 
 ### Consequences
 
-* Good, because call sites remain clean — `emit(ctx, record)` carries no source boilerplate
+* Good, because call sites remain clean — `build_usage_record(...).enqueue()` carries no source boilerplate
 * Good, because the `for_module()` call in module init is the single, auditable point where source is declared, using the compile-time `MODULE_NAME` constant rather than a free-form string
-* Good, because the SDK can enforce metric prefix consistency at `emit()` time and fail fast in the source process before the outbox is written
+* Good, because the emitter validates the metric against the allowed-metrics list at `enqueue()` time and fails fast in the source process before the outbox is written
 * Good, because the module name used for attribution is the same authoritative name registered in the module orchestrator, not a separately maintained string
-* Bad, because consuming modules must store a `ScopedUsageCollectorClientV1` wrapper rather than the raw `UsageCollectorClientV1` trait object — a minor change to client storage conventions
+* Bad, because consuming modules must store a `ScopedUsageEmitter` wrapper rather than the raw `UsageCollectorClientV1` trait object — a minor change to client storage conventions
 * Bad, because source attribution remains self-asserted — a developer can deliberately pass any module name to `for_module()`; this is acceptable given the internal threat model but would not withstand adversarial bypass
 
 ### Confirmation
 
 * Code review: verify each consuming module calls `for_module()` with its own `MODULE_NAME` constant (e.g., `LlmGatewayModule::MODULE_NAME`), not another module's constant
-* SDK unit tests: verify `ScopedUsageCollectorClientV1::emit()` returns an error when the metric name does not start with the declared source module prefix
-* Integration test: verify that emitting a metric with a mismatched prefix (e.g., a file-storage scoped client emitting `llm-gateway.tokens.input`) is rejected at the SDK level before reaching the outbox
+* SDK unit tests: verify `ScopedUsageEmitter::authorize_for()` followed by `build_usage_record(...).enqueue()` returns `UsageEmitterError::MetricNotAllowed` when the metric name is not in the `allowed_metrics` list for the declared source module
+* Integration test: verify that emitting a metric not present in the module's `allowed_metrics` config (e.g., a file-storage scoped emitter attempting to emit `llm-gateway.tokens.input`) is rejected at the SDK level before reaching the outbox
 
 ## Pros and Cons of the Options
 
 ### Per-call source declaration on `emit()` or `UsageRecord`
 
-Pass `source_module` as an explicit parameter to `emit()` or as a required field on `UsageRecord` on every call.
+Pass `source_module` as an explicit parameter to `enqueue()` or as a required field on `UsageRecord` on every call.
 
 * Good, because source attribution is explicit and visible at every call site
 * Good, because no additional wrapper type is required
-* Bad, because every `emit()` call site carries a repetitive boilerplate parameter
-* Bad, because there is no single auditable binding point — the correct module name must be passed correctly across every emit call, increasing the risk of copy-paste errors
+* Bad, because every `enqueue()` call site carries a repetitive boilerplate parameter
+* Bad, because there is no single auditable binding point — the correct module name must be passed correctly across every enqueue call, increasing the risk of copy-paste errors
 * Bad, because there is no natural place to derive the value from `Self::MODULE_NAME`; the call site must supply it manually each time
 
 ### `for_module()` scoped client bound once at module init
 
-The SDK exposes `for_module(name: &str) -> ScopedUsageCollectorClientV1`. Each consuming module calls this once during initialization with `Self::MODULE_NAME` and stores the scoped client. The `ScopedUsageCollectorClientV1` stamps the declared source on every `emit()` and validates the metric prefix.
+The `UsageEmitterV1` trait exposes `for_module(name: &str) -> ScopedUsageEmitter`. Each consuming module calls this once during initialization with `Self::MODULE_NAME` and stores the scoped emitter. The `ScopedUsageEmitter` stamps the declared source on every `enqueue()` and validates the metric against the module's `allowed_metrics` list fetched from the gateway during `authorize_for()`.
 
 * Good, because source attribution is declared once, from the authoritative compile-time constant
-* Good, because call sites are clean — `emit(ctx, record)` with no source parameter
+* Good, because call sites are clean — `build_usage_record(...).enqueue()` with no source parameter
 * Good, because the binding is code-review-auditable in one location (module init)
-* Good, because metric prefix enforcement happens automatically on every emit without call-site involvement
-* Bad, because consuming modules store a `ScopedUsageCollectorClientV1` instead of the raw trait object
+* Good, because allowed-metrics validation happens automatically on every enqueue without call-site involvement
+* Bad, because consuming modules store a `ScopedUsageEmitter` instead of the raw `UsageEmitterV1` trait object
 
 ### Convention-only, no SDK-level source tracking
 
@@ -110,8 +110,8 @@ This decision is stable for the initial release. Revisit if:
 
 This decision directly addresses the following requirements or design elements:
 
-* `cpt-cf-usage-collector-component-sdk` — adds `for_module()` to the SDK component's responsibility scope, returning a `ScopedUsageCollectorClientV1` that binds source attribution and enforces metric prefix at emit time
-* `cpt-cf-usage-collector-interface-sdk-trait` — `for_module()` extends the SDK public interface, returning a `ScopedUsageCollectorClientV1`
-* `cpt-cf-usage-collector-interface-scoped-client` — `ScopedUsageCollectorClientV1` is the type consuming modules store and use for emission; it binds `MODULE_NAME` and validates metric prefix at `emit()` time
+* `cpt-cf-usage-collector-component-emitter` — adds `for_module()` to the emitter component's responsibility scope, returning a `ScopedUsageEmitter` that binds source attribution and validates metrics against the allowed-metrics list
+* `cpt-cf-usage-collector-interface-emitter-trait` — `for_module()` is the entry point on `UsageEmitterV1`, returning a `ScopedUsageEmitter`
+* `cpt-cf-usage-collector-interface-scoped-emitter` — `ScopedUsageEmitter` is the type consuming modules store and use for emission; it binds `MODULE_NAME` and validates the metric against the allowed-metrics list during `authorize_for()`
 * `cpt-cf-usage-collector-principle-fail-closed` — the SDK fails closed on metric prefix mismatch, rejecting the emit before the outbox is written
 * `cpt-cf-usage-collector-fr-ingestion` — source attribution is part of the ingestion record, enabling per-module metric auditing at the gateway and storage layers

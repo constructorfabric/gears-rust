@@ -87,6 +87,7 @@ members = [
     "modules/system/oagw/oagw-sdk",
     "modules/mini-chat/mini-chat-sdk",
     "modules/mini-chat/mini-chat",
+    "modules/system/usage-collector/usage-collector-sdk",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
@@ -254,6 +255,9 @@ credstore-sdk = { package = "cyberware-credstore-sdk", version = "0.1.24", path 
 
 # mini-chat
 mini-chat-sdk = { package = "cyberware-mini-chat-sdk", version = "0.10.6", path = "modules/mini-chat/mini-chat-sdk" }
+
+# usage-collector
+usage-collector-sdk = { package = "cf-usage-collector-sdk", version = "0.1.0", path = "modules/system/usage-collector/usage-collector-sdk" }
 
 # system modules
 grpc_hub = { package = "cyberware-grpc-hub", version = "0.2.6", path = "modules/system/grpc-hub" }
