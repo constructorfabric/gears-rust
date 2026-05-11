@@ -1,0 +1,38 @@
+{
+  "$id": "gts://gts.cf.core.events.topic.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Topic resource. A named logical event stream divided into a fixed number of partitions. Sequencing, offsets, and ordering are scoped to a single (topic, partition).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "partitions"],
+  "properties": {
+    "id": {
+      "description": "Full GTS topic identifier (e.g., gts.cf.core.events.topic.v1~vendor.users.v1).",
+      "type": "string",
+      "readOnly": true
+    },
+    "description": {
+      "type": "string"
+    },
+    "partitions": {
+      "description": "Number of partitions. Required, no default. Fixed at topic creation; cannot be grown or shrunk on a live topic.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "retention": {
+      "description": "ISO 8601 duration (e.g., PT24H) controlling the TTL for evbk_producer_state rows for this topic. Capped at P14D (14 days); values exceeding the cap are rejected at topic creation/update.",
+      "type": "string",
+      "format": "duration"
+    },
+    "streaming": {
+      "description": "Opaque backend configuration. Validated against the chosen backend type's config_schema at topic registration. The well-known sub-field 'backend_selector' (with 'type' + 'metadata' filters) is used by the broker to resolve the backend instance via cluster.discover_shards().",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "readOnly": true
+    }
+  }
+}
