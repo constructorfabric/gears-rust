@@ -247,6 +247,24 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await
             .map_err(DomainError::from)?;
 
+        // Re-parent destination gate: when the request asks for a new parent,
+        // the caller must also hold `update` on that target. The composite
+        // tenant-equality check inside `update_group_inner` answers "is the
+        // move tenant-consistent on the moved group" but not "is the caller
+        // authorized to write into the destination". Run the second PEP call
+        // here so the contract is enforceable in the PEP regardless of policy
+        // quality.
+        let dest_scope = if let Some(new_pid) = req.parent_id {
+            Some(
+                self.enforcer
+                    .access_scope(ctx, &RG_GROUP_RESOURCE, "update", Some(new_pid))
+                    .await
+                    .map_err(DomainError::from)?,
+            )
+        } else {
+            None
+        };
+
         // Pre-validation (stateless, outside transaction).
         // Type is immutable on update — `UpdateGroupRequest` deliberately
         // does not carry a `code` field — so there is nothing to validate
@@ -263,6 +281,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let req = req.clone();
             let scope = scope.clone();
+            let dest_scope = dest_scope.clone();
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
@@ -273,6 +292,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     &*type_repo,
                     tx,
                     &scope,
+                    dest_scope.as_ref(),
                     group_id,
                     &req,
                     &profile,
@@ -287,16 +307,71 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-move-group:p1
     /// Move a group to a new parent (or make it a root).
     ///
-    /// Runs inside a `SERIALIZABLE` transaction with bounded retry (max 3 attempts)
-    /// to ensure cycle detection, invariant checks, and closure table rebuild are atomic.
+    /// Runs the `AuthZ` gate on both the moved group and the destination parent
+    /// (when one is supplied), then delegates to the SERIALIZABLE-bounded
+    /// inner that handles cycle detection, invariants, and closure rebuild.
+    ///
+    /// Two PEP calls — `update` on `group_id` and `update` on `new_parent_id`
+    /// — are required to prevent a caller with write permission on the moved
+    /// group from re-parenting it into a hierarchy they cannot write to.
     pub async fn move_group(
         &self,
+        ctx: &SecurityContext,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
         // Actor sends PUT /api/resource-group/v1/groups/{group_id} with new hierarchy.parent_id
+        // AuthZ gate: caller must have `update` on the moved group.
+        let scope = self
+            .enforcer
+            .access_scope(ctx, &RG_GROUP_RESOURCE, "update", Some(group_id))
+            .await
+            .map_err(DomainError::from)?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
+
+        // AuthZ gate on the destination: caller must also have `update`
+        // on the new parent. Skipped when making the group a root.
+        let dest_scope = if let Some(new_pid) = new_parent_id {
+            Some(
+                self.enforcer
+                    .access_scope(ctx, &RG_GROUP_RESOURCE, "update", Some(new_pid))
+                    .await
+                    .map_err(DomainError::from)?,
+            )
+        } else {
+            None
+        };
+
+        self.move_group_internal(scope, dest_scope, group_id, new_parent_id)
+            .await
+    }
+
+    /// Move a group without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose through a REST handler. Used by
+    /// tests and seeding paths that operate before any caller
+    /// `SecurityContext` exists. Business invariants (cycle detection,
+    /// `allowed_parent_types`, tenant-consistency, closure rebuild) still
+    /// run; only the `PolicyEnforcer` gate is skipped.
+    pub async fn move_group_unscoped(
+        &self,
+        group_id: Uuid,
+        new_parent_id: Option<Uuid>,
+    ) -> Result<ResourceGroup, DomainError> {
+        let scope = modkit_security::AccessScope::allow_all();
+        let dest_scope = new_parent_id.map(|_| modkit_security::AccessScope::allow_all());
+        self.move_group_internal(scope, dest_scope, group_id, new_parent_id)
+            .await
+    }
+
+    async fn move_group_internal(
+        &self,
+        scope: modkit_security::AccessScope,
+        dest_scope: Option<modkit_security::AccessScope>,
+        group_id: Uuid,
+        new_parent_id: Option<Uuid>,
+    ) -> Result<ResourceGroup, DomainError> {
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
@@ -307,6 +382,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+            let scope = scope.clone();
+            let dest_scope = dest_scope.clone();
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
@@ -315,6 +392,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     &*group_repo,
                     &*type_repo,
                     tx,
+                    &scope,
+                    dest_scope.as_ref(),
                     group_id,
                     new_parent_id,
                     &profile,
@@ -757,6 +836,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         type_repo: &TR,
         tx: &impl DBRunner,
         scope: &modkit_security::AccessScope,
+        dest_scope: Option<&modkit_security::AccessScope>,
         group_id: Uuid,
         req: &UpdateGroupRequest,
         profile: &QueryProfile,
@@ -825,6 +905,20 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 .find_model_by_id(tx, new_parent_id)
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
+            // PEP-level check on the destination tenant. Without this, a
+            // caller with `update` on the moved group plus any cross-tenant
+            // write grant on the destination could re-parent across tenants
+            // without the PEP ever evaluating the destination as a resource.
+            // Surfaces as `GroupNotFound` to avoid leaking the foreign tenant.
+            if let Some(ds) = dest_scope
+                && !ds.is_unconstrained()
+                && !ds.contains_uuid(
+                    modkit_security::pep_properties::OWNER_TENANT_ID,
+                    new_parent.tenant_id,
+                )
+            {
+                return Err(DomainError::group_not_found(new_parent_id));
+            }
             if new_parent.tenant_id != existing.tenant_id {
                 // Generic message: do not interpolate tenant ids — the caller
                 // can't act on them legitimately, and disclosing the foreign
@@ -897,15 +991,25 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     }
 
     /// Inner logic for `move_group`, runs inside a SERIALIZABLE transaction.
+    #[allow(clippy::too_many_arguments)]
     async fn move_group_inner(
         group_repo: &GR,
         type_repo: &TR,
         tx: &impl DBRunner,
+        scope: &modkit_security::AccessScope,
+        dest_scope: Option<&modkit_security::AccessScope>,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
         profile: &QueryProfile,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-3
+        // Scope-aware preflight on the moved group — a cross-tenant id must
+        // look the same as a non-existent id from the caller's viewpoint.
+        group_repo
+            .find_by_id(tx, scope, group_id)
+            .await?
+            .ok_or_else(|| DomainError::group_not_found(group_id))?;
+
         // Load group and new parent in transaction
         let existing = group_repo
             .find_model_by_id(tx, group_id)
@@ -940,10 +1044,25 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // in a different tenant than the moved group; tenant-type roots have
         // `tenant_id == group_id`, so the equality check covers them too.
         if let Some(new_parent_id) = new_parent_id {
+            // PEP-level check on the destination: when the caller's `dest_scope`
+            // does not cover the new parent's tenant, surface as `GroupNotFound`
+            // so existence of cross-tenant parents is not leaked. This runs in
+            // addition to the data-level guard below — relying solely on the
+            // tenant equality check would leave the contract enforceable only
+            // through policy, not the PEP.
             let new_parent = group_repo
                 .find_model_by_id(tx, new_parent_id)
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
+            if let Some(ds) = dest_scope
+                && !ds.is_unconstrained()
+                && !ds.contains_uuid(
+                    modkit_security::pep_properties::OWNER_TENANT_ID,
+                    new_parent.tenant_id,
+                )
+            {
+                return Err(DomainError::group_not_found(new_parent_id));
+            }
             if new_parent.tenant_id != existing.tenant_id {
                 // Generic message: do not interpolate tenant ids — the caller
                 // can't act on them legitimately, and disclosing the foreign

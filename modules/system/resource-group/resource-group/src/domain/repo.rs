@@ -268,15 +268,23 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
 
 #[async_trait]
 pub trait MembershipRepositoryTrait: Send + Sync + 'static {
+    /// List memberships filtered by the caller's tenant `AccessScope`.
+    ///
+    /// `resource_group_membership` has no `tenant_id` column; the scope is
+    /// applied via a sub-query against `resource_group.tenant_id`. An
+    /// unconstrained scope (allow-all) skips the filter; a constrained scope
+    /// with no tenant values returns an empty page.
     async fn list_memberships<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError>;
 
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         group_id: Uuid,
         gts_type_id: i16,
         resource_id: &str,
@@ -285,6 +293,7 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
     async fn delete<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         group_id: Uuid,
         gts_type_id: i16,
         resource_id: &str,
@@ -293,6 +302,7 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
     async fn find_by_composite_key<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         group_id: Uuid,
         gts_type_id: i16,
         resource_id: &str,

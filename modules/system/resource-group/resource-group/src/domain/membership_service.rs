@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use modkit_odata::{ODataQuery, Page};
-use modkit_security::{SecurityContext, pep_properties};
+use modkit_security::{AccessScope, SecurityContext, pep_properties};
 use resource_group_sdk::models::ResourceGroupMembership;
 use uuid::Uuid;
 
@@ -74,6 +74,32 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             .map_err(|e| DomainError::database(e.to_string()))
     }
 
+    /// Reject when the caller's `AccessScope` does not include the target
+    /// group's tenant. The PEP's allow/deny decision establishes the
+    /// caller has the permission at all; this check enforces that the
+    /// permission applies to the specific tenant the membership lives in.
+    ///
+    /// `resource_group_membership` has no `tenant_id` column of its own —
+    /// tenant scope is derived from the group via FK (see `DESIGN.md` §4.1).
+    /// `SecureORM` cannot apply tenant filtering to the membership entity
+    /// directly, so the check happens at the domain layer using the loaded
+    /// group model.
+    fn ensure_tenant_in_scope(
+        scope: &AccessScope,
+        group_id: Uuid,
+        tenant_id: Uuid,
+    ) -> Result<(), DomainError> {
+        if scope.is_unconstrained()
+            || scope.contains_uuid(pep_properties::OWNER_TENANT_ID, tenant_id)
+        {
+            return Ok(());
+        }
+        // Treat cross-tenant access as "group not found" so existence of
+        // groups outside the caller's tenant scope is not leaked. Mirrors
+        // `GroupService::get_group_descendants` scope-aware preflight.
+        Err(DomainError::group_not_found(group_id))
+    }
+
     /// Add a membership link between a resource and a group.
     ///
     /// Validates group existence, `resource_type` registration, `allowed_membership_types`
@@ -89,14 +115,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // Validate resource_type is a valid GtsTypePath (validated implicitly by resolve)
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-2
 
-        // AuthZ gate: verify the caller can create memberships
-        let _scope = self
+        // AuthZ gate: verify the caller can create memberships on this group.
+        // `group_id` is passed as resource_id so the PEP can apply per-group
+        // constraints (e.g. RESOURCE_ID-scoped policies).
+        let scope = self
             .enforcer
-            .access_scope(ctx, &RG_MEMBERSHIP_RESOURCE, "create", None)
+            .access_scope(ctx, &RG_MEMBERSHIP_RESOURCE, "create", Some(group_id))
             .await
             .map_err(DomainError::from)?;
 
-        self.add_membership_inner(group_id, resource_type, resource_id)
+        self.add_membership_inner(&scope, group_id, resource_type, resource_id)
             .await
     }
 
@@ -114,13 +142,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ResourceGroupMembership, DomainError> {
-        self.add_membership_inner(group_id, resource_type, resource_id)
+        let scope = AccessScope::allow_all();
+        self.add_membership_inner(&scope, group_id, resource_type, resource_id)
             .await
     }
 
     /// Shared post-authz body of `add_membership` / `add_membership_unscoped`.
     async fn add_membership_inner(
         &self,
+        scope: &AccessScope,
         group_id: Uuid,
         resource_type: &str,
         resource_id: &str,
@@ -137,6 +167,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             .ok_or(DomainError::GroupNotFound { id: group_id })?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-4
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-3
+
+        // Tenant-scope enforcement: the PEP allowed the action on this resource
+        // type, but `resource_group_membership` has no `tenant_id` column for
+        // `SecureORM` to filter on. Enforce here using the group's tenant.
+        // @cpt-algo:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1
+        Self::ensure_tenant_in_scope(scope, group_id, group_model.tenant_id)?;
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-5
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-6
@@ -211,10 +247,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
-        // Insert the membership (repo handles duplicate detection)
+        // Insert the membership (repo handles duplicate detection). The
+        // caller's scope is threaded so the post-insert read-back is
+        // tenant-filtered, matching the contract of the read/delete paths.
         let model = self
             .membership_repo
-            .insert(&conn, group_id, gts_type_id, resource_id)
+            .insert(&conn, scope, group_id, gts_type_id, resource_id)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
@@ -241,15 +279,27 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-1
         // Actor sends DELETE /api/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id}
-        // AuthZ gate: verify the caller can delete memberships
-        let _scope = self
+        // AuthZ gate: verify the caller can delete memberships on this group.
+        let scope = self
             .enforcer
-            .access_scope(ctx, &RG_MEMBERSHIP_RESOURCE, "delete", None)
+            .access_scope(ctx, &RG_MEMBERSHIP_RESOURCE, "delete", Some(group_id))
             .await
             .map_err(DomainError::from)?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-1
 
         let conn = self.conn()?;
+
+        // Tenant-scope enforcement: load the group and verify the caller's
+        // scope covers its tenant. Without this, a caller with `delete`
+        // permission scoped to tenant A could remove memberships from a
+        // group in tenant B if they know the composite key.
+        // @cpt-algo:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1
+        let group_model = self
+            .group_repo
+            .find_model_by_id(&conn, group_id)
+            .await?
+            .ok_or(DomainError::GroupNotFound { id: group_id })?;
+        Self::ensure_tenant_in_scope(&scope, group_id, group_model.tenant_id)?;
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-2
         // Resolve resource_type GTS path to surrogate ID
@@ -266,7 +316,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-4
         // Verify the membership exists
         self.membership_repo
-            .find_by_composite_key(&conn, group_id, gts_type_id, resource_id)
+            .find_by_composite_key(&conn, &scope, group_id, gts_type_id, resource_id)
             .await?
             .ok_or_else(|| {
                 DomainError::membership_not_found(format!(
@@ -277,7 +327,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 
         // Delete the membership
         self.membership_repo
-            .delete(&conn, group_id, gts_type_id, resource_id)
+            .delete(&conn, &scope, group_id, gts_type_id, resource_id)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-3
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-5
@@ -297,8 +347,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-2
         // Parse OData $filter (handled by ODataQuery parameter)
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-2
-        // AuthZ gate: verify the caller can list memberships
-        let _scope = self
+        // AuthZ gate: verify the caller can list memberships.
+        let scope = self
             .enforcer
             .access_scope(ctx, &RG_MEMBERSHIP_RESOURCE, "list", None)
             .await
@@ -310,8 +360,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-5
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-6
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-7
+        // Scope is applied as a tenant subquery on `resource_group.tenant_id`
+        // because `resource_group_membership` has no `tenant_id` column.
         #[allow(clippy::let_and_return)]
-        let result = self.membership_repo.list_memberships(&conn, query).await;
+        let result = self
+            .membership_repo
+            .list_memberships(&conn, &scope, query)
+            .await;
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-7
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-6
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-5

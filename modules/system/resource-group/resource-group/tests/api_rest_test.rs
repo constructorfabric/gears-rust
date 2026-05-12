@@ -131,7 +131,7 @@ async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
     let db = test_db().await;
     let enforcer = make_enforcer();
 
-    let type_svc = Arc::new(TypeService::new(db.clone(), Arc::new(TypeRepository)));
+    let type_svc = Arc::new(common::make_type_service(db.clone()));
     let group_svc = Arc::new(GroupService::new(
         db.clone(),
         QueryProfile::default(),
@@ -230,7 +230,7 @@ async fn create_type_duplicate_returns_409() {
 
     // Pre-create via service
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -287,7 +287,7 @@ async fn list_types_returns_200_with_page() {
     );
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -317,7 +317,7 @@ async fn get_type_returns_200() {
     );
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -368,7 +368,7 @@ async fn delete_type_returns_204() {
     );
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -401,7 +401,7 @@ async fn create_group_returns_201() {
     );
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -533,7 +533,7 @@ async fn rest_put_type_returns_200() {
     );
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -599,7 +599,7 @@ async fn rest_post_membership_returns_201() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -614,7 +614,7 @@ async fn rest_post_membership_returns_201() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -668,7 +668,7 @@ async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &s
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -678,7 +678,7 @@ async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &s
         .await
         .unwrap();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -701,7 +701,7 @@ async fn build_shared_router() -> (
 ) {
     let db = test_db().await;
     let enforcer = make_enforcer();
-    let type_svc = Arc::new(TypeService::new(db.clone(), Arc::new(TypeRepository)));
+    let type_svc = Arc::new(common::make_type_service(db.clone()));
     let group_svc = Arc::new(GroupService::new(
         db.clone(),
         QueryProfile::default(),
@@ -739,7 +739,7 @@ async fn rest_delete_membership_returns_204() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -754,7 +754,7 @@ async fn rest_delete_membership_returns_204() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -825,7 +825,7 @@ async fn rest_post_group_with_parent_returns_201() {
     );
     // Create type first without self-reference, then update to allow self as parent
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: root_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -835,7 +835,7 @@ async fn rest_post_group_with_parent_returns_201() {
         .await
         .unwrap();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &root_type,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -1050,7 +1050,7 @@ async fn rest_create_group_with_metadata() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1089,7 +1089,7 @@ async fn rest_group_response_omits_null_metadata() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1275,7 +1275,7 @@ async fn input_membership_non_gts_resource_type() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: rt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1513,7 +1513,7 @@ async fn input_deser_group_empty_name_returns_400() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1618,7 +1618,7 @@ async fn gts_membership_post_tilde_encoded() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1633,7 +1633,7 @@ async fn gts_membership_post_tilde_encoded() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1684,7 +1684,7 @@ async fn gts_membership_delete_tilde_encoded() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1699,7 +1699,7 @@ async fn gts_membership_delete_tilde_encoded() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1754,7 +1754,7 @@ async fn gts_put_type_tilde_encoded() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1790,7 +1790,7 @@ async fn smallint_type_response_has_no_surrogate_ids() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1827,7 +1827,7 @@ async fn smallint_group_response_has_no_surrogate_ids() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1867,7 +1867,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1882,7 +1882,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2023,7 +2023,7 @@ async fn rest_error_responses_have_problem_content_type_and_status() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],

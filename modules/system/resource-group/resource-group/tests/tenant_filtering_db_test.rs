@@ -26,7 +26,6 @@ use modkit_odata::ODataQuery;
 use modkit_security::pep_properties;
 
 use cyberware_resource_group::domain::group_service::{GroupService, QueryProfile};
-use cyberware_resource_group::domain::type_service::TypeService;
 use cyberware_resource_group::infra::storage::group_repo::GroupRepository;
 use cyberware_resource_group::infra::storage::membership_repo::MembershipRepository;
 use cyberware_resource_group::infra::storage::type_repo::TypeRepository;
@@ -102,7 +101,7 @@ fn make_group_service(
 #[tokio::test]
 async fn tenant_isolation_list_groups() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -181,7 +180,7 @@ async fn tenant_isolation_list_groups() {
 #[tokio::test]
 async fn tenant_isolation_get_group_cross_tenant_invisible() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -210,7 +209,7 @@ async fn tenant_isolation_get_group_cross_tenant_invisible() {
 #[tokio::test]
 async fn tenant_isolation_hierarchy_scoped() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -293,7 +292,7 @@ async fn tenant_isolation_hierarchy_scoped() {
 #[tokio::test]
 async fn tenant_isolation_update_cross_tenant_blocked() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -342,7 +341,7 @@ async fn tenant_isolation_update_cross_tenant_blocked() {
 #[tokio::test]
 async fn tenant_isolation_delete_cross_tenant_blocked() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -482,7 +481,7 @@ async fn group_based_in_group_predicate_produces_combined_scope() {
 #[tokio::test]
 async fn group_based_membership_data_correctly_stored() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant = Uuid::now_v7();
@@ -500,7 +499,7 @@ async fn group_based_membership_data_correctly_stored() {
 
     // Create task type first (project references it in allowed_membership_types)
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: task_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -511,7 +510,7 @@ async fn group_based_membership_data_correctly_stored() {
         .expect("create task type");
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: project_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],

@@ -62,56 +62,56 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 
     async fn create_type(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         request: CreateTypeRequest,
     ) -> Result<ResourceGroupType, ResourceGroupError> {
         self.type_service
-            .create_type(request)
+            .create_type(ctx, request)
             .await
             .map_err(ResourceGroupError::from)
     }
 
     async fn get_type(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         code: &str,
     ) -> Result<ResourceGroupType, ResourceGroupError> {
         self.type_service
-            .get_type(code)
+            .get_type(ctx, code)
             .await
             .map_err(ResourceGroupError::from)
     }
 
     async fn list_types(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
         self.type_service
-            .list_types(query)
+            .list_types(ctx, query)
             .await
             .map_err(ResourceGroupError::from)
     }
 
     async fn update_type(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         code: &str,
         request: UpdateTypeRequest,
     ) -> Result<ResourceGroupType, ResourceGroupError> {
         self.type_service
-            .update_type(code, request)
+            .update_type(ctx, code, request)
             .await
             .map_err(ResourceGroupError::from)
     }
 
     async fn delete_type(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         code: &str,
     ) -> Result<(), ResourceGroupError> {
         self.type_service
-            .delete_type(code)
+            .delete_type(ctx, code)
             .await
             .map_err(ResourceGroupError::from)
     }

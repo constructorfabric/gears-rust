@@ -9,14 +9,11 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use serde_json::json;
 use uuid::Uuid;
 
 use cyberware_resource_group::domain::error::DomainError;
 use cyberware_resource_group::domain::repo::TypeRepositoryTrait;
-use cyberware_resource_group::domain::type_service::TypeService;
 use cyberware_resource_group::infra::storage::entity::{
     gts_type::{self, Entity as GtsTypeEntity},
     gts_type_allowed_membership::{self, Entity as AllowedMembershipEntity},
@@ -52,7 +49,7 @@ fn system_scope() -> AccessScope {
 #[tokio::test]
 async fn type_create_with_valid_parents() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     // Create parent type first
     let parent = common::create_root_type(&type_svc, "parent").await;
@@ -60,7 +57,7 @@ async fn type_create_with_valid_parents() {
     // Create child type with parent in allowed_parent_types
     let child_code = type_code("child");
     let child = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: false,
             allowed_parent_types: vec![parent.code.clone()],
@@ -112,12 +109,12 @@ async fn type_create_with_valid_parents() {
 #[tokio::test]
 async fn type_create_nonexistent_parents() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("orphan");
     let nonexistent_parent = type_code("ghost");
     let err = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: false,
             allowed_parent_types: vec![nonexistent_parent],
@@ -141,12 +138,12 @@ async fn type_create_nonexistent_parents() {
 #[tokio::test]
 async fn type_create_nonexistent_memberships() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("membfail");
     let nonexistent_membership = type_code("nomemb");
     let err = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -166,11 +163,11 @@ async fn type_create_nonexistent_memberships() {
 #[tokio::test]
 async fn type_create_placement_invariant_violation() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("noplacement");
     let err = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: false,
             allowed_parent_types: vec![],
@@ -195,7 +192,7 @@ async fn type_create_placement_invariant_violation() {
 #[tokio::test]
 async fn type_update_replaces_parents() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let parent_a = common::create_root_type(&type_svc, "pa").await;
     let parent_b = common::create_root_type(&type_svc, "pb").await;
@@ -203,7 +200,7 @@ async fn type_update_replaces_parents() {
     // Create child with parent_a
     let child_code = type_code("updchild");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: false,
             allowed_parent_types: vec![parent_a.code.clone()],
@@ -215,7 +212,7 @@ async fn type_update_replaces_parents() {
 
     // Update child to have parent_b instead of parent_a
     let updated = type_svc
-        .update_type(
+        .update_type_unscoped(
             &child_code,
             UpdateTypeRequest {
                 can_be_root: false,
@@ -272,7 +269,7 @@ async fn type_update_replaces_parents() {
 #[tokio::test]
 async fn type_update_remove_parent_in_use() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -298,7 +295,7 @@ async fn type_update_remove_parent_in_use() {
 
     // Try to remove parent_type from child_type's allowed_parent_types
     let err = type_svc
-        .update_type(
+        .update_type_unscoped(
             &child_type.code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -325,7 +322,7 @@ async fn type_update_remove_parent_in_use() {
 #[tokio::test]
 async fn type_update_disable_root_with_root_groups() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -339,7 +336,7 @@ async fn type_update_disable_root_with_root_groups() {
 
     // Try to set can_be_root=false (must provide a parent to satisfy placement invariant)
     let err = type_svc
-        .update_type(
+        .update_type_unscoped(
             &root_type.code,
             UpdateTypeRequest {
                 can_be_root: false,
@@ -365,11 +362,11 @@ async fn type_update_disable_root_with_root_groups() {
 #[tokio::test]
 async fn type_update_not_found() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("notfound");
     let err = type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -391,7 +388,7 @@ async fn type_update_not_found() {
 #[tokio::test]
 async fn type_delete_with_active_groups() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -400,7 +397,7 @@ async fn type_delete_with_active_groups() {
     common::create_root_group(&group_svc, &ctx, &rt.code, "BusyGrp", tenant_id).await;
 
     let err = type_svc
-        .delete_type(&rt.code)
+        .delete_type_unscoped(&rt.code)
         .await
         .expect_err("should fail");
 
@@ -414,12 +411,12 @@ async fn type_delete_with_active_groups() {
 #[tokio::test]
 async fn type_update_placement_invariant_violation() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let rt = common::create_root_type(&type_svc, "updinv").await;
 
     let err = type_svc
-        .update_type(
+        .update_type_unscoped(
             &rt.code,
             UpdateTypeRequest {
                 can_be_root: false,
@@ -446,11 +443,11 @@ async fn type_update_placement_invariant_violation() {
 #[tokio::test]
 async fn type_create_self_reference_parent() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("selfref");
     let err = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: false,
             allowed_parent_types: vec![code],
@@ -471,11 +468,11 @@ async fn type_create_self_reference_parent() {
 #[tokio::test]
 async fn type_create_invalid_parent_format() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("badfmt");
     let err = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: false,
             allowed_parent_types: vec!["invalid-no-prefix".to_owned()],
@@ -499,10 +496,13 @@ async fn type_create_invalid_parent_format() {
 #[tokio::test]
 async fn type_delete_not_found() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("delnf");
-    let err = type_svc.delete_type(&code).await.expect_err("should fail");
+    let err = type_svc
+        .delete_type_unscoped(&code)
+        .await
+        .expect_err("should fail");
 
     assert!(
         matches!(err, DomainError::TypeNotFound { .. }),
@@ -514,7 +514,7 @@ async fn type_delete_not_found() {
 #[tokio::test]
 async fn type_create_with_metadata_schema() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("withmeta");
     let schema = json!({
@@ -525,7 +525,7 @@ async fn type_create_with_metadata_schema() {
     });
 
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -543,7 +543,7 @@ async fn type_create_with_metadata_schema() {
 #[tokio::test]
 async fn type_update_replaces_memberships() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let ma = common::create_root_type(&type_svc, "memba").await;
     let mb = common::create_root_type(&type_svc, "membb").await;
@@ -551,7 +551,7 @@ async fn type_update_replaces_memberships() {
 
     let code = type_code("membupd");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -563,7 +563,7 @@ async fn type_update_replaces_memberships() {
 
     // Update memberships to [B, C]
     let updated = type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -615,12 +615,12 @@ async fn type_update_replaces_memberships() {
 #[tokio::test]
 async fn type_update_hierarchy_check_skips_deleted_parent() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let parent = common::create_root_type(&type_svc, "delpar").await;
     let child_code = type_code("skipchild");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: false,
             allowed_parent_types: vec![parent.code.clone()],
@@ -632,7 +632,7 @@ async fn type_update_hierarchy_check_skips_deleted_parent() {
 
     // Delete the parent type (no groups use it)
     type_svc
-        .delete_type(&parent.code)
+        .delete_type_unscoped(&parent.code)
         .await
         .expect("delete parent");
 
@@ -640,7 +640,7 @@ async fn type_update_hierarchy_check_skips_deleted_parent() {
     // because resolve_id returns None for deleted parent, so no violation check occurs.
     // We must provide can_be_root=true since we are removing the only parent.
     let updated = type_svc
-        .update_type(
+        .update_type_unscoped(
             &child_code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -666,7 +666,7 @@ async fn type_update_hierarchy_check_skips_deleted_parent() {
 #[tokio::test]
 async fn meta_object_schema_roundtrip() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("metaobj");
     let schema = json!({
@@ -677,7 +677,7 @@ async fn meta_object_schema_roundtrip() {
     });
 
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -717,7 +717,7 @@ async fn meta_object_schema_roundtrip() {
     );
 
     // API response (loaded via service) has no __can_be_root
-    let loaded = type_svc.get_type(&code).await.expect("get type");
+    let loaded = type_svc.get_type_unscoped(&code).await.expect("get type");
     if let Some(ref ms) = loaded.metadata_schema {
         assert!(
             ms.get("__can_be_root").is_none(),
@@ -734,13 +734,13 @@ async fn meta_object_schema_roundtrip() {
 #[tokio::test]
 async fn meta_non_object_array_roundtrip() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("metaarr");
     let schema = json!(["string", "number"]);
 
     let result = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -767,13 +767,13 @@ async fn meta_non_object_array_roundtrip() {
 #[tokio::test]
 async fn meta_non_object_string_roundtrip() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("metastr");
     let schema = json!("just a string");
 
     let result = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -804,13 +804,13 @@ async fn meta_non_object_string_roundtrip() {
 #[tokio::test]
 async fn meta_non_object_number_roundtrip() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("metanum");
     let schema = json!(42);
 
     let result = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -835,7 +835,7 @@ async fn meta_non_object_number_roundtrip() {
 #[tokio::test]
 async fn meta_user_can_be_root_overwritten() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("metacbr");
     // User sends __can_be_root=false but the request says can_be_root=true
@@ -845,7 +845,7 @@ async fn meta_user_can_be_root_overwritten() {
     });
 
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -891,7 +891,7 @@ async fn meta_user_can_be_root_overwritten() {
 #[tokio::test]
 async fn meta_internal_keys_stripped() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("metaint");
     let schema = json!({
@@ -900,7 +900,7 @@ async fn meta_internal_keys_stripped() {
     });
 
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -922,7 +922,7 @@ async fn meta_internal_keys_stripped() {
 #[tokio::test]
 async fn meta_single_underscore_key_preserved() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("metasingle");
     let schema = json!({
@@ -930,7 +930,7 @@ async fn meta_single_underscore_key_preserved() {
     });
 
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -953,11 +953,11 @@ async fn meta_single_underscore_key_preserved() {
 #[tokio::test]
 async fn meta_none_stored_with_can_be_root() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("metanone");
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -995,7 +995,7 @@ async fn meta_none_stored_with_can_be_root() {
 #[tokio::test]
 async fn meta_can_be_root_derived_from_stored_key() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     // Test can_be_root=true
     let root_type = common::create_root_type(&type_svc, "cbrtrue").await;
@@ -1045,7 +1045,7 @@ async fn meta_can_be_root_derived_from_stored_key() {
 #[tokio::test]
 async fn meta_can_be_root_fallback_no_stored_key() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("nocbrkey");
 
@@ -1063,7 +1063,7 @@ async fn meta_can_be_root_fallback_no_stored_key() {
         .expect("direct insert");
 
     // Load via service -- no allowed_parent_types so fallback = true
-    let loaded = type_svc.get_type(&code).await.expect("get type");
+    let loaded = type_svc.get_type_unscoped(&code).await.expect("get type");
     assert!(
         loaded.can_be_root,
         "Fallback: no __can_be_root + no parents -> can_be_root=true"
@@ -1118,7 +1118,10 @@ async fn meta_can_be_root_fallback_no_stored_key() {
         .expect("insert junction");
 
     // Load via service -- has allowed_parent_types so fallback = false
-    let loaded_child = type_svc.get_type(&child_code).await.expect("get type");
+    let loaded_child = type_svc
+        .get_type_unscoped(&child_code)
+        .await
+        .expect("get type");
     assert!(
         !loaded_child.can_be_root,
         "Fallback: no __can_be_root + has parents -> can_be_root=false"
@@ -1133,7 +1136,7 @@ async fn meta_can_be_root_fallback_no_stored_key() {
 #[tokio::test]
 async fn meta_any_object_schema_accepted() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     // The root is an object — required by the schema shape rule. Inside,
     // arbitrary keys are tolerated (no keyword-level validation).
@@ -1145,7 +1148,7 @@ async fn meta_any_object_schema_accepted() {
     });
 
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1166,7 +1169,7 @@ async fn meta_any_object_schema_accepted() {
 #[tokio::test]
 async fn gts_resolve_id_existing() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let rt = common::create_root_type(&type_svc, "resid").await;
 
@@ -1205,7 +1208,7 @@ async fn gts_resolve_id_nonexistent() {
 #[tokio::test]
 async fn gts_resolve_ids_all_found() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let t1 = common::create_root_type(&type_svc, "batch1").await;
     let t2 = common::create_root_type(&type_svc, "batch2").await;
@@ -1230,7 +1233,7 @@ async fn gts_resolve_ids_all_found() {
 #[tokio::test]
 async fn gts_resolve_ids_some_missing() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let t1 = common::create_root_type(&type_svc, "partfound").await;
     let missing_code = type_code("missing");
@@ -1297,7 +1300,7 @@ async fn gts_resolve_ids_empty_list() {
 #[tokio::test]
 async fn gts_full_roundtrip_create_resolve_load() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let rt = common::create_root_type(&type_svc, "roundtrip").await;
 
@@ -1324,7 +1327,7 @@ async fn gts_full_roundtrip_create_resolve_load() {
 #[tokio::test]
 async fn gts_load_allowed_parent_types_returns_paths() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let parent = common::create_root_type(&type_svc, "gtspar").await;
     let child = common::create_child_type(&type_svc, "gtschild", &[&parent.code], &[]).await;
@@ -1336,7 +1339,10 @@ async fn gts_load_allowed_parent_types_returns_paths() {
     );
 
     // Also verify via direct get_type (which goes through load_full_type)
-    let loaded = type_svc.get_type(&child.code).await.expect("get type");
+    let loaded = type_svc
+        .get_type_unscoped(&child.code)
+        .await
+        .expect("get type");
     assert_eq!(loaded.allowed_parent_types, vec![parent.code]);
 }
 
@@ -1344,12 +1350,12 @@ async fn gts_load_allowed_parent_types_returns_paths() {
 #[tokio::test]
 async fn gts_load_allowed_membership_types_returns_paths() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let membership_type = common::create_root_type(&type_svc, "gtsmemb").await;
     let code = type_code("gtswithmemb");
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1366,7 +1372,7 @@ async fn gts_load_allowed_membership_types_returns_paths() {
     );
 
     // Verify via get_type
-    let loaded = type_svc.get_type(&code).await.expect("get type");
+    let loaded = type_svc.get_type_unscoped(&code).await.expect("get type");
     assert_eq!(loaded.allowed_membership_types, vec![membership_type.code]);
 }
 
@@ -1378,14 +1384,14 @@ async fn gts_load_allowed_membership_types_returns_paths() {
 #[tokio::test]
 async fn security_metadata_schema_cannot_overwrite_can_be_root() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     // Create a parent type first so we can set can_be_root=false
     let parent = common::create_root_type(&type_svc, "atk01par").await;
 
     let code = type_code("atk01");
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: false,
             allowed_parent_types: vec![parent.code.clone()],
@@ -1409,11 +1415,11 @@ async fn security_metadata_schema_cannot_overwrite_can_be_root() {
 #[tokio::test]
 async fn security_metadata_schema_can_be_root_non_boolean() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("atk02");
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1433,7 +1439,7 @@ async fn security_metadata_schema_can_be_root_non_boolean() {
 #[tokio::test]
 async fn security_metadata_schema_double_underscore_keys_filtered() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("atk03");
     let schema = json!({
@@ -1443,7 +1449,7 @@ async fn security_metadata_schema_double_underscore_keys_filtered() {
     });
 
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1459,7 +1465,7 @@ async fn security_metadata_schema_double_underscore_keys_filtered() {
     // A slip in the filter (e.g. `starts_with('_')` vs `starts_with("__")`,
     // or dropping the filter entirely) would let caller data leak back out,
     // so the assertions below check each case.
-    let loaded = type_svc.get_type(&code).await.expect("get type");
+    let loaded = type_svc.get_type_unscoped(&code).await.expect("get type");
     assert!(loaded.can_be_root, "System fields unaffected by __ keys");
 
     let schema = loaded
@@ -1497,14 +1503,14 @@ async fn security_metadata_schema_double_underscore_keys_filtered() {
 #[tokio::test]
 async fn security_metadata_schema_huge_payload() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("atk04");
     let big_value = "A".repeat(1_000_000);
     let schema = json!({"huge": big_value});
 
     let result = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1516,7 +1522,7 @@ async fn security_metadata_schema_huge_payload() {
     match result {
         Ok(rg_type) => {
             // If accepted, verify roundtrip
-            let loaded = type_svc.get_type(&code).await.expect("get type");
+            let loaded = type_svc.get_type_unscoped(&code).await.expect("get type");
             let schema = loaded.metadata_schema.unwrap();
             assert_eq!(
                 schema["huge"].as_str().unwrap().len(),
@@ -1538,7 +1544,7 @@ async fn security_metadata_schema_huge_payload() {
 #[tokio::test]
 async fn security_metadata_schema_deep_nesting() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("atk05");
 
@@ -1549,7 +1555,7 @@ async fn security_metadata_schema_deep_nesting() {
     }
 
     let result = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1563,7 +1569,7 @@ async fn security_metadata_schema_deep_nesting() {
     // be rejected by validation (depth/size limits) or by the DB layer.
     match result {
         Ok(_) => {
-            let loaded = type_svc.get_type(&code).await.expect("get type");
+            let loaded = type_svc.get_type_unscoped(&code).await.expect("get type");
             assert!(loaded.metadata_schema.is_some());
         }
         Err(DomainError::Validation { .. } | DomainError::Database(_)) => {}
@@ -1575,12 +1581,12 @@ async fn security_metadata_schema_deep_nesting() {
 #[tokio::test]
 async fn security_metadata_schema_special_values() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     // Test with null value
     let code1 = type_code("atk06a");
     let t1 = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code1.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1599,7 +1605,7 @@ async fn security_metadata_schema_special_values() {
     // Test with bare true
     let code2 = type_code("atk06b");
     let t2 = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code2.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1619,7 +1625,7 @@ async fn security_metadata_schema_special_values() {
 #[tokio::test]
 async fn security_metadata_schema_sql_column_names() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("atk07");
     let schema = json!({
@@ -1631,7 +1637,7 @@ async fn security_metadata_schema_sql_column_names() {
     });
 
     let rg_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1645,7 +1651,7 @@ async fn security_metadata_schema_sql_column_names() {
     assert!(rg_type.can_be_root);
     assert_eq!(rg_type.code, code);
 
-    let loaded = type_svc.get_type(&code).await.expect("get type");
+    let loaded = type_svc.get_type_unscoped(&code).await.expect("get type");
     assert_eq!(
         loaded.code, code,
         "code field must not be overwritten by metadata"
@@ -1656,11 +1662,11 @@ async fn security_metadata_schema_sql_column_names() {
 #[tokio::test]
 async fn security_metadata_schema_update_full_replacement() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("atk10");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1672,7 +1678,7 @@ async fn security_metadata_schema_update_full_replacement() {
 
     // Update with completely different schema
     let updated = type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -1700,11 +1706,11 @@ async fn security_metadata_schema_update_full_replacement() {
 #[tokio::test]
 async fn security_metadata_schema_last_write_wins() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("atk11");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1716,7 +1722,7 @@ async fn security_metadata_schema_last_write_wins() {
 
     // Simulate sequential updates (no real concurrency needed to verify no-merge)
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -1729,7 +1735,7 @@ async fn security_metadata_schema_last_write_wins() {
         .expect("update v2");
 
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -1741,7 +1747,7 @@ async fn security_metadata_schema_last_write_wins() {
         .await
         .expect("update v3");
 
-    let loaded = type_svc.get_type(&code).await.expect("get type");
+    let loaded = type_svc.get_type_unscoped(&code).await.expect("get type");
     let schema = loaded.metadata_schema.unwrap();
     assert_eq!(schema["version"], 3);
     assert!(

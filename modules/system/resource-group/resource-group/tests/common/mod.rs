@@ -270,7 +270,7 @@ pub async fn create_root_type(
         suffix,
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: true,
         allowed_parent_types: vec![],
@@ -293,7 +293,7 @@ pub async fn create_child_type(
         suffix,
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: false,
         allowed_parent_types: parents.iter().map(|s| (*s).to_owned()).collect(),
@@ -436,6 +436,11 @@ pub fn assert_no_surrogate_ids(json: &serde_json::Value) {
 }
 
 // -- Service construction helpers --
+
+/// Build a `TypeService` from a DB provider using the allow-all enforcer.
+pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
+    TypeService::new(db, make_enforcer(), Arc::new(TypeRepository))
+}
 
 /// Build a `GroupService` from a DB provider using the allow-all enforcer.
 pub fn make_group_service(
