@@ -79,10 +79,6 @@ reason = "Ignore module 'simple-user-settings' (not SDLC-documented yet: missing
 patterns = ["modules/simple-user-settings/*"]
 
 [[ignore]]
-reason = "Ignore module 'file-storage' (not SDLC-documented yet: missing required PRD/DESIGN)."
-patterns = ["modules/file-storage/*"]
-
-[[ignore]]
 reason = "Ignore module 'types-registry' (not SDLC-documented yet: missing required PRD/DESIGN)."
 patterns = ["modules/types-registry/*"]
 
@@ -92,6 +88,12 @@ patterns = [
   "modules/serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md",
   "modules/serverless-runtime/docs/DESIGN_RUST_TYPES.md",
   "modules/serverless-runtime/docs/NEXT_ADR_SCOPE.md",
+]
+
+[[ignore]]
+reason = "Ignore file-storage companion docs — api.md is a reference summary supplementary to DESIGN.md, not a standalone SDLC artifact."
+patterns = [
+  "modules/file-storage/docs/api.md",
 ]
 
 [[ignore]]
