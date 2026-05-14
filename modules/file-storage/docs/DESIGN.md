@@ -338,7 +338,12 @@ mapping to RFC 7807 Problem+JSON, and the split between auth-required and public
 - Map domain errors to status codes + Problem+JSON bodies per `docs/modkit_unified_system/05_errors_rfc9457.md`
 - Populate response headers including `ETag`, `Accept-Ranges`, `Last-Modified`, all `X-FS-*` system metadata, and
   `X-FS-Meta-<key>` for custom metadata (with RFC 8187 encoding for non-ASCII values)
-- Omit `X-FS-GTS-File-Type`, `X-FS-Public-Access`, and `X-FS-Meta-*` on the public namespace
+- On the public namespace: behave identically to the auth-required path on `ETag`, `Range`,
+  conditional requests, version-specific `/versions/{version_id}` retrieval (P2), and all other
+  standard response headers (`Content-*`, `Last-Modified`, `X-FS-File-Id`, `X-FS-Hash-*`,
+  `X-FS-Content-Revision`, `X-FS-Metadata-Revision`, `X-FS-Created-At`, and `X-FS-Version-Id`
+  when applicable). Omit only the owner-private headers: `X-FS-GTS-File-Type`,
+  `X-FS-Public-Access`, `X-FS-Owner-*`, and all `X-FS-Meta-*`
 - Route content endpoints (`GET`/`HEAD /files/{id}`, `POST /files`, `PATCH /files/{id}`) through raw axum handlers
   that stream bodies; route JSON endpoints (`GET /files`, `GET /storages`, `GET /storages/{id}`) through
   OperationBuilder
@@ -558,6 +563,7 @@ intended decomposition. Their detailed designs live in P2/P3 FEATURE artifacts (
 | `event-publisher`                                     | P2    | EventBroker emitter for upload/update/delete events, gated by owner policy                                               | PRD `cpt-cf-file-storage-fr-file-events`                                                       |
 | `quota-adapter`                                       | P2    | Synchronous quota check before storage-consuming operations; usage reports asynchronously                                | PRD `cpt-cf-file-storage-fr-storage-quota`, `…fr-usage-reporting`                              |
 | `serverless-adapter`                                  | P2    | Subscribes to owner-deletion events; invokes the configured Serverless Runtime workflow per owner                        | PRD `cpt-cf-file-storage-fr-owner-deletion`                                                    |
+| `orphan-reconciler`                                   | P2    | Scheduled background task that reconciles `files` rows against backend object existence and aborts abandoned multipart sessions; emits audit per disposition | PRD `cpt-cf-file-storage-fr-orphan-reconciliation`                                             |
 | `encryption-adapter`                                  | P3    | Manages server-side encryption parameters and key handles per backend                                                    | PRD `cpt-cf-file-storage-fr-file-encryption`                                                   |
 | `admin-config`                                        | P3    | DB-backed runtime backend management (CRUD on backend configs) with credential rotation                                  | PRD `cpt-cf-file-storage-fr-runtime-backends`                                                  |
 
