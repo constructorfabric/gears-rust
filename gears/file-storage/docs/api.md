@@ -47,11 +47,17 @@ Encoding conventions:
 ## P1 — Public (no auth)
 
 ```
-9.  GET    /files/{id}                         public download                                               — If-None-Match, Range
-10. HEAD   /files/{id}                         public metadata headers                                       — If-None-Match
+9.  GET    /files/{id}                         public download                                               — If-Match, If-None-Match, Range
+10. HEAD   /files/{id}                         public metadata headers                                       — If-Match, If-None-Match
 ```
 
-Access is gated by `files.public_access = true` on the file row. Otherwise the endpoint returns `404` (never `401`/`403`, to avoid leaking the existence of a private file). Custom metadata and `X-FS-GTS-File-Type` are not exposed on this namespace.
+In P2 when backend declares `versioning_native`, the versioning endpoints below are also reachable on this prefix subject to `public_access`:
+```
+GET   /files/{id}/versions/{version_id}        public download of a specific version                          — If-Match, If-None-Match, Range
+HEAD  /files/{id}/versions/{version_id}        public version metadata headers                                — If-Match, If-None-Match
+```
+
+Access is gated by `files.public_access = true` on the file row. Otherwise the endpoint returns `404` (never `401`/`403`, to avoid leaking the existence of a private file). `ETag`, `Range`, and all standard non-tenant-internal headers behave identically to the auth-required path. Only owner-private headers are stripped: `X-FS-GTS-File-Type`, `X-FS-Public-Access`, `X-FS-Owner-*`, and `X-FS-Meta-<key>` custom metadata.
 
 ## P2 — Multipart upload (declared, not implemented in P1)
 
@@ -116,14 +122,15 @@ X-FS-Hash-Algorithm: SHA-256                            # of content
 X-FS-Hash-Value: <hex>                                  # of content
 X-FS-Content-Revision: <u64>                            # increments only on content writes
 X-FS-Metadata-Revision: <u64>                           # increments on any PATCH
-X-FS-Owner-Kind: user|app
-X-FS-Owner-Id: <uuid>
+X-FS-Version-Id: <opaque>                               # only on /versions/{version_id} responses (P2)
+X-FS-Owner-Kind: user|app                               # auth-required only
+X-FS-Owner-Id: <uuid>                                   # auth-required only
 X-FS-Public-Access: true|false                          # auth-required only
 X-FS-Created-At: <ISO 8601>
-X-FS-Meta-<key>: <value>                                # one header per custom metadata key
+X-FS-Meta-<key>: <value>                                # one header per custom metadata key; auth-required only
 ```
 
-On the public namespace `X-FS-GTS-File-Type`, `X-FS-Public-Access`, and `X-FS-Meta-<key>` are omitted to avoid leaking internal classifiers and tenant-private tags.
+On the public namespace the following headers are omitted to avoid leaking owner-private context: `X-FS-GTS-File-Type`, `X-FS-Public-Access`, `X-FS-Owner-Kind`, `X-FS-Owner-Id`, and all `X-FS-Meta-<key>` custom metadata. Everything else — including `ETag`, `Range` headers, content hash, revision counters, and `X-FS-Version-Id` when applicable — behaves identically to the auth-required path.
 
 ## Status code summary
 
