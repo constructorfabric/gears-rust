@@ -139,6 +139,9 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-serverless-runtime-adr-workflow-dsl` | CNCF Serverless Workflow Specification v1.0.0 adopted as the vendor-neutral, declarative JSON/YAML workflow DSL — decoupled from the execution engine |
 | `cpt-cf-serverless-runtime-adr-temporal-workflow-engine` | Temporal chosen as the durable execution backend for the workflow engine plugin, interpreting the Serverless Workflow DSL atop Temporal primitives |
 | `cpt-cf-serverless-runtime-adr-thin-host` | Serverless-runtime gear boundary: host owns Registry, Tenant Policy, lightweight invocation index, REST, GTS validation, audit, and plugin dispatch; runtime plugins own invocation, scheduling, and event-trigger handling using their backend's native primitives |
+| `cpt-cf-serverless-runtime-adr-composed-runtime` | Composed Runtime plugin: `RuntimeAdapter` implementation providing a shared in-plugin environment (GTS-keyed router, unified `ExecutionContext`, durable checkpoint store, eventing) that hosts embedded language executors; managed in-process and managed-out-of-process variants from one binary |
+| `cpt-cf-serverless-runtime-adr-starlark-runtime` | Starlark selected as the code-as-orchestration embedded executor hosted inside the Composed Runtime plugin |
+| `cpt-cf-serverless-runtime-adr-native-rust-executor` | Hot-loadable native Rust function executor as a second embedded executor inside the Composed Runtime plugin; plugin-managed state; hot-reload through the in-plugin checkpoint store |
 
 ### 1.3 Architecture Layers
 

@@ -2,7 +2,10 @@
 
 **Source:** Consistency review of `DESIGN.md` against `PRD.md`
 **Date:** 2026-01-21
-**Updated:** 2026-05-14 (renumbered ADR-2–7 → ADR-3–8 after ADR-0002 JSON-RPC/MCP was written; then ADR-3–8 → ADR-5–10 after ADR-0003 Workflow DSL and ADR-0004 Temporal Workflow Engine were written; then ADR-5–10 → ADR-6–11 after ADR-0005 Thin Host Gear, Fat Runtime Plugins was written)
+**Updated:** 2026-04-22 (renumbered ADR-2–7 → ADR-3–8 after ADR-0002 JSON-RPC/MCP was written; then ADR-3–8 → ADR-5–10 after ADR-0003 Workflow DSL and ADR-0004 Temporal Workflow Engine were written)
+**Updated:** 2026-04-29 (renumbered ADR-5–10 → ADR-8–13 after ADR-0005 In-Process Runtime, ADR-0006 Starlark Executor, and ADR-0007 Native Rust Executor were written)
+**Updated:** 2026-05-12 (rebased onto upstream main: upstream's ADR-0005 Thin Host took the 0005 slot; local In-Process Runtime ADR moved into the 0006 slot — directly beneath the thin-host parent — so Starlark moved 0006 → 0007 and Native Rust moved 0007 → 0008; subsequent "Next" ADRs shifted ADR-8–13 → ADR-9–14; In-Process Runtime ADR reframed to describe the **in-process plugin** under the thin-host model, providing a shared environment — router, `ExecutionContext`, checkpointing, eventing, sync+async execution — for embedded language executors)
+**Updated:** 2026-05-14 (rebased onto upstream main, picking up the `serverless-runtime-sdk` PRD/DESIGN: ADR-0006 renamed from "In-Process Runtime" to "Composed Runtime"; ADR-0006/0007/0008 now explicitly reference `RuntimeAdapter` / `FunctionHandler` / `WorkflowHandler` / `Context` / `Environment` / `ServerlessRuntimeClient` from the SDK; no slot shifts)
 
 ---
 
@@ -70,6 +73,10 @@
 > **ADR-0003** (`0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md`) has been written and adopts the Serverless Workflow Specification as the workflow DSL.
 > **ADR-0004** (`0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md`) has been written and selects Temporal as the durable execution backend.
 > **ADR-0005** (`0005-cpt-cf-serverless-runtime-adr-thin-host.md`) has been written and commits to a thin host gear with fat runtime plugins (rejecting the PR 1279 three-tier orchestrator boundary).
+> **ADR-0006** (`0006-cpt-cf-serverless-runtime-adr-composed-runtime.md`) has been written and defines the **Composed Runtime plugin** under the ADR-0005 thin-host model: a `RuntimeAdapter` impl providing a managed in-process (and managed-out-of-process) environment with a GTS-keyed router, unified `ExecutionContext`, shared checkpoint store, eventing, and sync+async invocation for embedded language executors. Out of scope for deep integration: Temporal and cloud FaaS bridges.
+> **ADR-0007** (`0007-cpt-cf-serverless-runtime-adr-starlark-runtime.md`) has been written and selects Starlark as the first embedded executor inside the ADR-0006 Composed Runtime plugin (code-as-orchestration).
+> **ADR-0008** (`0008-cpt-cf-serverless-runtime-adr-native-rust-executor.md`) has been written and defines the hot-loadable native Rust executor embedded in the ADR-0006 Composed Runtime plugin, with plugin-managed state.
+> Future embedded executors (CEL, additional scripting languages, etc.) plug into the ADR-0006 environment through the same internal executor interface and inherit its checkpointing, eventing, and routing for free.
 > The ADRs below are renumbered accordingly.
 
 ### ADR-2 (Completed): JSON-RPC/MCP Protocol Surfaces
@@ -88,7 +95,19 @@ See [ADR-0004](ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.m
 
 See [ADR-0005](ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md).
 
-### ADR-6 (Next): Security Model (P0 — Blocker)
+### ADR-6 (Completed): Composed Runtime Plugin — Router, ExecutionContext, Shared Environment
+
+See [ADR-0006](ADR/0006-cpt-cf-serverless-runtime-adr-composed-runtime.md).
+
+### ADR-7 (Completed): Starlark Executor
+
+See [ADR-0007](ADR/0007-cpt-cf-serverless-runtime-adr-starlark-runtime.md).
+
+### ADR-8 (Completed): Hot-Loadable Native Rust Executor
+
+See [ADR-0008](ADR/0008-cpt-cf-serverless-runtime-adr-native-rust-executor.md).
+
+### ADR-9 (Next): Security Model (P0 — Blocker)
 
 **Scope:**
 
@@ -107,7 +126,7 @@ See [ADR-0005](ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md).
 
 **PRD Coverage:** BR-006, BR-013, BR-017, BR-023, BR-024, BR-025, BR-033, BR-034, BR-038, BR-039, BR-127, BR-130, PRD Risks
 
-### ADR-7: Runtime Capabilities SDK (P0 — High Priority)
+### ADR-10: Runtime Capabilities SDK (P0 — High Priority)
 
 **Scope:**
 
@@ -118,7 +137,7 @@ See [ADR-0005](ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md).
 
 **PRD Coverage:** BR-008, BR-040, BR-136
 
-### ADR-8: Debugging and Observability (P1)
+### ADR-11: Debugging and Observability (P1)
 
 **Scope:**
 
@@ -130,7 +149,7 @@ See [ADR-0005](ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md).
 
 **PRD Coverage:** BR-101, BR-102, BR-115, BR-120, BR-130
 
-### ADR-9: Advanced Workflow Patterns (P1)
+### ADR-12: Advanced Workflow Patterns (P1)
 
 **Scope:**
 
@@ -144,7 +163,7 @@ See [ADR-0005](ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md).
 
 **PRD Coverage:** BR-009, BR-026, BR-030, BR-104, BR-105, BR-108, BR-114
 
-### ADR-10: Deployment and Governance (P1)
+### ADR-13: Deployment and Governance (P1)
 
 **Scope:**
 
@@ -156,7 +175,7 @@ See [ADR-0005](ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md).
 
 **PRD Coverage:** BR-109, BR-117, BR-121, BR-122, BR-123
 
-### ADR-11: Error Taxonomy (P1)
+### ADR-14: Error Taxonomy (P1)
 
 **Scope:**
 
