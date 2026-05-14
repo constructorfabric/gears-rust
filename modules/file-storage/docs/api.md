@@ -15,9 +15,16 @@
 
 <!-- /toc -->
 
+FileStorage issues exactly one shape of file URL: `/files/{file_id_uuid}` (`GET` / `HEAD` only), unsigned and not
+time-bounded. The same UUID-based URL appears under two API Gateway prefixes that differ only in JWT enforcement —
+they are the same FileStorage endpoint with two routing modes. Richer sharing (TTLs, named recipients, download
+counters) is **not** part of this API; it lives in the separate **FileShare** module (P3, `modules/file-share/`),
+which has its own URL prefix and its own `sharable_link` entity.
+
 Base URLs:
-- Auth-required: `/api/file-storage/v1`
-- Public (no auth, API Gateway bypasses JWT by path prefix): `/api/file-storage-public/v1`
+- Auth-required: `/api/file-storage/v1` — JWT enforced by API Gateway; standard owner/tenant authorization applies
+- Public (no auth, API Gateway bypasses JWT by path prefix): `/api/file-storage-public/v1` — gated by the file's
+  `public_access` flag, returns `404` when off
 
 Encoding conventions:
 - Multipart create/update bodies use `multipart/form-data` with two named parts: `metadata` (`application/json`) and `content` (binary, `Content-Type` = declared mime).
@@ -78,7 +85,7 @@ Access is gated by `files.public_access = true` on the file row. Otherwise the e
 
 `PATCH` with a `content` part replaces the file content; `content_revision` is bumped, `metadata_revision` is bumped, `hash_value` is recomputed, and `ETag` changes. When the backing storage declares `versioning_native = true`, each content replacement creates a new version retrievable by version id; otherwise the prior content is permanently overwritten.
 
-`PATCH` with a `metadata` part applies JSON Merge Patch semantics to `custom_metadata`, `public_access`, and `download_availability`: keys present in the patch overwrite their values, keys set to `null` delete the entry, keys absent from the patch are left untouched. Metadata-only updates bump `metadata_revision` and `Last-Modified` but do **not** change `ETag` or `hash_value` — both remain tied to the content.
+`PATCH` with a `metadata` part applies JSON Merge Patch semantics to `custom_metadata` and `public_access`: keys present in the patch overwrite their values, keys set to `null` delete the entry, keys absent from the patch are left untouched. Metadata-only updates bump `metadata_revision` and `Last-Modified` but do **not** change `ETag` or `hash_value` — both remain tied to the content.
 
 ## Conditional headers
 
@@ -109,10 +116,9 @@ X-FS-Hash-Algorithm: SHA-256                            # of content
 X-FS-Hash-Value: <hex>                                  # of content
 X-FS-Content-Revision: <u64>                            # increments only on content writes
 X-FS-Metadata-Revision: <u64>                           # increments on any PATCH
-X-FS-Owner-Type: user|tenant
+X-FS-Owner-Kind: user|app
 X-FS-Owner-Id: <uuid>
 X-FS-Public-Access: true|false                          # auth-required only
-X-FS-Download-Availability: true|false
 X-FS-Created-At: <ISO 8601>
 X-FS-Meta-<key>: <value>                                # one header per custom metadata key
 ```
