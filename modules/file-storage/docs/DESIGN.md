@@ -50,14 +50,24 @@ The P1 architecture is deliberately narrow:
   [ADR-0002](./ADR/0002-cpt-cf-file-storage-adr-content-hash-selection.md)); the full configurable hash-policy surface
   is exposed from P1 with a locked allow-list of `["SHA-256"]`
 - Static TOML backend configuration; runtime/DB configuration is P3
-- No tokens, no scope-based sharing links — public access is a per-file boolean flag, per-principal grant-based
-  sharing is delivered by the separate FileShare module (P3)
+- One URL shape for files: `/files/{file_id_uuid}` (`GET`/`HEAD` only), exposed under two API Gateway prefixes that
+  differ only in JWT enforcement; the same UUID-based URL serves both authorized and anonymous (when `public_access`
+  is on) consumers. FileStorage never issues signed URLs, time-limited URLs, or per-recipient links — any of that
+  belongs to the separate **FileShare** module (P3, see below)
 
-P2 introduces multipart upload (with the tree-/streaming-hash work-out from ADR-0002), shareable-link policies-free
-audit + events + quota + usage outbound flows, file versioning under content-replace, and the policy engine. P3 adds
-runtime BYOS backend configuration, server-side encryption, and read audit. These phases are declared in the component
-model below with forward references to future FEATURE artifacts; their detailed designs are deliberately out of scope
-for this document.
+**FileStorage vs FileShare boundary.** Richer-than-flag sharing — time-bounded access, named recipients, group
+targeting, per-link download counters — is delivered by a separate Cyber Ware module called **FileShare** (P3,
+`modules/file-share/`). FileShare owns its own database with a `sharable_link` entity that references a FileStorage
+`file_id` (plus optional `etag` and/or `version_id` for content pinning) and carries the link-level rules (TTL,
+recipient principals, max downloads, etc.). FileShare issues URLs under its own prefix, proxies link-served traffic
+through its own handlers, and fetches content from FileStorage via the in-process FileStorage SDK. FileStorage stores
+no FileShare state, has no FileShare-specific endpoints, and treats FileShare as just another SDK consumer.
+
+P2 introduces multipart upload (with the tree-/streaming-hash work-out from ADR-0002), audit + events + quota + usage
+outbound flows, file versioning under content-replace, and the policy engine. P3 adds runtime BYOS backend
+configuration, server-side encryption, read audit, and the FileShare module itself. These phases are declared in the
+component model below with forward references to future FEATURE artifacts; their detailed designs are deliberately
+out of scope for this document.
 
 ### 1.2 Architecture Drivers
 
@@ -85,7 +95,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-fr-tenant-boundary`               | DB queries scoped by `SecurityContext.tenant_id` via SecureConn; cross-tenant rows are invisible                                                                         |
 | `cpt-cf-file-storage-fr-data-classification`           | No-op — FileStorage stores opaque bytes; classification is consumer concern                                                                                              |
 | `cpt-cf-file-storage-fr-file-type-classification`      | `gts_file_type` column on `files`; format-validated on upload; included as resource attribute in every `authz-adapter` call                                              |
-| `cpt-cf-file-storage-fr-public-access`                 | `public_access` boolean on `files`; dedicated `/api/file-storage-public/v1` router without `security_context_layer`; `404` when flag false or `download_availability` off |
+| `cpt-cf-file-storage-fr-public-access`                 | `public_access` boolean on `files`; dedicated `/api/file-storage-public/v1` router without `security_context_layer`; `404` when flag false                              |
 | `cpt-cf-file-storage-fr-metadata-storage`              | Eleven system columns + `files_custom_metadata` table; exposed as JSON on `GET` body and as `X-FS-*` headers on every response                                           |
 | `cpt-cf-file-storage-fr-update-metadata`               | `PATCH /files/{id}` with JSON Merge Patch on `metadata` part; metadata-only updates bump `metadata_revision`/`last_modified_at` and leave `content_revision`/ETag intact |
 | `cpt-cf-file-storage-fr-retention-indefinite`          | No background purge in P1; files live until owner deletes                                                                                                                |
@@ -778,7 +788,7 @@ sequenceDiagram
     C->>AGW: GET /api/file-storage-public/v1/files/{id}
     AGW->>HGW: forward (no JWT enforcement)
     HGW->>MS: read(file_id) — bypass tenant filter (public lookup by id only)
-    alt file not found, public_access=false, or download_availability=false
+    alt file not found or public_access=false
         HGW-->>C: 404 Not Found
     else
         HGW->>HGW: build headers (omit X-FS-GTS-File-Type, X-FS-Public-Access, X-FS-Meta-*)
@@ -847,7 +857,6 @@ sequenceDiagram
 | `hash_value`             | `bytea`                                    | 32-byte SHA-256 digest of the content                                        |
 | `content_state`          | `text` (`'pending'` \| `'available'`)      | `'pending'` only for P2 multipart pre-completion; P1 always `'available'`    |
 | `public_access`          | `boolean`                                  | Gates public namespace                                                       |
-| `download_availability`  | `boolean`                                  | Non-owner kill-switch                                                        |
 | `backend_id`             | `text`                                     | Identifier of the `BackendConfig` that owns the bytes (TOML in P1)           |
 | `backend_path`           | `text`                                     | Opaque path within the backend; format is per-driver                         |
 | `created_at`             | `timestamptz`                              | Creation time; immutable                                                     |

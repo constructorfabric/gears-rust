@@ -96,10 +96,6 @@ CREATE TABLE file_storage.files (
     -- /api/file-storage-public/v1/files/{file_id} are permitted.
     public_access           boolean      NOT NULL  DEFAULT false,
 
-    -- Owner kill-switch for non-owner downloads (public namespace + future
-    -- FileShare grantees). Owner can always download regardless.
-    download_availability   boolean      NOT NULL  DEFAULT true,
-
     -- Backend pointer. `backend_id` references the BackendConfig loaded from
     -- TOML in P1 (or from `storage_backends_runtime` in P3). `backend_path`
     -- is an opaque per-driver path; format is not parsed by FileStorage.
@@ -118,7 +114,6 @@ COMMENT ON COLUMN file_storage.files.content_revision         IS 'Monotonic coun
 COMMENT ON COLUMN file_storage.files.metadata_revision        IS 'Monotonic counter; bumped on every successful write (content or metadata).';
 COMMENT ON COLUMN file_storage.files.content_state            IS 'pending = created without content (P2 multipart pre-completion); available = content present.';
 COMMENT ON COLUMN file_storage.files.public_access            IS 'When true, file is anonymously readable on /api/file-storage-public/v1.';
-COMMENT ON COLUMN file_storage.files.download_availability    IS 'Owner kill-switch for non-owner reads; owner can always download.';
 
 -- Indexes on files -----------------------------------------------------------
 
