@@ -434,9 +434,20 @@ flag is not time-bounded — revoking access requires setting the flag back to `
 The public namespace **MUST**:
 
 - Support `GET` and `HEAD` only — all write methods return `405`
-- Support `Range` and conditional-request semantics identical to the auth-required path
-  (`cpt-cf-file-storage-fr-range-requests`, `cpt-cf-file-storage-fr-conditional-requests`)
-- Omit tenant-internal classifiers (GTS file type, custom metadata) from response headers
+- Behave identically to the auth-required path on every read concern: `Range` semantics
+  (`cpt-cf-file-storage-fr-range-requests`), conditional-request semantics including `ETag`
+  derivation, `If-None-Match`, and `If-Match` (`cpt-cf-file-storage-fr-conditional-requests`),
+  and version-specific retrieval — when the file's backend declares the versioning capability
+  (`cpt-cf-file-storage-fr-file-versioning`), the same `/files/{file_id_uuid}/versions/{version_id}`
+  `GET`/`HEAD` path **MUST** be reachable on the public namespace subject to `public_access`
+- Return the full set of standard response headers used on the auth-required path —
+  `ETag`, `Content-Type`, `Content-Length`, `Content-Range` (on `206`), `Accept-Ranges`,
+  `Last-Modified`, `X-FS-File-Id`, `X-FS-Hash-Algorithm`, `X-FS-Hash-Value`,
+  `X-FS-Content-Revision`, `X-FS-Metadata-Revision`, `X-FS-Created-At`, and `X-FS-Version-Id`
+  when applicable
+- Omit **only** the tenant-internal classifier headers — specifically `X-FS-GTS-File-Type`,
+  `X-FS-Public-Access`, and `X-FS-Owner-*` — together with `X-FS-Meta-<key>` custom metadata
+  headers, to avoid leaking owner-private context
 
 The file's UUID is the access secret on the public namespace; random 128-bit UUIDs make enumeration computationally
 infeasible.
@@ -635,6 +646,44 @@ blind deletion risks data loss, while indefinite retention risks compliance viol
 Serverless Runtime workflows enables deployment-specific logic (legal holds, data migration, cascading cleanup) without
 embedding policy decisions in FileStorage.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
+
+#### Orphan Reconciliation
+
+- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-orphan-reconciliation`
+
+The system **MUST** automatically detect and reconcile orphan state between the metadata store and storage backends.
+Even when content traffic transits FileStorage end-to-end, the metadata-DB write and the backend object write are not
+atomic with each other, and several edge cases produce orphans:
+
+- A `POST /files` create transaction committed the file row, but the backend write failed before the row could be
+  transitioned to `content_state = available`
+- A backend write succeeded, but the DB transaction that would have recorded the row failed (or was rolled back)
+- *(P2)* A multipart upload session was initiated (`POST /files/multipart` per
+  `cpt-cf-file-storage-fr-multipart-upload`), but neither `complete` nor `abort` was ever invoked, leaving a
+  `pending` file row and uploaded parts hanging
+
+After a configurable grace period, the system **MUST** reconcile file rows against actual backend object existence and
+apply the following dispositions:
+
+- File rows in `content_state = pending` past the grace window with **no** matching backend object → metadata row
+  deleted
+- File rows in `content_state = available` with **no** matching backend object → flagged for operator attention (do
+  **NOT** auto-delete; this most likely indicates backend data loss and requires manual review)
+- Backend objects with no matching file row → deleted at the backend (orphaned content; no metadata path can resolve
+  them)
+- *(P2)* Multipart upload sessions past the grace window with no `complete` → aborted at the backend
+  (`abortMultipartUpload`), uploaded parts discarded, the corresponding `pending` file row removed
+
+Reconciliation **MUST** be an internal scheduled task — it **MUST NOT** be triggerable from any public API surface —
+and **MUST** emit audit records (`cpt-cf-file-storage-fr-audit-trail`) for every disposition it performs.
+
+**Rationale**: Two-phase commit between metadata DB and storage backend is not free; transient failures inevitably
+produce divergent state, and that divergence accumulates over time as DB rows pointing at nothing or backend objects
+no FileStorage user can see. Reconciliation keeps the two stores converged. Auto-deletion is safe for orphan content
+(no metadata points to it, so no consumer can be broken) and for stale `pending` rows (the create never finished, so
+no consumer is depending on them). The diverged-available case is the only one that requires manual handling, because
+it implies either backend data loss or a long-running inconsistency that auto-deletion would mask.
+**Actors**: `cpt-cf-file-storage-actor-cf-modules`
 
 #### File Versioning
 
