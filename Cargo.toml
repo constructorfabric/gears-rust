@@ -267,7 +267,7 @@ grpc_hub = { package = "cyberware-grpc-hub", version = "0.2.6", path = "modules/
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde-saphyr = "0.0.22"
+serde-saphyr = "0.0.24"
 secrecy = { version = "0.10", features = ["serde"] }
 serde_urlencoded = "0.7"
 schemars = { version = "1.2", features = ["derive", "uuid1"] }
