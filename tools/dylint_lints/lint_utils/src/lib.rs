@@ -587,7 +587,7 @@ pub fn test_comment_annotations_match_stderr(
     lint_code: &str,
     comment_pattern: &str,
 ) {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
 
     let trigger_comment = format!("// Should trigger {} - {}", lint_code, comment_pattern);
@@ -626,16 +626,19 @@ pub fn test_comment_annotations_match_stderr(
         let rs_lines: Vec<&str> = rs_content.lines().collect();
 
         // Find all lines with "Should trigger" or "Should not trigger" comments
-        let mut should_trigger_lines = HashSet::new();
-        let mut should_not_trigger_lines = HashSet::new();
+        let mut should_trigger_lines = HashMap::new();
+        let mut should_not_trigger_lines = HashMap::new();
 
         for (idx, line) in rs_lines.iter().enumerate() {
+            let comment_line_num = idx + 1;
+            let expected_error_line_num = idx + 2;
+
             if line.contains(&trigger_comment) {
                 // The next line should have an error (idx + 1 is the next line, +1 again for 1-indexed)
-                should_trigger_lines.insert(idx + 2);
+                should_trigger_lines.insert(expected_error_line_num, comment_line_num);
             } else if line.contains(&not_trigger_comment) {
                 // The next line should NOT have an error
-                should_not_trigger_lines.insert(idx + 2);
+                should_not_trigger_lines.insert(expected_error_line_num, comment_line_num);
             }
         }
 
@@ -656,23 +659,23 @@ pub fn test_comment_annotations_match_stderr(
         }
 
         // Validate that should_trigger_lines match error_lines
-        for line_num in &should_trigger_lines {
+        for (line_num, comment_line_num) in &should_trigger_lines {
             assert!(
                 error_lines.contains(line_num),
                 "In {:?}: Line {} has '{}' comment but no corresponding error in .stderr file",
                 rs_file.file_name().unwrap(),
-                line_num,
+                comment_line_num,
                 trigger_comment
             );
         }
 
         // Validate that should_not_trigger_lines do NOT appear in error_lines
-        for line_num in &should_not_trigger_lines {
+        for (line_num, comment_line_num) in &should_not_trigger_lines {
             assert!(
                 !error_lines.contains(line_num),
                 "In {:?}: Line {} has '{}' comment but has an error in .stderr file",
                 rs_file.file_name().unwrap(),
-                line_num,
+                comment_line_num,
                 not_trigger_comment
             );
         }
@@ -680,7 +683,7 @@ pub fn test_comment_annotations_match_stderr(
         // Also verify that all error_lines are marked with should_trigger comments
         for line_num in &error_lines {
             assert!(
-                should_trigger_lines.contains(line_num),
+                should_trigger_lines.contains_key(line_num),
                 "In {:?}: Line {} has an error in .stderr file but no '{}' comment",
                 rs_file.file_name().unwrap(),
                 line_num,
