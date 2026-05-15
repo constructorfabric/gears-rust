@@ -567,6 +567,47 @@ intended decomposition. Their detailed designs live in P2/P3 FEATURE artifacts (
 | `encryption-adapter`                                  | P3    | Manages server-side encryption parameters and key handles per backend                                                    | PRD `cpt-cf-file-storage-fr-file-encryption`                                                   |
 | `admin-config`                                        | P3    | DB-backed runtime backend management (CRUD on backend configs) with credential rotation                                  | PRD `cpt-cf-file-storage-fr-runtime-backends`                                                  |
 
+##### P2 preview — multipart upload initiation contract
+
+The `multipart-coordinator` decomposition is deferred to its own P2 FEATURE artifact, but the shape of the
+initiation handshake is fixed enough now to record here so that P1 wire-level decisions (capability
+advertisement on `GET /storages`, hash-policy block, error model) leave room for it. This subsection is a
+**preview, not a binding specification** — the authoritative contract will live in the P2 FEATURE for
+`cpt-cf-file-storage-fr-multipart-upload`.
+
+**Initiation flow (illustrative):**
+
+- **Client request** — the same file-metadata envelope as single-shot `POST /files` (see §3.3) plus a
+  **`desired_part_count`** hint expressing into how many parts the client would prefer to split the upload.
+  The client MAY also send a hash-algorithm preference per `cpt-cf-file-storage-adr-content-hash-selection`.
+- **Server response** — the parts plan is **server-authoritative**. The server inspects the resolved
+  `BackendConfig` (`cpt-cf-file-storage-component-backend-abstraction`), the resolved hash algorithm
+  (`cpt-cf-file-storage-adr-content-hash-selection`), and the declared `size` from the metadata envelope, and
+  returns:
+  - **`hash_algorithm`** — the algorithm the server actually selected for this upload. The client preference
+    is only a hint; the effective algorithm is bounded by the backend's `allowed_algorithms` and selection
+    rules.
+  - **`parts[]`** — an ordered list of `{ position, length }` byte ranges that the client MUST use verbatim
+    when transferring the parts. The server **MAY return a different number of parts than
+    `desired_part_count`** because:
+    - backend-native multipart enforces minimum/maximum part sizes (e.g. S3's ~5 MB floor, ~5 GB ceiling, and
+      a hard cap on total parts);
+    - certain hash algorithms constrain part boundaries to specific multiples (e.g. BLAKE3 tree-chunk
+      boundaries used by tree-mode finalization per ADR-0002).
+    The exact alignment rules per backend/algorithm pair are deferred to the P2 FEATURE.
+  - **`concurrency`** — directive telling the client how the parts plan may be transferred:
+    - whether parts MUST be uploaded **strictly sequentially** (required when the backend or the validation
+      pipeline needs in-order arrival — e.g. magic-bytes validation on the first part per
+      `cpt-cf-file-storage-fr-content-type-validation`), or MAY be uploaded **in parallel**;
+    - in the parallel case, the **maximum number of concurrent part transfers** the server will accept for
+      this upload session.
+
+The wire format, idempotency semantics, per-part hash carry-over for tree-mode finalization
+(`cpt-cf-file-storage-adr-content-hash-selection`), resumability, retry semantics on individual parts, error
+codes, and the `complete` / `abort` flows are intentionally **not specified here**. They will be detailed in
+the P2 FEATURE for `multipart-coordinator` referenced from the table above and in a future revision of
+`api.md`.
+
 ### 3.3 API Contracts
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-api-contracts`
