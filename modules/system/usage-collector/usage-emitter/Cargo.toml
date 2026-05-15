@@ -1,0 +1,59 @@
+[package]
+name = "cyberware-usage-emitter"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Durable usage emission: two-phase PDP authorization, transactional outbox enqueue, async delivery to the collector"
+readme = "README.md"
+keywords = ["cyberfabric", "cyberware", "cyberware-system"]
+categories = ["development-tools"]
+
+[lib]
+name = "usage_emitter"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+authz-resolver-sdk = { workspace = true }
+usage-collector-sdk = { workspace = true }
+
+# ModKit dependencies
+modkit-canonical-errors = { workspace = true }
+modkit-db = { workspace = true, features = ["preview-outbox"] }
+modkit-security = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Data structures
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# DB
+sea-orm-migration = { workspace = true }
+
+[dev-dependencies]
+# ModKit dependencies
+modkit-db = { workspace = true, features = ["sqlite"] }
+
+# Async runtime
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# Data structures
+chrono = { workspace = true }

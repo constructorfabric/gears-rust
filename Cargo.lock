@@ -2663,6 +2663,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyberware-noop-usage-collector-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "cyberware-modkit",
+ "cyberware-modkit-macros",
+ "cyberware-modkit-security",
+ "cyberware-types-registry-sdk",
+ "cyberware-usage-collector-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cyberware-oagw"
 version = "0.2.25"
 dependencies = [
@@ -3075,6 +3094,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyberware-usage-collector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "cyberware-authz-resolver-sdk",
+ "cyberware-modkit",
+ "cyberware-modkit-canonical-errors",
+ "cyberware-modkit-db",
+ "cyberware-modkit-macros",
+ "cyberware-modkit-odata",
+ "cyberware-modkit-security",
+ "cyberware-modkit-utils",
+ "cyberware-types-registry-sdk",
+ "cyberware-usage-collector-sdk",
+ "cyberware-usage-emitter",
+ "http",
+ "parking_lot",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "cyberware-usage-collector-sdk"
 version = "0.1.0"
 dependencies = [
@@ -3091,6 +3143,26 @@ dependencies = [
  "serde_json",
  "tokio",
  "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cyberware-usage-emitter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "cyberware-authz-resolver-sdk",
+ "cyberware-modkit-canonical-errors",
+ "cyberware-modkit-db",
+ "cyberware-modkit-security",
+ "cyberware-usage-collector-sdk",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -1,0 +1,78 @@
+[package]
+name = "cyberware-usage-collector"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Usage Collector gateway"
+readme = "README.md"
+keywords = ["cyberfabric", "cyberware", "cyberware-system"]
+categories = ["development-tools"]
+
+[lib]
+name = "usage_collector"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+authz-resolver-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+usage-collector-sdk = { workspace = true }
+usage-emitter = { workspace = true }
+
+# ModKit dependencies
+modkit = { workspace = true }
+modkit-canonical-errors = { workspace = true }
+modkit-db = { workspace = true, features = ["preview-outbox"] }
+modkit-macros = { workspace = true }
+modkit-security = { workspace = true }
+modkit-utils = { workspace = true, features = ["humantime-serde"] }
+
+# REST
+axum = { workspace = true }
+http = { workspace = true }
+utoipa = { workspace = true }
+
+# Data structures
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Synchronous locking
+parking_lot = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialization
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# DB
+sea-orm-migration = { workspace = true }
+
+[dev-dependencies]
+# Local dependencies
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+
+# ModKit dependencies
+modkit-db = { workspace = true, features = ["sqlite"] }
+modkit-odata = { workspace = true }
+
+# HTTP testing
+tower = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

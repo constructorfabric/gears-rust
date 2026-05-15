@@ -87,7 +87,10 @@ members = [
     "modules/system/oagw/oagw-sdk",
     "modules/mini-chat/mini-chat-sdk",
     "modules/mini-chat/mini-chat",
+    "modules/system/usage-collector/plugins/noop-usage-collector-plugin",
+    "modules/system/usage-collector/usage-collector",
     "modules/system/usage-collector/usage-collector-sdk",
+    "modules/system/usage-collector/usage-emitter",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
@@ -257,7 +260,9 @@ credstore-sdk = { package = "cyberware-credstore-sdk", version = "0.1.24", path 
 mini-chat-sdk = { package = "cyberware-mini-chat-sdk", version = "0.10.6", path = "modules/mini-chat/mini-chat-sdk" }
 
 # usage-collector
+usage-collector = { package = "cyberware-usage-collector", version = "0.1.0", path = "modules/system/usage-collector/usage-collector" }
 usage-collector-sdk = { package = "cyberware-usage-collector-sdk", version = "0.1.0", path = "modules/system/usage-collector/usage-collector-sdk" }
+usage-emitter = { package = "cyberware-usage-emitter", version = "0.1.0", path = "modules/system/usage-collector/usage-emitter" }
 
 # system modules
 grpc_hub = { package = "cyberware-grpc-hub", version = "0.2.6", path = "modules/system/grpc-hub" }
