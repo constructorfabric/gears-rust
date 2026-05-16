@@ -311,7 +311,7 @@ security: deny fips-policy
 
 # -------- API and docs --------
 
-.PHONY: openapi
+.PHONY: openapi md-map
 
 # Generate OpenAPI spec from running cyberware-example-server
 openapi:
@@ -324,6 +324,10 @@ openapi:
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \
 	python3 tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
 	echo "OpenAPI spec saved to $(OPENAPI_OUT)"
+
+## Generate Markdown files map
+md-map:
+	python3 ./tools/scripts/md-map.py --out docs/md-map/md-map.html
 
 # -------- Development and auto fix --------
 
