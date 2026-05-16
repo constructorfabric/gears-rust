@@ -1,0 +1,81 @@
+[package]
+name = "cyberware-usage-collector-rest-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "REST client module for usage-collector"
+readme = "README.md"
+keywords = ["cyberfabric", "cyberware", "cyberware-system"]
+categories = ["development-tools"]
+
+[lib]
+name = "usage_collector_rest_client"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+authz-resolver-sdk = { workspace = true }
+authn-resolver-sdk = { workspace = true }
+usage-collector-sdk = { workspace = true }
+usage-emitter = { workspace = true }
+
+# ModKit dependencies
+modkit = { workspace = true }
+modkit-db = { workspace = true, features = ["preview-outbox"] }
+modkit-macros = { workspace = true }
+modkit-http = { workspace = true }
+
+# HTTP types
+http = { workspace = true }
+http-body-util = { workspace = true }
+
+# Tower middleware
+tower = { workspace = true, features = ["util"] }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Data structures
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Secrets
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+
+# URL parsing and encoding
+url = { workspace = true, features = ["serde"] }
+
+# Logging
+tracing = { workspace = true }
+
+# DB
+sea-orm-migration = { workspace = true }
+
+[dev-dependencies]
+# ModKit dependencies
+modkit-security = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# HTTP mocking
+httpmock = { workspace = true }
+
+# HTTP types
+bytes = { workspace = true }
+
+# Log capture for tests
+tracing-test = { workspace = true, features = ["no-env-filter"] }

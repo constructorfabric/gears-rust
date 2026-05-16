@@ -3127,6 +3127,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyberware-usage-collector-rest-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "cyberware-authn-resolver-sdk",
+ "cyberware-authz-resolver-sdk",
+ "cyberware-modkit",
+ "cyberware-modkit-db",
+ "cyberware-modkit-http",
+ "cyberware-modkit-macros",
+ "cyberware-modkit-security",
+ "cyberware-usage-collector-sdk",
+ "cyberware-usage-emitter",
+ "http",
+ "http-body-util",
+ "httpmock",
+ "sea-orm-migration",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-test",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "cyberware-usage-collector-sdk"
 version = "0.1.0"
 dependencies = [
