@@ -21,6 +21,7 @@ workspace = true
 # ModKit dependencies
 modkit = { workspace = true }
 modkit-canonical-errors = { workspace = true }
+modkit-odata = { workspace = true, features = ["with-utoipa"] }
 modkit-security = { workspace = true }
 
 # AuthZ
@@ -38,6 +39,11 @@ utoipa = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
+
+# Stable hashing for raw-query cursor filter signature (shared contract
+# between gateway and any storage plugin that mints `cursor.f`).
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 # GTS
 gts = { workspace = true }

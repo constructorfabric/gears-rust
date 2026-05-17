@@ -72,7 +72,7 @@ impl Module for UsageCollectorModule {
                 )
             })?;
 
-        let service = Service::new(cfg.clone(), ctx.client_hub());
+        let service = Service::new(cfg.clone(), ctx.client_hub(), Arc::clone(&authz));
         let service = Arc::new(service);
         self.service
             .set(Arc::clone(&service))

@@ -9,3 +9,7 @@ pub mod api;
 pub mod config;
 pub mod domain;
 mod module;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod test_support;

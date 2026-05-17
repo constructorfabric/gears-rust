@@ -8,7 +8,7 @@
 - [2. Entries](#2-entries)
   - [2.1 Core SDK, Emitter & In-Process Ingest ⏳ HIGH](#21-core-sdk-emitter--in-process-ingest--high)
   - [2.2 REST Client & Remote Ingest Delivery ⏳ HIGH](#22-rest-client--remote-ingest-delivery--high)
-  - [2.3 Usage Query API ⏳ HIGH](#23-usage-query-api--high)
+  - [2.3 Usage Query API 🔄 IN_PROGRESS](#23-usage-query-api--in_progress)
   - [2.4 Production Storage Plugin ⏳ HIGH](#24-production-storage-plugin--high)
   - [2.5 Usage Type System ⏳ HIGH](#25-usage-type-system--high)
   - [2.6 Emission Rate Limiting ⏳ HIGH](#26-emission-rate-limiting--high)
@@ -191,9 +191,10 @@ The Usage Collector DESIGN is decomposed into 8 features following a build-from-
 
 ---
 
-### 2.3 [Usage Query API](features/query-api/) ⏳ HIGH
+### 2.3 [Usage Query API](features/query-api/) 🔄 IN_PROGRESS
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-query-api`
+<!-- STATUS: IN_PROGRESS — SDK types (`AggregationFn`, `BucketSize`, `GroupByDimension`, `AggregationQuery`, `AggregationResult`, `RawQuery`), `CursorV1`/`Page<T>` adoption via `modkit-odata`, noop plugin `query_aggregated`/`query_raw` stubs, gateway authz delegate, REST handlers, and unit + integration test scaffolding are staged on branch `usage-collector/feature-3/query-api`. Feature spec lives at `docs/features/0003-cpt-cf-usage-collector-feature-query-api.md`. The `featstatus` checkbox cascade will promote to ✅ IMPLEMENTED once all `to_code` markers under the Feature 3 spec are checked in `cpt validate` runs after the implementation PR merges. -->
 
 - **Type**: REST API Layer
 
@@ -221,13 +222,18 @@ The Usage Collector DESIGN is decomposed into 8 features following a build-from-
 
   - [ ] `p1` - `cpt-cf-usage-collector-principle-fail-closed`
   - [ ] `p1` - `cpt-cf-usage-collector-principle-tenant-from-ctx`
+  - [ ] `p1` - `cpt-cf-usage-collector-principle-pluggable-storage`
 
 - **Design Constraints Covered**:
 
   - [ ] `p1` - `cpt-cf-usage-collector-constraint-security-context`
   - [ ] `p1` - `cpt-cf-usage-collector-constraint-no-business-logic`
+  - [ ] `p1` - `cpt-cf-usage-collector-constraint-or-of-ands-preservation`
 
 - **Domain Model Entities**:
+  - `AggregationFn`
+  - `BucketSize`
+  - `GroupByDimension`
   - `AggregationQuery`
   - `AggregationResult`
   - `RawQuery`

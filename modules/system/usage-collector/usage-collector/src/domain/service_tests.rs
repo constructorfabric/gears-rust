@@ -3,22 +3,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
+use authz_resolver_sdk::AuthZResolverClient;
+use chrono::{TimeZone, Utc};
 use modkit::client_hub::{ClientHub, ClientScope};
+use modkit_security::SecurityContext;
+use modkit_security::access_scope::pep_properties;
 use types_registry_sdk::testing::make_test_instance;
 use types_registry_sdk::{
     GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
     TypesRegistryClient, TypesRegistryError,
 };
 use usage_collector_sdk::{
-    Subject, UsageCollectorError, UsageCollectorPluginClientV1, UsageCollectorPluginSpecV1,
-    UsageKind, UsageRecord,
+    AggregationFn, AggregationQuery, AggregationResult, Page, RawQuery, Subject,
+    UsageCollectorError, UsageCollectorPluginClientV1, UsageCollectorPluginSpecV1, UsageKind,
+    UsageRecord,
 };
 use uuid::Uuid;
 
 use super::Service;
 use crate::config::{CircuitBreakerConfig, MetricConfig, UsageCollectorConfig};
-use crate::domain::DomainError;
+use crate::domain::{AggregationQueryRequest, DomainError, RawQueryRequest};
+use crate::test_support::{DenyAuthZ, HangingAuthZ, SingleConstraintAuthZ};
 
 // ── MockRegistry ──────────────────────────────────────────────────
 
@@ -129,6 +134,43 @@ impl UsageCollectorPluginClientV1 for OkPlugin {
     async fn create_usage_record(&self, _record: UsageRecord) -> Result<(), UsageCollectorError> {
         Ok(())
     }
+
+    async fn query_aggregated(
+        &self,
+        _query: AggregationQuery,
+    ) -> Result<Vec<AggregationResult>, UsageCollectorError> {
+        Ok(vec![])
+    }
+
+    async fn query_raw(&self, _query: RawQuery) -> Result<Page<UsageRecord>, UsageCollectorError> {
+        Ok(Page::empty(100))
+    }
+}
+
+// Returns a `DenyAuthZ` only because these tests don't reach the PDP — they
+// exercise non-query code paths (ingest, module config, circuit breaker), so
+// the value is irrelevant. Named `unused_authz` (not `noop_*`) so a future
+// test that *does* hit the PDP through this helper fails closed loudly under
+// a clearly-misleading name rather than silently passing.
+fn unused_authz() -> Arc<dyn AuthZResolverClient> {
+    Arc::new(DenyAuthZ)
+}
+
+fn permit_authz(tenant_id: Uuid) -> Arc<dyn AuthZResolverClient> {
+    Arc::new(SingleConstraintAuthZ { tenant_id })
+}
+
+fn deny_authz() -> Arc<dyn AuthZResolverClient> {
+    Arc::new(DenyAuthZ)
+}
+
+fn test_ctx() -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::new_v4())
+        .subject_tenant_id(Uuid::new_v4())
+        .token_scopes(vec!["*".to_owned()])
+        .build()
+        .expect("valid SecurityContext")
 }
 
 fn plugin_content(gts_id: &str, vendor: &str) -> serde_json::Value {
@@ -162,7 +204,7 @@ fn make_service() -> Service {
         UsageCollectorPluginSpecV1::gts_schema_id()
     );
     let hub = hub_with_plugin(&instance_id, "cyberfabric", Arc::new(OkPlugin));
-    Service::new(UsageCollectorConfig::default(), hub)
+    Service::new(UsageCollectorConfig::default(), hub, unused_authz())
 }
 
 fn make_service_with_vendor(hub: Arc<ClientHub>, vendor: &str) -> Service {
@@ -172,6 +214,7 @@ fn make_service_with_vendor(hub: Arc<ClientHub>, vendor: &str) -> Service {
             ..UsageCollectorConfig::default()
         },
         hub,
+        unused_authz(),
     )
 }
 
@@ -211,6 +254,19 @@ impl UsageCollectorPluginClientV1 for SlowPlugin {
         tokio::time::sleep(Duration::from_mins(1)).await;
         Ok(())
     }
+
+    async fn query_aggregated(
+        &self,
+        _query: AggregationQuery,
+    ) -> Result<Vec<AggregationResult>, UsageCollectorError> {
+        tokio::time::sleep(Duration::from_mins(1)).await;
+        Ok(vec![])
+    }
+
+    async fn query_raw(&self, _query: RawQuery) -> Result<Page<UsageRecord>, UsageCollectorError> {
+        tokio::time::sleep(Duration::from_mins(1)).await;
+        Ok(Page::empty(100))
+    }
 }
 
 #[tokio::test]
@@ -227,6 +283,7 @@ async fn plugin_timeout_returns_timeout_error() {
             ..UsageCollectorConfig::default()
         },
         hub,
+        unused_authz(),
     );
     let err = svc
         .create_usage_record(record(Uuid::new_v4()))
@@ -305,6 +362,7 @@ async fn get_module_config_returns_not_configured_when_no_metrics_configured() {
     let svc = Service::new(
         UsageCollectorConfig::default(),
         Arc::new(ClientHub::default()),
+        unused_authz(),
     );
     let err = svc.get_module_config("any-module").unwrap_err();
     assert!(matches!(err, DomainError::ModuleNotConfigured { .. }));
@@ -320,7 +378,11 @@ async fn get_module_config_returns_metric_when_modules_restriction_is_absent() {
             modules: None,
         },
     );
-    let svc = Service::new(config_with_metrics(metrics), Arc::new(ClientHub::default()));
+    let svc = Service::new(
+        config_with_metrics(metrics),
+        Arc::new(ClientHub::default()),
+        unused_authz(),
+    );
     let cfg = svc.get_module_config("any-module").unwrap();
     assert_eq!(cfg.allowed_metrics.len(), 1);
     assert_eq!(cfg.allowed_metrics[0].name, "cpu.usage");
@@ -338,7 +400,11 @@ async fn get_module_config_returns_metric_when_module_is_in_allow_list() {
             modules: Some(vec!["my-module".to_owned()]),
         },
     );
-    let svc = Service::new(config_with_metrics(metrics), Arc::new(ClientHub::default()));
+    let svc = Service::new(
+        config_with_metrics(metrics),
+        Arc::new(ClientHub::default()),
+        unused_authz(),
+    );
     let cfg = svc.get_module_config("my-module").unwrap();
     assert_eq!(cfg.allowed_metrics.len(), 1);
     assert_eq!(cfg.allowed_metrics[0].name, "req.count");
@@ -356,7 +422,11 @@ async fn get_module_config_returns_not_configured_when_module_not_in_allow_list(
             modules: Some(vec!["other-module".to_owned()]),
         },
     );
-    let svc = Service::new(config_with_metrics(metrics), Arc::new(ClientHub::default()));
+    let svc = Service::new(
+        config_with_metrics(metrics),
+        Arc::new(ClientHub::default()),
+        unused_authz(),
+    );
     let err = svc.get_module_config("my-module").unwrap_err();
     assert!(matches!(err, DomainError::ModuleNotConfigured { .. }));
 }
@@ -383,7 +453,7 @@ async fn get_module_config_returns_only_matching_metrics_from_mixed_config() {
         metrics,
         ..UsageCollectorConfig::default()
     };
-    let svc = Service::new(config, Arc::new(ClientHub::default()));
+    let svc = Service::new(config, Arc::new(ClientHub::default()), unused_authz());
     let cfg = svc.get_module_config("my-module").unwrap();
     assert_eq!(cfg.allowed_metrics.len(), 1);
     assert_eq!(cfg.allowed_metrics[0].name, "cpu.usage");
@@ -398,6 +468,21 @@ struct FailPlugin;
 #[async_trait::async_trait]
 impl UsageCollectorPluginClientV1 for FailPlugin {
     async fn create_usage_record(&self, _record: UsageRecord) -> Result<(), UsageCollectorError> {
+        Err(UsageCollectorError::service_unavailable()
+            .with_detail("simulated transient failure")
+            .create())
+    }
+
+    async fn query_aggregated(
+        &self,
+        _query: AggregationQuery,
+    ) -> Result<Vec<AggregationResult>, UsageCollectorError> {
+        Err(UsageCollectorError::service_unavailable()
+            .with_detail("simulated transient failure")
+            .create())
+    }
+
+    async fn query_raw(&self, _query: RawQuery) -> Result<Page<UsageRecord>, UsageCollectorError> {
         Err(UsageCollectorError::service_unavailable()
             .with_detail("simulated transient failure")
             .create())
@@ -417,6 +502,13 @@ impl CountingPlugin {
             should_fail: true,
         }
     }
+
+    fn ok(counter: Arc<AtomicUsize>) -> Self {
+        Self {
+            counter,
+            should_fail: false,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -429,6 +521,31 @@ impl UsageCollectorPluginClientV1 for CountingPlugin {
                 .create())
         } else {
             Ok(())
+        }
+    }
+
+    async fn query_aggregated(
+        &self,
+        _query: AggregationQuery,
+    ) -> Result<Vec<AggregationResult>, UsageCollectorError> {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        if self.should_fail {
+            Err(UsageCollectorError::service_unavailable()
+                .with_detail("simulated transient failure")
+                .create())
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    async fn query_raw(&self, _query: RawQuery) -> Result<Page<UsageRecord>, UsageCollectorError> {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        if self.should_fail {
+            Err(UsageCollectorError::service_unavailable()
+                .with_detail("simulated transient failure")
+                .create())
+        } else {
+            Ok(Page::empty(100))
         }
     }
 }
@@ -455,6 +572,7 @@ fn make_cb_service(
             ..UsageCollectorConfig::default()
         },
         hub,
+        unused_authz(),
     )
 }
 
@@ -548,4 +666,228 @@ async fn failed_probe_reopens_circuit() {
         .await
         .unwrap_err();
     assert!(matches!(err, DomainError::CircuitOpen));
+}
+
+// ── query API (authz wiring) ───────────────────────────────────────────────
+
+fn aggregation_request() -> AggregationQueryRequest {
+    AggregationQueryRequest {
+        time_range: (
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap(),
+        ),
+        function: AggregationFn::Sum,
+        group_by: vec![],
+        bucket_size: None,
+        usage_type: None,
+        resource_id: None,
+        resource_type: None,
+        subject_id: None,
+        subject_type: None,
+        source: None,
+    }
+}
+
+fn raw_request() -> RawQueryRequest {
+    RawQueryRequest {
+        time_range: (
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap(),
+        ),
+        usage_type: None,
+        resource_id: None,
+        resource_type: None,
+        subject_type: None,
+        subject_id: None,
+        cursor: None,
+        page_size: 100_u32,
+    }
+}
+
+fn make_service_with_authz(
+    plugin: Arc<dyn UsageCollectorPluginClientV1>,
+    authz: Arc<dyn AuthZResolverClient>,
+) -> Service {
+    let instance_id = format!(
+        "{}test.usage.mock.svc_q_test.v1",
+        UsageCollectorPluginSpecV1::gts_schema_id()
+    );
+    let hub = hub_with_plugin(&instance_id, "cyberfabric", plugin);
+    Service::new(UsageCollectorConfig::default(), hub, authz)
+}
+
+#[tokio::test]
+async fn query_aggregated_authz_allow_invokes_plugin_with_scope_populated() {
+    let tenant_id = Uuid::new_v4();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let plugin = Arc::new(CountingPlugin::ok(Arc::clone(&counter)));
+    let svc = make_service_with_authz(plugin, permit_authz(tenant_id));
+
+    let ctx = test_ctx();
+    let result = svc.query_aggregated(&ctx, aggregation_request()).await;
+
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "plugin must be invoked exactly once after authz allow"
+    );
+}
+
+#[tokio::test]
+async fn query_aggregated_authz_deny_skips_plugin() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let plugin = Arc::new(CountingPlugin::ok(Arc::clone(&counter)));
+    let svc = make_service_with_authz(plugin, deny_authz());
+
+    let ctx = test_ctx();
+    let err = svc
+        .query_aggregated(&ctx, aggregation_request())
+        .await
+        .unwrap_err();
+
+    match err {
+        DomainError::PermissionDenied(UsageCollectorError::PermissionDenied { .. }) => {}
+        other => panic!("expected DomainError::PermissionDenied(PermissionDenied), got {other:?}"),
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "plugin MUST NOT be invoked when authz denies"
+    );
+}
+
+#[tokio::test]
+async fn query_raw_authz_allow_invokes_plugin_with_scope_populated() {
+    let tenant_id = Uuid::new_v4();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let plugin = Arc::new(CountingPlugin::ok(Arc::clone(&counter)));
+    let svc = make_service_with_authz(plugin, permit_authz(tenant_id));
+
+    let ctx = test_ctx();
+    let result = svc.query_raw(&ctx, raw_request()).await;
+
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "plugin must be invoked exactly once after authz allow"
+    );
+}
+
+#[tokio::test]
+async fn query_raw_authz_deny_skips_plugin() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let plugin = Arc::new(CountingPlugin::ok(Arc::clone(&counter)));
+    let svc = make_service_with_authz(plugin, deny_authz());
+
+    let ctx = test_ctx();
+    let err = svc.query_raw(&ctx, raw_request()).await.unwrap_err();
+
+    match err {
+        DomainError::PermissionDenied(UsageCollectorError::PermissionDenied { .. }) => {}
+        other => panic!("expected DomainError::PermissionDenied(PermissionDenied), got {other:?}"),
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "plugin MUST NOT be invoked when authz denies"
+    );
+}
+
+#[tokio::test]
+async fn query_aggregated_authz_hang_fails_closed_via_authz_timeout() {
+    // A hung PDP must not pin the request task. With a tight `authz_timeout`,
+    // the gateway must elapse and map to `PermissionDenied` (fail-closed) —
+    // and MUST NOT invoke the storage plugin. Without the timeout this test
+    // would hang `std::future::pending::<()>()` forever.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let plugin = Arc::new(CountingPlugin::ok(Arc::clone(&counter)));
+    let instance_id = format!(
+        "{}test.usage.mock.authz_to_test.v1",
+        UsageCollectorPluginSpecV1::gts_schema_id()
+    );
+    let hub = hub_with_plugin(&instance_id, "cyberfabric", plugin);
+    let svc = Service::new(
+        UsageCollectorConfig {
+            authz_timeout: Duration::from_millis(100),
+            ..UsageCollectorConfig::default()
+        },
+        hub,
+        Arc::new(HangingAuthZ),
+    );
+
+    let ctx = test_ctx();
+    let err = svc
+        .query_aggregated(&ctx, aggregation_request())
+        .await
+        .unwrap_err();
+    match err {
+        DomainError::PermissionDenied(UsageCollectorError::PermissionDenied { .. }) => {}
+        other => panic!("expected PermissionDenied on authz timeout, got {other:?}"),
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "plugin MUST NOT be invoked when authz times out"
+    );
+}
+
+/// Plugin that captures the [`AccessScope`] embedded in `query.scope`.
+struct ScopeCapturingPlugin {
+    last_scope: parking_lot::Mutex<Option<modkit_security::AccessScope>>,
+}
+
+impl ScopeCapturingPlugin {
+    fn new() -> Self {
+        Self {
+            last_scope: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn take_scope(&self) -> Option<modkit_security::AccessScope> {
+        self.last_scope.lock().take()
+    }
+}
+
+#[async_trait::async_trait]
+impl UsageCollectorPluginClientV1 for ScopeCapturingPlugin {
+    async fn create_usage_record(&self, _record: UsageRecord) -> Result<(), UsageCollectorError> {
+        Ok(())
+    }
+
+    async fn query_aggregated(
+        &self,
+        query: AggregationQuery,
+    ) -> Result<Vec<AggregationResult>, UsageCollectorError> {
+        *self.last_scope.lock() = Some(query.scope);
+        Ok(vec![])
+    }
+
+    async fn query_raw(&self, query: RawQuery) -> Result<Page<UsageRecord>, UsageCollectorError> {
+        *self.last_scope.lock() = Some(query.scope);
+        Ok(Page::empty(100))
+    }
+}
+
+#[tokio::test]
+async fn query_aggregated_embeds_compiled_scope_into_query() {
+    let tenant_id = Uuid::new_v4();
+    let plugin = Arc::new(ScopeCapturingPlugin::new());
+    let svc = make_service_with_authz(Arc::clone(&plugin) as _, permit_authz(tenant_id));
+
+    let ctx = test_ctx();
+    svc.query_aggregated(&ctx, aggregation_request())
+        .await
+        .expect("authz allow + plugin Ok");
+
+    let captured = plugin.take_scope().expect("plugin recorded a scope");
+    assert!(
+        !captured.is_deny_all(),
+        "embedded scope must not be deny-all when authz permits"
+    );
+    assert!(
+        captured.contains_uuid(pep_properties::OWNER_TENANT_ID, tenant_id),
+        "embedded scope must contain the PDP-supplied tenant_id"
+    );
 }

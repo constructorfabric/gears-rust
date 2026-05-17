@@ -1,8 +1,13 @@
 use chrono::{TimeZone, Utc};
+use modkit_odata::{CursorV1, Page, PageInfo, SortDir};
+use modkit_security::AccessScope;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::{AllowedMetric, ModuleConfig, Subject, UsageKind, UsageRecord};
+use super::{
+    AggregationFn, AggregationResult, AllowedMetric, BucketSize, GroupByDimension, ModuleConfig,
+    RawQuery, Subject, UsageKind, UsageRecord,
+};
 
 fn make_record() -> UsageRecord {
     UsageRecord {
@@ -290,4 +295,184 @@ fn module_config_roundtrip_serde() {
     let json = serde_json::to_string(&cfg).unwrap();
     let deserialized: ModuleConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized, cfg);
+}
+
+// ── Query-side SDK types (Feature 3) ─────────────────────────────────────
+
+#[test]
+fn aggregation_fn_serde_names_are_snake_case_round_trip() {
+    for (variant, name) in [
+        (AggregationFn::Sum, "\"sum\""),
+        (AggregationFn::Count, "\"count\""),
+        (AggregationFn::Min, "\"min\""),
+        (AggregationFn::Max, "\"max\""),
+        (AggregationFn::Avg, "\"avg\""),
+    ] {
+        assert_eq!(serde_json::to_string(&variant).unwrap(), name);
+        assert_eq!(
+            serde_json::from_str::<AggregationFn>(name).unwrap(),
+            variant
+        );
+    }
+    assert!(
+        serde_json::from_str::<AggregationFn>("\"Sum\"").is_err(),
+        "PascalCase must not deserialize - snake_case is the wire contract"
+    );
+}
+
+#[test]
+fn bucket_size_serde_names_are_snake_case_round_trip() {
+    for (variant, name) in [
+        (BucketSize::Minute, "\"minute\""),
+        (BucketSize::Hour, "\"hour\""),
+        (BucketSize::Day, "\"day\""),
+        (BucketSize::Week, "\"week\""),
+        (BucketSize::Month, "\"month\""),
+    ] {
+        assert_eq!(serde_json::to_string(&variant).unwrap(), name);
+        assert_eq!(serde_json::from_str::<BucketSize>(name).unwrap(), variant);
+    }
+}
+
+#[test]
+fn group_by_dimension_serde_externally_tagged_for_time_bucket() {
+    // TimeBucket carries a payload → externally-tagged object on the wire.
+    let tb = GroupByDimension::TimeBucket(BucketSize::Day);
+    let json = serde_json::to_string(&tb).unwrap();
+    assert_eq!(json, "{\"time_bucket\":\"day\"}");
+    let round: GroupByDimension = serde_json::from_str(&json).unwrap();
+    assert_eq!(round, tb);
+    // Unit variants serialize as bare strings.
+    for (variant, name) in [
+        (GroupByDimension::UsageType, "\"usage_type\""),
+        (GroupByDimension::Subject, "\"subject\""),
+        (GroupByDimension::Resource, "\"resource\""),
+        (GroupByDimension::Source, "\"source\""),
+    ] {
+        assert_eq!(serde_json::to_string(&variant).unwrap(), name);
+        assert_eq!(
+            serde_json::from_str::<GroupByDimension>(name).unwrap(),
+            variant
+        );
+    }
+}
+
+#[test]
+fn aggregation_result_serde_omits_absent_dimensions() {
+    let result = AggregationResult {
+        function: AggregationFn::Count,
+        value: 42.0,
+        bucket_start: None,
+        usage_type: Some("compute.cpu".to_owned()),
+        subject_id: None,
+        subject_type: None,
+        resource_id: None,
+        resource_type: None,
+        source: None,
+    };
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(
+        !json.contains("bucket_start"),
+        "absent Option must not appear in JSON, got: {json}"
+    );
+    assert!(
+        !json.contains("subject_id"),
+        "absent subject_id must not appear in JSON, got: {json}"
+    );
+    assert!(
+        json.contains("\"usage_type\":\"compute.cpu\""),
+        "present grouping dimension must appear in JSON, got: {json}"
+    );
+    let deserialized: AggregationResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, result);
+}
+
+#[test]
+fn aggregation_result_serde_round_trip_with_all_dimensions() {
+    let bucket = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let result = AggregationResult {
+        function: AggregationFn::Avg,
+        value: 3.5,
+        bucket_start: Some(bucket),
+        usage_type: Some("network.bytes".to_owned()),
+        subject_id: Some(Uuid::nil()),
+        subject_type: Some("user".to_owned()),
+        resource_id: Some(Uuid::nil()),
+        resource_type: Some("compute.vm".to_owned()),
+        source: Some("billing".to_owned()),
+    };
+    let json = serde_json::to_string(&result).unwrap();
+    let deserialized: AggregationResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, result);
+}
+
+#[test]
+fn raw_query_carries_optional_cursor() {
+    // CursorV1 is the keyset cursor type for paginated raw queries — the SDK
+    // re-exports it from modkit-odata.
+    let cursor = CursorV1 {
+        k: vec![
+            "2026-01-01T06:00:00+00:00".to_owned(),
+            Uuid::nil().to_string(),
+        ],
+        o: SortDir::Asc,
+        s: "+timestamp,+id".to_owned(),
+        f: None,
+        d: "fwd".to_owned(),
+    };
+    let from = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let to = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+    let q = RawQuery {
+        scope: AccessScope::deny_all(),
+        time_range: (from, to),
+        usage_type: Some("network.bytes".to_owned()),
+        resource_id: None,
+        resource_type: None,
+        subject_type: Some("user".to_owned()),
+        subject_id: None,
+        cursor: Some(cursor.clone()),
+        page_size: 50,
+    };
+    let q_cursor = q.cursor.as_ref().expect("cursor must round-trip");
+    assert_eq!(q_cursor.k, cursor.k);
+    assert_eq!(q_cursor.s, cursor.s);
+}
+
+#[test]
+fn cursor_v1_encode_decode_round_trip() {
+    // Re-pin the modkit-odata cursor contract the SDK depends on: a freshly
+    // encoded cursor decodes back into an equivalent value.
+    let original = CursorV1 {
+        k: vec![
+            "2026-01-01T06:00:00+00:00".to_owned(),
+            Uuid::nil().to_string(),
+        ],
+        o: SortDir::Asc,
+        s: "+timestamp,+id".to_owned(),
+        f: None,
+        d: "fwd".to_owned(),
+    };
+    let encoded = original.encode().expect("CursorV1 encode is infallible");
+    let decoded = CursorV1::decode(&encoded).expect("decoded a freshly-encoded cursor");
+    assert_eq!(decoded.k, original.k);
+    assert_eq!(decoded.s, original.s);
+    assert_eq!(decoded.d, original.d);
+}
+
+#[test]
+fn page_round_trip_with_usage_record() {
+    let pi = PageInfo {
+        next_cursor: Some("cursor-token".to_owned()),
+        prev_cursor: None,
+        limit: 50,
+    };
+    let page: Page<UsageRecord> = Page::new(vec![make_record()], pi);
+    let json = serde_json::to_string(&page).unwrap();
+    let decoded: Page<UsageRecord> = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.items.len(), 1);
+    assert_eq!(decoded.page_info.limit, 50);
+    assert_eq!(
+        decoded.page_info.next_cursor.as_deref(),
+        Some("cursor-token")
+    );
 }

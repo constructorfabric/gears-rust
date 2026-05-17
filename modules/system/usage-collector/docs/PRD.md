@@ -350,6 +350,7 @@ The system **MUST** provide an API for querying aggregated usage data. Queries *
 
 The system **MUST** authorize each query via the platform PDP. The PDP decision determines whether the caller is permitted to query usage data; PDP-returned constraints are applied as additional query filters before execution. The system **MUST** fail closed on authorization failures.
 
+- **Endpoint**: `GET /usage-collector/v1/aggregated` — tenant derived from SecurityContext; mandatory query parameters `fn`, `from`, `to`; `bucket_size` required when `group_by` includes `time_bucket`; returns `200 OK` with a (possibly empty) JSON array of aggregation rows; 400 on validation failure; 403 on PDP denial or empty constraints; 503 on plugin failure. License-feature gated via `gts.cf.core.lic.feat.v1~cf.core.global.base.v1`.
 - **Rationale**: Downstream consumers (billing, dashboards) need aggregated views without fetching and processing raw records. Filter and grouping dimensions enable billing breakdowns (e.g., tokens per model per day) and per-subject chargeback without requiring consumers to process raw records.
 - **Actors**: `cpt-cf-usage-collector-actor-usage-consumer`, `cpt-cf-usage-collector-actor-tenant-admin`
 
@@ -361,6 +362,7 @@ The system **MUST** provide an API for querying raw usage records with cursor-ba
 
 The system **MUST** authorize each query via the platform PDP using decision and constraint enforcement, identical to the aggregation query path.
 
+- **Endpoint**: `GET /usage-collector/v1/raw` — tenant derived from SecurityContext; mandatory query parameters `from`, `to`; optional `cursor`, `page_size` (bounded by `[1, MAX_PAGE_SIZE]`, defaults to `DEFAULT_PAGE_SIZE`); returns `200 OK` with a `Page<UsageRecord>` (`modkit-odata`) where absent `page_info.next_cursor` signals the final page; 400 on validation/cursor-decode failure; 403 on PDP denial or empty constraints; 503 on plugin failure. License-feature gated via `gts.cf.core.lic.feat.v1~cf.core.global.base.v1`.
 - **Rationale**: Some consumers need access to individual records for auditing, debugging, or dispute resolution.
 - **Actors**: `cpt-cf-usage-collector-actor-usage-consumer`, `cpt-cf-usage-collector-actor-tenant-admin`
 

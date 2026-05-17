@@ -29,6 +29,7 @@ modkit = { workspace = true }
 modkit-canonical-errors = { workspace = true }
 modkit-db = { workspace = true, features = ["preview-outbox"] }
 modkit-macros = { workspace = true }
+modkit-odata = { workspace = true }
 modkit-security = { workspace = true }
 modkit-utils = { workspace = true, features = ["humantime-serde"] }
 
@@ -69,10 +70,15 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 
 # ModKit dependencies
 modkit-db = { workspace = true, features = ["sqlite"] }
-modkit-odata = { workspace = true }
 
 # HTTP testing
 tower = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# Log capture for ERROR-level assertions in handler tests (inst-agg-8c / inst-raw-8b).
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+
+# Query-string decode tests for `tenant_id`-rejection assertions.
+serde_urlencoded = { workspace = true }

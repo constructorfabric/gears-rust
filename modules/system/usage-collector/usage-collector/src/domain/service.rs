@@ -2,26 +2,36 @@
 //!
 //! Resolves the configured GTS storage plugin lazily on first call,
 //! wraps each plugin invocation in a [`CircuitBreaker`] with a per-call
-//! timeout, and exposes ingest and module-config operations
+//! timeout, and exposes ingest, module-config, and query operations
 //! returning [`DomainError`].
+//!
+//! For the query API, [`Service::query_aggregated`] and [`Service::query_raw`]
+//! perform the gateway-side PDP authorization (`authorize_and_compile_scope`)
+//! and embed the resulting [`modkit_security::AccessScope`] into the query
+//! before delegating the plugin call.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use authz_resolver_sdk::AuthZResolverClient;
 use modkit::client_hub::{ClientHub, ClientScope};
 use modkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use modkit::telemetry::ThrottledLog;
 use modkit_macros::domain_model;
+use modkit_security::{AccessScope, SecurityContext};
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
+use usage_collector_sdk::authz::{USAGE_RECORD, actions};
 use usage_collector_sdk::{
-    AllowedMetric, ModuleConfig, UsageCollectorError, UsageCollectorPluginClientV1,
-    UsageCollectorPluginSpecV1, UsageRecord,
+    AggregationResult, AllowedMetric, ModuleConfig, Page, UsageCollectorError,
+    UsageCollectorPluginClientV1, UsageCollectorPluginSpecV1, UsageRecord, UsageRecordError,
 };
 
+use super::authz::authorize_and_compile_scope;
 use super::circuit_breaker::CircuitBreaker;
 use super::error::DomainError;
+use super::query::{AggregationQueryRequest, RawQueryRequest};
 use crate::config::UsageCollectorConfig;
 
 /// Throttle interval for unavailable plugin warnings.
@@ -35,11 +45,16 @@ pub struct Service {
     selector: GtsPluginSelector,
     unavailable_log_throttle: ThrottledLog,
     circuit_breaker: CircuitBreaker,
+    authz: Arc<dyn AuthZResolverClient>,
 }
 
 impl Service {
     #[must_use]
-    pub fn new(config: UsageCollectorConfig, hub: Arc<ClientHub>) -> Self {
+    pub fn new(
+        config: UsageCollectorConfig,
+        hub: Arc<ClientHub>,
+        authz: Arc<dyn AuthZResolverClient>,
+    ) -> Self {
         let circuit_breaker = CircuitBreaker::new(config.circuit_breaker.clone());
         Self {
             hub,
@@ -47,6 +62,7 @@ impl Service {
             selector: GtsPluginSelector::new(),
             unavailable_log_throttle: ThrottledLog::new(UNAVAILABLE_LOG_THROTTLE),
             circuit_breaker,
+            authz,
         }
     }
 
@@ -179,6 +195,82 @@ impl Service {
             max_metadata_bytes: self.config.max_metadata_bytes,
         })
         // @cpt-end:cpt-cf-usage-collector-algo-sdk-and-ingest-core-get-module-config:p2:inst-cfg-p-4
+    }
+
+    /// Authorize and execute an aggregated usage query.
+    ///
+    /// Calls the PDP via [`authorize_and_compile_scope`] (`USAGE_RECORD`/`list`).
+    /// On `Err(PermissionDenied)` the plugin is NOT invoked. On success, the
+    /// compiled [`modkit_security::AccessScope`] is embedded into `query.scope`
+    /// and the query is delegated to the storage plugin.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomainError::PermissionDenied`] when the PDP denies the request or
+    ///   returns any non-Denied error (fail-closed; see `inst-authz-3a`/`-3b`).
+    /// - Plugin-call errors: [`DomainError::Timeout`], [`DomainError::Plugin`],
+    ///   [`DomainError::CircuitOpen`], and plugin-resolution errors.
+    pub async fn query_aggregated(
+        &self,
+        ctx: &SecurityContext,
+        request: AggregationQueryRequest,
+    ) -> Result<Vec<AggregationResult>, DomainError> {
+        let scope = self.authorize_query(ctx).await?;
+        let query = request.with_scope(scope);
+        self.call_plugin(|plugin| async move { plugin.query_aggregated(query).await })
+            .await
+    }
+
+    /// Authorize and execute a raw paginated usage query.
+    ///
+    /// Calls the PDP via [`authorize_and_compile_scope`] (`USAGE_RECORD`/`list`).
+    /// On `Err(PermissionDenied)` the plugin is NOT invoked. On success, the
+    /// compiled [`modkit_security::AccessScope`] is embedded into `query.scope`
+    /// and the query is delegated to the storage plugin.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomainError::PermissionDenied`] when the PDP denies the request or
+    ///   returns any non-Denied error (fail-closed; see `inst-authz-3a`/`-3b`).
+    /// - Plugin-call errors: [`DomainError::Timeout`], [`DomainError::Plugin`],
+    ///   [`DomainError::CircuitOpen`], and plugin-resolution errors.
+    pub async fn query_raw(
+        &self,
+        ctx: &SecurityContext,
+        request: RawQueryRequest,
+    ) -> Result<Page<UsageRecord>, DomainError> {
+        let scope = self.authorize_query(ctx).await?;
+        let query = request.with_scope(scope);
+        self.call_plugin(|plugin| async move { plugin.query_raw(query).await })
+            .await
+    }
+
+    /// Run the gateway-side PDP authorization for the query API and return the
+    /// compiled [`modkit_security::AccessScope`]. Shared between
+    /// [`Service::query_aggregated`] and [`Service::query_raw`] so the
+    /// fail-closed / `USAGE_RECORD`+`LIST` audit shape stays in lockstep.
+    ///
+    /// The PDP call is wrapped in `tokio::time::timeout(self.config.authz_timeout, …)`
+    /// so a slow or hung `AuthZResolverClient` cannot hang the request task.
+    /// Timeout elapsed is treated as a non-Denied PDP error and maps to
+    /// `PermissionDenied` (fail-closed; see `inst-authz-3b`).
+    async fn authorize_query(&self, ctx: &SecurityContext) -> Result<AccessScope, DomainError> {
+        let call =
+            authorize_and_compile_scope(ctx, Arc::clone(&self.authz), &USAGE_RECORD, actions::LIST);
+        if let Ok(result) = timeout(self.config.authz_timeout, call).await {
+            result.map_err(DomainError::PermissionDenied)
+        } else {
+            error!(
+                subject_id = %ctx.subject_id(),
+                authz_timeout_ms = u64::try_from(self.config.authz_timeout.as_millis()).unwrap_or(u64::MAX),
+                "PDP call timed out; access denied (fail-closed)",
+            );
+            Err(DomainError::PermissionDenied(
+                UsageRecordError::permission_denied()
+                    .with_reason("AUTHORIZATION_DENIED")
+                    .create(),
+            ))
+        }
     }
 }
 

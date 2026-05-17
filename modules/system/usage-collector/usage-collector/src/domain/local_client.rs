@@ -1,7 +1,13 @@
 //! Local (in-process) client for the usage-collector gateway.
 //!
-//! Wraps a [`Service`] and translates [`DomainError`] to the canonical
+//! Wraps a [`Service`] and translates [`super::DomainError`] to the canonical
 //! [`UsageCollectorError`] for consumption via `ClientHub`.
+//!
+//! The Feature 3 query API is intentionally **not** exposed here: queries run
+//! through [`Service::query_aggregated`] / [`Service::query_raw`], which
+//! compile and embed the PDP [`modkit_security::AccessScope`] before
+//! delegating to the storage plugin. Routing query traffic through the local
+//! client would create a public no-authz code path and is therefore omitted.
 
 use std::sync::Arc;
 

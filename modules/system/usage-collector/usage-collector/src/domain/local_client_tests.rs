@@ -1,17 +1,32 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use authz_resolver_sdk::AuthZResolverClient;
 use modkit::client_hub::ClientHub;
 use usage_collector_sdk::{UsageCollectorClientV1, UsageCollectorError, UsageKind};
 
 use super::{Service, UsageCollectorLocalClient};
 use crate::config::{MetricConfig, UsageCollectorConfig};
+use crate::test_support::DenyAuthZ;
+
+// ── Mocks ─────────────────────────────────────────────────────────────────
+//
+// The PDP mock used here — `DenyAuthZ` — is the centralised
+// `crate::test_support::DenyAuthZ`; the paths exercised below never invoke
+// the PDP, so any always-deny stub suffices.
+
+fn noop_authz() -> Arc<dyn AuthZResolverClient> {
+    Arc::new(DenyAuthZ)
+}
+
+// ── Module-config coverage ────────────────────────────────────────────────
 
 #[tokio::test]
 async fn module_not_configured_maps_to_canonical_not_found() {
     let svc = Arc::new(Service::new(
         UsageCollectorConfig::default(),
         Arc::new(ClientHub::default()),
+        noop_authz(),
     ));
     let client = UsageCollectorLocalClient::new(svc);
     let err = client.get_module_config("unknown").await.unwrap_err();
@@ -34,6 +49,7 @@ async fn module_config_returns_allowed_metrics() {
             ..UsageCollectorConfig::default()
         },
         Arc::new(ClientHub::default()),
+        noop_authz(),
     ));
     let client = UsageCollectorLocalClient::new(svc);
     let cfg = client.get_module_config("any-module").await.unwrap();
@@ -61,6 +77,7 @@ async fn module_config_preserves_counter_kind() {
             ..UsageCollectorConfig::default()
         },
         Arc::new(ClientHub::default()),
+        noop_authz(),
     ));
     let client = UsageCollectorLocalClient::new(svc);
     let cfg = client.get_module_config("any-module").await.unwrap();

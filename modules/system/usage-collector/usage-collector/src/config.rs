@@ -65,6 +65,14 @@ pub struct UsageCollectorConfig {
     #[serde(with = "modkit_utils::humantime_serde")]
     pub plugin_timeout: Duration,
 
+    /// Timeout for each PDP (authorization resolver) call made from the query
+    /// API. A slow/hung PDP must not be allowed to hang the request task; on
+    /// elapsed timeout the gateway fails closed and maps to
+    /// `PermissionDenied` (see `inst-authz-3b`).
+    /// Valid range: 100ms–30s. Default: 2s.
+    #[serde(with = "modkit_utils::humantime_serde")]
+    pub authz_timeout: Duration,
+
     /// Sliding-window circuit-breaker tuning for the storage plugin proxy.
     pub circuit_breaker: CircuitBreakerConfig,
 
@@ -88,6 +96,12 @@ impl UsageCollectorConfig {
         }
         if self.plugin_timeout > std::time::Duration::from_secs(30) {
             anyhow::bail!("plugin_timeout must not exceed 30s");
+        }
+        if self.authz_timeout < std::time::Duration::from_millis(100) {
+            anyhow::bail!("authz_timeout must be at least 100ms");
+        }
+        if self.authz_timeout > std::time::Duration::from_secs(30) {
+            anyhow::bail!("authz_timeout must not exceed 30s");
         }
         if self.circuit_breaker.failure_threshold < 1 {
             anyhow::bail!("circuit_breaker.failure_threshold must be at least 1");
@@ -119,6 +133,7 @@ impl Default for UsageCollectorConfig {
             vendor: "cyberfabric".to_owned(),
             max_metadata_bytes: 8192,
             plugin_timeout: Duration::from_secs(5),
+            authz_timeout: Duration::from_secs(2),
             circuit_breaker: CircuitBreakerConfig::default(),
             emitter: UsageEmitterConfig::default(),
             metrics: HashMap::new(),

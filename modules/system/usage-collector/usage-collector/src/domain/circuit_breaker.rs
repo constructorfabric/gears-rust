@@ -190,8 +190,11 @@ fn is_health_failure(err: &DomainError) -> bool {
         | DomainError::Timeout
         | DomainError::Internal(_) => true,
         DomainError::Plugin(canonical) => is_canonical_health_failure(canonical),
-        // Already-open or invalid-config errors are not new failure signals.
-        DomainError::CircuitOpen
+        // Authorization denials are caller-induced; already-open / invalid-config /
+        // module-not-configured are not new failure signals — none of them
+        // trip the breaker.
+        DomainError::PermissionDenied(_)
+        | DomainError::CircuitOpen
         | DomainError::InvalidPluginInstance { .. }
         | DomainError::ModuleNotConfigured { .. } => false,
     }

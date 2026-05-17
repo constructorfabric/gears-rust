@@ -37,6 +37,14 @@ pub enum DomainError {
     #[error("plugin error: {0}")]
     Plugin(#[source] UsageCollectorError),
 
+    /// Authorization denied by the PDP (or fail-closed on any non-Denied PDP
+    /// error). Distinguished from [`DomainError::Plugin`] so the REST boundary
+    /// can map authz failures to `403` without inspecting the wrapped canonical
+    /// error variant — keeps the path forward-compatible with future plugins
+    /// that legitimately return `PermissionDenied`.
+    #[error("authorization denied: {0}")]
+    PermissionDenied(#[source] UsageCollectorError),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -69,7 +77,7 @@ impl From<modkit::plugins::ChoosePluginError> for DomainError {
 impl From<DomainError> for UsageCollectorError {
     fn from(e: DomainError) -> Self {
         match e {
-            DomainError::Plugin(canonical) => canonical,
+            DomainError::Plugin(canonical) | DomainError::PermissionDenied(canonical) => canonical,
             DomainError::ModuleNotConfigured { module } => {
                 ModuleConfigError::not_found("module not configured")
                     .with_resource(&module)
