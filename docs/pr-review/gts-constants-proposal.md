@@ -61,10 +61,10 @@ quota_check failed: subject=8f3a... type=consumption enforcement=hard period=mon
 
 # Log line with GTS URIs — unambiguous, greppable, linkable
 quota_check failed:
-  subject_type=gts://gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1~
-  quota_type=gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1~
-  enforcement=gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1~
-  period=gts://gts.cf.qe.quota.period.v1~cf.qe.quota.period.monthly.v1~
+  subject_type=gts://gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1
+  quota_type=gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1
+  enforcement=gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1
+  period=gts://gts.cf.qe.quota.period.v1~cf.qe.quota.period.monthly.v1
 ```
 
 Benefits in practice:
@@ -81,7 +81,7 @@ The current design hard-codes the list of valid `subject_type`, `metric`, `enfor
 With GTS, a vendor registers their own child schema under the platform's parent:
 
 ```
-gts://gts.cf.qe.subject.type.v1~acme.billing.subject.cost_center.v1~
+gts://gts.cf.qe.subject.type.v1~acme.billing.subject.cost_center.v1
 ```
 
 The QE engine resolves the URI and delegates to the plugin that declared it. The platform never needs to know about `cost_center` — the registry and the plugin contract are sufficient. This is the extension model the plugin architecture in ADR-0001 promises but does not deliver with raw strings.
@@ -95,7 +95,7 @@ GTS schemas support arbitrary `properties` blocks. This lets the schema carry me
 supports_rollover   = true
 requires_period     = true
 ledger_shape        = "accumulative"
-default_enforcement = "gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1~"
+default_enforcement = "gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1"
 ```
 
 The evaluation engine reads `ledger_shape` from the resolved schema to determine how to count and reset — no match arms needed. A new quota type registered by a plugin just declares its own `ledger_shape` value; no engine code change.
@@ -206,6 +206,7 @@ Description:  Discriminator for the entity whose quota consumption is being trac
 Properties:
   hierarchical: bool   # whether subjects of this type form a tree
   is_uuid:      bool   # true means the subject ID is UUID, otherwise a string
+  description:  string
 ```
 
 **Child instances**
@@ -234,6 +235,7 @@ Properties:
   unit:        string  # human label: "tokens", "requests", "bytes", "calls"
   granularity: string  # "cumulative" | "delta" (could be also GTS...)
   aggregation: string  # "sum" | "max" | "last" (could be also GTS...)
+  description: string
 ```
 
 **Child instances**
@@ -264,15 +266,16 @@ Properties:
   supports_rollover: bool
   requires_period:   bool
   is_additive:       bool    # whether multiple quotas of this type stack
+  description:       string
 ```
 
 **Child instances**
 
 | URI | ledger_shape | supports_rollover | requires_period | description |
 |-----|-------------|-------------------|-----------------|-------------|
-| `~cf.qe.quota.consumption.v1~` | accumulative | true | true | Tracks cumulative usage against a cap. Resets each period. Typical for API calls and tokens. |
-| `~cf.qe.quota.allocation.v1~` | reservable | false | false | Reserves capacity via lease acquire/commit. Typical for storage bytes and reserved seats. |
-| `~cf.qe.quota.rate.v1~` | accumulative | false | false | (P3) Rolling-window rate limit. Cap applies per sliding interval, not a calendar period. |
+| `~cf.qe.quota.consumption.v1` | accumulative | true | true | Tracks cumulative usage against a cap. Resets each period. Typical for API calls and tokens. |
+| `~cf.qe.quota.allocation.v1` | reservable | false | false | Reserves capacity via lease acquire/commit. Typical for storage bytes and reserved seats. |
+| `~cf.qe.quota.rate.v1` | accumulative | false | false | (P3) Rolling-window rate limit. Cap applies per sliding interval, not a calendar period. |
 
 ---
 
@@ -289,17 +292,18 @@ Properties:
   iso_duration:     string  # ISO 8601 duration: P1D, P1W, P1M, P1Y
   calendar_aligned: bool    # true = resets at start of calendar unit, false = rolling
   orderable:        bool    # whether periods form a total order for sequencing
+  description:      string
 ```
 
 **Child instances**
 
 | URI | iso_duration | calendar_aligned | description |
 |-----|-------------|-----------------|-------------|
-| `~cf.qe.quota.period.daily.v1~` | P1D | true | Resets at midnight UTC each calendar day |
-| `~cf.qe.quota.period.weekly.v1~` | P1W | true | Resets at Monday 00:00 UTC each calendar week |
-| `~cf.qe.quota.period.monthly.v1~` | P1M | true | Resets on the 1st of each calendar month at 00:00 UTC |
-| `~cf.qe.quota.period.yearly.v1~` | P1Y | true | Resets on January 1st at 00:00 UTC |
-| `~cf.qe.quota.period.one_time.v1~` | — | false | No reset. Cap is a lifetime allowance. Useful for trial credits. |
+| `~cf.qe.quota.period.daily.v1` | P1D | true | Resets at midnight UTC each calendar day |
+| `~cf.qe.quota.period.weekly.v1` | P1W | true | Resets at Monday 00:00 UTC each calendar week |
+| `~cf.qe.quota.period.monthly.v1` | P1M | true | Resets on the 1st of each calendar month at 00:00 UTC |
+| `~cf.qe.quota.period.yearly.v1` | P1Y | true | Resets on January 1st at 00:00 UTC |
+| `~cf.qe.quota.period.one_time.v1` | — | false | No reset. Cap is a lifetime allowance. Useful for trial credits. |
 
 ---
 
@@ -316,6 +320,7 @@ Properties:
   rejects_over_cap:   bool  # true = HTTP 429 / RESOURCE_EXHAUSTED
   allows_partial:     bool  # true = debit is clamped to remaining balance
   notifies_threshold: bool  # true = threshold events are emitted
+  description:        string
 ```
 
 **Child instances**
@@ -350,10 +355,10 @@ Properties:
 |-----|---------|-------------------|-------------|
 | URI | priority | mutable_by_subject | required_permission | description |
 |-----|---------|-------------------|---------------------|-------------|
-| `~cf.qe.quota.source.licensing.v1~` | 0 | false | `~cf.qe.quota.manage_system.v1~` | Quota bound to a commercial license or subscription entitlement. Highest authority. |
-| `~cf.qe.quota.source.operator.v1~` | 10 | false | `~cf.qe.quota.manage_system.v1~` | Platform operator override. Applies platform-wide policy limits. |
-| `~cf.qe.quota.source.tenant_admin.v1~` | 20 | false | `~cf.qe.quota.manage_tenant.v1~` | (P2) Tenant administrator-configured cap. Cannot exceed operator cap. |
-| `~cf.qe.quota.source.user_self.v1~` | 30 | true | `~cf.qe.quota.manage_self.v1~` | (P2) User-defined personal cap. Cannot exceed tenant_admin cap. |
+| `~cf.qe.quota.source.licensing.v1~` | 0 | false | `~cf.qe.quota.manage_system.v1` | Quota bound to a commercial license or subscription entitlement. Highest authority. |
+| `~cf.qe.quota.source.operator.v1~` | 10 | false | `~cf.qe.quota.manage_system.v1` | Platform operator override. Applies platform-wide policy limits. |
+| `~cf.qe.quota.source.tenant_admin.v1~` | 20 | false | `~cf.qe.quota.manage_tenant.v1` | (P2) Tenant administrator-configured cap. Cannot exceed operator cap. |
+| `~cf.qe.quota.source.user_self.v1~` | 30 | true | `~cf.qe.quota.manage_self.v1` | (P2) User-defined personal cap. Cannot exceed tenant_admin cap. |
 
 ---
 
@@ -432,14 +437,14 @@ Enforcement decision resource:
 
 ```json
 {
-  "subject_type": "gts://gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1~",
+  "subject_type": "gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1",
   "subject_id": "uuid-...",
-  "metric": "gts://gts.cf.uc.metric.type.v1~cf.uc.metric.llm_token.v1~",
-  "quota_type": "gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1~",
-  "period": "gts://gts.cf.qe.quota.period.v1~cf.qe.quota.period.monthly.v1~",
+  "metric": "gts.cf.uc.metric.type.v1~cf.uc.metric.llm_token.v1",
+  "quota_type": "gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1",
+  "period": "gts.cf.qe.quota.period.v1~cf.qe.quota.period.monthly.v1",
   "cap": 1000000,
-  "enforcement_mode": "gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1~",
-  "source": "gts://gts.cf.qe.quota.source.v1~cf.qe.quota.source.licensing.v1~",
+  "enforcement_mode": "gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1",
+  "source": "gts.cf.qe.quota.source.v1~cf.qe.quota.source.licensing.v1",
   "notification_thresholds": [0.75, 0.90, 1.0]
 }
 ```
@@ -457,13 +462,13 @@ The validation path at the API boundary becomes:
 
 | String constant | Replacement base schema | Child instances defined | Properties usable by engine |
 |----------------|------------------------|------------------------|----------------------------|
-| `subject_type` | `gts.cf.qe.subject.type.v1` | 4 (2 P3) | hierarchical, id_format |
-| `metric` | `gts.cf.uc.metric.type.v1` | 5 | unit, granularity, aggregation |
-| `quota_type` | `gts.cf.qe.quota.type.v1` | 3 (1 P3) | ledger_shape, supports_rollover |
-| `period` | `gts.cf.qe.quota.period.v1` | 5 | iso_duration, calendar_aligned |
-| `enforcement_mode` | `gts.cf.qe.quota.enforcement.v1` | 3 (2 P3) | rejects_over_cap, allows_partial |
-| `source` | `gts.cf.qe.quota.source.v1` | 4 (2 P2) | priority, mutable_by_subject |
+| `subject_type` | `gts.cf.qe.subject.type.v1~` | 4 (2 P3) | hierarchical, id_format |
+| `metric` | `gts.cf.uc.metric.type.v1~` | 5 | unit, granularity, aggregation |
+| `quota_type` | `gts.cf.qe.quota.type.v1~` | 3 (1 P3) | ledger_shape, supports_rollover |
+| `period` | `gts.cf.qe.quota.period.v1~` | 5 | iso_duration, calendar_aligned |
+| `enforcement_mode` | `gts.cf.qe.quota.enforcement.v1~` | 3 (2 P3) | rejects_over_cap, allows_partial |
+| `source` | `gts.cf.qe.quota.source.v1~` | 4 (2 P2) | priority, mutable_by_subject |
 | resource type constants | flat schemas in `gts.cf.qe.resource.*` | 4 | used in Problem envelope `type` field |
-| `source` → `required_permission` | `gts.cf.modkit.authz.permission.v1` | 5 | eliminates role match arms in handler |
+| `source` → `required_permission` | `gts.cf.modkit.authz.permission.v1~` | 5 | eliminates role match arms in handler |
 
 Adopting this catalogue also closes Findings #1, #2 (wrong URI prefix on existing `gts.x.qe.subject-type.v1~`) and Finding #8 (resource-type constants unnamed) from the current review.
