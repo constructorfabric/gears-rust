@@ -51,7 +51,30 @@ The API schema does not change. Existing clients are unaffected. No version bump
 
 The same argument applies to `period`, `enforcement_mode`, `source`, and `subject_type`. Each of these is currently a strong candidate to grow new values as the platform adds subscription tiers, new quota shapes, or tenant-hierarchy enforcement — all without touching the HTTP contract.
 
-#### 5. Vendor and plugin extensions without forking
+#### 5. Self-identifying values in logs and error responses
+
+A string constant like `"hard"` or `"monthly"` is opaque in a log line or a Problem response body. Without surrounding context it is impossible to know which field it came from or which domain concept it represents. GTS URIs are self-describing:
+
+```
+# Log line with string constants — ambiguous
+quota_check failed: subject=8f3a... type=consumption enforcement=hard period=monthly
+
+# Log line with GTS URIs — unambiguous, greppable, linkable
+quota_check failed:
+  subject_type=gts://gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1~
+  quota_type=gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1~
+  enforcement=gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1~
+  period=gts://gts.cf.qe.quota.period.v1~cf.qe.quota.period.monthly.v1~
+```
+
+Benefits in practice:
+
+- **Grep is unambiguous.** Searching logs for `gts.cf.qe.quota.enforcement.hard` returns only enforcement decisions. Searching for `"hard"` matches anything.
+- **Problem responses are self-documenting.** An RFC 9457 `Problem` body that carries a GTS URI in the `type` or detail fields points the caller directly to the registry entry for the failing concept, with no extra look-up step.
+- **Cross-service correlation.** When QE emits an outbox event and Usage Collector emits a usage record, both carry the same `gts://gts.cf.uc.metric.type.v1~cf.uc.metric.llm_token.v1~` URI. A single grep across both services' logs ties the full request lifecycle together without a field-name mapping table.
+- **No collision between domains.** Two different modules can both log a field named `type` without ambiguity — the URI prefix carries the domain.
+
+#### 6. Vendor and plugin extensions without forking
 
 The current design hard-codes the list of valid `subject_type`, `metric`, `enforcement_mode`, and `source` values. If a plugin vendor wants to introduce a new subject type (e.g. `cost_center`, `project`, `resource_group`) they cannot do so without modifying the core enum and redeploying the platform.
 
