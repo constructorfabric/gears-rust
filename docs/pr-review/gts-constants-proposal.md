@@ -1,8 +1,5 @@
 ## PR Comment: Replace String Constants with GTS Type Instances
 
-**Files:** `DESIGN.md` §5 (Resource Types), §6 (Plugin Registry), PRD §5.1 (Subject Type Registry), quota creation API schema
-**Related findings:** Finding #1 (CRITICAL, wrong GTS URI prefix), Finding #2 (CRITICAL, second occurrence), Finding #8 (MEDIUM, resource-type constants undefined)
-
 ---
 
 ### Why GTS Over String Constants
@@ -11,7 +8,7 @@ The current design uses raw string literals (`"tenant"`, `"consumption"`, `"hard
 
 #### 1. Descriptions travel with the type
 
-A GTS schema carries a `description`, `display_name`, `tags`, and arbitrary `properties` in its registry entry. A bare string constant like `"consumption"` carries nothing — its meaning lives in scattered comments and PRD prose that drifts from the code over time. When a developer calls the quota API and sees `quota_type: "gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1~"` they can resolve that URI against the GTS registry and get a human-readable description, the owning team, the version history, and all custom properties attached to the schema. No documentation spelunking required.
+A GTS schema carries a `description`, `display_name`, `tags`, and arbitrary `properties` in its registry entry. A bare string constant like `"consumption"` carries nothing — its meaning lives in scattered comments and PRD prose that drifts from the code over time. When a developer calls the quota API and sees `quota_type: "gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1"` they can resolve that URI against the GTS registry and get a human-readable description, the owning team, the version history, and all custom properties attached to the schema. No documentation spelunking required.
 
 #### 2. Discoverability via API
 
@@ -20,9 +17,9 @@ With string constants, the only way to know valid values is to read the PRD or l
 ```
 GET /gts/schemas?parent=gts://gts.cf.qe.quota.type.v1~
 → [
-    "gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1~",
-    "gts://gts.cf.qe.quota.type.v1~cf.qe.quota.allocation.v1~",
-    "gts://gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1~"
+    "gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1",
+    "gts://gts.cf.qe.quota.type.v1~cf.qe.quota.allocation.v1",
+    "gts://gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1"
   ]
 ```
 
