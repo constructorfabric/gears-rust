@@ -32,7 +32,29 @@ A client SDK, an admin UI, and an integration test can all enumerate valid value
 
 A string constant is validated only if someone wrote a hand-rolled allowlist check. A GTS URI is validated by resolving it against the registry — the registry either has it or it does not. A typo like `"consumptoin"` or `"monhtly"` returns an immediate, structured `404 Not Found` from the GTS resolver with the offending URI in the response body, rather than a mysterious runtime failure deep in the evaluation engine. This makes integration errors obvious at the API boundary, not inside a CEL expression.
 
-#### 4. Vendor and plugin extensions without forking
+#### 4. No API versioning churn when the set of values grows
+
+If `quota_type` is declared as a Rust `enum` (or an OpenAPI `enum` string constraint), adding a new variant is a **breaking change**:
+
+- Generated client SDKs that pattern-match exhaustively will fail to compile.
+- OpenAPI validators will reject the new value until the schema is republished under a new version.
+- Consumers who cached a previous OpenAPI spec will see `422 Unprocessable Entity` for previously valid payloads.
+- Any API contract that encodes the enum forces a major version bump (`/v2/...`) even when the rest of the surface is unchanged.
+
+With a GTS URI the API field is always typed as `string (uri)`. The contract is:
+
+> "pass a valid child instance of this base schema"
+
+Adding `gts://gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1~` (P3 rate limiting) requires:
+
+1. Register the new schema in the GTS registry.
+2. Update the engine to handle it.
+
+The API schema does not change. Existing clients are unaffected. No version bump. The registry becomes the extension point instead of the OpenAPI document.
+
+The same argument applies to `period`, `enforcement_mode`, `source`, and `subject_type`. Each of these is currently a strong candidate to grow new values as the platform adds subscription tiers, new quota shapes, or tenant-hierarchy enforcement — all without touching the HTTP contract.
+
+#### 5. Vendor and plugin extensions without forking
 
 The current design hard-codes the list of valid `subject_type`, `metric`, `enforcement_mode`, and `source` values. If a plugin vendor wants to introduce a new subject type (e.g. `cost_center`, `project`, `resource_group`) they cannot do so without modifying the core enum and redeploying the platform.
 
