@@ -92,10 +92,6 @@ CREATE TABLE file_storage.files (
     content_state           text         NOT NULL  DEFAULT 'available'
                                          CHECK (content_state IN ('pending', 'available')),
 
-    -- Public-access flag. When true, anonymous reads via
-    -- /api/file-storage-public/v1/files/{file_id} are permitted.
-    public_access           boolean      NOT NULL  DEFAULT false,
-
     -- Backend pointer. `backend_id` references the BackendConfig loaded from
     -- TOML in P1 (or from `storage_backends_runtime` in P3). `backend_path`
     -- is an opaque per-driver path; format is not parsed by FileStorage.
@@ -113,7 +109,6 @@ COMMENT ON COLUMN file_storage.files.owner_kind               IS 'Owner principa
 COMMENT ON COLUMN file_storage.files.content_revision         IS 'Monotonic counter; bumped only on content writes. Backs the ETag derivation.';
 COMMENT ON COLUMN file_storage.files.metadata_revision        IS 'Monotonic counter; bumped on every successful write (content or metadata).';
 COMMENT ON COLUMN file_storage.files.content_state            IS 'pending = created without content (P2 multipart pre-completion); available = content present.';
-COMMENT ON COLUMN file_storage.files.public_access            IS 'When true, file is anonymously readable on /api/file-storage-public/v1.';
 
 -- Indexes on files -----------------------------------------------------------
 
@@ -125,11 +120,6 @@ CREATE INDEX files_owner_listing_idx
 -- Per-tenant per-type queries (used by authorization audit, P2 policy checks).
 CREATE INDEX files_tenant_gts_idx
     ON file_storage.files (tenant_id, gts_file_type);
-
--- Partial index for "list my public files" — common owner query.
-CREATE INDEX files_public_idx
-    ON file_storage.files (tenant_id, owner_kind, owner_id)
-    WHERE public_access = true;
 
 -- Recovery / debugging index on backend pointer (e.g., "which files live on
 -- backend X?"). Not on the hot path.

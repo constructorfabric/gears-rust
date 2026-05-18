@@ -36,11 +36,10 @@
   - [7.1 Public API Surface](#71-public-api-surface)
   - [7.2 External Integration Contracts](#72-external-integration-contracts)
 - [8. Use Cases](#8-use-cases)
-  - [Upload and Make Public](#upload-and-make-public)
+  - [Upload a File](#upload-a-file)
   - [Fetch File for Module Processing](#fetch-file-for-module-processing)
   - [Validate File Metadata Before Processing](#validate-file-metadata-before-processing)
   - [Delete a File](#delete-a-file)
-  - [Manage Public Access](#manage-public-access)
   - [Multi-Backend Deployment](#multi-backend-deployment)
   - [Configure Policy](#configure-policy)
 - [9. Acceptance Criteria](#9-acceptance-criteria)
@@ -57,10 +56,11 @@
 ### 1.1 Purpose
 
 FileStorage is a universal file storage and management service for the Cyber Ware middleware. It provides upload,
-download, metadata management, access control, and sharing capabilities for any module or user within the platform.
+download, metadata management, and tenant-scoped access control for any module or user within the platform. All
+access in P1 is authenticated — anonymous/external sharing is deferred to a separate concern (P3, see `§5.3`).
 
 The service supports pluggable storage backends, multiple access protocols (REST, S3-compatible, WebDAV), tenant-scoped
-access control with an ownership model, and policy-driven governance for file types, sizes, and sharing.
+access control with an ownership model, and policy-driven governance for file types and sizes.
 
 ### 1.2 Background / Problem Statement
 
@@ -80,8 +80,7 @@ Cyber Ware security and governance model.
 
 - Unified file storage accessible by all Cyber Ware modules and platform users
 - Tenant-scoped and origin-module-scoped access control with tenant, user and module ownership model
-- Anonymous public sharing via a per-file flag and a dedicated unauthenticated URL namespace
-- Policy-driven governance over file types, sizes, events, and sharing models
+- Policy-driven governance over file types, sizes, and events
 - Audit trail for all write operations
 - Pluggable storage backends without service rebuild
 
@@ -100,13 +99,12 @@ Cyber Ware security and governance model.
 | Term                | Definition                                                                                                                                                                                                                                                                              |
 |---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | File                | Binary content stored in FileStorage with associated metadata                                                                                                                                                                                                                           |
-| File URL            | The FileStorage URL of form `/files/{file_id_uuid}` (`GET`/`HEAD` only). Unsigned, no expiration, no per-user targeting. Served under two API Gateway prefixes: `/api/file-storage/v1` (JWT-enforced) and `/api/file-storage-public/v1` (anonymous, gated by the file's `public_access` flag) |
-| Metadata            | File properties: system-managed (name, size, mime_type, GTS file type, dates, owner, availability) and user-defined custom key-value pairs                                                                                                                                              |
+| File URL            | The persistent, unsigned URL by which a file is read from FileStorage. The same URL is returned to every consumer — no expiration, no per-user targeting. Concrete REST paths are defined in [DESIGN.md](./DESIGN.md) and [api.md](./api.md)                                                  |
+| Metadata            | File properties: system-managed (name, size, mime_type, GTS file type, dates, owner) and user-defined custom key-value pairs                                                                                                                                                            |
 | Custom Metadata     | User-defined key-value pairs attached to a file, analogous to S3 object metadata                                                                                                                                                                                                        |
 | Owner               | The principal that owns a file: `owner_kind ∈ {user, app}` plus `owner_id`. Every file also has a separate immutable `tenant_id`                                                                                                                                                       |
-| Public Access       | A per-file boolean flag (`public_access`) that, when true, allows anonymous read access via the public namespace `/api/file-storage-public/v1/files/{file_id_uuid}`. Not time-bounded; toggled by any actor authorized for write per `cpt-cf-file-storage-fr-authorization`           |
-| FileShare           | Separate Cyber Ware module (P3, `modules/file-share/`) that delivers richer-than-flag sharing on top of FileStorage. FileShare has its own database, issues its own URLs, and proxies link-served traffic via the FileStorage SDK. FileStorage stores no FileShare state                |
-| Sharable Link       | An entity owned by **FileShare** (not FileStorage): references a `file_id` plus optional `etag` and/or `version_id`, and carries rules such as expiration, recipient users/groups, and maximum download count. Materialized as a URL under FileShare's own prefix                       |
+| FileShare           | Working name for the future (P3) sharing capability built on top of FileStorage. Covers anonymous/public URLs, per-recipient grants, expirations, download counters, etc. Whether it ships as a separate Cyber Ware module or as an extension of FileStorage is deferred to a future ADR  |
+| Sharable Link       | A FileShare-issued (P3) reference to a FileStorage file with optional content/version pinning and access rules (anonymity, expiration, recipients, maximum download count). Out of P1 scope                                                                                                |
 | Storage Backend     | An underlying storage system (S3, GCS, Azure Blob, NFS, FTP, SMB, WebDAV) used for persisting file content                                                                                                                                                                              |
 | Policy              | A set of rules (allowed file types, size limits, events, sharing models) that constrain file operations; applicable at the tenant level and the user level independently — when both apply, the most restrictive value per aspect wins                                                  |
 | File Version        | An immutable snapshot of file content created on each upload to the same logical path when versioning is enabled; identified by an opaque version identifier assigned by the storage backend                                                                                            |
@@ -152,7 +150,6 @@ roles) from the platform authentication middleware.
 - File ownership by user or app (Cyber Ware module) within a tenant
 - GTS file type classification for per-actor access control
 - Authorization checks via Authorization Service
-- Anonymous public sharing via a per-file flag served on a dedicated unauthenticated URL namespace
 - Audit trail for all write operations and optional read audit logging
 - Policies (file types, size limits, events) at tenant and user levels
 - Pluggable storage backend abstraction
@@ -176,11 +173,9 @@ roles) from the platform authentication middleware.
 - Content transformation or transcoding
 - CDN distribution
 - Full-text search within file content
-- Scope-based shareable links (`public`, `tenant`, `tenant-hierarchy` link tokens) — replaced by the per-file
-  `public_access` flag (`cpt-cf-file-storage-fr-public-access`)
-- Per-principal grant-based sharing — owned by the **FileShare** module (P3, `modules/file-share/`)
-- S3-compatible and WebDAV protocol facades — if needed they will be implemented as separate modules consuming
-  FileStorage's SDK
+- All external/anonymous access (anonymous URLs, scope-based shareable links, per-recipient grants, time-bounded
+  or count-limited access) — deferred to P3 (see `§5.3`). FileStorage P1 exposes only the auth-required surface
+- S3-compatible and WebDAV protocol facades
 
 ## 5. Functional Requirements
 
@@ -190,9 +185,10 @@ roles) from the platform authentication middleware.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-upload-file`
 
-The system **MUST** accept file content with metadata and persist it, returning a persistent, accessible URL. Content
-is mutable through dedicated content-replacement operations on the same file; when the backing storage backend
-declares the versioning capability, each replacement creates a new immutable backend version.
+The system **MUST** accept file content with metadata and persist it, returning a persistent, accessible URL. The
+content of an existing file can be **replaced wholesale** through dedicated content-replacement operations on the
+same file — partial-byte mutation is **not** supported. When the backing storage backend declares the versioning
+capability, each replacement creates a new immutable backend version.
 
 **Rationale**: All platform modules and users need to store files — modules store generated content, documents, and
 artifacts, users upload files directly. Coupling content replacement to backend versioning preserves recoverability
@@ -333,10 +329,8 @@ tenant-scoped, and type-scoped permissions.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-tenant-boundary`
 
-The system **MUST** enforce tenant isolation: all file operations through the auth-required namespace **MUST NOT**
-cross tenant boundaries. A principal in one tenant **MUST NOT** access files owned by another tenant. The only
-exception is anonymous access via the public namespace (`cpt-cf-file-storage-fr-public-access`), which is not
-tenant-aware.
+The system **MUST** enforce tenant isolation on every file operation: a principal in one tenant **MUST NOT**
+access files owned by another tenant.
 
 **Rationale**: Multi-tenant platforms require strict data isolation to prevent unauthorized cross-tenant access.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
@@ -393,73 +387,21 @@ file's tenant preserves the tenant-isolation invariant.
 
 ### 5.3 Sharing
 
-#### Sharing model overview
+FileStorage P1 exposes **only an authenticated REST surface**. Anonymous/public access, per-recipient grants,
+expirations, content/version pinning, download counters, and any other sharing primitives are **out of P1 scope
+and deferred to P3**.
 
-FileStorage and FileShare are **two distinct modules** with a clear boundary:
+The working name for the deferred capability is "FileShare". Whether it ships as a separate Cyber Ware module or
+as an extension of FileStorage itself is an open architectural decision to be settled by a future ADR at the
+time the functionality is implemented. FileStorage P1 stores no sharing-related state, exposes no anonymous URL
+namespace, and has no JWT-bypass paths — its surface is identical for every consumer and always goes through
+platform authentication and the Authorization Service.
 
-- **FileStorage** issues exactly one kind of URL per file: `/files/{file_id_uuid}` (`GET` and `HEAD` only). The URL is
-  **unsigned**, has **no expiration**, and **does not target any particular user or group**. The same UUID-based URL
-  appears under two namespace prefixes that differ only in API Gateway routing:
-  - `/api/file-storage/v1/files/{file_id_uuid}` — JWT-enforced; the caller must be authorized via the platform
-    Authorization Service per `cpt-cf-file-storage-fr-authorization`
-  - `/api/file-storage-public/v1/files/{file_id_uuid}` — JWT skipped at the gateway; access is granted only if the
-    file's `public_access` flag is `true` (`cpt-cf-file-storage-fr-public-access`)
-  FileStorage has no notion of named recipients, time-bounded access, download counters, or any link-level rules.
-
-- **FileShare** is a separate Cyber Ware module (P3, `modules/file-share/`) with its own datastore that owns a
-  `sharable_link` entity referencing FileStorage files. Each `sharable_link` carries: `file_id` (required), optional
-  `etag` and/or `version_id` to pin the link to a specific content or version snapshot, and a set of access rules
-  (e.g., expiration, list of recipient users or groups, maximum download count). FileShare issues its **own**
-  URLs under its own prefix, proxies all link-served traffic itself, and fetches file content from FileStorage
-  through the FileStorage SDK on the grantee's behalf. FileStorage stores **no FileShare state** and has no
-  dependency on FileShare.
-
-The remainder of `§5.3` covers only the FileStorage-side `public_access` mechanism. The FileShare data model, link
-lifecycle, and recipient/expiration rules are defined in the FileShare module's own PRD (`modules/file-share/docs/PRD.md`,
-P3 deliverable).
-
-#### Public Access Flag
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-public-access`
-
-The system **MUST** expose a per-file boolean property `public_access` that any actor authorized for the **write**
-action (`cpt-cf-file-storage-fr-authorization`) can toggle via standard metadata updates
-(`cpt-cf-file-storage-fr-update-metadata`). When `public_access = true`, the file's content is readable
-through the **public namespace** (`/api/file-storage-public/v1/files/{file_id_uuid}`, `GET` and `HEAD` only) without
-authentication. The platform API Gateway **MUST** route requests under this prefix without enforcing JWT
-authentication. When `public_access = false`, requests to the public namespace **MUST** respond with `404 Not Found`
-regardless of the file's actual existence (never `401`/`403`), to avoid leaking the existence of private files. The
-flag is not time-bounded — revoking access requires setting the flag back to `false`.
-
-The public namespace **MUST**:
-
-- Support `GET` and `HEAD` only — all write methods return `405`
-- Behave identically to the auth-required path on every read concern: `Range` semantics
-  (`cpt-cf-file-storage-fr-range-requests`), conditional-request semantics including `ETag`
-  derivation, `If-None-Match`, and `If-Match` (`cpt-cf-file-storage-fr-conditional-requests`),
-  and version-specific retrieval — when the file's backend declares the versioning capability
-  (`cpt-cf-file-storage-fr-file-versioning`), the same `/files/{file_id_uuid}/versions/{version_id}`
-  `GET`/`HEAD` path **MUST** be reachable on the public namespace subject to `public_access`
-- Return the full set of standard response headers used on the auth-required path —
-  `ETag`, `Content-Type`, `Content-Length`, `Content-Range` (on `206`), `Accept-Ranges`,
-  `Last-Modified`, `X-FS-File-Id`, `X-FS-Hash-Algorithm`, `X-FS-Hash-Value`,
-  `X-FS-Content-Revision`, `X-FS-Metadata-Revision`, `X-FS-Created-At`, and `X-FS-Version-Id`
-  when applicable
-- Omit **only** the tenant-internal classifier headers — specifically `X-FS-GTS-File-Type`,
-  `X-FS-Public-Access`, and `X-FS-Owner-*` — together with `X-FS-Meta-<key>` custom metadata
-  headers, to avoid leaking owner-private context
-
-The file's UUID is the access secret on the public namespace; random 128-bit UUIDs make enumeration computationally
-infeasible.
-
-**Rationale**: A boolean flag controlled by standard metadata updates is the simplest mechanism for "the internet
-can read this" — no link tables, no token expiry, no per-user targeting inside FileStorage. Routing through a distinct
-URL prefix lets the API Gateway bypass JWT validation cleanly without per-request authentication-mode introspection.
-Returning `404` (rather than `401`/`403`) preserves the privacy of files whose UUIDs leak through logs. All
-richer-than-flag sharing semantics — TTLs, named recipients, download counters — belong in the FileShare module
-because they imply a separate persistent entity (the `sharable_link`) with its own lifecycle, which is not
-FileStorage's concern.
-**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
+**Rationale**: Public/anonymous access is a sharing concern, not a storage concern. Keeping FileStorage purely
+internal in P1 (a) lets sharing semantics evolve independently inside a single module with the appropriate
+data model, (b) eliminates JWT-bypass surfaces and owner-private-header redaction logic from FileStorage, and
+(c) matches the main-branch design where external sharing was already a separate (P2) FR rather than a P1
+storage concern.
 
 ### 5.4 Policies (Phase 2)
 
@@ -548,7 +490,6 @@ The system **MUST** store and return the following system-managed metadata for e
 - Creation date
 - Last modified date
 - Owner (`owner_kind ∈ {user, app}` + `owner_id`) and `tenant_id`
-- Public access (boolean; gates the public namespace per `cpt-cf-file-storage-fr-public-access`)
 
 In addition, the system **MUST** support user-defined custom metadata as arbitrary key-value string pairs. Custom
 metadata **MUST** be specifiable at upload time and updatable after upload. The system **MUST** return custom metadata
@@ -565,10 +506,8 @@ Blob metadata.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-update-metadata`
 
 Any actor authorized for the **write** action on the file's GTS type
-(`cpt-cf-file-storage-fr-authorization`) **MUST** be able to update the following file properties:
-
-- `custom_metadata` (user-defined key-value pairs)
-- `public_access` (gates the public namespace per `cpt-cf-file-storage-fr-public-access`)
+(`cpt-cf-file-storage-fr-authorization`) **MUST** be able to update the file's `custom_metadata` (user-defined
+key-value pairs).
 
 The set of principals admitted by the Authorization Service for this action **MAY** include the file's current owner,
 other principals within the same tenant, or service identities — the model is policy-driven, not hard-coded to
@@ -841,8 +780,8 @@ or geographic requirements.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-rest-api`
 
 The system **MUST** expose a REST API for all file operations (upload, download, delete, metadata management, backend
-discovery). The REST surface is split into the auth-required namespace (`/api/file-storage/v1`) and the public
-namespace (`/api/file-storage-public/v1`, `GET`/`HEAD` only) — see `cpt-cf-file-storage-fr-public-access`.
+discovery) under a single auth-required namespace (`/api/file-storage/v1`). FileStorage P1 has no anonymous
+namespace — see `§5.3`.
 
 **Rationale**: REST is the standard access interface for Cyber Ware modules and platform UI.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
@@ -853,8 +792,7 @@ namespace (`/api/file-storage-public/v1`, `GET`/`HEAD` only) — see `cpt-cf-fil
 
 Download endpoints **MUST** support random (non-sequential) read access to arbitrary byte ranges of stored content so
 that consumers can seek through large files efficiently — most importantly, so that media players can scrub through
-videos and audio without re-downloading the file. This applies uniformly to the auth-required download path and the
-public namespace (`cpt-cf-file-storage-fr-public-access`); no download channel may opt out.
+videos and audio without re-downloading the file.
 
 **Rationale**: Without random read access, every seek in a video forces a full re-download from byte 0, which is
 unusable for any clip longer than a few seconds. The protocol-level mechanics (HTTP `Range`/`Content-Range` semantics,
@@ -940,8 +878,8 @@ across requests with multiple files.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-nfr-url-availability`
 
-Stored file URLs (auth-required and public namespaces alike) **MUST** remain accessible for the duration of the
-file's retention with availability matching the platform SLA.
+Stored file URLs **MUST** remain accessible for the duration of the file's retention with availability matching
+the platform SLA.
 
 **Threshold**: URL availability matches platform SLA for the duration of the retention period
 **Rationale**: Consumers depend on URL stability — broken URLs disrupt downstream workflows and user experience.
@@ -1018,26 +956,15 @@ The following NFR categories from the platform checklist are **not applicable** 
 backend-capability discovery.
 **Breaking Change Policy**: Major version bump required for trait signature changes.
 
-#### Auth-Required REST API
+#### REST API
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-rest-api`
 
 **Type**: REST API (OpenAPI 3.0)
 **URL Prefix**: `/api/file-storage/v1`
 **Stability**: unstable
-**Description**: HTTP REST API for owner-authenticated file operations and metadata management.
-**Breaking Change Policy**: Major version bump required for endpoint removal or incompatible schema changes.
-
-#### Public REST API
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-public-rest-api`
-
-**Type**: REST API (no authentication)
-**URL Prefix**: `/api/file-storage-public/v1`
-**Stability**: unstable
-**Description**: `GET` and `HEAD` only, gated by per-file `public_access` flag
-(`cpt-cf-file-storage-fr-public-access`). The platform API Gateway routes this prefix without enforcing JWT
-authentication.
+**Description**: HTTP REST API for authenticated file operations and metadata management. All endpoints require
+platform JWT — there is no anonymous surface in P1 (see `§5.3`).
 **Breaking Change Policy**: Major version bump required for endpoint removal or incompatible schema changes.
 
 ### 7.2 External Integration Contracts
@@ -1094,9 +1021,9 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 
 ## 8. Use Cases
 
-### Upload and Make Public
+### Upload a File
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-upload-public`
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-upload`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -1114,14 +1041,12 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 5. FileStorage persists content, assigns ownership, stores metadata
 6. *(Phase 2)* FileStorage emits audit record for the upload
 7. FileStorage returns persistent URL and file identifier
-8. User toggles `public_access = true` via metadata update
-9. The file becomes readable via the public namespace (`/api/file-storage-public/v1/files/{id}`)
 
 **Postconditions**:
 
 - File stored with metadata and ownership
-- `public_access = true`; file is anonymously readable via the public namespace
-- *(Phase 2)* Audit records emitted for creation and public-access toggle
+- File is readable only by principals authorized via `cpt-cf-file-storage-fr-authorization`
+- *(Phase 2)* Audit record emitted for the upload
 
 **Alternative Flows**:
 
@@ -1241,37 +1166,6 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - **Version not found**: FileStorage returns version_not_found error
 - **Cross-tenant attempt**: FileStorage returns access-denied error (tenant boundary enforcement)
 
-### Manage Public Access
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-manage-public-access`
-
-**Actor**: `cpt-cf-file-storage-actor-platform-user`
-
-**Preconditions**:
-
-- User is authenticated
-- User is authorized for the **write** action on the file's GTS type (`cpt-cf-file-storage-fr-authorization`) —
-  typically the file's owner, but may also include any other principal admitted by the active access policy
-
-**Main Flow** (revoke public access):
-
-1. Authorized actor reads current file metadata
-2. Actor sends a metadata update to toggle `public_access = false`
-3. FileStorage checks authorization for the actor on `gts.cf.fstorage.file.type.v1~`
-4. FileStorage updates the flag; the public namespace returns `404` for subsequent requests
-5. *(Phase 2)* FileStorage emits an audit record for the change
-
-**Postconditions**:
-
-- `public_access = false`; public namespace responds with `404`
-- Auth-required access for authorized principals is unaffected
-- *(Phase 2)* Audit record emitted
-
-**Alternative Flows**:
-
-- **Enable public access**: same flow with `public_access = true`
-- **Authorization denied**: FileStorage returns access-denied error
-
 ### Multi-Backend Deployment
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-backend-config`
@@ -1334,8 +1228,7 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - [ ] File deletion of a non-versioned file permanently removes content
 - [ ] File deletion of a versioned file without version identifier places a soft-delete marker (no physical removal)
 - [ ] Authorization checked for every file operation via Authorization Service
-- [ ] Tenant boundary enforced — cross-tenant access through the auth-required namespace rejected
-- [ ] Public access flag (`public_access`) gates anonymous reads via the public namespace; `false` returns `404`
+- [ ] Tenant boundary enforced — cross-tenant access rejected
 - [ ] Audit record emitted for every write operation
 - [ ] Policies enforce file type and size restrictions on upload (most restrictive wins across tenant and user levels)
 - [ ] All content traffic flows through FileStorage; no backend-addressable URL is returned to any client
@@ -1344,8 +1237,8 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - [ ] Metadata-only queries complete without transferring file content
 - [ ] Content is mutable through dedicated content-replacement operations; ETag (content-derived) changes on every
   content write; metadata-only updates do not change ETag or content hash
-- [ ] Custom metadata and `public_access` are updatable by any actor authorized for the **write** action on the
-  file's GTS type; system-managed metadata is not user-updatable
+- [ ] `custom_metadata` is updatable by any actor authorized for the **write** action on the file's GTS type;
+  system-managed metadata is not user-updatable
 - [ ] Custom metadata update changes the file's last modified date
 - [ ] File ownership (`owner_kind`, `owner_id`) is immutable after creation except through explicit ownership transfer
   or owner deletion workflows; `tenant_id` is never mutable
@@ -1387,8 +1280,8 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
   Usage Collector is unavailable
 - [ ] Ownership transfer emits usage reports for both previous and new owner
 - [ ] File events emitted to EventBroker on write operations (upload, update, delete) when enabled by owner policy
-- [ ] HTTP Range requests return partial content for downloads (auth-required and public namespaces); seeking and
-  resumable downloads supported; `Accept-Ranges: bytes` set on every download response
+- [ ] HTTP Range requests return partial content for downloads; seeking and resumable downloads supported;
+  `Accept-Ranges: bytes` set on every download response
 - [ ] Retention policies automatically expire and delete files based on configured age, inactivity, or custom metadata
   criteria; per-file retention overrides are honored
 - [ ] Storage backends in P1 are loaded from a static TOML configuration file at module startup; in P3, backends can
@@ -1397,7 +1290,7 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
   authorization of both parties and emits an audit record
 - [ ] Custom metadata operations rejected when exceeding configurable limits (max pairs, key length, value length, total
   size)
-- [ ] Read audit records emitted for every download (auth-required and public namespaces) when enabled by policy
+- [ ] Read audit records emitted for every download when enabled by policy
 
 ## 10. Dependencies
 
@@ -1416,8 +1309,8 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - Authorization Service is available and supports `gts.cf.fstorage.file.type.v1~` resource type
 - All file access respects tenant boundaries at the platform level
 - Initial storage backend is configured at deployment time; runtime backend switching is phase 2
-- Auth-required file URLs are internal to Cyber Ware; external anonymous access is via the public namespace
-  (`cpt-cf-file-storage-fr-public-access`); per-principal external sharing is delivered by the FileShare module (P3)
+- All FileStorage URLs are internal to Cyber Ware and require platform JWT in P1; any external/anonymous sharing
+  is deferred to P3 (see `§5.3`)
 - Policy configuration is available to tenant administrators and users through the platform
 
 ## 12. Risks
