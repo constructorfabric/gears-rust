@@ -86,12 +86,12 @@ gts://gts.cf.qe.subject.type.v1~acme.billing.subject.cost_center.v1~
 
 The QE engine resolves the URI and delegates to the plugin that declared it. The platform never needs to know about `cost_center` — the registry and the plugin contract are sufficient. This is the extension model the plugin architecture in ADR-0001 promises but does not deliver with raw strings.
 
-#### 5. Custom properties on schemas
+#### 7. Custom properties on schemas
 
 GTS schemas support arbitrary `properties` blocks. This lets the schema carry metadata that the engine can read without any code change:
 
 ```toml
-[schema."gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1~".properties]
+[schema."gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1".properties]
 supports_rollover   = true
 requires_period     = true
 counter_table       = "quota_consumption_counters"
@@ -119,17 +119,17 @@ gts://gts.cf.qe.subject.type.v1~
 Every child instance follows the chained format:
 
 ```
-gts://gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1~
-gts://gts.cf.qe.subject.type.v1~cf.qe.subject.user.v1~
-gts://gts.cf.qe.subject.type.v1~cf.qe.subject.service_account.v1~   ← P2
-gts://gts.cf.qe.subject.type.v1~cf.qe.subject.cost_center.v1~       ← P3
+gts://gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1
+gts://gts.cf.qe.subject.type.v1~cf.qe.subject.user.v1
+gts://gts.cf.qe.subject.type.v1~cf.qe.subject.service_account.v1   ← P2
+gts://gts.cf.qe.subject.type.v1~cf.qe.subject.cost_center.v1       ← P3
 ```
 
 ---
 
 ### Proposed Full GTS Schema Catalogue
 
-Below is the complete schema catalogue covering every string constant in the current quota API. Each section shows the base schema URI, its description and properties, and all first-party child instances.
+Below is **just an example** of possible schema catalogue covering every string constant in the current quota API. Each section shows the base schema URI, its description and properties, and all first-party child instances.
 
 ---
 
@@ -139,22 +139,23 @@ Below is the complete schema catalogue covering every string constant in the cur
 
 ```
 URI:          gts://gts.cf.qe.subject.type.v1~
-Owner:        cf.qe
+Vendo:        cf (Cyber Fabric)
+Package:      qe (Quota Enforcement)
 Description:  Discriminator for the entity whose quota consumption is being tracked.
               A subject type identifies the dimension on which quota isolation is applied.
 Properties:
   hierarchical: bool   # whether subjects of this type form a tree
-  id_format:    string # hint for ID validation (uuid, email, slug, ...)
+  is_uuid:      bool   # true means the subject ID is UUID, otherwise a string
 ```
 
 **Child instances**
 
-| URI | description | hierarchical | id_format |
+| URI | description | hierarchical | is_uuid |
 |-----|-------------|-------------|-----------|
-| `~cf.qe.subject.tenant.v1~` | Top-level organizational tenant. Quota applies to all users and workloads within the tenant. | true | uuid |
-| `~cf.qe.subject.user.v1~` | Individual authenticated user within a tenant. | false | uuid |
-| `~cf.qe.subject.service_account.v1~` | Non-human workload identity. Treated as a first-class subject for machine-to-machine quota. | false | uuid |
-| `~cf.qe.subject.cost_center.v1~` | (P3) Named accounting unit within a tenant hierarchy. Supports hierarchical cap propagation. | true | slug |
+| `~cf.qe.subject.tenant.v1` | Top-level organizational tenant. Quota applies to all users and workloads within the tenant. | true | true |
+| `~cf.qe.subject.user.v1` | Individual authenticated user within a tenant. | false | true |
+| `~cf.qe.subject.service_account.v1` | Non-human workload identity. Treated as a first-class subject for machine-to-machine quota. | false | true |
+| `~cf.qe.subject.cost_center.v1` | (P3) Named accounting unit within a tenant hierarchy. Supports hierarchical cap propagation. | true | false |
 
 ---
 
@@ -164,25 +165,26 @@ Properties:
 
 ```
 URI:          gts://gts.cf.uc.metric.type.v1~
-Owner:        cf.uc   ← Usage Collector owns metric definitions, QE consumes them
+Vendor:       cf (Cyber Fabric)
+Package:      uc (Usage Collector) ← Usage Collector owns metric definitions, QE consumes them
 Description:  Identifies the resource or activity being metered.
               The same metric type is used by both Usage Collector (for recording)
               and Quota Enforcement (for counting against caps).
 Properties:
   unit:        string  # human label: "tokens", "requests", "bytes", "calls"
-  granularity: string  # "cumulative" | "delta"
-  aggregation: string  # "sum" | "max" | "last"
+  granularity: string  # "cumulative" | "delta" (could be also GTS...)
+  aggregation: string  # "sum" | "max" | "last" (could be also GTS...)
 ```
 
 **Child instances**
 
 | URI | unit | granularity | description |
 |-----|------|-------------|-------------|
-| `~cf.uc.metric.api_request.v1~` | requests | delta | One REST or gRPC call to any platform API endpoint |
-| `~cf.uc.metric.llm_token.v1~` | tokens | delta | LLM prompt+completion token pair, model-agnostic |
-| `~cf.uc.metric.storage_byte.v1~` | bytes | cumulative | Persistent storage consumed at snapshot time |
-| `~cf.uc.metric.egress_byte.v1~` | bytes | delta | Data transferred out of the platform boundary |
-| `~cf.uc.metric.compute_second.v1~` | seconds | delta | Wall-clock compute time charged to the subject |
+| `~cf.uc.metric.api_request.v1` | requests | delta | One REST or gRPC call to any platform API endpoint |
+| `~cf.uc.metric.llm_token.v1` | tokens | delta | LLM prompt+completion token pair, model-agnostic |
+| `~cf.uc.metric.storage_byte.v1` | bytes | cumulative | Persistent storage consumed at snapshot time |
+| `~cf.uc.metric.egress_byte.v1` | bytes | delta | Data transferred out of the platform boundary |
+| `~cf.uc.metric.compute_second.v1` | seconds | delta | Wall-clock compute time charged to the subject |
 
 > **Note:** new metric types are registered by the owning team in the UC namespace. QE needs no code change to enforce a new metric — it reads the schema's `unit` and `aggregation` properties.
 
