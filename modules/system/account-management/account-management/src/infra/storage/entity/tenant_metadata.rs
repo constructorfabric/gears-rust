@@ -21,6 +21,11 @@ pub struct Model {
     pub value: Json,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+    /// Monotonic version for optimistic locking. Bumped by every
+    /// UPDATE (`current + 1`); seeded at `1` for every INSERT.
+    /// Declared on the table in `m0001_initial_schema` so every
+    /// fresh deployment starts with the column in place.
+    pub version: i64,
 }
 // @cpt-end:cpt-cf-account-management-dbtable-tenant-metadata:p2:inst-dbtable-tenant-metadata-entity
 

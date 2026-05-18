@@ -22,7 +22,10 @@
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use modkit_security::AccessScope;
+use modkit_security::{
+    AccessScope, InTenantSubtreeScopeFilter, ScopeConstraint, ScopeFilter, SecurityContext,
+    pep_properties,
+};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -39,13 +42,23 @@ use crate::domain::conversion::service::{
 use crate::domain::conversion::test_support::FakeConversionRepo;
 use crate::domain::error::DomainError;
 use crate::domain::tenant::model::{TenantModel, TenantStatus};
-use crate::domain::tenant::test_support::FakeTenantRepo;
+use crate::domain::tenant::test_support::{FakeTenantRepo, deny_all_enforcer, mock_enforcer};
 use crate::domain::tenant_type::{TenantTypeChecker, inert_tenant_type_checker};
+use authz_resolver_sdk::PolicyEnforcer;
 
 const APPROVAL_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 const RETENTION_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+/// Marker used as `requested_by` on `seeded_request` rows so tests can
+/// assert against a stable, recognisable uuid. Distinct from
+/// [`CTX_SUBJECT`] — the seed builder stamps it directly, while
+/// service-emitted rows source their actor from `ctx.subject_id()`.
 const REQUESTER_MARKER: u128 = 0xF1;
-const COUNTERPARTY_MARKER: u128 = 0xC2;
+/// Actor uuid carried by every [`ctx`] `SecurityContext`. The PEP-gated
+/// service methods now source the actor from `ctx.subject_id()` instead
+/// of an explicit `*_by: Uuid` argument, so tests that previously
+/// asserted against `requester()` / `counterparty()` compare against
+/// this constant when the actor flows through the PEP path.
+const CTX_SUBJECT: Uuid = Uuid::from_u128(0xCAFE);
 
 // ---- helpers -------------------------------------------------------
 
@@ -53,8 +66,54 @@ fn fixed_now() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("epoch")
 }
 
-fn scope() -> AccessScope {
-    AccessScope::allow_all()
+/// Subject tenant id used by every service-test [`ctx`]. The
+/// `mock_enforcer` emits an `InTenantSubtree` predicate rooted here;
+/// `seed_tenant` materialises closure rows `(subject_root, tenant)`
+/// so tenants stay visible under the compiled PEP scope.
+const fn ctx_subject_root() -> Uuid {
+    Uuid::from_u128(0xCAFE_BABE)
+}
+
+fn ctx() -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(CTX_SUBJECT)
+        .subject_tenant_id(ctx_subject_root())
+        .build()
+        .expect("ctx")
+}
+
+fn ctx_for(root: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(CTX_SUBJECT)
+        .subject_tenant_id(root)
+        .build()
+        .expect("ctx")
+}
+
+/// Mirror of `ConversionService`'s `conversion_repo_scope` for the
+/// child-side branch — the URL-bound child's `tenant_id` clamps the
+/// conversion repo to that single tenant. Used by mutation tests
+/// that assert on the scope captured by `FakeConversionRepo`.
+fn expected_child_repo_scope(child_id: Uuid) -> AccessScope {
+    AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+        pep_properties::OWNER_TENANT_ID,
+        vec![child_id],
+    )]))
+}
+
+/// Mirror of `ConversionService`'s `conversion_repo_scope` for the
+/// parent-side branch — barrier-penetrating subtree clamp rooted at
+/// the URL-bound parent. Mirrors the
+/// `InTenantSubtreeScopeFilter::with_respect_barriers(.., false)` shape
+/// the service builds for parent-side counterparty mutations.
+fn expected_parent_repo_scope(parent_id: Uuid) -> AccessScope {
+    AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::InTenantSubtree(
+        InTenantSubtreeScopeFilter::with_respect_barriers(
+            pep_properties::OWNER_TENANT_ID,
+            parent_id,
+            false,
+        ),
+    )]))
 }
 
 fn approval_ttl() -> StdDuration {
@@ -84,6 +143,31 @@ fn make_service_with_checker(
         conv_repo,
         tenant_repo,
         tenant_type_checker,
+        mock_enforcer(),
+        approval_ttl(),
+        retention_window(),
+    )
+    .with_now_fn(now_fn)
+}
+
+/// Build a `ConversionService` with a caller-supplied `PolicyEnforcer`
+/// (`mock_enforcer` / `deny_all_enforcer` / etc.). Used by the
+/// caller-facing PEP-deny tests at the bottom of this file that pin
+/// the `EnforcerError::Denied → DomainError::CrossTenantDenied`
+/// propagation contract for every public method that runs through
+/// `self.authorize(...)`.
+fn make_service_with_enforcer(
+    conv_repo: Arc<FakeConversionRepo>,
+    tenant_repo: Arc<FakeTenantRepo>,
+    enforcer: PolicyEnforcer,
+    now: OffsetDateTime,
+) -> ConversionService {
+    let now_fn = Arc::new(move || now);
+    ConversionService::new(
+        conv_repo,
+        tenant_repo,
+        inert_tenant_type_checker(),
+        enforcer,
         approval_ttl(),
         retention_window(),
     )
@@ -119,6 +203,15 @@ fn seed_tenant(
         updated_at: now,
         deleted_at,
     });
+    // Closure seed for the PEP-derived `InTenantSubtree` predicate that
+    // `mock_enforcer` emits. Without these every PEP-derived scope
+    // would resolve to an empty visible set and every tenant lookup
+    // would surface as `NotFound`.
+    let subject_root = ctx_subject_root();
+    fake.seed_closure(subject_root, id, 0, status);
+    if subject_root != id {
+        fake.seed_closure(id, id, 0, status);
+    }
 }
 
 fn seeded_request(
@@ -150,14 +243,6 @@ fn seeded_request(
     }
 }
 
-fn requester() -> Uuid {
-    Uuid::from_u128(REQUESTER_MARKER)
-}
-
-fn counterparty() -> Uuid {
-    Uuid::from_u128(COUNTERPARTY_MARKER)
-}
-
 // ---- request_conversion -------------------------------------------
 
 #[tokio::test]
@@ -180,12 +265,11 @@ async fn request_conversion_happy_path_child_side() {
 
     let result = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: None,
-                requested_by: requester(),
             },
         )
         .await
@@ -235,12 +319,11 @@ async fn request_conversion_happy_path_parent_side() {
 
     let result = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::parent(parent),
                 target_mode_override: None,
-                requested_by: requester(),
             },
         )
         .await
@@ -264,12 +347,11 @@ async fn request_conversion_root_tenant_refused() {
 
     let err = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: root,
                 caller: ConversionCaller::child(root),
                 target_mode_override: None,
-                requested_by: requester(),
             },
         )
         .await
@@ -304,12 +386,11 @@ async fn request_conversion_status_suspended_rejected() {
 
     let err = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: None,
-                requested_by: requester(),
             },
         )
         .await
@@ -351,12 +432,11 @@ async fn request_conversion_status_deleted_rejected() {
 
     let err = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: None,
-                requested_by: requester(),
             },
         )
         .await
@@ -404,12 +484,11 @@ async fn request_conversion_pending_exists_returns_pending_exists() {
 
     let err = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: None,
-                requested_by: requester(),
             },
         )
         .await
@@ -457,12 +536,11 @@ async fn request_conversion_after_resolved_succeeds() {
 
     let row = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: None,
-                requested_by: requester(),
             },
         )
         .await
@@ -505,37 +583,31 @@ async fn cancel_happy_path_initiator() {
     )]));
     let svc = make_service(conv.clone(), tenants, now);
 
-    // Pass a narrowed scope (restricted to a specific tenant) to
-    // pin the documented contract that `cancel` MUST forward
-    // `AccessScope::allow_all()` to the repo — the
-    // `conversion_requests` entity is `Scopable(no_tenant,
-    // no_resource, no_owner, no_type)`, so a narrowed scope from
-    // the caller would compile to `WHERE false` in SeaORM and
-    // turn the mutation into a silent no-op. The
-    // `require_caller_tenant_visible` fence honors the caller's
-    // scope, but the conversion repo call MUST NOT — that's the
-    // forwarding invariant the assertion below guards.
-    let caller_scope = AccessScope::for_tenant(child);
+    // The conversion-repo call is expected to receive the
+    // **side-specific** scope built by `conversion_repo_scope`: for a
+    // child-side caller this is `for_tenant(child_id)` — `OWNER_TENANT_ID
+    // IN [child_id]` — which compiles to a DB-level clamp on
+    // `conversion_requests.tenant_id` and gives the repo second-line
+    // enforcement on top of the service's URL-coherence /
+    // caller-tenant-visible fences. The assertion below pins that
+    // forwarding contract so a regression that restores `allow_all`
+    // (or wires the caller scope through verbatim) fails here loudly.
     let updated = svc
-        .cancel(
-            &caller_scope,
-            pending_id,
-            ConversionCaller::child(child),
-            requester(),
-        )
+        .cancel(&ctx(), pending_id, ConversionCaller::child(child))
         .await
         .expect("initiator-side cancel succeeds");
 
     assert_eq!(updated.status, ConversionStatus::Cancelled);
-    assert_eq!(updated.cancelled_by, Some(requester()));
+    assert_eq!(updated.cancelled_by, Some(CTX_SUBJECT));
     assert_eq!(updated.resolved_at, Some(now));
     let captured = conv.captured_scopes();
+    let expected_repo_scope = expected_child_repo_scope(child);
     assert_eq!(
         captured.last(),
-        Some(&AccessScope::allow_all()),
-        "cancel MUST forward AccessScope::allow_all() to the conversion repo \
-         (entity is Scopable(no_tenant, no_resource, no_owner, no_type)); \
-         passing a narrowed scope would no-op the mutation in SeaORM"
+        Some(&expected_repo_scope),
+        "cancel MUST forward the child-side `for_tenant(child_id)` scope to the \
+         conversion repo so the entity-level Scopable(tenant_col, resource_col) \
+         clamp engages at the DB"
     );
 }
 
@@ -568,12 +640,7 @@ async fn cancel_by_counterparty_invalid_actor() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .cancel(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .cancel(&ctx(), pending_id, ConversionCaller::parent(parent))
         .await
         .expect_err("counterparty-side cancel must be rejected");
 
@@ -618,12 +685,7 @@ async fn cancel_on_resolved_returns_already_resolved() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .cancel(
-            &scope(),
-            resolved_id,
-            ConversionCaller::child(child),
-            requester(),
-        )
+        .cancel(&ctx(), resolved_id, ConversionCaller::child(child))
         .await
         .expect_err("cancel on a resolved row must return AlreadyResolved");
 
@@ -663,30 +725,29 @@ async fn reject_happy_path_counterparty() {
     )]));
     let svc = make_service(conv.clone(), tenants, now);
 
-    // See `cancel_happy_path_initiator` for the rationale on
-    // passing a narrowed scope here and asserting the repo
-    // received `AccessScope::allow_all()`. `reject` shares the
-    // forwarding contract.
-    let caller_scope = AccessScope::for_tenant(parent);
+    // See `cancel_happy_path_initiator` for the rationale on the
+    // service-built `conversion_repo_scope` forwarding contract.
+    // `reject` is counterparty-only — here the caller is the parent,
+    // so the expected repo-scope is a barrier-penetrating subtree
+    // clamp on `OWNER_TENANT_ID` rooted at `parent_id`. A regression
+    // that restored `allow_all` OR forgot `respect_barriers = false`
+    // (silently dropping self-managed-child rows) fails here loudly.
     let updated = svc
-        .reject(
-            &caller_scope,
-            pending_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .reject(&ctx(), pending_id, ConversionCaller::parent(parent))
         .await
         .expect("counterparty-side reject succeeds");
 
     assert_eq!(updated.status, ConversionStatus::Rejected);
-    assert_eq!(updated.rejected_by, Some(counterparty()));
+    assert_eq!(updated.rejected_by, Some(CTX_SUBJECT));
     assert_eq!(updated.resolved_at, Some(now));
     let captured = conv.captured_scopes();
+    let expected_repo_scope = expected_parent_repo_scope(parent);
     assert_eq!(
         captured.last(),
-        Some(&AccessScope::allow_all()),
-        "reject MUST forward AccessScope::allow_all() to the conversion repo \
-         (entity is Scopable(no_tenant, no_resource, no_owner, no_type))"
+        Some(&expected_repo_scope),
+        "reject MUST forward the parent-side subtree-with-barrier-penetration \
+         scope to the conversion repo so a parent rejecting a self-managed-child \
+         conversion still sees the row at the DB"
     );
 }
 
@@ -719,12 +780,7 @@ async fn reject_by_initiator_invalid_actor() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .reject(
-            &scope(),
-            pending_id,
-            ConversionCaller::child(child),
-            requester(),
-        )
+        .reject(&ctx(), pending_id, ConversionCaller::child(child))
         .await
         .expect_err("initiator-side reject must be rejected");
 
@@ -769,12 +825,7 @@ async fn reject_on_resolved_returns_already_resolved() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .reject(
-            &scope(),
-            resolved_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .reject(&ctx(), resolved_id, ConversionCaller::parent(parent))
         .await
         .expect_err("reject on a resolved row must return AlreadyResolved");
 
@@ -837,7 +888,7 @@ async fn list_own_for_tenant_pagination_and_status_filter() {
     // Page 1, top=2, no status filter — returns the two newest rows.
     let page1 = svc
         .list_own_for_tenant(
-            &scope(),
+            &ctx(),
             child,
             &ListConversionsQuery::any(2, 0).expect("top > 0"),
         )
@@ -850,7 +901,7 @@ async fn list_own_for_tenant_pagination_and_status_filter() {
     // Page 2, top=2, skip=2 — returns the next two.
     let page2 = svc
         .list_own_for_tenant(
-            &scope(),
+            &ctx(),
             child,
             &ListConversionsQuery::any(2, 2).expect("top > 0"),
         )
@@ -869,7 +920,7 @@ async fn list_own_for_tenant_pagination_and_status_filter() {
     // Status filter: only `Approved` rows (there are two in the seed).
     let approved = svc
         .list_own_for_tenant(
-            &scope(),
+            &ctx(),
             child,
             &ListConversionsQuery::with_status(10, 0, ConversionStatus::Approved).expect("top > 0"),
         )
@@ -951,7 +1002,7 @@ async fn list_inbound_for_parent_only_direct_children() {
 
     let page = svc
         .list_inbound_for_parent(
-            &scope(),
+            &ctx(),
             parent,
             &ListConversionsQuery::any(50, 0).expect("top > 0"),
         )
@@ -1015,7 +1066,7 @@ async fn list_inbound_for_parent_projection_drops_subtree() {
 
     let page = svc
         .list_inbound_for_parent(
-            &scope(),
+            &ctx(),
             parent,
             &ListConversionsQuery::any(10, 0).expect("top > 0"),
         )
@@ -1181,12 +1232,7 @@ async fn status_precedes_actor_check_on_resolved_row() {
     // Cancel from the COUNTERPARTY side (wrong actor for cancel).
     // Even though both rules would reject, the status check must win.
     let cancel_err = svc
-        .cancel(
-            &scope(),
-            resolved_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .cancel(&ctx(), resolved_id, ConversionCaller::parent(parent))
         .await
         .expect_err("cancel on resolved + wrong side must error");
     assert!(
@@ -1196,12 +1242,7 @@ async fn status_precedes_actor_check_on_resolved_row() {
 
     // Reject from the INITIATOR side (wrong actor for reject).
     let reject_err = svc
-        .reject(
-            &scope(),
-            resolved_id,
-            ConversionCaller::child(child),
-            requester(),
-        )
+        .reject(&ctx(), resolved_id, ConversionCaller::child(child))
         .await
         .expect_err("reject on resolved + wrong side must error");
     assert!(
@@ -1292,39 +1333,31 @@ async fn approve_counterparty_flips_self_managed_and_transitions() {
         Arc::new(FakeConversionRepo::with_seed(vec![row]).with_tenant_repo(Arc::clone(&tenants)));
     let svc = make_service(conv.clone(), Arc::clone(&tenants), now);
 
-    // Pass a parent-only scope to pin TWO contracts at once:
+    // Pin TWO contracts at once with the caller scope below:
     //
     //   1. `approve` loads the converting tenant via `allow_all()`,
     //      NOT via the caller's scope — parent-side approval of a
     //      self-managed child MUST work even though the child sits
     //      behind the closure barrier and is invisible to a
-    //      parent-restricted `AccessScope`. A regression that
-    //      forwarded the caller scope to `tenant_repo.find_by_id`
-    //      would collapse this happy-path to `NotFound` for
-    //      self-managed-target conversions.
-    //   2. `approve` forwards `AccessScope::allow_all()` to the
-    //      conversion repo (`apply_conversion_approval`) regardless
-    //      of caller scope — see `cancel_happy_path_initiator` for
-    //      the SeaORM `WHERE false` rationale on the forwarding
-    //      contract.
-    //
-    // Using `for_tenant(parent)` exercises both contracts; if
-    // either breaks, the test fails (Contract 1 fails as `NotFound`
-    // from the active-precheck; Contract 2 fails the
-    // `captured_scopes` assertion below).
-    let caller_scope = AccessScope::for_tenant(parent);
+    //      parent-restricted `AccessScope` on the `tenants` entity.
+    //      A regression that wired the caller scope into the
+    //      `tenant_repo.find_by_id` call would collapse this happy-
+    //      path to `NotFound` for self-managed-target conversions.
+    //   2. `approve` forwards the side-specific scope produced by
+    //      `conversion_repo_scope` to the conversion repo, NOT the
+    //      caller's incoming scope. For a parent-side caller that is
+    //      `InTenantSubtree(OWNER_TENANT_ID, parent_id,
+    //      respect_barriers = false)` — exactly the shape that lets
+    //      a parent counterparty act on a self-managed-child row at
+    //      the DB while keeping subtree clamp as second-line authz.
+    //      The `captured_scopes` assertion below pins this contract.
     let updated = svc
-        .approve(
-            &caller_scope,
-            pending_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::parent(parent))
         .await
         .expect("counterparty-side approve succeeds");
 
     assert_eq!(updated.status, ConversionStatus::Approved);
-    assert_eq!(updated.approved_by, Some(counterparty()));
+    assert_eq!(updated.approved_by, Some(CTX_SUBJECT));
     assert_eq!(updated.resolved_at, Some(now));
     assert!(
         tenant_self_managed(&tenants, child),
@@ -1337,11 +1370,13 @@ async fn approve_counterparty_flips_self_managed_and_transitions() {
     assert_eq!(closure_barrier(&tenants, child, child), 0);
     assert_eq!(closure_barrier(&tenants, parent, parent), 0);
     let captured = conv.captured_scopes();
+    let expected_repo_scope = expected_parent_repo_scope(parent);
     assert_eq!(
         captured.last(),
-        Some(&AccessScope::allow_all()),
-        "approve MUST forward AccessScope::allow_all() to the conversion repo \
-         (entity is Scopable(no_tenant, no_resource, no_owner, no_type))"
+        Some(&expected_repo_scope),
+        "approve MUST forward the parent-side subtree-with-barrier-penetration \
+         scope to the conversion repo so a parent approving a self-managed-target \
+         conversion still sees the row at the DB"
     );
 }
 
@@ -1378,12 +1413,7 @@ async fn approve_initiator_side_returns_invalid_actor() {
 
     let err = svc
         // Initiator side approving its own request -> invalid actor.
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::child(child),
-            requester(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::child(child))
         .await
         .expect_err("initiator-side approve must be rejected");
 
@@ -1435,12 +1465,7 @@ async fn approve_already_resolved_returns_already_resolved() {
     let svc = make_service(conv, Arc::clone(&tenants), now);
 
     let err = svc
-        .approve(
-            &scope(),
-            resolved_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .approve(&ctx(), resolved_id, ConversionCaller::parent(parent))
         .await
         .expect_err("approve on resolved row must surface AlreadyResolved");
     assert!(
@@ -1489,12 +1514,7 @@ async fn approve_type_reeval_rejects_leaves_pending_intact() {
     );
 
     let err = svc
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::parent(parent))
         .await
         .expect_err("type re-eval rejection must surface TypeNotAllowed");
 
@@ -1554,12 +1574,7 @@ async fn approve_when_tenant_inactive_returns_validation() {
     let svc = make_service(conv, Arc::clone(&tenants), now);
 
     let err = svc
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::parent(parent))
         .await
         .expect_err("approve on non-active tenant must surface Validation");
 
@@ -1619,12 +1634,11 @@ async fn request_conversion_parent_scope_mismatch_returns_not_found() {
 
     let err = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::parent(wrong_parent),
                 target_mode_override: None,
-                requested_by: requester(),
             },
         )
         .await
@@ -1634,7 +1648,7 @@ async fn request_conversion_parent_scope_mismatch_returns_not_found() {
         );
 
     assert!(
-        matches!(err, DomainError::NotFound { .. }),
+        matches!(err, DomainError::ConversionRequestNotFound { .. }),
         "expected NotFound, got {err:?}"
     );
 }
@@ -1674,17 +1688,12 @@ async fn cancel_parent_scope_mismatch_wins_over_state_and_actor() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .cancel(
-            &scope(),
-            resolved_id,
-            ConversionCaller::parent(wrong_parent),
-            counterparty(),
-        )
+        .cancel(&ctx(), resolved_id, ConversionCaller::parent(wrong_parent))
         .await
         .expect_err("parent-side scope mismatch must beat state / actor checks");
 
     assert!(
-        matches!(err, DomainError::NotFound { .. }),
+        matches!(err, DomainError::ConversionRequestNotFound { .. }),
         "scope check MUST run before AlreadyResolved / InvalidActor AND scope mismatch \
          MUST surface as NotFound (existence-leak prevention); got {err:?}"
     );
@@ -1720,12 +1729,7 @@ async fn reject_parent_scope_mismatch_returns_not_found() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .reject(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(wrong_parent),
-            counterparty(),
-        )
+        .reject(&ctx(), pending_id, ConversionCaller::parent(wrong_parent))
         .await
         .expect_err(
             "parent-side scope mismatch must surface NotFound \
@@ -1733,7 +1737,7 @@ async fn reject_parent_scope_mismatch_returns_not_found() {
         );
 
     assert!(
-        matches!(err, DomainError::NotFound { .. }),
+        matches!(err, DomainError::ConversionRequestNotFound { .. }),
         "expected NotFound, got {err:?}"
     );
 }
@@ -1771,12 +1775,7 @@ async fn approve_parent_scope_mismatch_returns_not_found() {
     let svc = make_service(conv, Arc::clone(&tenants), now);
 
     let err = svc
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(wrong_parent),
-            counterparty(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::parent(wrong_parent))
         .await
         .expect_err(
             "parent-side scope mismatch must surface NotFound \
@@ -1784,7 +1783,7 @@ async fn approve_parent_scope_mismatch_returns_not_found() {
         );
 
     assert!(
-        matches!(err, DomainError::NotFound { .. }),
+        matches!(err, DomainError::ConversionRequestNotFound { .. }),
         "expected NotFound, got {err:?}"
     );
 }
@@ -1833,12 +1832,7 @@ async fn cancel_child_scope_mismatch_returns_not_found() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .cancel(
-            &scope(),
-            pending_id,
-            ConversionCaller::child(wrong_child),
-            requester(),
-        )
+        .cancel(&ctx(), pending_id, ConversionCaller::child(wrong_child))
         .await
         .expect_err(
             "child-side scope mismatch must surface NotFound \
@@ -1846,7 +1840,7 @@ async fn cancel_child_scope_mismatch_returns_not_found() {
         );
 
     assert!(
-        matches!(err, DomainError::NotFound { .. }),
+        matches!(err, DomainError::ConversionRequestNotFound { .. }),
         "expected NotFound, got {err:?}"
     );
 }
@@ -1884,12 +1878,7 @@ async fn reject_child_scope_mismatch_returns_not_found() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .reject(
-            &scope(),
-            pending_id,
-            ConversionCaller::child(wrong_child),
-            requester(),
-        )
+        .reject(&ctx(), pending_id, ConversionCaller::child(wrong_child))
         .await
         .expect_err(
             "child-side scope mismatch must surface NotFound \
@@ -1897,7 +1886,7 @@ async fn reject_child_scope_mismatch_returns_not_found() {
         );
 
     assert!(
-        matches!(err, DomainError::NotFound { .. }),
+        matches!(err, DomainError::ConversionRequestNotFound { .. }),
         "expected NotFound, got {err:?}"
     );
 }
@@ -1938,12 +1927,7 @@ async fn approve_child_scope_mismatch_returns_not_found() {
     let svc = make_service(conv, Arc::clone(&tenants), now);
 
     let err = svc
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::child(wrong_child),
-            counterparty(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::child(wrong_child))
         .await
         .expect_err(
             "child-side scope mismatch must surface NotFound \
@@ -1951,7 +1935,7 @@ async fn approve_child_scope_mismatch_returns_not_found() {
         );
 
     assert!(
-        matches!(err, DomainError::NotFound { .. }),
+        matches!(err, DomainError::ConversionRequestNotFound { .. }),
         "expected NotFound, got {err:?}"
     );
 }
@@ -1997,12 +1981,7 @@ async fn cancel_parent_side_on_null_parent_id_row_surfaces_not_found() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .cancel(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(any_parent),
-            requester(),
-        )
+        .cancel(&ctx(), pending_id, ConversionCaller::parent(any_parent))
         .await
         .expect_err(
             "parent-side caller on a NULL-parent_id row must surface NotFound \
@@ -2012,7 +1991,7 @@ async fn cancel_parent_side_on_null_parent_id_row_surfaces_not_found() {
         );
 
     assert!(
-        matches!(err, DomainError::NotFound { .. }),
+        matches!(err, DomainError::ConversionRequestNotFound { .. }),
         "expected NotFound (data-integrity case maps to the same surface as a regular \
          scope mismatch to avoid leaking corruption to a potentially untrusted caller); \
          got {err:?}"
@@ -2049,12 +2028,11 @@ async fn request_conversion_no_op_managed_to_managed_returns_validation() {
 
     let err = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: Some(TargetMode::Managed),
-                requested_by: requester(),
             },
         )
         .await
@@ -2092,12 +2070,11 @@ async fn request_conversion_no_op_self_managed_to_self_managed_returns_validatio
 
     let err = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: Some(TargetMode::SelfManaged),
-                requested_by: requester(),
             },
         )
         .await
@@ -2151,12 +2128,7 @@ async fn approve_returns_internal_when_fake_repo_missing_tenant_repo_handle() {
     let svc = make_service(conv, Arc::clone(&tenants), now);
 
     let err = svc
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::parent(parent))
         .await
         .expect_err("approve must surface Internal when fake apply seam is unwired");
 
@@ -2224,12 +2196,7 @@ async fn approve_rewrites_barrier_managed_to_self_managed() {
     // parent-initiated row, complementing the
     // parent-initiator-on-child-counterparty cases above.
     let _ = svc
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::child(mid),
-            counterparty(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::child(mid))
         .await
         .expect("counterparty (child) approve succeeds");
 
@@ -2319,12 +2286,7 @@ async fn approve_rewrites_barrier_self_managed_to_managed() {
     let svc = make_service(conv, Arc::clone(&tenants), now);
 
     let _ = svc
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(root),
-            counterparty(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::parent(root))
         .await
         .expect("counterparty (parent) approve succeeds");
 
@@ -2972,23 +2934,22 @@ async fn cancel_under_restricted_scope_excluding_child_tenant_collapses_to_not_f
     )]));
     let svc = make_service(conv, tenants, now);
 
-    // Scope restricted to a `foreign` tenant: the caller's URL-binding
-    // `ConversionCaller::child(child)` still matches `row.tenant_id`
-    // (so `require_caller_scope_or_not_found` passes), but the
-    // surrounding `AccessScope` excludes `child` — the new fence
-    // MUST collapse to `NotFound`.
-    let restricted = AccessScope::for_tenant(foreign);
+    // Ctx rooted at a `foreign` tenant: `mock_enforcer` compiles an
+    // `InTenantSubtree` predicate rooted at `foreign`, so the
+    // PEP-derived scope excludes `child` and `parent` even though the
+    // caller's URL-binding `ConversionCaller::child(child)` still
+    // matches `row.tenant_id`. The caller-visibility fence MUST
+    // collapse to `NotFound`.
     let err = svc
         .cancel(
-            &restricted,
+            &ctx_for(foreign),
             pending_id,
             ConversionCaller::child(child),
-            requester(),
         )
         .await
         .expect_err("out-of-scope caller must not see the row");
     match err {
-        DomainError::NotFound { resource, .. } => {
+        DomainError::ConversionRequestNotFound { resource, .. } => {
             assert_eq!(
                 resource,
                 pending_id.to_string(),
@@ -3033,15 +2994,10 @@ async fn cancel_on_soft_deleted_child_tenant_collapses_to_not_found() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .cancel(
-            &scope(),
-            pending_id,
-            ConversionCaller::child(child),
-            requester(),
-        )
+        .cancel(&ctx(), pending_id, ConversionCaller::child(child))
         .await
         .expect_err("soft-deleted child tenant must collapse to NotFound");
-    assert!(matches!(err, DomainError::NotFound { .. }));
+    assert!(matches!(err, DomainError::ConversionRequestNotFound { .. }));
 }
 
 #[tokio::test]
@@ -3074,20 +3030,19 @@ async fn reject_under_restricted_scope_excluding_parent_tenant_collapses_to_not_
     let svc = make_service(conv, tenants, now);
 
     // Parent-side reject: caller-owned tenant is `row.parent_id`. A
-    // scope restricted to a `foreign` tenant excludes `parent`, so
-    // the fence MUST collapse to `NotFound` after
+    // ctx rooted at a `foreign` tenant compiles to a PEP-derived
+    // scope that excludes `parent`, so the caller-visibility fence
+    // MUST collapse to `NotFound` after
     // `require_caller_scope_or_not_found` passes the URL-binding check.
-    let restricted = AccessScope::for_tenant(foreign);
     let err = svc
         .reject(
-            &restricted,
+            &ctx_for(foreign),
             pending_id,
             ConversionCaller::parent(parent),
-            counterparty(),
         )
         .await
         .expect_err("out-of-scope parent caller must not see the row");
-    assert!(matches!(err, DomainError::NotFound { .. }));
+    assert!(matches!(err, DomainError::ConversionRequestNotFound { .. }));
 }
 
 #[tokio::test]
@@ -3129,15 +3084,10 @@ async fn reject_on_soft_deleted_parent_tenant_collapses_to_not_found() {
     let svc = make_service(conv, tenants, now);
 
     let err = svc
-        .reject(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(parent),
-            counterparty(),
-        )
+        .reject(&ctx(), pending_id, ConversionCaller::parent(parent))
         .await
         .expect_err("soft-deleted parent tenant must collapse to NotFound");
-    assert!(matches!(err, DomainError::NotFound { .. }));
+    assert!(matches!(err, DomainError::ConversionRequestNotFound { .. }));
 }
 
 // ---- Cross-tenant denial coverage on the remaining public methods --
@@ -3171,15 +3121,13 @@ async fn request_conversion_under_restricted_scope_excluding_tenant_collapses_to
     let now = fixed_now();
     let svc = make_service(conv, tenants, now);
 
-    let restricted = AccessScope::for_tenant(foreign);
     let err = svc
         .request_conversion(
-            &restricted,
+            &ctx_for(foreign),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: None,
-                requested_by: requester(),
             },
         )
         .await
@@ -3246,237 +3194,151 @@ async fn approve_under_url_binding_mismatch_collapses_to_not_found() {
     // `require_caller_scope_or_not_found` collapses to NotFound
     // before any state load runs.
     let err = svc
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(other_parent),
-            counterparty(),
-        )
+        .approve(&ctx(), pending_id, ConversionCaller::parent(other_parent))
         .await
         .expect_err("parent-side approve on mismatched URL binding must not leak existence");
     match err {
-        DomainError::NotFound { resource, .. } => {
+        DomainError::ConversionRequestNotFound { resource, .. } => {
             assert_eq!(resource, pending_id.to_string());
         }
         other => panic!("expected NotFound, got {other:?}"),
     }
 }
 
-// ---- nil-actor guards (H2 / H3 fixes) ------------------------------
+// ---- PEP-deny propagation on every caller-facing method ----------
 //
-// Pin the cross-method uniformity that the AM-CONV-001/002 review
-// findings flagged: every conversion-service entry point that takes
-// an actor field MUST surface `Uuid::nil()` as a typed `Conflict`
-// (FailedPrecondition / HTTP 400), NOT `Internal` (HTTP 500). The
-// public `detail` is the sanitised "request missing required actor
-// identifier" string — AM-internal field/method names live on the
-// `am.conversion.audit` warn line only (asymmetry with the prior
-// `Internal { diagnostic = "..." }` shape would re-leak the bug the
-// `am.user.audit` fix on `provision_user` already closed). The
-// repo-side guard at `apply_conversion_approval` stays as
-// defence-in-depth and is exercised by repo-level tests.
-
-fn sanitised_actor_detail() -> &'static str {
-    "request missing required actor identifier"
-}
+// Each test below builds a `ConversionService` wired to
+// `deny_all_enforcer()` — a PDP fake that refuses every evaluation
+// with `decision: false`. The corresponding `EnforcerError::Denied`
+// then maps to `DomainError::CrossTenantDenied` via the `From` impl
+// in `domain::error`. The tests pin that every caller-facing public
+// method (`request_conversion` / `cancel` / `reject` / `approve` /
+// `list_own_for_tenant` / `list_inbound_for_parent`) funnels through
+// `self.authorize(...)` BEFORE any tenant / row lookup. A regression
+// that strips the `authorize` call from one of these methods (or
+// re-orders it past a tenant load) surfaces here as a lifted /
+// non-`CrossTenantDenied` error.
+//
+// No tenant / conversion-row seeding is required: the deny path
+// triggers on the very first line of each method and short-circuits
+// before any repo access.
 
 #[tokio::test]
-async fn request_conversion_rejects_nil_requested_by_with_conflict() {
+async fn request_conversion_propagates_pep_deny_as_cross_tenant_denied() {
     let conv = Arc::new(FakeConversionRepo::new());
     let tenants = Arc::new(FakeTenantRepo::new());
-    let parent = Uuid::from_u128(0xA10);
-    let child = Uuid::from_u128(0xA11);
-    seed_tenant(&tenants, parent, None, TenantStatus::Active, false, "root");
-    seed_tenant(
-        &tenants,
-        child,
-        Some(parent),
-        TenantStatus::Active,
-        false,
-        "c",
-    );
-    let svc = make_service(conv, tenants, fixed_now());
+    let svc = make_service_with_enforcer(conv, tenants, deny_all_enforcer(), fixed_now());
 
+    let child = Uuid::from_u128(0x9001);
     let err = svc
         .request_conversion(
-            &scope(),
+            &ctx(),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: None,
-                requested_by: Uuid::nil(),
             },
         )
         .await
-        .expect_err("nil requested_by MUST reject");
-    match err {
-        DomainError::Conflict { detail } => {
-            assert_eq!(detail, sanitised_actor_detail());
-            assert!(
-                !detail.contains("request_conversion")
-                    && !detail.contains("requested_by")
-                    && !detail.contains("Uuid::nil()"),
-                "Conflict.detail leaked AM-internal text into public envelope: {detail}"
-            );
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
+        .expect_err("PEP-denied request_conversion must propagate as CrossTenantDenied");
+    assert!(
+        matches!(err, DomainError::CrossTenantDenied { .. }),
+        "expected CrossTenantDenied, got {err:?}"
+    );
 }
 
 #[tokio::test]
-async fn cancel_rejects_nil_cancelled_by_with_conflict() {
+async fn cancel_propagates_pep_deny_as_cross_tenant_denied() {
+    let conv = Arc::new(FakeConversionRepo::new());
     let tenants = Arc::new(FakeTenantRepo::new());
-    let parent = Uuid::from_u128(0xA20);
-    let child = Uuid::from_u128(0xA21);
-    seed_tenant(&tenants, parent, None, TenantStatus::Active, false, "root");
-    seed_tenant(
-        &tenants,
-        child,
-        Some(parent),
-        TenantStatus::Active,
-        false,
-        "c",
-    );
-    let pending_id = Uuid::from_u128(0x0000_CAFE);
-    let now = fixed_now();
-    let conv = Arc::new(FakeConversionRepo::with_seed(vec![seeded_request(
-        pending_id,
-        child,
-        Some(parent),
-        ConversionSide::Child,
-        ConversionStatus::Pending,
-        now,
-        None,
-    )]));
-    let svc = make_service(conv, tenants, now);
+    let svc = make_service_with_enforcer(conv, tenants, deny_all_enforcer(), fixed_now());
 
+    let request_id = Uuid::from_u128(0x9002);
+    let child = Uuid::from_u128(0x9003);
     let err = svc
-        .cancel(
-            &scope(),
-            pending_id,
-            ConversionCaller::child(child),
-            Uuid::nil(),
-        )
+        .cancel(&ctx(), request_id, ConversionCaller::child(child))
         .await
-        .expect_err("nil cancelled_by MUST reject");
-    match err {
-        DomainError::Conflict { detail } => {
-            assert_eq!(detail, sanitised_actor_detail());
-            assert!(
-                !detail.contains("cancel")
-                    && !detail.contains("cancelled_by")
-                    && !detail.contains("Uuid::nil()"),
-                "Conflict.detail leaked AM-internal text into public envelope: {detail}"
-            );
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
+        .expect_err("PEP-denied cancel must propagate as CrossTenantDenied");
+    assert!(
+        matches!(err, DomainError::CrossTenantDenied { .. }),
+        "expected CrossTenantDenied, got {err:?}"
+    );
 }
 
 #[tokio::test]
-async fn reject_rejects_nil_rejected_by_with_conflict() {
+async fn reject_propagates_pep_deny_as_cross_tenant_denied() {
+    let conv = Arc::new(FakeConversionRepo::new());
     let tenants = Arc::new(FakeTenantRepo::new());
-    let parent = Uuid::from_u128(0xA30);
-    let child = Uuid::from_u128(0xA31);
-    seed_tenant(&tenants, parent, None, TenantStatus::Active, false, "root");
-    seed_tenant(
-        &tenants,
-        child,
-        Some(parent),
-        TenantStatus::Active,
-        false,
-        "c",
-    );
-    let pending_id = Uuid::from_u128(0x0000_CAFF);
-    let now = fixed_now();
-    let conv = Arc::new(FakeConversionRepo::with_seed(vec![seeded_request(
-        pending_id,
-        child,
-        Some(parent),
-        ConversionSide::Child,
-        ConversionStatus::Pending,
-        now,
-        None,
-    )]));
-    let svc = make_service(conv, tenants, now);
+    let svc = make_service_with_enforcer(conv, tenants, deny_all_enforcer(), fixed_now());
 
-    // Counterparty-side caller (parent) rejects a child-initiated
-    // request. Nil actor must fail closed BEFORE the state machine
-    // produces an InvalidActorForTransition envelope.
+    let request_id = Uuid::from_u128(0x9004);
+    let parent = Uuid::from_u128(0x9005);
     let err = svc
-        .reject(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(parent),
-            Uuid::nil(),
-        )
+        .reject(&ctx(), request_id, ConversionCaller::parent(parent))
         .await
-        .expect_err("nil rejected_by MUST reject");
-    match err {
-        DomainError::Conflict { detail } => {
-            assert_eq!(detail, sanitised_actor_detail());
-            assert!(
-                !detail.contains("reject")
-                    && !detail.contains("rejected_by")
-                    && !detail.contains("Uuid::nil()"),
-                "Conflict.detail leaked AM-internal text into public envelope: {detail}"
-            );
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
+        .expect_err("PEP-denied reject must propagate as CrossTenantDenied");
+    assert!(
+        matches!(err, DomainError::CrossTenantDenied { .. }),
+        "expected CrossTenantDenied, got {err:?}"
+    );
 }
 
 #[tokio::test]
-async fn approve_rejects_nil_approver_uuid_with_conflict() {
+async fn approve_propagates_pep_deny_as_cross_tenant_denied() {
+    let conv = Arc::new(FakeConversionRepo::new());
     let tenants = Arc::new(FakeTenantRepo::new());
-    let parent = Uuid::from_u128(0xA40);
-    let child = Uuid::from_u128(0xA41);
-    seed_tenant(&tenants, parent, None, TenantStatus::Active, false, "root");
-    seed_tenant(
-        &tenants,
-        child,
-        Some(parent),
-        TenantStatus::Active,
-        false,
-        "c",
-    );
-    let pending_id = Uuid::from_u128(0x0000_CB00);
-    let now = fixed_now();
-    let conv = Arc::new(FakeConversionRepo::with_seed(vec![seeded_request(
-        pending_id,
-        child,
-        Some(parent),
-        ConversionSide::Child,
-        ConversionStatus::Pending,
-        now,
-        None,
-    )]));
-    let svc = make_service(conv, tenants, now);
+    let svc = make_service_with_enforcer(conv, tenants, deny_all_enforcer(), fixed_now());
 
-    // Counterparty-side caller (parent) approves a child-initiated
-    // request. Service-layer guard fires AFTER
-    // `require_caller_scope_or_not_found` (URL-binding check) so a
-    // mismatched URL still collapses to NotFound; nil actor on a
-    // legitimately-bound URL surfaces as Conflict.
+    let request_id = Uuid::from_u128(0x9006);
+    let parent = Uuid::from_u128(0x9007);
     let err = svc
-        .approve(
-            &scope(),
-            pending_id,
-            ConversionCaller::parent(parent),
-            Uuid::nil(),
+        .approve(&ctx(), request_id, ConversionCaller::parent(parent))
+        .await
+        .expect_err("PEP-denied approve must propagate as CrossTenantDenied");
+    assert!(
+        matches!(err, DomainError::CrossTenantDenied { .. }),
+        "expected CrossTenantDenied, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_own_for_tenant_propagates_pep_deny_as_cross_tenant_denied() {
+    let conv = Arc::new(FakeConversionRepo::new());
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let svc = make_service_with_enforcer(conv, tenants, deny_all_enforcer(), fixed_now());
+
+    let tenant_id = Uuid::from_u128(0x9008);
+    let err = svc
+        .list_own_for_tenant(
+            &ctx(),
+            tenant_id,
+            &ListConversionsQuery::any(10, 0).expect("top > 0"),
         )
         .await
-        .expect_err("nil approver_uuid MUST reject at the service boundary");
-    match err {
-        DomainError::Conflict { detail } => {
-            assert_eq!(detail, sanitised_actor_detail());
-            assert!(
-                !detail.contains("approve")
-                    && !detail.contains("approver_uuid")
-                    && !detail.contains("Uuid::nil()"),
-                "Conflict.detail leaked AM-internal text into public envelope: {detail}"
-            );
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
+        .expect_err("PEP-denied list_own_for_tenant must propagate as CrossTenantDenied");
+    assert!(
+        matches!(err, DomainError::CrossTenantDenied { .. }),
+        "expected CrossTenantDenied, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_inbound_for_parent_propagates_pep_deny_as_cross_tenant_denied() {
+    let conv = Arc::new(FakeConversionRepo::new());
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let svc = make_service_with_enforcer(conv, tenants, deny_all_enforcer(), fixed_now());
+
+    let parent_id = Uuid::from_u128(0x9009);
+    let err = svc
+        .list_inbound_for_parent(
+            &ctx(),
+            parent_id,
+            &ListConversionsQuery::any(10, 0).expect("top > 0"),
+        )
+        .await
+        .expect_err("PEP-denied list_inbound_for_parent must propagate as CrossTenantDenied");
+    assert!(
+        matches!(err, DomainError::CrossTenantDenied { .. }),
+        "expected CrossTenantDenied, got {err:?}"
+    );
 }

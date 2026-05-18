@@ -603,6 +603,62 @@ impl core::fmt::Display for IdpUserOperationFailure {
 
 impl core::error::Error for IdpUserOperationFailure {}
 
+/// Query parameters for
+/// [`crate::AccountManagementClient::list_users`].
+///
+/// Groups the pagination and the optional single-user filter into one
+/// extensible struct — symmetric with the `&ODataQuery` parameter on
+/// `list_children` / `list_metadata`. The wrapper is **intentionally
+/// not** named `*ODataQuery`: `list_users` forwards to the configured
+/// `IdP` plugin ([`crate::IdpPluginClient::list_users`]), and the
+/// plugin contract is vendor-defined — arbitrary `OData` `$filter`
+/// expressions (`email eq 'x'`, `status eq 'active'`, …) cannot be
+/// translated to vendor APIs in any general way. Any future field
+/// added to this struct MUST correspond to a capability the
+/// [`crate::IdpListUsersRequest`] contract exposes, otherwise it
+/// would silently no-op at the plugin boundary.
+///
+/// Today the only honored filter is `user_id_filter` — the
+/// authoritative single-user existence-check shape consumed by
+/// sibling features (user-groups membership writes, RBAC mapping).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ListUsersQuery {
+    /// Page size + opaque cursor. Defaults to
+    /// [`IdpUserPagination::default`] (top = 50, no cursor).
+    pub pagination: IdpUserPagination,
+    /// Optional `user_id` filter. `Some(_)` is the authoritative
+    /// existence-check shape — see
+    /// [`IdpListUsersRequest::user_id_filter`] for the contract.
+    /// When set, the AM service-layer enforces `top = 1` and
+    /// `cursor = None` so the existence-check semantics cannot be
+    /// bypassed.
+    pub user_id_filter: Option<Uuid>,
+}
+
+impl ListUsersQuery {
+    /// Construct a query with the given pagination and no
+    /// `user_id_filter`. Equivalent to
+    /// `ListUsersQuery { pagination, user_id_filter: None }`.
+    #[must_use]
+    pub const fn new(pagination: IdpUserPagination) -> Self {
+        Self {
+            pagination,
+            user_id_filter: None,
+        }
+    }
+
+    /// Builder: attach a `user_id_filter`. Caller MUST pair this with
+    /// `pagination` such that `top = 1` and `cursor = None`; the AM
+    /// service-layer enforces this and surfaces a violation as
+    /// `Validation`.
+    #[must_use]
+    pub const fn with_user_id_filter(mut self, user_id: Uuid) -> Self {
+        self.user_id_filter = Some(user_id);
+        self
+    }
+}
+
 #[cfg(test)]
 #[path = "idp_user_tests.rs"]
 mod tests;

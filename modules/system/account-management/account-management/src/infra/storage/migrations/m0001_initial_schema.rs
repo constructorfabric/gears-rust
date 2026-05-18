@@ -44,7 +44,6 @@ CREATE TABLE IF NOT EXISTS tenants (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP WITH TIME ZONE NULL,
-    deletion_scheduled_at TIMESTAMP WITH TIME ZONE NULL,
     retention_window_secs BIGINT NULL,
     claimed_by UUID NULL,
     claimed_at TIMESTAMPTZ NULL,
@@ -60,7 +59,7 @@ CREATE TABLE IF NOT EXISTS tenants (
                 "CREATE INDEX IF NOT EXISTS idx_tenants_status ON tenants (status);",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_type ON tenants (tenant_type_uuid);",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_deleted_at ON tenants (deleted_at) WHERE deleted_at IS NOT NULL;",
-                "CREATE INDEX IF NOT EXISTS idx_tenants_retention_scan ON tenants (deletion_scheduled_at, depth DESC) WHERE status = 3 AND deletion_scheduled_at IS NOT NULL;",
+                "CREATE INDEX IF NOT EXISTS idx_tenants_retention_scan ON tenants (deleted_at, depth DESC) WHERE status = 3 AND deleted_at IS NOT NULL;",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_provisioning_stuck ON tenants (created_at) WHERE status = 0;",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_retention_claim ON tenants (claimed_by) WHERE claimed_by IS NOT NULL;",
                 r"
@@ -91,6 +90,7 @@ CREATE TABLE IF NOT EXISTS tenant_metadata (
     value JSONB NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1,
     CONSTRAINT pk_tenant_metadata PRIMARY KEY (tenant_id, schema_uuid),
     CONSTRAINT fk_tenant_metadata_tenant
         FOREIGN KEY (tenant_id) REFERENCES tenants(id)
@@ -112,7 +112,6 @@ CREATE TABLE IF NOT EXISTS tenants (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TEXT NULL,
-    deletion_scheduled_at TEXT NULL,
     retention_window_secs INTEGER NULL,
     claimed_by TEXT NULL,
     claimed_at TIMESTAMP NULL,
@@ -133,7 +132,7 @@ CREATE TABLE IF NOT EXISTS tenants (
                 "CREATE INDEX IF NOT EXISTS idx_tenants_parent_status ON tenants (parent_id, status);",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_status ON tenants (status);",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_type ON tenants (tenant_type_uuid);",
-                "CREATE INDEX IF NOT EXISTS idx_tenants_retention_scan ON tenants (deletion_scheduled_at, depth DESC) WHERE status = 3 AND deletion_scheduled_at IS NOT NULL;",
+                "CREATE INDEX IF NOT EXISTS idx_tenants_retention_scan ON tenants (deleted_at, depth DESC) WHERE status = 3 AND deleted_at IS NOT NULL;",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_provisioning_stuck ON tenants (created_at) WHERE status = 0;",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_retention_claim ON tenants (claimed_by) WHERE claimed_by IS NOT NULL;",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_deleted_at ON tenants (deleted_at) WHERE deleted_at IS NOT NULL;",
@@ -159,6 +158,7 @@ CREATE TABLE IF NOT EXISTS tenant_metadata (
     value TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (tenant_id, schema_uuid),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id)
         ON UPDATE CASCADE ON DELETE CASCADE

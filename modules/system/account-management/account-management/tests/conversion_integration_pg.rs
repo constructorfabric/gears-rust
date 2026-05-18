@@ -125,6 +125,7 @@ async fn pg_happy_path_approve_flips_self_managed_and_barrier() {
             conv_repo_dyn,
             tenant_repo,
             inert_tenant_type_checker(),
+            mock_enforcer(),
             StdDuration::from_secs(APPROVAL_TTL_SECS),
             StdDuration::from_secs(RETENTION_SECS),
         )
@@ -133,24 +134,18 @@ async fn pg_happy_path_approve_flips_self_managed_and_barrier() {
 
     let initiated = svc
         .request_conversion(
-            &allow_all(),
+            &ctx_for(root),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: None,
-                requested_by: Uuid::new_v4(),
             },
         )
         .await
         .expect("request_conversion");
 
     let approved = svc
-        .approve(
-            &allow_all(),
-            initiated.id,
-            ConversionCaller::parent(root),
-            Uuid::new_v4(),
-        )
+        .approve(&ctx_for(root), initiated.id, ConversionCaller::parent(root))
         .await
         .expect("approve");
     assert_eq!(approved.status, ConversionStatus::Approved);
@@ -264,6 +259,7 @@ async fn pg_concurrent_approves_serialize_to_one_winner() {
             conv_repo_dyn,
             tenant_repo,
             inert_tenant_type_checker(),
+            mock_enforcer(),
             StdDuration::from_secs(APPROVAL_TTL_SECS),
             StdDuration::from_secs(RETENTION_SECS),
         )
@@ -272,20 +268,21 @@ async fn pg_concurrent_approves_serialize_to_one_winner() {
 
     let initiated = svc
         .request_conversion(
-            &allow_all(),
+            &ctx_for(root),
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
                 target_mode_override: None,
-                requested_by: Uuid::new_v4(),
             },
         )
         .await
         .expect("request_conversion");
 
     // Two parallel counterparty approves against the same pending row.
-    // Distinct `approver_uuid`s so the audit trail can disambiguate
-    // the winner deterministically.
+    // Both tasks share the same `ctx_for(root)` actor (sourced from
+    // `SecurityContext::subject_id`); the winner is established by the
+    // SERIALIZABLE retry classifier, not by a distinguishing approver
+    // uuid.
     //
     // A `Barrier::new(3)` gates the two approve calls AND the main
     // task on a single rendezvous so both transactions begin inside
@@ -304,18 +301,16 @@ async fn pg_concurrent_approves_serialize_to_one_winner() {
     let gate_a = Arc::clone(&gate);
     let gate_b = Arc::clone(&gate);
     let id = initiated.id;
-    let approver_a = Uuid::new_v4();
-    let approver_b = Uuid::new_v4();
     let task_a = tokio::spawn(async move {
         gate_a.wait().await;
         svc_a
-            .approve(&allow_all(), id, ConversionCaller::parent(root), approver_a)
+            .approve(&ctx_for(root), id, ConversionCaller::parent(root))
             .await
     });
     let task_b = tokio::spawn(async move {
         gate_b.wait().await;
         svc_b
-            .approve(&allow_all(), id, ConversionCaller::parent(root), approver_b)
+            .approve(&ctx_for(root), id, ConversionCaller::parent(root))
             .await
     });
     gate.wait().await;
@@ -342,8 +337,8 @@ async fn pg_concurrent_approves_serialize_to_one_winner() {
     );
 
     // Final DB state: tenant flipped exactly once, closure barrier
-    // recomputed exactly once. Both invariants are independent of
-    // which approver UUID won the race.
+    // recomputed exactly once. Both invariants hold regardless of
+    // which task won the race.
     let row = fetch_tenant(&h.provider, child)
         .await
         .unwrap()

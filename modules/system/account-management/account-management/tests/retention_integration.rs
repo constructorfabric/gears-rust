@@ -9,16 +9,16 @@
 //! ## What these tests must cover once the scaffold lands
 //!
 //! 1. **`scan_retention_due` ordering** — seed rows at multiple depths with
-//!    `deletion_scheduled_at` values that straddle the retention window
-//!    boundary. Assert the returned Vec is sorted by the canonical contract
-//!    `(depth DESC, deletion_scheduled_at ASC, id ASC)` (the same column
-//!    sequence pinned by `apply_retention_leaf_first_order` and the
+//!    `deleted_at` values that straddle the retention window boundary.
+//!    Assert the returned Vec is sorted by the canonical contract
+//!    `(depth DESC, deleted_at ASC, id ASC)` (the same column sequence
+//!    pinned by `apply_retention_leaf_first_order` and the
 //!    `retention_scan_orders_leaf_first` snapshot test) and that rows whose
-//!    `deletion_scheduled_at + retention_window > now` are excluded.
+//!    `deleted_at + retention_window > now` are excluded.
 //!
-//! 2. **`is_due` SQL vs Rust parity** — insert a row whose `scheduled_at` is
+//! 2. **`is_due` SQL vs Rust parity** — insert a row whose `deleted_at` is
 //!    exactly `now - retention_window`. The SQL predicate and the Rust
-//!    `is_due(now, scheduled_at, retention)` check must both return `true`.
+//!    `is_due(now, deleted_at, retention)` check must both return `true`.
 //!
 //! 3. **Claim-lock atomicity** — start two concurrent `scan_retention_due` calls
 //!    on the same batch. Assert each row appears in exactly one of the two result
@@ -38,13 +38,13 @@
 //!    leaf-first deletion ordering, not an FK rejection.
 //!
 //! 6. **Parent-starvation regression** — seed N+1 due rows where N parents have
-//!    `created_at` (and thus `deletion_scheduled_at`) older than one due leaf.
-//!    Each parent has at least one Deleted-state child still present (so
-//!    `hard_delete_one` defers it via the child-existence guard). Call
-//!    `scan_retention_due(limit = N)`. Assert the leaf appears in the returned
-//!    batch — the SQL must select leaf-first under the canonical contract
-//!    `(depth DESC, deletion_scheduled_at ASC, id ASC)`, not
-//!    `deletion_scheduled_at ASC` first, otherwise the older parents fill the LIMIT
+//!    `deleted_at` older than one due leaf. Each parent has at least one
+//!    Deleted-state child still present (so `hard_delete_one` defers it via
+//!    the child-existence guard). Call `scan_retention_due(limit = N)`.
+//!    Assert the leaf appears in the returned batch — the SQL must select
+//!    leaf-first under the canonical contract
+//!    `(depth DESC, deleted_at ASC, id ASC)`, not
+//!    `deleted_at ASC` first, otherwise the older parents fill the LIMIT
 //!    window every tick and the leaf starves indefinitely. The unit-side
 //!    snapshot at `infra/storage/repo_impl/retention.rs::tests::retention_scan_orders_leaf_first`
 //!    pins the ORDER BY column sequence; this integration test is the

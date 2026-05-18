@@ -3,8 +3,31 @@
 //! no filesystem.
 
 use account_management_sdk::TenantStatus as PublicTenantStatus;
+use modkit_odata::ODataQuery;
+use modkit_odata::ast::{CompareOperator, Expr, Value as OdataValue};
 
 use super::*;
+
+/// Build a one-predicate `$filter=status eq '<label>'` `ODataQuery`
+/// for `list_children` tests. Constructing the AST by hand keeps the
+/// test dependency surface stable — relying on the parser would couple
+/// these tests to grammar changes in `modkit-odata`. The string form
+/// matches the public SDK contract; the impl-side
+/// `TenantODataMapper::map_value` translates it into the storage
+/// SMALLINT before binding.
+fn list_children_status_eq(status: PublicTenantStatus) -> ODataQuery {
+    let label = match status {
+        PublicTenantStatus::Active => "active",
+        PublicTenantStatus::Suspended => "suspended",
+        PublicTenantStatus::Deleted => "deleted",
+    };
+    let expr = Expr::Compare(
+        Box::new(Expr::Identifier("status".to_owned())),
+        CompareOperator::Eq,
+        Box::new(Expr::Value(OdataValue::String(label.to_owned()))),
+    );
+    ODataQuery::default().with_filter(expr).with_limit(10)
+}
 use crate::config::AccountManagementConfig;
 use crate::domain::tenant::closure::ClosureRow;
 use crate::domain::tenant::repo::TenantRepo;
@@ -328,21 +351,23 @@ fn child_input(child_id: Uuid, parent_id: Uuid) -> CreateTenantRequest {
 // -----------------------------------------------------------------
 
 #[tokio::test]
-async fn create_child_happy_path_writes_self_row_and_one_ancestor_row() {
+async fn create_tenant_happy_path_writes_self_row_and_one_ancestor_row() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x200);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo.clone(), FakeOutcome::Ok);
 
     let created = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create ok");
 
     assert_eq!(created.id.0, child);
     assert_eq!(created.status, account_management_sdk::TenantStatus::Active);
-    // `depth` is an internal storage column, not part of TenantInfo;
-    // verify via the repo snapshot.
+    // `depth` is also on the public `Tenant` projection now — pin
+    // it on the returned value directly, and additionally verify the
+    // repo-side fake row to keep the storage column wired through.
+    assert_eq!(created.depth, 1);
     let row = repo
         .find_by_id_unchecked(child)
         .expect("activated row in fake repo");
@@ -364,7 +389,7 @@ async fn create_child_happy_path_writes_self_row_and_one_ancestor_row() {
 }
 
 #[tokio::test]
-async fn create_child_clean_failure_compensates_and_writes_no_closure_rows() {
+async fn create_tenant_clean_failure_compensates_and_writes_no_closure_rows() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x201);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -372,7 +397,7 @@ async fn create_child_clean_failure_compensates_and_writes_no_closure_rows() {
     let svc = make_service(repo.clone(), FakeOutcome::CleanFailure);
 
     let err = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect_err("should fail");
     assert_eq!(err.code(), "service_unavailable");
@@ -388,7 +413,7 @@ async fn create_child_clean_failure_compensates_and_writes_no_closure_rows() {
 }
 
 #[tokio::test]
-async fn create_child_ambiguous_failure_keeps_provisioning_row_and_writes_no_closure_rows() {
+async fn create_tenant_ambiguous_failure_keeps_provisioning_row_and_writes_no_closure_rows() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x202);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -396,7 +421,7 @@ async fn create_child_ambiguous_failure_keeps_provisioning_row_and_writes_no_clo
     let svc = make_service(repo.clone(), FakeOutcome::Ambiguous);
 
     let err = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect_err("should fail");
     assert_eq!(err.code(), "internal");
@@ -412,14 +437,14 @@ async fn create_child_ambiguous_failure_keeps_provisioning_row_and_writes_no_clo
 }
 
 #[tokio::test]
-async fn create_child_unsupported_op_compensates_and_surfaces_idp_unsupported_operation() {
+async fn create_tenant_unsupported_op_compensates_and_surfaces_idp_unsupported_operation() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x203);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo.clone(), FakeOutcome::Unsupported);
 
     let err = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect_err("should fail");
     assert_eq!(err.code(), "unsupported_operation");
@@ -432,7 +457,7 @@ async fn create_child_unsupported_op_compensates_and_surfaces_idp_unsupported_op
 }
 
 #[tokio::test]
-async fn create_child_advisory_depth_threshold_emits_metric_and_succeeds() {
+async fn create_tenant_advisory_depth_threshold_emits_metric_and_succeeds() {
     // Per `algo-depth-threshold-evaluation` the advisory branch
     // fires at `depth > threshold` and creation proceeds. We pin
     // a low `depth_threshold = 4`, build a chain of depth 0..=4,
@@ -480,7 +505,7 @@ async fn create_child_advisory_depth_threshold_emits_metric_and_succeeds() {
     let child = Uuid::from_u128(0x9999);
     let root = Uuid::from_u128(0x1000);
     let created = svc
-        .create_child(&ctx_for(root), child_input(child, deepest))
+        .create_tenant(&ctx_for(root), child_input(child, deepest))
         .await
         .expect("advisory branch still proceeds");
     assert_eq!(created.status, account_management_sdk::TenantStatus::Active);
@@ -491,31 +516,28 @@ async fn create_child_advisory_depth_threshold_emits_metric_and_succeeds() {
 }
 
 #[tokio::test]
-async fn read_tenant_happy_path_returns_model() {
+async fn get_tenant_happy_path_returns_model() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo, FakeOutcome::Ok);
-    let t = svc
-        .read_tenant(&ctx_for(root), root)
-        .await
-        .expect("read ok");
+    let t = svc.get_tenant(&ctx_for(root), root).await.expect("read ok");
     assert_eq!(t.id.0, root);
 }
 
 #[tokio::test]
-async fn read_tenant_not_found_returns_not_found() {
+async fn get_tenant_not_found_returns_not_found() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo, FakeOutcome::Ok);
     let err = svc
-        .read_tenant(&ctx_for(root), Uuid::from_u128(0xDEAD))
+        .get_tenant(&ctx_for(root), Uuid::from_u128(0xDEAD))
         .await
         .expect_err("should be not found");
     assert_eq!(err.code(), "not_found");
 }
 
 #[tokio::test]
-async fn read_tenant_provisioning_tenant_is_reported_as_not_found() {
+async fn get_tenant_provisioning_tenant_is_reported_as_not_found() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x201);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -535,7 +557,7 @@ async fn read_tenant_provisioning_tenant_is_reported_as_not_found() {
     });
     let svc = make_service(repo, FakeOutcome::Ok);
     let err = svc
-        .read_tenant(&ctx_for(root), child)
+        .get_tenant(&ctx_for(root), child)
         .await
         .expect_err("should hide");
     assert_eq!(err.code(), "not_found");
@@ -548,21 +570,22 @@ async fn list_children_honours_top_and_skip() {
     let svc = make_service(repo.clone(), FakeOutcome::Ok);
     for i in 0..5u128 {
         let child = Uuid::from_u128(0x300 + i);
-        svc.create_child(&ctx_for(root), child_input(child, root))
+        svc.create_tenant(&ctx_for(root), child_input(child, root))
             .await
             .expect("create");
     }
     let page = svc
-        .list_children(
-            &ctx_for(root),
-            ListChildrenQuery::new(root, None, 2, 1).expect("query"),
-        )
+        .list_children(&ctx_for(root), root, &ODataQuery::default().with_limit(2))
         .await
         .expect("list ok");
+    // Cursor-based pagination: the first page returns exactly `top`
+    // items and the `limit` round-trips on `page_info`. Offset /
+    // total semantics were retired with `TenantPage<T>`; tests that
+    // need to walk to the next page now drive the listing via
+    // `next_cursor` (covered by `paginate_odata`'s own integration
+    // tests on the real DB).
     assert_eq!(page.items.len(), 2);
-    assert_eq!(page.top, 2);
-    assert_eq!(page.skip, 1);
-    assert_eq!(page.total, Some(5));
+    assert_eq!(page.page_info.limit, 2);
 }
 
 #[tokio::test]
@@ -572,25 +595,25 @@ async fn list_children_status_filter_applies() {
     let svc = make_service(repo.clone(), FakeOutcome::Ok);
     let c1 = Uuid::from_u128(0x301);
     let c2 = Uuid::from_u128(0x302);
-    svc.create_child(&ctx_for(root), child_input(c1, root))
+    svc.create_tenant(&ctx_for(root), child_input(c1, root))
         .await
         .expect("c1");
-    svc.create_child(&ctx_for(root), child_input(c2, root))
+    svc.create_tenant(&ctx_for(root), child_input(c2, root))
         .await
         .expect("c2");
-    svc.update_tenant(
-        &ctx_for(root),
-        c2,
-        TenantUpdate::new().with_status(PublicTenantStatus::Suspended),
-    )
-    .await
-    .expect("patch c2");
+    svc.suspend_tenant(&ctx_for(root), c2)
+        .await
+        .expect("suspend c2");
 
+    // Filter by the public SDK string contract — `'active'` /
+    // `'suspended'` / `'deleted'`. The impl-side
+    // `TenantODataMapper::map_value` translates these into the
+    // storage SMALLINT before binding.
     let active_only = svc
         .list_children(
             &ctx_for(root),
-            ListChildrenQuery::new(root, Some(vec![PublicTenantStatus::Active]), 10, 0)
-                .expect("query"),
+            root,
+            &list_children_status_eq(PublicTenantStatus::Active),
         )
         .await
         .expect("list ok");
@@ -600,8 +623,8 @@ async fn list_children_status_filter_applies() {
     let suspended_only = svc
         .list_children(
             &ctx_for(root),
-            ListChildrenQuery::new(root, Some(vec![PublicTenantStatus::Suspended]), 10, 0)
-                .expect("query"),
+            root,
+            &list_children_status_eq(PublicTenantStatus::Suspended),
         )
         .await
         .expect("list ok");
@@ -610,12 +633,12 @@ async fn list_children_status_filter_applies() {
 }
 
 #[tokio::test]
-async fn update_tenant_accepts_name_and_supported_status_transitions() {
+async fn update_tenant_accepts_name_then_status_transitions_via_dedicated_methods() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo.clone(), FakeOutcome::Ok);
     let child = Uuid::from_u128(0x400);
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create");
 
@@ -623,28 +646,20 @@ async fn update_tenant_accepts_name_and_supported_status_transitions() {
         .update_tenant(
             &ctx_for(root),
             child,
-            TenantUpdate::new().with_name("renamed"),
+            UpdateTenantRequest::new().with_name("renamed"),
         )
         .await
         .expect("rename ok");
     assert_eq!(renamed.name, "renamed");
 
     let suspended = svc
-        .update_tenant(
-            &ctx_for(root),
-            child,
-            TenantUpdate::new().with_status(PublicTenantStatus::Suspended),
-        )
+        .suspend_tenant(&ctx_for(root), child)
         .await
         .expect("suspend ok");
     assert_eq!(suspended.status, PublicTenantStatus::Suspended);
 
     let reactivated = svc
-        .update_tenant(
-            &ctx_for(root),
-            child,
-            TenantUpdate::new().with_status(PublicTenantStatus::Active),
-        )
+        .unsuspend_tenant(&ctx_for(root), child)
         .await
         .expect("unsuspend ok");
     assert_eq!(reactivated.status, PublicTenantStatus::Active);
@@ -659,23 +674,22 @@ async fn update_tenant_accepts_name_and_supported_status_transitions() {
     );
 }
 
-/// Idempotent PATCH (option A — true HTTP idempotency).
-///
-/// Sending `{status: active}` on an Active tenant MUST:
+/// Idempotent same-state transition — calling `unsuspend_tenant` on
+/// an already-Active tenant MUST:
 /// 1. Succeed (no 409 / `failed_precondition`).
 /// 2. Skip the DB UPDATE — `updated_at` unchanged.
 /// 3. Skip the closure rewrite — `descendant_status` rows untouched.
 ///
 /// The third requirement is a nice property for the closure-self-row
-/// invariant: a no-op PATCH is observably indistinguishable from a
-/// read on the `tenant_closure` side.
+/// invariant: a no-op transition is observably indistinguishable
+/// from a read on the `tenant_closure` side.
 #[tokio::test]
-async fn update_tenant_status_no_op_is_idempotent() {
+async fn unsuspend_tenant_no_op_is_idempotent() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo.clone(), FakeOutcome::Ok);
     let child = Uuid::from_u128(0x420);
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create");
 
@@ -686,19 +700,15 @@ async fn update_tenant_status_no_op_is_idempotent() {
         .expect("child row present");
 
     // Tiny pause so a `now()` re-stamp would be visible against the
-    // pre-PATCH `updated_at`. The `FakeTenantRepo` uses
+    // pre-call `updated_at`. The `FakeTenantRepo` uses
     // `OffsetDateTime::now_utc()` which has sub-microsecond resolution;
     // 1 ms is plenty.
     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
     let returned = svc
-        .update_tenant(
-            &ctx_for(root),
-            child,
-            TenantUpdate::new().with_status(PublicTenantStatus::Active),
-        )
+        .unsuspend_tenant(&ctx_for(root), child)
         .await
-        .expect("same-status PATCH must be idempotent ok, not 409");
+        .expect("same-status call must be idempotent ok, not 409");
     assert_eq!(returned.status, PublicTenantStatus::Active);
 
     let after = repo
@@ -724,7 +734,7 @@ async fn update_tenant_name_no_op_is_idempotent() {
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo.clone(), FakeOutcome::Ok);
     let child = Uuid::from_u128(0x421);
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create");
 
@@ -740,7 +750,7 @@ async fn update_tenant_name_no_op_is_idempotent() {
     svc.update_tenant(
         &ctx_for(root),
         child,
-        TenantUpdate::new().with_name(current_name),
+        UpdateTenantRequest::new().with_name(current_name),
     )
     .await
     .expect("same-name PATCH is an idempotent no-op");
@@ -757,30 +767,27 @@ async fn update_tenant_name_no_op_is_idempotent() {
     assert_eq!(after.name, before.name);
 }
 
-/// Two consecutive identical `PATCH`es both succeed and produce the
-/// same observable state — the canonical retry-safety property HTTP
-/// `PATCH` idempotency promises. If the response of the first request
-/// is lost in the network and the client retries, they get back the
-/// same answer with no additional state mutation.
+/// Two consecutive identical `suspend_tenant` calls both succeed and
+/// produce the same observable state — the canonical retry-safety
+/// property an idempotent lifecycle transition promises. If the
+/// response of the first request is lost in the network and the
+/// client retries, they get back the same answer with no additional
+/// state mutation.
 #[tokio::test]
-async fn update_tenant_double_patch_is_observably_identical() {
+async fn suspend_tenant_double_call_is_observably_identical() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo.clone(), FakeOutcome::Ok);
     let child = Uuid::from_u128(0x422);
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create");
 
-    // First PATCH actually changes the status — bumps `updated_at`.
+    // First call actually changes the status — bumps `updated_at`.
     let first = svc
-        .update_tenant(
-            &ctx_for(root),
-            child,
-            TenantUpdate::new().with_status(PublicTenantStatus::Suspended),
-        )
+        .suspend_tenant(&ctx_for(root), child)
         .await
-        .expect("first PATCH ok");
+        .expect("first suspend ok");
     let first_row = repo
         .find_by_id(&AccessScope::allow_all(), child)
         .await
@@ -789,15 +796,11 @@ async fn update_tenant_double_patch_is_observably_identical() {
 
     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
-    // Second identical PATCH is a no-op.
+    // Second identical call is a no-op.
     let second = svc
-        .update_tenant(
-            &ctx_for(root),
-            child,
-            TenantUpdate::new().with_status(PublicTenantStatus::Suspended),
-        )
+        .suspend_tenant(&ctx_for(root), child)
         .await
-        .expect("retry of identical PATCH MUST also succeed");
+        .expect("retry of identical suspend MUST also succeed");
     let second_row = repo
         .find_by_id(&AccessScope::allow_all(), child)
         .await
@@ -808,7 +811,7 @@ async fn update_tenant_double_patch_is_observably_identical() {
     assert_eq!(first.name, second.name);
     assert_eq!(
         first_row.updated_at, second_row.updated_at,
-        "second identical PATCH MUST NOT touch `updated_at` (idempotency)"
+        "second identical suspend MUST NOT touch `updated_at` (idempotency)"
     );
 }
 
@@ -818,41 +821,20 @@ async fn update_tenant_rejects_empty_patch() {
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo.clone(), FakeOutcome::Ok);
     let err = svc
-        .update_tenant(&ctx_for(root), root, TenantUpdate::default())
+        .update_tenant(&ctx_for(root), root, UpdateTenantRequest::default())
         .await
         .expect_err("reject");
     assert_eq!(err.code(), "validation");
 }
 
-#[tokio::test]
-async fn update_tenant_rejects_transition_to_deleted() {
-    let root = Uuid::from_u128(0x100);
-    let repo = Arc::new(FakeTenantRepo::with_root(root));
-    let svc = make_service(repo.clone(), FakeOutcome::Ok);
-    let child = Uuid::from_u128(0x500);
-    svc.create_child(&ctx_for(root), child_input(child, root))
-        .await
-        .expect("create");
-
-    let err = svc
-        .update_tenant(
-            &ctx_for(root),
-            child,
-            TenantUpdate::new().with_status(PublicTenantStatus::Deleted),
-        )
-        .await
-        .expect_err("delete must go through DELETE flow");
-    // `validate_status_transition` admits the cross-flip
-    // (`Active ↔ Suspended`) and the same-to-same idempotent no-op,
-    // and rejects everything else (target=Deleted/Provisioning,
-    // current=Deleted/Provisioning) with `DomainError::Conflict`
-    // (HTTP 400 / `failed_precondition`). This test pins the
-    // target=Deleted reject branch.
-    assert_eq!(err.code(), "conflict");
-}
+// The previous `update_tenant_rejects_transition_to_deleted` test
+// is no longer applicable: `UpdateTenantRequest` lost its `status`
+// field, so the patch can no longer carry `Deleted` at all. Soft-
+// delete idempotency on already-deleted rows is covered by
+// `delete_tenant_is_idempotent_on_already_deleted_tenant` below.
 
 #[tokio::test]
-async fn update_tenant_rejects_transition_from_provisioning() {
+async fn unsuspend_tenant_rejects_provisioning_as_not_found() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x600);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -871,14 +853,10 @@ async fn update_tenant_rejects_transition_from_provisioning() {
     });
     let svc = make_service(repo, FakeOutcome::Ok);
     let err = svc
-        .update_tenant(
-            &ctx_for(root),
-            child,
-            TenantUpdate::new().with_status(PublicTenantStatus::Active),
-        )
+        .unsuspend_tenant(&ctx_for(root), child)
         .await
         .expect_err("must not see provisioning tenant");
-    // Provisioning is SDK-invisible, so the service surfaces not_found.
+    // Provisioning is AM-internal — the service surfaces not_found.
     assert_eq!(err.code(), "not_found");
 }
 
@@ -904,7 +882,7 @@ async fn update_tenant_accepts_oversized_name_when_gts_schema_unregistered() {
         .update_tenant(
             &ctx_for(root),
             root,
-            TenantUpdate::new().with_name("x".repeat(256)),
+            UpdateTenantRequest::new().with_name("x".repeat(256)),
         )
         .await
         .expect("rename succeeds without registered schema; DB CHECK is the prod fence");
@@ -924,10 +902,10 @@ async fn closure_invariants_are_preserved_across_self_managed_path() {
 
     let mut mid_input = child_input(mid, root);
     mid_input.self_managed = true;
-    svc.create_child(&ctx_for(root), mid_input)
+    svc.create_tenant(&ctx_for(root), mid_input)
         .await
         .expect("mid ok");
-    svc.create_child(&ctx_for(root), child_input(leaf, mid))
+    svc.create_tenant(&ctx_for(root), child_input(leaf, mid))
         .await
         .expect("leaf ok");
 
@@ -962,7 +940,7 @@ async fn closure_invariants_no_self_managed_gives_all_zero_barriers() {
     let child = Uuid::from_u128(0x110);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = make_service(repo.clone(), FakeOutcome::Ok);
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("ok");
 
@@ -974,7 +952,7 @@ async fn closure_invariants_no_self_managed_gives_all_zero_barriers() {
 }
 
 #[tokio::test]
-async fn create_child_rejects_inactive_parent() {
+async fn create_tenant_rejects_inactive_parent() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     // Suspend the root via direct mutation.
@@ -984,7 +962,7 @@ async fn create_child_rejects_inactive_parent() {
     }
     let svc = make_service(repo, FakeOutcome::Ok);
     let err = svc
-        .create_child(&ctx_for(root), child_input(Uuid::from_u128(0x700), root))
+        .create_tenant(&ctx_for(root), child_input(Uuid::from_u128(0x700), root))
         .await
         .expect_err("suspended parent rejects");
     assert_eq!(err.code(), "validation");
@@ -1044,7 +1022,7 @@ impl ResourceOwnershipChecker for CountingChecker {
 }
 
 #[tokio::test]
-async fn soft_delete_rejects_root_tenant() {
+async fn delete_tenant_rejects_root_tenant() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = svc_with(
@@ -1054,14 +1032,14 @@ async fn soft_delete_rejects_root_tenant() {
         Arc::new(InertResourceOwnershipChecker),
     );
     let err = svc
-        .soft_delete(&ctx(), root)
+        .delete_tenant(&ctx(), root)
         .await
         .expect_err("root reject");
     assert_eq!(err.code(), "root_tenant_cannot_delete");
 }
 
 #[tokio::test]
-async fn soft_delete_rejects_tenant_with_children() {
+async fn delete_tenant_rejects_tenant_with_children() {
     let root = Uuid::from_u128(0x100);
     let mid = Uuid::from_u128(0x110);
     let leaf = Uuid::from_u128(0x111);
@@ -1072,22 +1050,22 @@ async fn soft_delete_rejects_tenant_with_children() {
         AccountManagementConfig::default(),
         Arc::new(InertResourceOwnershipChecker),
     );
-    svc.create_child(&ctx_for(root), child_input(mid, root))
+    svc.create_tenant(&ctx_for(root), child_input(mid, root))
         .await
         .expect("mid");
-    svc.create_child(&ctx_for(root), child_input(leaf, mid))
+    svc.create_tenant(&ctx_for(root), child_input(leaf, mid))
         .await
         .expect("leaf");
 
     let err = svc
-        .soft_delete(&ctx(), mid)
+        .delete_tenant(&ctx(), mid)
         .await
         .expect_err("has children");
     assert_eq!(err.code(), "tenant_has_children");
 }
 
 #[tokio::test]
-async fn soft_delete_rejects_tenant_with_rg_resources() {
+async fn delete_tenant_rejects_tenant_with_rg_resources() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x200);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -1097,14 +1075,189 @@ async fn soft_delete_rejects_tenant_with_rg_resources() {
         AccountManagementConfig::default(),
         Arc::new(CountingChecker { count: 3 }),
     );
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("child");
     let err = svc
-        .soft_delete(&ctx(), child)
+        .delete_tenant(&ctx(), child)
         .await
         .expect_err("has resources");
     assert_eq!(err.code(), "tenant_has_resources");
+}
+
+/// `delete_tenant` is idempotent: a second call on an already-deleted
+/// row returns the same tombstone (same `deleted_at`), does NOT invoke
+/// the RG ownership probe, and does NOT rewrite retention metadata.
+#[tokio::test]
+async fn delete_tenant_is_idempotent_on_already_deleted_tenant() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[allow(unknown_lints, de0309_must_have_domain_model)]
+    struct RecordingChecker {
+        calls: Arc<AtomicU64>,
+    }
+    #[async_trait]
+    impl ResourceOwnershipChecker for RecordingChecker {
+        async fn count_ownership_links(
+            &self,
+            _ctx: &SecurityContext,
+            _id: Uuid,
+        ) -> Result<u64, DomainError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x201);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let calls = Arc::new(AtomicU64::new(0));
+    let svc = svc_with(
+        repo.clone(),
+        FakeOutcome::Ok,
+        AccountManagementConfig::default(),
+        Arc::new(RecordingChecker {
+            calls: calls.clone(),
+        }),
+    );
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
+        .await
+        .expect("child");
+
+    let first = svc
+        .delete_tenant(&ctx(), child)
+        .await
+        .expect("first delete ok");
+    assert_eq!(first.status, PublicTenantStatus::Deleted);
+    let first_deleted_at = first.deleted_at.expect("tombstone carries deleted_at");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "first delete must probe RG exactly once"
+    );
+
+    // Snapshot the retention bookkeeping after the first delete so we
+    // can prove the second call does not rewrite it.
+    let retention_after_first = repo
+        .state
+        .lock()
+        .expect("lock")
+        .retention
+        .get(&child)
+        .copied();
+    assert!(
+        retention_after_first.is_some(),
+        "first delete must record retention row"
+    );
+
+    // Tiny pause so a `now()` re-stamp would be visible against the
+    // first call's `deleted_at`.
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+    let second = svc
+        .delete_tenant(&ctx(), child)
+        .await
+        .expect("second delete must succeed (idempotent), not 409");
+    assert_eq!(second.status, PublicTenantStatus::Deleted);
+    assert_eq!(
+        second.deleted_at,
+        Some(first_deleted_at),
+        "idempotent retry MUST NOT re-stamp deleted_at"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "second delete MUST NOT re-probe RG"
+    );
+    assert_eq!(
+        repo.state
+            .lock()
+            .expect("lock")
+            .retention
+            .get(&child)
+            .copied(),
+        retention_after_first,
+        "idempotent retry MUST NOT rewrite the retention row"
+    );
+}
+
+/// `suspend_tenant` / `unsuspend_tenant` on a soft-deleted tenant
+/// surface as `Conflict` (the row is read-only during retention).
+#[tokio::test]
+async fn suspend_tenant_rejects_deleted_tenant() {
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x202);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let svc = svc_with(
+        repo.clone(),
+        FakeOutcome::Ok,
+        AccountManagementConfig::default(),
+        Arc::new(InertResourceOwnershipChecker),
+    );
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
+        .await
+        .expect("child");
+    svc.delete_tenant(&ctx(), child).await.expect("soft delete");
+
+    let err = svc
+        .suspend_tenant(&ctx_for(root), child)
+        .await
+        .expect_err("deleted tenant is read-only");
+    assert_eq!(err.code(), "conflict");
+
+    let err = svc
+        .unsuspend_tenant(&ctx_for(root), child)
+        .await
+        .expect_err("deleted tenant is read-only");
+    assert_eq!(err.code(), "conflict");
+}
+
+/// `suspend_tenant` on a missing tenant surfaces as `NotFound`.
+#[tokio::test]
+async fn suspend_tenant_returns_not_found_for_missing_tenant() {
+    let root = Uuid::from_u128(0x100);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let svc = svc_with(
+        repo,
+        FakeOutcome::Ok,
+        AccountManagementConfig::default(),
+        Arc::new(InertResourceOwnershipChecker),
+    );
+    let err = svc
+        .suspend_tenant(&ctx_for(root), Uuid::from_u128(0xDEAD))
+        .await
+        .expect_err("missing tenant");
+    assert_eq!(err.code(), "not_found");
+}
+
+/// `suspend_tenant` on a `Provisioning` tenant surfaces as `NotFound`
+/// — the AM-internal status has no SDK representation and must not
+/// leak through the lifecycle surface. Mirrors the symmetric
+/// `unsuspend_tenant_rejects_provisioning_as_not_found` test.
+#[tokio::test]
+async fn suspend_tenant_rejects_provisioning_as_not_found() {
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x601);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("epoch");
+    repo.insert_tenant_raw(TenantModel {
+        id: child,
+        parent_id: Some(root),
+        name: "prov".into(),
+        status: TenantStatus::Provisioning,
+        self_managed: false,
+        tenant_type_uuid: Uuid::from_u128(0xAA),
+        depth: 1,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    });
+    let svc = make_service(repo, FakeOutcome::Ok);
+    let err = svc
+        .suspend_tenant(&ctx_for(root), child)
+        .await
+        .expect_err("must not see provisioning tenant");
+    assert_eq!(err.code(), "not_found");
 }
 
 #[tokio::test]
@@ -1648,7 +1801,7 @@ async fn hard_delete_batch_skips_rows_already_claimed_by_another_worker() {
     // Seed both as `Active` then call `schedule_deletion` to flip
     // them to `Deleted` with `retention=0` so they are immediately
     // due — `schedule_deletion` is the same call site that
-    // `soft_delete` uses, so the resulting rows + retention metadata
+    // `delete_tenant` uses, so the resulting rows + retention metadata
     // match production. (Calling it on an already-`Deleted` row is
     // rejected by the fake as `Conflict`, mirroring the real repo.)
     for id in [due_unclaimed, due_held] {
@@ -1761,10 +1914,10 @@ async fn hard_delete_batch_skips_parent_when_child_still_exists() {
         },
     )
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
-    svc.create_child(&ctx_for(root), child_input(parent, root))
+    svc.create_tenant(&ctx_for(root), child_input(parent, root))
         .await
         .expect("p");
-    svc.create_child(&ctx_for(root), child_input(child, parent))
+    svc.create_tenant(&ctx_for(root), child_input(child, parent))
         .await
         .expect("c");
     // Seed an already-deleted parent directly. `schedule_deletion`
@@ -1845,10 +1998,10 @@ async fn hard_delete_batch_holds_claim_on_deferred_child_present() {
         },
     )
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
-    svc.create_child(&ctx_for(root), child_input(parent, root))
+    svc.create_tenant(&ctx_for(root), child_input(parent, root))
         .await
         .expect("parent");
-    svc.create_child(&ctx_for(root), child_input(child, parent))
+    svc.create_tenant(&ctx_for(root), child_input(child, parent))
         .await
         .expect("child");
     // Soft-delete the parent's status directly so the retention scan
@@ -1945,10 +2098,10 @@ async fn hard_delete_batch_invokes_cascade_hook_before_idp() {
     )
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("c");
-    svc.soft_delete(&ctx(), child).await.expect("sd");
+    svc.delete_tenant(&ctx(), child).await.expect("sd");
 
     let log_for_hook = order_log.clone();
     let hook: TenantHardDeleteHook = Arc::new(move |_id: Uuid| {
@@ -2019,10 +2172,10 @@ async fn hard_delete_batch_panicking_cascade_hook_classifies_terminal_and_parks(
     )
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create child");
-    svc.soft_delete(&ctx(), child).await.expect("soft delete");
+    svc.delete_tenant(&ctx(), child).await.expect("soft delete");
 
     // Hook returns a future that panics on first poll. The pipeline
     // spawns it via `tokio::spawn`, so the panic surfaces as
@@ -2184,10 +2337,10 @@ async fn hard_delete_batch_idp_terminal_parks_row_via_terminal_failure_at() {
     )
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create child");
-    svc.soft_delete(&ctx(), child).await.expect("soft delete");
+    svc.delete_tenant(&ctx(), child).await.expect("soft delete");
 
     // Tick 1 — IdP returns Terminal → IdpTerminal outcome → row
     // parked.
@@ -2536,10 +2689,10 @@ async fn hard_delete_concurrency_processes_siblings_in_parallel() {
 
     for i in 0..5u128 {
         let id = Uuid::from_u128(0x300 + i);
-        svc.create_child(&ctx_for(root), child_input(id, root))
+        svc.create_tenant(&ctx_for(root), child_input(id, root))
             .await
             .expect("child");
-        svc.soft_delete(&ctx(), id).await.expect("sd");
+        svc.delete_tenant(&ctx(), id).await.expect("sd");
     }
 
     let in_flight = Arc::new(AtomicU32::new(0));
@@ -2633,7 +2786,7 @@ async fn strict_mode_rejects_deep_child() {
     let child = Uuid::from_u128(0x9001);
     let root = Uuid::from_u128(0x2000);
     let err = svc
-        .create_child(&ctx_for(root), child_input(child, deepest))
+        .create_tenant(&ctx_for(root), child_input(child, deepest))
         .await
         .expect_err("strict reject");
     assert_eq!(err.code(), "tenant_depth_exceeded");
@@ -2720,7 +2873,7 @@ fn make_service_with_type_checker(
 /// the child's `allowed_parent_types`, the barrier rejects with
 /// `type_not_allowed` and no `tenants` row is written.
 #[tokio::test]
-async fn create_child_rejects_when_parent_type_not_in_child_allowed_parents() {
+async fn create_tenant_rejects_when_parent_type_not_in_child_allowed_parents() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x500);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -2736,7 +2889,7 @@ async fn create_child_rejects_when_parent_type_not_in_child_allowed_parents() {
     );
 
     let err = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect_err("type-not-allowed must reject");
     assert_eq!(err.code(), "type_not_allowed");
@@ -2754,7 +2907,7 @@ async fn create_child_rejects_when_parent_type_not_in_child_allowed_parents() {
 /// Barrier admits -> saga proceeds and the checker observed exactly
 /// one `(parent_type, child_type)` call with the right shape.
 #[tokio::test]
-async fn create_child_succeeds_when_parent_child_compatible() {
+async fn create_tenant_succeeds_when_parent_child_compatible() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x501);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -2765,7 +2918,7 @@ async fn create_child_succeeds_when_parent_child_compatible() {
     // and the child uuid is derived from the chained-id string in
     // `child_input` via `gts::GtsID::new(...).to_uuid()`.
     let created = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("compatible types admit");
     assert_eq!(created.id.0, child);
@@ -2784,7 +2937,7 @@ async fn create_child_succeeds_when_parent_child_compatible() {
 /// AC §6 fifth bullet -- when GTS is unreachable, the saga propagates
 /// `service_unavailable` (HTTP 503) and writes nothing.
 #[tokio::test]
-async fn create_child_propagates_types_registry_unavailable_as_service_unavailable() {
+async fn create_tenant_propagates_types_registry_unavailable_as_service_unavailable() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x502);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -2800,7 +2953,7 @@ async fn create_child_propagates_types_registry_unavailable_as_service_unavailab
     );
 
     let err = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect_err("registry down must propagate");
     assert_eq!(err.code(), "service_unavailable");
@@ -2820,7 +2973,7 @@ async fn create_child_propagates_types_registry_unavailable_as_service_unavailab
 /// `allowed_parent_types`. Drive via the checker stub returning
 /// `type_not_allowed` for the same-type pairing.
 #[tokio::test]
-async fn create_child_rejects_same_type_nesting_when_disallowed() {
+async fn create_tenant_rejects_same_type_nesting_when_disallowed() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x503);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -2849,7 +3002,7 @@ async fn create_child_rejects_same_type_nesting_when_disallowed() {
     let svc = make_service_with_type_checker(repo.clone(), FakeOutcome::Ok, checker.clone());
 
     let err = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect_err("disallowed same-type nesting must reject");
     assert_eq!(err.code(), "type_not_allowed");
@@ -2876,7 +3029,7 @@ async fn create_child_rejects_same_type_nesting_when_disallowed() {
 /// AC §6 third bullet, positive half -- same-type nesting requested
 /// and the GTS schema admits the type as its own allowed parent.
 #[tokio::test]
-async fn create_child_accepts_same_type_nesting_when_allowed() {
+async fn create_tenant_accepts_same_type_nesting_when_allowed() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x504);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -2896,7 +3049,7 @@ async fn create_child_accepts_same_type_nesting_when_allowed() {
     let svc = make_service_with_type_checker(repo.clone(), FakeOutcome::Ok, checker.clone());
 
     let created = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("same-type nesting admitted by checker must succeed");
     assert_eq!(created.id.0, child);
@@ -2923,14 +3076,13 @@ async fn create_child_accepts_same_type_nesting_when_allowed() {
 
 /// F1 -- `Suspended -> Deleted` soft-delete transition.
 ///
-/// `model::TenantUpdate::validate_status_transition` admits
-/// `Suspended` as a source status, and `service::soft_delete` does
-/// not gate on `Active` -- but the existing happy-path test only
-/// covered an active leaf. This test moves the leaf through
-/// suspension first and then asserts the soft-delete still flips
+/// `service::delete_tenant` admits any SDK-visible non-Deleted source
+/// status, but the existing happy-path test only covered an active
+/// leaf. This test moves the leaf through suspension first via
+/// `suspend_tenant` and then asserts the soft-delete still flips
 /// the row to `Deleted` with retention metadata.
 #[tokio::test]
-async fn soft_delete_succeeds_on_suspended_leaf_tenant() {
+async fn delete_tenant_succeeds_on_suspended_leaf_tenant() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0xF100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -2940,24 +3092,20 @@ async fn soft_delete_succeeds_on_suspended_leaf_tenant() {
         AccountManagementConfig::default(),
         Arc::new(InertResourceOwnershipChecker),
     );
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create child");
 
-    // Move the leaf to Suspended via the public PATCH path.
+    // Move the leaf to Suspended via the dedicated lifecycle method.
     let suspended = svc
-        .update_tenant(
-            &ctx_for(root),
-            child,
-            TenantUpdate::new().with_status(PublicTenantStatus::Suspended),
-        )
+        .suspend_tenant(&ctx_for(root), child)
         .await
         .expect("suspension allowed");
     assert_eq!(suspended.status, PublicTenantStatus::Suspended);
 
     // Now soft-delete the suspended leaf -- should succeed.
     let deleted = svc
-        .soft_delete(&ctx_for(root), child)
+        .delete_tenant(&ctx_for(root), child)
         .await
         .expect("soft-delete suspended leaf");
     assert_eq!(deleted.status, PublicTenantStatus::Deleted);
@@ -2975,15 +3123,14 @@ async fn soft_delete_succeeds_on_suspended_leaf_tenant() {
 /// Pin the public-contract requirement that soft-delete stamps
 /// `tenants.deleted_at`. The `OpenAPI` `Tenant.deleted_at` field is
 /// surfaced on every tenant response, the migration declares a
-/// partial index `idx_tenants_deleted_at` keyed on this column,
-/// and the `Tenant` schema lists it as the public-contract
-/// tombstone marker. An earlier implementation of
-/// `schedule_deletion` only stamped `deletion_scheduled_at` and
-/// left this column permanently NULL -- making the partial index
-/// empty and surfacing soft-deleted rows with
+/// partial index `idx_tenants_deleted_at` keyed on this column, the
+/// retention-scan index (`idx_tenants_retention_scan`) keys on it as
+/// well, and the `Tenant` schema lists it as the public-contract
+/// tombstone marker. Missing this stamp would empty both partial
+/// indexes AND surface soft-deleted rows with
 /// `status=deleted, deleted_at=null` to the API.
 #[tokio::test]
-async fn soft_delete_stamps_deleted_at_on_returned_model_and_subsequent_reads() {
+async fn delete_tenant_stamps_deleted_at_on_returned_model_and_subsequent_reads() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0xF101);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -2994,7 +3141,7 @@ async fn soft_delete_stamps_deleted_at_on_returned_model_and_subsequent_reads() 
         Arc::new(InertResourceOwnershipChecker),
     );
 
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create child");
     let row_after_create = repo
@@ -3006,17 +3153,24 @@ async fn soft_delete_stamps_deleted_at_on_returned_model_and_subsequent_reads() 
     );
 
     let deleted = svc
-        .soft_delete(&ctx_for(root), child)
+        .delete_tenant(&ctx_for(root), child)
         .await
         .expect("soft-delete leaf");
     assert_eq!(deleted.status, PublicTenantStatus::Deleted);
+    // `deleted_at` MUST be populated on the public `Tenant` surface
+    // after soft-delete — admin UIs read it to render the "Will be
+    // removed on …" banner (deadline = `deleted_at + retention_window`)
+    // without a follow-up retention round-trip. `None` would mean the
+    // lifter dropped the field or `schedule_deletion` never stamped
+    // the column.
+    let public_deleted_at = deleted
+        .deleted_at
+        .expect("Tenant.deleted_at must be Some after soft-delete");
 
-    // `deleted_at` / `updated_at` are storage-internal columns — they
-    // are not part of the public `TenantInfo` shape. The
-    // `schedule_deletion` contract is asserted via the storage row
-    // directly through the unchecked accessor that bypasses the
+    // The `schedule_deletion` contract is asserted via the storage
+    // row directly through the unchecked accessor that bypasses the
     // SDK-visibility filter (deleted rows are filtered out by
-    // `read_tenant`).
+    // `get_tenant`).
     let after = repo
         .find_by_id_unchecked(child)
         .expect("row still present pre hard-delete");
@@ -3027,6 +3181,11 @@ async fn soft_delete_stamps_deleted_at_on_returned_model_and_subsequent_reads() 
         stamped, after.updated_at,
         "deleted_at and updated_at are written in the same transaction \
          and should match `now` exactly"
+    );
+    assert_eq!(
+        public_deleted_at, stamped,
+        "Tenant.deleted_at must equal the persisted storage value \
+         (same-tx stamp)"
     );
 }
 
@@ -3104,7 +3263,7 @@ async fn hard_delete_batch_marks_idp_terminal_failure_as_failed() {
 /// compensation step fails (e.g. a peer reaper claimed the row
 /// mid-activation, or the `IdP` returned `Retryable` / `Terminal`).
 #[tokio::test]
-async fn create_child_finalization_tx_failure_compensates_idp_and_row() {
+async fn create_tenant_finalization_tx_failure_compensates_idp_and_row() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0xF300);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -3121,7 +3280,7 @@ async fn create_child_finalization_tx_failure_compensates_idp_and_row() {
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
     let result = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await;
     assert!(
         matches!(result, Err(DomainError::Internal { .. })),
@@ -3155,7 +3314,7 @@ async fn create_child_finalization_tx_failure_compensates_idp_and_row() {
 /// retry. Pins the contract that compensation degrades to the
 /// reaper instead of orphaning vendor-side state.
 #[tokio::test]
-async fn create_child_finalization_failure_with_retryable_idp_leaves_row_for_reaper() {
+async fn create_tenant_finalization_failure_with_retryable_idp_leaves_row_for_reaper() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0xF301);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -3176,7 +3335,7 @@ async fn create_child_finalization_failure_with_retryable_idp_leaves_row_for_rea
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
     let result = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await;
     assert!(
         matches!(result, Err(DomainError::Internal { .. })),
@@ -3211,7 +3370,7 @@ async fn create_child_finalization_failure_with_retryable_idp_leaves_row_for_rea
 /// dies in the saga's stack frame and the reaper forwards an empty
 /// `TenantContext::metadata`, silently leaking vendor-side state.
 #[tokio::test]
-async fn create_child_finalization_failure_persists_idp_metadata_for_reaper() {
+async fn create_tenant_finalization_failure_persists_idp_metadata_for_reaper() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0xF303);
     let plugin_blob = serde_json::json!({"realm": "acme-prod", "vendor_token": "opaque-blob"});
@@ -3236,7 +3395,7 @@ async fn create_child_finalization_failure_persists_idp_metadata_for_reaper() {
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
     let result = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await;
     assert!(
         matches!(result, Err(DomainError::Internal { .. })),
@@ -3274,7 +3433,7 @@ async fn create_child_finalization_failure_persists_idp_metadata_for_reaper() {
 /// no AM-side handle to deprovision it later — exactly the bug
 /// pattern codex flagged on the previous review pass.
 #[tokio::test]
-async fn create_child_upsert_idp_metadata_failure_runs_idp_compensation() {
+async fn create_tenant_upsert_idp_metadata_failure_runs_idp_compensation() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0xF304);
 
@@ -3297,7 +3456,7 @@ async fn create_child_upsert_idp_metadata_failure_runs_idp_compensation() {
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
     let result = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await;
     assert!(
         matches!(result, Err(DomainError::Internal { .. })),
@@ -3324,7 +3483,7 @@ async fn create_child_upsert_idp_metadata_failure_runs_idp_compensation() {
 /// gone after the compensation path succeeds (`FakeTenantRepo`
 /// mirrors the production explicit DELETE).
 #[tokio::test]
-async fn create_child_clean_compensation_removes_pre_activation_idp_metadata() {
+async fn create_tenant_clean_compensation_removes_pre_activation_idp_metadata() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0xF305);
     let plugin_blob = serde_json::json!({"realm": "acme-prod"});
@@ -3348,7 +3507,7 @@ async fn create_child_clean_compensation_removes_pre_activation_idp_metadata() {
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
     let result = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await;
     // Activation was armed to fail; surface is `Internal`. The
     // post-error assertions below are the load-bearing checks.
@@ -3387,7 +3546,7 @@ async fn create_child_clean_compensation_removes_pre_activation_idp_metadata() {
 /// and for the reaper by
 /// `reaper_marks_unsupported_terminal_when_idp_required_true`.
 #[tokio::test]
-async fn create_child_finalization_failure_with_unsupported_idp_required_leaves_row_for_reaper() {
+async fn create_tenant_finalization_failure_with_unsupported_idp_required_leaves_row_for_reaper() {
     use crate::config::IdpConfig;
 
     let root = Uuid::from_u128(0x100);
@@ -3415,7 +3574,7 @@ async fn create_child_finalization_failure_with_unsupported_idp_required_leaves_
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
     let result = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await;
     assert!(
         matches!(result, Err(DomainError::Internal { .. })),
@@ -3577,7 +3736,7 @@ async fn reaper_marks_unsupported_terminal_when_idp_required_true() {
 // service layer with no DB side-effects.
 
 #[tokio::test(start_paused = true)]
-async fn soft_delete_propagates_rg_timeout_as_service_unavailable() {
+async fn delete_tenant_propagates_rg_timeout_as_service_unavailable() {
     use crate::infra::rg::RgResourceOwnershipChecker;
     use crate::infra::rg::test_helpers::SlowRgClient;
     use std::sync::Arc as StdArc;
@@ -3601,12 +3760,12 @@ async fn soft_delete_propagates_rg_timeout_as_service_unavailable() {
     )
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
     // Create a child to act on.
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create");
 
     let err = svc
-        .soft_delete(&ctx_for(root), child)
+        .delete_tenant(&ctx_for(root), child)
         .await
         .expect_err("RG timeout must surface as service_unavailable");
     assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
@@ -3627,7 +3786,7 @@ async fn soft_delete_propagates_rg_timeout_as_service_unavailable() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn create_child_propagates_gts_timeout_as_service_unavailable() {
+async fn create_tenant_propagates_gts_timeout_as_service_unavailable() {
     use crate::infra::types_registry::GtsTenantTypeChecker;
     use crate::infra::types_registry::test_helpers::SlowRegistry;
     use std::sync::Arc as StdArc;
@@ -3654,7 +3813,7 @@ async fn create_child_propagates_gts_timeout_as_service_unavailable() {
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
     let err = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect_err("GTS timeout must surface as service_unavailable");
     assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
@@ -3676,40 +3835,39 @@ async fn create_child_propagates_gts_timeout_as_service_unavailable() {
 }
 
 // ---------------------------------------------------------------------------
-// Constraint-bearing PDP scope — `tenants`-entity scope-discard contract
+// Constraint-bearing PDP scope — `tenants`-entity subtree-clamp contract
 // ---------------------------------------------------------------------------
 //
-// The `tenants` entity is declared `no_tenant, no_resource, no_owner,
-// no_type` (`entity/tenants.rs`), so a PDP-narrowed permit compiles
-// to `WHERE false` at the secure-extension layer until
-// `InTenantSubtree` lands (cyberware-rust#1813). The service-level
-// PEP gate authorizes the caller, but the **repo** call below it
-// must use `AccessScope::allow_all` — otherwise an authorized
-// read/update/soft-delete silently turns into `NotFound` for any
-// PDP that returns row-level constraints (e.g. the static AuthZ
-// resolver emitting an `OWNER_TENANT_ID` constraint).
+// The `tenants` entity declares `resource_col = "id"` (see
+// `entity/tenants.rs`) so the
+// [`InTenantSubtree`](modkit_security::ScopeFilter::in_tenant_subtree)
+// predicate (cyberware-rust#1813) compiles into
+// `tenants.id IN (SELECT descendant_id FROM tenant_closure
+//   WHERE ancestor_id = :root AND barrier = 0)` at the secure-
+// extension layer. The service forwards the compiled `AccessScope`
+// from the PDP gate verbatim into the repo so authorization runs
+// defence-in-depth: the gate authorizes the operation, the SQL JOIN
+// clamps the row. The tests below pin both sides of the contract:
 //
-// The default `MockAuthZResolver` returns no constraints (compiles
-// to `allow_all`), so it cannot regression-pin this contract. The
-// tests below wire `ConstraintBearingAuthZResolver` (returns one
-// `OWNER_TENANT_ID Eq` constraint) and assert that
-// `read_tenant` / `update_tenant_mutable_fields` / `soft_delete`
-// still observe the row.
+// * Positive — a caller whose PDP-narrowed scope **includes** the
+//   target's tenant in the subtree must still see / update / delete
+//   the row. The pre-#1813 contract was inverted (`scope` MUST be
+//   discarded to avoid `WHERE false`); the post-#1813 contract is
+//   "scope flows in, subtree-clamp lets the descendant through".
+// * Negative — a caller whose PDP-narrowed scope is rooted at a
+//   different ancestor (target NOT in the subtree) collapses to
+//   `NotFound` at the database. This is the cross-tenant-denial
+//   guarantee the previous `allow_all`-passing posture could never
+//   express.
 
 #[tokio::test]
-async fn read_tenant_does_not_deny_all_under_constraint_bearing_pdp() {
-    // Wires the constraint-bearing PDP fake. With the pre-fix code,
-    // `find_by_id(&scope, …)` against the `no_*` `tenants` entity
-    // would compile the synthetic `OWNER_TENANT_ID Eq` constraint to
-    // `WHERE false` AT THE PRODUCTION SECURE-EXTENSION LAYER. The
-    // `FakeTenantRepo` mirror models the constraint as
-    // "visible-id set = {root}", so reading the constrained id
-    // itself would pass under both pre- and post-fix wiring (false
-    // positive). Reading a CHILD id under the constraint forces the
-    // pre-fix wiring into a `None` (child not in {root}) which
-    // makes the test actually distinguish the regression. This
-    // mirrors how `update_tenant` / `soft_delete` regression tests
-    // below already operate on a non-root child by construction.
+async fn get_tenant_clamps_to_subtree_under_constraint_bearing_pdp() {
+    // Wires the constraint-bearing PDP fake rooted at `root`. The
+    // compiled scope is `InTenantSubtree(RESOURCE_ID, root)`; the
+    // `FakeTenantRepo` walks its closure (root self-row + the
+    // `(root, child)` ancestor row stamped by `create_tenant`'s
+    // saga) to materialise `subtree(root) = {root, child}`. The
+    // child is in the subtree so the read succeeds.
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x501);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
@@ -3722,19 +3880,19 @@ async fn read_tenant_does_not_deny_all_under_constraint_bearing_pdp() {
         AccountManagementConfig::default(),
     )
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
-    svc.create_child(&ctx_for(root), child_input(child, root))
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect("create child via mock provisioning happy path");
 
     let info = svc
-        .read_tenant(&ctx_for(root), child)
+        .get_tenant(&ctx_for(root), child)
         .await
-        .expect("authorized read MUST NOT collapse to NotFound under constraint-bearing PDP");
+        .expect("authorized read of a descendant inside the caller's subtree MUST succeed");
     assert_eq!(info.id.0, child);
 }
 
 #[tokio::test]
-async fn update_tenant_does_not_deny_all_under_constraint_bearing_pdp() {
+async fn update_tenant_clamps_to_subtree_under_constraint_bearing_pdp() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = TenantService::new(
@@ -3747,23 +3905,25 @@ async fn update_tenant_does_not_deny_all_under_constraint_bearing_pdp() {
     )
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
     let target = Uuid::from_u128(0x301);
-    svc.create_child(&ctx_for(root), child_input(target, root))
+    svc.create_tenant(&ctx_for(root), child_input(target, root))
         .await
         .expect("create child via mock provisioning happy path");
 
-    // Switch the service to the constraint-bearing PDP for the
-    // update step. (The create_child saga above used the same
-    // enforcer; the constraint also applies to UPDATE in the fake.)
-    let patch = account_management_sdk::TenantUpdate::new().with_name("renamed");
+    // Subtree clamp at the secure-extension layer must let an UPDATE
+    // on a descendant inside the caller's subtree through. The
+    // patched name proves the write actually landed (a scope
+    // mishandling that turned the SELECT-fence into a silent
+    // mismatch would short-circuit before the UPDATE).
+    let patch = account_management_sdk::UpdateTenantRequest::new().with_name("renamed");
     let updated = svc
         .update_tenant(&ctx_for(root), target, patch)
         .await
-        .expect("authorized update MUST NOT collapse to NotFound under constraint-bearing PDP");
+        .expect("authorized update of a descendant inside the caller's subtree MUST succeed");
     assert_eq!(updated.name, "renamed");
 }
 
 #[tokio::test]
-async fn soft_delete_does_not_deny_all_under_constraint_bearing_pdp() {
+async fn delete_tenant_clamps_to_subtree_under_constraint_bearing_pdp() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let svc = TenantService::new(
@@ -3776,17 +3936,177 @@ async fn soft_delete_does_not_deny_all_under_constraint_bearing_pdp() {
     )
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
     let target = Uuid::from_u128(0x401);
-    svc.create_child(&ctx_for(root), child_input(target, root))
+    svc.create_tenant(&ctx_for(root), child_input(target, root))
         .await
         .expect("create child via mock provisioning happy path");
 
-    let deleted = svc.soft_delete(&ctx_for(root), target).await.expect(
-        "authorized soft_delete MUST NOT collapse to NotFound under constraint-bearing PDP",
+    let deleted = svc.delete_tenant(&ctx_for(root), target).await.expect(
+        "authorized delete_tenant of a descendant inside the caller's subtree MUST succeed",
     );
     assert_eq!(
         deleted.status,
         account_management_sdk::TenantStatus::Deleted
     );
+}
+
+#[tokio::test]
+async fn get_tenant_outside_caller_subtree_returns_not_found() {
+    // Cross-subtree denial: build a tree with root + child, then
+    // wire a `ConstraintBearingAuthZResolver` rooted at `child`
+    // (i.e. the caller's PDP only permits subtree(child) = {child}).
+    // Reading `root` through this service MUST collapse to
+    // `NotFound` — the secure-extension layer's subtree clamp
+    // (`tenants.id IN (SELECT descendant_id FROM tenant_closure
+    //   WHERE ancestor_id = child)`) leaves `root` out of the
+    // descendant set. Pre-#1813 this case would have returned the
+    // `root` row because the repo was called with `allow_all`.
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x501);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    // Setup uses `mock_enforcer` so `create_tenant` operates inside
+    // the caller's own subtree (`subject_tenant_id = root`,
+    // subtree(root) = {root, child}). After the saga, we hand the
+    // repo to a fresh service wired with
+    // `constraint_bearing_enforcer(child)` to model a caller
+    // authorised to a strictly narrower subtree than the operation
+    // it is about to attempt.
+    let setup_svc = TenantService::new(
+        repo.clone(),
+        Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok)),
+        Arc::new(InertResourceOwnershipChecker),
+        crate::domain::tenant_type::inert_tenant_type_checker(),
+        mock_enforcer(),
+        AccountManagementConfig::default(),
+    );
+    setup_svc
+        .create_tenant(&ctx_for(root), child_input(child, root))
+        .await
+        .expect("create child via mock provisioning happy path");
+
+    let svc = TenantService::new(
+        repo,
+        Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok)),
+        Arc::new(InertResourceOwnershipChecker),
+        crate::domain::tenant_type::inert_tenant_type_checker(),
+        constraint_bearing_enforcer(child),
+        AccountManagementConfig::default(),
+    );
+
+    let err = svc
+        .get_tenant(&ctx_for(root), root)
+        .await
+        .expect_err("cross-subtree read MUST collapse to NotFound at the secure-extension layer");
+    match err {
+        DomainError::NotFound { .. } => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+/// Helper: build a 2-tenant tree (root + child) via the saga, then
+/// return a fresh service wired with `constraint_bearing_enforcer(child)`
+/// — i.e. a caller authorised to a strictly narrower subtree
+/// (`subtree(child) = {child}`) than the tenant they are about to
+/// touch. Used by the cross-subtree denial regression tests below.
+async fn make_cross_subtree_svc(
+    root: Uuid,
+    child: Uuid,
+) -> (TenantService<FakeTenantRepo>, Arc<FakeTenantRepo>) {
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let setup_svc = TenantService::new(
+        repo.clone(),
+        Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok)),
+        Arc::new(InertResourceOwnershipChecker),
+        crate::domain::tenant_type::inert_tenant_type_checker(),
+        mock_enforcer(),
+        AccountManagementConfig::default(),
+    );
+    setup_svc
+        .create_tenant(&ctx_for(root), child_input(child, root))
+        .await
+        .expect("create child via mock provisioning happy path");
+
+    let svc = TenantService::new(
+        repo.clone(),
+        Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok)),
+        Arc::new(InertResourceOwnershipChecker),
+        crate::domain::tenant_type::inert_tenant_type_checker(),
+        constraint_bearing_enforcer(child),
+        AccountManagementConfig::default(),
+    );
+    (svc, repo)
+}
+
+#[tokio::test]
+async fn update_tenant_outside_caller_subtree_returns_not_found() {
+    // Symmetric to `get_tenant_outside_caller_subtree_returns_not_found`:
+    // an UPDATE on a tenant outside the caller's subtree MUST collapse
+    // to `NotFound` at the database layer. The find_by_id pre-update
+    // load runs under the narrowed scope and the SELECT-fence in
+    // `update_tenant_mutable`'s SERIALIZABLE retry also subtree-clamps
+    // — either is sufficient to defeat the write.
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x501);
+    let (svc, _repo) = make_cross_subtree_svc(root, child).await;
+
+    let patch = account_management_sdk::UpdateTenantRequest::new().with_name("renamed");
+    let err = svc
+        .update_tenant(&ctx_for(root), root, patch)
+        .await
+        .expect_err("cross-subtree update MUST collapse to NotFound");
+    match err {
+        DomainError::NotFound { .. } => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn delete_tenant_outside_caller_subtree_returns_not_found() {
+    // Symmetric to update: soft-delete on a tenant outside the
+    // caller's subtree must NOT succeed. The find_by_id disclosure
+    // read is gated by the subtree clamp; the schedule_deletion
+    // write would also fence on its own SELECT-then-UPDATE if the
+    // read leaked through.
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x501);
+    let (svc, _repo) = make_cross_subtree_svc(root, child).await;
+
+    let err = svc
+        .delete_tenant(&ctx_for(root), root)
+        .await
+        .expect_err("cross-subtree delete_tenant MUST collapse to NotFound");
+    match err {
+        DomainError::NotFound { .. } => {}
+        // `RootTenantCannotDelete` would mask the scope-clamp signal
+        // -- surface it as a regression if it ever leaks here,
+        // because it would mean the find_by_id read returned the
+        // root row despite the narrowed scope.
+        other => panic!(
+            "expected NotFound from scope-clamped find_by_id, got {other:?} (scope clamp leaked?)"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn list_children_outside_caller_subtree_returns_not_found() {
+    // The parent-existence guard inside `list_children` resolves
+    // `parent_id` under the caller's narrowed scope. When the caller
+    // is scoped to `subtree(child)` and the parent argument is
+    // `root`, the find_by_id returns None → NotFound. Without the
+    // scope plumbing, this would silently return the listing as an
+    // empty page (or `root`'s children list), leaking topology.
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x501);
+    let (svc, _repo) = make_cross_subtree_svc(root, child).await;
+
+    let query = ODataQuery::default().with_limit(10);
+    let err = svc
+        .list_children(&ctx_for(root), root, &query)
+        .await
+        .expect_err("cross-subtree list_children MUST collapse to NotFound at the parent gate");
+    match err {
+        DomainError::NotFound { .. } => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4254,7 +4574,7 @@ async fn load_tenant_context_defers_on_gts_type_schema_not_found() {
 // `handle_provision_success`).
 
 #[tokio::test]
-async fn create_child_rejects_oversize_provisioning_metadata_input() {
+async fn create_tenant_rejects_oversize_provisioning_metadata_input() {
     use crate::domain::tenant::service::MAX_IDP_METADATA_BYTES;
 
     let root = Uuid::from_u128(0x100);
@@ -4280,13 +4600,13 @@ async fn create_child_rejects_oversize_provisioning_metadata_input() {
     input.provisioning_metadata = Some(oversize);
 
     let err = svc
-        .create_child(&ctx_for(root), input)
+        .create_tenant(&ctx_for(root), input)
         .await
         .expect_err("oversize provisioning_metadata MUST reject");
     match err {
         DomainError::Validation { detail } => {
             assert!(
-                detail.contains("create_child.provisioning_metadata")
+                detail.contains("create_tenant.provisioning_metadata")
                     && detail.contains("byte AM boundary cap"),
                 "Validation must name the cap source; got: {detail}"
             );
@@ -4301,7 +4621,7 @@ async fn create_child_rejects_oversize_provisioning_metadata_input() {
 }
 
 #[tokio::test]
-async fn create_child_rejects_oversize_plugin_returned_metadata_and_compensates() {
+async fn create_tenant_rejects_oversize_plugin_returned_metadata_and_compensates() {
     use crate::domain::tenant::service::MAX_IDP_METADATA_BYTES;
 
     let root = Uuid::from_u128(0x100);
@@ -4322,13 +4642,13 @@ async fn create_child_rejects_oversize_plugin_returned_metadata_and_compensates(
     .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
 
     let err = svc
-        .create_child(&ctx_for(root), child_input(child, root))
+        .create_tenant(&ctx_for(root), child_input(child, root))
         .await
         .expect_err("oversize plugin-returned metadata MUST reject");
     match err {
         DomainError::Validation { detail } => {
             assert!(
-                detail.contains("create_child.idp_returned_metadata")
+                detail.contains("create_tenant.idp_returned_metadata")
                     && detail.contains("byte AM boundary cap"),
                 "Validation must name the cap source; got: {detail}"
             );
@@ -4347,7 +4667,7 @@ async fn create_child_rejects_oversize_plugin_returned_metadata_and_compensates(
 }
 
 #[tokio::test]
-async fn create_child_accepts_metadata_at_cap_boundary() {
+async fn create_tenant_accepts_metadata_at_cap_boundary() {
     use crate::domain::tenant::service::MAX_IDP_METADATA_BYTES;
 
     let root = Uuid::from_u128(0x100);
@@ -4372,7 +4692,7 @@ async fn create_child_accepts_metadata_at_cap_boundary() {
     input.provisioning_metadata = Some(near_cap);
 
     let _ = svc
-        .create_child(&ctx_for(root), input)
+        .create_tenant(&ctx_for(root), input)
         .await
         .expect("metadata just under the cap MUST pass");
 }

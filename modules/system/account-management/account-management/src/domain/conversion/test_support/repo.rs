@@ -470,7 +470,7 @@ impl ConversionRepo for FakeConversionRepo {
                 .filter(|r| r.deleted_at.is_none())
                 .cloned()
         };
-        let req = req_snapshot.ok_or_else(|| DomainError::NotFound {
+        let req = req_snapshot.ok_or_else(|| DomainError::ConversionRequestNotFound {
             detail: format!("conversion request {} not found", input.request_id),
             resource: input.request_id.to_string(),
         })?;
@@ -872,7 +872,7 @@ fn lookup_pending_mut(
     // racing a real mutator. Mirrors the production scenario where
     // a parent tenant gets hard-deleted (FK cascade) mid-tick.
     if state.vanished_ids.contains(&request_id) {
-        return Err(DomainError::NotFound {
+        return Err(DomainError::ConversionRequestNotFound {
             detail: format!("conversion request {request_id} not found"),
             resource: request_id.to_string(),
         });
@@ -888,15 +888,16 @@ fn lookup_pending_mut(
     if let Some(err) = state.injected_errors.remove(&request_id) {
         return Err(err);
     }
-    let row = state
-        .rows
-        .get_mut(&request_id)
-        .ok_or_else(|| DomainError::NotFound {
-            detail: format!("conversion request {request_id} not found"),
-            resource: request_id.to_string(),
-        })?;
+    let row =
+        state
+            .rows
+            .get_mut(&request_id)
+            .ok_or_else(|| DomainError::ConversionRequestNotFound {
+                detail: format!("conversion request {request_id} not found"),
+                resource: request_id.to_string(),
+            })?;
     if row.deleted_at.is_some() {
-        return Err(DomainError::NotFound {
+        return Err(DomainError::ConversionRequestNotFound {
             detail: format!("conversion request {request_id} not found (soft-deleted)"),
             resource: request_id.to_string(),
         });

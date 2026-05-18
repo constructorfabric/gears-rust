@@ -16,8 +16,8 @@
 //!   tenant in the same tx (DESIGN §3.1 closure status
 //!   denormalization invariant).
 //! * `schedule_deletion` marks the tenant `Deleted`, stamps
-//!   `deletion_scheduled_at`, and rewrites closure
-//!   `descendant_status` in one tx.
+//!   `deleted_at` (which also starts the retention timer), and
+//!   rewrites closure `descendant_status` in one tx.
 //! * `compensate_provisioning` deletes the `Provisioning` row
 //!   without touching closure (no closure ever existed).
 
@@ -33,7 +33,6 @@ use account_management::domain::tenant::TenantRepo;
 use account_management::domain::tenant::closure::build_activation_rows;
 use account_management::domain::tenant::model::{NewTenant, TenantStatus};
 use account_management::domain::tenant::retention::{HardDeleteEligibility, HardDeleteOutcome};
-use account_management_sdk::{TenantStatus as SdkTenantStatus, TenantUpdate};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -342,13 +341,13 @@ async fn activate_tenant_writes_full_closure_for_three_node_chain_with_self_mana
 }
 
 // ---------------------------------------------------------------------
-// `update_tenant_mutable` status flip — Active -> Suspended →
+// `TenantRepo::set_status` status flip — Active -> Suspended →
 // rewrites every closure row's `descendant_status` for the tenant
 // in the same tx.
 // ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn update_tenant_mutable_status_flip_rewrites_closure_descendant_status() {
+async fn set_status_flip_rewrites_closure_descendant_status() {
     let h = setup_sqlite().await.expect("sqlite");
     let root = Uuid::new_v4();
     let mid = Uuid::new_v4();
@@ -365,12 +364,16 @@ async fn update_tenant_mutable_status_flip_rewrites_closure_descendant_status() 
         assert_eq!(row.descendant_status, ACTIVE);
     }
 
-    // Flip mid -> Suspended.
-    let patch = TenantUpdate::new().with_status(SdkTenantStatus::Suspended);
+    // Flip mid -> Suspended via the dedicated repo method.
     h.repo
-        .update_tenant_mutable(&allow_all(), mid, &patch)
+        .set_status(
+            &allow_all(),
+            mid,
+            TenantStatus::Suspended,
+            time::OffsetDateTime::now_utc(),
+        )
         .await
-        .expect("update mid -> Suspended");
+        .expect("set_status mid -> Suspended");
 
     // tenants.status updated.
     let updated = fetch_tenant(&h.provider, mid)
@@ -405,11 +408,15 @@ async fn update_tenant_mutable_status_flip_rewrites_closure_descendant_status() 
     }
 
     // Round-trip back to Active.
-    let patch_back = TenantUpdate::new().with_status(SdkTenantStatus::Active);
     h.repo
-        .update_tenant_mutable(&allow_all(), mid, &patch_back)
+        .set_status(
+            &allow_all(),
+            mid,
+            TenantStatus::Active,
+            time::OffsetDateTime::now_utc(),
+        )
         .await
-        .expect("update mid -> Active");
+        .expect("set_status mid -> Active");
     for row in fetch_closure_rows_for_descendant(&h.provider, mid)
         .await
         .unwrap()
@@ -420,8 +427,8 @@ async fn update_tenant_mutable_status_flip_rewrites_closure_descendant_status() 
 
 // ---------------------------------------------------------------------
 // `schedule_deletion` — soft-delete marks tenant Deleted, stamps
-// `deletion_scheduled_at`, and rewrites closure `descendant_status`
-// to Deleted in the same tx.
+// `deleted_at` (retention-timer start), and rewrites closure
+// `descendant_status` to Deleted in the same tx.
 // ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -584,9 +591,8 @@ async fn hard_delete_one_cleans_tenant_and_closure_rows() {
     create_active_child(&h, leaf, root, "leaf", false, 1).await;
 
     // Soft-delete the leaf so it enters the `Deleted` state with
-    // `deletion_scheduled_at` stamped — the structural precondition
-    // both `check_hard_delete_eligibility` and `hard_delete_one`
-    // verify.
+    // `deleted_at` stamped — the structural precondition both
+    // `check_hard_delete_eligibility` and `hard_delete_one` verify.
     let scheduled_at = OffsetDateTime::now_utc();
     h.repo
         .schedule_deletion(
@@ -603,7 +609,7 @@ async fn hard_delete_one_cleans_tenant_and_closure_rows() {
         .unwrap()
         .expect("leaf row present after soft-delete");
     assert_eq!(after_soft_delete.status, DELETED);
-    assert!(after_soft_delete.deletion_scheduled_at.is_some());
+    assert!(after_soft_delete.deleted_at.is_some());
 
     // Stamp `claimed_by` / `claimed_at` directly to mimic what the
     // retention-scan claim UPDATE does on a healthy backend, then

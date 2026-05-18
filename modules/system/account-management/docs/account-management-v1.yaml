@@ -115,7 +115,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TenantUpdateRequest'
+              $ref: '#/components/schemas/UpdateTenantRequest'
       responses:
         '200':
           description: Updated tenant
@@ -449,7 +449,7 @@ components:
           additionalProperties: true
           description: Opaque provider-specific provisioning context forwarded to the IdP contract.
 
-    TenantUpdateRequest:
+    UpdateTenantRequest:
       type: object
       additionalProperties: false
       minProperties: 1

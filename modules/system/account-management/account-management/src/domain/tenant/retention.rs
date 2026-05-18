@@ -35,7 +35,10 @@ use crate::domain::metrics::{AM_RETENTION_INVALID_WINDOW, MetricKind, emit_metri
 pub struct TenantRetentionRow {
     pub id: Uuid,
     pub depth: u32,
-    pub deletion_scheduled_at: OffsetDateTime,
+    /// Soft-delete timestamp. Doubles as the retention-timer start —
+    /// `deleted_at + retention_window` is the wall-clock at which
+    /// the hard-delete sweep becomes eligible.
+    pub deleted_at: OffsetDateTime,
     pub retention_window: Duration,
     pub claimed_by: Uuid,
 }
@@ -59,16 +62,16 @@ pub struct TenantProvisioningRow {
     pub claimed_by: Uuid,
 }
 
-/// True iff `scheduled_at + retention <= now`. Comparison is inclusive —
+/// True iff `deleted_at + retention <= now`. Comparison is inclusive —
 /// a row whose effective reclaim timestamp equals `now` IS due.
 #[must_use]
-pub fn is_due(now: OffsetDateTime, scheduled_at: OffsetDateTime, retention: Duration) -> bool {
+pub fn is_due(now: OffsetDateTime, deleted_at: OffsetDateTime, retention: Duration) -> bool {
     if time::Duration::try_from(retention).is_err() {
         emit_metric(AM_RETENTION_INVALID_WINDOW, MetricKind::Counter, &[]);
         return false;
     }
 
-    let age = now - scheduled_at;
+    let age = now - deleted_at;
     let Ok(elapsed) = Duration::try_from(age) else {
         return false;
     };
@@ -76,28 +79,28 @@ pub fn is_due(now: OffsetDateTime, scheduled_at: OffsetDateTime, retention: Dura
 }
 
 /// Leaf-first stable ordering for the hard-delete batch:
-/// `(depth DESC, deletion_scheduled_at ASC, id ASC)`.
+/// `(depth DESC, deleted_at ASC, id ASC)`.
 ///
 /// `depth DESC` is what lets `hard_delete_one` succeed under the
 /// `ON DELETE RESTRICT` parent-FK from Phase 1: children are reclaimed
 /// before their parents, so the parent's in-tx child-existence guard
 /// always finds the table empty when its turn arrives.
 ///
-/// `deletion_scheduled_at ASC` is the second key — it mirrors the
-/// scanner contract (`scan_retention_due` returns rows in
-/// `(depth DESC, deletion_scheduled_at ASC, id ASC)` order to prevent
-/// starvation: among siblings at the same depth, the tenant scheduled
-/// earliest goes first). Dropping it as a tiebreaker would make the
-/// hard-delete batch order siblings by `id` only — a tenant scheduled
-/// last could randomly beat one scheduled first if its UUID sorted
-/// earlier. `id ASC` is the final deterministic tiebreaker for rows
-/// scheduled at the exact same instant.
+/// `deleted_at ASC` is the second key — it mirrors the scanner
+/// contract (`scan_retention_due` returns rows in
+/// `(depth DESC, deleted_at ASC, id ASC)` order to prevent starvation:
+/// among siblings at the same depth, the tenant soft-deleted earliest
+/// goes first). Dropping it as a tiebreaker would make the hard-delete
+/// batch order siblings by `id` only — a tenant deleted last could
+/// randomly beat one deleted first if its UUID sorted earlier.
+/// `id ASC` is the final deterministic tiebreaker for rows deleted at
+/// the exact same instant.
 #[must_use]
 pub fn order_batch_leaf_first(mut rows: Vec<TenantRetentionRow>) -> Vec<TenantRetentionRow> {
     rows.sort_by(|a, b| {
         b.depth
             .cmp(&a.depth)
-            .then_with(|| a.deletion_scheduled_at.cmp(&b.deletion_scheduled_at))
+            .then_with(|| a.deleted_at.cmp(&b.deleted_at))
             .then_with(|| a.id.cmp(&b.id))
     });
     rows
@@ -114,8 +117,8 @@ pub enum HardDeleteOutcome {
     /// children will be cleaned first thanks to leaf-first ordering.
     DeferredChildPresent,
     /// Row failed the structural eligibility guard at hard-delete time:
-    /// either `status != Deleted` or `deletion_scheduled_at IS NULL`.
-    /// Temporal eligibility (`scheduled_at + retention <= now`) is
+    /// either `status != Deleted` or `deleted_at IS NULL`.
+    /// Temporal eligibility (`deleted_at + retention <= now`) is
     /// established at candidate-selection time by
     /// [`crate::domain::tenant::repo::TenantRepo::scan_retention_due`]
     /// and is not re-checked here, so this variant indicates a stale
@@ -223,7 +226,7 @@ pub enum HardDeleteEligibility {
     /// up first on a subsequent tick.
     DeferredChildPresent,
     /// Row state is no longer eligible: row is gone, status drifted
-    /// (re-`Active`/`Provisioning`), `deletion_scheduled_at` cleared,
+    /// (re-`Active`/`Provisioning`), `deleted_at` cleared (un-delete),
     /// or claim lost. Maps to [`HardDeleteOutcome::NotEligible`] at
     /// the caller boundary.
     NotEligible,

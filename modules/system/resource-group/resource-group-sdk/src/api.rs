@@ -92,13 +92,40 @@ pub trait ResourceGroupClient: Send + Sync {
         request: UpdateGroupRequest,
     ) -> Result<ResourceGroup, ResourceGroupError>;
 
-    /// Delete a resource group.
+    /// Delete a resource group (non-cascade).
     ///
-    /// SDK deletes are non-cascade: the call fails with
-    /// `ConflictActiveReferences` if the group has child groups or memberships.
-    /// Cascade deletion is only available through the REST surface.
+    /// The call fails with `ConflictActiveReferences` if the group has child
+    /// groups or active memberships. For force-cascade behaviour use
+    /// [`Self::delete_group_cascade`].
     async fn delete_group(&self, ctx: &SecurityContext, id: Uuid)
     -> Result<(), ResourceGroupError>;
+
+    /// Force-delete a resource group, cascading into the entire subtree:
+    /// every descendant group, every membership row for those groups, and
+    /// every closure-table row anchored at this group. Mirrors the
+    /// `force=true` REST flag.
+    ///
+    /// Intended for **cross-module cleanup paths** -- e.g. the AM
+    /// tenant-hard-delete cascade hook that tears down all user-group
+    /// state for a tenant before the `tenants` row is removed. Most
+    /// consumers want [`Self::delete_group`] (the non-cascade variant)
+    /// and surface `ConflictActiveReferences` to the caller as 409.
+    ///
+    /// Default impl delegates to the non-cascade variant so existing
+    /// implementers (production `RgService`, test fakes) compile without
+    /// breakage; implementations that genuinely support cascade SHOULD
+    /// override this to call into their REST-side `force=true` path.
+    /// Implementations that cannot cascade (e.g. inert test fakes) are
+    /// expected to return `ConflictActiveReferences` from the default
+    /// fallback when the group has children / memberships, mirroring the
+    /// non-cascade contract.
+    async fn delete_group_cascade(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<(), ResourceGroupError> {
+        self.delete_group(ctx, id).await
+    }
 
     /// Get descendants of a reference group (depth >= 0).
     async fn get_group_descendants(

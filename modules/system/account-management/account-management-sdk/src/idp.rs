@@ -363,7 +363,7 @@ impl core::error::Error for IdpDeprovisionFailure {}
 /// backoff, jittered scheduling, or circuit-breakers. Each AM call
 /// site issues exactly one invocation per logical attempt:
 ///
-/// * `provision_tenant` — one call per `create_child` saga.
+/// * `provision_tenant` — one call per `create_tenant` saga.
 /// * `deprovision_tenant` — at most one call per claimed row per
 ///   tick (both `hard_delete_batch` and `reap_stuck_provisioning`
 ///   take a 600-second DB lease before invoking the plugin so two

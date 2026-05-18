@@ -108,22 +108,38 @@ pub struct ApplyConversionApprovalInput {
 /// # Caller contract on `scope`
 ///
 /// The `conversion_requests` entity is declared
-/// `Scopable(no_tenant, no_resource, no_owner, no_type)` — the same
-/// declaration used for `tenants` and `tenant_closure`. On these
-/// declarations `Scopable::IS_UNRESTRICTED` is `false` and every
-/// constraint property resolves to `None`, which means:
+/// `Scopable(tenant_col = "tenant_id", resource_col = "id", no_owner,
+/// no_type)`, so `OWNER_TENANT_ID` resolves to the `tenant_id` column
+/// and `RESOURCE_ID` resolves to the request's own `id`. The secure-
+/// extension layer compiles a narrowed scope of shape
+/// `InTenantSubtree(OWNER_TENANT_ID, root, respect_barriers = b)` into
+/// `tenant_id IN (SELECT descendant_id FROM tenant_closure
+///   WHERE ancestor_id = :root [AND barrier = 0 if b])`; the analogous
+/// shape on `RESOURCE_ID` clamps `conversion_requests.id` for future
+/// identity-based policies the REST PR may emit.
 ///
-/// * `scope_with(allow_all())` -> no-op (no `WHERE` clause added).
-/// * `scope_with(<narrowed>)` -> `deny_all()` (`WHERE false`) for reads
-///   / mutations, and `ScopeError::Denied` for INSERTs.
+/// **Service-side posture:** the conversion service builds a caller-
+/// bound scope per URL-bound side (see
+/// [`super::service::ConversionService`] internals):
 ///
-/// **Until `InTenantSubtree` lands** (cyberfabric-core#1813), callers
-/// MUST pass [`AccessScope::allow_all`]. A narrowed scope silently
-/// zero-rows every read and turns every mutation into a no-op or hard
-/// deny — no useful authorization happens at this boundary today.
-/// Cross-tenant authorization is enforced one layer up by the PDP gate
-/// in the service layer; this is **single-layer enforcement** and is a
-/// pre-production gate.
+/// * Child-side caller: `AccessScope::for_tenant(child_id)` — clamps
+///   `tenant_id = child_id`.
+/// * Parent-side caller / parent-side inbound listings:
+///   `InTenantSubtree(OWNER_TENANT_ID, parent_id, respect_barriers =
+///   false)` — clamps `tenant_id` to the parent's closure descendants
+///   with barrier penetration so parent-side counterparty actions on a
+///   self-managed child stay visible (the dual-consent flows are the
+///   case where barrier penetration is correct: the request lives under
+///   the parent's URL authority even when the converting child is
+///   invisible to a barrier-respecting tenant scope).
+///
+/// Cross-tenant authorization is layered: the URL-coherence gate
+/// [`super::service::ConversionCaller`] runs at the service-layer
+/// boundary, `tenant_repo.find_by_id(scope, caller_owned_tenant)`
+/// fences the caller-owned tenant under the incoming `AccessScope`,
+/// and the repo-level row clamp documented above adds the third line
+/// of defence. INSERTs always use `scope_unchecked` — Scopable
+/// INSERT-time clamps are not the right model for inserts.
 #[async_trait]
 pub trait ConversionRepo: Send + Sync {
     // ---- Inserts -------------------------------------------------------
@@ -319,7 +335,7 @@ pub trait ConversionRepo: Send + Sync {
     /// Count of rows that would be returned by
     /// [`Self::list_own_for_tenant`] under the same `(tenant_id,
     /// status_filter)` filter, ignoring pagination. Used by the
-    /// service-layer pagination contract so `TenantPage.total`
+    /// service-layer pagination contract so `OffsetPage.total`
     /// reflects the underlying row count and not the current page
     /// size. Soft-deleted rows are excluded by the same predicate.
     async fn count_own_for_tenant(

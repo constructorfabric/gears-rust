@@ -36,6 +36,7 @@
 //! are REST-ready so that drop-in is a thin handler wiring step.
 
 pub mod model;
+pub mod page;
 pub mod repo;
 pub mod service;
 pub mod state_machine;

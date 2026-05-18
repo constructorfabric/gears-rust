@@ -5,25 +5,127 @@
 //! any inter-module Rust callers wired through `ClientHub`. They are
 //! deliberately slim and stable:
 //!
-//! * Inputs ([`CreateTenantRequest`], [`TenantUpdate`], [`ListChildrenQuery`])
-//!   carry only what callers must supply. Internal storage details
-//!   (`UUIDv5` derivations, hierarchy depth, lifecycle timestamps) live on
-//!   AM-internal shapes in the impl crate and never appear here.
-//! * Output reuses [`TenantInfo`] (re-exported from
-//!   [`tenant_resolver_sdk`]) so the resolver subsystem and AM speak the
-//!   same vocabulary on the public boundary — no duplicated tenant DTOs
-//!   across CF SDKs.
-//! * Status uses [`TenantStatus`] from `tenant-resolver-sdk` (3 public
-//!   variants: `Active` / `Suspended` / `Deleted`). AM's internal
-//!   4-variant `TenantStatus` (with `Provisioning`) is service-internal
-//!   and is filtered out before any value crosses this boundary.
+//! * Inputs ([`CreateTenantRequest`], [`UpdateTenantRequest`]) carry only what
+//!   callers must supply. Internal storage details (`UUIDv5` derivations,
+//!   hierarchy depth, lifecycle timestamps) live on AM-internal shapes in
+//!   the impl crate and never appear here.
+//! * Listing input is the platform-wide [`modkit_odata::ODataQuery`]
+//!   (`$filter` / `$orderby` / `$top` / `$cursor`); the filterable
+//!   column set is declared by [`TenantInfoQuery`] which the
+//!   [`#[derive(ODataFilterable)]`](modkit_odata_macros::ODataFilterable)
+//!   macro expands into [`TenantInfoFilterField`] for the impl-side
+//!   repo. Path-scoped `parent_id` stays a positional argument on
+//!   [`crate::AccountManagementClient::list_children`] — it is not a
+//!   filter column.
+//! * Output is the AM-owned [`Tenant`] shape — a deliberately richer
+//!   projection than the resolver's identity-shaped
+//!   `tenant_resolver_sdk::TenantInfo`. It carries the lifecycle
+//!   timestamps (`created_at`, `updated_at`, `deleted_at`) and the
+//!   hierarchy `depth` admin / UI consumers typically want, while
+//!   keeping internal-only columns (`retention_window_secs`,
+//!   `claimed_by`, `claimed_at`, the raw `tenant_type_uuid`) inside
+//!   the impl crate. `deleted_at` doubles as the retention-timer
+//!   start; the hard-delete deadline is
+//!   `deleted_at + retention_window_secs` (operator override) or the
+//!   scanner-default when the override is NULL — both computed
+//!   server-side and not surfaced through this shape.
+//! * `TenantId` and `TenantStatus` keep being re-used from
+//!   `tenant-resolver-sdk` — they are the cross-SDK identity
+//!   primitives (the resolver, PEP scopes, closure walks all speak
+//!   them) and inlining a parallel copy here would force every
+//!   consumer of `Tenant` to translate them back. AM's internal
+//!   4-variant status (`Provisioning` + the three public ones) is
+//!   service-internal and is filtered out before any value crosses
+//!   this boundary.
 
 use gts::GtsSchemaId;
+use modkit_odata_macros::ODataFilterable;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::OffsetDateTime;
+use time::serde::rfc3339;
 use uuid::Uuid;
 
-pub use tenant_resolver_sdk::{TenantId, TenantInfo, TenantStatus};
+pub use tenant_resolver_sdk::{TenantId, TenantStatus};
+
+/// Public AM tenant projection returned from
+/// [`crate::AccountManagementClient`] CRUD and listing surfaces.
+///
+/// Wider than the resolver's identity-shaped
+/// [`tenant_resolver_sdk::TenantInfo`] — `Tenant` is what AM hands
+/// to admin tooling, UIs, and inter-module Rust consumers that need
+/// to display or reason about a tenant. The extra fields beyond
+/// `TenantInfo` are:
+///
+/// * `depth` — hierarchy depth at write time. `0` for the root.
+///   Available so UIs can render tree breadcrumbs without a second
+///   round-trip to the closure layer.
+/// * `created_at` / `updated_at` / `deleted_at` — lifecycle timestamps.
+///   `created_at` is set on insert and immutable thereafter;
+///   `updated_at` advances on every mutation. `deleted_at` is
+///   `Some(_)` exactly when `status == Deleted` and doubles as the
+///   retention-timer start (hard-delete becomes eligible at
+///   `deleted_at + retention_window`). All are wire-serialised as
+///   RFC 3339.
+///
+/// Internal-only columns are intentionally **not** here:
+/// `tenant_type_uuid` (consumers speak chained `tenant_type` string),
+/// `retention_window_secs` (operator override stored per-row but not
+/// part of the public lifecycle contract), `claimed_by` / `claimed_at`
+/// (hard-delete worker claim). Promoting any of them to the public
+/// projection is a `SemVer` minor bump.
+///
+/// Pre-1.0 SDK: NOT `#[non_exhaustive]`. Listing all fields in a
+/// struct expression is the documented construction style — the
+/// impl-side service composes `Tenant` directly without going
+/// through a constructor, and adding a column is an explicit `SemVer`
+/// minor bump that requires updating every literal site (the
+/// compiler will flag them via the `missing field` error). Promoting
+/// to `#[non_exhaustive]` is a 1.0 / wider-adoption decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "`tenant_type` mirrors the field name on `tenant_resolver_sdk::TenantInfo` and on the storage entity; renaming for clippy would diverge from cross-SDK vocabulary"
+)]
+pub struct Tenant {
+    pub id: TenantId,
+    pub name: String,
+    pub status: TenantStatus,
+    /// Chained `gts.cf.core.am.tenant_type.v1~vendor.app.foo.v1~`
+    /// identifier of the registered type. `None` when the types
+    /// registry was momentarily unreachable at the lowering site;
+    /// AM does not block read responses on a registry blip, so this
+    /// field is best-effort. Mirrors the same `Option<String>` policy
+    /// `tenant_resolver_sdk::TenantInfo` uses for cross-SDK
+    /// consistency.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub tenant_type: Option<String>,
+    /// Parent tenant id. `None` for the platform root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<TenantId>,
+    /// `true` when this tenant is the start of a self-managed
+    /// subtree. Ancestors cannot traverse into it under the default
+    /// (non barrier-penetrating) scope.
+    #[serde(default)]
+    pub self_managed: bool,
+    /// Hierarchy depth recorded at insert. `0` for the root, `parent.depth + 1`
+    /// for every child.
+    pub depth: u32,
+    #[serde(with = "rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "rfc3339")]
+    pub updated_at: OffsetDateTime,
+    /// Soft-delete tombstone. `Some(_)` exactly when
+    /// `status == Deleted`; also marks the start of the retention
+    /// timer (hard-delete becomes eligible at
+    /// `deleted_at + retention_window`).
+    #[serde(
+        default,
+        with = "rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deleted_at: Option<OffsetDateTime>,
+}
 
 /// Input for the create-child-tenant flow.
 ///
@@ -84,28 +186,33 @@ impl CreateTenantRequest {
     }
 }
 
-/// Patch shape for the update-tenant flow. An empty patch (both fields
-/// `None`) is rejected at the service boundary per the `OpenAPI`
-/// `minProperties: 1` rule on `TenantUpdateRequest`.
+/// Patch shape for the update-tenant flow. Carries only **mutable**
+/// tenant fields; an empty patch (all fields `None`) is rejected at
+/// the service boundary.
+///
+/// `status` is **not** part of this shape — lifecycle transitions go
+/// through dedicated methods:
+/// [`crate::AccountManagementClient::suspend_tenant`] /
+/// [`crate::AccountManagementClient::unsuspend_tenant`] for the
+/// `Active` ↔ `Suspended` flip and
+/// [`crate::AccountManagementClient::delete_tenant`] for soft-delete.
+/// This keeps each lifecycle transition idempotent on its own surface
+/// and avoids exposing the AM-internal status taxonomy as a patchable
+/// field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
-pub struct TenantUpdate {
+pub struct UpdateTenantRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<TenantStatus>,
 }
 
-impl TenantUpdate {
-    /// Construct an empty patch. Both fields default to `None` and
-    /// are set via [`Self::with_name`] / [`Self::with_status`].
-    /// An all-`None` patch is rejected at the service boundary.
+impl UpdateTenantRequest {
+    /// Construct an empty patch. Fields default to `None` and are set
+    /// via [`Self::with_name`]. An all-`None` patch is rejected at the
+    /// service boundary.
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            name: None,
-            status: None,
-        }
+        Self { name: None }
     }
 
     #[must_use]
@@ -114,191 +221,101 @@ impl TenantUpdate {
         self
     }
 
-    #[must_use]
-    pub const fn with_status(mut self, status: TenantStatus) -> Self {
-        self.status = Some(status);
-        self
-    }
-
     /// Whether this patch is effectively empty.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.name.is_none() && self.status.is_none()
+        self.name.is_none()
     }
 }
 
-/// Pagination + filter query for `list_children`.
+/// `OData` filter schema for
+/// [`crate::AccountManagementClient::list_children`].
 ///
-/// Construct via [`ListChildrenQuery::new`] (validates `top > 0`); the
-/// serde path routes through [`RawListChildrenQuery`] + [`TryFrom`] so
-/// the same invariant is enforced on every deserialization input.
+/// Declares the columns of [`TenantInfo`] (and the storage-side
+/// `tenants` row) that callers may use in `$filter` and `$orderby`
+/// predicates. The derive expands into the [`TenantInfoFilterField`]
+/// enum the impl-crate's repo layer references when invoking
+/// `modkit_db::odata::paginate_odata`; keeping the field set in the
+/// SDK keeps the public contract a single source of truth.
 ///
-/// Field visibility encodes invariants:
-/// * `parent_id`, `skip` — public; no invariant (zero `skip` is fine).
-/// * `top` — private. Read via [`ListChildrenQuery::top`]. Made private
-///   because the contract requires `top > 0`, and a `pub` field would
-///   let serde set it to `0` and bypass [`ListChildrenQuery::new`].
-/// * `status_filter` — private. Read via
-///   [`ListChildrenQuery::status_filter`]. Encapsulated to keep the
-///   `None`/empty-vec equivalence rule (see the getter doc) consistent
-///   across all callers. The `Provisioning` status is **not** part of
-///   [`TenantStatus`] on the public boundary, so it cannot appear in
-///   the filter by construction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(try_from = "RawListChildrenQuery")]
-pub struct ListChildrenQuery {
-    pub parent_id: Uuid,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    status_filter: Option<Vec<TenantStatus>>,
-    top: u32,
-    #[serde(default)]
-    pub skip: u32,
-}
-
-/// Wire shape for [`ListChildrenQuery`] deserialization. Mirrors the
-/// public fields but skips the `top > 0` invariant — the
-/// [`TryFrom<RawListChildrenQuery>`] impl below routes the value
-/// through [`ListChildrenQuery::new`] so the invariant is enforced on
-/// every serde input path, not just constructor calls.
-#[derive(Debug, Clone, Deserialize)]
-struct RawListChildrenQuery {
-    parent_id: Uuid,
-    #[serde(default)]
-    status_filter: Option<Vec<TenantStatus>>,
-    #[serde(default = "ListChildrenQuery::default_top")]
-    top: u32,
-    #[serde(default)]
-    skip: u32,
-}
-
-impl TryFrom<RawListChildrenQuery> for ListChildrenQuery {
-    type Error = ListChildrenQueryError;
-
-    fn try_from(raw: RawListChildrenQuery) -> Result<Self, Self::Error> {
-        Self::new(raw.parent_id, raw.status_filter, raw.top, raw.skip)
-    }
-}
-
-/// Validation errors reported by [`ListChildrenQuery::new`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ListChildrenQueryError {
-    /// `top` was zero; `OpenAPI` `Top.minimum = 1`.
-    TopMustBePositive,
-}
-
-impl core::fmt::Display for ListChildrenQueryError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::TopMustBePositive => f.write_str("top must be at least 1"),
-        }
-    }
-}
-
-impl core::error::Error for ListChildrenQueryError {}
-
-impl ListChildrenQuery {
-    /// Default page size used when serde input omits `top` (e.g.
-    /// `GET /tenants/{id}/children?skip=10`). Mirrors
-    /// [`crate::idp_user::IdpUserPagination::DEFAULT_TOP`] so REST
-    /// handlers apply the same fallback across tenant-CRUD and
-    /// user-ops listings.
-    pub const DEFAULT_TOP: u32 = 50;
-
-    /// Serde-attribute helper: returns [`Self::DEFAULT_TOP`]. Used by
-    /// [`RawListChildrenQuery`] so a wire payload that omits `top`
-    /// still produces a non-zero page size when routed through
-    /// [`ListChildrenQuery::new`]. Without this helper, omitting `top`
-    /// would fail deserialization with "missing field `top`" —
-    /// diverging from [`crate::idp_user::IdpUserPagination`], which
-    /// already defaults to its `DEFAULT_TOP`.
-    #[must_use]
-    const fn default_top() -> u32 {
-        Self::DEFAULT_TOP
-    }
-
-    /// Construct a validated query.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ListChildrenQueryError::TopMustBePositive`] when `top`
-    /// is zero.
-    pub fn new(
-        parent_id: Uuid,
-        status_filter: Option<Vec<TenantStatus>>,
-        top: u32,
-        skip: u32,
-    ) -> Result<Self, ListChildrenQueryError> {
-        if top == 0 {
-            return Err(ListChildrenQueryError::TopMustBePositive);
-        }
-        // Normalize `Some(vec![])` to `None` so the documented
-        // contract on `status_filter()` ("empty vector is treated
-        // identically to `None`") is enforced at construction time
-        // rather than relying on every consumer to remember the
-        // equivalence.
-        let status_filter = status_filter.filter(|v| !v.is_empty());
-        Ok(Self {
-            parent_id,
-            status_filter,
-            top,
-            skip,
-        })
-    }
-
-    /// Read-only access to the validated `top`. Always `>= 1` per the
-    /// constructor invariant.
-    #[must_use]
-    pub const fn top(&self) -> u32 {
-        self.top
-    }
-
-    /// Read-only access to the validated `status_filter`. `None` means
-    /// "default visibility set" — repo applies its own SDK-visible
-    /// default. An empty vector is treated identically to `None`.
-    #[must_use]
-    pub fn status_filter(&self) -> Option<&[TenantStatus]> {
-        self.status_filter.as_deref()
-    }
-}
-
-/// Page envelope returned by list-children.
+/// Path-scoped `parent_id` is NOT part of this surface — it stays a
+/// positional argument on `list_children`. Listing for an arbitrary
+/// `parent_id` via `$filter` would let callers bypass the
+/// parent-existence + status guard the service layer runs before the
+/// repo call.
 ///
-/// Generic over the item shape so AM-internal callers (repo trait) can
-/// instantiate `TenantPage<TenantModel>` with the full storage row,
-/// while the public service boundary returns `TenantPage<TenantInfo>`
-/// with the slim shape consumers expect.
+/// `id` is exposed primarily as the **cursor tiebreaker** — the
+/// listing surface composes `(created_at ASC, id ASC)` as its
+/// effective sort so two siblings sharing a `created_at` timestamp
+/// (microsecond collisions on batch INSERTs or parallel API calls)
+/// stay disambiguated across page boundaries. Without a unique
+/// secondary key the cursor predicate `created_at > last_ts`
+/// silently skips collision-mates on the next page. Exact-id lookups
+/// still go through `get_tenant` — the `OData` filter surface accepts
+/// `$filter=id eq <uuid>` for niche bulk-export flows but most
+/// callers will use the dedicated endpoint.
 ///
-/// `total` is a best-effort snapshot — `list` and `count` are two
-/// independent reads on the repo seam, so under concurrent writes
-/// `total` may disagree with `items.len()` by one (READ COMMITTED
-/// on Postgres; per-statement autocommit on `SQLite`). Consumers
-/// driving `has_more` from `(total - skip) > top` should treat the
-/// number as advisory rather than authoritative.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct TenantPage<T> {
-    pub items: Vec<T>,
-    pub top: u32,
-    pub skip: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total: Option<u64>,
+/// Status filtering retains the AM-default hidden-AND: when a caller
+/// supplies no `status` predicate, the repo layer ANDs
+/// `status IN (Active, Suspended)` so soft-deleted rows stay hidden by
+/// default. Callers wanting to see deleted rows opt in via
+/// `$filter=status eq 'deleted'`. The accepted string values match the
+/// serde rename on the public [`TenantStatus`] enum (`"active"`,
+/// `"suspended"`, `"deleted"`); the AM-internal `Provisioning` status
+/// has no SDK representation and is rejected as a validation error.
+///
+/// The struct is **never** constructed; its only role is to drive the
+/// derive macro. The `dead_code` allow keeps clippy quiet on the
+/// unused fields — the derive consumes them at compile time.
+#[derive(ODataFilterable)]
+#[allow(dead_code)]
+pub struct TenantInfoQuery {
+    /// `tenants.id` (UUID, primary key). Exposed as the cursor
+    /// tiebreaker so `list_children` can compose
+    /// `(created_at ASC, id ASC)` as a total order — preventing
+    /// silent row-loss when sibling tenants share a `created_at`
+    /// timestamp. Filter use is allowed (`$filter=id eq <uuid>`)
+    /// but the dedicated `get_tenant` endpoint is the ergonomic
+    /// path for exact-id reads.
+    #[odata(filter(kind = "Uuid"))]
+    pub id: Uuid,
+    /// `tenants.status` projected as the public [`TenantStatus`]
+    /// lifecycle string: `"active"`, `"suspended"`, or `"deleted"`
+    /// (the serde rename on the SDK enum). The `OData` parser
+    /// validates the string up-front; unknown values — including the
+    /// AM-internal `"provisioning"` — are rejected as a validation
+    /// error before the predicate reaches storage.
+    #[odata(filter(kind = "String"))]
+    pub status: String,
+    /// Deterministic `UUIDv5` of the registered tenant-type schema id.
+    /// Filtering on the UUID rather than the chained `gts.*` string
+    /// keeps the wire path simple — callers building a UI dropdown
+    /// over tenant types already hold the UUID (the resolver registry
+    /// returns it on type lookups), and the SDK does not need a
+    /// server-side `derive_schema_uuid` rewrite step. Exact-type
+    /// listings go through `$filter=tenant_type_uuid eq <uuid>`.
+    #[odata(filter(kind = "Uuid"))]
+    pub tenant_type_uuid: Uuid,
+    /// `tenants.self_managed` flag. Useful to surface "boundary"
+    /// child tenants vs ordinary ones in operator UIs.
+    #[odata(filter(kind = "Bool"))]
+    pub self_managed: bool,
+    /// Row creation timestamp. Exposed as a filter / order column so
+    /// callers can paginate chronologically. When callers omit
+    /// `$orderby`, the impl-side `list_children` injects
+    /// `created_at ASC` so the chronological default is preserved;
+    /// `id ASC` (declared above) is then appended as the unique
+    /// tiebreaker, yielding effective order `(created_at ASC, id ASC)`.
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub created_at: OffsetDateTime,
+    /// Last-mutation timestamp. Available for `$filter` /
+    /// `$orderby` so callers can watch for recently-changed tenants
+    /// (e.g. a UI sidebar "recent activity" panel).
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub updated_at: OffsetDateTime,
 }
 
-impl<T> TenantPage<T> {
-    /// Construct a page envelope. `total = None` is the documented
-    /// shape when the underlying source does not surface a total
-    /// count cheaply.
-    #[must_use]
-    pub const fn new(items: Vec<T>, top: u32, skip: u32, total: Option<u64>) -> Self {
-        Self {
-            items,
-            top,
-            skip,
-            total,
-        }
-    }
-}
+pub use TenantInfoQueryFilterField as TenantInfoFilterField;
 
 #[cfg(test)]
 #[path = "tenant_tests.rs"]

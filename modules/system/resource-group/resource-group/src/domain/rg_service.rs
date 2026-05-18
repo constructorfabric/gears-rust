@@ -169,9 +169,25 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         ctx: &SecurityContext,
         id: Uuid,
     ) -> Result<(), ResourceGroupError> {
-        // SDK deletes are non-cascade by contract; cascade is REST-only.
+        // Non-cascade variant: surface `ConflictActiveReferences` to the
+        // caller; cascade goes through `delete_group_cascade` below.
         self.group_service
             .delete_group(ctx, id, false)
+            .await
+            .map_err(ResourceGroupError::from)
+    }
+
+    async fn delete_group_cascade(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<(), ResourceGroupError> {
+        // Cascade variant: forwards to `delete_group_inner` with
+        // `force=true`, which atomically removes the entire subtree,
+        // membership rows, and closure rows under a SERIALIZABLE
+        // transaction. Mirrors the REST `?force=true` path.
+        self.group_service
+            .delete_group(ctx, id, true)
             .await
             .map_err(ResourceGroupError::from)
     }

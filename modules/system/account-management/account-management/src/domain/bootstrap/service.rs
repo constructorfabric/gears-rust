@@ -989,7 +989,7 @@ impl<R: TenantRepo> BootstrapService<R> {
     /// `Validation` instead of burning the full `idp_wait_timeout`
     /// budget on retries.
     ///
-    /// Mirrors the call sites in `TenantService::create_child` (and
+    /// Mirrors the call sites in `TenantService::create_tenant` (and
     /// the `cf-resource-group::validate_metadata_via_gts` posture):
     /// when the registry has the schema the JSON-Schema bounds
     /// (`minLength`, `maxLength`) gate the call; when the schema is
@@ -1073,7 +1073,7 @@ impl<R: TenantRepo> BootstrapService<R> {
         // `ux_tenants_single_root` partial unique index.
         // Derive `tenant_type_uuid` from the configured GTS id via
         // `gts::GtsID::to_uuid()` — the same canonical V5-UUID
-        // algorithm `create_child` uses, so the bootstrap and
+        // algorithm `create_tenant` uses, so the bootstrap and
         // child-create paths produce identical FK values for the
         // same `root_tenant_type`. `GtsID::new` additionally
         // validates the chain shape, surfacing
@@ -1250,7 +1250,7 @@ impl<R: TenantRepo> BootstrapService<R> {
         // opens its SERIALIZABLE TX so the provisioning reaper can
         // recover vendor-side state even if the activation fails.
         // Mirrors the same fix on the create-child saga path. See
-        // `tenant::service::create_child` for the rationale on why
+        // `tenant::service::create_tenant` for the rationale on why
         // the up-front upsert is load-bearing.
         //
         // # `?` on the upsert is safe here

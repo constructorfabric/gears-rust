@@ -71,9 +71,9 @@ pub(crate) mod pep {
 
 use account_management_sdk::{
     CreateTenantRequest, IdpDeprovisionFailure, IdpDeprovisionTenantRequest, IdpPluginClient,
-    IdpProvisionFailure, IdpProvisionTenantRequest, IdpTenantContext, ListChildrenQuery,
-    TenantInfo, TenantPage, TenantUpdate,
+    IdpProvisionFailure, IdpProvisionTenantRequest, IdpTenantContext, Tenant, UpdateTenantRequest,
 };
+use modkit_odata::{ODataQuery, Page};
 use serde_json::Value;
 use tenant_resolver_sdk::TenantId;
 use types_registry_sdk::{TypesRegistryClient, TypesRegistryError};
@@ -90,9 +90,7 @@ use crate::domain::tenant::closure::build_activation_rows;
 use crate::domain::tenant::context::TenantContext;
 use crate::domain::tenant::hooks::TenantHardDeleteHook;
 use crate::domain::tenant::integrity::{IntegrityCategory, IntegrityReport, Violation};
-use crate::domain::tenant::model::{
-    ChildCountFilter, NewTenant, TenantModel, TenantStatus, validate_status_transition,
-};
+use crate::domain::tenant::model::{ChildCountFilter, NewTenant, TenantModel, TenantStatus};
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::resource_checker::ResourceOwnershipChecker;
 use crate::domain::tenant_type::checker::TenantTypeChecker;
@@ -166,20 +164,20 @@ pub struct TenantService<R: TenantRepo> {
     /// teardown.
     hooks: Arc<PlMutex<Vec<TenantHardDeleteHook>>>,
     /// Resource-ownership probe; owns the `tenant_has_resources` reject
-    /// path inside `soft_delete`.
+    /// path inside `delete_tenant`.
     resource_checker: Arc<dyn ResourceOwnershipChecker>,
     /// Tenant-type compatibility barrier (FEATURE 2.3
     /// `tenant-type-enforcement`). Invoked at saga step 3
-    /// (`inst-algo-saga-type-check`) of `create_child` between the
+    /// (`inst-algo-saga-type-check`) of `create_tenant` between the
     /// parent-read and the `provisioning` row insert; rejects
     /// incompatible parent / child type pairings before any tenants /
     /// closure rows are written.
     tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync>,
     /// Optional GTS Types Registry client used to resolve a tenant's
     /// `tenant_type_uuid` back to its chained-id string before the
-    /// service hands a [`TenantInfo`] to public callers. `None` in
+    /// service hands a [`Tenant`] to public callers. `None` in
     /// dev / test deployments without a registry plugin (in which case
-    /// `TenantInfo.tenant_type` is left as `None`). Production reads
+    /// `Tenant.tenant_type` is left as `None`). Production reads
     /// rely on the registry client's own caching — every CRUD return
     /// fans out one `get_type_schema_by_uuid` call (or one batched
     /// `get_type_schemas_by_uuid` for `list_children`); the cache
@@ -232,8 +230,8 @@ impl<R: TenantRepo> TenantService<R> {
 
     /// Wire a Types Registry client used to resolve `tenant_type_uuid`
     /// back to its chained GTS id when lowering [`TenantModel`] to
-    /// [`TenantInfo`] on public CRUD return values. Without this the
-    /// service still works — `TenantInfo.tenant_type` is just left as
+    /// [`Tenant`] on public CRUD return values. Without this the
+    /// service still works — `Tenant.tenant_type` is just left as
     /// `None`. Production wiring (`module.rs`) calls this from
     /// `init` after the registry client resolves from `ClientHub`;
     /// tests (which usually pin an inert tenant-type checker) leave
@@ -339,7 +337,7 @@ impl<R: TenantRepo> TenantService<R> {
     /// Resolve a tenant-type UUID into its chained GTS string via the
     /// configured registry client. Returns `None` when no registry is
     /// wired or when the lookup fails — the public `tenant_type` field
-    /// on [`TenantInfo`] is `Option<String>` precisely so a registry
+    /// on [`Tenant`] is `Option<String>` precisely so a registry
     /// blip doesn't fail an otherwise-fine read.
     async fn resolve_tenant_type(&self, type_uuid: Uuid) -> Option<String> {
         let registry = self.types_registry.as_ref()?;
@@ -357,38 +355,42 @@ impl<R: TenantRepo> TenantService<R> {
         }
     }
 
-    /// Lower an internal [`TenantModel`] to the public [`TenantInfo`]
+    /// Lower an internal [`TenantModel`] to the public [`Tenant`]
     /// shape (consumed by REST consumers / sibling SDK callers via
     /// `tenant-resolver-sdk`).
     ///
     /// **Invariant:** the caller must filter `Provisioning` rows
     /// before invoking this helper — every public CRUD method either
     /// short-circuits with `NotFound` for SDK-invisible rows
-    /// (`read_tenant`, `update_tenant`, `soft_delete`) or filters
+    /// (`get_tenant`, `update_tenant`, `delete_tenant`) or filters
     /// them out (`list_children`). The status conversion uses
     /// `TryFrom<TenantStatus>` so a bypass surfaces as
     /// [`DomainError::Internal`] (HTTP 500) instead of a process
     /// panic.
-    async fn lower_to_tenant_info(&self, model: TenantModel) -> Result<TenantInfo, DomainError> {
+    async fn lower_to_tenant(&self, model: TenantModel) -> Result<Tenant, DomainError> {
         let tenant_type = self.resolve_tenant_type(model.tenant_type_uuid).await;
         let status =
             account_management_sdk::TenantStatus::try_from(model.status).map_err(|_| {
                 DomainError::Internal {
                     diagnostic: format!(
-                        "tenant {} reached lower_to_tenant_info with status=Provisioning; \
+                        "tenant {} reached lower_to_tenant with status=Provisioning; \
                      upstream is_sdk_visible filter was bypassed",
                         model.id
                     ),
                     cause: None,
                 }
             })?;
-        Ok(TenantInfo {
+        Ok(Tenant {
             id: TenantId(model.id),
             name: model.name,
             status,
             tenant_type,
             parent_id: model.parent_id.map(TenantId),
             self_managed: model.self_managed,
+            depth: model.depth,
+            created_at: model.created_at,
+            updated_at: model.updated_at,
+            deleted_at: model.deleted_at,
         })
     }
 
@@ -397,15 +399,9 @@ impl<R: TenantRepo> TenantService<R> {
     /// scales with number of pages, not number of rows.
     async fn lower_to_tenant_page(
         &self,
-        page: TenantPage<TenantModel>,
-    ) -> Result<TenantPage<TenantInfo>, DomainError> {
-        let TenantPage {
-            items,
-            top,
-            skip,
-            total,
-            ..
-        } = page;
+        page: Page<TenantModel>,
+    ) -> Result<Page<Tenant>, DomainError> {
+        let Page { items, page_info } = page;
 
         // Fan out one batch lookup for distinct uuids in the page; we
         // tolerate per-uuid registry failures by leaving `tenant_type`
@@ -427,7 +423,7 @@ impl<R: TenantRepo> TenantService<R> {
             }
         }
 
-        let mut mapped: Vec<TenantInfo> = Vec::with_capacity(items.len());
+        let mut mapped: Vec<Tenant> = Vec::with_capacity(items.len());
         for m in items {
             let status =
                 account_management_sdk::TenantStatus::try_from(m.status).map_err(|_| {
@@ -440,17 +436,21 @@ impl<R: TenantRepo> TenantService<R> {
                         cause: None,
                     }
                 })?;
-            mapped.push(TenantInfo {
+            mapped.push(Tenant {
                 id: TenantId(m.id),
                 name: m.name,
                 status,
                 tenant_type: type_strings.get(&m.tenant_type_uuid).cloned(),
                 parent_id: m.parent_id.map(TenantId),
                 self_managed: m.self_managed,
+                depth: m.depth,
+                created_at: m.created_at,
+                updated_at: m.updated_at,
+                deleted_at: m.deleted_at,
             });
         }
 
-        Ok(TenantPage::new(mapped, top, skip, total))
+        Ok(Page::new(mapped, page_info))
     }
 
     /// Append a cascade hook. Hooks run in registration order.
@@ -526,25 +526,41 @@ impl<R: TenantRepo> TenantService<R> {
     /// (a tenant row IS its own scope; the closure's `barrier` bit
     /// sits on `(ancestor, descendant)` pairs, so the PDP must
     /// receive the row's own id to evaluate barrier-clamp on
-    /// self-managed descendants). `RESOURCE_ID` is conveyed via the
-    /// standard `resource_id` argument and does not need to be set
-    /// on the [`AccessRequest`].
+    /// self-managed descendants).
+    ///
+    /// `RESOURCE_ID` is set on the [`AccessRequest`] (when
+    /// `resource_id.is_some()`) **in addition** to flowing through
+    /// the standard `resource_id` argument. The duplication is
+    /// intentional: the standard argument lands on
+    /// `EvaluationRequest::resource.id` per the `AuthZEN` spec, while
+    /// the `resource_property` slot is what the PEP compiler reads
+    /// to bind the `InTenantSubtree(RESOURCE_ID, …)` predicate's
+    /// property value at constraint-compile time. Without the
+    /// property bind, a PDP that returns `InTenantSubtree` on
+    /// `RESOURCE_ID` would compile cleanly but the secure-extension
+    /// would have nothing to clamp against.
     ///
     /// Errors:
     /// - PDP `Denied` → [`DomainError::CrossTenantDenied`] (HTTP 403).
-    /// - PDP transport failure → [`DomainError::ServiceUnavailable`] (HTTP
-    ///   503). DESIGN §4.3 mandates fail-closed; AM does not provide a
-    ///   local authorization fallback.
-    /// - Constraint compile failure → [`DomainError::Internal`] (PEP / PDP
-    ///   integration bug — unsupported constraint shape).
+    /// - PDP transport failure → [`DomainError::ServiceUnavailable`]
+    ///   (HTTP 503). DESIGN §4.3 mandates fail-closed; AM does not
+    ///   provide a local authorization fallback.
+    /// - Constraint compile failure (unsupported predicate shape,
+    ///   empty constraints with `require_constraints=true`, etc.) →
+    ///   [`DomainError::CrossTenantDenied`] (HTTP 403). The
+    ///   `EnforcerError::CompileFailed → CrossTenantDenied` mapping
+    ///   lives in [`crate::domain::error`]; this is **fail-closed**,
+    ///   not a 5xx — a misconfigured policy bundle denies access
+    ///   rather than leaking it via a silent `allow_all`.
     ///
-    /// `require_constraints(false)` is set today because the AM PEP-
-    /// side `in_tenant_subtree` compiler is not yet implemented; once
-    /// the Tenant Resolver Plugin lands, this flips to `true` and the
-    /// compiled scope is plumbed into SQL filters. **Until then, AM
-    /// authorization is single-layer (PDP gate only) — see
-    /// `cyberware-rust#1813` and the crate-level `lib.rs`
-    /// production-readiness note.**
+    /// `require_constraints(true)` — the AM PEP-side
+    /// `InTenantSubtree` compiler is live (cyberware-rust#1813) and
+    /// the `tenants` entity now declares `resource_col = "id"`, so
+    /// the compiled `AccessScope` materialises a subtree-clamp JOIN
+    /// against `tenant_closure` at the database. A PDP that emits
+    /// `decision: true, constraints: []` against `require_constraints
+    /// = true` fails loudly via the `CompileFailed → CrossTenantDenied`
+    /// mapping rather than silently widening the read.
     async fn authorize(
         &self,
         ctx: &SecurityContext,
@@ -552,16 +568,19 @@ impl<R: TenantRepo> TenantService<R> {
         owner_tenant_id: Uuid,
         resource_id: Option<Uuid>,
     ) -> Result<AccessScope, DomainError> {
-        // TODO(cyberware-rust#1813): flip `require_constraints` to
-        // `true` once `InTenantSubtree` lands in the secure-builder
-        // and the AM PEP can compile subtree predicates. Today the
-        // PDP gate is the only enforcement layer; SQL-level subtree
-        // filtering is a no-op because the `tenants` entity is
-        // `no_tenant, no_resource, no_owner, no_type` (see
-        // `TenantRepo` trait doc). This is a pre-production gate.
-        let request = AccessRequest::new()
+        // Pass both `OWNER_TENANT_ID` (the parent / acted-on tenant,
+        // consumed by ownership-style policies) AND `RESOURCE_ID`
+        // (the target tenant id, consumed by the `InTenantSubtree`
+        // predicate on `tenants.id`). `require_constraints(true)`
+        // turns missing-policy / unsupported-constraint shapes into
+        // `CrossTenantDenied` (HTTP 403, fail-closed) rather than a
+        // silent `allow_all`.
+        let mut request = AccessRequest::new()
             .resource_property(pep_properties::OWNER_TENANT_ID, owner_tenant_id)
-            .require_constraints(false);
+            .require_constraints(true);
+        if let Some(rid) = resource_id {
+            request = request.resource_property(pep_properties::RESOURCE_ID, rid);
+        }
         let scope = self
             .enforcer
             .access_scope_with(ctx, &pep::TENANT, action, resource_id, &request)
@@ -602,11 +621,11 @@ impl<R: TenantRepo> TenantService<R> {
         reason = "saga has six steps inline (PEP -> parent fetch -> tenant_type checker -> insert -> IdP dispatch with three compensation branches -> activate -> event); \
                   the hot variant is the linear happy path, hoisting compensation branches out splits the IdP-failure classification ladder into a method body that loses access to the saga's local state and forces re-clones"
     )]
-    pub async fn create_child(
+    pub async fn create_tenant(
         &self,
         ctx: &SecurityContext,
         input: CreateTenantRequest,
-    ) -> Result<TenantInfo, DomainError> {
+    ) -> Result<Tenant, DomainError> {
         // PEP gate (DESIGN §4.2). For `Tenant.create` the resource
         // owner is the parent tenant; the child id is not yet a
         // committed resource so `resource_id` is `None`.
@@ -689,7 +708,7 @@ impl<R: TenantRepo> TenantService<R> {
         // saga's first DB write so an oversize payload never
         // produces a `provisioning` row.
         check_idp_metadata_size(
-            "create_child.provisioning_metadata",
+            "create_tenant.provisioning_metadata",
             input.provisioning_metadata.as_ref(),
         )?;
 
@@ -968,7 +987,7 @@ impl<R: TenantRepo> TenantService<R> {
         // vendor-side state OR get persisted into
         // `tenant_idp_metadata` past the boundary cap.
         if let Err(size_err) =
-            check_idp_metadata_size("create_child.idp_returned_metadata", idp_metadata.as_ref())
+            check_idp_metadata_size("create_tenant.idp_returned_metadata", idp_metadata.as_ref())
         {
             tracing::warn!(
                 target: "am.tenant.saga",
@@ -1091,9 +1110,9 @@ impl<R: TenantRepo> TenantService<R> {
         // caller-supplied `tenant_type` string verbatim — saga step 3
         // already proved the registry chain is valid (and resolved its
         // schema) so we don't need a registry RTT here.
-        let mut info = self.lower_to_tenant_info(activated).await?;
+        let mut info = self.lower_to_tenant(activated).await?;
         if info.tenant_type.is_none() {
-            // `TenantInfo.tenant_type` is `Option<String>` per the
+            // `Tenant.tenant_type` is `Option<String>` per the
             // tenant-resolver-sdk public shape; lower the typed
             // `GtsSchemaId` back to its wire form.
             info.tenant_type = Some(input.tenant_type.into_string());
@@ -1106,7 +1125,7 @@ impl<R: TenantRepo> TenantService<R> {
 
     /// Saga step 3 inner pipeline: load ancestor chain → build
     /// closure rows → flip the tenant to `Active`. Extracted so the
-    /// caller (`create_child`) can wrap it in a single error-handling
+    /// caller (`create_tenant`) can wrap it in a single error-handling
     /// `match` and drive [`Self::compensate_failed_activation`] on
     /// any failure.
     async fn finalize_provisioning(
@@ -1307,44 +1326,37 @@ impl<R: TenantRepo> TenantService<R> {
     ///   the internal `Provisioning` state.
     // @cpt-begin:cpt-cf-account-management-flow-tenant-hierarchy-management-read-tenant:p1:inst-flow-read-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-tenant-read-scope:p1:inst-dod-read-scope-service
-    pub async fn read_tenant(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<TenantInfo, DomainError> {
-        // PEP gate (DESIGN §4.2). The compiled scope is intentionally
-        // discarded for the repo read: the `tenants` entity is
-        // declared `no_tenant, no_resource, no_owner, no_type` (see
-        // `entity/tenants.rs` doc + `TenantRepo` trait doc), so a
-        // PDP-narrowed permit would compile to `WHERE false` at the
-        // secure-extension layer and turn an authorized read into
-        // `NotFound`. Subtree clamp at the database lands once the
-        // `InTenantSubtree` predicate ships; tracked in
-        // cyberware-rust#1813. Until then this matches
-        // `list_children`'s posture: the PDP gate is the single
-        // enforcement layer; the repo read uses `allow_all` to fetch
-        // the row, and the gate above already authorized the caller.
-        // TODO(cyberware-rust#1813): once `InTenantSubtree` is wired,
-        // forward the compiled scope so a PDP-narrowed permit (e.g.
-        // `tenant_id IN subtree(...)`) clamps the row at the database.
-        let _scope = self
+    pub async fn get_tenant(&self, ctx: &SecurityContext, id: Uuid) -> Result<Tenant, DomainError> {
+        // PEP gate (DESIGN §4.2) + DB-level subtree clamp (cyberware-rust#1813).
+        // The `tenants` entity now declares `resource_col = "id"`, so
+        // the compiled `AccessScope` materialises a subtree-clamp
+        // JOIN against `tenant_closure` at the database — a caller
+        // whose PDP-narrowed scope clamps to a subtree NOT containing
+        // `id` collapses to `NotFound` even though `authorize`
+        // returned a permit. Defence-in-depth: the gate authorizes
+        // the operation, the SQL JOIN clamps the row.
+        let scope = self
             .authorize(ctx, pep::actions::READ, id, Some(id))
             .await?;
-        let tenant = self
-            .repo
-            .find_by_id(&AccessScope::allow_all(), id)
-            .await?
-            .ok_or_else(|| DomainError::NotFound {
-                detail: format!("tenant {id} not found"),
-                resource: id.to_string(),
-            })?;
-        if !tenant.status.is_sdk_visible() {
+        let tenant =
+            self.repo
+                .find_by_id(&scope, id)
+                .await?
+                .ok_or_else(|| DomainError::NotFound {
+                    detail: format!("tenant {id} not found"),
+                    resource: id.to_string(),
+                })?;
+        // `Provisioning` is AM-internal and has no SDK representation.
+        // `Deleted` rows are public tombstones (the `Tenant` projection
+        // carries `deleted_at`), so they are returned as-is —
+        // matching the SDK contract.
+        if matches!(tenant.status, TenantStatus::Provisioning) {
             return Err(DomainError::NotFound {
                 detail: format!("tenant {id} not found"),
                 resource: id.to_string(),
             });
         }
-        self.lower_to_tenant_info(tenant).await
+        self.lower_to_tenant(tenant).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-tenant-read-scope:p1:inst-dod-read-scope-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-read-tenant:p1:inst-flow-read-service
@@ -1369,55 +1381,37 @@ impl<R: TenantRepo> TenantService<R> {
     pub async fn list_children(
         &self,
         ctx: &SecurityContext,
-        query: ListChildrenQuery,
-    ) -> Result<TenantPage<TenantInfo>, DomainError> {
-        // PEP gate (DESIGN §4.2). For `Tenant.list_children` the
-        // resource owner is the parent tenant whose subtree is being
-        // enumerated; `resource_id` is `None` because the call returns
-        // a collection. Authorization is enforced by this service-level
-        // PDP gate: if the caller is not permitted, `authorize` returns
-        // `CrossTenantDenied` before the repo is consulted. The
-        // compiled `AccessScope` is then forwarded to the repo, but
-        // the `tenants` entity is currently `no_*` (see `TenantRepo`
-        // trait doc) so any narrowed scope would zero-row the read —
-        // callers therefore pass and rely on `allow_all` semantics for
-        // the actual SQL filter (`parent_id = …`). Subtree clamp at
-        // the database lands once the `InTenantSubtree` predicate
-        // ships; tracked in cyberware-rust#1813.
-        // TODO(cyberware-rust#1813): once `InTenantSubtree` is wired,
-        // a PDP-narrowed permit will compile into a JOIN on
-        // `tenant_closure` and clamp the row set at the database.
-        // Authorization runs but the compiled scope is intentionally
-        // discarded until `InTenantSubtree` lands (see comment block
-        // above). The repo call below uses `allow_all()` to match the
-        // documented contract; forwarding a constrained scope here
-        // would zero-row the result given the `tenants` entity's
-        // current `no_*` declaration.
-        self.authorize(ctx, pep::actions::LIST_CHILDREN, query.parent_id, None)
+        parent_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<Tenant>, DomainError> {
+        // PEP gate (DESIGN §4.2) + DB-level subtree clamp
+        // (cyberware-rust#1813). Authorization for the parent tenant
+        // runs through `authorize`; the compiled scope is forwarded
+        // verbatim into the parent existence check AND the children
+        // listing so a caller whose subtree does not contain
+        // `parent_id` collapses to `NotFound`, and a caller whose
+        // subtree does contain `parent_id` but excludes some
+        // self-managed children sees the listing clamped to their
+        // own subtree at the database. `resource_id` is `None` for
+        // listings because the call returns a collection.
+        let scope = self
+            .authorize(ctx, pep::actions::LIST_CHILDREN, parent_id, None)
             .await?;
-        // allow_all: structural existence/status precondition per
-        // DESIGN §4.2 line 1370. The PEP gate above already authorized
-        // the caller; this read only resolves "does the parent exist
-        // and is it SDK-visible?" — disclosure of the children list
-        // flows through the children query further down.
         let parent = self
             .repo
-            .find_by_id(&AccessScope::allow_all(), query.parent_id)
+            .find_by_id(&scope, parent_id)
             .await?
             .ok_or_else(|| DomainError::NotFound {
-                detail: format!("tenant {} not found", query.parent_id),
-                resource: query.parent_id.to_string(),
+                detail: format!("tenant {parent_id} not found"),
+                resource: parent_id.to_string(),
             })?;
         if !parent.status.is_sdk_visible() {
             return Err(DomainError::NotFound {
-                detail: format!("tenant {} not found", query.parent_id),
-                resource: query.parent_id.to_string(),
+                detail: format!("tenant {parent_id} not found"),
+                resource: parent_id.to_string(),
             });
         }
-        let mut page = self
-            .repo
-            .list_children(&AccessScope::allow_all(), &query)
-            .await?;
+        let mut page = self.repo.list_children(&scope, parent_id, query).await?;
         // Defense-in-depth: drop any `Provisioning` row that slips
         // through the repo filter before we lower the page to the
         // public shape (where `Provisioning` is unrepresentable).
@@ -1433,64 +1427,67 @@ impl<R: TenantRepo> TenantService<R> {
 
     /// Implements FEATURE `Update Tenant Mutable Fields`.
     ///
-    /// Immutable-field rejection happens at the API-DTO layer (where the
-    /// `OpenAPI` contract lists only `name` + `status` as acceptable);
-    /// defence-in-depth here guards against an internal caller passing a
-    /// patch built from a broader type.
+    /// PATCH carries only the `name` field. Lifecycle transitions
+    /// (`Active` ↔ `Suspended`, soft-delete) go through dedicated
+    /// methods ([`Self::suspend_tenant`], [`Self::unsuspend_tenant`],
+    /// [`Self::delete_tenant`]) so each transition stays idempotent on
+    /// its own surface.
     ///
     /// # Errors
     ///
     /// - [`DomainError::CrossTenantDenied`] when the PDP denies the
     ///   caller access to the target tenant.
-    /// - [`DomainError::Validation`] when the patch is empty, the new name
-    ///   violates the length bounds, or the status transition is not
-    ///   allowed via PATCH (cf. [`TenantUpdate::validate_status_transition`]).
+    /// - [`DomainError::Validation`] when the patch is empty or the new
+    ///   name fails GTS validation.
+    /// - [`DomainError::Conflict`] when the target tenant is in
+    ///   `Deleted` status (read-only during retention).
     /// - [`DomainError::NotFound`] when the target tenant does not exist or
-    ///   is SDK-invisible.
+    ///   is `Provisioning`.
     // @cpt-begin:cpt-cf-account-management-flow-tenant-hierarchy-management-update-tenant:p1:inst-flow-update-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-update-mutable-only:p1:inst-dod-update-mutable-service
-    // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-status-change-non-cascading:p1:inst-dod-status-change-service
     pub async fn update_tenant(
         &self,
         ctx: &SecurityContext,
         id: Uuid,
-        patch: TenantUpdate,
-    ) -> Result<TenantInfo, DomainError> {
+        patch: UpdateTenantRequest,
+    ) -> Result<Tenant, DomainError> {
         if patch.is_empty() {
             return Err(DomainError::Validation {
                 detail: "update patch is empty; at least one field required".into(),
             });
         }
-        // PEP gate (DESIGN §4.2). The compiled scope is intentionally
-        // discarded for both the pre-update read and the mutating
-        // write: the `tenants` entity is `no_tenant, no_resource,
-        // no_owner, no_type`, so a PDP-narrowed permit would compile
-        // to `WHERE false` and turn an authorized update into a
-        // silent `NotFound`. The PDP gate is the single enforcement
-        // layer until `InTenantSubtree` lands
-        // (cyberware-rust#1813); the repo calls below use
-        // `allow_all` to match `list_children` / `read_tenant`.
-        // TODO(cyberware-rust#1813): once `InTenantSubtree` is
-        // wired, forward the compiled scope so a PDP-narrowed permit
-        // clamps the read AND the write at the database.
-        let _scope = self
+        // PEP gate (DESIGN §4.2) + DB-level subtree clamp
+        // (cyberware-rust#1813). The compiled scope flows into the
+        // pre-update load AND the mutating write below; the
+        // secure-extension materialises a `tenants.id IN subtree(...)`
+        // JOIN against `tenant_closure` so a caller scoped to a
+        // subtree that does NOT contain `id` collapses to `NotFound`
+        // on the load (and the write fences inside the SERIALIZABLE
+        // retry catch the same clamp on the UPDATE).
+        let scope = self
             .authorize(ctx, pep::actions::UPDATE, id, Some(id))
             .await?;
         // Load the current row BEFORE any GTS round-trip so an
-        // idempotent same-name PATCH (or a PATCH against a missing /
-        // soft-deleted tenant) reaches the no-op / `NotFound` path
-        // without paying a registry call. A naive ordering that hit
-        // GTS first would turn every registry blip into a `503` for
-        // PATCH requests that would otherwise be 200 no-ops or 404s.
-        let current = self
-            .repo
-            .find_by_id(&AccessScope::allow_all(), id)
-            .await?
-            .ok_or_else(|| DomainError::NotFound {
-                detail: format!("tenant {id} not found"),
-                resource: id.to_string(),
-            })?;
-        if !current.status.is_sdk_visible() {
+        // idempotent same-name PATCH (or a PATCH against a missing
+        // tenant) reaches the no-op / `NotFound` path without paying a
+        // registry call. A naive ordering that hit GTS first would
+        // turn every registry blip into a `503` for PATCH requests
+        // that would otherwise be 200 no-ops or 404s.
+        let current =
+            self.repo
+                .find_by_id(&scope, id)
+                .await?
+                .ok_or_else(|| DomainError::NotFound {
+                    detail: format!("tenant {id} not found"),
+                    resource: id.to_string(),
+                })?;
+        // `Provisioning` is AM-internal — surface as `NotFound` so the
+        // boundary never leaks the internal status. `Deleted` rows are
+        // SDK-visible (tombstone), but read-only — they fall through
+        // to the repo guard which returns `Conflict` (defence-in-depth
+        // against a future caller that mints a patch through an
+        // internal seam).
+        if matches!(current.status, TenantStatus::Provisioning) {
             return Err(DomainError::NotFound {
                 detail: format!("tenant {id} not found"),
                 resource: id.to_string(),
@@ -1500,11 +1497,11 @@ impl<R: TenantRepo> TenantService<R> {
         // so a registry outage / malformed-schema response surfaces
         // only to already-authorized callers acting on a real row —
         // an out-of-scope caller still gets `403 CrossTenantDenied`,
-        // a missing/deleted-row caller still gets `404 NotFound`,
-        // instead of `503` leaking registry health through the error
-        // channel. Mirrors the ordering in `create_child`. Skipped
-        // when the patched name is identical to the current name
-        // (idempotent PATCH — no shape change, no need to validate).
+        // a missing-row caller still gets `404 NotFound`, instead of
+        // `503` leaking registry health through the error channel.
+        // Mirrors the ordering in `create_tenant`. Skipped when the
+        // patched name is identical to the current name (idempotent
+        // PATCH — no shape change, no need to validate).
         if let Some(ref new_name) = patch.name
             && new_name != &current.name
             && let Some(registry) = self.types_registry.as_ref()
@@ -1515,27 +1512,12 @@ impl<R: TenantRepo> TenantService<R> {
             )
             .await?;
         }
-        // Lift the SDK 3-variant patch status into the AM-internal
-        // 4-variant taxonomy for the transition guard. SDK status
-        // cannot represent `Provisioning`, so the transition guard
-        // sees only legal source/target combinations.
-        let new_status_internal: Option<TenantStatus> = patch.status.map(Into::into);
-        if let Some(new_status) = new_status_internal {
-            validate_status_transition(current.status, new_status)?;
-        }
-        let updated = self
-            .repo
-            .update_tenant_mutable(&AccessScope::allow_all(), id, &patch)
-            .await?;
+        let updated = self.repo.update_tenant_mutable(&scope, id, &patch).await?;
 
         // Suppress the lifecycle event log on an idempotent no-op
         // (option A — true HTTP PATCH idempotency). The repo skips the
-        // DB write
-        // when neither `name` nor `status` actually changes, so
-        // `updated.updated_at` stays equal to `current.updated_at`. If
-        // a sibling field changes in a future patch shape, this gate
-        // will need revisiting — keep the cheap `updated_at`-equality
-        // signal for now.
+        // DB write when `name` is unchanged, so `updated.updated_at`
+        // stays equal to `current.updated_at`.
         let was_no_op = updated.updated_at == current.updated_at;
         if !was_no_op {
             // TODO(events): emit AM event when platform event-bus lands.
@@ -1549,17 +1531,114 @@ impl<R: TenantRepo> TenantService<R> {
                 event = "updated",
                 name_from = %current.name,
                 name_to = ?patch.name.as_deref(),
-                status_from = current.status.as_str(),
-                status_to = ?new_status_internal.map(TenantStatus::as_str),
                 "am tenant state changed"
             );
         }
 
-        self.lower_to_tenant_info(updated).await
+        self.lower_to_tenant(updated).await
     }
-    // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-status-change-non-cascading:p1:inst-dod-status-change-service
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-update-mutable-only:p1:inst-dod-update-mutable-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-update-tenant:p1:inst-flow-update-service
+
+    /// Transition `id` from `Active` to `Suspended`. Idempotent on
+    /// already-suspended rows.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomainError::CrossTenantDenied`] when the PDP denies the
+    ///   caller access.
+    /// - [`DomainError::NotFound`] when the tenant does not exist or is
+    ///   `Provisioning`.
+    /// - [`DomainError::Conflict`] when the tenant is in `Deleted`
+    ///   status (terminal during retention).
+    // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-status-change-non-cascading:p1:inst-dod-status-change-service-suspend
+    pub async fn suspend_tenant(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<Tenant, DomainError> {
+        self.set_status_internal(ctx, id, TenantStatus::Suspended, "suspended")
+            .await
+    }
+    // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-status-change-non-cascading:p1:inst-dod-status-change-service-suspend
+
+    /// Transition `id` from `Suspended` back to `Active`. Idempotent
+    /// on already-active rows.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::suspend_tenant`].
+    // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-status-change-non-cascading:p1:inst-dod-status-change-service-unsuspend
+    pub async fn unsuspend_tenant(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<Tenant, DomainError> {
+        self.set_status_internal(ctx, id, TenantStatus::Active, "unsuspended")
+            .await
+    }
+    // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-status-change-non-cascading:p1:inst-dod-status-change-service-unsuspend
+
+    /// Shared body for [`Self::suspend_tenant`] /
+    /// [`Self::unsuspend_tenant`]: PEP gate, `Provisioning`/`Deleted`
+    /// rejection, dispatch to `TenantRepo::set_status`, audit log on
+    /// non-no-op transitions.
+    async fn set_status_internal(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+        target: TenantStatus,
+        event_label: &'static str,
+    ) -> Result<Tenant, DomainError> {
+        let scope = self
+            .authorize(ctx, pep::actions::UPDATE, id, Some(id))
+            .await?;
+        let current =
+            self.repo
+                .find_by_id(&scope, id)
+                .await?
+                .ok_or_else(|| DomainError::NotFound {
+                    detail: format!("tenant {id} not found"),
+                    resource: id.to_string(),
+                })?;
+        // `Provisioning` is AM-internal — surface as `NotFound`.
+        // `Deleted` is terminal during retention — surface as
+        // `Conflict` so the caller can distinguish "tenant gone" from
+        // "tenant frozen". The repo layer enforces both again under
+        // SERIALIZABLE retry; the eager checks here keep error
+        // messages crisp and avoid a TX round-trip on the obvious
+        // rejections.
+        if matches!(current.status, TenantStatus::Provisioning) {
+            return Err(DomainError::NotFound {
+                detail: format!("tenant {id} not found"),
+                resource: id.to_string(),
+            });
+        }
+        if matches!(current.status, TenantStatus::Deleted) {
+            return Err(DomainError::Conflict {
+                detail: format!("tenant {id} is deleted; status is terminal during retention"),
+            });
+        }
+        let now = OffsetDateTime::now_utc();
+        let updated = self.repo.set_status(&scope, id, target, now).await?;
+        let was_no_op = updated.updated_at == current.updated_at;
+        if !was_no_op {
+            // TODO(events): emit AM event when platform event-bus lands.
+            tracing::info!(
+                target: "am.events",
+                kind = "tenantStateChanged",
+                actor = "tenant_scoped",
+                subject_id = %ctx.subject_id(),
+                subject_tenant_id = %ctx.subject_tenant_id(),
+                tenant_id = %updated.id,
+                event = event_label,
+                status_from = current.status.as_str(),
+                status_to = target.as_str(),
+                "am tenant state changed"
+            );
+        }
+        self.lower_to_tenant(updated).await
+    }
 
     // -----------------------------------------------------------------
     // Phase 3 — soft delete + hard-delete batch + reaper + integrity
@@ -1567,44 +1646,43 @@ impl<R: TenantRepo> TenantService<R> {
 
     /// Implements FEATURE `Soft-Delete Tenant`.
     ///
+    /// Idempotent: calling on a tenant that is already in `Deleted`
+    /// status short-circuits to the existing tombstone (no preflight,
+    /// no RG probe, no DB write — the retention timer is preserved).
+    ///
     /// # Errors
     ///
     /// - [`DomainError::CrossTenantDenied`] when the PDP denies the
     ///   caller access to the target tenant.
     /// - [`DomainError::RootTenantCannotDelete`] when `tenant_id` is the root tenant.
-    /// - [`DomainError::NotFound`] when the tenant does not exist or is already SDK-invisible.
+    /// - [`DomainError::NotFound`] when the tenant does not exist or is `Provisioning`.
     /// - [`DomainError::TenantHasChildren`] when any child tenant still exists.
     /// - [`DomainError::TenantHasResources`] when the RG ownership probe finds any rows.
     // @cpt-begin:cpt-cf-account-management-flow-tenant-hierarchy-management-soft-delete-tenant:p1:inst-flow-sdel-service
     // @cpt-begin:cpt-cf-account-management-algo-tenant-hierarchy-management-soft-delete-preconditions:p1:inst-algo-sdelpc-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-soft-delete-preconditions:p1:inst-dod-soft-delete-preconditions
     // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-data-lifecycle:p1:inst-dod-data-lifecycle-soft-delete
-    pub async fn soft_delete(
+    pub async fn delete_tenant(
         &self,
         ctx: &SecurityContext,
         tenant_id: Uuid,
-    ) -> Result<TenantInfo, DomainError> {
-        // PEP gate (DESIGN §4.2). The compiled scope is intentionally
-        // discarded for the disclosure read AND the mutating
-        // `schedule_deletion` write: the `tenants` entity is `no_*`,
-        // so a PDP-narrowed permit would compile to `WHERE false` and
-        // turn an authorized soft-delete into a silent `NotFound` /
-        // failed-write. The PDP gate is the single enforcement layer
-        // until `InTenantSubtree` lands (cyberware-rust#1813);
-        // matches `list_children` / `read_tenant` / `update_tenant`.
+    ) -> Result<Tenant, DomainError> {
+        // PEP gate (DESIGN §4.2) + DB-level subtree clamp
+        // (cyberware-rust#1813). The compiled scope flows into the
+        // disclosure read AND the mutating `schedule_deletion` write
+        // so a caller scoped to a subtree that does NOT contain
+        // `tenant_id` collapses to `NotFound` at the database.
         // Structural precondition checks (`count_children`,
-        // `count_ownership_links`) also use `allow_all` — those are
-        // saga-internal guard counts, not data disclosure of the
+        // `count_ownership_links`) stay at `allow_all` — those are
+        // saga-internal guard counts asserting "this row has no
+        // descendants / no resources", not data disclosure of the
         // tenant being acted on.
-        // TODO(cyberware-rust#1813): once `InTenantSubtree` is
-        // wired, forward the compiled scope so a PDP-narrowed permit
-        // clamps both the read and the soft-delete write.
-        let _scope = self
+        let scope = self
             .authorize(ctx, pep::actions::DELETE, tenant_id, Some(tenant_id))
             .await?;
         let tenant = self
             .repo
-            .find_by_id(&AccessScope::allow_all(), tenant_id)
+            .find_by_id(&scope, tenant_id)
             .await?
             .ok_or_else(|| DomainError::NotFound {
                 detail: format!("tenant {tenant_id} not found"),
@@ -1613,11 +1691,35 @@ impl<R: TenantRepo> TenantService<R> {
         if tenant.parent_id.is_none() {
             return Err(DomainError::RootTenantCannotDelete);
         }
-        if !tenant.status.is_sdk_visible() {
+        // `Provisioning` rows are AM-internal — they have no public
+        // representation and are reaped through the provisioning
+        // saga / reaper, not soft-delete. Surface as `NotFound` so the
+        // SDK boundary never observes the internal status.
+        if matches!(tenant.status, TenantStatus::Provisioning) {
             return Err(DomainError::NotFound {
                 detail: format!("tenant {tenant_id} not found"),
                 resource: tenant_id.to_string(),
             });
+        }
+        // Idempotent short-circuit: already in `Deleted`, the row is
+        // a tombstone. Return it without re-running RG probes or
+        // re-stamping `deleted_at` (which would push back the
+        // retention deadline and let a malicious caller indefinitely
+        // delay the hard-delete sweep). The authoritative idempotency
+        // boundary lives inside `TenantRepo::schedule_deletion`'s
+        // SERIALIZABLE TX (it also returns the existing tombstone on
+        // re-entry); this service-level short-circuit is a pure
+        // optimisation to skip the RG ownership probe on the
+        // un-contended retry path. Audit log emission is intentionally
+        // skipped here — idempotent retries are silent, mirroring the
+        // no-op suppression on `update_tenant` / `set_status`. If a
+        // future audit policy requires a "retry observed" signal,
+        // wire it through the `am.events` channel with a distinct
+        // event label (e.g. `event = "soft_delete_retry_noop"`) so
+        // downstream filters can distinguish first-write events from
+        // idempotent retries.
+        if matches!(tenant.status, TenantStatus::Deleted) {
+            return self.lower_to_tenant(tenant).await;
         }
         // 1. Child-rejection guard. `include_deleted = false` excludes
         // ONLY rows in `Deleted` status; `Provisioning`, `Active` and
@@ -1662,7 +1764,7 @@ impl<R: TenantRepo> TenantService<R> {
         };
         let updated = self
             .repo
-            .schedule_deletion(&AccessScope::allow_all(), tenant_id, now, retention)
+            .schedule_deletion(&scope, tenant_id, now, retention)
             .await?;
         // TODO(events): emit AM event when platform event-bus lands.
         tracing::info!(
@@ -1676,7 +1778,7 @@ impl<R: TenantRepo> TenantService<R> {
             retention_secs = self.cfg.retention.default_window_secs,
             "am tenant state changed"
         );
-        self.lower_to_tenant_info(updated).await
+        self.lower_to_tenant(updated).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-data-lifecycle:p1:inst-dod-data-lifecycle-soft-delete
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-soft-delete-preconditions:p1:inst-dod-soft-delete-preconditions

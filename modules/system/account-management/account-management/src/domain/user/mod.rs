@@ -16,7 +16,7 @@
 //!
 //! * [`service`] -- [`service::UserService`] resolves the target tenant
 //!   via [`crate::domain::tenant::TenantRepo`], validates `Active`
-//!   status, and forwards `provision_user` / `deprovision_user` /
+//!   status, and forwards `create_user` / `delete_user` /
 //!   `list_users` to the configured plugin. Maps SDK
 //!   `IdpUserOperationFailure` variants onto [`crate::domain::error::DomainError`]
 //!   through the boundary helper in [`crate::domain::idp`].

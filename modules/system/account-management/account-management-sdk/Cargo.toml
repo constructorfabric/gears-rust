@@ -4,7 +4,7 @@ version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Account Management SDK — public inter-module contracts (canonical-errors re-export, IdP provisioner client trait, tenant CRUD input/output shapes)"
+description = "Account Management SDK — public inter-module contracts (AccountManagementError, IdP provisioner client trait, tenant CRUD input/output shapes)"
 repository.workspace = true
 keywords = ["cyberfabric", "cyberware", "cyberfabric-system"]
 categories = ["web-programming"]
@@ -16,11 +16,13 @@ name = "account_management_sdk"
 workspace = true
 
 [dependencies]
-# AM's public inter-module error surface is the AIP-193 `CanonicalError`
-# from `modkit-canonical-errors`. The SDK re-exports it as
-# `AccountManagementError` for naming continuity with the
-# `resource-group-sdk` / `tenant-resolver-sdk` pattern.
-modkit-canonical-errors = { workspace = true }
+# AM's public inter-module error surface is `AccountManagementError`
+# (see src/error.rs) — a flat thiserror enum mirroring the AIP-193
+# categories. The impl crate maps `DomainError → AccountManagementError`
+# at the trait boundary and lifts further to
+# `modkit_canonical_errors::CanonicalError` at the REST boundary; the
+# SDK itself stays decoupled from the canonical-errors crate.
+thiserror = { workspace = true }
 
 # IdP provisioner contract (trait + DTO) consumed by AM and implemented
 # by deployment-specific IdP plugins. Lives in the SDK so plugin authors
@@ -52,6 +54,23 @@ tenant-resolver-sdk = { workspace = true }
 # cursor (e.g. Zitadel `next_token`).
 modkit-odata = { workspace = true }
 
+# `MetadataEntryQuery` derives `ODataFilterable` to generate the
+# typed `FilterField` enum the impl-crate's repo layer uses with
+# `modkit_db::odata::paginate_odata`. Hard dep (not optional like
+# RG SDK) because `AccountManagementClient::list_metadata` takes
+# `&ODataQuery` — every consumer of the trait needs the filter
+# field shapes.
+modkit-odata-macros = { workspace = true }
+
+# `AccountManagementClient` (this SDK's inter-module trait) takes
+# `&SecurityContext` on the tenant-CRUD methods (PEP-gated by the
+# impl-side `TenantService::authorize` per DESIGN §4.2) and
+# `&AccessScope` on the user-CRUD methods (caller pre-computes the
+# scope until those services land their own PDP gate). Both types
+# come from `modkit-security`. RG SDK already follows this pattern
+# (`ResourceGroupClient` methods accept `&SecurityContext`).
+modkit-security = { workspace = true }
+
 # `modkit-gts::gts_type_schema` powers compile-time validation for
 # the `IdpPluginSpecV1` plugin-discovery type (mirrors
 # `AuthNResolverPluginSpecV1` in `authn-resolver-sdk/src/gts.rs`).
@@ -62,6 +81,15 @@ gts-macros = { workspace = true }
 modkit = { workspace = true }
 modkit-gts = { workspace = true }
 schemars = { workspace = true }
+
+# `time` carries `MetadataEntry::updated_at` in the metadata SDK
+# module. The workspace pin already enables `serde` / `formatting` /
+# `parsing`; we additionally request `serde-well-known` so the field
+# wire-serialises as RFC 3339 (the default `time` serde format is a
+# tuple, which would leak into every public metadata response body).
+# `macros` is requested so unit tests can spell timestamps with
+# `time::macros::datetime!`.
+time = { workspace = true, features = ["serde-well-known", "macros"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

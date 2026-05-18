@@ -16,7 +16,7 @@
 //! * [`HookError::Terminal`] skips the tenant for this tick and emits a
 //!   structured audit record; an operator must intervene. Subsequent
 //!   ticks will retry (the row is still
-//!   `status = Deleted AND deletion_scheduled_at IS NOT NULL`), but the
+//!   `status = Deleted AND deleted_at IS NOT NULL`), but the
 //!   pipeline will not make progress until the hook itself succeeds.
 
 use std::sync::Arc;

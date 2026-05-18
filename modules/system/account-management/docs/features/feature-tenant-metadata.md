@@ -255,7 +255,7 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 
 ### Schema Registration + UUIDv5 Derivation
 
-- [ ] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-schema-registration-and-uuid-derivation`
+- [x] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-schema-registration-and-uuid-derivation`
 
 The system **MUST** accept the full chained `GtsSchemaId` as the `schema_id` path parameter on every REST operation and **MUST** validate that the schema is registered in the GTS types registry before any DB read or write; unregistered schemas **MUST** be refused with `code=metadata_schema_not_registered`. `MetadataService` **MUST** derive `schema_uuid` as a deterministic UUIDv5 from `schema_id` using the shared GTS namespace; the derivation **MUST** be a pure computation so `(tenant_id, schema_uuid)` remains stable across restarts, deployments, and replicas. `dbtable-tenant-metadata` **MUST NOT** retain the public `schema_id`; responses re-hydrate `schema_id` from Types Registry on every read.
 
@@ -276,7 +276,7 @@ The system **MUST** accept the full chained `GtsSchemaId` as the `schema_id` pat
 
 ### CRUD Contract
 
-- [ ] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-crud-contract`
+- [x] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-crud-contract`
 
 The system **MUST** support tenant-scoped CRUD on `dbtable-tenant-metadata` keyed by `(tenant_id, schema_uuid)`: `GET` per-schema reads the tenant's own entry; `PUT` upserts after validating the payload body against the registered GTS schema; `DELETE` removes the direct entry without affecting ancestor values; `GET /metadata` lists the tenant's own entries (paginated) and **MUST NOT** walk ancestors. `UNIQUE (tenant_id, schema_uuid)` **MUST** be the authoritative at-most-one-direct-entry-per-pair guard at the DB layer. Payloads that fail GTS schema validation **MUST** be rejected with `code=validation` before any row is written.
 
@@ -295,7 +295,7 @@ The system **MUST** support tenant-scoped CRUD on `dbtable-tenant-metadata` keye
 
 ### Distinct 404 Codes
 
-- [ ] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-distinct-404-codes`
+- [x] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-distinct-404-codes`
 
 The system **MUST** distinguish "unknown metadata schema" from "schema known but no direct entry on this tenant" on the `GET` and `DELETE` per-schema endpoints via two distinct codes — `metadata_schema_not_registered` and `metadata_entry_not_found` — both surfaced as HTTP 404 through the `feature-errors-observability` envelope. The `/resolved` endpoint **MUST NOT** return `metadata_entry_not_found` for empty resolution — empty is a valid terminal state of the walk per DESIGN §3.2.3 — but **MUST** return `metadata_schema_not_registered` when the schema itself is unknown.
 
@@ -311,7 +311,7 @@ The system **MUST** distinguish "unknown metadata schema" from "schema known but
 
 ### Inheritance Resolution Contract
 
-- [ ] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-inheritance-resolution-contract`
+- [x] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-inheritance-resolution-contract`
 
 `MetadataService::resolve` **MUST** apply each schema's `inheritance_policy` trait — resolved from `x-gts-traits` with default `override_only` — as the sole controller of the walk: `override_only` returns the tenant's own entry or empty; `inherit` walks `parent_id` ancestors. The walk **MUST** stop at the nearest self-managed ancestor (barrier-stop per `principle-barrier-as-data`), so a self-managed tenant never inherits metadata from above its barrier. The walk **MUST** skip (traverse through) ancestors whose `status == suspended` and continue to their parents — suspension is a lifecycle state, not a barrier. Empty resolution **MUST** be returned as an empty success response, NOT `metadata_entry_not_found`. There **MUST NOT** be any service-local `inheritance_policy` table, side configuration, or policy override — the trait is authoritative.
 
@@ -330,7 +330,7 @@ The system **MUST** distinguish "unknown metadata schema" from "schema known but
 
 ### Application-Only Enforcement
 
-- [ ] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-application-only-enforcement`
+- [x] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-application-only-enforcement`
 
 Per `adr-metadata-inheritance` (ADR-0002), inheritance semantics **MUST** be enforced exclusively inside `MetadataService::resolve` at read time. `dbtable-tenant-metadata` **MUST** store only directly-written values; the feature **MUST NOT** introduce a DB-level CHECK, trigger, materialized-inheritance column, or reconciliation job that mirrors the walk-up. Any SQL reader bypassing `MetadataService` **MUST** see only directly-written values — consumers that need inherited values **MUST** call the `/resolved` API boundary or the `MetadataService::resolve` entry point. No reconciliation job is needed because inheritance is derived on every read rather than materialized; write amplification is zero for inheritance semantics.
 

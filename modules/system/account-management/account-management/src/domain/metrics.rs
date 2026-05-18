@@ -6,10 +6,26 @@
 //! runtime crate is self-contained and peer SDKs do not expose metric
 //! constants (see `resource-group-sdk`, `tenant-resolver-sdk`).
 //!
-//! Emission helpers ([`emit_metric`], [`emit_gauge_value`],
-//! [`emit_histogram_value`]) are fire-and-forget no-ops in this
-//! storage-floor phase; the observability port is wired in a later PR.
+//! ## Emission pipeline
+//!
+//! Existing call sites emit through the stringly-typed helpers
+//! [`emit_metric`], [`emit_gauge_value`], and [`emit_histogram_value`].
+//! When the infra adapter has installed a [`MetricsFacadeBridge`] via
+//! [`install_facade_bridge`] (done in [`crate::module`] init), emissions
+//! are forwarded to OpenTelemetry instruments. Before installation —
+//! and in tests that do not wire the adapter — the helpers are silent
+//! no-ops, preserving the pre-init posture.
+//!
+//! The bridge is a **transitional surface**: typed port traits in
+//! [`crate::domain::ports::metrics`] are the long-term API. Per-subdomain
+//! call-site migration onto the typed ports proceeds family-by-family;
+//! the bridge and the [`emit_*`] helpers are removed in the final
+//! cleanup PR once every call site has moved.
 
+use std::sync::Arc;
+use std::sync::LazyLock;
+
+use arc_swap::ArcSwap;
 use modkit_macros::domain_model;
 
 // @cpt-begin:cpt-cf-account-management-dod-errors-observability-metric-catalog:p1:inst-dod-metric-catalog-constants
@@ -137,19 +153,91 @@ impl MetricKind {
     }
 }
 
-/// Emit a metric sample (fire-and-forget, currently a no-op).
+// ════════════════════════════════════════════════════════════════════
+//  Transitional facade-bridge
+// ════════════════════════════════════════════════════════════════════
+//
+// The bridge plugs the stringly-typed [`emit_metric`] /
+// [`emit_gauge_value`] / [`emit_histogram_value`] helpers into the
+// OpenTelemetry-backed adapter without requiring every call site to
+// migrate at once. The adapter installs an implementation during
+// module init; calls before installation are silent no-ops.
+//
+// Removed in the same PR that retires the last `emit_*` call site.
+
+/// Forwarder used by the [`emit_*`] helpers to reach a real metrics
+/// adapter without the domain layer depending on infra. The infra
+/// adapter implements this trait; [`install_facade_bridge`] installs
+/// the implementation at module-init time.
+pub trait MetricsFacadeBridge: Send + Sync + 'static {
+    /// Forward an [`emit_metric`] call (counter-only today; the helper
+    /// rejects gauge / histogram kinds at the call site).
+    fn emit(&self, family: &'static str, kind: MetricKind, labels: &[(&'static str, &str)]);
+
+    /// Forward an [`emit_gauge_value`] call.
+    fn emit_gauge(&self, family: &'static str, value: i64, labels: &[(&'static str, &str)]);
+
+    /// Forward an [`emit_histogram_value`] call.
+    fn emit_histogram(&self, family: &'static str, value: f64, labels: &[(&'static str, &str)]);
+}
+
+/// `Arc`-wrapped `dyn MetricsFacadeBridge`. Aliased to keep the
+/// `ArcSwap<Option<_>>` parametrisation readable — `arc_swap`'s
+/// `RefCnt` impl requires the inner type to be `Sized`, which a bare
+/// `dyn Trait` is not, so we wrap it in an `Arc` *first* (Sized) and
+/// then wrap that `Option` in `ArcSwap`.
+type BridgeArc = Arc<dyn MetricsFacadeBridge>;
+
+/// Process-wide bridge slot. `ArcSwap` gives lock-free reads on the
+/// emit hot path and lets [`install_facade_bridge`] *replace* the
+/// active bridge — needed when a test harness swaps the global meter
+/// provider between AM module inits (the new adapter's instruments
+/// are bound to the new provider; an unconditionally first-wins
+/// `OnceLock` would freeze emissions on the stale instruments).
+static FACADE_BRIDGE: LazyLock<ArcSwap<Option<BridgeArc>>> =
+    LazyLock::new(|| ArcSwap::from(Arc::new(None)));
+
+/// Install (or replace) the process-wide facade bridge. Called once
+/// during AM module init; idempotent across re-inits — the most
+/// recent installation wins. The bridge stays installed for the
+/// lifetime of the process unless overwritten, matching the
+/// `opentelemetry::global::set_meter_provider` posture which itself
+/// supports overwrite.
 ///
-/// The observability port is wired in a later PR; call sites are stable.
-#[inline]
-#[allow(unused_variables)]
-pub fn emit_metric(family: &'static str, kind: MetricKind, labels: &[(&'static str, &str)]) {}
+/// Returns `true` if this call installed the *first* bridge, `false`
+/// if a prior bridge was replaced. The boolean is informational —
+/// callers can log on the rare "already installed" branch (parallel
+/// module init in test harnesses, meter-provider hot-swap) but should
+/// not treat it as an error.
+pub fn install_facade_bridge(bridge: BridgeArc) -> bool {
+    let prev = FACADE_BRIDGE.swap(Arc::new(Some(bridge)));
+    prev.is_none()
+}
 
-/// Emit a value-carrying gauge sample (fire-and-forget, currently a no-op).
+/// Emit a metric sample (fire-and-forget).
+///
+/// Forwards to the installed [`MetricsFacadeBridge`] when one is
+/// present; otherwise a silent no-op. Counter-only — gauge and
+/// histogram families use [`emit_gauge_value`] / [`emit_histogram_value`].
 #[inline]
-#[allow(unused_variables)]
-pub fn emit_gauge_value(family: &'static str, value: i64, labels: &[(&'static str, &str)]) {}
+pub fn emit_metric(family: &'static str, kind: MetricKind, labels: &[(&'static str, &str)]) {
+    if let Some(bridge) = FACADE_BRIDGE.load().as_ref() {
+        bridge.emit(family, kind, labels);
+    }
+}
 
-/// Emit a value-carrying histogram sample (fire-and-forget, currently a no-op).
+/// Emit a value-carrying gauge sample (fire-and-forget).
 #[inline]
-#[allow(unused_variables)]
-pub fn emit_histogram_value(family: &'static str, value: f64, labels: &[(&'static str, &str)]) {}
+pub fn emit_gauge_value(family: &'static str, value: i64, labels: &[(&'static str, &str)]) {
+    if let Some(bridge) = FACADE_BRIDGE.load().as_ref() {
+        bridge.emit_gauge(family, value, labels);
+    }
+}
+
+/// Emit a value-carrying histogram sample (fire-and-forget).
+#[inline]
+pub fn emit_histogram_value(family: &'static str, value: f64, labels: &[(&'static str, &str)]) {
+    if let Some(bridge) = FACADE_BRIDGE.load().as_ref() {
+        bridge.emit_histogram(family, value, labels);
+    }
+}

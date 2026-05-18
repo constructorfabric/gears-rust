@@ -11,7 +11,7 @@
 //!
 //! ## Probe shape
 //!
-//! `soft_delete` only needs a boolean ("does the child tenant own at
+//! `delete_tenant` only needs a boolean ("does the child tenant own at
 //! least one RG row?") to drive the [`DomainError::TenantHasResources`]
 //! rejection. The implementation issues:
 //!
@@ -100,7 +100,7 @@ impl ResourceOwnershipChecker for RgResourceOwnershipChecker {
         tenant_id: Uuid,
     ) -> Result<u64, DomainError> {
         // `$top=1` — we only need a boolean answer; the actual count is
-        // never read by `soft_delete`, which compares against zero.
+        // never read by `delete_tenant`, which compares against zero.
         let query = ODataQuery::default()
             .with_limit(1)
             .with_filter(Expr::Compare(

@@ -27,15 +27,15 @@ use super::TenantRepoImpl;
 use super::helpers::{RETENTION_CLAIM_TTL, map_scope_err};
 
 /// Apply the leaf-first ORDER BY chain used by `scan_retention_due`:
-/// `(depth DESC, deletion_scheduled_at ASC, id ASC)`.
+/// `(depth DESC, deleted_at ASC, id ASC)`.
 ///
 /// Pinned via this helper (and the snapshot test below) so a future
 /// refactor cannot accidentally re-introduce the starvation regression
-/// where `deletion_scheduled_at ASC` ran first and let an older parent
-/// with surviving Deleted children monopolise the `LIMIT` window.
+/// where `deleted_at ASC` ran first and let an older parent with
+/// surviving Deleted children monopolise the `LIMIT` window.
 fn apply_retention_leaf_first_order<Q: sea_orm::QueryOrder>(q: Q) -> Q {
     q.order_by(tenants::Column::Depth, Order::Desc)
-        .order_by(tenants::Column::DeletionScheduledAt, Order::Asc)
+        .order_by(tenants::Column::DeletedAt, Order::Asc)
         .order_by(tenants::Column::Id, Order::Asc)
 }
 
@@ -48,7 +48,7 @@ pub(super) async fn scan_retention_due(
 ) -> Result<Vec<TenantRetentionRow>, DomainError> {
     // Push the per-row due-check into SQL so the `LIMIT` applies to
     // *due* rows only. The earlier implementation over-fetched
-    // `4 × batch` rows ordered by `scheduled_at ASC` and applied
+    // `4 × batch` rows ordered by `deleted_at ASC` and applied
     // `is_due` in Rust afterwards — but a backlog of older
     // not-yet-due rows (typical case: NULL `retention_window_secs`
     // → default 90 days) could fill the over-fetch window and
@@ -58,19 +58,22 @@ pub(super) async fn scan_retention_due(
     // due-set is exact and starvation is impossible.
     //
     // The effective due predicate is
-    //   `scheduled_at + (retention_window_secs if non-negative else default) seconds <= now`.
-    // The `CASE WHEN >= 0` clamp mirrors the Rust `is_due` fallback
-    // (`Some(secs) if secs >= 0 => secs else default`) byte-for-byte:
-    // NULL and negative `retention_window_secs` both fall through to
-    // `default_secs`, while a meaningful admin-set `0` (immediate
-    // hard-delete on next tick) is preserved. Without the clamp a
-    // negative window would compute `scheduled_at + negative` and
-    // mark the row instantly due — the Rust defense-in-depth check
-    // catches it but emits warn-spam every tick. Both supported
-    // backends express the comparison without engine-specific
-    // INTERVAL arithmetic exposed to Rust. The MySQL backend is
-    // unsupported by AM migrations (see `m0001_initial_schema`) so
-    // it errors here for symmetry with the migration-set rejection.
+    //   `deleted_at + (retention_window_secs if non-negative else default) seconds <= now`.
+    // `deleted_at` doubles as the retention-timer start: it is stamped
+    // by `schedule_deletion` together with the `status = Deleted` flip
+    // and is unique to soft-deleted rows. The `CASE WHEN >= 0` clamp
+    // mirrors the Rust `is_due` fallback (`Some(secs) if secs >= 0 =>
+    // secs else default`) byte-for-byte: NULL and negative
+    // `retention_window_secs` both fall through to `default_secs`,
+    // while a meaningful admin-set `0` (immediate hard-delete on next
+    // tick) is preserved. Without the clamp a negative window would
+    // compute `deleted_at + negative` and mark the row instantly due —
+    // the Rust defense-in-depth check catches it but emits warn-spam
+    // every tick. Both supported backends express the comparison
+    // without engine-specific INTERVAL arithmetic exposed to Rust. The
+    // MySQL backend is unsupported by AM migrations (see
+    // `m0001_initial_schema`) so it errors here for symmetry with the
+    // migration-set rejection.
     let engine = repo.db.db().db_engine();
     // Fail fast on overflow — clamping to `i64::MAX` would silently
     // make rows almost-never due and mask the misconfiguration.
@@ -85,7 +88,7 @@ pub(super) async fn scan_retention_due(
         })?;
     let due_check = match engine {
         "postgres" => Expr::cust_with_values(
-            "deletion_scheduled_at + make_interval(secs => CASE WHEN retention_window_secs >= 0 THEN retention_window_secs ELSE $1 END) <= $2",
+            "deleted_at + make_interval(secs => CASE WHEN retention_window_secs >= 0 THEN retention_window_secs ELSE $1 END) <= $2",
             vec![
                 sea_orm::Value::from(default_secs),
                 sea_orm::Value::from(now),
@@ -98,7 +101,7 @@ pub(super) async fn scan_retention_due(
             // SeaORM uses for the bound `now`. Parens around the
             // `CASE` keep the `/ 86400.0` division scoped to the
             // chosen seconds value, not the comparison.
-            "julianday(deletion_scheduled_at) + (CASE WHEN retention_window_secs >= 0 THEN retention_window_secs ELSE $1 END) / 86400.0 <= julianday($2)",
+            "julianday(deleted_at) + (CASE WHEN retention_window_secs >= 0 THEN retention_window_secs ELSE $1 END) / 86400.0 <= julianday($2)",
             vec![
                 sea_orm::Value::from(default_secs),
                 sea_orm::Value::from(now),
@@ -149,9 +152,10 @@ pub(super) async fn scan_retention_due(
                         .add(tenants::Column::ClaimedAt.lte(stale_cutoff));
                     // `due_check` is also re-asserted in the claim
                     // UPDATE below, so a peer transaction that
-                    // extends `retention_window_secs` or moves
-                    // `deletion_scheduled_at` forward between this
-                    // SELECT and the UPDATE cannot leave the row
+                    // extends `retention_window_secs` (or, in a
+                    // hypothetical un-delete-then-re-delete flow,
+                    // moves `deleted_at` forward) between this SELECT
+                    // and the UPDATE cannot leave the row
                     // claim-eligible against the new (later) due
                     // instant. The clone is cheap (FNV-style byte
                     // duplication of the bound parameters); it
@@ -175,7 +179,7 @@ pub(super) async fn scan_retention_due(
                     // reaper side.
                     let scan_filter = Condition::all()
                         .add(tenants::Column::Status.eq(TenantStatus::Deleted.as_smallint()))
-                        .add(tenants::Column::DeletionScheduledAt.is_not_null())
+                        .add(tenants::Column::DeletedAt.is_not_null())
                         .add(tenants::Column::TerminalFailureAt.is_null())
                         .add(claimable.clone())
                         .add(due_check.clone());
@@ -217,7 +221,7 @@ pub(super) async fn scan_retention_due(
                     let candidate_ids: Vec<Uuid> = candidates
                         .iter()
                         .filter_map(|row| {
-                            let scheduled_at = row.deletion_scheduled_at?;
+                            let deleted_at = row.deleted_at?;
                             let retention = match row.retention_window_secs {
                                 Some(secs) if secs >= 0 => {
                                     Duration::from_secs(u64::try_from(secs).unwrap_or(0))
@@ -226,7 +230,7 @@ pub(super) async fn scan_retention_due(
                             };
                             if crate::domain::tenant::retention::is_due(
                                 now,
-                                scheduled_at,
+                                deleted_at,
                                 retention,
                             ) {
                                 Some(row.id)
@@ -270,11 +274,11 @@ pub(super) async fn scan_retention_due(
                     // the claim UPDATE: the SELECT above ran under
                     // READ COMMITTED, so a peer transaction could
                     // have flipped `status` away from `Deleted` (or
-                    // cleared `deletion_scheduled_at`) between SELECT
-                    // and UPDATE. The `claimable` predicate alone
-                    // fences worker-vs-worker but not row-vs-state-
-                    // change; without these the claim can land on a
-                    // row that no longer satisfies the retention
+                    // cleared `deleted_at` via un-delete) between
+                    // SELECT and UPDATE. The `claimable` predicate
+                    // alone fences worker-vs-worker but not row-vs-
+                    // state-change; without these the claim can land
+                    // on a row that no longer satisfies the retention
                     // predicate, leaving the SELECT-by-marker below
                     // to surface a non-`Deleted` row to the
                     // hard-delete pipeline.
@@ -288,18 +292,20 @@ pub(super) async fn scan_retention_due(
                                     tenants::Column::Status
                                         .eq(TenantStatus::Deleted.as_smallint()),
                                 )
-                                .add(tenants::Column::DeletionScheduledAt.is_not_null())
+                                .add(tenants::Column::DeletedAt.is_not_null())
                                 // Re-assert the full due predicate here —
-                                // not just `Status` / `DeletionScheduledAt` —
-                                // so a concurrent transaction that extends
-                                // `retention_window_secs` or moves
-                                // `deletion_scheduled_at` forward between
-                                // the SELECT and this UPDATE cannot leave
-                                // the row claim-eligible against the new
-                                // (later) due instant. Without this, a
-                                // tenant whose retention window was just
-                                // extended could be hard-deleted on the
-                                // very next reaper tick.
+                                // not just `Status` / `DeletedAt` — so a
+                                // concurrent transaction that extends
+                                // `retention_window_secs` (or, in a
+                                // hypothetical un-delete-then-re-delete
+                                // flow, moves `deleted_at` forward)
+                                // between the SELECT and this UPDATE
+                                // cannot leave the row claim-eligible
+                                // against the new (later) due instant.
+                                // Without this, a tenant whose retention
+                                // window was just extended could be
+                                // hard-deleted on the very next reaper
+                                // tick.
                                 .add(due_check)
                                 // Defense-in-depth re-assert of the
                                 // retention-side terminal-failure
@@ -353,7 +359,7 @@ pub(super) async fn scan_retention_due(
     // the transaction, so every row here is already verified due.
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        let Some(scheduled_at) = r.deletion_scheduled_at else {
+        let Some(deleted_at) = r.deleted_at else {
             continue;
         };
         let retention = match r.retention_window_secs {
@@ -369,13 +375,13 @@ pub(super) async fn scan_retention_due(
                 ),
                 cause: None,
             })?,
-            deletion_scheduled_at: scheduled_at,
+            deleted_at,
             retention_window: retention,
             claimed_by: worker_id,
         });
     }
     // The SQL ordering is already leaf-first
-    // (`depth DESC, scheduled_at ASC, id ASC`); the post-TX re-sort
+    // (`depth DESC, deleted_at ASC, id ASC`); the post-TX re-sort
     // here is defensive against the `is_due` filter changing the
     // surviving subset's order (it wouldn't, since the filter is
     // boolean per-row, but the explicit sort makes the contract
@@ -383,7 +389,7 @@ pub(super) async fn scan_retention_due(
     out.sort_by(|a, b| {
         b.depth
             .cmp(&a.depth)
-            .then_with(|| a.deletion_scheduled_at.cmp(&b.deletion_scheduled_at))
+            .then_with(|| a.deleted_at.cmp(&b.deleted_at))
             .then_with(|| a.id.cmp(&b.id))
     });
     Ok(out)

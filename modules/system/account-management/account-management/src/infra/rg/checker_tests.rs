@@ -238,7 +238,7 @@ async fn rg_checker_returns_one_on_non_empty_page() {
         .count_ownership_links(&SecurityContext::anonymous(), Uuid::from_u128(0xAB))
         .await
         .expect("rg up => count");
-    // Probe is `$top=1`; soft_delete only checks `> 0`, so reporting
+    // Probe is `$top=1`; delete_tenant only checks `> 0`, so reporting
     // `1` is sufficient — no need to drag back the full count.
     assert_eq!(count, 1);
     // Same filter-shape assertion as the empty-page test — a future

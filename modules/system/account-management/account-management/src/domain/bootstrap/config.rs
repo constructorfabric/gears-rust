@@ -77,7 +77,7 @@ pub struct BootstrapConfig {
     /// wrapper at config-load time so downstream consumers do not
     /// re-parse on every saga step. The `tenants.tenant_type_uuid`
     /// foreign-key value is derived from this GTS id at saga time
-    /// via the same V5-UUID algorithm `create_child` uses, so
+    /// via the same V5-UUID algorithm `create_tenant` uses, so
     /// operators only configure the canonical type identifier.
     pub root_tenant_type: gts::GtsSchemaId,
 

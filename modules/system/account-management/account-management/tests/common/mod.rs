@@ -56,6 +56,115 @@ pub fn allow_all() -> AccessScope {
     AccessScope::allow_all()
 }
 
+// ---------------------------------------------------------------------
+// PEP test fixture
+// ---------------------------------------------------------------------
+//
+// The metadata + tenant service surfaces now PEP-gate every call
+// through `PolicyEnforcer::access_scope_with`. Service-level
+// integration tests build an `ActorAuthZResolver` that always
+// permits and emits an `InTenantSubtree` constraint rooted at the
+// `subject_tenant_id` carried on the caller's `SecurityContext`.
+// Mirrors the lib-internal `domain::tenant::test_support::auth::MockAuthZResolver`
+// — duplicated here because `#[cfg(test)]` items in the lib crate
+// are not reachable from the integration-test compilation unit.
+
+use async_trait::async_trait;
+use authz_resolver_sdk::constraints::{Constraint, InTenantSubtreePredicate, Predicate};
+use authz_resolver_sdk::models::{
+    Capability, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+};
+use authz_resolver_sdk::{AuthZResolverClient, AuthZResolverError, PolicyEnforcer};
+use modkit_security::{SecurityContext, pep_properties};
+
+/// Permissive PDP fake that emits a single
+/// [`InTenantSubtree`](modkit_security::ScopeFilter::in_tenant_subtree)
+/// predicate rooted at the caller's `subject.properties["tenant_id"]`.
+/// AM services call `access_scope_with(... require_constraints(true))`
+/// so an empty-constraint response would fail closed; the subtree
+/// clamp keeps every seeded tenant visible because tests act inside
+/// the root they seeded.
+struct PermitWithSubtreeResolver;
+
+#[async_trait]
+impl AuthZResolverClient for PermitWithSubtreeResolver {
+    async fn evaluate(
+        &self,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        let root_str = request
+            .subject
+            .properties
+            .get("tenant_id")
+            .and_then(serde_json::Value::as_str)
+            .expect(
+                "PermitWithSubtreeResolver: ctx is missing subject_tenant_id; \
+                 use `ctx_for(root)` to build the SecurityContext",
+            );
+        let root = Uuid::parse_str(root_str).expect("subject_tenant_id must be a Uuid");
+        // Emit TWO alternative constraints, OR'd together at the
+        // secure-orm boundary. Each constraint carries a single
+        // `InTenantSubtree` predicate keyed on a different property
+        // so the compiled scope clamps every AM entity:
+        //
+        // * `tenant_metadata` (`tenant_col = "tenant_id"`) resolves
+        //   the `OWNER_TENANT_ID` constraint.
+        // * `tenants` (`resource_col = "id"`, `no_owner`) and
+        //   `conversion_requests` (via `conversion_repo_scope`)
+        //   resolve the `RESOURCE_ID` constraint.
+        //
+        // Constraint resolution is fail-closed at the FILTER level:
+        // if a constraint's filter references a column the entity
+        // does not declare, that constraint resolves to `None` and is
+        // dropped. The OR-of-constraints semantics means the other
+        // surviving constraint still clamps the read — exactly what
+        // the production PDP returns when policies emit alternative
+        // access paths.
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![
+                    Constraint {
+                        predicates: vec![Predicate::InTenantSubtree(
+                            InTenantSubtreePredicate::new(pep_properties::OWNER_TENANT_ID, root),
+                        )],
+                    },
+                    Constraint {
+                        predicates: vec![Predicate::InTenantSubtree(
+                            InTenantSubtreePredicate::new(pep_properties::RESOURCE_ID, root),
+                        )],
+                    },
+                ],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// Build a production-shaped [`PolicyEnforcer`] with the
+/// [`Capability::TenantHierarchy`] advertised so the PDP returns the
+/// native `InTenantSubtree` predicate. Used by metadata + tenant
+/// service integration tests.
+#[must_use]
+pub fn mock_enforcer() -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverClient> = Arc::new(PermitWithSubtreeResolver);
+    PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
+}
+
+/// Build a [`SecurityContext`] whose `subject_tenant_id` matches the
+/// supplied `root`. The `mock_enforcer` returns an
+/// `InTenantSubtree(root = subject_tenant_id)` predicate, so every
+/// tenant in `root`'s closure subtree is visible under the compiled
+/// scope.
+#[must_use]
+pub fn ctx_for(root: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0xCAFE))
+        .subject_tenant_id(root)
+        .build()
+        .expect("ctx")
+}
+
 /// Bring-up output: an isolated in-memory `SQLite` DB with the AM
 /// migration set applied, plus the production-shaped
 /// `(provider, repo)` pair wired on top.
@@ -105,7 +214,6 @@ pub async fn insert_tenant(
         created_at: ActiveValue::Set(now),
         updated_at: ActiveValue::Set(now),
         deleted_at: ActiveValue::Set(None),
-        deletion_scheduled_at: ActiveValue::Set(None),
         retention_window_secs: ActiveValue::Set(None),
         claimed_by: ActiveValue::Set(None),
         claimed_at: ActiveValue::Set(None),

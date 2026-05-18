@@ -55,20 +55,49 @@ pub enum DomainError {
     RootTenantCannotConvert,
 
     // ---- NotFound (HTTP 404) ----
-    /// `resource` is the stable resource identifier (typically a UUID
-    /// rendered as a string) that the AIP-193 `NotFound` envelope
-    /// surfaces through `with_resource`. `detail` is the human-readable
-    /// summary; both fields are populated by the construction site
-    /// (where the id is in scope) so the boundary mapping does not have
-    /// to parse it back out of the message.
-    #[error("resource not found: {detail}")]
+    /// Tenant lookup miss. `resource` is the stable tenant identifier
+    /// (typically a UUID rendered as a string) surfaced through the
+    /// AIP-193 `NotFound` envelope's `with_resource`. `detail` is the
+    /// human-readable summary populated at the call site (where the
+    /// id is in scope) so the boundary mapping does not have to parse
+    /// it back out of the message.
+    #[error("tenant not found: {detail}")]
     NotFound { detail: String, resource: String },
+
+    /// `IdP` user lookup miss within a specific tenant scope.
+    /// `resource` is the user id (stable across `IdP` providers per
+    /// the AM identity model). `detail` carries the human-readable
+    /// summary.
+    #[error("user not found: {detail}")]
+    UserNotFound { detail: String, resource: String },
+
+    /// Conversion-request lookup miss. `resource` is the conversion
+    /// request id (UUID-as-string). `detail` is the human-readable
+    /// summary.
+    #[error("conversion request not found: {detail}")]
+    ConversionRequestNotFound { detail: String, resource: String },
 
     #[error("metadata schema not registered: {detail}")]
     MetadataSchemaNotRegistered { detail: String, schema: String },
 
     #[error("metadata entry not found: {detail}")]
     MetadataEntryNotFound { detail: String, entry: String },
+
+    // ---- Aborted / version mismatch (HTTP 409) ----
+    /// `UpsertMetadataRequest::expected_version` did not match the
+    /// stored row's `version`. Lifted to
+    /// [`account_management_sdk::AccountManagementError::MetadataVersionMismatch`]
+    /// at the SDK boundary and to AIP-193 `Aborted` (HTTP 409) at the
+    /// canonical boundary. `entry` is the `(tenant_id, schema_uuid)`
+    /// pair the caller targeted; `current` is the row's actual
+    /// version (so the caller can re-issue with the right
+    /// precondition); `expected` is the value the caller supplied.
+    #[error("metadata version mismatch for {entry}: expected v{expected}, stored v{current}")]
+    MetadataVersionMismatch {
+        entry: String,
+        expected: i64,
+        current: i64,
+    },
 
     // ---- AlreadyExists (HTTP 409) ----
     /// Produced by the storage layer's DB-error classifier when the

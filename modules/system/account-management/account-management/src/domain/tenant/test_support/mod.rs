@@ -14,6 +14,9 @@ pub mod auth;
 pub mod idp;
 pub mod repo;
 
-pub use auth::{constraint_bearing_enforcer, mock_enforcer};
+pub use auth::{
+    constraint_bearing_enforcer, deny_all_enforcer, mock_enforcer, schema_selective_enforcer,
+    schema_unavailable_enforcer,
+};
 pub use idp::{FakeDeprovisionOutcome, FakeIdpProvisioner, FakeOutcome};
 pub use repo::FakeTenantRepo;

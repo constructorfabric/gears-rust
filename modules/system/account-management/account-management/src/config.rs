@@ -349,7 +349,7 @@ pub struct IdpConfig {
     /// When `true`, module init fails closed if no
     /// `IdpPluginClient` is registered in `ClientHub`.
     /// When `false` (default), AM falls back to the no-op
-    /// `NoopIdpProvider`, in which case `create_child` returns
+    /// `NoopIdpProvider`, in which case `create_tenant` returns
     /// [`crate::domain::error::DomainError::UnsupportedOperation`] at
     /// runtime if the saga reaches the `IdP` step. Production
     /// deployments that need `IdP` integration MUST set this to `true`
@@ -363,7 +363,7 @@ pub struct IdpConfig {
 impl AccountManagementConfig {
     /// Upper bound on `hierarchy.depth_threshold` so that the
     /// `algo-depth-threshold-evaluation` `parent.depth + 1` arithmetic
-    /// in `create_child` cannot land on `u32::MAX` and either silently
+    /// in `create_tenant` cannot land on `u32::MAX` and either silently
     /// saturate (via `saturating_add`) or overflow if the
     /// implementation ever switches to checked arithmetic. The 1 M cap
     /// is far past any realistic hierarchy (the design default is 10).

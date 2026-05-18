@@ -50,6 +50,58 @@ pub trait FieldToColumn<F: FilterField> {
 
     /// Map a DTO filter field to a `SeaORM` column
     fn map_field(field: F) -> Self::Column;
+
+    /// Optional per-field value normalisation. Default returns the
+    /// value unchanged. Implementors override this when the wire
+    /// representation of a field differs from its storage
+    /// representation — e.g. an SDK that exposes a lifecycle column
+    /// as a string enum (`"active"` / `"deleted"`) backed by a
+    /// `SMALLINT` column in the database. The framework calls this
+    /// hook inside [`filter_node_to_condition`] AFTER the validated
+    /// `FilterNode` is built and BEFORE the value is bound into the
+    /// `SeaORM` predicate, so the returned [`ODataValue`] becomes
+    /// the effective value the database sees.
+    ///
+    /// `op` is the operator the value is being bound for:
+    /// [`FilterOp::Eq`] / [`FilterOp::Ne`] / [`FilterOp::Gt`] /
+    /// [`FilterOp::Ge`] / [`FilterOp::Lt`] / [`FilterOp::Le`] /
+    /// [`FilterOp::Contains`] / [`FilterOp::StartsWith`] /
+    /// [`FilterOp::EndsWith`] for binary nodes, and
+    /// [`FilterOp::In`] for membership (`$filter=col in (...)`)
+    /// nodes. Implementors that translate wire shape to storage shape
+    /// SHOULD reject operators whose semantics differ between the two
+    /// shapes — typically the ordered comparisons (`Gt`/`Ge`/`Lt`/`Le`)
+    /// on a categorical column whose numeric storage encoding is not a
+    /// meaningful order over the wire string values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable error string when the wire value is
+    /// invalid for this field (typically: enum string outside the
+    /// allowed set) or when `op` is not supported on the translated
+    /// column. The framework wraps the message as
+    /// `ODataError::InvalidFilter`; the call site (e.g.
+    /// [`paginate_odata_try`]) maps that to the module's validation
+    /// category.
+    fn map_value(_field: F, _op: FilterOp, value: &ODataValue) -> Result<ODataValue, String> {
+        Ok(value.clone())
+    }
+
+    /// Whether `field` is admissible in `$orderby` (and therefore as
+    /// a key in cursor-based pagination). Default `true`. Implementors
+    /// override with `false` when the wire shape of the field differs
+    /// from its storage shape — there is no consistent ordering
+    /// between the two shapes (alphabetical strings vs ordinal
+    /// integers), and the cursor encoding path relies on
+    /// `field.kind()` to read tokens back, which would fail to decode
+    /// a storage-encoded value. The framework checks this in
+    /// `paginate_odata_collect` before composing the effective order
+    /// and rejects the `$orderby` clause as
+    /// [`ODataError::InvalidOrderByField`] — keeping the diagnostic
+    /// at the same site as unknown-field rejections.
+    fn is_orderable(_field: F) -> bool {
+        true
+    }
 }
 
 /// Extended trait for `OData` field mapping including cursor extraction.
@@ -150,9 +202,18 @@ where
 {
     match filter {
         FilterNode::Binary { field, op, value } => {
-            // Map DTO field to database column
+            // Map DTO field to database column. The `map_value` hook
+            // runs per-field-instance and per-operator so a mapper can
+            // translate wire-shape values (e.g. enum-as-string
+            // `"deleted"`) into storage-shape values (e.g. SMALLINT
+            // `3`) without the framework having to know about the
+            // enum encoding, AND reject operators whose semantics
+            // differ between the two shapes (typically the ordered
+            // comparisons). Default impl is identity and accepts every
+            // operator, so existing call sites are unaffected.
             let column = M::map_field(*field);
-            build_binary_condition(column, *op, value)
+            let mapped = M::map_value(*field, *op, value)?;
+            build_binary_condition(column, *op, &mapped)
         }
         FilterNode::InList { field, values } => {
             if values.is_empty() {
@@ -162,7 +223,10 @@ where
             let kind = field.kind();
             let sea_values: Vec<sea_orm::Value> = values
                 .iter()
-                .map(|v| odata_value_to_sea_value_for_kind(v, kind))
+                .map(|v| {
+                    let mapped = M::map_value(*field, FilterOp::In, v)?;
+                    odata_value_to_sea_value_for_kind(&mapped, kind)
+                })
                 .collect::<Result<_, _>>()?;
             Ok(Condition::all().add(Expr::col(column).is_in(sea_values)))
         }
@@ -500,6 +564,93 @@ where
     Mapper: Fn(E::Model) -> D,
     C: DBRunner,
 {
+    let (rows, page_info) =
+        paginate_odata_collect::<F, M, E, C>(select, conn, query, tiebreaker, limit_cfg).await?;
+    let items = rows.into_iter().map(model_to_domain).collect();
+    Ok(Page { items, page_info })
+}
+
+/// Sibling of [`paginate_odata`] for callers whose `model -> domain`
+/// mapping is **fallible** — e.g. when a domain enum is reconstructed
+/// from a `SMALLINT` column whose values are pinned by a DDL `CHECK`
+/// constraint but could in theory drift on legacy / manually-repaired
+/// databases. Instead of panicking in the mapper, the error is
+/// propagated through the typed [`PaginateOdataTryError`] wrapper so
+/// the caller decides whether the row-shape drift surfaces as 500
+/// (`Internal`) or some other category.
+///
+/// Existing infallible callers should keep using [`paginate_odata`];
+/// this variant is additive and the two share the internal
+/// pagination machinery (`paginate_odata_collect`) so cursor / filter
+/// / ordering semantics stay identical.
+///
+/// # Errors
+/// * [`PaginateOdataTryError::OData`] — same set of failures
+///   [`paginate_odata`] surfaces (filter / cursor / DB).
+/// * [`PaginateOdataTryError::MapError`] — first mapper failure
+///   short-circuits the page assembly with the caller's domain error
+///   verbatim.
+pub async fn paginate_odata_try<F, M, E, D, Mapper, MapErr, C>(
+    select: SecureSelect<E, Scoped>,
+    conn: &C,
+    query: &modkit_odata::ODataQuery,
+    tiebreaker: (&str, SortDir),
+    limit_cfg: LimitCfg,
+    model_to_domain: Mapper,
+) -> Result<Page<D>, PaginateOdataTryError<MapErr>>
+where
+    F: FilterField,
+    M: ODataFieldMapping<F, Entity = E>,
+    E: EntityTrait,
+    Mapper: Fn(E::Model) -> Result<D, MapErr>,
+    C: DBRunner,
+{
+    let (rows, page_info) =
+        paginate_odata_collect::<F, M, E, C>(select, conn, query, tiebreaker, limit_cfg)
+            .await
+            .map_err(PaginateOdataTryError::OData)?;
+    let items = rows
+        .into_iter()
+        .map(model_to_domain)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PaginateOdataTryError::MapError)?;
+    Ok(Page { items, page_info })
+}
+
+/// Error envelope for [`paginate_odata_try`]. Carries the
+/// caller's `MapErr` verbatim so the AM domain-error mapping
+/// (`DomainError::Internal { diagnostic, cause }`) is preserved
+/// across the helper boundary.
+#[derive(thiserror::Error, Debug)]
+pub enum PaginateOdataTryError<MapErr> {
+    /// `OData` / filter / cursor / DB failure — identical category set to
+    /// what plain [`paginate_odata`] would surface.
+    #[error("OData pagination failed: {0}")]
+    OData(#[from] ODataError),
+    /// Caller's `model -> domain` mapping failed on a row. The first
+    /// failure short-circuits page assembly.
+    #[error("model→domain mapping failed: {0}")]
+    MapError(MapErr),
+}
+
+/// Internal page-collector shared by [`paginate_odata`] and
+/// [`paginate_odata_try`]. Returns the raw `Vec<E::Model>` rows plus
+/// the assembled [`PageInfo`] (cursor tokens + clamped limit) so the
+/// public wrappers can apply either an infallible or a fallible
+/// `model -> domain` projection on top.
+async fn paginate_odata_collect<F, M, E, C>(
+    select: SecureSelect<E, Scoped>,
+    conn: &C,
+    query: &modkit_odata::ODataQuery,
+    tiebreaker: (&str, SortDir),
+    limit_cfg: LimitCfg,
+) -> Result<(Vec<E::Model>, PageInfo), ODataError>
+where
+    F: FilterField,
+    M: ODataFieldMapping<F, Entity = E>,
+    E: EntityTrait,
+    C: DBRunner,
+{
     let limit = clamp_limit(query.limit, limit_cfg);
     let fetch = limit + 1;
 
@@ -512,6 +663,23 @@ where
             .clone()
             .ensure_tiebreaker(tiebreaker.0, tiebreaker.1)
     };
+
+    // Reject `$orderby` keys against fields the mapper has flagged as
+    // non-orderable (typically: filter columns whose wire shape
+    // differs from their storage shape — e.g. a SMALLINT-backed enum
+    // exposed as a string on the API surface). Without this guard the
+    // cursor codec would round-trip through `field.kind()` and either
+    // misinterpret the encoded token or hand `SeaORM` a value with
+    // the wrong SQL type. Tiebreakers go through the same gate so a
+    // caller cannot smuggle a non-orderable column in via
+    // `ensure_tiebreaker`.
+    for order_key in &effective_order.0 {
+        let field = F::from_name(&order_key.field)
+            .ok_or_else(|| ODataError::InvalidOrderByField(order_key.field.clone()))?;
+        if !M::is_orderable(field) {
+            return Err(ODataError::InvalidOrderByField(order_key.field.clone()));
+        }
+    }
 
     // Validate cursor consistency (filter hash only)
     if let Some(cur) = &query.cursor
@@ -617,16 +785,14 @@ where
         None
     };
 
-    let items = rows.into_iter().map(model_to_domain).collect();
-
-    Ok(Page {
-        items,
-        page_info: PageInfo {
+    Ok((
+        rows,
+        PageInfo {
             next_cursor,
             prev_cursor,
             limit,
         },
-    })
+    ))
 }
 
 /// Build a cursor from rows, using either the first or last row

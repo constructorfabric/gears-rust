@@ -1,27 +1,39 @@
-//! Tests for the [`DomainError`] → [`CanonicalError`] boundary mapping.
+//! Tests for the [`DomainError`] → [`AccountManagementError`] boundary mapping.
 //!
 //! Validates the AIP-193 category, HTTP status code, and key context
-//! fields (`resource_type`, `resource_name`, `retry_after_seconds`, `reason`)
-//! produced by `From<DomainError> for CanonicalError`. Renaming any of
-//! these mappings is a public-contract break — the tests below are the
-//! regression line for that contract.
+//! fields (`resource_type`, `resource`, `retry_after_seconds`, `reason`)
+//! produced by `From<DomainError> for AccountManagementError`. Renaming
+//! any of these mappings is a public-contract break — the tests below
+//! are the regression line for the SDK enum shape.
 //!
-//! Boundary mapping lives in [`crate::infra::canonical_mapping`]
-//! (kept out of `domain/` so the DB-aware classification ladder can
-//! reach `sea_orm`/`modkit_db` without violating Dylint
-//! domain-layer rules). The tests still live alongside `domain/error`
-//! because they pin the shape of the public contract.
+//! Boundary mapping lives in [`crate::infra::sdk_error_mapping`] (kept
+//! out of `domain/` so the DB-aware classification ladder can reach
+//! `sea_orm`/`modkit_db` without violating Dylint domain-layer rules).
+//! The tests still live alongside `domain/error` because they pin the
+//! shape of the public contract.
+//!
+//! The companion `infra::sdk_error_mapping_tests` exercise the second
+//! hop (`AccountManagementError → CanonicalError`) and the full
+//! composition end-to-end; this file covers the SDK enum shape that
+//! consumers pattern-match on directly.
 
 use std::time::Duration;
 
-use modkit_canonical_errors::CanonicalError;
+use account_management_sdk::error::AccountManagementError;
 
 use super::DomainError;
 
-/// Convenience: convert a `DomainError` into a `CanonicalError` and
-/// read its `status_code()`.
+/// Convenience: read the test-only `DomainError::http_status()`
+/// helper. Pinned to the canonical AIP-193 table — the production
+/// HTTP status is produced by the canonical envelope in
+/// [`crate::infra::sdk_error_mapping`], not by this helper.
+///
+/// Takes the error by value so call sites can use the short
+/// `status_of(DomainError::Variant{..})` form without sprinkling
+/// `&` at every call.
+#[allow(clippy::needless_pass_by_value)]
 fn status_of(err: DomainError) -> u16 {
-    CanonicalError::from(err).status_code()
+    err.http_status()
 }
 
 // ---------------------------------------------------------------------------
@@ -112,16 +124,16 @@ fn already_exists_maps_to_409() {
 
 #[test]
 fn aborted_maps_to_409_with_reason() {
-    let canonical: CanonicalError = DomainError::Aborted {
+    let ame: AccountManagementError = DomainError::Aborted {
         reason: "SERIALIZATION_CONFLICT".into(),
         detail: "serialization conflict; retry budget exhausted".into(),
     }
     .into();
-    assert_eq!(canonical.status_code(), 409);
-    let CanonicalError::Aborted { ctx, .. } = canonical else {
-        panic!("expected Aborted variant");
-    };
-    assert_eq!(ctx.reason, "SERIALIZATION_CONFLICT");
+    assert!(matches!(
+        ame,
+        AccountManagementError::SerializationConflict { .. }
+    ));
+    assert!(ame.is_retryable());
 }
 
 #[test]
@@ -130,6 +142,29 @@ fn cross_tenant_denied_maps_to_403() {
         status_of(DomainError::CrossTenantDenied { cause: None }),
         403
     );
+}
+
+/// Fail-closed pin: a PDP that returns `decision: true` with empty
+/// constraints under `require_constraints(true)` surfaces as
+/// `ConstraintCompileError::ConstraintsRequiredButAbsent`, which the
+/// `From<EnforcerError>` impl in `error.rs` MUST map to
+/// `CrossTenantDenied` (HTTP 403), never to `Internal` (HTTP 500). A
+/// future refactor that adds a new compile-error variant without
+/// updating the wildcard pattern would also be caught here.
+#[test]
+fn compile_failed_maps_to_cross_tenant_denied_403() {
+    use authz_resolver_sdk::EnforcerError;
+    use authz_resolver_sdk::pep::ConstraintCompileError;
+
+    let err = DomainError::from(EnforcerError::CompileFailed(
+        ConstraintCompileError::ConstraintsRequiredButAbsent,
+    ));
+    assert!(
+        matches!(err, DomainError::CrossTenantDenied { .. }),
+        "CompileFailed must map to CrossTenantDenied (fail-closed), got {err:?}"
+    );
+    assert_eq!(err.http_status(), 403);
+    assert_eq!(err.code(), "cross_tenant_denied");
 }
 
 #[test]
@@ -160,93 +195,57 @@ fn internal_maps_to_500() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn not_found_carries_resource_name_and_type() {
-    let canonical: CanonicalError = DomainError::NotFound {
+fn not_found_carries_resource_id() {
+    let ame: AccountManagementError = DomainError::NotFound {
         detail: "tenant 7 not found".into(),
         resource: "7".into(),
     }
     .into();
-    assert_eq!(canonical.resource_name(), Some("7"));
-    assert_eq!(
-        canonical.resource_type(),
-        Some(account_management_sdk::gts::TENANT_RESOURCE_TYPE)
-    );
+    let AccountManagementError::TenantNotFound { tenant_id, .. } = &ame else {
+        panic!("expected TenantNotFound variant");
+    };
+    assert_eq!(tenant_id, "7");
+    assert!(ame.is_not_found());
 }
 
 #[test]
-fn metadata_schema_not_registered_uses_metadata_resource_type() {
-    let canonical: CanonicalError = DomainError::MetadataSchemaNotRegistered {
+fn metadata_schema_not_registered_carries_schema_id() {
+    let ame: AccountManagementError = DomainError::MetadataSchemaNotRegistered {
         detail: "schema billing.v1 missing".into(),
         schema: "billing.v1".into(),
     }
     .into();
-    assert_eq!(canonical.resource_name(), Some("billing.v1"));
-    assert_eq!(
-        canonical.resource_type(),
-        Some(account_management_sdk::gts::TENANT_METADATA_RESOURCE_TYPE)
-    );
+    let AccountManagementError::MetadataSchemaNotRegistered { schema, .. } = &ame else {
+        panic!("expected MetadataSchemaNotRegistered variant");
+    };
+    assert_eq!(schema, "billing.v1");
+    assert!(ame.is_not_found());
 }
 
-/// Pin the `#[resource_error]` macro literal strings against the SDK
-/// constants — the macro takes a literal at expansion time and cannot
-/// resolve consts, so the only mechanism preventing the impl-side
-/// strings from drifting from the SDK source of truth is this test.
-/// Covers all three resource types (`Tenant`, `TenantMetadata`,
-/// `ConversionRequest`) — a fourth resource added without the
-/// corresponding assertion would also drift undetected.
-#[test]
-fn resource_error_strings_match_sdk_constants() {
-    let tenant_not_found: CanonicalError = DomainError::NotFound {
-        detail: "any".into(),
-        resource: "any".into(),
-    }
-    .into();
-    assert_eq!(
-        tenant_not_found.resource_type(),
-        Some(account_management_sdk::gts::TENANT_RESOURCE_TYPE),
-        "domain::error tenant resource_type drifted from SDK constant"
-    );
-
-    let metadata_not_found: CanonicalError = DomainError::MetadataSchemaNotRegistered {
-        detail: "any".into(),
-        schema: "any".into(),
-    }
-    .into();
-    assert_eq!(
-        metadata_not_found.resource_type(),
-        Some(account_management_sdk::gts::TENANT_METADATA_RESOURCE_TYPE),
-        "domain::error tenant_metadata resource_type drifted from SDK constant"
-    );
-
-    let conversion_already_resolved: CanonicalError = DomainError::AlreadyResolved.into();
-    assert_eq!(
-        conversion_already_resolved.resource_type(),
-        Some(account_management_sdk::gts::CONVERSION_REQUEST_RESOURCE_TYPE),
-        "domain::error conversion_request resource_type drifted from SDK constant"
-    );
-}
+// Drift between `#[resource_error("...")]` macro literals in
+// `crate::infra::sdk_error_mapping` and the SDK `gts::*_RESOURCE_TYPE`
+// constants is now exercised at the canonical-pipeline boundary in
+// `infra::sdk_error_mapping_tests` — every variant routes through one
+// specific resource builder, and those tests assert the resulting
+// `CanonicalError::resource_type()` matches the SDK constant. A new
+// resource added without the corresponding canonical assertion would
+// trip there.
 
 #[test]
 fn service_unavailable_propagates_retry_after_seconds() {
-    let canonical: CanonicalError = DomainError::ServiceUnavailable {
+    let ame: AccountManagementError = DomainError::ServiceUnavailable {
         detail: "idp warming up".into(),
         retry_after: Some(Duration::from_secs(15)),
         cause: None,
     }
     .into();
-    let CanonicalError::ServiceUnavailable { ctx, .. } = canonical else {
-        panic!("expected ServiceUnavailable variant");
-    };
-    assert_eq!(ctx.retry_after_seconds, Some(15));
+    assert_eq!(ame.retry_after_seconds(), Some(15));
 }
 
 #[test]
 fn service_unavailable_without_hint_omits_retry_after() {
-    let canonical: CanonicalError = DomainError::service_unavailable("db down").into();
-    let CanonicalError::ServiceUnavailable { ctx, .. } = canonical else {
-        panic!("expected ServiceUnavailable variant");
-    };
-    assert!(ctx.retry_after_seconds.is_none());
+    let ame: AccountManagementError = DomainError::service_unavailable("db down").into();
+    assert!(ame.retry_after_seconds().is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -255,15 +254,15 @@ fn service_unavailable_without_hint_omits_retry_after() {
 //
 // `code()` / `http_status()` are `#[cfg(test)]`-only convenience methods used
 // by service-layer tests to pin the variant→code/status contract without
-// going through `CanonicalError::from(...)` on every assertion. Production
-// callers MUST go through [`crate::infra::canonical_mapping`]; this impl
-// block lives in the companion test file (per dylint `DE1101`) so the
-// production [`DomainError`] surface stays free of test-only items.
+// going through `AccountManagementError::from(...)` on every assertion.
+// Production callers MUST go through [`crate::infra::sdk_error_mapping`];
+// this impl block lives in the companion test file (per dylint `DE1101`) so
+// the production [`DomainError`] surface stays free of test-only items.
 
 impl DomainError {
     /// AM-specific `snake_case` error tag. Mirrors the variant name in
     /// `snake_case`; the canonical wire code comes from
-    /// [`crate::infra::canonical_mapping`] and may differ (e.g. several
+    /// [`crate::infra::sdk_error_mapping`] and may differ (e.g. several
     /// variants collapse to `failed_precondition` on the wire).
     #[must_use]
     pub(crate) fn code(&self) -> &'static str {
@@ -273,8 +272,11 @@ impl DomainError {
             Self::RootTenantCannotDelete => "root_tenant_cannot_delete",
             Self::RootTenantCannotConvert => "root_tenant_cannot_convert",
             Self::NotFound { .. } => "not_found",
+            Self::UserNotFound { .. } => "user_not_found",
+            Self::ConversionRequestNotFound { .. } => "conversion_request_not_found",
             Self::MetadataSchemaNotRegistered { .. } => "metadata_schema_not_registered",
             Self::MetadataEntryNotFound { .. } => "metadata_entry_not_found",
+            Self::MetadataVersionMismatch { .. } => "metadata_version_mismatch",
             Self::AlreadyExists { .. } => "already_exists",
             Self::Aborted { .. } => "aborted",
             Self::TypeNotAllowed { .. } => "type_not_allowed",
@@ -297,11 +299,11 @@ impl DomainError {
 
     /// HTTP status produced for this error by the canonical-mapping
     /// boundary. Computed locally so tests do not pay the per-call
-    /// `CanonicalError::from(...)` allocation; pinned to the same
-    /// status table the canonical mapping returns.
+    /// `AccountManagementError::from(...)` allocation; pinned to the
+    /// same status table the canonical mapping returns.
     ///
     /// `failed_precondition` variants land on **400** (per AIP-193 +
-    /// the canonical mapping in [`crate::infra::canonical_mapping`]),
+    /// the canonical mapping in [`crate::infra::sdk_error_mapping`]),
     /// not 409 — only `AlreadyExists` and `Aborted` carry 409 here.
     /// The `precondition_variants_map_to_400` /
     /// `already_exists_maps_to_409` tests in this file pin the
@@ -323,9 +325,13 @@ impl DomainError {
             | Self::Conflict { .. }
             | Self::FeatureDisabled { .. } => 400,
             Self::NotFound { .. }
+            | Self::UserNotFound { .. }
+            | Self::ConversionRequestNotFound { .. }
             | Self::MetadataSchemaNotRegistered { .. }
             | Self::MetadataEntryNotFound { .. } => 404,
-            Self::AlreadyExists { .. } | Self::Aborted { .. } => 409,
+            Self::AlreadyExists { .. }
+            | Self::Aborted { .. }
+            | Self::MetadataVersionMismatch { .. } => 409,
             Self::CrossTenantDenied { .. } => 403,
             Self::ServiceUnavailable { .. } | Self::IdpUnavailable { .. } => 503,
             Self::UnsupportedOperation { .. } => 501,

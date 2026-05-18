@@ -3,10 +3,22 @@
 //! Mirrors the conventions established by the sibling [`TenantRepoImpl`]
 //! splits ([`reads`], [`lifecycle`], [`retention`]): every method on the
 //! [`ConversionRepo`] trait is dispatched to a free function in this
-//! module, all DB access goes through `SecureORM` with
-//! [`AccessScope::allow_all`] (until the `InTenantSubtree` predicate
-//! lands), and DB errors are routed through the canonical-mapping
-//! classifier so domain code never sees a raw `DbErr`.
+//! module, all reads / mutations go through `SecureORM` against the
+//! `conversion_requests` entity. The entity declares
+//! `Scopable(tenant_col = "tenant_id", resource_col = "id", no_owner,
+//! no_type)`, so a caller-bound `AccessScope` compiles into a real
+//! DB-level clamp on `tenant_id` (and / or `id` once a future PDP
+//! emits `InTenantSubtree(RESOURCE_ID, …)`); the
+//! [`crate::domain::conversion::service::ConversionService`] builds
+//! the right shape per caller side (`for_tenant(child_id)` for child-
+//! side, `InTenantSubtree(OWNER_TENANT_ID, parent_id, respect_barriers
+//! = false)` for parent-side counterparty / inbound listings, with
+//! barrier penetration because the dual-consent flows must surface
+//! conversions targeting self-managed children whose closure barrier
+//! is `1`). INSERT paths call `scope_unchecked` since Scopable INSERT-
+//! time clamps are not the right model for inserts. DB errors flow
+//! through the canonical-mapping classifier so domain code never sees
+//! a raw `DbErr`.
 //!
 //! Two repo-specific behaviours are pinned here:
 //!
@@ -173,17 +185,14 @@ async fn insert_pending(
     let conn = repo.db.conn()?;
     let insert_res = conversion_requests::Entity::insert(am)
         .secure()
-        // The `conversion_requests` entity is declared
-        // `no_tenant, no_resource` (see entity doc), so a narrowed
-        // scope here would compile to `ScopeError::Denied`. This is
-        // the same posture as `tenants` INSERTs use today
-        // (`scope_unchecked` in `repo_impl::lifecycle::insert_provisioning`).
-        // Authorization for the operation as a whole is enforced
-        // upstream at the PDP gate in the service layer; the
-        // `InTenantSubtree` predicate will plumb subtree clamp into AM
-        // reads, not into INSERTs.
-        // TODO(InTenantSubtree): revisit once the predicate lands so
-        // `rg "TODO(InTenantSubtree)"` lists every bypass in one pass.
+        // INSERT path: `scope_unchecked` per the entity-level contract
+        // (Scopable INSERT-time clamps are not the right model — the
+        // row is being created and cannot yet be filtered against the
+        // caller's scope). Authorization for the operation as a whole
+        // is enforced upstream at the service-layer dual-consent role
+        // check on the caller-supplied `ConversionCaller`. Mirrors the
+        // `tenants` INSERT posture in
+        // `repo_impl::lifecycle::insert_provisioning`.
         .scope_unchecked(scope)
         .map_err(map_scope_err)?
         .exec_with_returning(&conn)
@@ -208,12 +217,11 @@ async fn insert_pending(
             // contract change.
             let existing = conversion_requests::Entity::find()
                 .secure()
-                // Read uses `allow_all` for the same reason the
-                // INSERT bypasses scope: the entity is declared
-                // `no_tenant`/`no_resource`, so a narrowed scope
-                // collapses to `WHERE false` and would silently
-                // mask the conflicting row.
-                // TODO(InTenantSubtree)
+                // Read uses `allow_all` for the same reason the INSERT
+                // uses `scope_unchecked`: the entity is declared
+                // `no_tenant`/`no_resource`, so narrowing has no
+                // resolvable property and would silently mask the
+                // conflicting row.
                 .scope_with(&AccessScope::allow_all())
                 .filter(
                     Condition::all()
@@ -276,22 +284,16 @@ async fn find_pending_for_tenant(
     scope: &AccessScope,
     tenant_id: Uuid,
 ) -> Result<Option<ConversionRequest>, DomainError> {
-    // `conversion_requests` is `Scopable(no_tenant, no_resource,
-    // no_owner, no_type)`: a narrowed scope compiles to `WHERE
-    // false` (silent zero-row read). Honour the trait's
-    // "callers MUST pass allow_all()" contract by passing it
-    // explicitly here, mirroring the apply / list helpers below
-    // that already do the same. The incoming `scope` is reserved
-    // for the `InTenantSubtree` (#1813) plumbing — once scope
-    // columns land on this entity, this branch swaps back to
-    // `scope_with(scope)`. Discarded with `let _ = scope` so the
-    // unused-binding lint stays honest and the future swap site
-    // is grep-discoverable.
-    let _ = scope;
+    // `conversion_requests` declares `tenant_col = "tenant_id"` +
+    // `resource_col = "id"`, so a narrowed scope from the caller
+    // (e.g. `for_tenant(tenant_id)`) compiles to a real DB-level
+    // clamp. The caller is responsible for passing a scope that
+    // covers `tenant_id`; here we forward it verbatim so the repo
+    // does not paper over a mis-routed caller.
     let conn = repo.db.conn()?;
     let row = conversion_requests::Entity::find()
         .secure()
-        .scope_with(&AccessScope::allow_all())
+        .scope_with(scope)
         .filter(
             Condition::all()
                 .add(conversion_requests::Column::TenantId.eq(tenant_id))
@@ -362,8 +364,9 @@ where
             // Re-read with `allow_all` so a narrowed caller scope
             // cannot turn `AlreadyResolved` into a misleading
             // `NotFound`; mirrors the rationale in the
-            // `is_unique_violation` re-read above.
-            // TODO(InTenantSubtree)
+            // `is_unique_violation` re-read above. Permanent posture:
+            // the entity is `no_tenant, no_resource` and the read is
+            // a diagnostic disambiguation on a row we already touched.
             .scope_with(&AccessScope::allow_all())
             .filter(
                 Condition::all()
@@ -375,7 +378,7 @@ where
             .map_err(map_scope_err)?;
         return match existing {
             Some(_) => Err(DomainError::AlreadyResolved),
-            None => Err(DomainError::NotFound {
+            None => Err(DomainError::ConversionRequestNotFound {
                 detail: format!("conversion request {request_id} not found"),
                 resource: request_id.to_string(),
             }),
@@ -391,10 +394,9 @@ where
     // hard-deleted concurrently — operator-action territory).
     let fresh = conversion_requests::Entity::find()
         .secure()
-        // TODO(InTenantSubtree): post-transition re-read uses
-        // `allow_all` so a narrowed caller scope cannot mask a row
-        // we just successfully updated. Mirrors the rationale in the
-        // unique-violation re-read above.
+        // Post-transition re-read uses `allow_all` so a narrowed
+        // caller scope cannot mask a row we just successfully
+        // updated. Same posture as the unique-violation re-read above.
         .scope_with(&AccessScope::allow_all())
         .filter(id_eq_alive(request_id))
         .one(&conn)
@@ -569,7 +571,7 @@ async fn apply_conversion_approval(
                     .await
                     .map_err(map_scope_to_tx)?
                     .ok_or_else(|| {
-                        TxError::Domain(DomainError::NotFound {
+                        TxError::Domain(DomainError::ConversionRequestNotFound {
                             detail: format!("conversion request {} not found", input.request_id),
                             resource: input.request_id.to_string(),
                         })
@@ -639,9 +641,29 @@ async fn apply_conversion_approval(
                 // tenant was hard-deleted between request and approve
                 // — the FK cascade would have wiped the conversion
                 // row too, so we wouldn't have reached this point.
+                //
+                // `allow_all` (not the forwarded `scope`) is load-
+                // bearing here: the forwarded `scope` is the
+                // conversion-row clamp built by
+                // [`ConversionService::conversion_repo_scope`] —
+                // shaped for the `conversion_requests` entity
+                // (`OWNER_TENANT_ID` on `tenant_id`). `tenants`
+                // declares `resource_col = "id"` only, so an
+                // `OWNER_TENANT_ID`-shaped filter does not resolve on
+                // `tenants` and the secure-extension would fail-
+                // closed — silently turning the load into a
+                // `WHERE false` and surfacing `NotFound` on a row that
+                // exists. The service-layer caller-visibility fence on
+                // the parent ([`require_caller_tenant_visible`]) has
+                // already authorized the caller's identity; the
+                // converting child for a parent-side approval may sit
+                // behind the closure barrier and be invisible to a
+                // parent-narrowed `tenants` scope anyway, so the
+                // structural reload uses `allow_all` to mirror the
+                // parent-row reload below.
                 let tenant_row = tenants::Entity::find()
                     .secure()
-                    .scope_with(&scope)
+                    .scope_with(&AccessScope::allow_all())
                     .filter(Condition::all().add(tenants::Column::Id.eq(input.target_tenant_id)))
                     .one(tx)
                     .await
@@ -832,9 +854,11 @@ async fn apply_conversion_approval(
                 // multi-MB heap allocation per retry attempt and
                 // widens the SI conflict surface. Replace with a
                 // closure-bounded query (load only tenants on the
-                // strict path of the converted subtree) once
-                // `InTenantSubtree` (#1813) lands and a closure-walk
-                // helper exists. Until then this is the only
+                // strict path of the converted subtree) once a
+                // closure-walk helper exists — the `tenant_closure`
+                // table is the natural anchor (same machinery
+                // [`ScopeFilter::in_tenant_subtree`](modkit_security::ScopeFilter::in_tenant_subtree)
+                // compiles against). Today this is the only
                 // engine-agnostic shape that keeps the barrier
                 // recompute correct for soft-deleted descendants.
                 //
@@ -1196,7 +1220,7 @@ async fn count_inbound_for_parent(
 /// Shared count helper that applies the same predicate `list_by` uses
 /// (caller-supplied base + optional `status_filter` + soft-delete
 /// exclusion) and returns the row count without pagination. Used by
-/// the service layer to populate `TenantPage.total` correctly when
+/// the service layer to populate `OffsetPage.total` correctly when
 /// `top < total` or `skip > 0`.
 async fn count_by(
     repo: &ConversionRepoImpl,

@@ -5,9 +5,12 @@
 //! `crate::infra::storage::entity::{tenants, tenant_closure}`. Public
 //! input / output DTOs (request bodies, query parameters, response
 //! envelopes) live on [`account_management_sdk`] and reuse
-//! [`account_management_sdk::TenantInfo`] / [`account_management_sdk::TenantStatus`]
-//! (re-exported from `tenant-resolver-sdk`) on the public boundary —
-//! no duplicated tenant DTOs across CF SDKs.
+//! [`account_management_sdk::Tenant`] (AM-owned projection) /
+//! [`account_management_sdk::TenantStatus`] (re-exported from
+//! `tenant-resolver-sdk`) on the public boundary. `TenantStatus` /
+//! `TenantId` keep being shared cross-SDK; the `Tenant` projection
+//! itself is AM-owned because admin tooling needs more than the
+//! resolver's identity shape.
 //!
 //! What stays here:
 //! * [`TenantStatus`] — internal 4-variant lifecycle (includes
@@ -23,8 +26,6 @@ use modkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-use crate::domain::error::DomainError;
 
 /// Full lifecycle status of a tenant.
 ///
@@ -108,15 +109,18 @@ pub struct TenantModel {
     pub depth: u32,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+    /// Soft-delete tombstone. `Some(_)` exactly when `status ==
+    /// TenantStatus::Deleted`; also serves as the retention-timer start
+    /// (hard-delete becomes eligible at `deleted_at + retention_window`).
     pub deleted_at: Option<OffsetDateTime>,
 }
 
-// NOTE: Phase 3 adds two retention columns (`deletion_scheduled_at`,
-// `retention_window_secs`) to the `tenants` entity — see
-// `src/infra/storage/entity/tenants.rs`. The domain layer surfaces them
-// through the [`retention::TenantRetentionRow`] selection row rather than
-// as free-floating `TenantModel` fields, so the happy-path surface used
-// by every existing flow (read / list / update) keeps its Phase-1 shape.
+// NOTE: Phase 3 adds the `retention_window_secs` column to the
+// `tenants` entity — see `src/infra/storage/entity/tenants.rs`. It
+// stays off `TenantModel`: it is an operator-set per-tenant override
+// of the module-default retention window, used by the sweep planner,
+// and is surfaced through the [`retention::TenantRetentionRow`]
+// selection row rather than the happy-path read shape.
 
 /// Validated fields used to create a tenant's initial row (before the
 /// `IdP` provisioning step of the create-tenant saga).
@@ -137,73 +141,6 @@ pub struct NewTenant {
     pub tenant_type_uuid: Uuid,
     pub depth: u32,
 }
-
-/// Reject status transitions that are not supported by the PATCH flow
-/// (DESIGN §3.3 update flow + FEATURE §2 `Update Tenant Mutable Fields`).
-///
-/// Allowed via PATCH:
-/// - `Active → Suspended` and `Suspended → Active` (the cross-flip).
-/// - **Same-to-same** (`Active → Active`, `Suspended → Suspended`) —
-///   admitted as an HTTP-PATCH idempotent no-op. The repo and service
-///   layers detect no-op and skip the DB write so `updated_at` is NOT
-///   bumped (true idempotency: PATCH N times = PATCH once).
-///
-/// Disallowed:
-/// - Any target of `Deleted` (owned by the DELETE flow /
-///   `schedule_deletion`).
-/// - Any target of `Provisioning` (internal lifecycle state).
-/// - Any transition from `Deleted` or `Provisioning` (terminal /
-///   internal — those tenants are not mutable through PATCH; the repo
-///   layer rejects mutation on those rows directly).
-///
-/// # Errors
-///
-/// Returns [`DomainError::Conflict`] when the transition is rejected
-/// by one of the rules above. Matches the
-/// [`crate::domain::tenant::repo::TenantRepo::update_tenant_mutable`]
-/// contract — every failed transition is a state-precondition
-/// conflict, not an input-schema validation error. Both
-/// [`DomainError::Conflict`] and [`DomainError::Validation`] surface
-/// as HTTP 400 through the canonical error mapping in
-/// [`crate::infra::canonical_mapping`] (`failed_precondition` and
-/// `invalid_argument` AIP-193 statuses respectively); the public
-/// SDK contract intentionally keeps both under 400 so clients
-/// distinguish via the canonical reason rather than the HTTP code.
-// @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-status-change-non-cascading:p1:inst-dod-status-transition-guard
-pub fn validate_status_transition(
-    current: TenantStatus,
-    target: TenantStatus,
-) -> Result<(), DomainError> {
-    if matches!(target, TenantStatus::Deleted) {
-        return Err(DomainError::Conflict {
-            detail: "status=deleted must go through DELETE flow".into(),
-        });
-    }
-    if matches!(target, TenantStatus::Provisioning) {
-        return Err(DomainError::Conflict {
-            detail: "status=provisioning is internal; not patchable".into(),
-        });
-    }
-    match (current, target) {
-        (TenantStatus::Active, TenantStatus::Suspended)
-        | (TenantStatus::Suspended, TenantStatus::Active) => Ok(()),
-        // Same-to-same: idempotent no-op per HTTP PATCH semantics. The
-        // repo/service layers detect no-op and skip the DB write so
-        // `updated_at` is unchanged (option A — true idempotency).
-        // The early-returns above catch `target == Deleted` and
-        // `target == Provisioning`, so this arm only reaches
-        // `(Active, Active)` and `(Suspended, Suspended)`.
-        (s, t) if s == t => Ok(()),
-        _ => Err(DomainError::Conflict {
-            detail: format!(
-                "invalid status transition from {current:?} to {target:?}; \
-                 PATCH only accepts the cross-flip Active<->Suspended \
-                 (same-to-same is idempotent)"
-            ),
-        }),
-    }
-}
-// @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-status-change-non-cascading:p1:inst-dod-status-transition-guard
 
 // `validate_tenant_name` was a synchronous, hardcoded `[1, 255]`
 // length check that duplicated the published `gts.cf.core.am.tenant.v1~`
@@ -237,7 +174,7 @@ impl From<account_management_sdk::TenantStatus> for TenantStatus {
 /// SDK representation. Service-layer call sites filter Provisioning
 /// rows via [`TenantStatus::is_sdk_visible`] before lowering, so
 /// reaching this error means the filter was bypassed (programmer
-/// error). The service layer maps it to [`DomainError::Internal`]
+/// error). The service layer maps it to `DomainError::Internal`
 /// so the bypass surfaces as HTTP 500 rather than a process panic.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

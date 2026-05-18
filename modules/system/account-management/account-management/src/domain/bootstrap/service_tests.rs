@@ -168,7 +168,7 @@ impl TypesRegistryClient for StubTypesRegistry {
         //     (`preflight_root_tenant_type`).
         //   * `gts.cf.core.am.tenant.v1~` — `root_name` structural
         //     validation in `insert_root_provisioning` mirroring the
-        //     `create_child` site. Any other id is a wiring regression
+        //     `create_tenant` site. Any other id is a wiring regression
         //     and trips a loud panic, same posture as the previous
         //     single-id assertion.
         match type_id {
@@ -660,7 +660,7 @@ async fn run_rejects_root_name_violating_tenant_v1_schema_via_gts() {
     // (>255 chars per the canned stub schema, mirroring the live
     // bounds) MUST fail saga step 1 with `Validation` BEFORE any
     // `tenants` row is written. Mirror site for
-    // `TenantService::create_child`'s GTS-name gate — without this
+    // `TenantService::create_tenant`'s GTS-name gate — without this
     // fence the only guard for `root_name` would be the DB CHECK
     // constraint, which leaks the bounds duplication the GTS-runtime
     // validation pattern was introduced to eliminate.

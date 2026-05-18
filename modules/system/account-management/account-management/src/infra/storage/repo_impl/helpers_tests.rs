@@ -2,7 +2,7 @@
 // against a real DB (Phase 3 owns cross-backend coverage). These unit
 // tests cover the pure helpers only.
 use super::*;
-use modkit_canonical_errors::CanonicalError;
+use account_management_sdk::error::AccountManagementError;
 use time::OffsetDateTime;
 
 #[test]
@@ -18,7 +18,6 @@ fn entity_to_model_rejects_unknown_status() {
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
         deleted_at: None,
-        deletion_scheduled_at: None,
         retention_window_secs: None,
         claimed_by: None,
         claimed_at: None,
@@ -41,7 +40,6 @@ fn entity_to_model_rejects_negative_depth() {
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
         deleted_at: None,
-        deletion_scheduled_at: None,
         retention_window_secs: None,
         claimed_by: None,
         claimed_at: None,
@@ -82,8 +80,8 @@ fn map_scope_err_preserves_tenant_not_in_scope_routing() {
     };
     let err = map_scope_err(scope_err);
     assert!(matches!(err, DomainError::CrossTenantDenied { .. }));
-    let canonical: CanonicalError = err.into();
-    assert_eq!(canonical.status_code(), 403);
+    let ame: AccountManagementError = err.into();
+    assert!(ame.is_permission_denied());
 }
 
 #[test]

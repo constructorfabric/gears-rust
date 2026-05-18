@@ -25,9 +25,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use account_management_sdk::TenantPage;
+use crate::domain::conversion::page::OffsetPage;
+use authz_resolver_sdk::PolicyEnforcer;
+use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use modkit_macros::domain_model;
-use modkit_security::AccessScope;
+use modkit_security::{
+    AccessScope, InTenantSubtreeScopeFilter, ScopeConstraint, ScopeFilter, SecurityContext,
+    pep_properties,
+};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -141,13 +146,18 @@ impl ConversionCaller {
 /// `self_managed` flag — `Managed` becomes `SelfManaged` and vice
 /// versa, which is the only legal "flip" shape per FEATURE
 /// `managed-self-managed-modes` §2.
+///
+/// The actor UUID recorded on the resulting row is sourced from the
+/// caller's [`SecurityContext::subject_id`] inside the service — see
+/// the cancel / reject / approve methods, which followed the same
+/// migration off explicit `*_by: Uuid` parameters onto the
+/// platform-AuthN-validated `SecurityContext`.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct RequestConversionInput {
     pub tenant_id: Uuid,
     pub caller: ConversionCaller,
     pub target_mode_override: Option<TargetMode>,
-    pub requested_by: Uuid,
 }
 
 /// Three-way status selector consumed by the service-level `list_*`
@@ -207,14 +217,19 @@ impl ConversionStatusSelector {
 /// not surface in code review until the scope filter zero-rowed a
 /// production request.
 ///
-/// `conversion_requests` is `Scopable(no_tenant, no_resource,
-/// no_owner, no_type)` — the entity-level scope filter is a no-op
-/// today (see the `_AM_CONVERSION_REPO_SCOPE_CONTRACT` rationale in
-/// `service.rs`). The wrapped `AccessScope` is forwarded to the
-/// `TenantRepo` lookups + `verify_caller_scope` PDP boundary; the
-/// `ConversionRepo` calls hardcode `AccessScope::allow_all()` until
-/// `InTenantSubtree` (#1813) plumbs scope columns. When that lands,
-/// the wrapped scope flows through to the conversion repo unchanged.
+/// `conversion_requests` is `Scopable(tenant_col = "tenant_id",
+/// resource_col = "id", no_owner, no_type)` — system-driven sweeps
+/// (`expire_pending` / `soft_delete_resolved`) wrap an
+/// [`AccessScope::allow_all`] inner so the reaper / retention paths
+/// see every row regardless of the URL-bound subtree clamp the
+/// caller-facing surface applies. The discriminator is what binds
+/// each call to the right audit envelope; the inner
+/// `AccessScope` is forwarded to the repo's `query_expired` /
+/// `transition_pending_to_expired` / `soft_delete_resolved_older_than`
+/// methods verbatim. Caller-facing seams (`cancel` / `reject` /
+/// `approve` / `list_*`) build their own derived `AccessScope` via
+/// [`conversion_repo_scope`] / [`own_listing_repo_scope`] /
+/// [`parent_inbound_repo_scope`] and do not consume this wrapper.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ConversionScope {
@@ -512,6 +527,53 @@ pub struct ConversionRequestParentProjection {
 }
 // @cpt-end:cpt-cf-account-management-dod-managed-self-managed-modes-parent-side-minimal-surface:p1:inst-dod-parent-side-projection
 
+/// PEP descriptors for the conversion-request resource.
+///
+/// Mirrors the `pep::TENANT` / `pep::USER` / `pep::METADATA`
+/// declarations on sibling services. The resource type name pins
+/// [`account_management_sdk::gts::CONVERSION_REQUEST_RG_TYPE_CODE`];
+/// the impl-side duplication is required because `ResourceType.name`
+/// is a `&'static str` consumed at compile time.
+pub(super) mod pep {
+    use super::{ResourceType, pep_properties};
+
+    /// Resource declaration for `ConversionRequest`. The compiled
+    /// `AccessScope` is consumed by `ConversionService::authorize`
+    /// for the allow/deny PEP gate plus the `InTenantSubtree`
+    /// predicate the tenant-existence guards (caller-owned tenant
+    /// resolve, parent / child Active prechecks) consult.
+    ///
+    /// Supported PEP properties:
+    ///
+    /// * `OWNER_TENANT_ID` — the tenant the request is acted upon
+    ///   from the caller's side (child-tenant id for child-side
+    ///   callers, parent-tenant id for parent-side callers). The
+    ///   service forwards `tenant_id` (the URL-bound scope) here
+    ///   so policies that gate by ownership see the right tenant.
+    /// * `RESOURCE_ID` — set to the same tenant id (matches the
+    ///   `tenants` entity's `resource_col = "id"` declaration so the
+    ///   compiled subtree clamp on `tenants` resolves through this
+    ///   property).
+    pub const CONVERSION: ResourceType = ResourceType {
+        name: "gts.cf.core.am.conversion_request.v1~",
+        supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+    };
+
+    /// Action vocabulary. Each public conversion-service method
+    /// PEP-gates on exactly one action; system-driven sweeps
+    /// (`expire_pending`, `soft_delete_resolved`) do NOT pass
+    /// through the PEP gate because they run under
+    /// [`super::ConversionScope::system_sweep`].
+    pub mod actions {
+        pub const REQUEST: &str = "request";
+        pub const CANCEL: &str = "cancel";
+        pub const REJECT: &str = "reject";
+        pub const APPROVE: &str = "approve";
+        pub const LIST_OWN: &str = "list_own";
+        pub const LIST_INBOUND: &str = "list_inbound";
+    }
+}
+
 /// Central AM domain service for `ConversionRequest` lifecycle.
 ///
 /// Construction mirrors `TenantService::new` — every dependency is
@@ -532,6 +594,12 @@ pub struct ConversionService {
     /// [`ApplyConversionApprovalInput::expected_parent_tenant_type_uuid`]
     /// as TX-side TOCTOU guards.
     tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync>,
+    /// PEP gate. Mirrors `TenantService` / `UserService` / `MetadataService`:
+    /// every caller-facing conversion method PEP-gates via
+    /// [`Self::authorize`] before any state read. The `PolicyEnforcer`
+    /// is owned by-value (it is `Clone`); the module wiring clones it
+    /// from the shared instance used by sibling services.
+    enforcer: PolicyEnforcer,
     now_fn: NowFn,
     approval_ttl: StdDuration,
     resolved_retention: StdDuration,
@@ -540,17 +608,22 @@ pub struct ConversionService {
     retention_batch_size: u32,
 }
 
-// `ConversionRepo` calls hardcode `AccessScope::allow_all` per the
-// entity contract: `conversion_requests` is declared `no_tenant,
-// no_resource, no_owner, no_type`, so a narrowed scope from the
-// caller would compile to `WHERE false` (silently zero-rowing reads
-// and turning mutations into no-ops or `ScopeError::Denied`). The
-// `scope` argument that flows in from REST handlers is reserved for
-// the `TenantRepo` lookups + `verify_caller_scope` PDP boundary —
-// authorization for the conversion-row mutation as a whole is
-// enforced one layer up by the dual-consent role check, not at this
-// storage seam. Mirrors the rationale documented on
-// `crate::domain::tenant::repo::TenantRepo`.
+// `ConversionRepo` mutating calls (`find_by_id` / `transition_pending_to_*`
+// / `apply_conversion_approval`) receive a service-built `AccessScope`
+// derived from the [`ConversionCaller`] via [`conversion_repo_scope`].
+// `conversion_requests` declares `tenant_col = "tenant_id"` and
+// `resource_col = "id"` (post-#1813), so the secure-extension layer
+// materialises the caller-bound clamp at the database (`tenant_id =
+// child_id` for a child-side caller, `tenant_id IN closure(parent_id)`
+// with barrier penetration for a parent-side caller). The incoming
+// `&AccessScope` argument from REST handlers is forwarded to the
+// `TenantRepo` lookups and the `verify_caller_scope` PDP boundary; the
+// conversion-row scope is derived from the URL-bound caller side so
+// the repo's row-level enforcement stays consistent regardless of how
+// the platform PDP currently shapes the caller's tenant scope.
+// INSERT paths continue to call `scope_unchecked` — the Scopable
+// INSERT-time clamp isn't the right model for inserts (the row is
+// being created and cannot yet be filtered).
 
 impl ConversionService {
     /// Default cleanup tick used when `with_cleanup_lifecycle` is not
@@ -577,6 +650,7 @@ impl ConversionService {
         repo: Arc<dyn ConversionRepo>,
         tenant_repo: Arc<dyn TenantRepo>,
         tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync>,
+        enforcer: PolicyEnforcer,
         approval_ttl: StdDuration,
         resolved_retention: StdDuration,
     ) -> Self {
@@ -584,6 +658,7 @@ impl ConversionService {
             repo,
             tenant_repo,
             tenant_type_checker,
+            enforcer,
             now_fn: Arc::new(OffsetDateTime::now_utc),
             approval_ttl,
             resolved_retention,
@@ -591,6 +666,43 @@ impl ConversionService {
             expire_batch_size: Self::DEFAULT_EXPIRE_BATCH_SIZE,
             retention_batch_size: Self::DEFAULT_RETENTION_BATCH_SIZE,
         }
+    }
+
+    /// PEP gate. Calls the platform-side `PolicyEnforcer`, returns the
+    /// [`AccessScope`] caller-visibility fences forward through
+    /// `TenantRepo` lookups.
+    ///
+    /// Mirrors `TenantService::authorize` / `UserService::authorize` /
+    /// `MetadataService::authorize`:
+    ///
+    /// * `OWNER_TENANT_ID = tenant_id` — the URL-bound scope tenant
+    ///   (child tenant for child-side callers, parent tenant for
+    ///   parent-side callers).
+    /// * `RESOURCE_ID = tenant_id` — matches `tenants.id` so the PDP-
+    ///   emitted `InTenantSubtree` predicate clamps the `tenants` reads
+    ///   in the caller-visibility fences to the caller's subtree.
+    /// * `require_constraints(true)` — a PDP returning `decision: true,
+    ///   constraints: []` fails closed via `CompileFailed →
+    ///   CrossTenantDenied` rather than silently widening visibility.
+    ///
+    /// System-driven sweeps (`expire_pending`, `soft_delete_resolved`)
+    /// do NOT call this method — they run under
+    /// [`ConversionScope::system_sweep`].
+    async fn authorize(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        tenant_id: Uuid,
+    ) -> Result<AccessScope, DomainError> {
+        let request = AccessRequest::new()
+            .resource_property(pep_properties::OWNER_TENANT_ID, tenant_id)
+            .resource_property(pep_properties::RESOURCE_ID, tenant_id)
+            .require_constraints(true);
+        let scope = self
+            .enforcer
+            .access_scope_with(ctx, &pep::CONVERSION, action, Some(tenant_id), &request)
+            .await?;
+        Ok(scope)
     }
 
     /// Override the wall-clock function used to compute `expires_at`
@@ -704,29 +816,34 @@ impl ConversionService {
             // `ok_or_else` arm below is defense-in-depth for any
             // future call site that invokes this helper without
             // running the URL-coherence gate first.
-            ConversionSide::Parent => row.parent_id.ok_or_else(|| DomainError::NotFound {
-                detail: format!(
-                    "{op}: resource {} not found or not accessible to the caller",
-                    row.id
-                ),
-                resource: row.id.to_string(),
-            })?,
+            ConversionSide::Parent => {
+                row.parent_id
+                    .ok_or_else(|| DomainError::ConversionRequestNotFound {
+                        detail: format!(
+                            "{op}: resource {} not found or not accessible to the caller",
+                            row.id
+                        ),
+                        resource: row.id.to_string(),
+                    })?
+            }
         };
         let tenant = self
             .tenant_repo
             .find_by_id(scope, target)
             .await?
-            .ok_or_else(|| DomainError::NotFound {
+            .ok_or_else(|| DomainError::ConversionRequestNotFound {
                 detail: format!(
                     "{op}: resource {} not found or not accessible to the caller",
                     row.id
                 ),
                 resource: row.id.to_string(),
             })?;
-        // Soft-deleted tenant: collapse to `NotFound` so a row tied
-        // to a removed tenant cannot be mutated through this seam.
+        // Soft-deleted tenant: collapse to `ConversionRequestNotFound`
+        // so a row tied to a removed tenant cannot be mutated through
+        // this seam — the caller is acting on a conversion request,
+        // not the tenant directly.
         if matches!(tenant.status, TenantStatus::Deleted) {
-            return Err(DomainError::NotFound {
+            return Err(DomainError::ConversionRequestNotFound {
                 detail: format!(
                     "{op}: resource {} not found or not accessible to the caller",
                     row.id
@@ -771,39 +888,26 @@ impl ConversionService {
     // @cpt-begin:cpt-cf-account-management-flow-managed-self-managed-modes-conversion-initiation:p1:inst-flow-conversion-initiation-service
     #[allow(
         clippy::cognitive_complexity,
-        reason = "flat guard sequence (nil-actor precondition -> tenant load -> root-tenant refusal -> non-active reject -> type resolve -> insert_pending) is the security-critical ordering reviewers eyeball-check; extracting helpers would fragment the audit chain and obscure the @cpt-* CPT markers anchored to each step"
+        reason = "flat guard sequence (PEP gate -> tenant load -> root-tenant refusal -> non-active reject -> type resolve -> insert_pending) is the security-critical ordering reviewers eyeball-check; extracting helpers would fragment the audit chain and obscure the @cpt-* CPT markers anchored to each step"
     )]
     pub async fn request_conversion(
         &self,
-        scope: &AccessScope,
+        ctx: &SecurityContext,
         input: RequestConversionInput,
     ) -> Result<ConversionRequest, DomainError> {
-        // Fail closed on `Uuid::nil()` for the actor field — mirrors the
-        // repo-side guard at `apply_conversion_approval` and the
-        // `user::service` precondition pattern. A nil-actor row would
-        // land in `am.events` as a structurally valid audit entry and
-        // silently coalesce downstream aggregations.
-        //
-        // Surfaced as `Conflict` (FailedPrecondition / HTTP 400), not
-        // `Internal`: the caller's REST handler failed to wire a real
-        // actor, the request is non-retryable until the handler is
-        // fixed, and routing through the 500 budget would mask the
-        // bug behind generic "we're broken" alerts. Public detail is
-        // intentionally generic — operator-actionable text lives on
-        // the `am.conversion.audit` warn (see `user::service` H1 fix
-        // for the `PreconditionViolationV1.description`-leak
-        // rationale).
-        if input.requested_by.is_nil() {
-            tracing::warn!(
-                target: "am.conversion.audit",
-                method = "request_conversion",
-                tenant_id = %input.tenant_id,
-                "actor identifier was Uuid::nil(); caller (REST handler) did not wire actor_uuid"
-            );
-            return Err(DomainError::Conflict {
-                detail: "request missing required actor identifier".to_owned(),
-            });
-        }
+        // PEP gate FIRST: compiles the caller's `SecurityContext` into
+        // an `AccessScope` (`InTenantSubtree` predicate rooted at the
+        // caller's subtree). A denied caller surfaces as
+        // `CrossTenantDenied` BEFORE any tenant lookup or row write.
+        // Mirrors the production posture in `TenantService` /
+        // `UserService` / `MetadataService`. The gate is keyed on the
+        // caller's URL-bound tenant id (`caller.scope_id()`), not on
+        // the conversion target — for a parent-side initiation the
+        // parent IS the URL-bound tenant.
+        let scope = self
+            .authorize(ctx, pep::actions::REQUEST, input.caller.scope_id())
+            .await?;
+        let actor = ctx.subject_id();
         // `tenants` is `Scopable(no_tenant, no_resource, no_owner,
         // no_type)`, so the entity-level scope filter is a no-op in
         // production AND would collapse a parent-scoped caller's
@@ -873,7 +977,7 @@ impl ConversionService {
         };
         let caller_owned = self
             .tenant_repo
-            .find_by_id(scope, caller_owned_id)
+            .find_by_id(&scope, caller_owned_id)
             .await?
             .ok_or_else(|| DomainError::NotFound {
                 detail: format!(
@@ -995,7 +1099,7 @@ impl ConversionService {
             child_tenant_name: tenant.name.clone(),
             initiator_side: input.caller.side(),
             target_mode,
-            requested_by: input.requested_by,
+            requested_by: actor,
             requested_at: now,
             expires_at,
         };
@@ -1022,7 +1126,7 @@ impl ConversionService {
             request_id = %inserted.id,
             tenant_id = %inserted.tenant_id,
             caller_side = input.caller.side().as_str(),
-            actor_uuid = %input.requested_by,
+            actor_uuid = %actor,
             target_mode = inserted.target_mode.as_str(),
             outcome = "ok",
             "am conversion requested"
@@ -1053,37 +1157,38 @@ impl ConversionService {
     // @cpt-begin:cpt-cf-account-management-flow-managed-self-managed-modes-conversion-cancellation:p1:inst-flow-conversion-cancellation-service
     pub async fn cancel(
         &self,
-        scope: &AccessScope,
+        ctx: &SecurityContext,
         request_id: Uuid,
         caller: ConversionCaller,
-        cancelled_by: Uuid,
     ) -> Result<ConversionRequest, DomainError> {
-        // Fail closed on `Uuid::nil()` for the actor field — same
-        // rationale and `Conflict` envelope as `request_conversion`.
-        if cancelled_by.is_nil() {
-            tracing::warn!(
-                target: "am.conversion.audit",
-                method = "cancel",
-                request_id = %request_id,
-                "actor identifier was Uuid::nil(); caller (REST handler) did not wire actor_uuid"
-            );
-            return Err(DomainError::Conflict {
-                detail: "request missing required actor identifier".to_owned(),
-            });
-        }
-        // `ConversionRepo` calls below hardcode `AccessScope::allow_all`
-        // because the entity is `no_tenant / no_resource` (the
-        // `conversion_requests` table has no scope columns), so the
-        // repo cannot enforce the caller's `AccessScope` directly.
-        // Visibility is enforced via the
+        // PEP gate FIRST: compile the caller's `SecurityContext` into
+        // an `AccessScope` keyed on the URL-bound caller tenant. A
+        // denied caller surfaces as `CrossTenantDenied` BEFORE any
+        // row lookup or visibility leak through the error channel.
+        let scope = self
+            .authorize(ctx, pep::actions::CANCEL, caller.scope_id())
+            .await?;
+        let cancelled_by = ctx.subject_id();
+        // `ConversionRepo` calls below pass a caller-bound scope built
+        // by [`conversion_repo_scope`]; with the entity declaring
+        // `tenant_col = "tenant_id"` + `resource_col = "id"`, the
+        // secure-extension layer clamps `tenant_id = child_id` (child-
+        // side) or `tenant_id IN closure(parent_id) AND barrier-ignored`
+        // (parent-side counterparty / parent-initiated cancel of a
+        // child that may sit behind the closure barrier). Visibility
+        // on the caller-owned tenant is still verified via
         // `tenant_repo.find_by_id(scope, caller_owned_tenant_id)`
-        // fence below — the same pattern `approve` already uses.
+        // below — the row-level repo clamp is defence-in-depth on top
+        // of that fence and the
+        // `require_caller_scope_or_not_found` URL-coherence check
+        // above.
+        let repo_scope = conversion_repo_scope(caller);
         // @cpt-begin:cpt-cf-account-management-dod-managed-self-managed-modes-dual-consent-actor-discipline:p1:inst-dod-dual-consent-actor-discipline-cancel
         let row = self
             .repo
-            .find_by_id(&AccessScope::allow_all(), request_id)
+            .find_by_id(&repo_scope, request_id)
             .await?
-            .ok_or_else(|| DomainError::NotFound {
+            .ok_or_else(|| DomainError::ConversionRequestNotFound {
                 detail: format!("conversion request {request_id} not found"),
                 resource: request_id.to_string(),
             })?;
@@ -1103,17 +1208,17 @@ impl ConversionService {
         )?;
 
         // Caller-visibility fence: resolve the caller-owned tenant
-        // under the incoming `AccessScope`. Without this, an internal
-        // actor that can mint a matching `ConversionCaller` could
-        // cancel a request on a tenant outside its `AccessScope`
-        // because the repo runs at `allow_all` and the
+        // under the PEP-compiled `AccessScope`. Without this, an
+        // internal actor that can mint a matching `ConversionCaller`
+        // could cancel a request on a tenant outside its
+        // `AccessScope` because the repo runs at `allow_all` and the
         // `require_caller_scope_or_not_found` check above only
         // confirms URL coherence, not the caller's authorization
         // to that tenant. Mirrors the `tenant_repo.find_by_id(scope, ...)`
         // pattern in `approve` and in the listing methods. An
         // out-of-scope / nonexistent tenant collapses to `NotFound`
         // here, before the cancel mutation runs.
-        self.require_caller_tenant_visible(scope, caller, &row, "cancel")
+        self.require_caller_tenant_visible(&scope, caller, &row, "cancel")
             .await?;
 
         // Single guard: state-then-role validation lives in
@@ -1134,12 +1239,7 @@ impl ConversionService {
         let now = self.now();
         let updated = self
             .repo
-            .transition_pending_to_cancelled(
-                &AccessScope::allow_all(),
-                request_id,
-                cancelled_by,
-                now,
-            )
+            .transition_pending_to_cancelled(&repo_scope, request_id, cancelled_by, now)
             .await?;
 
         tracing::info!(
@@ -1180,31 +1280,27 @@ impl ConversionService {
     // @cpt-begin:cpt-cf-account-management-flow-managed-self-managed-modes-conversion-rejection:p1:inst-flow-conversion-rejection-service
     pub async fn reject(
         &self,
-        scope: &AccessScope,
+        ctx: &SecurityContext,
         request_id: Uuid,
         caller: ConversionCaller,
-        rejected_by: Uuid,
     ) -> Result<ConversionRequest, DomainError> {
-        // Fail closed on `Uuid::nil()` for the actor field — same
-        // rationale and `Conflict` envelope as `cancel` /
-        // `request_conversion`.
-        if rejected_by.is_nil() {
-            tracing::warn!(
-                target: "am.conversion.audit",
-                method = "reject",
-                request_id = %request_id,
-                "actor identifier was Uuid::nil(); caller (REST handler) did not wire actor_uuid"
-            );
-            return Err(DomainError::Conflict {
-                detail: "request missing required actor identifier".to_owned(),
-            });
-        }
+        // PEP gate FIRST — see `cancel` for the full rationale.
+        let scope = self
+            .authorize(ctx, pep::actions::REJECT, caller.scope_id())
+            .await?;
+        let rejected_by = ctx.subject_id();
+        // See `cancel` for the rationale on the side-specific
+        // `conversion_repo_scope` shape and the role of the
+        // `require_caller_scope_or_not_found` URL-coherence gate /
+        // `require_caller_tenant_visible` caller-tenant fence as
+        // defence-in-depth above the repo-level clamp.
+        let repo_scope = conversion_repo_scope(caller);
         // @cpt-begin:cpt-cf-account-management-dod-managed-self-managed-modes-dual-consent-actor-discipline:p1:inst-dod-dual-consent-actor-discipline-reject
         let row = self
             .repo
-            .find_by_id(&AccessScope::allow_all(), request_id)
+            .find_by_id(&repo_scope, request_id)
             .await?
-            .ok_or_else(|| DomainError::NotFound {
+            .ok_or_else(|| DomainError::ConversionRequestNotFound {
                 detail: format!("conversion request {request_id} not found"),
                 resource: request_id.to_string(),
             })?;
@@ -1220,11 +1316,11 @@ impl ConversionService {
         )?;
 
         // Caller-visibility fence: resolve the caller-owned tenant
-        // under the incoming `AccessScope`. See `cancel` for the
+        // under the PEP-compiled `AccessScope`. See `cancel` for the
         // full rationale on why this is required alongside
         // `require_caller_scope_or_not_found` when the repo runs at
         // `allow_all`.
-        self.require_caller_tenant_visible(scope, caller, &row, "reject")
+        self.require_caller_tenant_visible(&scope, caller, &row, "reject")
             .await?;
 
         // State-then-role validation: see `cancel` for the full
@@ -1241,7 +1337,7 @@ impl ConversionService {
         let now = self.now();
         let updated = self
             .repo
-            .transition_pending_to_rejected(&AccessScope::allow_all(), request_id, rejected_by, now)
+            .transition_pending_to_rejected(&repo_scope, request_id, rejected_by, now)
             .await?;
 
         tracing::info!(
@@ -1273,18 +1369,18 @@ impl ConversionService {
     // nonexistent / soft-deleted tenant collapses to `NotFound`
     // there, before the conversion repo is touched.
     //
-    // This pattern is correct today because the REST handler binds
-    // `tenant_id` (or `parent_tenant_id`) from the URL path, which
-    // the platform AuthN layer has already verified the caller is
-    // authorized for, AND the storage scope is currently `allow_all`
-    // (entity is `no_tenant / no_resource`). When `InTenantSubtree`
-    // (cyberfabric-core#1813) lands, the `scope` argument forwarded
-    // into `find_by_id` will narrow reads at the DB layer; until
-    // then the in-Rust comparison inside the tenant repo's
-    // `find_by_id` is sufficient. Do NOT restore a
-    // `ConversionCaller` scope check on these paths — it would
-    // duplicate the gate and split the caller-visibility surface
-    // between two layers, which is exactly what
+    // Conversion-repo scope: the listing methods build a derived
+    // `AccessScope` (`own_listing_repo_scope` / `parent_inbound_repo_scope`)
+    // and forward it to the conversion repo so the secure-extension
+    // layer materialises the row-level clamp at the database
+    // (`tenant_id = X` for own listings, `tenant_id IN closure(parent)
+    // AND barrier-ignored` for parent listings). This is defence-in-
+    // depth on top of the `tenant_repo.find_by_id(scope, ...)`
+    // visibility fence and is independent of the caller's incoming
+    // `&AccessScope`, mirroring the mutation-side `conversion_repo_scope`
+    // contract. Do NOT restore a `ConversionCaller` scope check on
+    // these paths — it would duplicate the gate and split the caller-
+    // visibility surface between two layers, which is exactly what
     // `require_caller_scope_or_not_found` exists to prevent on the
     // mutation paths (single source of truth).
     // ----------------------------------------------------------------
@@ -1299,12 +1395,19 @@ impl ConversionService {
     /// * Any error surfaced by `repo.list_own_for_tenant`.
     pub async fn list_own_for_tenant(
         &self,
-        scope: &AccessScope,
+        ctx: &SecurityContext,
         tenant_id: Uuid,
         page_query: &ListConversionsQuery,
-    ) -> Result<TenantPage<ConversionRequest>, DomainError> {
+    ) -> Result<OffsetPage<ConversionRequest>, DomainError> {
+        // PEP gate FIRST: compile the caller's `SecurityContext` into
+        // an `AccessScope` keyed on the URL-bound `tenant_id`. A
+        // denied caller surfaces as `CrossTenantDenied` BEFORE any
+        // tenant lookup or listing.
+        let scope = self
+            .authorize(ctx, pep::actions::LIST_OWN, tenant_id)
+            .await?;
         // Tenant-existence guard mirrors `list_inbound_for_parent`:
-        // resolve `tenant_id` under the caller's `scope` so a
+        // resolve `tenant_id` under the PEP-compiled `scope` so a
         // nonexistent / soft-deleted / out-of-scope tenant collapses
         // to `NotFound` rather than returning a misleading `200 /
         // empty` page. The lookup also serves as the caller-visibility
@@ -1319,7 +1422,7 @@ impl ConversionService {
         // historical conversion rows.
         let tenant = self
             .tenant_repo
-            .find_by_id(scope, tenant_id)
+            .find_by_id(&scope, tenant_id)
             .await?
             .ok_or_else(|| DomainError::NotFound {
                 detail: format!("tenant {tenant_id} not found"),
@@ -1331,10 +1434,21 @@ impl ConversionService {
                 resource: tenant_id.to_string(),
             });
         }
+        // `list_own_for_tenant` is the "tenant lists its own
+        // conversions" surface — the converting tenant lives at the
+        // root of its own subtree and the rows we want are precisely
+        // those whose `tenant_id == tenant_id`. Equality (via
+        // [`own_listing_repo_scope`]) is sharper than a subtree clamp
+        // here: a tenant should NOT see its descendants' conversions
+        // through this listing (those belong to the descendants' own
+        // surface). Defence-in-depth on top of the
+        // `tenant_repo.find_by_id(scope, tenant_id)` visibility fence
+        // above.
+        let repo_scope = own_listing_repo_scope(tenant_id);
         let items = self
             .repo
             .list_own_for_tenant(
-                &AccessScope::allow_all(),
+                &repo_scope,
                 tenant_id,
                 page_query.repo_status_filter(),
                 page_query.pagination(),
@@ -1357,13 +1471,9 @@ impl ConversionService {
         // 40001-retry cycles for a read-only listing.
         let total = self
             .repo
-            .count_own_for_tenant(
-                &AccessScope::allow_all(),
-                tenant_id,
-                page_query.repo_status_filter(),
-            )
+            .count_own_for_tenant(&repo_scope, tenant_id, page_query.repo_status_filter())
             .await?;
-        Ok(TenantPage::new(
+        Ok(OffsetPage::new(
             items,
             page_query.top(),
             page_query.skip(),
@@ -1393,24 +1503,31 @@ impl ConversionService {
     // @cpt-begin:cpt-cf-account-management-flow-managed-self-managed-modes-parent-child-conversions-discovery:p1:inst-flow-parent-side-discovery-service
     pub async fn list_inbound_for_parent(
         &self,
-        scope: &AccessScope,
+        ctx: &SecurityContext,
         parent_id: Uuid,
         page_query: &ListConversionsQuery,
-    ) -> Result<TenantPage<ConversionRequestParentProjection>, DomainError> {
+    ) -> Result<OffsetPage<ConversionRequestParentProjection>, DomainError> {
+        // PEP gate FIRST: compile the caller's `SecurityContext` into
+        // an `AccessScope` keyed on the URL-bound `parent_id`. A
+        // denied caller surfaces as `CrossTenantDenied` BEFORE any
+        // parent lookup or listing.
+        let scope = self
+            .authorize(ctx, pep::actions::LIST_INBOUND, parent_id)
+            .await?;
         // Parent-existence guard: `list_inbound_for_parent` filters
         // `tenant_closure.parent_id = :parent_id` and would silently
         // return an empty page for a nonexistent / soft-deleted /
         // hard-deleted parent. Resolve the parent tenant first so a
         // missing parent surfaces as `NotFound` (matching the REST
         // contract) instead of a misleading `200 / empty` response.
-        // The lookup uses the caller's `scope` so an out-of-scope
+        // The lookup uses the PEP-compiled `scope` so an out-of-scope
         // parent_id collapses to `NotFound` as well. `TenantRepo::find_by_id`
         // returns soft-deleted rows too, so reject `Deleted`
         // explicitly — a soft-deleted parent must not surface
         // historical inbound rows.
         let parent = self
             .tenant_repo
-            .find_by_id(scope, parent_id)
+            .find_by_id(&scope, parent_id)
             .await?
             .ok_or_else(|| DomainError::NotFound {
                 detail: format!("tenant {parent_id} not found"),
@@ -1423,10 +1540,18 @@ impl ConversionService {
             });
         }
 
+        // Parent-side inbound listing surfaces conversions targeting
+        // self-managed children that sit behind the parent's closure
+        // barrier — `parent_inbound_repo_scope` builds a subtree
+        // clamp on `tenant_id` with `respect_barriers = false` so
+        // those rows stay visible while still pinning the listing to
+        // descendants of the URL-bound parent. See the helper's
+        // docstring for the full barrier-penetration rationale.
+        let repo_scope = parent_inbound_repo_scope(parent_id);
         let rows = self
             .repo
             .list_inbound_for_parent(
-                &AccessScope::allow_all(),
+                &repo_scope,
                 parent_id,
                 page_query.repo_status_filter(),
                 page_query.pagination(),
@@ -1437,11 +1562,7 @@ impl ConversionService {
         // and the sibling listing share with `tenant-CRUD::list_children`.
         let total = self
             .repo
-            .count_inbound_for_parent(
-                &AccessScope::allow_all(),
-                parent_id,
-                page_query.repo_status_filter(),
-            )
+            .count_inbound_for_parent(&repo_scope, parent_id, page_query.repo_status_filter())
             .await?;
 
         // Live-name resolution: one batch lookup over the unique
@@ -1542,7 +1663,7 @@ impl ConversionService {
             items.push(project_to_parent_view(&row, child_tenant_name));
         }
 
-        Ok(TenantPage::new(
+        Ok(OffsetPage::new(
             items,
             page_query.top(),
             page_query.skip(),
@@ -1564,8 +1685,6 @@ impl ConversionService {
     /// resolved_at <= cutoff AND deleted_at IS NULL`) and the short-
     /// lived TX; the service simply derives the cutoff from the
     /// configured `now_fn` and forwards the count back to the caller.
-    ///
-    /// # Authorization
     ///
     /// # Authorization
     ///
@@ -1651,17 +1770,28 @@ impl ConversionService {
     )]
     pub async fn approve(
         &self,
-        scope: &AccessScope,
+        ctx: &SecurityContext,
         request_id: Uuid,
         caller: ConversionCaller,
-        approver_uuid: Uuid,
     ) -> Result<ConversionRequest, DomainError> {
+        // PEP gate FIRST — see `cancel` for the full rationale on
+        // why the caller-bound PEP authorization precedes every
+        // other guard.
+        let scope = self
+            .authorize(ctx, pep::actions::APPROVE, caller.scope_id())
+            .await?;
+        let approver_uuid = ctx.subject_id();
+        // See `cancel` for the rationale on the side-specific
+        // `conversion_repo_scope` shape (parent-side: subtree with
+        // `respect_barriers = false`, so a self-managed child's row
+        // stays visible to the parent counterparty).
+        let repo_scope = conversion_repo_scope(caller);
         // @cpt-begin:cpt-cf-account-management-dod-managed-self-managed-modes-dual-consent-actor-discipline:p1:inst-dod-dual-consent-actor-discipline-approve
         let row = self
             .repo
-            .find_by_id(&AccessScope::allow_all(), request_id)
+            .find_by_id(&repo_scope, request_id)
             .await?
-            .ok_or_else(|| DomainError::NotFound {
+            .ok_or_else(|| DomainError::ConversionRequestNotFound {
                 detail: format!("conversion request {request_id} not found"),
                 resource: request_id.to_string(),
             })?;
@@ -1677,27 +1807,6 @@ impl ConversionService {
             request_id,
         )?;
 
-        // Fail closed on `Uuid::nil()` for the actor field — same
-        // rationale and `Conflict` envelope as
-        // `request_conversion` / `cancel` / `reject`. Runs AFTER
-        // `require_caller_scope_or_not_found` so an out-of-scope
-        // caller with a nil actor sees `NotFound` (URL-coherence
-        // gate) rather than `Conflict` (precondition diagnostic).
-        // The repo-side guard in `apply_conversion_approval`
-        // remains as defence-in-depth.
-        if approver_uuid.is_nil() {
-            tracing::warn!(
-                target: "am.conversion.audit",
-                method = "approve",
-                request_id = %request_id,
-                tenant_id = %row.tenant_id,
-                "actor identifier was Uuid::nil(); caller (REST handler) did not wire actor_uuid"
-            );
-            return Err(DomainError::Conflict {
-                detail: "request missing required actor identifier".to_owned(),
-            });
-        }
-
         // State-then-role validation: see `cancel` for the full
         // rationale. Approve is counterparty-only — the matrix lives
         // in `state_machine::validate_transition`, called here so the
@@ -1709,6 +1818,19 @@ impl ConversionService {
             row.initiator_side,
         )?;
 
+        // Caller-visibility fence: resolve the caller-owned tenant
+        // (`row.tenant_id` for child callers, `row.parent_id` for
+        // parent callers) under the incoming `AccessScope`. Mirrors
+        // the symmetric fence in `cancel` / `reject` — an internal
+        // actor that can mint a matching `ConversionCaller` MUST NOT
+        // be able to approve a request whose caller-owned tenant is
+        // outside their `AccessScope`. Runs BEFORE the converting-
+        // tenant load below so an out-of-scope caller collapses to
+        // `NotFound` before the structural tenant lookup leaks
+        // existence.
+        self.require_caller_tenant_visible(&scope, caller, &row, "approve")
+            .await?;
+
         // Tenant precondition runs after the state + role validation
         // so a wrong-actor or already-resolved request fails fast
         // without an extra `find_by_id` round-trip on the tenant.
@@ -1716,61 +1838,27 @@ impl ConversionService {
         // is a cheap fence so the common-case rejection short-circuits
         // before the SERIALIZABLE TX opens.
         //
-        // # Loaded at `allow_all`, not at the caller's `scope`
+        // # Tenant load uses `allow_all`
         //
         // The converting tenant (`row.tenant_id`) is the child. For
-        // parent-side approval (`PATCH /tenants/{parent_id}/child-conversions/{request_id}`),
-        // a self-managed child sits behind the closure barrier and
-        // is invisible to the parent's `InTenantSubtree` scope —
-        // approving a self-managed → managed conversion is exactly
-        // the case where the parent counterparty needs to act on a
-        // tenant they cannot directly see. Use `allow_all` for the
-        // precondition load and rely on `require_caller_scope_or_not_found`
-        // above for the URL-coherence authz check.
-        //
-        // # Asymmetry vs `cancel` / `reject`
-        //
-        // `cancel` and `reject` use `require_caller_tenant_visible`
-        // which resolves the **caller-owned** tenant
-        // (`row.tenant_id` for child callers, `row.parent_id` for
-        // parent callers) under `scope`. `approve` deliberately
-        // does NOT call that helper: the Active precondition for
-        // the mode-flip is on the converting tenant, not on the
-        // approver's own scope. The active check guards the apply
-        // TX from racing a soft-delete; the caller's own visibility
-        // is not relevant here because the URL binding has already
-        // been authz-checked. Per the entity-level scope contract
-        // documented above (`_AM_CONVERSION_REPO_SCOPE_CONTRACT`),
-        // `conversion_requests` is declared no-tenant/no-resource,
-        // so the incoming `scope` is silently widened to
-        // `AccessScope::allow_all()` on every repo read below —
-        // narrowed scopes from callers (e.g. parent-side
-        // `for_tenant(parent)`) are accepted as part of the public
-        // API but have no effect until `InTenantSubtree` (#1813)
-        // adds scope columns. Tests deliberately pass narrowed
-        // scopes to verify this widening posture.
-        //
-        // # FIXME(next-PR / conversion-resource-binding)
-        //
-        // codex review (against pre-amend `6c5c3b53`) flagged this as
-        // a service-layer authz gap: with the current no-tenant /
-        // no-resource declaration, a caller whose `AccessScope` is
-        // `for_tenant(X)` but whose URL-bound `ConversionCaller`
-        // names a different `scope_id` is admitted as long as
-        // `verify_caller_scope` matches `caller.scope_id() ==
-        // row.{tenant_id|parent_id}`. In production this is mitigated
-        // by REST middleware that derives `AccessScope` from the URL
-        // path (so `caller.scope_id() == scope.tenant`), but the
-        // defense-in-depth check is missing here.
-        //
-        // The follow-up PR re-marks `conversion_requests` as a
-        // tenant-scoped resource (Scopable with tenant + resource
-        // columns wired) so the repo-side scope filter starts doing
-        // the second-line enforcement automatically. Until then this
-        // site keeps the `let _ = scope;` posture documented above
-        // and relies on the URL binding + counterparty-only state
-        // machine to fence off cross-scope mutation.
-        let _ = scope;
+        // parent-side approval a self-managed child sits behind the
+        // closure barrier and is invisible to the parent's barrier-
+        // respecting clamp on the `tenants` entity (`tenants` declares
+        // `resource_col = "id"`). Approving a self-managed → managed
+        // conversion is exactly the case where the parent counterparty
+        // needs to act on a tenant they cannot directly see, so the
+        // structural tenant load uses `allow_all`. The authz check on
+        // the conversion row itself is carried by
+        // `require_caller_scope_or_not_found` (URL coherence),
+        // `require_caller_tenant_visible` (caller-owned tenant
+        // visibility), and the `conversion_repo_scope(caller)` clamp
+        // used on `repo.find_by_id` / `apply_conversion_approval` —
+        // for parent-side the conversion clamp uses
+        // `respect_barriers = false`, so the conversion row stays
+        // visible while the converting tenant's own row remains
+        // outside the parent's scope (which is the correct surface
+        // posture: the parent acts on the request, not directly on
+        // the child tenant).
         let tenant = self
             .tenant_repo
             .find_by_id(&AccessScope::allow_all(), row.tenant_id)
@@ -1848,7 +1936,7 @@ impl ConversionService {
         let approved = self
             .repo
             .apply_conversion_approval(
-                &AccessScope::allow_all(),
+                &repo_scope,
                 ApplyConversionApprovalInput {
                     request_id,
                     target_tenant_id: row.tenant_id,
@@ -2024,7 +2112,7 @@ impl ConversionService {
                         "am conversion expire skipped"
                     );
                 }
-                Err(DomainError::NotFound { .. }) => {
+                Err(DomainError::ConversionRequestNotFound { .. }) => {
                     // Row vanished between scan and transition — most
                     // commonly the tenant was hard-deleted (FK cascade)
                     // or a peer retention sweep soft-deleted the row.
@@ -2244,7 +2332,7 @@ fn require_caller_scope_or_not_found(
                 detail = %detail,
                 "scope mismatch normalized to NotFound to avoid existence-leak"
             );
-            Err(DomainError::NotFound {
+            Err(DomainError::ConversionRequestNotFound {
                 detail: format!(
                     "{op}: resource {resource_id} not found or not accessible to the caller"
                 ),
@@ -2253,4 +2341,110 @@ fn require_caller_scope_or_not_found(
         }
         Err(other) => Err(other),
     }
+}
+
+/// Build the [`AccessScope`] the [`ConversionRepo`] runs at for a given
+/// URL-bound [`ConversionCaller`].
+///
+/// `conversion_requests` declares `tenant_col = "tenant_id"` and
+/// `resource_col = "id"`, so the secure-extension layer clamps both
+/// columns at the database. The shape we return is side-specific:
+///
+/// * **Child-side caller**: clamp `tenant_id = child_id`. The URL binds
+///   the converting tenant; a child-side caller acting on any other
+///   tenant's request collapses to a `WHERE false` at the repo and
+///   surfaces as `NotFound` — second-line enforcement on top of the
+///   service-layer `require_caller_scope_or_not_found` URL-coherence
+///   check.
+///
+/// * **Parent-side caller**: clamp `tenant_id IN closure(parent_id)`
+///   with `respect_barriers = false`. A parent acting as counterparty
+///   on a self-managed child whose closure barrier is `1` MUST still
+///   see the conversion row — the dual-consent flows are precisely
+///   where barrier penetration is correct, because the request lives
+///   under the parent's URL authority even though the converting
+///   child is invisible to a barrier-respecting `AccessScope`. The
+///   subtree-clamp narrows the caller to descendants of the URL-bound
+///   parent (which the closure invariants guarantee includes every
+///   conversion-request `tenant_id` whose `parent_id` is that parent);
+///   without `respect_barriers = false` the clamp would silently drop
+///   every conversion targeting a self-managed child.
+///
+/// The returned scope is consumed by every conversion-row touching
+/// repo call in `cancel` / `reject` / `approve`. INSERT paths
+/// (`request_conversion`) and system-driven sweeps (`expire_pending` /
+/// `soft_delete_resolved`) continue to use `scope_unchecked` /
+/// [`AccessScope::allow_all`] respectively per the entity-level
+/// contract documented above.
+///
+/// The function takes no `tenant_repo` and performs no IO — it composes
+/// values from `caller.scope_id()` and the secure-property constants
+/// only, so it stays a pure helper.
+fn conversion_repo_scope(caller: ConversionCaller) -> AccessScope {
+    let root = caller.scope_id();
+    let filter = match caller.side() {
+        ConversionSide::Child => {
+            // Equality on `tenant_id`: the URL binds exactly one
+            // converting tenant, and the row's `tenant_id` MUST match
+            // it. `In` over a one-element set is the canonical shape
+            // for the secure-extension layer (mirrors
+            // `AccessScope::for_tenant`, but kept explicit here so the
+            // companion `Parent` arm reads symmetrically).
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![root])
+        }
+        ConversionSide::Parent => {
+            // `respect_barriers = false` is the load-bearing knob.
+            // Without it, a self-managed child's `tenant_closure`
+            // edge from the parent has `barrier = 1` and would be
+            // filtered out, collapsing the parent's counterparty
+            // action / inbound listing to `NotFound` on exactly the
+            // case the dual-consent flows are designed for.
+            ScopeFilter::InTenantSubtree(InTenantSubtreeScopeFilter::with_respect_barriers(
+                pep_properties::OWNER_TENANT_ID,
+                root,
+                false,
+            ))
+        }
+    };
+    AccessScope::single(ScopeConstraint::new(vec![filter]))
+}
+
+/// Build the [`AccessScope`] the [`ConversionRepo`] runs at for the
+/// own-tenant listing surface
+/// ([`ConversionService::list_own_for_tenant`] /
+/// `ConversionRepo::count_own_for_tenant`).
+///
+/// The converting tenant lists its own conversions, so the repo
+/// clamp is the flat-equality shape `tenant_id = tenant_id` —
+/// mirrors the child-side branch of [`conversion_repo_scope`] but
+/// without a [`ConversionCaller`] discriminator (the listing surface
+/// takes a bare `tenant_id`).
+fn own_listing_repo_scope(tenant_id: Uuid) -> AccessScope {
+    AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+        pep_properties::OWNER_TENANT_ID,
+        vec![tenant_id],
+    )]))
+}
+
+/// Build the [`AccessScope`] the [`ConversionRepo`] runs at for the
+/// parent-side inbound listing surface
+/// ([`ConversionService::list_inbound_for_parent`] /
+/// [`ConversionService::count_inbound_for_parent`]).
+///
+/// Same shape as the parent-side branch of [`conversion_repo_scope`]:
+/// `tenant_id IN closure(parent_id)` with `respect_barriers = false`,
+/// so the listing surfaces conversions targeting self-managed children
+/// (which sit behind the parent's barrier and would otherwise be
+/// filtered out). The doc-comment justification for barrier penetration
+/// is the same as on [`conversion_repo_scope`]; this helper exists as a
+/// separate seam because the listing methods take a bare `parent_id`
+/// without the [`ConversionCaller`] discriminator.
+fn parent_inbound_repo_scope(parent_id: Uuid) -> AccessScope {
+    AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::InTenantSubtree(
+        InTenantSubtreeScopeFilter::with_respect_barriers(
+            pep_properties::OWNER_TENANT_ID,
+            parent_id,
+            false,
+        ),
+    )]))
 }

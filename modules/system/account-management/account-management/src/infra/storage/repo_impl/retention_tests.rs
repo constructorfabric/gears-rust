@@ -27,14 +27,14 @@ fn scan_retention_due_filter_binds_in_expected_order() {
         .add(tenants::Column::ClaimedBy.is_null())
         .add(tenants::Column::ClaimedAt.lte(stale_cutoff));
     let due = Expr::cust_with_values(
-        "deletion_scheduled_at + make_interval(secs => CASE WHEN retention_window_secs >= 0 THEN retention_window_secs ELSE $1 END) <= $2",
+        "deleted_at + make_interval(secs => CASE WHEN retention_window_secs >= 0 THEN retention_window_secs ELSE $1 END) <= $2",
         vec![sea_orm::Value::from(60_i64), sea_orm::Value::from(now)],
     );
     let stmt = tenants::Entity::find()
         .filter(
             Condition::all()
                 .add(tenants::Column::Status.eq(3_i16))
-                .add(tenants::Column::DeletionScheduledAt.is_not_null())
+                .add(tenants::Column::DeletedAt.is_not_null())
                 .add(claimable)
                 .add(due),
         )
@@ -69,10 +69,10 @@ fn scan_retention_due_filter_binds_in_expected_order() {
 
 /// Snapshot test pinning the leaf-first ORDER BY for
 /// `scan_retention_due`. Catches the starvation regression where
-/// `deletion_scheduled_at ASC` ran first and let an older parent
-/// with surviving Deleted children monopolise the LIMIT window
-/// (`hard_delete_one` defers parents-with-children, so the next
-/// tick re-picks the same parent and starves newer due leaves).
+/// `deleted_at ASC` ran first and let an older parent with surviving
+/// Deleted children monopolise the LIMIT window (`hard_delete_one`
+/// defers parents-with-children, so the next tick re-picks the same
+/// parent and starves newer due leaves).
 ///
 /// The test calls the same `apply_retention_leaf_first_order`
 /// helper the impl uses, so a reordering of the helper's
@@ -87,23 +87,23 @@ fn retention_scan_orders_leaf_first() {
         .find("\"depth\" DESC")
         .or_else(|| sql.find("`depth` DESC"))
         .expect("ORDER BY must include `depth DESC`");
-    let scheduled_pos = sql
-        .find("\"deletion_scheduled_at\" ASC")
-        .or_else(|| sql.find("`deletion_scheduled_at` ASC"))
-        .expect("ORDER BY must include `deletion_scheduled_at ASC`");
+    let deleted_pos = sql
+        .find("\"deleted_at\" ASC")
+        .or_else(|| sql.find("`deleted_at` ASC"))
+        .expect("ORDER BY must include `deleted_at ASC`");
     let id_pos = sql
         .find("\"id\" ASC")
         .or_else(|| sql.find("`id` ASC"))
         .expect("ORDER BY must include `id ASC`");
 
     assert!(
-        depth_pos < scheduled_pos,
-        "leaf-first ORDER BY: `depth DESC` must precede `deletion_scheduled_at ASC` to \
+        depth_pos < deleted_pos,
+        "leaf-first ORDER BY: `depth DESC` must precede `deleted_at ASC` to \
              prevent the parent-starvation regression. Full SQL: {sql}"
     );
     assert!(
-        scheduled_pos < id_pos,
-        "tiebreaker order: `deletion_scheduled_at ASC` must precede `id ASC`. \
+        deleted_pos < id_pos,
+        "tiebreaker order: `deleted_at ASC` must precede `id ASC`. \
              Full SQL: {sql}"
     );
 }

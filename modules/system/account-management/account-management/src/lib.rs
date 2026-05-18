@@ -13,44 +13,36 @@
 //! REST wiring, the platform-bootstrap saga, and hierarchy-integrity
 //! audit arrive in subsequent PRs.
 //!
-//! # Production readiness — pre-production gates
+//! # Authorization posture
 //!
-//! The following items MUST land before this crate is fronted by an
-//! externally-reachable REST surface in a production multi-tenant
-//! deployment. They are tracked here so reviewers and operators see
-//! them at the top of the crate doc, not buried in feature specs.
+//! The [`InTenantSubtree`](modkit_security::ScopeFilter::in_tenant_subtree)
+//! predicate (cyberware-rust#1813) provides the SQL-level subtree
+//! clamp via a `tenant_closure` JOIN. AM consumes the predicate as
+//! follows:
 //!
-//! * **`InTenantSubtree` predicate / SQL-level subtree clamp** —
-//!   tracked in `cyberware-rust#1813`. Today AM authorization is
-//!   single-layer: the service-level PDP gate
-//!   ([`crate::domain::tenant::service::TenantService`]) is the only
-//!   enforcement layer. The `tenants` and `tenant_closure` entities
-//!   are declared `no_tenant, no_resource, no_owner, no_type`, so
-//!   `modkit-db secure` adds **no** automatic `WHERE` clause on
-//!   reads; callers MUST pass [`modkit_security::AccessScope::allow_all`]
-//!   (see [`crate::domain::tenant::TenantRepo`] trait contract). A
-//!   future endpoint that forgets to call the PDP gate would have no
-//!   DB-level backstop. After `InTenantSubtree` lands, the PDP
-//!   returns `InTenantSubtree(root=subject.tenant_id)` constraints,
-//!   the secure builder compiles them to a JOIN on `tenant_closure`,
-//!   and the `require_constraints(false)` on the `authorize` helper
-//!   flips to `true`.
+//! * `tenants` and `tenant_closure` are declared
+//!   `no_tenant, no_resource, no_owner, no_type` — the predicate has
+//!   no resolvable property to clamp against on those entities, so
+//!   reads stay scope-property-less and the service-layer PDP gate
+//!   ([`crate::domain::tenant::service::TenantService`]) carries the
+//!   authorization burden for the tenant CRUD surface.
+//! * `tenant_metadata` is declared `Scopable(tenant_col = "tenant_id",
+//!   ...)`. A caller-built `InTenantSubtree(root=subject.tenant_id)`
+//!   scope therefore clamps `MetadataRepo` reads / writes via the
+//!   secure-ORM closure subquery — no AM-side wiring required, the
+//!   storage seam simply forwards the caller's [`AccessScope`].
+//! * Conversion / lifecycle paths run as `actor=system` and pass
+//!   [`AccessScope::allow_all`] explicitly; structural reads on the
+//!   closure table use the same posture.
 //!
-//! REST handlers MUST NOT be added on top of `TenantRepo` until
-//! `cyberware-rust#1813` is closed. The methods currently relying
-//! on this single-layer enforcement are:
-//!
-//! * [`TenantService::create_child`](crate::domain::tenant::service::TenantService::create_child)
-//! * [`TenantService::read_tenant`](crate::domain::tenant::service::TenantService::read_tenant)
-//! * [`TenantService::list_children`](crate::domain::tenant::service::TenantService::list_children)
-//! * [`TenantService::update_tenant`](crate::domain::tenant::service::TenantService::update_tenant)
-//! * [`TenantService::soft_delete`](crate::domain::tenant::service::TenantService::soft_delete)
-//!
-//! Reviewers of follow-on PRs that wire any of the above into a REST
-//! handler MUST verify `cyberware-rust#1813` is closed before
-//! approving the wiring.
+//! REST handlers on top of `TenantRepo` MUST build the
+//! `InTenantSubtree` constraint at the request-handler layer (from
+//! the platform `AuthN` context) before invoking the service so the
+//! PDP-narrowed scope flows into every downstream `MetadataRepo` /
+//! `ConversionRepo` call.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod client;
 pub mod config;
 pub mod domain;
 pub mod infra;
@@ -72,4 +64,5 @@ pub use domain::tenant::{
 pub use infra::storage::migrations::Migrator;
 pub use infra::storage::repo_impl::{AmDbProvider, TenantRepoImpl};
 
+pub use client::AccountManagementClientImpl;
 pub use module::AccountManagementModule;

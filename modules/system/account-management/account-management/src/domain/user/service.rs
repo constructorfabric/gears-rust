@@ -7,8 +7,8 @@
 //! deliver the three flows defined by FEATURE
 //! `idp-user-operations-contract`:
 //!
-//! * `provision_user`  -- `POST /tenants/{tenant_id}/users` (REST drop-in)
-//! * `deprovision_user` -- `DELETE /tenants/{tenant_id}/users/{user_id}`
+//! * `create_user`  -- `POST /tenants/{tenant_id}/users` (REST drop-in)
+//! * `delete_user` -- `DELETE /tenants/{tenant_id}/users/{user_id}`
 //! * `list_users`      -- `GET /tenants/{tenant_id}/users`
 //!
 //! Every method:
@@ -25,7 +25,7 @@
 //!    [`DomainError`] via the redacting boundary helper in
 //!    [`crate::domain::idp`].
 //!
-//! `deprovision_user` additionally implements the
+//! `delete_user` additionally implements the
 //! `cpt-cf-account-management-algo-idp-user-operations-contract-deprovision-idempotency-guard`
 //! rule: `Ok(())` from the plugin is treated as idempotent success
 //! regardless of whether the user was actually removed on this call
@@ -42,21 +42,31 @@
 
 use std::sync::Arc;
 
+use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RG_TYPE_CODE};
 use account_management_sdk::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpNewUser, IdpPluginClient,
-    IdpProvisionUserRequest, IdpTenantContext, IdpUser, IdpUserPagination,
+    IdpProvisionUserRequest, IdpTenantContext, IdpUser, IdpUserPagination, ListUsersQuery,
 };
+use authz_resolver_sdk::PolicyEnforcer;
+use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use modkit_macros::domain_model;
 use modkit_odata::Page;
+use modkit_odata::ast::{CompareOperator, Expr, Value};
+use modkit_odata::{CursorV1, ODataQuery};
 use modkit_security::AccessScope;
+use modkit_security::{SecurityContext, pep_properties};
+use resource_group_sdk::{ResourceGroupClient, ResourceGroupError};
+use std::time::Duration;
 use types_registry_sdk::TypesRegistryClient;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::idp::UserOperationFailureExt;
+use crate::domain::metrics::{AM_DEPENDENCY_HEALTH, MetricKind, emit_metric};
 use crate::domain::tenant::TenantContext;
 use crate::domain::tenant::model::TenantStatus;
 use crate::domain::tenant::repo::TenantRepo;
+use crate::domain::user_groups::am_system_context;
 
 /// Upper bound on `username` length enforced at the AM boundary
 /// before the `IdP` round-trip. Matches the `child_tenant_name`
@@ -95,6 +105,51 @@ const MAX_PROFILE_FIELD_CHARS: usize = 255;
 /// service holds no clock seam and no batch-size knobs because the
 /// FEATURE doc state model is empty (no AM-side lifecycle here -- see
 /// the section "States (CDSL): Not applicable").
+/// PEP descriptors for the tenant-scoped `IdP` user resource.
+///
+/// Mirrors the `pep::TENANT` / `pep::METADATA` declarations on
+/// sibling services. The resource type name pins
+/// [`account_management_sdk::USER_RESOURCE_TYPE`]; the impl-side
+/// duplication is required because `ResourceType.name` is a
+/// `&'static str` consumed at compile time. Cross-checks live in
+/// `domain::error_tests`.
+pub(super) mod pep {
+    use super::{ResourceType, pep_properties};
+
+    /// Resource declaration for `IdpUser`. AM persists no user table
+    /// (per `cpt-cf-account-management-constraint-no-user-storage`),
+    /// so the compiled `AccessScope` does NOT clamp any AM-owned
+    /// table — its role here is purely the PEP-side allow/deny gate
+    /// plus the `InTenantSubtree` predicate the tenant-existence
+    /// guard (`resolve_active_tenant`) consults.
+    ///
+    /// Supported PEP properties:
+    ///
+    /// * `OWNER_TENANT_ID` — the tenant the `IdP` user belongs to;
+    ///   ownership-style policies consume this.
+    /// * `RESOURCE_ID` — set to the tenant id (the per-user
+    ///   `IdpUser.id` is not policy-visible because users are
+    ///   IdP-side primitives, not AM resources). Matches the
+    ///   `tenants` entity's `resource_col = "id"` declaration so the
+    ///   compiled subtree clamp on `tenants` resolves through this
+    ///   property.
+    pub const USER: ResourceType = ResourceType {
+        name: "gts.cf.core.am.user.v1~",
+        supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+    };
+
+    /// Action vocabulary. `get_user` is internally a single-row
+    /// `list_users` projection so it shares the `LIST` policy bucket;
+    /// fine-grained per-user `READ` is reserved for the future
+    /// (e.g. policies that gate per-user-id metadata reads behind a
+    /// separate decision).
+    pub mod actions {
+        pub const CREATE: &str = "create";
+        pub const LIST: &str = "list";
+        pub const DELETE: &str = "delete";
+    }
+}
+
 #[domain_model]
 pub struct UserService {
     tenant_repo: Arc<dyn TenantRepo>,
@@ -105,21 +160,134 @@ pub struct UserService {
     /// published JSON Schema rather than re-hardcoded here. Mirrors
     /// the wiring in `cf-resource-group::validate_metadata_via_gts`.
     types_registry: Arc<dyn TypesRegistryClient>,
+    /// PEP gate. Mirrors `TenantService` / `MetadataService`: every
+    /// public user-ops method PEP-gates via [`Self::authorize`]
+    /// before any `IdP` / RG round trip. The `PolicyEnforcer` is owned
+    /// by-value (it is `Clone`); the module wiring clones it from
+    /// the shared instance used by sibling services.
+    enforcer: PolicyEnforcer,
+    /// Optional `ResourceGroupClient` used by
+    /// [`Self::delete_user`] to remove dangling user-group
+    /// memberships referencing the deleted user from RG's
+    /// `resource_group_membership` table. `None` in tests that don't
+    /// exercise the cleanup path; production wiring in `module.rs`
+    /// always passes `Some(...)`.
+    rg_client: Option<Arc<dyn ResourceGroupClient + Send + Sync>>,
 }
+
+/// Per-call RG timeout for the cleanup helper.
+///
+/// Matches `CASCADE_TIMEOUT` in `domain::user_groups::cascade` so the
+/// two pipelines share an operator-tunable upper bound. Lifted into
+/// a constant so the `delete_user` test fixtures can construct
+/// it without re-deriving the literal.
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "from_mins is unstable on workspace MSRV; keep from_secs"
+)]
+const RG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum user-group rows fetched per `list_groups` page during cleanup.
+///
+/// Matches `CASCADE_PAGE_SIZE` in `domain::user_groups::cascade`.
+const RG_CLEANUP_PAGE_SIZE: u64 = 100;
+
+/// Overall budget for one `cleanup_user_group_memberships` invocation.
+///
+/// Caps the worst-case time the deprovision request can spend on RG
+/// cleanup before surfacing [`DomainError::ServiceUnavailable`].
+/// Without this cap a tenant with N user-groups would compound
+/// `RG_CLEANUP_TIMEOUT` × pages × N remove-calls into a request future
+/// that the caller cannot cancel.
+///
+/// Tighter sibling of `CASCADE_BUDGET` in
+/// `domain::user_groups::cascade`: cleanup runs on the synchronous
+/// `delete_user` request path (60s -- a user-visible response
+/// budget), whereas cascade runs on the retention pipeline's tenant
+/// hard-delete tick (120s -- a background-job budget that can yield
+/// cheaply). The two are intentionally asymmetric on purpose.
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "from_mins is unstable on workspace MSRV; keep from_secs"
+)]
+const RG_CLEANUP_BUDGET: Duration = Duration::from_secs(60);
 
 impl UserService {
     /// Construct a fully-wired service.
+    ///
+    /// The optional [`ResourceGroupClient`] cleanup wiring is set via
+    /// [`Self::with_rg_membership_cleanup`] after construction so
+    /// existing test fixtures that don't model membership scenarios
+    /// can build the service without a fake RG client.
     #[must_use]
     pub fn new(
         tenant_repo: Arc<dyn TenantRepo>,
         idp_user: Arc<dyn IdpPluginClient>,
         types_registry: Arc<dyn TypesRegistryClient>,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             tenant_repo,
             idp_user,
             types_registry,
+            enforcer,
+            rg_client: None,
         }
+    }
+
+    /// PEP gate. Calls the platform-side `PolicyEnforcer`, returns
+    /// the [`AccessScope`] the tenant-existence guard
+    /// (`resolve_active_tenant`) forwards through `modkit_db`'s
+    /// secure builders.
+    ///
+    /// Mirrors `TenantService::authorize` / `MetadataService::authorize`:
+    ///
+    /// * `OWNER_TENANT_ID = tenant_id` — the `IdP` user's owning tenant.
+    /// * `RESOURCE_ID = tenant_id` — matches `tenants.id` so the PDP-
+    ///   emitted `InTenantSubtree` predicate clamps the `tenants`
+    ///   read in `resolve_active_tenant` to the caller's subtree.
+    /// * `require_constraints(true)` — a PDP returning `decision: true,
+    ///   constraints: []` fails closed via `CompileFailed →
+    ///   CrossTenantDenied` rather than silently widening the read.
+    ///
+    /// AM persists no user table; the PEP role here is purely the
+    /// allow/deny + tenant-existence-gate subtree clamp.
+    async fn authorize(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        tenant_id: Uuid,
+    ) -> Result<AccessScope, DomainError> {
+        let request = AccessRequest::new()
+            .resource_property(pep_properties::OWNER_TENANT_ID, tenant_id)
+            .resource_property(pep_properties::RESOURCE_ID, tenant_id)
+            .require_constraints(true);
+        let scope = self
+            .enforcer
+            .access_scope_with(ctx, &pep::USER, action, Some(tenant_id), &request)
+            .await?;
+        Ok(scope)
+    }
+
+    /// Wire the [`ResourceGroupClient`] used by
+    /// [`Self::delete_user`] to clean up dangling user-group
+    /// memberships referencing the deprovisioned user. Without this,
+    /// hard-deleted AM users leave orphaned rows in RG's
+    /// `resource_group_membership` table (their `resource_id`
+    /// references a non-existent AM user); the next listing of the
+    /// containing group would surface a member that is no longer
+    /// a valid user.
+    ///
+    /// Production wiring in `module.rs` always invokes this builder;
+    /// tests that don't exercise the cleanup path skip it and leave
+    /// `rg_client = None` so the cleanup branch short-circuits.
+    #[must_use]
+    pub fn with_rg_membership_cleanup(
+        mut self,
+        rg_client: Arc<dyn ResourceGroupClient + Send + Sync>,
+    ) -> Self {
+        self.rg_client = Some(rg_client);
+        self
     }
 
     // ----------------------------------------------------------------
@@ -140,10 +308,9 @@ impl UserService {
     ///    [`DomainError::Validation`] -- no `IdP` call.
     /// 4. Forward to [`IdpPluginClient::provision_user`].
     ///
-    /// `requested_by` is the principal UUID resolved from the platform
-    /// `SecurityContext` at the REST layer; recorded on the outcome
-    /// `am.events` line for audit correlation. AM does not validate
-    /// the value -- platform `AuthN` is a precondition per
+    /// The actor recorded on the outcome `am.events` line is
+    /// `ctx.subject_id()`. AM does not re-validate it — platform
+    /// `AuthN` is a precondition per
     /// `cpt-cf-account-management-nfr-authentication-context`.
     ///
     /// # Errors
@@ -167,59 +334,30 @@ impl UserService {
         clippy::cognitive_complexity,
         reason = "flat guard sequence (tenant scope -> actor precondition -> payload trim/cap -> GTS structural -> IdP call -> response nil-id guard) is the security-critical ordering reviewers eyeball-check; extracting helpers would fragment the audit chain and obscure the @cpt-* CPT markers anchored to each step"
     )]
-    pub async fn provision_user(
+    pub async fn create_user(
         &self,
-        scope: &AccessScope,
+        ctx: &SecurityContext,
         tenant_id: Uuid,
         mut payload: IdpNewUser,
-        requested_by: Uuid,
     ) -> Result<IdpUser, DomainError> {
         // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-provision-user:p1:inst-flow-puser-resolve-tenant
         // @cpt-begin:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-puser
-        // Tenant existence + status guard runs FIRST so a request
-        // against a non-existent / soft-deleted / out-of-scope tenant
-        // surfaces as `NotFound` / `Validation` without leaking
-        // tenant topology through a payload-shape error. Earlier
-        // ordering returned `Validation` for whitespace-only
-        // `username` before resolving the tenant — that let an
-        // unauthorised caller distinguish "this tenant does not
-        // exist" from "this tenant rejects my payload". The actor
-        // precondition below runs AFTER the tenant guard for the
-        // same reason: a nil-actor probe must not distinguish
-        // "tenant does not exist" from "this handler is wired wrong".
-        let tenant_context = self.resolve_active_tenant(scope, tenant_id).await?;
+        // PEP gate FIRST: compiles the caller's `SecurityContext`
+        // into an `AccessScope` (`InTenantSubtree` predicate rooted
+        // at the caller's subtree). A denied caller surfaces as
+        // `CrossTenantDenied` BEFORE any IdP / Types Registry round
+        // trip. Mirrors the production posture in `TenantService`
+        // and `MetadataService`.
+        let scope = self.authorize(ctx, pep::actions::CREATE, tenant_id).await?;
+        let actor = ctx.subject_id();
+
+        // Tenant existence + status guard runs AFTER the PEP gate so
+        // a request against a non-existent / soft-deleted / out-of-
+        // scope tenant surfaces as `NotFound` / `Validation` without
+        // leaking tenant topology through a payload-shape error.
+        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-puser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-provision-user:p1:inst-flow-puser-resolve-tenant
-
-        // Fail closed on `Uuid::nil()` for the actor field —
-        // `requested_by` flows into `am.events` as `actor_uuid` and a
-        // default-constructed nil would coalesce every misuse into
-        // one audit bucket, hiding the bug from downstream
-        // `(event, actor_uuid)` aggregations. Surfaced as
-        // `Conflict` (FailedPrecondition / HTTP 400), not `Internal`:
-        // the caller's REST handler failed to wire a real actor, the
-        // request is non-retryable until the handler is fixed, and
-        // routing this through the 500 budget would mask the bug
-        // behind generic "we're broken" alerts.
-        //
-        // The public `Conflict.detail` is intentionally generic —
-        // `infra::canonical_mapping` serialises this field into
-        // `PreconditionViolationV1.description` (which is NOT
-        // `#[serde(skip)]`), so any AM-internal text here leaks into
-        // the public Problem envelope. Operator-actionable text
-        // ("which field, which method, which actor") lives on the
-        // `am.user.audit` warn below, not on the wire.
-        if requested_by.is_nil() {
-            tracing::warn!(
-                target: "am.user.audit",
-                tenant_id = %tenant_id,
-                method = "provision_user",
-                "actor identifier was Uuid::nil(); caller (REST handler) did not wire actor_uuid"
-            );
-            return Err(DomainError::Conflict {
-                detail: "request missing required actor identifier".to_owned(),
-            });
-        }
 
         // AM business invariants on the username, enforced AFTER the
         // tenant guard so payload-shape feedback never leaks tenant
@@ -253,13 +391,13 @@ impl UserService {
         let trimmed = payload.username.trim();
         if trimmed.is_empty() {
             return Err(DomainError::Validation {
-                detail: "provision_user: username MUST not be all-whitespace".to_owned(),
+                detail: "create_user: username MUST not be all-whitespace".to_owned(),
             });
         }
         if trimmed.chars().count() > MAX_USERNAME_CHARS {
             return Err(DomainError::Validation {
                 detail: format!(
-                    "provision_user: username MUST be {MAX_USERNAME_CHARS} characters or fewer"
+                    "create_user: username MUST be {MAX_USERNAME_CHARS} characters or fewer"
                 ),
             });
         }
@@ -311,11 +449,11 @@ impl UserService {
                     tracing::warn!(
                         target: "am.user.audit",
                         tenant_id = %tenant_id,
-                        "provision_user: provider returned Uuid::nil() as user id (plugin contract violation)"
+                        "create_user: provider returned Uuid::nil() as user id (plugin contract violation)"
                     );
                     return Err(DomainError::Internal {
                         diagnostic: format!(
-                            "provision_user: provider returned Uuid::nil() as user id for tenant {tenant_id} (plugin contract violation)"
+                            "create_user: provider returned Uuid::nil() as user id for tenant {tenant_id} (plugin contract violation)"
                         ),
                         cause: None,
                     });
@@ -350,7 +488,7 @@ impl UserService {
                     event = "user_provisioned",
                     tenant_id = %tenant_id,
                     user_id = %projection.id,
-                    actor_uuid = %requested_by,
+                    actor_uuid = %actor,
                     outcome = "ok",
                     "am user provisioned"
                 );
@@ -404,40 +542,19 @@ impl UserService {
     ///   the operation.
     /// * [`DomainError::Validation`] -- provider rejected the request.
     // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-service
-    pub async fn deprovision_user(
+    pub async fn delete_user(
         &self,
-        scope: &AccessScope,
+        ctx: &SecurityContext,
         tenant_id: Uuid,
         user_id: Uuid,
-        requested_by: Uuid,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-resolve-tenant
         // @cpt-begin:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-duser
-        let tenant_context = self.resolve_active_tenant(scope, tenant_id).await?;
+        let scope = self.authorize(ctx, pep::actions::DELETE, tenant_id).await?;
+        let actor = ctx.subject_id();
+        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-duser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-resolve-tenant
-
-        // Fail closed on `Uuid::nil()` for the actor field — same
-        // ordering + rationale as `provision_user`: tenant guard
-        // runs first to avoid leaking tenant topology through a
-        // payload-shape diagnostic, and the variant is `Conflict`
-        // (FailedPrecondition / HTTP 400) rather than `Internal` so
-        // the bug shows up where caller-precondition violations
-        // belong, not in the internal-error budget. The public
-        // `Conflict.detail` MUST stay generic — see the matching
-        // comment on the `provision_user` guard for the
-        // `PreconditionViolationV1.description` leak rationale.
-        if requested_by.is_nil() {
-            tracing::warn!(
-                target: "am.user.audit",
-                tenant_id = %tenant_id,
-                method = "deprovision_user",
-                "actor identifier was Uuid::nil(); caller (REST handler) did not wire actor_uuid"
-            );
-            return Err(DomainError::Conflict {
-                detail: "request missing required actor identifier".to_owned(),
-            });
-        }
 
         // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-invoke-contract
         // @cpt-begin:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-package-request-duser
@@ -463,14 +580,21 @@ impl UserService {
             // @cpt-begin:cpt-cf-account-management-dod-idp-user-operations-contract-deprovision-idempotency:p1:inst-dod-deprovision-idempotency-service
             // Plugin maps vendor "user does not exist" responses to
             // `Ok(())` itself; AM observes a single success arm
-            // regardless of removed-vs-absent provenance.
+            // regardless of removed-vs-absent provenance. RG-membership
+            // cleanup runs BEFORE emitting the success log so the
+            // success event lands only after the user is truly gone
+            // end-to-end. If cleanup fails, the call returns Err and a
+            // retry re-enters the path; IdP returns `Ok(())` idempotently,
+            // cleanup retries.
             Ok(()) => {
+                self.cleanup_user_group_memberships(tenant_id, user_id)
+                    .await?;
                 tracing::info!(
                     target: "am.events",
                     event = "user_deprovisioned",
                     tenant_id = %tenant_id,
                     user_id = %user_id,
-                    actor_uuid = %requested_by,
+                    actor_uuid = %actor,
                     outcome = "ok",
                     "am user deprovisioned"
                 );
@@ -510,6 +634,59 @@ impl UserService {
     // List users
     // ----------------------------------------------------------------
 
+    /// Fetch a single user by id from `tenant_id` via the configured
+    /// `IdP` plugin. Thin wrapper over [`Self::list_users`] with
+    /// `user_id_filter = Some(user_id)`, `top = 1`, `cursor = None`;
+    /// the AM-level pagination disciplines documented on `list_users`
+    /// (cursor MUST be absent, top MUST be 1 when `user_id_filter` is
+    /// set) make a one-shot filtered lookup the authoritative
+    /// existence check for a specific user.
+    ///
+    /// User profile mutation is intentionally **not** exposed by AM —
+    /// `email` / `display_name` / `username` live in the `IdP` and
+    /// SCIM-style edits go directly to the provider's admin API per
+    /// `cpt-cf-account-management-adr-idp-user-identity-source-of-truth`.
+    /// AM exposes only the lifecycle saga (`create_user` /
+    /// `delete_user`) and read-side projection (`get_user` /
+    /// `list_users`).
+    ///
+    /// # Errors
+    ///
+    /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve OR
+    ///   the user is not present in the plugin's response (empty page).
+    /// * All other failure shapes documented on [`Self::list_users`]
+    ///   (status precondition, `IdP` transport failure, unsupported
+    ///   operation, provider validation).
+    pub async fn get_user(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<IdpUser, DomainError> {
+        // `IdpUserPagination::new(1, None)` is statically valid (`top=1`
+        // is `>= 1` and `<= MAX_TOP`, no cursor to validate), so the
+        // `Err` arm is unreachable. Route the impossible failure
+        // through `Internal` rather than `expect()` to keep the
+        // workspace clippy `expect_used` lint clean and surface any
+        // future regression (e.g. a stricter constructor contract
+        // that rejects `top=1`) as a structured error.
+        let pagination = IdpUserPagination::new(1, None).map_err(|e| DomainError::Internal {
+            diagnostic: format!(
+                "get_user: failed to build single-row pagination (top=1, no cursor): {e}"
+            ),
+            cause: None,
+        })?;
+        let query = ListUsersQuery::new(pagination).with_user_id_filter(user_id);
+        let page = self.list_users(ctx, tenant_id, query).await?;
+        page.items
+            .into_iter()
+            .next()
+            .ok_or_else(|| DomainError::UserNotFound {
+                detail: format!("user {user_id} not found in tenant {tenant_id}"),
+                resource: user_id.to_string(),
+            })
+    }
+
     /// List users in `tenant_id` via the configured `IdP` plugin.
     /// `user_id_filter = Some(_)` is the authoritative existence
     /// signal consumed by sibling features (e.g. `feature-user-groups`).
@@ -531,18 +708,29 @@ impl UserService {
     // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-list-users:p1:inst-flow-luser-service
     pub async fn list_users(
         &self,
-        scope: &AccessScope,
+        ctx: &SecurityContext,
         tenant_id: Uuid,
-        user_id_filter: Option<Uuid>,
-        pagination: IdpUserPagination,
+        query: ListUsersQuery,
     ) -> Result<Page<IdpUser>, DomainError> {
-        // Tenant existence + status guard runs FIRST so a request
+        let ListUsersQuery {
+            pagination,
+            user_id_filter,
+            ..
+        } = query;
+        // PEP gate FIRST. The `LIST` action is used for both the
+        // raw list and the `get_user` existence-check shape
+        // (`user_id_filter = Some(_)`) so the same policy decision
+        // governs both surfaces. The compiled scope clamps the
+        // tenant-existence guard below.
+        let scope = self.authorize(ctx, pep::actions::LIST, tenant_id).await?;
+
+        // Tenant existence + status guard runs after PEP so a request
         // against a non-existent / soft-deleted / out-of-scope tenant
         // surfaces as `NotFound` / `Validation` without leaking
         // tenant topology through a pagination-shape error.
         // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-list-users:p1:inst-flow-luser-resolve-tenant
         // @cpt-begin:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-luser
-        let tenant_context = self.resolve_active_tenant(scope, tenant_id).await?;
+        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-luser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-list-users:p1:inst-flow-luser-resolve-tenant
 
@@ -635,7 +823,7 @@ impl UserService {
                     });
                 }
                 // Response-side schema validation is NOT performed
-                // (mirrors the `provision_user` rationale above): AM
+                // (mirrors the `create_user` rationale above): AM
                 // trusts the plugin's published projection contract
                 // and only enforces the `user_id_filter` discipline
                 // here. Failing closed on a single drifted row would
@@ -741,10 +929,294 @@ impl UserService {
             metadata,
         ))
     }
+
+    // ----------------------------------------------------------------
+    // RG-membership cleanup post user-deprovision
+    // ----------------------------------------------------------------
+
+    /// Remove every RG user-group membership row that references the
+    /// deprovisioned user as a member. Closes the orphaned-row gap
+    /// left by AM hard-deleting a user while RG still holds rows
+    /// pointing at it.
+    ///
+    /// Short-circuits on `rg_client = None` (test fixtures that don't
+    /// model membership scenarios). System-actor context is built via
+    /// [`am_system_context`] so the call goes through cross-module
+    /// authz with the stable AM subject UUID, mirroring the
+    /// user-group cascade hook.
+    ///
+    /// Two-step, tenant-scoped by construction:
+    ///
+    /// 1. `list_groups($filter = tenant_id eq T AND type eq USER_GROUP_RG_TYPE_CODE)`
+    ///    — drain all pages → `Vec<group_id>`. Listing groups (not
+    ///    memberships) is what clamps the cleanup to a single tenant:
+    ///    `ResourceGroup` carries `tenant_id` directly, whereas
+    ///    `ResourceGroupMembership` does not, so a membership-keyed
+    ///    listing cannot express a tenant filter without joining
+    ///    through `group_id`.
+    /// 2. For each group: `remove_membership(group_id, USER_RG_TYPE_CODE,
+    ///    user_id.to_string())`. `NotFound` is idempotent success —
+    ///    the user simply isn't a member of that group, or a peer
+    ///    cleanup tick has already removed the row.
+    ///
+    /// Symmetric with `domain::user_groups::cascade::cascade_inner`,
+    /// which also lists tenant-scoped user-groups and then dispatches
+    /// per-group cleanup. The whole body is wrapped in a single
+    /// [`tokio::time::timeout`] (`RG_CLEANUP_BUDGET`) so a tenant with
+    /// pathologically many user-groups cannot pin the deprovision
+    /// request future indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// * [`DomainError::ServiceUnavailable`] -- RG transport failure,
+    ///   per-call timeout, or overall-budget exceeded. The user has
+    ///   already been removed from `IdP`; the caller's retry path
+    ///   returns `NotFoundInTenant` from `IdP` and retries cleanup
+    ///   against the still-orphaned RG rows. The mapping to AIP-193
+    ///   `ServiceUnavailable` (HTTP 503) matches other RG-failure
+    ///   call sites (cascade hook, resource ownership checker) so
+    ///   the dependency-health signal is uniform across AM.
+    /// * [`DomainError::Internal`] -- RG returned an unexpected error
+    ///   shape (e.g. an `OData` cursor it cannot decode). Surfaces
+    ///   loud rather than silently swallowing.
+    async fn cleanup_user_group_memberships(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), DomainError> {
+        let Some(rg) = self.rg_client.as_ref() else {
+            return Ok(());
+        };
+        let sys_ctx = am_system_context(Some(tenant_id));
+
+        let body = cleanup_inner(rg.as_ref(), &sys_ctx, tenant_id, user_id);
+        match tokio::time::timeout(RG_CLEANUP_BUDGET, body).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                emit_metric(
+                    AM_DEPENDENCY_HEALTH,
+                    MetricKind::Counter,
+                    &[
+                        ("target", "resource_group"),
+                        ("op", "user_cleanup_memberships"),
+                        ("outcome", "budget_exceeded"),
+                    ],
+                );
+                Err(DomainError::service_unavailable(format!(
+                    "resource-group: cleanup of memberships for deprovisioned user {user_id} in \
+                     tenant {tenant_id} exceeded overall budget of {}s",
+                    RG_CLEANUP_BUDGET.as_secs()
+                )))
+            }
+        }
+    }
+}
+
+/// Inner cleanup body — extracted so the overall budget timeout in
+/// [`UserService::cleanup_user_group_memberships`] can wrap it as one
+/// future.
+///
+/// Lists every user-group in the tenant, then issues one
+/// `remove_membership(group_id, USER_RG_TYPE_CODE, user_id)` per
+/// listed group. `NotFound` on remove is idempotent (the user
+/// wasn't a member of that group); transport errors surface as
+/// [`DomainError::ServiceUnavailable`] so the caller's retry path
+/// re-enters the flow.
+async fn cleanup_inner(
+    rg: &(dyn ResourceGroupClient + Send + Sync),
+    sys_ctx: &SecurityContext,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), DomainError> {
+    let user_id_str = user_id.to_string();
+    let groups = list_tenant_user_groups(rg, sys_ctx, tenant_id, user_id).await?;
+
+    let mut removed: usize = 0;
+    let mut already_gone: usize = 0;
+    for group_id in &groups {
+        match tokio::time::timeout(
+            RG_CLEANUP_TIMEOUT,
+            rg.remove_membership(sys_ctx, *group_id, USER_RG_TYPE_CODE, &user_id_str),
+        )
+        .await
+        {
+            Err(_elapsed) => {
+                emit_metric(
+                    AM_DEPENDENCY_HEALTH,
+                    MetricKind::Counter,
+                    &[
+                        ("target", "resource_group"),
+                        ("op", "user_cleanup_remove_membership"),
+                        ("outcome", "timeout"),
+                    ],
+                );
+                return Err(DomainError::service_unavailable(format!(
+                    "resource-group: timeout removing user {user_id} from group {group_id} \
+                     during deprovision cleanup"
+                )));
+            }
+            Ok(Err(ResourceGroupError::NotFound { .. })) => {
+                // Either the user was never a member of this group,
+                // or a peer cleanup tick removed the row between our
+                // list and remove calls. Idempotent success — emit
+                // a distinct outcome so the metric distinguishes "we
+                // removed it" from "it wasn't there".
+                already_gone += 1;
+                emit_metric(
+                    AM_DEPENDENCY_HEALTH,
+                    MetricKind::Counter,
+                    &[
+                        ("target", "resource_group"),
+                        ("op", "user_cleanup_remove_membership"),
+                        ("outcome", "already_gone"),
+                    ],
+                );
+            }
+            Ok(Err(e)) => {
+                emit_metric(
+                    AM_DEPENDENCY_HEALTH,
+                    MetricKind::Counter,
+                    &[
+                        ("target", "resource_group"),
+                        ("op", "user_cleanup_remove_membership"),
+                        ("outcome", "error"),
+                    ],
+                );
+                tracing::warn!(
+                    target: "am.events",
+                    tenant_id = %tenant_id,
+                    user_id = %user_id,
+                    group_id = %group_id,
+                    error = %e,
+                    "RG user-group membership cleanup failed during user deprovision; \
+                     orphaned membership row pending retry"
+                );
+                return Err(DomainError::service_unavailable(format!(
+                    "resource-group: failed to remove user {user_id} from group {group_id} \
+                     during deprovision cleanup: {e}"
+                )));
+            }
+            Ok(Ok(())) => {
+                removed += 1;
+            }
+        }
+    }
+
+    emit_metric(
+        AM_DEPENDENCY_HEALTH,
+        MetricKind::Counter,
+        &[
+            ("target", "resource_group"),
+            ("op", "user_cleanup_memberships"),
+            ("outcome", "success"),
+        ],
+    );
+    tracing::debug!(
+        target: "am.user_groups",
+        tenant_id = %tenant_id,
+        user_id = %user_id,
+        groups_listed = groups.len(),
+        memberships_removed = removed,
+        already_gone,
+        "deprovision cleanup completed"
+    );
+
+    Ok(())
+}
+
+/// Drain every user-group in `tenant_id`, paginated by `CursorV1`.
+///
+/// Filters `tenant_id eq T AND type eq USER_GROUP_RG_TYPE_CODE` so
+/// the result set is tenant-clamped at the source. `user_id` is
+/// included in error diagnostics only; the listing itself is
+/// per-tenant, not per-user.
+async fn list_tenant_user_groups(
+    rg: &(dyn ResourceGroupClient + Send + Sync),
+    sys_ctx: &SecurityContext,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, DomainError> {
+    let filter = Expr::And(
+        Box::new(Expr::Compare(
+            Box::new(Expr::Identifier("tenant_id".to_owned())),
+            CompareOperator::Eq,
+            Box::new(Expr::Value(Value::Uuid(tenant_id))),
+        )),
+        Box::new(Expr::Compare(
+            Box::new(Expr::Identifier("type".to_owned())),
+            CompareOperator::Eq,
+            Box::new(Expr::Value(Value::String(
+                USER_GROUP_RG_TYPE_CODE.to_owned(),
+            ))),
+        )),
+    );
+
+    let mut all_ids = Vec::new();
+    let mut cursor: Option<CursorV1> = None;
+    loop {
+        let mut query = ODataQuery::default()
+            .with_limit(RG_CLEANUP_PAGE_SIZE)
+            .with_filter(filter.clone());
+        if let Some(c) = cursor.take() {
+            query = query.with_cursor(c);
+        }
+
+        let page =
+            match tokio::time::timeout(RG_CLEANUP_TIMEOUT, rg.list_groups(sys_ctx, &query)).await {
+                Err(_elapsed) => {
+                    emit_metric(
+                        AM_DEPENDENCY_HEALTH,
+                        MetricKind::Counter,
+                        &[
+                            ("target", "resource_group"),
+                            ("op", "user_cleanup_list_groups"),
+                            ("outcome", "timeout"),
+                        ],
+                    );
+                    return Err(DomainError::service_unavailable(format!(
+                        "resource-group: timeout listing user-groups for deprovisioned user \
+                         {user_id} in tenant {tenant_id}"
+                    )));
+                }
+                Ok(Err(e)) => {
+                    emit_metric(
+                        AM_DEPENDENCY_HEALTH,
+                        MetricKind::Counter,
+                        &[
+                            ("target", "resource_group"),
+                            ("op", "user_cleanup_list_groups"),
+                            ("outcome", "error"),
+                        ],
+                    );
+                    return Err(DomainError::service_unavailable(format!(
+                        "resource-group: failed to list user-groups for deprovisioned user \
+                         {user_id} in tenant {tenant_id}: {e}"
+                    )));
+                }
+                Ok(Ok(p)) => p,
+            };
+
+        all_ids.extend(page.items.into_iter().map(|g| g.id));
+
+        match page.page_info.next_cursor {
+            Some(token) => {
+                cursor = Some(CursorV1::decode(&token).map_err(|e| DomainError::Internal {
+                    diagnostic: format!(
+                        "resource-group: invalid cursor from list_groups during \
+                         user-deprovision cleanup ({user_id} in {tenant_id}): {e}"
+                    ),
+                    cause: None,
+                })?);
+            }
+            None => break,
+        }
+    }
+
+    Ok(all_ids)
 }
 
 /// AM-side fallback length cap for the optional profile fields
-/// (`email`, `display_name`) on `provision_user`. `None`
+/// (`email`, `display_name`) on `create_user`. `None`
 /// short-circuits to `Ok(())` because the public schema declares
 /// the field optional and AM does not synthesise a value;
 /// `Some(value)` is rejected with [`DomainError::Validation`] when
@@ -768,7 +1240,7 @@ fn check_profile_field_bound(
     if value.chars().count() > MAX_PROFILE_FIELD_CHARS {
         return Err(DomainError::Validation {
             detail: format!(
-                "provision_user: {field_name} MUST be {MAX_PROFILE_FIELD_CHARS} characters or fewer"
+                "create_user: {field_name} MUST be {MAX_PROFILE_FIELD_CHARS} characters or fewer"
             ),
         });
     }

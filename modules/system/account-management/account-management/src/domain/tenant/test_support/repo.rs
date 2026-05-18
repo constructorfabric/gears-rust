@@ -29,7 +29,8 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use account_management_sdk::{ListChildrenQuery, TenantPage, TenantUpdate};
+use account_management_sdk::UpdateTenantRequest;
+use modkit_odata::{ODataQuery, Page, PageInfo};
 
 use crate::domain::error::DomainError;
 use crate::domain::tenant::closure::ClosureRow;
@@ -445,33 +446,185 @@ fn mark_terminal_failure_with_status(
     true
 }
 
-/// Compute the set of tenant ids visible to `scope` on the `tenants`
-/// table, matching production semantics: the `SeaORM` `Scopable` derive
-/// declares `tenant_col = "id"`, so the secure-extension filter
-/// translates `AccessScope::for_tenant(t)` into `WHERE tenants.id = t`
-/// — only the row whose own id equals the scope's tenant matches. It
-/// does **not** transparently expand to descendants via
-/// `tenant_closure`. Cross-tenant authorization is enforced by the
-/// PDP (`AuthZ` resolver) at the service-layer PEP call; post-gate repo
-/// calls pass `AccessScope::allow_all()` so this filter is a no-op in
-/// practice. The strict per-row variant is preserved here only so
-/// direct fake calls behave identically to production for tests that
-/// exercise the secure-extension boundary.
+/// Properties [`visible_ids_for`] resolves on the `tenants` table.
 ///
-/// Mapping:
-/// * `allow_all` → `None` (no filter; every row visible).
-/// * `for_tenant(t)` → `Some({t})` (single-row equality).
-/// * multi-tenant scope built from N owner-tenant UUIDs → `Some(set)`
-///   = the union of those UUIDs (`WHERE tenants.id IN (...)`). The
-///   service never builds that shape today — every post-gate call
-///   uses `allow_all` — so this branch exists only for completeness.
-fn visible_ids_for(_state: &RepoState, scope: &AccessScope) -> Option<HashSet<Uuid>> {
+/// Production `Scopable(no_tenant, resource_col = "id", no_owner,
+/// no_type)` only resolves `RESOURCE_ID`, and the secure-extension
+/// would fail-closed on `OWNER_TENANT_ID`. The fake nonetheless
+/// **also** accepts `OWNER_TENANT_ID` as an id-equality on
+/// `tenants.id` -- a deliberate test-only widening that lets
+/// conversion-service unit tests synthesize convenience scopes
+/// (`AccessScope::for_tenant(child)`) without going through the real
+/// PEP. Production conversion flows use a real PEP, which emits
+/// `InTenantSubtree(RESOURCE_ID, ...)`; those compile cleanly against
+/// the new entity. The asymmetry is therefore tolerated here so that
+/// the fake remains useful as a stand-in for both the post-#1813
+/// subtree-clamp shape AND the legacy convenience shape -- without
+/// it, every conversion-side test would need to be retrofitted to
+/// build PEP-shape scopes manually.
+/// Extract the `i16` from a single-predicate `$filter=status eq <v>`
+/// AST. Mirrors the production `TenantODataMapper::map_value`
+/// translation: the SDK contract speaks the string form
+/// (`'active'`/`'suspended'`/`'deleted'`) and the fake maps it to the
+/// storage SMALLINT here. A legacy numeric RHS is still accepted so
+/// service-tests that build the AST by hand with a SMALLINT keep
+/// working until they migrate. Returns `None` for any other shape
+/// (compound predicates, non-`status` columns, unknown label) — the
+/// fake intentionally supports only the minimal flavour tests
+/// exercise so a malformed match falls through to the default "no
+/// status filter" branch (which then engages the hidden-AND
+/// `Active + Suspended` default).
+fn extract_status_eq(expr: &modkit_odata::ast::Expr) -> Option<i16> {
+    use modkit_odata::ast::{CompareOperator, Expr, Value};
+    let Expr::Compare(l, CompareOperator::Eq, r) = expr else {
+        return None;
+    };
+    let value_side: Option<&Value> = match (l.as_ref(), r.as_ref()) {
+        (Expr::Identifier(name), Expr::Value(v)) if name == "status" => Some(v),
+        (Expr::Value(v), Expr::Identifier(name)) if name == "status" => Some(v),
+        _ => None,
+    };
+    match value_side? {
+        Value::Number(n) => n.to_string().parse::<i16>().ok(),
+        Value::String(s) => match s.as_str() {
+            "active" => Some(TenantStatus::Active.as_smallint()),
+            "suspended" => Some(TenantStatus::Suspended.as_smallint()),
+            "deleted" => Some(TenantStatus::Deleted.as_smallint()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn resolves_on_tenants(property: &str) -> bool {
+    use modkit_security::pep_properties;
+    property == pep_properties::RESOURCE_ID || property == pep_properties::OWNER_TENANT_ID
+}
+
+/// Compute the set of tenant ids visible to `scope` on the `tenants`
+/// table, matching production semantics post-#1813.
+///
+/// The `SeaORM` `Scopable` derive on `tenants` resolves
+/// `pep_properties::RESOURCE_ID` to the `id` column (declared via
+/// `resource_col = "id"`). The production secure-extension at
+/// [`libs/modkit-db/src/secure/cond.rs:88`] returns `None` for any
+/// filter whose property does not resolve on the entity, which
+/// fail-closes the entire constraint -- this fake mirrors that
+/// behaviour for `InGroup` / `InGroupSubtree` and for other unknown
+/// properties by contributing `HashSet::new()` so the AND chain
+/// intersects to empty. `OWNER_TENANT_ID` is accepted in addition
+/// to `RESOURCE_ID` -- see [`resolves_on_tenants`] for the rationale.
+///
+/// Filter compilation:
+///
+/// * [`ScopeFilter::InTenantSubtree`](modkit_security::ScopeFilter::InTenantSubtree)
+///   on a resolvable property, rooted at `R`, with `respect_barriers`
+///   and `descendant_status` honoured → `tenants.id IN (SELECT
+///   descendant_id FROM tenant_closure WHERE ancestor_id = R
+///   [AND barrier = 0] [AND descendant_status IN (...)])`.
+/// * [`ScopeFilter::Eq`](modkit_security::ScopeFilter::Eq) /
+///   [`ScopeFilter::In`](modkit_security::ScopeFilter::In) on a
+///   resolvable property → flat single-row / set-membership equality
+///   on `tenants.id`. Used by legacy `AccessScope::for_tenant` paths.
+/// * Any other filter shape (`InGroup`, `InGroupSubtree`, unknown
+///   property) fails the constraint closed.
+///
+/// Multiple filters within a constraint are AND-ed; multiple
+/// constraints in a scope are OR-ed (union across constraints).
+fn visible_ids_for(state: &RepoState, scope: &AccessScope) -> Option<HashSet<Uuid>> {
+    use modkit_security::access_scope::ScopeFilter;
+
     if scope.is_unconstrained() {
         return None;
     }
+
     let mut visible: HashSet<Uuid> = HashSet::new();
-    for tid in scope.all_uuid_values_for(modkit_security::pep_properties::OWNER_TENANT_ID) {
-        visible.insert(tid);
+    for constraint in scope.constraints() {
+        let mut filter_count = 0_usize;
+        let mut per_constraint: Option<HashSet<Uuid>> = None;
+        for filter in constraint.filters() {
+            filter_count += 1;
+            let filter_ids: HashSet<Uuid> = match filter {
+                ScopeFilter::Eq(_) | ScopeFilter::In(_) => {
+                    if resolves_on_tenants(filter.property()) {
+                        filter.uuid_values().into_iter().collect()
+                    } else {
+                        // Unresolvable property on `tenants` — prod
+                        // secure-extension would fail-closed; mirror.
+                        HashSet::new()
+                    }
+                }
+                ScopeFilter::InTenantSubtree(f) => {
+                    if !resolves_on_tenants(f.property()) {
+                        HashSet::new()
+                    } else if let Some(root) = f.root_tenant_id().as_uuid() {
+                        let respect_barriers = f.respect_barriers();
+                        // Honour `descendant_status` like
+                        // `libs/modkit-db/src/secure/cond.rs:177-183`.
+                        // The PEP encodes each `TenantStatus` to its
+                        // canonical SMALLINT via `as_smallint`, and
+                        // the closure row stores the same
+                        // SMALLINT in `descendant_status`. Empty list
+                        // disables the filter, matching prod.
+                        let status_smallints: Option<Vec<i16>> = if f.descendant_status().is_empty()
+                        {
+                            None
+                        } else {
+                            let mut acc: Vec<i16> = Vec::new();
+                            for v in f.descendant_status() {
+                                if let modkit_security::access_scope::ScopeValue::Int(i) = v
+                                    && let Ok(s) = i16::try_from(*i)
+                                {
+                                    acc.push(s);
+                                }
+                            }
+                            Some(acc)
+                        };
+                        let mut ids: HashSet<Uuid> = HashSet::new();
+                        for row in &state.closure {
+                            if row.ancestor_id != root {
+                                continue;
+                            }
+                            if respect_barriers && row.barrier != 0 {
+                                continue;
+                            }
+                            if let Some(ref statuses) = status_smallints
+                                && !statuses.contains(&row.descendant_status)
+                            {
+                                continue;
+                            }
+                            ids.insert(row.descendant_id);
+                        }
+                        ids
+                    } else {
+                        // Non-UUID root: prod would fail compile;
+                        // mirror by failing this constraint closed.
+                        HashSet::new()
+                    }
+                }
+                // Resource-group filters do not resolve on the
+                // `tenants` entity. Prod secure-extension would
+                // `None` out the constraint; fake mirrors by failing
+                // closed.
+                ScopeFilter::InGroup(_) | ScopeFilter::InGroupSubtree(_) => HashSet::new(),
+            };
+            per_constraint = Some(match per_constraint {
+                None => filter_ids,
+                Some(prev) => prev.intersection(&filter_ids).copied().collect(),
+            });
+        }
+        // A constraint with zero filters is `AND of nothing` = TRUE
+        // in real SQL; this fake's `tenants` entity is finite, so
+        // contributing the universe is represented by leaving
+        // `visible_ids_for` to return `None` upstream — that case is
+        // unreachable through the public AccessScope constructors
+        // today, so contributing nothing is the safer default. If a
+        // future constructor builds such a shape, expand here.
+        if filter_count > 0
+            && let Some(ids) = per_constraint
+        {
+            visible.extend(ids);
+        }
     }
     Some(visible)
 }
@@ -534,36 +687,54 @@ impl TenantRepo for FakeTenantRepo {
     async fn list_children(
         &self,
         scope: &AccessScope,
-        query: &ListChildrenQuery,
-    ) -> Result<TenantPage<TenantModel>, DomainError> {
+        parent_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<TenantModel>, DomainError> {
+        // Fake repo mirrors the production hidden-AND default
+        // (`status IN (Active, Suspended)` when no `$filter=status …`
+        // is present) and additionally honors the single-predicate
+        // shape `status eq <i16>` so service-level tests can assert
+        // status-filtering behaviour without depending on the real
+        // `paginate_odata`. Anything richer (`$filter=name …`,
+        // boolean composition over `status`, `$orderby`, cursor
+        // round-trips) is ignored — those flows are covered by
+        // `paginate_odata`'s own tests in `modkit-db`.
         let state = self.state.lock().expect("lock");
         let visible = visible_ids_for(&state, scope);
+        let status_filter: Option<i16> = query.filter().and_then(extract_status_eq);
+        let caller_filters_status = status_filter.is_some();
         let mut items: Vec<TenantModel> = state
             .tenants
             .values()
-            .filter(|t| t.parent_id == Some(query.parent_id))
+            .filter(|t| t.parent_id == Some(parent_id))
             .filter(|t| t.status.is_sdk_visible())
             .filter(|t| match &visible {
                 Some(vis) => vis.contains(&t.id),
                 None => true,
             })
-            .filter(|t| match query.status_filter() {
-                // Lift SDK 3-variant status into AM-internal so the
-                // membership check against `t.status` (4-var) compiles.
-                Some(allowed) if !allowed.is_empty() => {
-                    allowed.iter().any(|s| TenantStatus::from(*s) == t.status)
-                }
-                // Default: active and suspended only, matching repo_impl default.
-                _ => !matches!(t.status, TenantStatus::Deleted),
+            .filter(|t| match status_filter {
+                Some(code) => t.status.as_smallint() == code,
+                None if caller_filters_status => true,
+                None => !matches!(t.status, TenantStatus::Deleted),
             })
             .cloned()
             .collect();
         items.sort_by_key(|t| (t.created_at, t.id));
-        let total = u64::try_from(items.len()).unwrap_or(u64::MAX);
-        let skip = usize::try_from(query.skip).unwrap_or(usize::MAX);
-        let top = usize::try_from(query.top()).unwrap_or(usize::MAX);
-        let paged: Vec<TenantModel> = items.into_iter().skip(skip).take(top).collect();
-        Ok(TenantPage::new(paged, query.top(), query.skip, Some(total)))
+
+        // Cursor / order are ignored — service tests assert on the
+        // first page only. Limit honors `query.limit` with the
+        // production default fallback (50).
+        let limit_u64 = query.limit.unwrap_or(50);
+        let take_n = usize::try_from(limit_u64).unwrap_or(usize::MAX);
+        let paged: Vec<TenantModel> = items.into_iter().take(take_n).collect();
+        Ok(Page {
+            items: paged,
+            page_info: PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: limit_u64,
+            },
+        })
     }
 
     async fn insert_provisioning(
@@ -785,7 +956,7 @@ impl TenantRepo for FakeTenantRepo {
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
-        patch: &TenantUpdate,
+        patch: &UpdateTenantRequest,
     ) -> Result<TenantModel, DomainError> {
         let mut state = self.state.lock().expect("lock");
         let visible = visible_ids_for(&state, scope);
@@ -805,12 +976,10 @@ impl TenantRepo for FakeTenantRepo {
                 resource: tenant_id.to_string(),
             })?;
 
-        // Mirror the production guards in `repo_impl::updates`. A
-        // service-layer test that bypasses
-        // `validate_status_transition` and lands here would silently
-        // pass against an un-guarded fake while production would
-        // reject the patch with `Conflict`. Keeping the fake faithful
-        // to the SQL impl prevents that drift.
+        // Mirror the production guards in `repo_impl::updates::update_tenant_mutable`.
+        // The PATCH shape is name-only — lifecycle transitions go
+        // through `set_status` — so the guards here reject the
+        // non-mutable lifecycle states and stop.
         if matches!(tenant.status, TenantStatus::Deleted) {
             return Err(DomainError::Conflict {
                 detail: format!("tenant {tenant_id} is deleted and not mutable"),
@@ -821,59 +990,117 @@ impl TenantRepo for FakeTenantRepo {
                 detail: format!("tenant {tenant_id} is provisioning and not mutable through PATCH"),
             });
         }
-        let maybe_new_status: Option<TenantStatus> = patch.status.map(TenantStatus::from);
-        if let Some(new_status) = maybe_new_status {
-            match new_status {
-                TenantStatus::Active | TenantStatus::Suspended => {}
-                TenantStatus::Deleted => {
-                    return Err(DomainError::Conflict {
-                        detail: format!(
-                            "tenant {tenant_id}: PATCH cannot transition to deleted; \
-                             use the soft-delete flow (`schedule_deletion`)"
-                        ),
-                    });
-                }
-                TenantStatus::Provisioning => {
-                    return Err(DomainError::Conflict {
-                        detail: format!(
-                            "tenant {tenant_id}: PATCH cannot transition to provisioning"
-                        ),
-                    });
-                }
-            }
-        }
 
         // Idempotent no-op (HTTP PATCH semantics, option A — true
         // idempotency). Mirrors the production change-detection in
-        // `repo_impl::updates`: fold "patch is Some AND value differs"
-        // into an `Option` so we can pattern-match the write step
-        // without a redundant flag-then-`expect` dance.
+        // `repo_impl::updates::update_tenant_mutable`: if the patched
+        // name matches the current row, skip the write.
         let name_to_write = patch
             .name
             .as_ref()
             .filter(|n| n.as_str() != tenant.name.as_str());
-        let status_to_write = maybe_new_status.filter(|s| *s != tenant.status);
-        if name_to_write.is_none() && status_to_write.is_none() {
+        if name_to_write.is_none() {
             return Ok(tenant.clone());
         }
 
         if let Some(new_name) = name_to_write {
             tenant.name = new_name.clone();
         }
-        if let Some(new_status) = status_to_write {
-            tenant.status = new_status;
-        }
         // Production stamps `updated_at = now()` inside the same
         // transaction; mirror it so tests that read back the row see
         // the same timestamp behavior.
         tenant.updated_at = OffsetDateTime::now_utc();
-        let updated = tenant.clone();
-        if status_to_write.is_some() {
-            for row in &mut state.closure {
-                if row.descendant_id == tenant_id {
-                    row.descendant_status = updated.status.as_smallint();
-                }
+        Ok(tenant.clone())
+    }
+
+    async fn set_status(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        new_status: TenantStatus,
+        now: OffsetDateTime,
+    ) -> Result<TenantModel, DomainError> {
+        // Eager rejection of non-admissible targets — matches
+        // `repo_impl::updates::set_status`.
+        match new_status {
+            TenantStatus::Active | TenantStatus::Suspended => {}
+            TenantStatus::Deleted => {
+                return Err(DomainError::Conflict {
+                    detail: format!(
+                        "tenant {tenant_id}: set_status cannot transition to deleted; \
+                         use the soft-delete flow (`schedule_deletion`)"
+                    ),
+                });
             }
+            TenantStatus::Provisioning => {
+                return Err(DomainError::Conflict {
+                    detail: format!(
+                        "tenant {tenant_id}: set_status cannot transition to provisioning"
+                    ),
+                });
+            }
+        }
+        let mut state = self.state.lock().expect("lock");
+        let visible = visible_ids_for(&state, scope);
+        if let Some(ref vis) = visible
+            && !vis.contains(&tenant_id)
+        {
+            return Err(DomainError::NotFound {
+                detail: format!("tenant {tenant_id} not found"),
+                resource: tenant_id.to_string(),
+            });
+        }
+        let tenant = state
+            .tenants
+            .get_mut(&tenant_id)
+            .ok_or_else(|| DomainError::NotFound {
+                detail: format!("tenant {tenant_id} not found"),
+                resource: tenant_id.to_string(),
+            })?;
+        if matches!(tenant.status, TenantStatus::Deleted) {
+            return Err(DomainError::Conflict {
+                detail: format!(
+                    "tenant {tenant_id} is deleted; status is terminal during retention"
+                ),
+            });
+        }
+        if matches!(tenant.status, TenantStatus::Provisioning) {
+            return Err(DomainError::Conflict {
+                detail: format!(
+                    "tenant {tenant_id} is provisioning; lifecycle transitions are not \
+                     permitted until activation completes"
+                ),
+            });
+        }
+        // Same-to-same: idempotent no-op (no `updated_at` bump).
+        if tenant.status == new_status {
+            return Ok(tenant.clone());
+        }
+        tenant.status = new_status;
+        tenant.updated_at = now;
+        let updated = tenant.clone();
+        // Mirror the production self-row invariant
+        // (`repo_impl::updates::set_status`): every SDK-visible tenant
+        // MUST have a `(id, id)` closure row, so this rewrite MUST
+        // touch at least the self-row. Zero matches means a test
+        // seeded an invariant-broken state. Surface it as `Internal`
+        // so the fake stays faithful to production and a buggy seed
+        // does not silently pass.
+        let mut closure_rows_affected = 0usize;
+        for row in &mut state.closure {
+            if row.descendant_id == tenant_id {
+                row.descendant_status = updated.status.as_smallint();
+                closure_rows_affected += 1;
+            }
+        }
+        if closure_rows_affected == 0 {
+            return Err(DomainError::Internal {
+                diagnostic: format!(
+                    "set_status: closure descendant_status rewrite for tenant \
+                     {tenant_id} affected 0 rows; self-row missing"
+                ),
+                cause: None,
+            });
         }
         Ok(updated)
     }
@@ -936,25 +1163,21 @@ impl TenantRepo for FakeTenantRepo {
                     TenantRetentionRow {
                         id: t.id,
                         depth: t.depth,
-                        deletion_scheduled_at: *sched,
+                        deleted_at: *sched,
                         retention_window: retention,
                         claimed_by: worker_id,
                     }
                 })
             })
             .filter(|r| {
-                crate::domain::tenant::retention::is_due(
-                    now,
-                    r.deletion_scheduled_at,
-                    r.retention_window,
-                )
+                crate::domain::tenant::retention::is_due(now, r.deleted_at, r.retention_window)
             })
             .collect();
         // Stable leaf-first ordering, matching `repo_impl::scan_retention_due`.
         out.sort_by(|a, b| {
             b.depth
                 .cmp(&a.depth)
-                .then_with(|| a.deletion_scheduled_at.cmp(&b.deletion_scheduled_at))
+                .then_with(|| a.deleted_at.cmp(&b.deleted_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
         out.truncate(limit);
@@ -1063,10 +1286,14 @@ impl TenantRepo for FakeTenantRepo {
                 detail: format!("tenant {id} not found"),
                 resource: id.to_string(),
             })?;
+        // Idempotent short-circuit: already a tombstone. Mirrors the
+        // production guard in `repo_impl::updates::schedule_deletion`
+        // — return the existing row without re-stamping `deleted_at`
+        // or rewriting the retention bookkeeping so a racing retry
+        // observes the post-flip state and returns the tombstone
+        // instead of `Conflict`.
         if matches!(existing.status, TenantStatus::Deleted) {
-            return Err(DomainError::Conflict {
-                detail: format!("tenant {id} already deleted"),
-            });
+            return Ok(existing.clone());
         }
         if matches!(existing.status, TenantStatus::Provisioning) {
             return Err(DomainError::Conflict {
@@ -1088,6 +1315,9 @@ impl TenantRepo for FakeTenantRepo {
         tenant.updated_at = now;
         // Mirror the real repo: `deleted_at` is the public-contract
         // tombstone (see `repo_impl.rs::schedule_deletion`).
+        // Production stamps `deleted_at = now`; the retention sweep
+        // computes eligibility wall-clock as
+        // `deleted_at + retention_window`. The fake mirrors that.
         tenant.deleted_at = Some(now);
         let updated = tenant.clone();
         state.retention.insert(id, (now, retention));
@@ -1389,16 +1619,19 @@ mod repo_contract_tests {
         repo.insert_tenant_raw(tenant(suspended, Some(root), TenantStatus::Suspended));
         repo.insert_tenant_raw(tenant(deleted, Some(root), TenantStatus::Deleted));
 
-        let query = ListChildrenQuery::new(root, Some(Vec::new()), 10, 0).expect("query");
+        // ODataQuery with no `$filter`: production repo ANDs the
+        // hidden default `status IN (Active, Suspended)`. The fake
+        // mirrors that default.
+        let query = ODataQuery::default().with_limit(10);
         let page = repo
-            .list_children(&AccessScope::allow_all(), &query)
+            .list_children(&AccessScope::allow_all(), root, &query)
             .await
             .expect("list");
 
         assert_eq!(
             page.items.iter().map(|t| t.id).collect::<Vec<_>>(),
             vec![active, suspended],
-            "empty status filter must match production default: Active + Suspended"
+            "absent `$filter=status ...` must match production default: Active + Suspended"
         );
     }
 
@@ -1462,6 +1695,74 @@ mod repo_contract_tests {
         );
     }
 
+    /// Idempotency at the repo boundary: calling `schedule_deletion`
+    /// on a row that is already `Deleted` MUST return the existing
+    /// tombstone without rewriting `deleted_at` or the retention
+    /// bookkeeping. This is the correctness boundary that protects
+    /// against a concurrent-DELETE race in which two callers both
+    /// load `Active` and both enter the TX — the loser's
+    /// SERIALIZABLE retry would observe `Deleted` and previously
+    /// emitted `Conflict("already deleted")`, defeating the
+    /// service-layer idempotency contract.
+    #[tokio::test]
+    async fn schedule_deletion_is_idempotent_on_already_deleted_row() {
+        let id = Uuid::from_u128(0x100);
+        let repo = FakeTenantRepo::with_root(id);
+        let leaf = Uuid::from_u128(0x101);
+        repo.insert_tenant_raw(tenant(leaf, Some(id), TenantStatus::Active));
+
+        let first = repo
+            .schedule_deletion(
+                &AccessScope::allow_all(),
+                leaf,
+                ts(1_700_000_100),
+                Some(Duration::from_secs(0)),
+            )
+            .await
+            .expect("first soft-delete");
+        assert_eq!(first.status, TenantStatus::Deleted);
+        let first_deleted_at = first
+            .deleted_at
+            .expect("tombstone carries deleted_at after first call");
+        let retention_after_first = repo
+            .state
+            .lock()
+            .expect("lock")
+            .retention
+            .get(&leaf)
+            .copied();
+        assert!(retention_after_first.is_some(), "retention row written");
+
+        // Second call with a LATER `now`. Idempotent return path MUST
+        // NOT re-stamp `deleted_at` (which would push back the
+        // retention deadline) and MUST NOT rewrite the retention row.
+        let second = repo
+            .schedule_deletion(
+                &AccessScope::allow_all(),
+                leaf,
+                ts(1_700_000_500),
+                Some(Duration::from_secs(0)),
+            )
+            .await
+            .expect("second soft-delete must succeed (idempotent), not Conflict");
+        assert_eq!(second.status, TenantStatus::Deleted);
+        assert_eq!(
+            second.deleted_at,
+            Some(first_deleted_at),
+            "idempotent retry MUST NOT re-stamp deleted_at"
+        );
+        assert_eq!(
+            repo.state
+                .lock()
+                .expect("lock")
+                .retention
+                .get(&leaf)
+                .copied(),
+            retention_after_first,
+            "idempotent retry MUST NOT rewrite the retention bookkeeping"
+        );
+    }
+
     #[tokio::test]
     async fn hard_delete_one_clears_fake_side_state() {
         let id = Uuid::from_u128(0x100);
@@ -1500,7 +1801,7 @@ mod repo_contract_tests {
         );
     }
 
-    /// Race window: the `create_child` saga's `IdP` call out-runs the
+    /// Race window: the `create_tenant` saga's `IdP` call out-runs the
     /// reaper's `provisioning_timeout_secs`, the reaper claims the
     /// stuck `Provisioning` row, then the saga returns and tries to
     /// finalize. The activation MUST be rejected with `Conflict` so
@@ -1706,7 +2007,7 @@ mod claim_invariant_tests {
             rows.iter().map(|row| row.id).collect::<Vec<_>>(),
             vec![deep, older_low_id, older_high_id, newer_lower_id, shallow],
             "fake repo must mirror production order: depth DESC, \
-             deletion_scheduled_at ASC, id ASC"
+             deleted_at ASC, id ASC"
         );
     }
 

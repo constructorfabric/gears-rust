@@ -394,7 +394,7 @@ async fn soft_delete_resolved_older_than_only_touches_resolved() {
     let touched = repo
         .soft_delete_resolved_older_than(&scope(), cutoff, now + Duration::days(8), 10)
         .await
-        .expect("soft_delete");
+        .expect("delete_tenant");
     assert_eq!(touched, 1, "only the resolved row should be touched");
     let snapshot = repo.snapshot_all();
     let resolved_after = snapshot

@@ -14,6 +14,7 @@
 //! checker is reserved for unit tests.
 
 pub(crate) mod checker;
+pub(crate) mod metadata_schema_registry;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -23,3 +24,4 @@ pub(crate) mod test_helpers;
 // It is **not** part of the AM module's external API surface — outside
 // consumers go through `account-management-sdk`.
 pub(crate) use checker::GtsTenantTypeChecker;
+pub(crate) use metadata_schema_registry::GtsMetadataSchemaRegistry;

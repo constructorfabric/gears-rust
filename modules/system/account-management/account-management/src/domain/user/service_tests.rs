@@ -26,8 +26,8 @@
 
 use std::sync::Arc;
 
-use account_management_sdk::{IdpNewUser, IdpUser, IdpUserPagination};
-use modkit_security::AccessScope;
+use account_management_sdk::{IdpNewUser, IdpUser, IdpUserPagination, ListUsersQuery};
+use modkit_security::SecurityContext;
 use serde_json::json;
 use time::OffsetDateTime;
 use types_registry_sdk::testing::MockTypesRegistryClient;
@@ -36,11 +36,9 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::tenant::model::{TenantModel, TenantStatus};
-use crate::domain::tenant::test_support::FakeTenantRepo;
+use crate::domain::tenant::test_support::{FakeTenantRepo, mock_enforcer};
 use crate::domain::user::service::UserService;
 use crate::domain::user::test_support::{FakeIdpUserProvisioner, FakeUserOutcome};
-
-const REQUESTER_MARKER: u128 = 0xF1;
 
 /// Canonical chained `tenant_type` every seeded tenant carries. The
 /// matching `GtsTypeSchema` is pre-registered in [`make_service`]'s
@@ -79,12 +77,33 @@ fn fixed_now() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("epoch")
 }
 
-fn scope() -> AccessScope {
-    AccessScope::allow_all()
+/// Subject tenant id used by every service-test `ctx()`. The
+/// `mock_enforcer` returns an `InTenantSubtree` predicate rooted at
+/// this id, and `seed_tenant` materialises closure rows
+/// `(subject_root, tenant, barrier = 0)` so the PEP-derived scope
+/// resolves to a non-empty visible set on the `FakeTenantRepo`.
+const fn ctx_subject_root() -> Uuid {
+    Uuid::from_u128(0xCAFE_BABE)
 }
 
-fn requester() -> Uuid {
-    Uuid::from_u128(REQUESTER_MARKER)
+fn ctx() -> SecurityContext {
+    // The seeded `subject_tenant_id` matches `ctx_subject_root()` so
+    // closure-row seeding in `seed_tenant` keeps every test tenant
+    // visible under the compiled PEP scope. Tests asserting on the
+    // PEP-deny path build a different ctx via `ctx_for(...)`.
+    SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0xCAFE))
+        .subject_tenant_id(ctx_subject_root())
+        .build()
+        .expect("ctx")
+}
+
+fn ctx_for(root: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0xCAFE))
+        .subject_tenant_id(root)
+        .build()
+        .expect("ctx")
 }
 
 fn user_schema() -> GtsTypeSchema {
@@ -109,18 +128,18 @@ fn make_service(tenants: Arc<FakeTenantRepo>, idp: Arc<FakeIdpUserProvisioner>) 
     // mandatory) can resolve the seeded tenants' chained type, AND
     // with the `gts.cf.core.am.user.v1~` user-projection schema so
     // `validate_new_user_payload_via_gts` reaches the registered-
-    // schema path. `provision_user` is fail-closed on a missing user
+    // schema path. `create_user` is fail-closed on a missing user
     // schema (see `validate_new_user_payload_via_gts` doc), so any
     // happy-path test would otherwise short-circuit to
     // `ServiceUnavailable` before reaching the IdP. A dedicated test
-    // (`provision_user_without_registered_user_schema_returns_service_unavailable`)
+    // (`create_user_without_registered_user_schema_returns_service_unavailable`)
     // pins the fail-closed behaviour with a registry that omits the
     // user schema.
     let types_registry = Arc::new(
         MockTypesRegistryClient::new()
             .with_type_schemas([test_tenant_type_schema(), user_schema()]),
     );
-    UserService::new(tenants, idp, types_registry)
+    UserService::new(tenants, idp, types_registry, mock_enforcer())
 }
 
 fn make_service_without_user_schema(
@@ -130,11 +149,11 @@ fn make_service_without_user_schema(
     // Mirrors `make_service` but omits the `gts.cf.core.am.user.v1~`
     // schema so `validate_new_user_payload_via_gts` exercises its
     // fail-closed arm. Drives the
-    // `provision_user_without_registered_user_schema_returns_service_unavailable`
+    // `create_user_without_registered_user_schema_returns_service_unavailable`
     // service-layer contract test.
     let types_registry =
         Arc::new(MockTypesRegistryClient::new().with_type_schemas([test_tenant_type_schema()]));
-    UserService::new(tenants, idp, types_registry)
+    UserService::new(tenants, idp, types_registry, mock_enforcer())
 }
 
 fn seed_tenant(
@@ -158,6 +177,17 @@ fn seed_tenant(
         updated_at: now,
         deleted_at: None,
     });
+    // Mirror metadata service tests: closure rows the
+    // `MockAuthZResolver`-derived `InTenantSubtree` predicate
+    // consults via `FakeTenantRepo::visible_ids_for`. Without
+    // these every PEP-derived scope would resolve to an empty
+    // visible set and every tenant lookup would surface as
+    // `NotFound`.
+    let subject_root = ctx_subject_root();
+    fake.seed_closure(subject_root, id, 0, status);
+    if subject_root != id {
+        fake.seed_closure(id, id, 0, status);
+    }
 }
 
 fn payload(username: &str) -> IdpNewUser {
@@ -178,10 +208,10 @@ fn filter_pagination() -> IdpUserPagination {
     IdpUserPagination::new(1, None).expect("top=1 is valid")
 }
 
-// ---- provision_user -----------------------------------------------
+// ---- create_user -----------------------------------------------
 
 #[tokio::test]
-async fn provision_user_happy_path_returns_projection() {
+async fn create_user_happy_path_returns_projection() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x1);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -196,7 +226,7 @@ async fn provision_user_happy_path_returns_projection() {
     let svc = make_service(tenants, idp.clone());
 
     let projection = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), requester())
+        .create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect("happy path provision");
 
@@ -210,14 +240,14 @@ async fn provision_user_happy_path_returns_projection() {
     assert_eq!(calls[0].1, "alice");
 }
 
-/// Mirror of [`provision_user_happy_path_returns_projection`] with
+/// Mirror of [`create_user_happy_path_returns_projection`] with
 /// the `gts.cf.core.am.user.v1~` user-projection schema actually
 /// registered in the types registry. Pins that the service-layer
 /// happy path traverses the registered-schema validator without
 /// short-circuiting to the unknown-schema arm. Closes deep-review
 /// #20.
 #[tokio::test]
-async fn provision_user_happy_path_with_registered_user_schema_returns_projection() {
+async fn create_user_happy_path_with_registered_user_schema_returns_projection() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x1);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -232,7 +262,7 @@ async fn provision_user_happy_path_with_registered_user_schema_returns_projectio
     let svc = make_service(tenants, idp.clone());
 
     let projection = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), requester())
+        .create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect("happy path provision with registered user schema");
 
@@ -249,13 +279,13 @@ async fn provision_user_happy_path_with_registered_user_schema_returns_projectio
 
 /// Service-layer contract test for the fail-closed
 /// `validate_new_user_payload_via_gts` arm: when the registry has no
-/// `gts.cf.core.am.user.v1~` entry, `provision_user` MUST surface
+/// `gts.cf.core.am.user.v1~` entry, `create_user` MUST surface
 /// `ServiceUnavailable` rather than degrading to length-only checks.
 /// Pins that the deployment cliff (`format: email` and future
 /// `pattern` rules silently disabled before catalog seed) cannot
 /// recur.
 #[tokio::test]
-async fn provision_user_without_registered_user_schema_returns_service_unavailable() {
+async fn create_user_without_registered_user_schema_returns_service_unavailable() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x1);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -264,7 +294,7 @@ async fn provision_user_without_registered_user_schema_returns_service_unavailab
     let svc = make_service_without_user_schema(tenants, idp.clone());
 
     let err = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), requester())
+        .create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect_err(
             "user schema unregistered MUST fail closed -- no AM-side fallback gate \
@@ -290,14 +320,14 @@ async fn provision_user_without_registered_user_schema_returns_service_unavailab
 }
 
 #[tokio::test]
-async fn provision_user_rejects_unknown_tenant_with_not_found_no_idp_call() {
+async fn create_user_rejects_unknown_tenant_with_not_found_no_idp_call() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let idp = Arc::new(FakeIdpUserProvisioner::new());
     let svc = make_service(tenants, idp.clone());
 
     let unknown = Uuid::from_u128(0x2);
     let err = svc
-        .provision_user(&scope(), unknown, payload("alice"), requester())
+        .create_user(&ctx(), unknown, payload("alice"))
         .await
         .expect_err("unknown tenant must reject");
 
@@ -318,12 +348,12 @@ async fn provision_user_rejects_unknown_tenant_with_not_found_no_idp_call() {
 /// tenant exists but the caller's `AccessScope` is narrowed to a
 /// foreign tenant — the `resolve_active_tenant` lookup forwards
 /// the caller scope and surfaces the seeded tenant as `NotFound`.
-/// An internal actor that holds a `provision_user` capability
+/// An internal actor that holds a `create_user` capability
 /// cannot probe tenant existence by submitting requests against
 /// tenants outside its scope. Closes deep-review #8 user-side
 /// coverage.
 #[tokio::test]
-async fn provision_user_under_restricted_scope_collapses_to_not_found_no_idp_call() {
+async fn create_user_under_restricted_scope_collapses_to_not_found_no_idp_call() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x1);
     let foreign = Uuid::from_u128(0x99);
@@ -332,9 +362,9 @@ async fn provision_user_under_restricted_scope_collapses_to_not_found_no_idp_cal
     let idp = Arc::new(FakeIdpUserProvisioner::new());
     let svc = make_service(tenants, idp.clone());
 
-    let restricted = AccessScope::for_tenant(foreign);
+    let restricted = ctx_for(foreign);
     let err = svc
-        .provision_user(&restricted, tenant_id, payload("alice"), requester())
+        .create_user(&restricted, tenant_id, payload("alice"))
         .await
         .expect_err("out-of-scope caller must not see the tenant");
     match err {
@@ -351,7 +381,7 @@ async fn provision_user_under_restricted_scope_collapses_to_not_found_no_idp_cal
 }
 
 #[tokio::test]
-async fn provision_user_rejects_suspended_tenant_with_validation_no_idp_call() {
+async fn create_user_rejects_suspended_tenant_with_validation_no_idp_call() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x10);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Suspended, "frozen");
@@ -359,7 +389,7 @@ async fn provision_user_rejects_suspended_tenant_with_validation_no_idp_call() {
     let svc = make_service(tenants, idp.clone());
 
     let err = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), requester())
+        .create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect_err("suspended tenant must reject");
 
@@ -376,7 +406,7 @@ async fn provision_user_rejects_suspended_tenant_with_validation_no_idp_call() {
 }
 
 #[tokio::test]
-async fn provision_user_rejects_provisioning_tenant_with_validation_no_idp_call() {
+async fn create_user_rejects_provisioning_tenant_with_validation_no_idp_call() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x11);
     seed_tenant(
@@ -390,7 +420,7 @@ async fn provision_user_rejects_provisioning_tenant_with_validation_no_idp_call(
     let svc = make_service(tenants, idp.clone());
 
     let err = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), requester())
+        .create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect_err("provisioning tenant must reject");
 
@@ -399,7 +429,7 @@ async fn provision_user_rejects_provisioning_tenant_with_validation_no_idp_call(
 }
 
 #[tokio::test]
-async fn provision_user_idp_unavailable_maps_to_idp_unavailable() {
+async fn create_user_idp_unavailable_maps_to_idp_unavailable() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x20);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -408,7 +438,7 @@ async fn provision_user_idp_unavailable_maps_to_idp_unavailable() {
     let svc = make_service(tenants, idp);
 
     let err = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), requester())
+        .create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect_err("unavailable must err");
 
@@ -416,7 +446,7 @@ async fn provision_user_idp_unavailable_maps_to_idp_unavailable() {
 }
 
 #[tokio::test]
-async fn provision_user_idp_unsupported_maps_to_unsupported_operation() {
+async fn create_user_idp_unsupported_maps_to_unsupported_operation() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x21);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -425,7 +455,7 @@ async fn provision_user_idp_unsupported_maps_to_unsupported_operation() {
     let svc = make_service(tenants, idp);
 
     let err = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), requester())
+        .create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect_err("unsupported must err");
 
@@ -433,7 +463,7 @@ async fn provision_user_idp_unsupported_maps_to_unsupported_operation() {
 }
 
 #[tokio::test]
-async fn provision_user_idp_rejects_payload_maps_to_validation() {
+async fn create_user_idp_rejects_payload_maps_to_validation() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x22);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -442,17 +472,17 @@ async fn provision_user_idp_rejects_payload_maps_to_validation() {
     let svc = make_service(tenants, idp);
 
     let err = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), requester())
+        .create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect_err("rejected payload must err");
 
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
-// ---- deprovision_user ---------------------------------------------
+// ---- delete_user ---------------------------------------------
 
 #[tokio::test]
-async fn deprovision_user_happy_path_removed() {
+async fn delete_user_happy_path_removed() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x30);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -460,7 +490,7 @@ async fn deprovision_user_happy_path_removed() {
     let svc = make_service(tenants, idp.clone());
 
     let user_id = Uuid::from_u128(0xBEEF);
-    svc.deprovision_user(&scope(), tenant_id, user_id, requester())
+    svc.delete_user(&ctx(), tenant_id, user_id)
         .await
         .expect("happy path deprovision returns Ok");
     assert_eq!(idp.delete_call_count(), 1);
@@ -469,7 +499,7 @@ async fn deprovision_user_happy_path_removed() {
 }
 
 #[tokio::test]
-async fn deprovision_user_retry_remains_idempotent() {
+async fn delete_user_retry_remains_idempotent() {
     // AC #5: a subsequent retry of the same DELETE also returns 204.
     // The plugin contract folds removed-vs-absent into a single
     // `Ok(())` (plugin maps vendor 404 / 410 to `Ok(())` itself), so
@@ -484,11 +514,11 @@ async fn deprovision_user_retry_remains_idempotent() {
 
     let user_id = Uuid::from_u128(0xBEEF_BEEF);
 
-    svc.deprovision_user(&scope(), tenant_id, user_id, requester())
+    svc.delete_user(&ctx(), tenant_id, user_id)
         .await
         .expect("first delete returns Ok(())");
 
-    svc.deprovision_user(&scope(), tenant_id, user_id, requester())
+    svc.delete_user(&ctx(), tenant_id, user_id)
         .await
         .expect("retry returns Ok(()) - idempotent contract");
 
@@ -500,7 +530,7 @@ async fn deprovision_user_retry_remains_idempotent() {
 }
 
 #[tokio::test]
-async fn deprovision_user_idp_unavailable_does_not_become_idempotent_success() {
+async fn delete_user_idp_unavailable_does_not_become_idempotent_success() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x32);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -510,7 +540,7 @@ async fn deprovision_user_idp_unavailable_does_not_become_idempotent_success() {
 
     let user_id = Uuid::from_u128(0xDEAD);
     let err = svc
-        .deprovision_user(&scope(), tenant_id, user_id, requester())
+        .delete_user(&ctx(), tenant_id, user_id)
         .await
         .expect_err("unavailable must NOT collapse to idempotent success");
     assert!(
@@ -520,7 +550,7 @@ async fn deprovision_user_idp_unavailable_does_not_become_idempotent_success() {
 }
 
 #[tokio::test]
-async fn deprovision_user_unsupported_passes_through() {
+async fn delete_user_unsupported_passes_through() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x33);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -529,21 +559,21 @@ async fn deprovision_user_unsupported_passes_through() {
     let svc = make_service(tenants, idp);
 
     let err = svc
-        .deprovision_user(&scope(), tenant_id, Uuid::from_u128(0xBEEF), requester())
+        .delete_user(&ctx(), tenant_id, Uuid::from_u128(0xBEEF))
         .await
         .expect_err("unsupported must surface unchanged");
     assert!(matches!(err, DomainError::UnsupportedOperation { .. }));
 }
 
 #[tokio::test]
-async fn deprovision_user_rejects_unknown_tenant_no_idp_call() {
+async fn delete_user_rejects_unknown_tenant_no_idp_call() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let idp = Arc::new(FakeIdpUserProvisioner::new());
     let svc = make_service(tenants, idp.clone());
 
     let unknown = Uuid::from_u128(0x40);
     let err = svc
-        .deprovision_user(&scope(), unknown, Uuid::from_u128(0xBEEF), requester())
+        .delete_user(&ctx(), unknown, Uuid::from_u128(0xBEEF))
         .await
         .expect_err("unknown tenant must reject");
     assert!(matches!(err, DomainError::NotFound { .. }));
@@ -565,7 +595,7 @@ async fn list_users_happy_path_returns_page_through_idp() {
     let svc = make_service(tenants, idp);
 
     let page = svc
-        .list_users(&scope(), tenant_id, None, pagination())
+        .list_users(&ctx(), tenant_id, ListUsersQuery::new(pagination()))
         .await
         .expect("happy path list");
     assert_eq!(page.items.len(), 2);
@@ -590,7 +620,11 @@ async fn list_users_user_id_filter_returns_one_or_empty() {
     let svc = make_service(tenants, idp);
 
     let hit = svc
-        .list_users(&scope(), tenant_id, Some(target), filter_pagination())
+        .list_users(
+            &ctx(),
+            tenant_id,
+            ListUsersQuery::new(filter_pagination()).with_user_id_filter(target),
+        )
         .await
         .expect("filter by existing user id");
     assert_eq!(hit.items.len(), 1, "single-user filter returns 1 row");
@@ -598,7 +632,11 @@ async fn list_users_user_id_filter_returns_one_or_empty() {
 
     let absent = Uuid::from_u128(0xDEAD);
     let miss = svc
-        .list_users(&scope(), tenant_id, Some(absent), filter_pagination())
+        .list_users(
+            &ctx(),
+            tenant_id,
+            ListUsersQuery::new(filter_pagination()).with_user_id_filter(absent),
+        )
         .await
         .expect("filter by absent user id is success-with-empty-list");
     assert!(
@@ -617,7 +655,7 @@ async fn list_users_idp_unavailable_does_not_serve_stale_page() {
     let svc = make_service(tenants, idp);
 
     let err = svc
-        .list_users(&scope(), tenant_id, None, pagination())
+        .list_users(&ctx(), tenant_id, ListUsersQuery::new(pagination()))
         .await
         .expect_err("unavailable must err");
     assert!(matches!(err, DomainError::IdpUnavailable { .. }));
@@ -631,7 +669,7 @@ async fn list_users_rejects_unknown_tenant_no_idp_call() {
 
     let unknown = Uuid::from_u128(0x53);
     let err = svc
-        .list_users(&scope(), unknown, None, pagination())
+        .list_users(&ctx(), unknown, ListUsersQuery::new(pagination()))
         .await
         .expect_err("unknown tenant must reject");
     assert!(matches!(err, DomainError::NotFound { .. }));
@@ -647,11 +685,72 @@ async fn list_users_rejects_deleted_tenant_no_idp_call() {
     let svc = make_service(tenants, idp.clone());
 
     let err = svc
-        .list_users(&scope(), tenant_id, None, pagination())
+        .list_users(&ctx(), tenant_id, ListUsersQuery::new(pagination()))
         .await
         .expect_err("deleted tenant must reject");
     assert!(matches!(err, DomainError::Validation { .. }));
     assert_eq!(idp.list_call_count(), 0);
+}
+
+// ---- get_user ------------------------------------------------------
+
+#[tokio::test]
+async fn get_user_happy_path_returns_user() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x55);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let target = Uuid::from_u128(0xB1);
+    idp.set_list_items(vec![IdpUser::new(target, "alice")]);
+    let svc = make_service(tenants, idp);
+
+    let user = svc
+        .get_user(&ctx(), tenant_id, target)
+        .await
+        .expect("get_user returns the matching user");
+    assert_eq!(user.id, target);
+    assert_eq!(user.username, "alice");
+}
+
+#[tokio::test]
+async fn get_user_absent_user_id_collapses_to_not_found() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x56);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    // No items configured -- list_users returns an empty page.
+    let svc = make_service(tenants, idp);
+
+    let absent = Uuid::from_u128(0xBEEF);
+    let err = svc
+        .get_user(&ctx(), tenant_id, absent)
+        .await
+        .expect_err("absent user surfaces as UserNotFound (not empty page)");
+    match err {
+        DomainError::UserNotFound { resource, .. } => {
+            assert_eq!(resource, absent.to_string());
+        }
+        other => panic!("expected UserNotFound, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn get_user_rejects_unknown_tenant_no_idp_call() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let svc = make_service(tenants, idp.clone());
+
+    let unknown_tenant = Uuid::from_u128(0x57);
+    let err = svc
+        .get_user(&ctx(), unknown_tenant, Uuid::from_u128(0xB2))
+        .await
+        .expect_err("unknown tenant must reject before IdP call");
+    assert!(matches!(err, DomainError::NotFound { .. }));
+    assert_eq!(
+        idp.list_call_count(),
+        0,
+        "tenant guard runs before the IdP plugin call"
+    );
 }
 
 #[tokio::test]
@@ -674,7 +773,11 @@ async fn list_users_with_user_id_filter_and_cursor_rejects_validation_no_idp_cal
     let with_cursor = IdpUserPagination::new(1, Some("opaque-continuation".to_owned()))
         .expect("top=1 + cursor is structurally valid pagination");
     let err = svc
-        .list_users(&scope(), tenant_id, Some(user_id), with_cursor)
+        .list_users(
+            &ctx(),
+            tenant_id,
+            ListUsersQuery::new(with_cursor).with_user_id_filter(user_id),
+        )
         .await
         .expect_err("user_id_filter + cursor must reject at the AM boundary");
     match err {
@@ -705,7 +808,11 @@ async fn list_users_with_user_id_filter_and_no_cursor_passes_through() {
 
     let user_id = Uuid::from_u128(0xA2);
     let _ = svc
-        .list_users(&scope(), tenant_id, Some(user_id), filter_pagination())
+        .list_users(
+            &ctx(),
+            tenant_id,
+            ListUsersQuery::new(filter_pagination()).with_user_id_filter(user_id),
+        )
         .await
         .expect("user_id_filter + cursor=None must reach the IdP");
     assert_eq!(idp.list_call_count(), 1);
@@ -726,7 +833,11 @@ async fn list_users_with_user_id_filter_and_top_gt_one_rejects_validation_no_idp
 
     let user_id = Uuid::from_u128(0xA3);
     let err = svc
-        .list_users(&scope(), tenant_id, Some(user_id), pagination())
+        .list_users(
+            &ctx(),
+            tenant_id,
+            ListUsersQuery::new(pagination()).with_user_id_filter(user_id),
+        )
         .await
         .expect_err("user_id_filter + top>1 must reject at the AM boundary");
     match err {
@@ -740,7 +851,7 @@ async fn list_users_with_user_id_filter_and_top_gt_one_rejects_validation_no_idp
 }
 
 #[tokio::test]
-async fn provision_user_rejects_oversized_username_no_idp_call() {
+async fn create_user_rejects_oversized_username_no_idp_call() {
     // AM-side cap of 255 characters fires before the IdP round-trip
     // so the provider never sees megabyte-scale identifiers. This
     // guard is the load-bearing fallback when the GTS user schema
@@ -757,7 +868,7 @@ async fn provision_user_rejects_oversized_username_no_idp_call() {
     // mask the username-specific cap.
     let p = IdpNewUser::new(oversized);
     let err = svc
-        .provision_user(&scope(), tenant_id, p, requester())
+        .create_user(&ctx(), tenant_id, p)
         .await
         .expect_err("256-char username must reject");
     match err {
@@ -771,7 +882,7 @@ async fn provision_user_rejects_oversized_username_no_idp_call() {
 }
 
 #[tokio::test]
-async fn provision_user_rejects_whitespace_only_username_no_idp_call() {
+async fn create_user_rejects_whitespace_only_username_no_idp_call() {
     // `"   "` passes the schema's `minLength: 1` but is semantically
     // empty for a login identifier — caught explicitly at the AM
     // service layer so two callers writing `"alice"` and
@@ -788,7 +899,7 @@ async fn provision_user_rejects_whitespace_only_username_no_idp_call() {
     // specific "all-whitespace" check.
     let p = IdpNewUser::new("   ");
     let err = svc
-        .provision_user(&scope(), tenant_id, p, requester())
+        .create_user(&ctx(), tenant_id, p)
         .await
         .expect_err("whitespace-only username must reject");
     match err {
@@ -801,111 +912,13 @@ async fn provision_user_rejects_whitespace_only_username_no_idp_call() {
     assert_eq!(idp.create_call_count(), 0, "must not reach the IdP");
 }
 
-/// Pins the nil-actor precondition on `provision_user`: a caller
-/// that forgot to wire `actor_uuid` MUST surface as a typed
-/// `Conflict` (`FailedPrecondition` / HTTP 400), not `Internal`
-/// (HTTP 500); the check MUST run AFTER `resolve_active_tenant` so
-/// the failure cannot distinguish "tenant absent" from "actor wired
-/// wrong" for an out-of-scope caller. Closes deep-review #3, #4.
-#[tokio::test]
-async fn provision_user_rejects_nil_actor_with_conflict_after_tenant_guard() {
-    let tenants = Arc::new(FakeTenantRepo::new());
-    let tenant_id = Uuid::from_u128(0x80);
-    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
-    let idp = Arc::new(FakeIdpUserProvisioner::new());
-    let svc = make_service(tenants, idp.clone());
-
-    let err = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), Uuid::nil())
-        .await
-        .expect_err("nil actor MUST reject");
-    match err {
-        DomainError::Conflict { detail } => {
-            // The public `detail` is intentionally generic — AM-
-            // internal field names (`requested_by`), method names
-            // (`provision_user`), and operator hints would otherwise
-            // serialise into the public `PreconditionViolationV1
-            // .description` envelope. Operator text lives on the
-            // `am.user.audit` warn line, not on the wire.
-            assert_eq!(
-                detail, "request missing required actor identifier",
-                "Conflict.detail must be a sanitised public message; got: {detail}"
-            );
-            assert!(
-                !detail.contains("requested_by")
-                    && !detail.contains("provision_user")
-                    && !detail.contains("Uuid::nil()")
-                    && !detail.contains("actor_uuid"),
-                "Conflict.detail leaked AM-internal text into public envelope: {detail}"
-            );
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
-    assert_eq!(idp.create_call_count(), 0, "must not reach the IdP");
-
-    // Ordering invariant: nil actor against a non-existent tenant
-    // surfaces as `NotFound` (tenant guard fires first), NOT
-    // `Conflict` — that's what prevents a route-probing caller from
-    // distinguishing "tenant absent" from "handler is wired wrong".
-    let unknown = Uuid::from_u128(0x81);
-    let err = svc
-        .provision_user(&scope(), unknown, payload("alice"), Uuid::nil())
-        .await
-        .expect_err("nil actor + unknown tenant MUST surface tenant guard first");
-    assert!(
-        matches!(err, DomainError::NotFound { .. }),
-        "tenant guard MUST run before the nil-actor precondition; got: {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn deprovision_user_rejects_nil_actor_with_conflict_after_tenant_guard() {
-    let tenants = Arc::new(FakeTenantRepo::new());
-    let tenant_id = Uuid::from_u128(0x82);
-    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
-    let idp = Arc::new(FakeIdpUserProvisioner::new());
-    let svc = make_service(tenants, idp.clone());
-
-    let err = svc
-        .deprovision_user(&scope(), tenant_id, Uuid::from_u128(0xBEEF), Uuid::nil())
-        .await
-        .expect_err("nil actor MUST reject");
-    match err {
-        DomainError::Conflict { detail } => {
-            assert_eq!(
-                detail, "request missing required actor identifier",
-                "Conflict.detail must be a sanitised public message; got: {detail}"
-            );
-            assert!(
-                !detail.contains("requested_by")
-                    && !detail.contains("deprovision_user")
-                    && !detail.contains("Uuid::nil()")
-                    && !detail.contains("actor_uuid"),
-                "Conflict.detail leaked AM-internal text into public envelope: {detail}"
-            );
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
-    assert_eq!(idp.delete_call_count(), 0, "must not reach the IdP");
-
-    let unknown = Uuid::from_u128(0x83);
-    let err = svc
-        .deprovision_user(&scope(), unknown, Uuid::from_u128(0xBEEF), Uuid::nil())
-        .await
-        .expect_err("nil actor + unknown tenant MUST surface tenant guard first");
-    assert!(
-        matches!(err, DomainError::NotFound { .. }),
-        "tenant guard MUST run before the nil-actor precondition; got: {err:?}"
-    );
-}
-
-/// Pins the plugin-contract guard on `provision_user`: a provider
+/// Pins the plugin-contract guard on `create_user`: a provider
 /// returning `Uuid::nil()` as the IdP-issued user id is a contract
 /// violation that MUST surface as `Internal` rather than be
 /// forwarded into `am.events` / downstream membership writes.
 /// Closes deep-review #2.
 #[tokio::test]
-async fn provision_user_rejects_nil_projection_id_from_plugin() {
+async fn create_user_rejects_nil_projection_id_from_plugin() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x84);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
@@ -914,7 +927,7 @@ async fn provision_user_rejects_nil_projection_id_from_plugin() {
     let svc = make_service(tenants, idp.clone());
 
     let err = svc
-        .provision_user(&scope(), tenant_id, payload("alice"), requester())
+        .create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect_err("nil projection id MUST surface as Internal");
     match err {
@@ -935,7 +948,7 @@ async fn provision_user_rejects_nil_projection_id_from_plugin() {
 /// `UserService::resolve_active_tenant` MUST load
 /// `tenant_idp_metadata` via `TenantRepo::find_idp_metadata` and
 /// forward it verbatim into `TenantContext::metadata` on each `IdP`
-/// method (`provision_user`, `deprovision_user`, `list_users`).
+/// method (`create_user`, `delete_user`, `list_users`).
 /// Closes deep-review #1 — without this seam, a regression dropping
 /// the metadata-load step would pass every existing test (all of
 /// which seed `idp_metadata = None`).
@@ -953,13 +966,13 @@ async fn user_ops_forward_tenant_idp_metadata_into_tenant_context_on_every_call(
     idp.set_list_items(vec![IdpUser::new(user_id, "alice")]);
     let svc = make_service(tenants, idp.clone());
 
-    svc.provision_user(&scope(), tenant_id, payload("alice"), requester())
+    svc.create_user(&ctx(), tenant_id, payload("alice"))
         .await
         .expect("provision happy path");
-    svc.deprovision_user(&scope(), tenant_id, user_id, requester())
+    svc.delete_user(&ctx(), tenant_id, user_id)
         .await
         .expect("deprovision happy path");
-    svc.list_users(&scope(), tenant_id, None, pagination())
+    svc.list_users(&ctx(), tenant_id, ListUsersQuery::new(pagination()))
         .await
         .expect("list happy path");
 
@@ -967,12 +980,12 @@ async fn user_ops_forward_tenant_idp_metadata_into_tenant_context_on_every_call(
     assert_eq!(
         idp.create_metadata_snapshots(),
         expected,
-        "provision_user MUST forward tenant_idp_metadata blob on the IdP call"
+        "create_user MUST forward tenant_idp_metadata blob on the IdP call"
     );
     assert_eq!(
         idp.delete_metadata_snapshots(),
         expected,
-        "deprovision_user MUST forward tenant_idp_metadata blob on the IdP call"
+        "delete_user MUST forward tenant_idp_metadata blob on the IdP call"
     );
     assert_eq!(
         idp.list_metadata_snapshots(),
@@ -982,7 +995,7 @@ async fn user_ops_forward_tenant_idp_metadata_into_tenant_context_on_every_call(
 }
 
 #[tokio::test]
-async fn provision_user_rejects_oversized_profile_fields_no_idp_call() {
+async fn create_user_rejects_oversized_profile_fields_no_idp_call() {
     // Defence-in-depth caps on `email`, `display_name` run AFTER
     // tenant guard but BEFORE GTS round-trip / IdP call so
     // megabyte-scale optional fields don't reach the provider when
@@ -997,7 +1010,7 @@ async fn provision_user_rejects_oversized_profile_fields_no_idp_call() {
 
     let p_email = IdpNewUser::new("alice").with_email(oversized.clone());
     let err = svc
-        .provision_user(&scope(), tenant_id, p_email, requester())
+        .create_user(&ctx(), tenant_id, p_email)
         .await
         .expect_err("oversized email must reject");
     assert!(
@@ -1007,7 +1020,7 @@ async fn provision_user_rejects_oversized_profile_fields_no_idp_call() {
 
     let p_display = IdpNewUser::new("alice").with_display_name(oversized);
     let err = svc
-        .provision_user(&scope(), tenant_id, p_display, requester())
+        .create_user(&ctx(), tenant_id, p_display)
         .await
         .expect_err("oversized display_name must reject");
     assert!(
@@ -1016,4 +1029,499 @@ async fn provision_user_rejects_oversized_profile_fields_no_idp_call() {
     );
 
     assert_eq!(idp.create_call_count(), 0, "no IdP call on any reject path");
+}
+
+// ---- delete_user → RG user-group membership cleanup ----------
+//
+// Tests the post-IdP-success cleanup of RG user-group memberships
+// referencing the deprovisioned user. Cleanup is a two-step pipeline:
+//
+//   1. `list_groups($filter = tenant_id eq T AND type eq
+//      USER_GROUP_RG_TYPE_CODE)` — drain all pages.
+//   2. For each group: `remove_membership(group_id, USER_RG_TYPE_CODE,
+//      user_id)`. `NotFound` is idempotent success.
+//
+// The cleanup short-circuits when the service is constructed without
+// `with_rg_membership_cleanup`; the tests below wire a minimal fake
+// RG client around `list_groups` + `remove_membership`.
+
+mod cleanup {
+    use super::*;
+    use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RG_TYPE_CODE};
+    use async_trait::async_trait;
+    use modkit_odata::{ODataQuery, Page, PageInfo};
+    use modkit_security::SecurityContext;
+    use resource_group_sdk::{
+        CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
+        ResourceGroupError, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,
+        UpdateGroupRequest, UpdateTypeRequest,
+    };
+    use std::sync::Mutex;
+
+    use crate::domain::user::test_support::FakeUserOutcome;
+
+    // -- minimal RG fake focused on list_groups + remove_membership --
+
+    enum ListBehaviour {
+        Pages(Vec<Page<ResourceGroup>>),
+        Error(ResourceGroupError),
+    }
+
+    enum RemoveBehaviour {
+        Ok,
+        NotFound,
+        Error(ResourceGroupError),
+    }
+
+    struct FakeMembershipRgClient {
+        list_behaviour: Mutex<ListBehaviour>,
+        remove_behaviour: RemoveBehaviour,
+        removed: Mutex<Vec<(Uuid, String, String)>>,
+        list_calls: Mutex<u32>,
+    }
+
+    impl FakeMembershipRgClient {
+        /// One full page returning the given user-group rows.
+        fn with_groups(rows: Vec<ResourceGroup>) -> Self {
+            let page = Page {
+                items: rows,
+                page_info: PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: 100,
+                },
+            };
+            Self {
+                list_behaviour: Mutex::new(ListBehaviour::Pages(vec![page])),
+                remove_behaviour: RemoveBehaviour::Ok,
+                removed: Mutex::new(Vec::new()),
+                list_calls: Mutex::new(0),
+            }
+        }
+
+        /// Multiple pages chained via `next_cursor` tokens — exercises
+        /// the cursor-advancement branch in `list_tenant_user_groups`.
+        fn with_paged_groups(pages: Vec<Page<ResourceGroup>>) -> Self {
+            Self {
+                list_behaviour: Mutex::new(ListBehaviour::Pages(pages)),
+                remove_behaviour: RemoveBehaviour::Ok,
+                removed: Mutex::new(Vec::new()),
+                list_calls: Mutex::new(0),
+            }
+        }
+
+        fn empty() -> Self {
+            Self::with_groups(Vec::new())
+        }
+
+        fn with_remove_behaviour(mut self, behaviour: RemoveBehaviour) -> Self {
+            self.remove_behaviour = behaviour;
+            self
+        }
+
+        fn with_list_error(error: ResourceGroupError) -> Self {
+            Self {
+                list_behaviour: Mutex::new(ListBehaviour::Error(error)),
+                remove_behaviour: RemoveBehaviour::Ok,
+                removed: Mutex::new(Vec::new()),
+                list_calls: Mutex::new(0),
+            }
+        }
+
+        fn removed_snapshot(&self) -> Vec<(Uuid, String, String)> {
+            self.removed.lock().expect("lock").clone()
+        }
+
+        fn list_call_count(&self) -> u32 {
+            *self.list_calls.lock().expect("lock")
+        }
+    }
+
+    #[async_trait]
+    impl ResourceGroupClient for FakeMembershipRgClient {
+        async fn list_groups(
+            &self,
+            _ctx: &SecurityContext,
+            _query: &ODataQuery,
+        ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+            *self.list_calls.lock().expect("lock") += 1;
+            let mut behaviour = self.list_behaviour.lock().expect("lock");
+            match &mut *behaviour {
+                ListBehaviour::Error(e) => Err(e.clone()),
+                ListBehaviour::Pages(pages) => {
+                    if pages.is_empty() {
+                        return Ok(Page::empty(100));
+                    }
+                    Ok(pages.remove(0))
+                }
+            }
+        }
+
+        async fn remove_membership(
+            &self,
+            _ctx: &SecurityContext,
+            group_id: Uuid,
+            resource_type: &str,
+            resource_id: &str,
+        ) -> Result<(), ResourceGroupError> {
+            self.removed.lock().expect("lock").push((
+                group_id,
+                resource_type.to_owned(),
+                resource_id.to_owned(),
+            ));
+            match &self.remove_behaviour {
+                RemoveBehaviour::Ok => Ok(()),
+                RemoveBehaviour::NotFound => Err(ResourceGroupError::not_found("membership")),
+                RemoveBehaviour::Error(e) => Err(e.clone()),
+            }
+        }
+
+        // -- Unreachable: cleanup never calls these --
+
+        async fn list_memberships(
+            &self,
+            _ctx: &SecurityContext,
+            _query: &ODataQuery,
+        ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+            unreachable!(
+                "cleanup uses list_groups(tenant) + per-group remove, never list_memberships"
+            )
+        }
+        async fn create_type(
+            &self,
+            _ctx: &SecurityContext,
+            _request: CreateTypeRequest,
+        ) -> Result<ResourceGroupType, ResourceGroupError> {
+            unreachable!()
+        }
+        async fn get_type(
+            &self,
+            _ctx: &SecurityContext,
+            _code: &str,
+        ) -> Result<ResourceGroupType, ResourceGroupError> {
+            unreachable!()
+        }
+        async fn list_types(
+            &self,
+            _ctx: &SecurityContext,
+            _query: &ODataQuery,
+        ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
+            unreachable!()
+        }
+        async fn update_type(
+            &self,
+            _ctx: &SecurityContext,
+            _code: &str,
+            _request: UpdateTypeRequest,
+        ) -> Result<ResourceGroupType, ResourceGroupError> {
+            unreachable!()
+        }
+        async fn delete_type(
+            &self,
+            _ctx: &SecurityContext,
+            _code: &str,
+        ) -> Result<(), ResourceGroupError> {
+            unreachable!()
+        }
+        async fn create_group(
+            &self,
+            _ctx: &SecurityContext,
+            _request: CreateGroupRequest,
+        ) -> Result<ResourceGroup, ResourceGroupError> {
+            unreachable!()
+        }
+        async fn get_group(
+            &self,
+            _ctx: &SecurityContext,
+            _id: Uuid,
+        ) -> Result<ResourceGroup, ResourceGroupError> {
+            unreachable!()
+        }
+        async fn update_group(
+            &self,
+            _ctx: &SecurityContext,
+            _id: Uuid,
+            _request: UpdateGroupRequest,
+        ) -> Result<ResourceGroup, ResourceGroupError> {
+            unreachable!()
+        }
+        async fn delete_group(
+            &self,
+            _ctx: &SecurityContext,
+            _id: Uuid,
+        ) -> Result<(), ResourceGroupError> {
+            unreachable!()
+        }
+        async fn get_group_descendants(
+            &self,
+            _ctx: &SecurityContext,
+            _group_id: Uuid,
+            _query: &ODataQuery,
+        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+            unreachable!()
+        }
+        async fn get_group_ancestors(
+            &self,
+            _ctx: &SecurityContext,
+            _group_id: Uuid,
+            _query: &ODataQuery,
+        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+            unreachable!()
+        }
+        async fn add_membership(
+            &self,
+            _ctx: &SecurityContext,
+            _group_id: Uuid,
+            _resource_type: &str,
+            _resource_id: &str,
+        ) -> Result<ResourceGroupMembership, ResourceGroupError> {
+            unreachable!()
+        }
+    }
+
+    fn make_service_with_cleanup(
+        tenants: Arc<FakeTenantRepo>,
+        idp: Arc<FakeIdpUserProvisioner>,
+        rg: Arc<FakeMembershipRgClient>,
+    ) -> UserService {
+        // Register the seeded tenants' `tenant_type_uuid` schema so
+        // `resolve_active_tenant` (which now treats `tenant_type` as
+        // mandatory) succeeds for `seed_tenant` rows. Mirrors the
+        // sibling `make_service` / `make_service_with_user_schema`
+        // helpers above — without this, every cleanup test that goes
+        // through `delete_user` fails with
+        // `ServiceUnavailable { detail: "tenant_type resolution failed
+        // ... GTS type-schema not found ..." }` before the RG-cleanup
+        // path ever runs.
+        let types_registry =
+            Arc::new(MockTypesRegistryClient::new().with_type_schemas([test_tenant_type_schema()]));
+        let rg: Arc<dyn ResourceGroupClient + Send + Sync> = rg;
+        UserService::new(tenants, idp, types_registry, mock_enforcer())
+            .with_rg_membership_cleanup(rg)
+    }
+
+    fn user_group(id: Uuid, tenant_id: Uuid) -> ResourceGroup {
+        ResourceGroup {
+            id,
+            code: USER_GROUP_RG_TYPE_CODE.to_owned(),
+            name: format!("ug-{id}"),
+            hierarchy: GroupHierarchy {
+                parent_id: None,
+                tenant_id,
+            },
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_membership_per_listed_group_on_removed_outcome() {
+        let tenants = Arc::new(FakeTenantRepo::new());
+        let tenant_id = Uuid::from_u128(0xC1);
+        seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "t");
+        let user_id = Uuid::from_u128(0xC2);
+        let group_a = Uuid::from_u128(0xC3);
+        let group_b = Uuid::from_u128(0xC4);
+
+        let idp = Arc::new(FakeIdpUserProvisioner::new());
+        idp.set_delete_outcome(FakeUserOutcome::Ok);
+        let rg = Arc::new(FakeMembershipRgClient::with_groups(vec![
+            user_group(group_a, tenant_id),
+            user_group(group_b, tenant_id),
+        ]));
+        let svc = make_service_with_cleanup(tenants, idp, Arc::clone(&rg));
+
+        svc.delete_user(&ctx(), tenant_id, user_id)
+            .await
+            .expect("deprovision succeeds");
+
+        let removed = rg.removed_snapshot();
+        assert_eq!(removed.len(), 2, "one remove_membership per listed group");
+        let user_str = user_id.to_string();
+        assert!(
+            removed
+                .iter()
+                .all(|(_, t, r)| t == USER_RG_TYPE_CODE && r == &user_str),
+            "every remove targets the deprovisioned user under USER_RG_TYPE_CODE"
+        );
+        let group_ids: std::collections::HashSet<Uuid> =
+            removed.iter().map(|(g, _, _)| *g).collect();
+        assert!(
+            group_ids.contains(&group_a) && group_ids.contains(&group_b),
+            "both listed groups received a remove call"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_with_no_user_groups_is_noop_success() {
+        let tenants = Arc::new(FakeTenantRepo::new());
+        let tenant_id = Uuid::from_u128(0xE1);
+        seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "t");
+        let user_id = Uuid::from_u128(0xE2);
+
+        let idp = Arc::new(FakeIdpUserProvisioner::new());
+        idp.set_delete_outcome(FakeUserOutcome::Ok);
+        let rg = Arc::new(FakeMembershipRgClient::empty());
+        let svc = make_service_with_cleanup(tenants, idp, Arc::clone(&rg));
+
+        svc.delete_user(&ctx(), tenant_id, user_id)
+            .await
+            .expect("zero-groups deprovision succeeds");
+
+        assert_eq!(rg.list_call_count(), 1, "one list_groups round-trip");
+        assert!(
+            rg.removed_snapshot().is_empty(),
+            "no groups listed; nothing removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_remove_not_found_is_idempotent_success() {
+        // The user wasn't a member of the listed group (or a peer
+        // cleanup tick already removed the row). RG returns
+        // `NotFound` on remove; we treat as success.
+        let tenants = Arc::new(FakeTenantRepo::new());
+        let tenant_id = Uuid::from_u128(0xF1);
+        seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "t");
+        let user_id = Uuid::from_u128(0xF2);
+        let group_a = Uuid::from_u128(0xF3);
+
+        let idp = Arc::new(FakeIdpUserProvisioner::new());
+        idp.set_delete_outcome(FakeUserOutcome::Ok);
+        let rg = Arc::new(
+            FakeMembershipRgClient::with_groups(vec![user_group(group_a, tenant_id)])
+                .with_remove_behaviour(RemoveBehaviour::NotFound),
+        );
+        let svc = make_service_with_cleanup(tenants, idp, Arc::clone(&rg));
+
+        svc.delete_user(&ctx(), tenant_id, user_id)
+            .await
+            .expect("remove NotFound treated as idempotent success");
+    }
+
+    #[tokio::test]
+    async fn cleanup_list_transport_error_surfaces_service_unavailable() {
+        let tenants = Arc::new(FakeTenantRepo::new());
+        let tenant_id = Uuid::from_u128(0xA1);
+        seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "t");
+        let user_id = Uuid::from_u128(0xA2);
+
+        let idp = Arc::new(FakeIdpUserProvisioner::new());
+        idp.set_delete_outcome(FakeUserOutcome::Ok);
+        let rg = Arc::new(FakeMembershipRgClient::with_list_error(
+            ResourceGroupError::ServiceUnavailable {
+                message: "connection refused".to_owned(),
+            },
+        ));
+        let svc = make_service_with_cleanup(tenants, idp, Arc::clone(&rg));
+
+        let err = svc
+            .delete_user(&ctx(), tenant_id, user_id)
+            .await
+            .expect_err("transport error must surface");
+        match err {
+            DomainError::ServiceUnavailable { .. } => {}
+            other => panic!("expected ServiceUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_drains_multi_page_group_list() {
+        // Exercises the cursor-advancement branch in
+        // `list_tenant_user_groups`: page 1 returns one group + a
+        // `next_cursor` token; the loop decodes the cursor and
+        // fetches page 2 (one more group, terminal `next_cursor`).
+        // Both groups receive a `remove_membership` call.
+        use modkit_odata::{CursorV1, SortDir};
+
+        let tenants = Arc::new(FakeTenantRepo::new());
+        let tenant_id = Uuid::from_u128(0x1A1);
+        seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "t");
+        let user_id = Uuid::from_u128(0x1A2);
+        let group_p1 = Uuid::from_u128(0x1A3);
+        let group_p2 = Uuid::from_u128(0x1A4);
+
+        let token = CursorV1 {
+            k: vec!["id".to_owned()],
+            o: SortDir::Asc,
+            s: group_p1.to_string(),
+            f: None,
+            d: "fwd".to_owned(),
+        }
+        .encode()
+        .expect("cursor encodes");
+
+        let page1 = Page {
+            items: vec![user_group(group_p1, tenant_id)],
+            page_info: PageInfo {
+                next_cursor: Some(token),
+                prev_cursor: None,
+                limit: 100,
+            },
+        };
+        let page2 = Page {
+            items: vec![user_group(group_p2, tenant_id)],
+            page_info: PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 100,
+            },
+        };
+
+        let idp = Arc::new(FakeIdpUserProvisioner::new());
+        idp.set_delete_outcome(FakeUserOutcome::Ok);
+        let rg = Arc::new(FakeMembershipRgClient::with_paged_groups(vec![
+            page1, page2,
+        ]));
+        let svc = make_service_with_cleanup(tenants, idp, Arc::clone(&rg));
+
+        svc.delete_user(&ctx(), tenant_id, user_id)
+            .await
+            .expect("multi-page deprovision succeeds");
+
+        assert_eq!(
+            rg.list_call_count(),
+            2,
+            "two list_groups round-trips for two pages"
+        );
+        let removed_groups: std::collections::HashSet<Uuid> =
+            rg.removed_snapshot().iter().map(|(g, _, _)| *g).collect();
+        assert!(
+            removed_groups.contains(&group_p1) && removed_groups.contains(&group_p2),
+            "both pages' groups received a remove call"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_remove_transport_error_surfaces_service_unavailable() {
+        // Symmetric coverage for the per-row remove path. Listing
+        // succeeds, the remove step fails with a transport error;
+        // the deprovision call surfaces `ServiceUnavailable` so the
+        // caller's retry path re-enters the flow.
+        let tenants = Arc::new(FakeTenantRepo::new());
+        let tenant_id = Uuid::from_u128(0xB1);
+        seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "t");
+        let user_id = Uuid::from_u128(0xB2);
+        let group_a = Uuid::from_u128(0xB3);
+
+        let idp = Arc::new(FakeIdpUserProvisioner::new());
+        idp.set_delete_outcome(FakeUserOutcome::Ok);
+        let rg = Arc::new(
+            FakeMembershipRgClient::with_groups(vec![user_group(group_a, tenant_id)])
+                .with_remove_behaviour(RemoveBehaviour::Error(
+                    ResourceGroupError::ServiceUnavailable {
+                        message: "connection refused".to_owned(),
+                    },
+                )),
+        );
+        let svc = make_service_with_cleanup(tenants, idp, Arc::clone(&rg));
+
+        let err = svc
+            .delete_user(&ctx(), tenant_id, user_id)
+            .await
+            .expect_err("remove transport error must surface");
+        match err {
+            DomainError::ServiceUnavailable { .. } => {}
+            other => panic!("expected ServiceUnavailable, got {other:?}"),
+        }
+    }
 }

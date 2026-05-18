@@ -1,4 +1,4 @@
-//! Resource-ownership check trait used by `soft_delete`.
+//! Resource-ownership check trait used by `delete_tenant`.
 //!
 //! AM has to reject soft-delete when the tenant still owns resource-group
 //! rows (DESIGN §3.5). The check itself is owned by the `resource-group`

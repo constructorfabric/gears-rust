@@ -8,12 +8,39 @@
 //! [`crate::domain::conversion::model::ConversionSide`] /
 //! [`crate::domain::conversion::model::TargetMode`].
 //!
-//! `Scopable(no_tenant, no_resource, no_owner, no_type)` mirrors
-//! `tenants` / `tenant_closure`: until the `InTenantSubtree` predicate
-//! lands, AM enforces cross-tenant authorization at the service layer
-//! via the PDP gate; per-row auto-filtering is intentionally off here
-//! and callers MUST pass [`modkit_security::AccessScope::allow_all`]
-//! when invoking the repo methods that read or write this table.
+//! `Scopable(tenant_col = "tenant_id", resource_col = "id", no_owner,
+//! no_type)` — the entity declares BOTH the row's owner tenant (via
+//! `tenant_id`) AND the row's own primary key (via `id`) as resolvable
+//! secured properties, so a compiled
+//! [`InTenantSubtree`](modkit_security::ScopeFilter::in_tenant_subtree)
+//! predicate has a property to clamp against on either column. A scope
+//! of shape `InTenantSubtree(OWNER_TENANT_ID, root, respect_barriers
+//! = b)` materialises as
+//! `tenant_id IN (SELECT descendant_id FROM tenant_closure
+//!   WHERE ancestor_id = :root [AND barrier = 0 if b])`;
+//! `InTenantSubtree(RESOURCE_ID, root, …)` clamps `conversion_requests.id`
+//! the same way (forward-compat for the future REST PR that will let the
+//! PDP emit identity-based subtree clamps on this entity).
+//!
+//! **Service-side posture:**
+//! [`crate::domain::conversion::service::ConversionService::cancel`] /
+//! `reject` / `approve` / `list_inbound_for_parent` build a side-specific
+//! [`modkit_security::AccessScope`] before calling the repo:
+//!
+//! * Child-side caller: `for_tenant(child_id)` — clamps
+//!   `tenant_id = child_id` so the URL-bound child cannot see a request
+//!   on any other tenant.
+//! * Parent-side caller: `InTenantSubtree(OWNER_TENANT_ID, parent_id,
+//!   respect_barriers = false)` — clamps `tenant_id IN closure(parent_id)`
+//!   with barrier penetration, so a parent acting as counterparty on a
+//!   self-managed child whose barrier is `1` still sees the row (the
+//!   request authorisation is on `parent`, the converting child is
+//!   inside the parent's subtree by hierarchy even when invisible to a
+//!   barrier-respecting scope).
+//!
+//! INSERT paths stay `scope_unchecked` — the Scopable INSERT-time clamp
+//! is not the right model for inserts (the row is being created and
+//! cannot yet be filtered against the caller's scope).
 
 use modkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
@@ -23,7 +50,7 @@ use uuid::Uuid;
 // @cpt-begin:cpt-cf-account-management-dbtable-conversion-requests:p1:inst-dbtable-conversion-requests-entity
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Scopable)]
 #[sea_orm(table_name = "conversion_requests")]
-#[secure(no_tenant, no_resource, no_owner, no_type)]
+#[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,

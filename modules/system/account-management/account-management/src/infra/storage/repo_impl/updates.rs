@@ -1,6 +1,7 @@
 //! Mutating writes outside the create/destroy lifecycle:
-//! `update_tenant_mutable`, `load_ancestor_chain_through_parent`,
-//! `schedule_deletion`. All transactional writes go through
+//! `update_tenant_mutable`, `set_status`,
+//! `load_ancestor_chain_through_parent`, `schedule_deletion`. All
+//! transactional writes go through
 //! [`super::helpers::with_serializable_retry`] under `SERIALIZABLE`
 //! isolation per AC#15.
 
@@ -14,7 +15,7 @@ use sea_orm::{ColumnTrait, Condition, EntityTrait, Order, QueryFilter};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use account_management_sdk::TenantUpdate;
+use account_management_sdk::UpdateTenantRequest;
 
 use crate::domain::error::DomainError;
 use crate::domain::tenant::model::{TenantModel, TenantStatus};
@@ -29,7 +30,7 @@ pub(super) async fn update_tenant_mutable(
     repo: &TenantRepoImpl,
     scope: &AccessScope,
     tenant_id: Uuid,
-    patch: &TenantUpdate,
+    patch: &UpdateTenantRequest,
 ) -> Result<TenantModel, DomainError> {
     let patch_owned = patch.clone();
     let scope = scope.clone();
@@ -74,63 +75,18 @@ pub(super) async fn update_tenant_mutable(
                     .into());
                 }
 
-                // Lower the SDK status into the domain enum once and
-                // reuse the binding across the validation match, the
-                // change-detection check, and the `tenants.status` /
-                // `tenant_closure.descendant_status` writes. `TenantStatus: Copy`,
-                // so destructuring the `Option` repeatedly is free.
-                let maybe_new_status: Option<TenantStatus> =
-                    patch_owned.status.map(TenantStatus::from);
-
-                // Patch-side status validation: PATCH may only flip
-                // between `Active` and `Suspended` (or admit a same-to-
-                // same no-op — see the change-detection step below).
-                // A `Deleted` target would skip the `deleted_at` /
-                // `deletion_scheduled_at` stamps that
-                // `schedule_deletion` is responsible for, leaving the
-                // public Tenant schema with `status=deleted,
-                // deleted_at=null` (an OpenAPI contract violation). A
-                // `Provisioning` target would flip an SDK-visible row
-                // back to invisible while its `tenant_closure` rows
-                // remain present — corrupt state per the
-                // provisioning-exclusion invariant.
-                if let Some(new_status) = maybe_new_status {
-                    match new_status {
-                        TenantStatus::Active | TenantStatus::Suspended => {}
-                        TenantStatus::Deleted => {
-                            return Err(DomainError::Conflict {
-                                detail: format!(
-                                    "tenant {tenant_id}: PATCH cannot transition to deleted; \
-                                     use the soft-delete flow (`schedule_deletion`)"
-                                ),
-                            }
-                            .into());
-                        }
-                        TenantStatus::Provisioning => {
-                            return Err(DomainError::Conflict {
-                                detail: format!(
-                                    "tenant {tenant_id}: PATCH cannot transition to provisioning"
-                                ),
-                            }
-                            .into());
-                        }
-                    }
-                }
-
                 // Idempotent no-op detection (HTTP PATCH semantics,
-                // option A — true idempotency). For each patchable
-                // field, fold "patch is Some AND value differs from
-                // current row" into a single `Option` whose `Some`
-                // means "this column must be written". If both
-                // collapse to `None`, skip the entire UPDATE: no
-                // `updated_at` bump, no `tenant_closure` rewrite.
-                // Caller observes identical state on retry.
+                // option A — true idempotency). The patch shape is
+                // name-only (status transitions go through
+                // `set_status`); if the patched name matches the
+                // current row, skip the UPDATE so `updated_at` stays
+                // unchanged and the caller observes identical state
+                // on retry.
                 let name_to_write = patch_owned
                     .name
                     .as_ref()
                     .filter(|n| n.as_str() != row.name.as_str());
-                let status_to_write = maybe_new_status.filter(|s| s.as_smallint() != row.status);
-                if name_to_write.is_none() && status_to_write.is_none() {
+                if name_to_write.is_none() {
                     return entity_to_model(row).map_err(TxError::Domain);
                 }
 
@@ -140,70 +96,12 @@ pub(super) async fn update_tenant_mutable(
                 if let Some(new_name) = name_to_write {
                     upd = upd.col_expr(tenants::Column::Name, Expr::value(new_name.clone()));
                 }
-                if let Some(new_status) = status_to_write {
-                    upd = upd.col_expr(
-                        tenants::Column::Status,
-                        Expr::value(new_status.as_smallint()),
-                    );
-                }
                 upd.filter(id_eq(tenant_id))
                     .secure()
                     .scope_with(&scope)
                     .exec(tx)
                     .await
                     .map_err(map_scope_to_tx)?;
-
-                // Rewrite tenant_closure.descendant_status atomically
-                // on actual status change. Both `tenant_closure` and
-                // `tenants` are declared `no_tenant, no_resource,
-                // no_owner, no_type` (see entity docs). On a `no_*`
-                // entity `scope_with(scope)` compiles to a no-op when
-                // the caller passes `allow_all` and to `WHERE false`
-                // on any narrowed scope — there is no in-between. The
-                // trait contract requires callers to pass `allow_all`
-                // until `InTenantSubtree` lands; we explicitly pass
-                // `allow_all` here so this closure write is unaffected
-                // by any future caller mistake. The `tenants` UPDATE
-                // one statement up forwards the caller's scope
-                // verbatim — that path relies on the same trait
-                // contract. Authorization is enforced upstream at the
-                // PDP gate in the service layer.
-                if let Some(new_status) = status_to_write {
-                    // @cpt-begin:cpt-cf-account-management-algo-tenant-hierarchy-management-closure-maintenance:p1:inst-algo-closmnt-repo-status-update
-                    let closure_rows_affected = tenant_closure::Entity::update_many()
-                        .col_expr(
-                            tenant_closure::Column::DescendantStatus,
-                            Expr::value(new_status.as_smallint()),
-                        )
-                        .filter(
-                            Condition::all()
-                                .add(tenant_closure::Column::DescendantId.eq(tenant_id)),
-                        )
-                        .secure()
-                        .scope_with(&AccessScope::allow_all())
-                        .exec(tx)
-                        .await
-                        .map_err(map_scope_to_tx)?
-                        .rows_affected;
-                    // Closure self-row invariant: every SDK-visible tenant
-                    // has a `(id, id)` row, so this UPDATE must touch at
-                    // least the self-row. Zero here means the self-row is
-                    // missing — a concrete invariant breach the integrity
-                    // classifier would only flag retroactively. Fail the
-                    // tx so SERIALIZABLE rolls back the `tenants.status`
-                    // flip rather than leaving `tenant_closure` stale.
-                    if closure_rows_affected == 0 {
-                        return Err(DomainError::Internal {
-                            diagnostic: format!(
-                                "update_tenant_mutable: closure descendant_status rewrite for \
-                                 tenant {tenant_id} affected 0 rows; self-row missing"
-                            ),
-                            cause: None,
-                        }
-                        .into());
-                    }
-                    // @cpt-end:cpt-cf-account-management-algo-tenant-hierarchy-management-closure-maintenance:p1:inst-algo-closmnt-repo-status-update
-                }
 
                 let fresh = tenants::Entity::find()
                     .secure()
@@ -214,6 +112,164 @@ pub(super) async fn update_tenant_mutable(
                     .map_err(map_scope_to_tx)?
                     .ok_or_else(|| DomainError::Internal {
                         diagnostic: format!("tenant {tenant_id} disappeared after update"),
+                        cause: None,
+                    })?;
+                entity_to_model(fresh).map_err(TxError::Domain)
+            })
+        })
+    })
+    .await
+}
+
+/// Flip `tenants.status` between `Active` and `Suspended` (with a
+/// matching rewrite of `tenant_closure.descendant_status`) under
+/// SERIALIZABLE isolation. Same-to-same is an idempotent no-op and
+/// returns the current row without emitting an UPDATE. `Deleted` /
+/// `Provisioning` either as the current state or as `new_status`
+/// surface as `Conflict` — only the dedicated soft-delete /
+/// provisioning flows are allowed to move the row in or out of those
+/// states.
+// Note on `now`: the wall-clock is captured once by the caller and
+// reused across every SERIALIZABLE retry. On a highly contended row
+// the committed `updated_at` may therefore lag the actual commit
+// time by however long the retry loop took. This mirrors the
+// established pattern in `schedule_deletion` and is acceptable
+// because (1) `updated_at` is informational, not load-bearing for any
+// invariant, and (2) re-stamping `now` per retry would defeat the
+// `was_no_op` heuristic in the service layer (caller compares
+// pre/post `updated_at` to suppress audit on same-to-same calls).
+pub(super) async fn set_status(
+    repo: &TenantRepoImpl,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    new_status: TenantStatus,
+    now: OffsetDateTime,
+) -> Result<TenantModel, DomainError> {
+    // Reject the inadmissible targets eagerly so the SERIALIZABLE TX
+    // is not entered on a request that cannot succeed. The repo
+    // contract reserves `Deleted` for `schedule_deletion` and
+    // `Provisioning` for the create-tenant saga.
+    match new_status {
+        TenantStatus::Active | TenantStatus::Suspended => {}
+        TenantStatus::Deleted => {
+            return Err(DomainError::Conflict {
+                detail: format!(
+                    "tenant {tenant_id}: set_status cannot transition to deleted; \
+                     use the soft-delete flow (`schedule_deletion`)"
+                ),
+            });
+        }
+        TenantStatus::Provisioning => {
+            return Err(DomainError::Conflict {
+                detail: format!("tenant {tenant_id}: set_status cannot transition to provisioning"),
+            });
+        }
+    }
+    let scope = scope.clone();
+    with_serializable_retry(&repo.db, move || {
+        let scope = scope.clone();
+        Box::new(move |tx: &DbTx<'_>| {
+            Box::pin(async move {
+                let row = tenants::Entity::find()
+                    .secure()
+                    .scope_with(&scope)
+                    .filter(id_eq(tenant_id))
+                    .one(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?
+                    .ok_or_else(|| DomainError::NotFound {
+                        detail: format!("tenant {tenant_id} not found"),
+                        resource: tenant_id.to_string(),
+                    })?;
+                if row.status == TenantStatus::Deleted.as_smallint() {
+                    return Err(DomainError::Conflict {
+                        detail: format!(
+                            "tenant {tenant_id} is deleted; status is terminal during retention"
+                        ),
+                    }
+                    .into());
+                }
+                if row.status == TenantStatus::Provisioning.as_smallint() {
+                    return Err(DomainError::Conflict {
+                        detail: format!(
+                            "tenant {tenant_id} is provisioning; lifecycle transitions are not \
+                             permitted until activation completes"
+                        ),
+                    }
+                    .into());
+                }
+
+                // Same-to-same: idempotent no-op. Skip the UPDATE so
+                // `updated_at` is unchanged and the closure rewrite
+                // does not run.
+                if row.status == new_status.as_smallint() {
+                    return entity_to_model(row).map_err(TxError::Domain);
+                }
+
+                tenants::Entity::update_many()
+                    .col_expr(
+                        tenants::Column::Status,
+                        Expr::value(new_status.as_smallint()),
+                    )
+                    .col_expr(tenants::Column::UpdatedAt, Expr::value(now))
+                    .filter(id_eq(tenant_id))
+                    .secure()
+                    .scope_with(&scope)
+                    .exec(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?;
+
+                // Rewrite tenant_closure.descendant_status atomically.
+                // `tenant_closure` is declared
+                // `no_tenant/no_resource/no_owner/no_type` so
+                // `scope_with(scope)` would compile to either a no-op
+                // (`allow_all`) or `WHERE false` (any narrowed scope).
+                // Authorization was enforced upstream at the PDP gate;
+                // pass `allow_all` here so the closure write is
+                // unaffected by the caller's scope shape.
+                // @cpt-begin:cpt-cf-account-management-algo-tenant-hierarchy-management-closure-maintenance:p1:inst-algo-closmnt-repo-status-update
+                let closure_rows_affected = tenant_closure::Entity::update_many()
+                    .col_expr(
+                        tenant_closure::Column::DescendantStatus,
+                        Expr::value(new_status.as_smallint()),
+                    )
+                    .filter(
+                        Condition::all().add(tenant_closure::Column::DescendantId.eq(tenant_id)),
+                    )
+                    .secure()
+                    .scope_with(&AccessScope::allow_all())
+                    .exec(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?
+                    .rows_affected;
+                // Closure self-row invariant: every SDK-visible tenant
+                // has a `(id, id)` row, so this UPDATE must touch at
+                // least the self-row. Zero here means the self-row is
+                // missing — a concrete invariant breach the integrity
+                // classifier would only flag retroactively. Fail the
+                // tx so SERIALIZABLE rolls back the `tenants.status`
+                // flip rather than leaving `tenant_closure` stale.
+                if closure_rows_affected == 0 {
+                    return Err(DomainError::Internal {
+                        diagnostic: format!(
+                            "set_status: closure descendant_status rewrite for tenant \
+                             {tenant_id} affected 0 rows; self-row missing"
+                        ),
+                        cause: None,
+                    }
+                    .into());
+                }
+                // @cpt-end:cpt-cf-account-management-algo-tenant-hierarchy-management-closure-maintenance:p1:inst-algo-closmnt-repo-status-update
+
+                let fresh = tenants::Entity::find()
+                    .secure()
+                    .scope_with(&scope)
+                    .filter(id_eq(tenant_id))
+                    .one(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?
+                    .ok_or_else(|| DomainError::Internal {
+                        diagnostic: format!("tenant {tenant_id} disappeared after set_status"),
                         cause: None,
                     })?;
                 entity_to_model(fresh).map_err(TxError::Domain)
@@ -430,11 +486,22 @@ pub(super) async fn schedule_deletion(
                         detail: format!("tenant {id} not found"),
                         resource: id.to_string(),
                     })?;
+                // Idempotent short-circuit: already a tombstone. Return
+                // the existing row WITHOUT re-stamping `deleted_at`,
+                // re-running the closure rewrite, or pushing back the
+                // retention deadline (a malicious retry could otherwise
+                // indefinitely delay the hard-delete sweep). Symmetric
+                // with the same-to-same no-op in `set_status` —
+                // idempotency lives inside the SERIALIZABLE TX so two
+                // racing DELETEs on the same Active row both observe
+                // the post-flip state on the loser's retry and return
+                // the tombstone instead of a 409. The service-layer
+                // short-circuit in `delete_tenant` is a pure
+                // optimisation to skip the RG ownership probe on the
+                // un-contended retry path; this guard is the
+                // authoritative correctness boundary.
                 if existing.status == TenantStatus::Deleted.as_smallint() {
-                    return Err(DomainError::Conflict {
-                        detail: format!("tenant {id} already deleted"),
-                    }
-                    .into());
+                    return entity_to_model(existing).map_err(TxError::Domain);
                 }
                 // `Provisioning` rows have no closure entries by
                 // construction; flipping them straight to `Deleted`
@@ -478,20 +545,16 @@ pub(super) async fn schedule_deletion(
                         Expr::value(TenantStatus::Deleted.as_smallint()),
                     )
                     .col_expr(tenants::Column::UpdatedAt, Expr::value(now))
-                    // `deleted_at` is the public-contract tombstone
-                    // exposed through the `Tenant` schema
-                    // (`account-management-v1.yaml:591`) and the
-                    // partial index `idx_tenants_deleted_at`
+                    // `deleted_at` is both the public-contract
+                    // tombstone exposed through the `Tenant` schema
+                    // (`account-management-v1.yaml:591`) AND the
+                    // retention-timer start consumed by the
+                    // `idx_tenants_retention_scan` partial index
                     // declared by `m0001_initial_schema`. The
-                    // earlier implementation only stamped
-                    // `deletion_scheduled_at` and left this column
-                    // permanently NULL — which both made the
-                    // dedicated partial index empty and surfaced
-                    // soft-deleted rows to the API with
-                    // `status=deleted, deleted_at=null`, violating
-                    // the OpenAPI contract.
-                    .col_expr(tenants::Column::DeletedAt, Expr::value(now))
-                    .col_expr(tenants::Column::DeletionScheduledAt, Expr::value(now));
+                    // hard-delete sweep becomes eligible at
+                    // `deleted_at + retention_window` — see
+                    // `scan_retention_due`.
+                    .col_expr(tenants::Column::DeletedAt, Expr::value(now));
                 if let Some(secs) = retention_secs {
                     upd = upd.col_expr(tenants::Column::RetentionWindowSecs, Expr::value(secs));
                 }
@@ -508,12 +571,14 @@ pub(super) async fn schedule_deletion(
                 // `update_tenant_mutable`: closure is
                 // `no_tenant/no_resource/no_owner/no_type`, so a
                 // narrowed scope would collapse to `WHERE false`
-                // here. The `tenants` UPDATE above forwards the
+                // here because `tenant_closure` is property-less for
+                // the [`InTenantSubtree`](modkit_security::ScopeFilter::in_tenant_subtree)
+                // predicate. The `tenants` UPDATE above forwards the
                 // caller's `scope` verbatim — that path is safe only
                 // because the trait contract requires `allow_all`
-                // until `InTenantSubtree` lands (see `repo.rs` trait
-                // doc). Authorization is enforced upstream at the
-                // PDP gate in the service layer.
+                // (see `repo.rs` trait doc). Authorization is
+                // enforced upstream at the PDP gate in the service
+                // layer.
                 // @cpt-begin:cpt-cf-account-management-algo-tenant-hierarchy-management-closure-maintenance:p1:inst-algo-closmnt-repo-soft-delete-status
                 let closure_rows_affected = tenant_closure::Entity::update_many()
                     .col_expr(

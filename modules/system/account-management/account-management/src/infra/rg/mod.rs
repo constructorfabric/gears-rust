@@ -2,7 +2,7 @@
 //!
 //! Holds the [`RgResourceOwnershipChecker`] adapter that backs the
 //! production resource-ownership probe consumed by
-//! [`crate::domain::tenant::service::TenantService::soft_delete`].
+//! [`crate::domain::tenant::service::TenantService::delete_tenant`].
 //!
 //! The `ClientHub` binding is wired in the AM module entry-point
 //! ([`crate::module::AccountManagementModule`]): `resource-group` is

@@ -9,11 +9,13 @@ pub mod conversion;
 mod helpers;
 mod integrity;
 mod lifecycle;
+pub mod metadata;
 mod reads;
 mod retention;
 mod updates;
 
 pub use conversion::ConversionRepoImpl;
+pub use metadata::MetadataRepoImpl;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,12 +27,13 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use account_management_sdk::{ListChildrenQuery, TenantPage, TenantUpdate};
+use account_management_sdk::UpdateTenantRequest;
+use modkit_odata::{ODataQuery, Page};
 
 use crate::domain::error::DomainError;
 use crate::domain::tenant::closure::ClosureRow;
 use crate::domain::tenant::integrity::{IntegrityCategory, Violation};
-use crate::domain::tenant::model::{ChildCountFilter, NewTenant, TenantModel};
+use crate::domain::tenant::model::{ChildCountFilter, NewTenant, TenantModel, TenantStatus};
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::retention::{
     HardDeleteEligibility, HardDeleteOutcome, TenantProvisioningRow, TenantRetentionRow,
@@ -72,9 +75,10 @@ impl TenantRepo for TenantRepoImpl {
     async fn list_children(
         &self,
         scope: &AccessScope,
-        query: &ListChildrenQuery,
-    ) -> Result<TenantPage<TenantModel>, DomainError> {
-        reads::list_children(self, scope, query).await
+        parent_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<TenantModel>, DomainError> {
+        reads::list_children(self, scope, parent_id, query).await
     }
 
     async fn insert_provisioning(
@@ -125,9 +129,19 @@ impl TenantRepo for TenantRepoImpl {
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
-        patch: &TenantUpdate,
+        patch: &UpdateTenantRequest,
     ) -> Result<TenantModel, DomainError> {
         updates::update_tenant_mutable(self, scope, tenant_id, patch).await
+    }
+
+    async fn set_status(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        new_status: TenantStatus,
+        now: OffsetDateTime,
+    ) -> Result<TenantModel, DomainError> {
+        updates::set_status(self, scope, tenant_id, new_status, now).await
     }
 
     async fn load_ancestor_chain_through_parent(
