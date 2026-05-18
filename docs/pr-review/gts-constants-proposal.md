@@ -94,11 +94,71 @@ GTS schemas support arbitrary `properties` blocks. This lets the schema carry me
 [schema."gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1".properties]
 supports_rollover   = true
 requires_period     = true
-counter_table       = "quota_consumption_counters"
+ledger_shape        = "accumulative"
 default_enforcement = "gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1~"
 ```
 
-The evaluation engine reads `counter_table` from the resolved schema instead of a match arm. A new quota type defined by a plugin just needs to register its schema with the right properties — no engine code change.
+The evaluation engine reads `ledger_shape` from the resolved schema to determine how to count and reset — no match arms needed. A new quota type registered by a plugin just declares its own `ledger_shape` value; no engine code change.
+
+#### 8. GTS-driven authorization — no hardcoded role checks
+
+The clearest example of the pattern: `POST /quota-enforcement/quotas` (create a quota). The caller's required permission depends entirely on the `source` field of the request body — a licensing-system call must be authorized differently from a tenant-admin call or a user self-service call.
+
+**Without GTS — fragile match arm in the handler:**
+
+```rust
+match request.source.as_str() {
+    "licensing" | "operator" => {
+        if !ctx.has_role("platform_operator") {
+            return Err(Problem::forbidden());
+        }
+    }
+    "tenant_admin" => {
+        if !ctx.has_role("tenant_admin") {
+            return Err(Problem::forbidden());
+        }
+    }
+    "user_self" => {
+        if request.subject_id != ctx.subject_id() {
+            return Err(Problem::forbidden());
+        }
+    }
+    _ => return Err(Problem::bad_request("unknown source")),
+}
+```
+
+Every new `source` value — added by a plugin or a new subscription tier — requires a code change and a redeployment of the core module.
+
+**With GTS — the handler has no role knowledge at all:**
+
+```rust
+// 1. Resolve the source schema from the GTS registry
+let source_schema = gts.resolve(&request.source).await
+    .map_err(|_| Problem::unprocessable("invalid source URI"))?;
+
+// 2. Read the required permission URI from the schema's properties
+let required_permission: &str = source_schema
+    .properties
+    .get("required_permission")
+    .ok_or_else(|| Problem::internal("source schema missing required_permission"))?;
+
+// 3. PolicyEnforcer checks the caller holds that permission
+//    The PEP resolves roles, scopes, and tenant context — the handler does none of this
+enforcer
+    .access_scope(&ctx, &QUOTA_RESOURCE, required_permission, None)
+    .await
+    .map_err(|_| Problem::forbidden())?;
+```
+
+The authorization rule lives in the GTS schema of the `source` type, not in the handler. Adding a new source type (e.g. `partner_provisioned`) requires:
+
+1. Register `~cf.qe.quota.source.partner_provisioned.v1~` in GTS with `required_permission = "...manage_partner.v1~"`.
+2. Register the new permission instance.
+3. Configure the PDP policy for that permission.
+
+Zero handler code changes. The module does not need to be redeployed.
+
+This pattern follows what `mini-chat` already does: every operation declares a GTS `AuthzPermissionV1` instance, and the PolicyEnforcer evaluates them at request time (see `libs/modkit/src/api/operation_builder.rs` `.authenticated()` + `modules/mini-chat/mini-chat/src/gts/permissions.rs`).
 
 ---
 
@@ -197,10 +257,10 @@ Properties:
 ```
 URI:          gts://gts.cf.qe.quota.type.v1~
 Owner:        cf.qe
-Description:  Structural shape of the quota. Determines which counter table is used,
+Description:  Structural shape of the quota. Determines the ledger accounting model,
               whether the period resets, and what the enforcement semantics are.
 Properties:
-  counter_table:     string  # "quota_consumption_counters" | "quota_allocation_counters"
+  ledger_shape:      string  # "accumulative" | "reservable"  (maps to storage internally)
   supports_rollover: bool
   requires_period:   bool
   is_additive:       bool    # whether multiple quotas of this type stack
@@ -208,11 +268,11 @@ Properties:
 
 **Child instances**
 
-| URI | counter_table | supports_rollover | requires_period | description |
-|-----|--------------|-------------------|-----------------|-------------|
-| `~cf.qe.quota.consumption.v1~` | quota_consumption_counters | true | true | Tracks cumulative usage against a cap. Resets each period. Typical for API calls and tokens. |
-| `~cf.qe.quota.allocation.v1~` | quota_allocation_counters | false | false | Reserves capacity via lease acquire/commit. Typical for storage bytes and reserved seats. |
-| `~cf.qe.quota.rate.v1~` | quota_consumption_counters | false | false | (P3) Rolling-window rate limit. Cap applies per sliding interval, not a calendar period. |
+| URI | ledger_shape | supports_rollover | requires_period | description |
+|-----|-------------|-------------------|-----------------|-------------|
+| `~cf.qe.quota.consumption.v1~` | accumulative | true | true | Tracks cumulative usage against a cap. Resets each period. Typical for API calls and tokens. |
+| `~cf.qe.quota.allocation.v1~` | reservable | false | false | Reserves capacity via lease acquire/commit. Typical for storage bytes and reserved seats. |
+| `~cf.qe.quota.rate.v1~` | accumulative | false | false | (P3) Rolling-window rate limit. Cap applies per sliding interval, not a calendar period. |
 
 ---
 
@@ -279,22 +339,50 @@ Description:  Identifies the authority that created or granted this quota.
               Used for audit, for multi-quota arbitration ordering, and for
               determining whether the quota can be modified by the subject.
 Properties:
-  mutable_by_subject: bool  # whether the subject itself can adjust the cap
-  priority:           int   # lower = higher authority; used in most-restrictive-wins ordering
+  mutable_by_subject:  bool    # whether the subject itself can adjust the cap
+  priority:            int     # lower = higher authority; used in most-restrictive-wins ordering
+  required_permission: string  # GTS AuthzPermissionV1 URI; PolicyEnforcer evaluates this at request time
 ```
 
 **Child instances**
 
 | URI | priority | mutable_by_subject | description |
 |-----|---------|-------------------|-------------|
-| `~cf.qe.quota.source.licensing.v1~` | 0 | false | Quota bound to a commercial license or subscription entitlement. Highest authority. |
-| `~cf.qe.quota.source.operator.v1~` | 10 | false | Platform operator override. Applies platform-wide policy limits. |
-| `~cf.qe.quota.source.tenant_admin.v1~` | 20 | false | (P2) Tenant administrator-configured cap. Cannot exceed operator cap. |
-| `~cf.qe.quota.source.user_self.v1~` | 30 | true | (P2) User-defined personal cap. Cannot exceed tenant_admin cap. |
+| URI | priority | mutable_by_subject | required_permission | description |
+|-----|---------|-------------------|---------------------|-------------|
+| `~cf.qe.quota.source.licensing.v1~` | 0 | false | `~cf.qe.quota.manage_system.v1~` | Quota bound to a commercial license or subscription entitlement. Highest authority. |
+| `~cf.qe.quota.source.operator.v1~` | 10 | false | `~cf.qe.quota.manage_system.v1~` | Platform operator override. Applies platform-wide policy limits. |
+| `~cf.qe.quota.source.tenant_admin.v1~` | 20 | false | `~cf.qe.quota.manage_tenant.v1~` | (P2) Tenant administrator-configured cap. Cannot exceed operator cap. |
+| `~cf.qe.quota.source.user_self.v1~` | 30 | true | `~cf.qe.quota.manage_self.v1~` | (P2) User-defined personal cap. Cannot exceed tenant_admin cap. |
 
 ---
 
-#### G. GTS Resource Type Constants (Fixes Finding #8)
+#### G. Permissions (AuthzPermissionV1 instances)
+
+Each quota operation gets a dedicated GTS `AuthzPermissionV1` instance. The PolicyEnforcer resolves these at request time; no role checks live in handler code.
+
+**Base schema (platform-owned):**
+
+```
+URI:    gts://gts.cf.modkit.authz.permission.v1~
+Owner:  cf.modkit
+```
+
+**QE permission instances:**
+
+| URI (short) | action | resource_type pattern | description |
+|-------------|--------|-----------------------|-------------|
+| `~cf.qe.quota.manage_system.v1~` | `quota:manage:system` | `gts.cf.qe.resource.quota.v1~*` | Create / modify licensing- or operator-source quotas. Requires platform operator principal. |
+| `~cf.qe.quota.manage_tenant.v1~` | `quota:manage:tenant` | `gts.cf.qe.resource.quota.v1~*` | Create / modify tenant_admin-source quotas. Requires tenant admin role within the caller's tenant. |
+| `~cf.qe.quota.manage_self.v1~` | `quota:manage:self` | `gts.cf.qe.resource.quota.v1~*` | Create / modify user_self-source quotas. Subject ID in request must match caller. |
+| `~cf.qe.quota.debit.v1~` | `quota:debit` | `gts.cf.qe.resource.quota.v1~*` | Debit, credit, and lease operations. Typically held by service accounts and the evaluation engine. |
+| `~cf.qe.quota.read.v1~` | `quota:read` | `gts.cf.qe.resource.quota.v1~*` | Read quota configuration and remaining balance. Held by all authenticated principals. |
+
+The `~cf.qe.quota.source.*` schemas each carry `required_permission` pointing to the matching entry above. The handler resolves the source URI → reads `required_permission` → calls `enforcer.access_scope(ctx, &QUOTA_RESOURCE, required_permission, None)`. No `match` arm on source string values anywhere in production code.
+
+---
+
+#### H. GTS Resource Type Constants (Fixes Finding #8)
 
 These are the OpenAPI / Problem envelope resource type URIs referenced in DESIGN.md §5 but never spelled out. They follow the resource type convention (flat schema URIs, not child-schema chaining):
 
@@ -371,10 +459,11 @@ The validation path at the API boundary becomes:
 |----------------|------------------------|------------------------|----------------------------|
 | `subject_type` | `gts.cf.qe.subject.type.v1` | 4 (2 P3) | hierarchical, id_format |
 | `metric` | `gts.cf.uc.metric.type.v1` | 5 | unit, granularity, aggregation |
-| `quota_type` | `gts.cf.qe.quota.type.v1` | 3 (1 P3) | counter_table, supports_rollover |
+| `quota_type` | `gts.cf.qe.quota.type.v1` | 3 (1 P3) | ledger_shape, supports_rollover |
 | `period` | `gts.cf.qe.quota.period.v1` | 5 | iso_duration, calendar_aligned |
 | `enforcement_mode` | `gts.cf.qe.quota.enforcement.v1` | 3 (2 P3) | rejects_over_cap, allows_partial |
 | `source` | `gts.cf.qe.quota.source.v1` | 4 (2 P2) | priority, mutable_by_subject |
 | resource type constants | flat schemas in `gts.cf.qe.resource.*` | 4 | used in Problem envelope `type` field |
+| `source` → `required_permission` | `gts.cf.modkit.authz.permission.v1` | 5 | eliminates role match arms in handler |
 
 Adopting this catalogue also closes Findings #1, #2 (wrong URI prefix on existing `gts.x.qe.subject-type.v1~`) and Finding #8 (resource-type constants unnamed) from the current review.
