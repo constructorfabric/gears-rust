@@ -91,14 +91,14 @@ The QE engine resolves the URI and delegates to the plugin that declared it. The
 GTS schemas support arbitrary `properties` blocks. This lets the schema carry metadata that the engine can read without any code change:
 
 ```toml
-[schema."gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1".properties]
+[schema."gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1~".properties]
 supports_rollover   = true
 requires_period     = true
-ledger_shape        = "accumulative"
-default_enforcement = "gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1"
+ledger_shape        = "gts://gts.cf.qe.ledger.shape.v1~cf.qe.ledger.shape.accumulative.v1~"
+default_enforcement = "gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1~"
 ```
 
-The evaluation engine reads `ledger_shape` from the resolved schema to determine how to count and reset — no match arms needed. A new quota type registered by a plugin just declares its own `ledger_shape` value; no engine code change.
+The evaluation engine reads `ledger_shape` (itself a GTS URI) from the resolved schema, resolves it to get storage and lease semantics, and routes accordingly — no match arms needed. A new quota type registered by a plugin just declares its own `ledger_shape` URI; no engine code change.
 
 #### 8. GTS-driven authorization — no hardcoded role checks
 
@@ -232,23 +232,74 @@ Description:  Identifies the resource or activity being metered.
               The same metric type is used by both Usage Collector (for recording)
               and Quota Enforcement (for counting against caps).
 Properties:
-  unit:        string  # human label: "tokens", "requests", "bytes", "calls"
-  granularity: string  # "cumulative" | "delta" (could be also GTS...)
-  aggregation: string  # "sum" | "max" | "last" (could be also GTS...)
-  description: string
+  unit:        string  # human display label: "tokens", "requests", "bytes", "calls"
+  granularity: uri     # gts://gts.cf.uc.metric.granularity.v1~ child instance
+  aggregation: uri     # gts://gts.cf.uc.metric.aggregation.v1~ child instance
 ```
 
 **Child instances**
 
-| URI | unit | granularity | description |
-|-----|------|-------------|-------------|
-| `~cf.uc.metric.api_request.v1` | requests | delta | One REST or gRPC call to any platform API endpoint |
-| `~cf.uc.metric.llm_token.v1` | tokens | delta | LLM prompt+completion token pair, model-agnostic |
-| `~cf.uc.metric.storage_byte.v1` | bytes | cumulative | Persistent storage consumed at snapshot time |
-| `~cf.uc.metric.egress_byte.v1` | bytes | delta | Data transferred out of the platform boundary |
-| `~cf.uc.metric.compute_second.v1` | seconds | delta | Wall-clock compute time charged to the subject |
+| URI | unit | granularity (short) | aggregation (short) | description |
+|-----|------|---------------------|---------------------|-------------|
+| `~cf.uc.metric.api_request.v1~` | requests | `~granularity.delta.v1~` | `~aggregation.sum.v1~` | One REST or gRPC call to any platform API endpoint |
+| `~cf.uc.metric.llm_token.v1~` | tokens | `~granularity.delta.v1~` | `~aggregation.sum.v1~` | LLM prompt+completion token pair, model-agnostic |
+| `~cf.uc.metric.storage_byte.v1~` | bytes | `~granularity.cumulative.v1~` | `~aggregation.last.v1~` | Persistent storage consumed at snapshot time |
+| `~cf.uc.metric.egress_byte.v1~` | bytes | `~granularity.delta.v1~` | `~aggregation.sum.v1~` | Data transferred out of the platform boundary |
+| `~cf.uc.metric.compute_second.v1~` | seconds | `~granularity.delta.v1~` | `~aggregation.sum.v1~` | Wall-clock compute time charged to the subject |
 
-> **Note:** new metric types are registered by the owning team in the UC namespace. QE needs no code change to enforce a new metric — it reads the schema's `unit` and `aggregation` properties.
+> **Note:** new metric types are registered by the owning team in the UC namespace. QE needs no code change to enforce a new metric — it reads the schema's `unit`, `granularity`, and `aggregation` URIs and routes accordingly.
+
+---
+
+#### B1. Metric Granularity
+
+**Base schema**
+
+```
+URI:          gts://gts.cf.uc.metric.granularity.v1~
+Vendor:       cf (Cyber Fabric)
+Package:      uc (Usage Collector)
+Description:  Describes how individual metric observations relate to cumulative totals.
+              Determines whether Usage Collector should sum increments or take the
+              latest snapshot when computing a period value.
+Properties:
+  is_additive: bool  # true = readings are summed to produce period totals;
+                     # false = only the latest reading within a window is meaningful
+```
+
+**Child instances**
+
+| URI | is_additive | description |
+|-----|-------------|-------------|
+| `~cf.uc.metric.granularity.delta.v1~` | true | Each observation is an increment to be added to prior observations. Typical for event-driven metrics: API calls, tokens consumed, bytes transferred. The period total = Σ(all increments in the window). |
+| `~cf.uc.metric.granularity.cumulative.v1~` | false | Each observation is a running total that supersedes the previous value. Typical for storage bytes sampled at a point in time. Summing two readings would double-count; only the latest reading is used. |
+
+---
+
+#### B2. Metric Aggregation
+
+**Base schema**
+
+```
+URI:          gts://gts.cf.uc.metric.aggregation.v1~
+Vendor:       cf (Cyber Fabric)
+Package:      uc (Usage Collector)
+Description:  Defines the mathematical function applied when collapsing multiple
+              observations into a single value for a quota comparison or reporting window.
+              Works in conjunction with granularity: the aggregation function is applied
+              after observations are collected according to the granularity rule.
+Properties:
+  requires_ordered_observations: bool    # true = result depends on observation order
+  identity_element:              string  # neutral element for the operation
+```
+
+**Child instances**
+
+| URI | requires_ordered_observations | identity_element | description |
+|-----|------------------------------|------------------|-------------|
+| `~cf.uc.metric.aggregation.sum.v1~` | false | `"0"` | Observations are summed to produce the window total. Used with `delta` granularity metrics where each reading is an increment. The quota balance is `cap − Σ(increments)`. |
+| `~cf.uc.metric.aggregation.max.v1~` | false | `"-∞"` | The highest observed value within the window is taken. Used with `cumulative` granularity to detect peak usage. The quota balance is `cap − max(readings)`. |
+| `~cf.uc.metric.aggregation.last.v1~` | true | `"—"` | The most recent observation replaces all prior ones. Used with `cumulative` granularity where only current state matters. The quota balance is `cap − latest(reading)`. |
 
 ---
 
@@ -258,24 +309,52 @@ Properties:
 
 ```
 URI:          gts://gts.cf.qe.quota.type.v1~
-Owner:        cf.qe
+Vendor:       cf (Cyber Fabric)
+Package:      qe (Quota Enforcement)
 Description:  Structural shape of the quota. Determines the ledger accounting model,
               whether the period resets, and what the enforcement semantics are.
 Properties:
-  ledger_shape:      string  # "accumulative" | "reservable"  (maps to storage internally)
+  ledger_shape:      uri   # gts://gts.cf.qe.ledger.shape.v1~ child instance
   supports_rollover: bool
   requires_period:   bool
-  is_additive:       bool    # whether multiple quotas of this type stack
-  description:       string
+  is_additive:       bool  # whether multiple quotas of this type stack
 ```
 
 **Child instances**
 
-| URI | ledger_shape | supports_rollover | requires_period | description |
-|-----|-------------|-------------------|-----------------|-------------|
-| `~cf.qe.quota.consumption.v1` | accumulative | true | true | Tracks cumulative usage against a cap. Resets each period. Typical for API calls and tokens. |
-| `~cf.qe.quota.allocation.v1` | reservable | false | false | Reserves capacity via lease acquire/commit. Typical for storage bytes and reserved seats. |
-| `~cf.qe.quota.rate.v1` | accumulative | false | false | (P3) Rolling-window rate limit. Cap applies per sliding interval, not a calendar period. |
+| URI | ledger_shape (short) | supports_rollover | requires_period | description |
+|-----|---------------------|-------------------|-----------------|-------------|
+| `~cf.qe.quota.consumption.v1~` | `~ledger.shape.accumulative.v1~` | true | true | Tracks cumulative usage against a cap. Resets each period. Typical for API calls and tokens. |
+| `~cf.qe.quota.allocation.v1~` | `~ledger.shape.reservable.v1~` | false | false | Reserves capacity via lease acquire/commit. Typical for storage bytes and reserved seats. |
+| `~cf.qe.quota.rate.v1~` | `~ledger.shape.accumulative.v1~` | false | false | (P3) Rolling-window rate limit. Cap applies per sliding interval, not a calendar period. |
+
+---
+
+#### C1. Ledger Shape
+
+**Base schema**
+
+```
+URI:          gts://gts.cf.qe.ledger.shape.v1~
+Vendor:       cf (Cyber Fabric)
+Package:      qe (Quota Enforcement)
+Description:  Defines the accounting model used by the quota engine to track usage
+              against a cap. The ledger shape determines which storage operations are
+              available, how balance is computed, and whether lease operations apply.
+              This is an internal routing concept — callers never set it directly;
+              the engine reads it from the resolved quota_type schema.
+Properties:
+  supports_period_reset: bool    # true = counter resets at each period boundary
+  supports_lease:        bool    # true = acquire / commit / release operations apply
+  balance_formula:       string  # human description of how remaining balance is computed
+```
+
+**Child instances**
+
+| URI | supports_period_reset | supports_lease | balance_formula | description |
+|-----|----------------------|----------------|-----------------|-------------|
+| `~cf.qe.ledger.shape.accumulative.v1~` | true | false | `cap − Σ(committed_debits)` | Counter grows monotonically within a period and is compared against the cap. Resets at each period boundary. Typical for API calls and token consumption. |
+| `~cf.qe.ledger.shape.reservable.v1~` | false | true | `cap − Σ(active_leases + committed_leases)` | Capacity is tentatively claimed via acquire and confirmed by commit or returned by release. No period reset. Typical for storage bytes and reserved seats. |
 
 ---
 
@@ -351,8 +430,6 @@ Properties:
 
 **Child instances**
 
-| URI | priority | mutable_by_subject | description |
-|-----|---------|-------------------|-------------|
 | URI | priority | mutable_by_subject | required_permission | description |
 |-----|---------|-------------------|---------------------|-------------|
 | `~cf.qe.quota.source.licensing.v1~` | 0 | false | `~cf.qe.quota.manage_system.v1` | Quota bound to a commercial license or subscription entitlement. Highest authority. |
@@ -460,15 +537,18 @@ The validation path at the API boundary becomes:
 
 ### Impact Summary
 
-| String constant | Replacement base schema | Child instances defined | Properties usable by engine |
-|----------------|------------------------|------------------------|----------------------------|
-| `subject_type` | `gts.cf.qe.subject.type.v1~` | 4 (2 P3) | hierarchical, id_format |
-| `metric` | `gts.cf.uc.metric.type.v1~` | 5 | unit, granularity, aggregation |
-| `quota_type` | `gts.cf.qe.quota.type.v1~` | 3 (1 P3) | ledger_shape, supports_rollover |
-| `period` | `gts.cf.qe.quota.period.v1~` | 5 | iso_duration, calendar_aligned |
-| `enforcement_mode` | `gts.cf.qe.quota.enforcement.v1~` | 3 (2 P3) | rejects_over_cap, allows_partial |
-| `source` | `gts.cf.qe.quota.source.v1~` | 4 (2 P2) | priority, mutable_by_subject |
+| String constant | Replacement base schema | Child instances | Properties usable by engine |
+|----------------|------------------------|-----------------|----------------------------|
+| `subject_type` | `gts.cf.qe.subject.type.v1` | 4 (2 P3) | hierarchical, is_uuid |
+| `metric` | `gts.cf.uc.metric.type.v1` | 5 | unit, granularity (URI), aggregation (URI) |
+| metric `granularity` value | `gts.cf.uc.metric.granularity.v1` | 2 | is_additive |
+| metric `aggregation` value | `gts.cf.uc.metric.aggregation.v1` | 3 | requires_ordered_observations, identity_element |
+| `quota_type` | `gts.cf.qe.quota.type.v1` | 3 (1 P3) | ledger_shape (URI), supports_rollover |
+| `quota_type.ledger_shape` value | `gts.cf.qe.ledger.shape.v1` | 2 | supports_period_reset, supports_lease, balance_formula |
+| `period` | `gts.cf.qe.quota.period.v1` | 5 | iso_duration, calendar_aligned |
+| `enforcement_mode` | `gts.cf.qe.quota.enforcement.v1` | 3 (2 P3) | rejects_over_cap, allows_partial |
+| `source` | `gts.cf.qe.quota.source.v1` | 4 (2 P2) | priority, mutable_by_subject, required_permission (URI) |
+| `source.required_permission` value | `gts.cf.modkit.authz.permission.v1` | 5 | eliminates role match arms in handler |
 | resource type constants | flat schemas in `gts.cf.qe.resource.*` | 4 | used in Problem envelope `type` field |
-| `source` → `required_permission` | `gts.cf.modkit.authz.permission.v1~` | 5 | eliminates role match arms in handler |
 
 Adopting this catalogue also closes Findings #1, #2 (wrong URI prefix on existing `gts.x.qe.subject-type.v1~`) and Finding #8 (resource-type constants unnamed) from the current review.
