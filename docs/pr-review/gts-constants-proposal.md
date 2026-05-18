@@ -94,8 +94,8 @@ GTS schemas support arbitrary `properties` blocks. This lets the schema carry me
 [schema."gts://gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1~".properties]
 supports_rollover   = true
 requires_period     = true
-ledger_shape        = "gts://gts.cf.qe.ledger.shape.v1~cf.qe.ledger.shape.accumulative.v1~"
-default_enforcement = "gts://gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1~"
+ledger_shape        = "gts.cf.qe.ledger.shape.v1~cf.qe.ledger.shape.accumulative.v1"
+default_enforcement = "gts.cf.qe.quota.enforcement.v1~cf.qe.quota.enforcement.hard.v1"
 ```
 
 The evaluation engine reads `ledger_shape` (itself a GTS URI) from the resolved schema, resolves it to get storage and lease semantics, and routes accordingly — no match arms needed. A new quota type registered by a plugin just declares its own `ledger_shape` URI; no engine code change.
@@ -173,16 +173,16 @@ gts.x.qe.subject-type.v1~          ← wrong vendor prefix, kebab-case, only 3 t
 The correct form following confirmed platform conventions (4 tokens, underscores, `cf` vendor):
 
 ```
-gts://gts.cf.qe.subject.type.v1~
+gts.cf.qe.subject.type.v1~
 ```
 
 Every child instance follows the chained format:
 
 ```
-gts://gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1
-gts://gts.cf.qe.subject.type.v1~cf.qe.subject.user.v1
-gts://gts.cf.qe.subject.type.v1~cf.qe.subject.service_account.v1   ← P2
-gts://gts.cf.qe.subject.type.v1~cf.qe.subject.cost_center.v1       ← P3
+gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1
+gts.cf.qe.subject.type.v1~cf.qe.subject.user.v1
+gts.cf.qe.subject.type.v1~cf.qe.subject.service_account.v1   ← P2
+gts.cf.qe.subject.type.v1~cf.qe.subject.cost_center.v1       ← P3
 ```
 
 ---
@@ -198,7 +198,7 @@ Below is **just an example** of possible schema catalogue covering every string 
 **Base schema**
 
 ```
-URI:          gts://gts.cf.qe.subject.type.v1~
+GTS ID:          gts.cf.qe.subject.type.v1~
 Vendo:        cf (Cyber Fabric)
 Package:      qe (Quota Enforcement)
 Description:  Discriminator for the entity whose quota consumption is being tracked.
@@ -225,7 +225,7 @@ Properties:
 **Base schema**
 
 ```
-URI:          gts://gts.cf.uc.metric.type.v1~
+GTS ID:       gts.cf.uc.metric.type.v1~
 Vendor:       cf (Cyber Fabric)
 Package:      uc (Usage Collector) ← Usage Collector owns metric definitions, QE consumes them
 Description:  Identifies the resource or activity being metered.
@@ -233,8 +233,8 @@ Description:  Identifies the resource or activity being metered.
               and Quota Enforcement (for counting against caps).
 Properties:
   unit:        string  # human display label: "tokens", "requests", "bytes", "calls"
-  granularity: uri     # gts://gts.cf.uc.metric.granularity.v1~ child instance
-  aggregation: uri     # gts://gts.cf.uc.metric.aggregation.v1~ child instance
+  granularity: GTS     # gts.cf.uc.metric.granularity.v1~*
+  aggregation: GTS     # gts.cf.uc.metric.aggregation.v1~*
 ```
 
 **Child instances**
@@ -256,7 +256,7 @@ Properties:
 **Base schema**
 
 ```
-URI:          gts://gts.cf.uc.metric.granularity.v1~
+GTS ID:       gts.cf.uc.metric.granularity.v1~
 Vendor:       cf (Cyber Fabric)
 Package:      uc (Usage Collector)
 Description:  Describes how individual metric observations relate to cumulative totals.
@@ -281,7 +281,7 @@ Properties:
 **Base schema**
 
 ```
-URI:          gts://gts.cf.uc.metric.aggregation.v1~
+GTS ID:       gts.cf.uc.metric.aggregation.v1~
 Vendor:       cf (Cyber Fabric)
 Package:      uc (Usage Collector)
 Description:  Defines the mathematical function applied when collapsing multiple
@@ -308,13 +308,13 @@ Properties:
 **Base schema**
 
 ```
-URI:          gts://gts.cf.qe.quota.type.v1~
+GTS ID:       gts.cf.qe.quota.type.v1~
 Vendor:       cf (Cyber Fabric)
 Package:      qe (Quota Enforcement)
 Description:  Structural shape of the quota. Determines the ledger accounting model,
               whether the period resets, and what the enforcement semantics are.
 Properties:
-  ledger_shape:      uri   # gts://gts.cf.qe.ledger.shape.v1~ child instance
+  ledger_shape:      GTS   # gts.cf.qe.ledger.shape.v1~*
   supports_rollover: bool
   requires_period:   bool
   is_additive:       bool  # whether multiple quotas of this type stack
@@ -335,7 +335,7 @@ Properties:
 **Base schema**
 
 ```
-URI:          gts://gts.cf.qe.ledger.shape.v1~
+GTS ID:       gts.cf.qe.ledger.shape.v1~
 Vendor:       cf (Cyber Fabric)
 Package:      qe (Quota Enforcement)
 Description:  Defines the accounting model used by the quota engine to track usage
@@ -363,7 +363,7 @@ Properties:
 **Base schema**
 
 ```
-URI:          gts://gts.cf.qe.quota.period.v1~
+GTS ID:       gts.cf.qe.quota.period.v1~
 Owner:        cf.qe
 Description:  Calendar or billing period that governs when a consumption quota resets.
               Not applicable to allocation quotas (see quota_type.requires_period).
@@ -391,7 +391,7 @@ Properties:
 **Base schema**
 
 ```
-URI:          gts://gts.cf.qe.quota.enforcement.v1~
+GTS ID:       gts.cf.qe.quota.enforcement.v1~
 Owner:        cf.qe
 Description:  Controls how the evaluation engine responds when a debit request would
               exceed the remaining cap.
@@ -417,7 +417,7 @@ Properties:
 **Base schema**
 
 ```
-URI:          gts://gts.cf.qe.quota.source.v1~
+GTS ID:       gts.cf.qe.quota.source.v1~
 Owner:        cf.qe
 Description:  Identifies the authority that created or granted this quota.
               Used for audit, for multi-quota arbitration ordering, and for
@@ -446,7 +446,7 @@ Each quota operation gets a dedicated GTS `AuthzPermissionV1` instance. The Poli
 **Base schema (platform-owned):**
 
 ```
-URI:    gts://gts.cf.modkit.authz.permission.v1~
+GTS ID: gts.cf.modkit.authz.permission.v1~
 Owner:  cf.modkit
 ```
 
@@ -470,22 +470,22 @@ These are the OpenAPI / Problem envelope resource type URIs referenced in DESIGN
 
 ```
 Quota policy resource:
-  gts://gts.cf.qe.resource.quota.v1~
+  gts.cf.qe.resource.quota.v1~
   Description: A configured quota policy record. References subject, metric,
                cap, period, and enforcement mode.
 
 Quota lease resource:
-  gts://gts.cf.qe.resource.lease.v1~
+  gts.cf.qe.resource.lease.v1~
   Description: An active two-phase lease acquired against an allocation quota.
                Has TTL; expires lazily on next operation if not committed.
 
 Quota operation resource:
-  gts://gts.cf.qe.resource.operation.v1~
+  gts.cf.qe.resource.operation.v1~
   Description: A debit or credit operation applied against a quota counter.
                Immutable once committed. Carries correlation_id for idempotency.
 
 Enforcement decision resource:
-  gts://gts.cf.qe.resource.decision.v1~
+  gts.cf.qe.resource.decision.v1~
   Description: The evaluation result returned by QuotaResolutionEngineV1::evaluate.
                Carries granted_amount, plan entries, and applied quota references.
 ```
@@ -539,16 +539,14 @@ The validation path at the API boundary becomes:
 
 | String constant | Replacement base schema | Child instances | Properties usable by engine |
 |----------------|------------------------|-----------------|----------------------------|
-| `subject_type` | `gts.cf.qe.subject.type.v1` | 4 (2 P3) | hierarchical, is_uuid |
-| `metric` | `gts.cf.uc.metric.type.v1` | 5 | unit, granularity (URI), aggregation (URI) |
-| metric `granularity` value | `gts.cf.uc.metric.granularity.v1` | 2 | is_additive |
-| metric `aggregation` value | `gts.cf.uc.metric.aggregation.v1` | 3 | requires_ordered_observations, identity_element |
-| `quota_type` | `gts.cf.qe.quota.type.v1` | 3 (1 P3) | ledger_shape (URI), supports_rollover |
-| `quota_type.ledger_shape` value | `gts.cf.qe.ledger.shape.v1` | 2 | supports_period_reset, supports_lease, balance_formula |
-| `period` | `gts.cf.qe.quota.period.v1` | 5 | iso_duration, calendar_aligned |
-| `enforcement_mode` | `gts.cf.qe.quota.enforcement.v1` | 3 (2 P3) | rejects_over_cap, allows_partial |
-| `source` | `gts.cf.qe.quota.source.v1` | 4 (2 P2) | priority, mutable_by_subject, required_permission (URI) |
-| `source.required_permission` value | `gts.cf.modkit.authz.permission.v1` | 5 | eliminates role match arms in handler |
+| `subject_type` | `gts.cf.qe.subject.type.v1~` | 4 (2 P3) | hierarchical, is_uuid |
+| `metric` | `gts.cf.uc.metric.type.v1~` | 5 | unit, granularity (URI), aggregation (URI) |
+| metric `granularity` value | `gts.cf.uc.metric.granularity.v1~` | 2 | is_additive |
+| metric `aggregation` value | `gts.cf.uc.metric.aggregation.v1~` | 3 | requires_ordered_observations, identity_element |
+| `quota_type` | `gts.cf.qe.quota.type.v1~` | 3 (1 P3) | ledger_shape (URI), supports_rollover |
+| `quota_type.ledger_shape` value | `gts.cf.qe.ledger.shape.v1~` | 2 | supports_period_reset, supports_lease, balance_formula |
+| `period` | `gts.cf.qe.quota.period.v1~` | 5 | iso_duration, calendar_aligned |
+| `enforcement_mode` | `gts.cf.qe.quota.enforcement.v1~` | 3 (2 P3) | rejects_over_cap, allows_partial |
+| `source` | `gts.cf.qe.quota.source.v1~` | 4 (2 P2) | priority, mutable_by_subject, required_permission (URI) |
+| `source.required_permission` value | `gts.cf.modkit.authz.permission.v1~` | 5 | eliminates role match arms in handler |
 | resource type constants | flat schemas in `gts.cf.qe.resource.*` | 4 | used in Problem envelope `type` field |
-
-Adopting this catalogue also closes Findings #1, #2 (wrong URI prefix on existing `gts.x.qe.subject-type.v1~`) and Finding #8 (resource-type constants unnamed) from the current review.
