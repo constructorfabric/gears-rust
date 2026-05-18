@@ -52,7 +52,7 @@ Chosen option: "Proxy all content traffic through FileStorage", because it is th
 ### Consequences
 
 * The PRD requirements that defined direct-to-backend transfer, signed URLs, and orphaned-direct-upload garbage collection (named `fr-direct-transfer`, `fr-signed-urls`, and `fr-gc-direct-uploads` in earlier PRD drafts) are superseded by this ADR and have been removed from the PRD in the same change set that adopts this decision; the "Direct Upload from External Client" and "Generate and Access Signed URL" use cases are removed for the same reason
-* External, unauthenticated sharing was originally delivered through scope-based shareable links served by FileStorage. In the current PRD revision the public-access slice is delivered by the `cpt-cf-file-storage-fr-public-access` flag and the per-principal slice by the separate FileShare module (P3); both paths still inherit FileStorage's proxy-level audit and access controls
+* External, unauthenticated sharing was originally delivered through scope-based shareable links served by FileStorage. In the current PRD revision all external/anonymous access is deferred to P3 (see PRD `§5.3` and DESIGN.md §1.1 "Sharing boundary") — its delivery shape (separate sibling module vs. FileStorage extension) will be settled by a future ADR. When implemented, that surface will still inherit FileStorage's proxy-level audit and access controls via the FileStorage SDK
 * The "Presigned URLs" entry in the backend capability model (`cpt-cf-file-storage-fr-backend-capabilities`) is reframed as an internal-only capability — declared per backend, used by FileStorage itself, and never surfaced to clients; the public capability discovery surface no longer exposes it
 * `cpt-cf-file-storage-fr-content-type-validation` applies uniformly to every upload — the carve-out for direct uploads is removed
 * `cpt-cf-file-storage-fr-read-audit` applies uniformly to every download — the carve-out for presigned URL downloads is removed
@@ -125,7 +125,7 @@ This decision directly addresses the following requirements or design elements:
 * `fr-direct-transfer` (historical PRD ID, since removed) — Superseded by this ADR; removed from PRD in the same change set
 * `fr-signed-urls` (historical PRD ID, since removed) — Superseded by this ADR; removed from PRD in the same change set
 * `fr-gc-direct-uploads` (historical PRD ID, since removed) — Removed because the orphaned-direct-upload class no longer exists
-* `fr-shareable-links` (historical PRD ID, since removed) — Originally intended as the sole external sharing mechanism. In the current PRD revision external sharing is split across `cpt-cf-file-storage-fr-public-access` (anonymous URL access) and the FileShare module (per-principal grants, P3)
+* `fr-shareable-links` (historical PRD ID, since removed) — Originally intended as the sole external sharing mechanism. In the current PRD revision all external/anonymous sharing (anonymous URLs, per-principal grants, expirations, etc.) is deferred to P3 (see PRD `§5.3`); its delivery shape is left to a future ADR
 * `cpt-cf-file-storage-fr-backend-capabilities` — "Presigned URLs" capability is reframed as internal-only; it remains useful between FileStorage and its backends but is removed from the public capability discovery surface
 * `cpt-cf-file-storage-fr-content-type-validation` — Applies uniformly to every upload; the direct-upload carve-out is removed
 * `cpt-cf-file-storage-fr-read-audit` — Applies uniformly to every download; the presigned-URL carve-out is removed

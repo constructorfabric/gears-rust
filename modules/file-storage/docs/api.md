@@ -4,7 +4,6 @@
 <!-- toc -->
 
 - [P1 — Auth-required](#p1--auth-required)
-- [P1 — Public (no auth)](#p1--public-no-auth)
 - [P2 — Multipart upload (declared, not implemented in P1)](#p2--multipart-upload-declared-not-implemented-in-p1)
 - [P2 — Versioning (when backend declares `versioning_native`)](#p2--versioning-when-backend-declares-versioning_native)
 - [POST /files vs PATCH /files/{id}](#post-files-vs-patch-filesid)
@@ -15,16 +14,14 @@
 
 <!-- /toc -->
 
-FileStorage issues exactly one shape of file URL: `/files/{file_id_uuid}` (`GET` / `HEAD` only), unsigned and not
-time-bounded. The same UUID-based URL appears under two API Gateway prefixes that differ only in JWT enforcement —
-they are the same FileStorage endpoint with two routing modes. Richer sharing (TTLs, named recipients, download
-counters) is **not** part of this API; it lives in the separate **FileShare** module (P3, `modules/file-share/`),
-which has its own URL prefix and its own `sharable_link` entity.
+FileStorage issues exactly one shape of file URL: `/files/{file_id_uuid}` (`GET` / `HEAD` only), served only on the
+auth-required prefix and reachable only with a valid platform JWT. FileStorage P1 has **no anonymous surface** —
+anonymous/public access, time-bounded URLs, named recipients, download counters, and any other sharing primitives
+are deferred to P3 (see DESIGN.md §1.1 "Sharing boundary"); whether they ship as a separate sibling module or as
+an extension of FileStorage is left to a future ADR.
 
-Base URLs:
-- Auth-required: `/api/file-storage/v1` — JWT enforced by API Gateway; standard owner/tenant authorization applies
-- Public (no auth, API Gateway bypasses JWT by path prefix): `/api/file-storage-public/v1` — gated by the file's
-  `public_access` flag, returns `404` when off
+Base URL:
+- `/api/file-storage/v1` — JWT enforced by API Gateway; standard owner/tenant authorization applies
 
 Encoding conventions:
 - Multipart create/update bodies use `multipart/form-data` with two named parts: `metadata` (`application/json`) and `content` (binary, `Content-Type` = declared mime).
@@ -44,38 +41,23 @@ Encoding conventions:
 8.  GET    /storages/{storage_id}              one storage + capabilities
 ```
 
-## P1 — Public (no auth)
-
-```
-9.  GET    /files/{id}                         public download                                               — If-Match, If-None-Match, Range
-10. HEAD   /files/{id}                         public metadata headers                                       — If-Match, If-None-Match
-```
-
-In P2 when backend declares `versioning_native`, the versioning endpoints below are also reachable on this prefix subject to `public_access`:
-```
-GET   /files/{id}/versions/{version_id}        public download of a specific version                          — If-Match, If-None-Match, Range
-HEAD  /files/{id}/versions/{version_id}        public version metadata headers                                — If-Match, If-None-Match
-```
-
-Access is gated by `files.public_access = true` on the file row. Otherwise the endpoint returns `404` (never `401`/`403`, to avoid leaking the existence of a private file). `ETag`, `Range`, and all standard non-tenant-internal headers behave identically to the auth-required path. Only owner-private headers are stripped: `X-FS-GTS-File-Type`, `X-FS-Public-Access`, `X-FS-Owner-*`, and `X-FS-Meta-<key>` custom metadata.
-
 ## P2 — Multipart upload (declared, not implemented in P1)
 
 ```
-11. POST   /files/multipart                                      initiate (JSON metadata); returns {file_id, upload_id, etag}; creates pending file
-12. POST   /files/{id}/multipart/{upload_id}/parts/{n}           upload one part (binary body)                                — If-Match
-13. POST   /files/{id}/multipart/{upload_id}/complete            finalize; transitions file to available                     — If-Match
-14. DELETE /files/{id}/multipart/{upload_id}                     abort; parts discarded                                       — If-Match
-15. GET    /files/{id}/multipart/{upload_id}                     list uploaded parts (introspection)
+9.  POST   /files/multipart                                      initiate (JSON metadata); returns {file_id, upload_id, etag}; creates pending file
+10. POST   /files/{id}/multipart/{upload_id}/parts/{n}           upload one part (binary body)                                — If-Match
+11. POST   /files/{id}/multipart/{upload_id}/complete            finalize; transitions file to available                     — If-Match
+12. DELETE /files/{id}/multipart/{upload_id}                     abort; parts discarded                                       — If-Match
+13. GET    /files/{id}/multipart/{upload_id}                     list uploaded parts (introspection)
 ```
 
 ## P2 — Versioning (when backend declares `versioning_native`)
 
 ```
-16. GET    /files/{id}/versions                                  list versions
-17. GET    /files/{id}/versions/{version_id}                     download specific version                                    — If-Match, If-None-Match, Range
-18. HEAD   /files/{id}/versions/{version_id}                     version metadata headers                                     — If-Match, If-None-Match
-19. DELETE /files/{id}/versions/{version_id}                     permanent version delete                                     — If-Match
+14. GET    /files/{id}/versions                                  list versions
+15. GET    /files/{id}/versions/{version_id}                     download specific version                                    — If-Match, If-None-Match, Range
+16. HEAD   /files/{id}/versions/{version_id}                     version metadata headers                                     — If-Match, If-None-Match
+17. DELETE /files/{id}/versions/{version_id}                     permanent version delete                                     — If-Match
 ```
 
 ## POST /files vs PATCH /files/{id}
@@ -91,18 +73,18 @@ Access is gated by `files.public_access = true` on the file row. Otherwise the e
 
 `PATCH` with a `content` part replaces the file content; `content_revision` is bumped, `metadata_revision` is bumped, `hash_value` is recomputed, and `ETag` changes. When the backing storage declares `versioning_native = true`, each content replacement creates a new version retrievable by version id; otherwise the prior content is permanently overwritten.
 
-`PATCH` with a `metadata` part applies JSON Merge Patch semantics to `custom_metadata` and `public_access`: keys present in the patch overwrite their values, keys set to `null` delete the entry, keys absent from the patch are left untouched. Metadata-only updates bump `metadata_revision` and `Last-Modified` but do **not** change `ETag` or `hash_value` — both remain tied to the content.
+`PATCH` with a `metadata` part applies JSON Merge Patch semantics to `custom_metadata`: keys present in the patch overwrite their values, keys set to `null` delete the entry, keys absent from the patch are left untouched. Metadata-only updates bump `metadata_revision` and `Last-Modified` but do **not** change `ETag` or `hash_value` — both remain tied to the content.
 
 ## Conditional headers
 
 - `If-Match`: required on every write (`PATCH`, `DELETE`) and on every multipart-control endpoint (`POST .../multipart/...`, `DELETE .../multipart/{upload_id}`). On read endpoints (`GET`, `HEAD`) it is optional; non-match returns `412 Precondition Failed`.
-- `If-None-Match`: optional on `GET`/`HEAD`; match returns `304 Not Modified` with no body. Supported on both auth-required and public namespaces.
+- `If-None-Match`: optional on `GET`/`HEAD`; match returns `304 Not Modified` with no body.
 - ETag is opaque, deterministic per `(file_id, content_revision)`, and explicitly **not** equal to the content hash. The content hash is exposed as `X-FS-Hash-Algorithm` + `X-FS-Hash-Value` headers (P1: SHA-256 only, per ADR-0002).
 - **ETag is content-only.** Metadata-only `PATCH` (no `content` part) does **not** change ETag — only `metadata_revision` and `Last-Modified` are bumped. Consequently `If-Match` on metadata-only `PATCH` protects against concurrent **content** writes but does **not** detect concurrent metadata writes (S3-style limitation; metadata updates are last-write-wins).
 
 ## Range support
 
-- `GET /files/{id}` (on both auth-required and public namespaces) accepts `Range: bytes=<start>-<end>`, `bytes=<start>-`, and `bytes=-<suffix-length>`. Valid ranges return `206 Partial Content` with `Content-Range: bytes <s>-<e>/<n>`. Unsatisfiable ranges return `416 Range Not Satisfiable` with `Content-Range: bytes */<n>`.
+- `GET /files/{id}` accepts `Range: bytes=<start>-<end>`, `bytes=<start>-`, and `bytes=-<suffix-length>`. Valid ranges return `206 Partial Content` with `Content-Range: bytes <s>-<e>/<n>`. Unsatisfiable ranges return `416 Range Not Satisfiable` with `Content-Range: bytes */<n>`.
 - Every download response includes `Accept-Ranges: bytes`.
 - `HEAD` ignores the `Range` header and always responds with full-file metadata; the `Accept-Ranges: bytes` header is still set to advertise support on `GET`.
 - Multi-range (`multipart/byteranges`) is optional; when unsupported the server may return the full content or a single coalesced range, per RFC 7233.
@@ -117,20 +99,17 @@ Content-Range: bytes <s>-<e>/<n>    # only on 206
 Accept-Ranges: bytes
 Last-Modified: <RFC 7231 date>
 X-FS-File-Id: <uuid>
-X-FS-GTS-File-Type: gts.cf.fstorage.file.type.v1~...    # auth-required only
+X-FS-GTS-File-Type: gts.cf.fstorage.file.type.v1~...
 X-FS-Hash-Algorithm: SHA-256                            # of content
 X-FS-Hash-Value: <hex>                                  # of content
 X-FS-Content-Revision: <u64>                            # increments only on content writes
 X-FS-Metadata-Revision: <u64>                           # increments on any PATCH
 X-FS-Version-Id: <opaque>                               # only on /versions/{version_id} responses (P2)
-X-FS-Owner-Kind: user|app                               # auth-required only
-X-FS-Owner-Id: <uuid>                                   # auth-required only
-X-FS-Public-Access: true|false                          # auth-required only
+X-FS-Owner-Kind: user|app
+X-FS-Owner-Id: <uuid>
 X-FS-Created-At: <ISO 8601>
-X-FS-Meta-<key>: <value>                                # one header per custom metadata key; auth-required only
+X-FS-Meta-<key>: <value>                                # one header per custom metadata key
 ```
-
-On the public namespace the following headers are omitted to avoid leaking owner-private context: `X-FS-GTS-File-Type`, `X-FS-Public-Access`, `X-FS-Owner-Kind`, `X-FS-Owner-Id`, and all `X-FS-Meta-<key>` custom metadata. Everything else — including `ETag`, `Range` headers, content hash, revision counters, and `X-FS-Version-Id` when applicable — behaves identically to the auth-required path.
 
 ## Status code summary
 
@@ -140,8 +119,8 @@ On the public namespace the following headers are omitted to avoid leaking owner
 - `206 Partial Content` — successful range read.
 - `304 Not Modified` — `If-None-Match` matched current ETag.
 - `400 Bad Request` — malformed request (missing required form parts, invalid JSON, etc.).
-- `403 Forbidden` — authorization denied (auth namespace only).
-- `404 Not Found` — file does not exist, version does not exist, or public access is disabled on the public namespace.
+- `403 Forbidden` — authorization denied.
+- `404 Not Found` — file does not exist or version does not exist.
 - `409 Conflict` — multipart state conflicts (e.g., complete on aborted upload).
 - `412 Precondition Failed` — `If-Match` mismatch.
 - `415 Unsupported Media Type` — declared mime does not match magic-bytes detection.

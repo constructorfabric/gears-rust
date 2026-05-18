@@ -43,31 +43,29 @@ single REST surface (and its in-process SDK trait), and FileStorage talks to bac
 The P1 architecture is deliberately narrow:
 
 - One ModKit module, in-process, consumed by other Cyber Ware modules through ClientHub
-- Two HTTP URL namespaces — auth-required (`/api/file-storage/v1`) and public-anonymous
-  (`/api/file-storage-public/v1`). The API Gateway routes the public prefix without JWT enforcement
+- One HTTP URL namespace — auth-required (`/api/file-storage/v1`). All requests are platform-JWT-enforced;
+  FileStorage has no anonymous surface in P1
 - Streaming I/O on the proxy path; no full-file buffering at the FileStorage layer regardless of file size
 - One hash algorithm — SHA-256, computed on the streaming upload path (see
   [ADR-0002](./ADR/0002-cpt-cf-file-storage-adr-content-hash-selection.md)); the full configurable hash-policy surface
   is exposed from P1 with a locked allow-list of `["SHA-256"]`
 - Static TOML backend configuration; runtime/DB configuration is P3
-- One URL shape for files: `/files/{file_id_uuid}` (`GET`/`HEAD` only), exposed under two API Gateway prefixes that
-  differ only in JWT enforcement; the same UUID-based URL serves both authorized and anonymous (when `public_access`
-  is on) consumers. FileStorage never issues signed URLs, time-limited URLs, or per-recipient links — any of that
-  belongs to the separate **FileShare** module (P3, see below)
+- One URL shape for files: `/files/{file_id_uuid}` (`GET`/`HEAD` only), served only on the auth-required prefix.
+  FileStorage never issues signed URLs, time-limited URLs, anonymous URLs, or per-recipient links — all of that is
+  part of the deferred sharing surface (see "Sharing boundary (P3)" below)
 
-**FileStorage vs FileShare boundary.** Richer-than-flag sharing — time-bounded access, named recipients, group
-targeting, per-link download counters — is delivered by a separate Cyber Ware module called **FileShare** (P3,
-`modules/file-share/`). FileShare owns its own database with a `sharable_link` entity that references a FileStorage
-`file_id` (plus optional `etag` and/or `version_id` for content pinning) and carries the link-level rules (TTL,
-recipient principals, max downloads, etc.). FileShare issues URLs under its own prefix, proxies link-served traffic
-through its own handlers, and fetches content from FileStorage via the in-process FileStorage SDK. FileStorage stores
-no FileShare state, has no FileShare-specific endpoints, and treats FileShare as just another SDK consumer.
+**Sharing boundary (P3).** Anonymous/public access, time-bounded URLs, named recipients, group targeting, per-link
+download counters, and any other sharing primitives are out of P1/P2 scope and deferred to P3. The working name
+for this future capability is "FileShare"; whether it ships as a separate Cyber Ware module or as an extension of
+FileStorage itself is **not decided here** and will be settled by a future ADR at the time the functionality is
+implemented. FileStorage P1/P2 stores no sharing-related state, exposes no anonymous URL namespace, has no JWT-bypass
+paths, and has no endpoints tied to that future decision.
 
 P2 introduces multipart upload (with the tree-/streaming-hash work-out from ADR-0002), audit + events + quota + usage
 outbound flows, file versioning under content-replace, and the policy engine. P3 adds runtime BYOS backend
-configuration, server-side encryption, read audit, and the FileShare module itself. These phases are declared in the
-component model below with forward references to future FEATURE artifacts; their detailed designs are deliberately
-out of scope for this document.
+configuration, server-side encryption, read audit, and the sharing capability described above. These phases are
+declared in the component model below with forward references to future FEATURE artifacts; their detailed designs
+are deliberately out of scope for this document.
 
 ### 1.2 Architecture Drivers
 
@@ -95,8 +93,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-fr-tenant-boundary`               | DB queries scoped by `SecurityContext.tenant_id` via SecureConn; cross-tenant rows are invisible                                                                         |
 | `cpt-cf-file-storage-fr-data-classification`           | No-op — FileStorage stores opaque bytes; classification is consumer concern                                                                                              |
 | `cpt-cf-file-storage-fr-file-type-classification`      | `gts_file_type` column on `files`; format-validated on upload; included as resource attribute in every `authz-adapter` call                                              |
-| `cpt-cf-file-storage-fr-public-access`                 | `public_access` boolean on `files`; dedicated `/api/file-storage-public/v1` router without `security_context_layer`; `404` when flag false                              |
-| `cpt-cf-file-storage-fr-metadata-storage`              | Eleven system columns + `files_custom_metadata` table; exposed as JSON on `GET` body and as `X-FS-*` headers on every response                                           |
+| `cpt-cf-file-storage-fr-metadata-storage`              | System columns + `files_custom_metadata` table; exposed as JSON on `GET` body and as `X-FS-*` headers on every response                                                  |
 | `cpt-cf-file-storage-fr-update-metadata`               | `PATCH /files/{id}` with JSON Merge Patch on `metadata` part; metadata-only updates bump `metadata_revision`/`last_modified_at` and leave `content_revision`/ETag intact |
 | `cpt-cf-file-storage-fr-retention-indefinite`          | No background purge in P1; files live until owner deletes                                                                                                                |
 | `cpt-cf-file-storage-fr-backend-abstraction`           | `StorageBackend` async trait with capability sub-traits; P1 drivers: `local-filesystem`, `s3-compatible`                                                                 |
@@ -129,7 +126,6 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 graph LR
     Client([Client / Browser / SDK]) -->|HTTPS| AGW[API Gateway]
     AGW -->|/api/file-storage/v1<br/>JWT enforced| HGW
-    AGW -->|/api/file-storage-public/v1<br/>no JWT| HGW
 
     Module[Cyber Ware Module] -->|ClientHub trait| SDK[sdk-facade]
     SDK --> Meta
@@ -195,16 +191,6 @@ metadata-write conflicts are rare and small.
 
 **ADRs**: `cpt-cf-file-storage-adr-content-hash-selection`
 
-#### One module, two URL namespaces
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-principle-two-namespaces`
-
-Auth-required and anonymous-public are different *routing trees in the same module*, not different services. They
-share components, metadata, backend drivers — they differ only in the middleware stack (security context on, security
-context off) and in which response headers are populated.
-
-**ADRs**: `cpt-cf-file-storage-adr-proxy-content-traffic`
-
 #### Capability discovery, not feature flags
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-principle-capabilities`
@@ -239,15 +225,6 @@ Tenant scoping happens through SecureConn — there is no direct un-scoped DB ac
 Backend definitions in P1 are loaded from a static TOML file at module startup. Changing the set of backends or
 their credentials requires a restart. Runtime/DB-driven configuration with admin tooling is a P3 deliverable
 (`cpt-cf-file-storage-fr-runtime-backends`).
-
-#### No JWT enforcement on public namespace
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-constraint-public-no-jwt`
-
-The platform API Gateway is configured to skip JWT enforcement for path prefix `/api/file-storage-public/v1`.
-FileStorage **assumes** this routing rule is in place — without it, every public-namespace request would be rejected
-upstream before reaching the module. This is a deployment-time contract with the API Gateway, not something FileStorage
-can enforce internally.
 
 ## 3. Technical Architecture
 
@@ -325,25 +302,18 @@ graph TB
 
 ##### Why this component exists
 
-The HTTP entry point. Owns route registration, security middleware, conditional-request/Range header parsing, error
-mapping to RFC 7807 Problem+JSON, and the split between auth-required and public namespaces.
+The HTTP entry point. Owns route registration, security middleware, conditional-request/Range header parsing, and
+error mapping to RFC 7807 Problem+JSON.
 
 ##### Responsibility scope
 
-- Register two routers: `/api/file-storage/v1/*` (with platform `security_context_layer`) and
-  `/api/file-storage-public/v1/*` (no security layer)
+- Register the auth-required router `/api/file-storage/v1/*` with the platform `security_context_layer`
 - Parse and validate HTTP-level inputs: `Content-Type` (must be `multipart/form-data` for create/update),
   `Range` header (parse to `ByteRange`), conditional headers
 - Enforce conditional-request semantics (return `304`, `412` as defined in `cpt-cf-file-storage-fr-conditional-requests`)
 - Map domain errors to status codes + Problem+JSON bodies per `docs/modkit_unified_system/05_errors_rfc9457.md`
 - Populate response headers including `ETag`, `Accept-Ranges`, `Last-Modified`, all `X-FS-*` system metadata, and
   `X-FS-Meta-<key>` for custom metadata (with RFC 8187 encoding for non-ASCII values)
-- On the public namespace: behave identically to the auth-required path on `ETag`, `Range`,
-  conditional requests, version-specific `/versions/{version_id}` retrieval (P2), and all other
-  standard response headers (`Content-*`, `Last-Modified`, `X-FS-File-Id`, `X-FS-Hash-*`,
-  `X-FS-Content-Revision`, `X-FS-Metadata-Revision`, `X-FS-Created-At`, and `X-FS-Version-Id`
-  when applicable). Omit only the owner-private headers: `X-FS-GTS-File-Type`,
-  `X-FS-Public-Access`, `X-FS-Owner-*`, and all `X-FS-Meta-*`
 - Route content endpoints (`GET`/`HEAD /files/{id}`, `POST /files`, `PATCH /files/{id}`) through raw axum handlers
   that stream bodies; route JSON endpoints (`GET /files`, `GET /storages`, `GET /storages/{id}`) through
   OperationBuilder
@@ -507,7 +477,6 @@ in the resource context so that the Authorization Service can apply per-type pol
   - `resource = gts.cf.fstorage.file.type.v1~<gts_file_type>~<file_id>`
 - Call `PolicyEnforcer::check` (in-process via ClientHub)
 - Convert `Deny` decisions to `403 Forbidden` Problem+JSON; `Allow` decisions are silent
-- Skip enforcement entirely on the public namespace — the public router never instantiates this adapter
 
 ##### Responsibility boundaries
 
@@ -557,7 +526,7 @@ intended decomposition. Their detailed designs live in P2/P3 FEATURE artifacts (
 | Component (`cpt-cf-file-storage-component-…`)         | Phase | One-line responsibility                                                                                                  | Forward reference                                                                              |
 |-------------------------------------------------------|-------|--------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
 | `multipart-coordinator`                               | P2    | Owns the multipart-upload lifecycle (initiate / part / complete / abort) and the per-part hash combiner from ADR-0002    | PRD `cpt-cf-file-storage-fr-multipart-upload`                                                  |
-| `policy-engine`                                       | P2    | Evaluates tenant/user policies (allowed types, size limits, sharing restriction, custom-metadata limits)                 | PRD `cpt-cf-file-storage-fr-allowed-types-policy`, `…fr-size-limits-policy`, `…fr-public-access-policy` |
+| `policy-engine`                                       | P2    | Evaluates tenant/user policies (allowed types, size limits, custom-metadata limits)                                      | PRD `cpt-cf-file-storage-fr-allowed-types-policy`, `…fr-size-limits-policy`                    |
 | `version-manager`                                     | P2    | Owns the file-versioning lifecycle on versioning-capable backends; soft-delete markers; restore                          | PRD `cpt-cf-file-storage-fr-file-versioning`                                                   |
 | `audit-publisher`                                     | P2    | Transactional outbox writer + async worker that drains to the platform audit sink                                        | PRD `cpt-cf-file-storage-fr-audit-trail`                                                       |
 | `event-publisher`                                     | P2    | EventBroker emitter for upload/update/delete events, gated by owner policy                                               | PRD `cpt-cf-file-storage-fr-file-events`                                                       |
@@ -615,11 +584,10 @@ the P2 FEATURE for `multipart-coordinator` referenced from the table above and i
 The full HTTP surface — endpoint list, multipart envelope shape, conditional headers, Range semantics, response header
 schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 
-- **Technology**: REST (axum + OperationBuilder for JSON), no GraphQL, no gRPC. Public API contracts versioned per
-  `cpt-cf-file-storage-interface-rest-api` and `cpt-cf-file-storage-interface-public-rest-api`
+- **Technology**: REST (axum + OperationBuilder for JSON), no GraphQL, no gRPC. Public API contract versioned per
+  `cpt-cf-file-storage-interface-rest-api`
 - **Auth-required base**: `/api/file-storage/v1` — `POST /files`, `PATCH /files/{id}`, `GET/HEAD /files/{id}`,
-  `DELETE /files/{id}`, `GET /files`, `GET /storages`, `GET /storages/{storage_id}`
-- **Public base**: `/api/file-storage-public/v1` — `GET /files/{id}`, `HEAD /files/{id}` only
+  `DELETE /files/{id}`, `GET /files`, `GET /storages`, `GET /storages/{storage_id}`. P1 has no anonymous surface
 - **Create / update body**: `multipart/form-data` with `metadata` (`application/json`, required on `POST`, optional
   on `PATCH`) and `content` (binary, required on `POST`, optional on `PATCH`). `metadata` MUST precede `content` to let
   the server route content through the right pipeline (declared mime informs the magic-bytes check)
@@ -628,7 +596,7 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 - **Range**: full `bytes=` syntax supported; `Accept-Ranges: bytes` advertised on every download response; `HEAD`
   ignores `Range` and returns full-file headers. See §4.1 for backend translation rules
 - **Custom metadata in headers**: one `X-FS-Meta-<key>` per pair; non-ASCII values use RFC 8187
-  `*=UTF-8''<percent-encoded>` form. Omitted on the public namespace
+  `*=UTF-8''<percent-encoded>` form
 
 ### 3.4 Internal Dependencies
 
@@ -644,7 +612,7 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 **Dependency Rules**:
 - No circular dependencies (FileStorage has no upstream Cyber Ware module dependencies in P1)
 - All inter-module communication is via SDK traits, not internal types
-- `SecurityContext` is propagated on all in-process calls **except** on the public namespace, where there is none
+- `SecurityContext` is propagated on every in-process call
 
 ### 3.5 External Dependencies
 
@@ -666,20 +634,13 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
   - **Interaction**: `aws-sdk-s3`; native multipart (P2), native Range, optional server-side encryption (P3),
     optional versioning (P2)
 
-#### API Gateway
-
-- **Contract**: deployment-time agreement that requests under `/api/file-storage-public/v1/*` are routed without JWT
-  enforcement
-- **Purpose**: deliver anonymous reads to the public namespace
-- **Interaction**: configured at API Gateway (not in FileStorage code). Validation is out-of-band
-
 ### 3.6 Interactions & Sequences
 
 #### Upload (P1, single-shot)
 
 **ID**: `cpt-cf-file-storage-seq-upload-single-shot`
 
-**Use cases**: `cpt-cf-file-storage-usecase-upload-public`
+**Use cases**: `cpt-cf-file-storage-usecase-upload`
 
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
@@ -816,41 +777,6 @@ sequenceDiagram
     end
 ```
 
-#### Public download (P1)
-
-**ID**: `cpt-cf-file-storage-seq-public-download`
-
-**Use cases**: `cpt-cf-file-storage-usecase-manage-public-access`
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Anonymous Client
-    participant AGW as API Gateway
-    participant HGW as http-gateway (public router)
-    participant MS as metadata-service
-    participant SP as stream-proxy
-    participant BA as backend driver
-
-    C->>AGW: GET /api/file-storage-public/v1/files/{id}
-    AGW->>HGW: forward (no JWT enforcement)
-    HGW->>MS: read(file_id) — bypass tenant filter (public lookup by id only)
-    alt file not found or public_access=false
-        HGW-->>C: 404 Not Found
-    else
-        HGW->>HGW: build headers (omit X-FS-GTS-File-Type, X-FS-Public-Access, X-FS-Meta-*)
-        alt If-None-Match matches
-            HGW-->>C: 304
-        else
-            HGW->>SP: stream_get(backend_id, path, range)
-            SP->>BA: get(path, range)
-            BA-->>SP: Stream<Bytes>
-            SP-->>HGW: pipe
-            HGW-->>C: 200 / 206
-        end
-    end
-```
-
 #### List files (P1)
 
 **ID**: `cpt-cf-file-storage-seq-list-files`
@@ -903,7 +829,6 @@ sequenceDiagram
 | `hash_algorithm`         | `text`                                     | P1: `'SHA-256'` only                                                         |
 | `hash_value`             | `bytea`                                    | 32-byte SHA-256 digest of the content                                        |
 | `content_state`          | `text` (`'pending'` \| `'available'`)      | `'pending'` only for P2 multipart pre-completion; P1 always `'available'`    |
-| `public_access`          | `boolean`                                  | Gates public namespace                                                       |
 | `backend_id`             | `text`                                     | Identifier of the `BackendConfig` that owns the bytes (TOML in P1)           |
 | `backend_path`           | `text`                                     | Opaque path within the backend; format is per-driver                         |
 | `created_at`             | `timestamptz`                              | Creation time; immutable                                                     |
@@ -920,7 +845,6 @@ sequenceDiagram
 - `PRIMARY KEY (file_id)`
 - `(tenant_id, owner_kind, owner_id, created_at DESC)` — covers `GET /files` listing
 - `(tenant_id, gts_file_type)` — supports per-type queries
-- `(tenant_id, public_access) WHERE public_access = true` — partial index for "list my public files"
 
 **Additional info**: Soft-delete markers in P2 are not implemented as a separate column; they live in
 `file_versions` (declared in P2 FEATURE). For P1 there is no version history table.
@@ -972,9 +896,7 @@ arrangements:
   replicas). Postgres is the shared coordination point
 - **API Gateway routing**:
   - `/api/file-storage/v1/*` → JWT-enforced → forwarded to a FileStorage instance
-  - `/api/file-storage-public/v1/*` → no JWT → forwarded to a FileStorage instance
-  - Per-prefix rate limiting and abuse protection (CIDR / fingerprinting) is the API Gateway's responsibility — this
-    is especially relevant for the public namespace, where UUIDs are the only access secret
+  - Rate limiting and abuse protection (CIDR / fingerprinting) is the API Gateway's responsibility
 - **Backend reachability**: every FileStorage replica must be able to reach every configured backend (S3 endpoint /
   local filesystem mount). For `local-filesystem`, the same physical (or networked) filesystem MUST be mounted on every
   replica; for `s3-compatible`, every replica must have network access and credentials. Credentials live in environment
@@ -992,8 +914,7 @@ This section is the technical realization of PRD's `cpt-cf-file-storage-fr-range
 download channel must support arbitrary byte-range access. The implementation lives in `http-gateway` (parsing +
 response shape), `stream-proxy` (translation to backend), and the backend drivers (native range or fallback).
 
-**Range parsing (in `http-gateway`).** On every incoming `GET /files/{id}` (auth-required and public alike) the
-gateway inspects the `Range` header. Supported forms (RFC 7233 §2.1):
+**Range parsing (in `http-gateway`).** On every incoming `GET /files/{id}` the gateway inspects the `Range` header. Supported forms (RFC 7233 §2.1):
 
 - `bytes=<start>-<end>` → `ByteRange::Inclusive(start, end)`
 - `bytes=<start>-` → `ByteRange::OpenEnded(start)` — to end of file
