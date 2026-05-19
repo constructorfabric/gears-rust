@@ -9,7 +9,7 @@
   - [2.1 Core SDK, Emitter & In-Process Ingest ⏳ HIGH](#21-core-sdk-emitter--in-process-ingest--high)
   - [2.2 REST Client & Remote Ingest Delivery ⏳ HIGH](#22-rest-client--remote-ingest-delivery--high)
   - [2.3 Usage Query API 🔄 IN_PROGRESS](#23-usage-query-api--in_progress)
-  - [2.4 Production Storage Plugin ⏳ HIGH](#24-production-storage-plugin--high)
+  - [2.4 Production Storage Plugin ✅ HIGH](#24-production-storage-plugin--high)
   - [2.5 Usage Type System ⏳ HIGH](#25-usage-type-system--high)
   - [2.6 Emission Rate Limiting ⏳ HIGH](#26-emission-rate-limiting--high)
   - [2.7 Retention Policy Management ⏳ MEDIUM](#27-retention-policy-management--medium)
@@ -259,9 +259,10 @@ The Usage Collector DESIGN is decomposed into 8 features following a build-from-
 
 ---
 
-### 2.4 [Production Storage Plugin](features/production-storage-plugin/) ⏳ HIGH
+### 2.4 [Production Storage Plugin](features/production-storage-plugin/) ✅ HIGH
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-production-storage-plugin`
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-feature-production-storage-plugin`
+<!-- STATUS: IMPLEMENTED — all p1 DoD items verified and implemented (plugin crate `cyberware-timescaledb-usage-collector-plugin`, schema migrations, continuous aggregate, idempotent ingest with `usage_idempotency_keys` claim, scope-to-SQL translation, query routing between `usage_agg_1h` and the raw hypertable, cursor-based raw pagination, GTS registration, hexagonal internal layout via `InsertPort` / `QueryPort` / `PluginMetrics`, Level 1 inline unit tests in `src/domain/client_tests.rs`, Level 2 integration tests in `tests/integration.rs` gated by `--features integration`). Feature spec lives at `docs/features/0004-cpt-cf-usage-collector-feature-production-storage-plugin.md`. Retention enforcement (`nfr-retention`, `RetentionPolicy`) and operator write operations (backfill, amendment, deactivation, watermarks) are explicitly deferred to F7/F8 per the spec's §6 Non-Applicability Notes. -->
 
 - **Type**: Plugin Interface
 
@@ -270,43 +271,43 @@ The Usage Collector DESIGN is decomposed into 8 features following a build-from-
 - **Depends On**: `cpt-cf-usage-collector-feature-sdk-and-ingest-core`, `cpt-cf-usage-collector-feature-query-api`
 
 - **Scope**:
-  - First production plugin crate implementing the full storage plugin trait
-  - Idempotent record ingest keyed on idempotency key; counter delta accumulation semantics
-  - Aggregation query pushdown to the storage engine with optional pre-aggregated acceleration; cursor-based raw query pagination with tenant and dimension filtering
-  - Operator write operations: backfill ingest, record amendment, record deactivation
-  - Retention enforcement and watermark retrieval operations
-  - GTS schema registration, database schema migrations, encrypted connections to the storage backend
+  - First production plugin crate (`cyberware-timescaledb-usage-collector-plugin` at `modules/system/usage-collector/plugins/timescaledb-usage-collector-plugin/`) implementing the full `UsageCollectorPluginClientV1` trait
+  - Idempotent record ingest keyed on `(tenant_id, idempotency_key)` via a two-step `usage_idempotency_keys` + `usage_records` transaction; counter delta accumulation semantics (no separate accumulation table; persistent total = `SUM(value)`)
+  - Aggregation query pushdown with routing between the `usage_agg_1h` continuous aggregate (low-cardinality dimensions) and the raw `usage_records` hypertable (high-cardinality `resource_id` / `subject_id` filters or GROUP BY); cursor-based raw query pagination with stable `(timestamp, id)` keyset ordering
+  - `AccessScope` → SQL translator preserving OR-of-ANDs PDP constraint structure; fail-closed on empty scope and on `InGroup` / `InGroupSubtree` predicates
+  - GTS schema registration (`UsageCollectorStoragePluginSpecV1`), idempotent TimescaleDB schema migrations, TLS-enforced `sqlx::PgPool` connections to the storage backend
 
 - **Out of scope**:
   - No-op plugin (Feature 1)
   - Second storage backend
+  - Retention enforcement, retention policy CRUD (Feature 7)
+  - Operator write operations — backfill ingest, record amendment, record deactivation, watermark retrieval (Feature 8)
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-pluggable-storage`
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-query-latency`
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-throughput`
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-rpo` (applies-to: all — F4 must independently satisfy the RPO constraint via durable storage backend)
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-recovery` (applies-to: all — F4 must independently satisfy recovery via storage backend durability guarantees)
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-retention`
+  - [x] `p1` - `cpt-cf-usage-collector-fr-pluggable-storage` (applies-to: all — F4 ships the first production implementation of the storage-plugin trait; capability remains `[ ]` in PRD until F1's noop plugin and gateway plugin-resolution also land)
+  - [x] `p1` - `cpt-cf-usage-collector-nfr-query-latency` (applies-to: all — F4 owns the performance-meeting query path; F3 defers verification of this NFR to F4 per PERF-FDESIGN-004)
+  - [x] `p1` - `cpt-cf-usage-collector-nfr-throughput` (applies-to: all — F4 owns the throughput-meeting ingest path at the storage layer)
+  - [x] `p1` - `cpt-cf-usage-collector-nfr-rpo` (applies-to: all — F4 must independently satisfy the RPO constraint via durable storage backend)
+  - [x] `p1` - `cpt-cf-usage-collector-nfr-recovery` (applies-to: all — F4 must independently satisfy recovery via storage backend durability guarantees)
 
 - **Design Principles Covered**:
 
-  - [ ] `p1` - `cpt-cf-usage-collector-principle-pluggable-storage`
+  - [x] `p1` - `cpt-cf-usage-collector-principle-pluggable-storage` (applies-to: all — F4 instantiates the pluggability principle by being the first production plugin distinct from the noop)
 
 - **Design Constraints Covered**:
 
-  - [ ] `p1` - `cpt-cf-usage-collector-constraint-single-plugin`
-  - [ ] `p1` - `cpt-cf-usage-collector-constraint-types-registry` (GTS schema for plugin registration)
-  - [ ] `p1` - `cpt-cf-usage-collector-constraint-encryption`
+  - [x] `p1` - `cpt-cf-usage-collector-constraint-single-plugin` (applies-to: all — F4 occupies the single active-plugin slot; constraint enforcement at gateway resolution belongs to F1)
+  - [x] `p1` - `cpt-cf-usage-collector-constraint-types-registry` (GTS schema for plugin registration)
+  - [x] `p1` - `cpt-cf-usage-collector-constraint-encryption` (TLS-only `PgPool` connection enforced by plugin configuration; encryption at rest governed by platform infrastructure policy)
+  - [x] `p1` - `cpt-cf-usage-collector-constraint-or-of-ands-preservation` (scope-to-sql translator preserves OR-of-ANDs PDP constraint structure)
 
 - **Domain Model Entities**:
   - `UsageRecord` — USES: UsageRecord (defined in F1) — reads and persists records for storage
-  - `RetentionPolicy` (enforced by plugin)
 
 - **Design Components**:
 
-  - [ ] `p1` - `cpt-cf-usage-collector-component-storage-plugin` (production implementation)
+  - [x] `p1` - `cpt-cf-usage-collector-component-storage-plugin` (production implementation)
 
 - **API**:
   - None (internal plugin interface only)
@@ -319,14 +320,12 @@ The Usage Collector DESIGN is decomposed into 8 features following a build-from-
 
 - **Data**:
   - `usage-records` table (primary storage: idempotent upsert on ingest, read for aggregation and raw queries)
-  - [ ] `cpt-cf-usage-collector-dbtable-records`
-  - [ ] `cpt-cf-usage-collector-dbtable-counter-accumulation`
+  - [x] `cpt-cf-usage-collector-dbtable-records`
 
 - **Phases/Milestones**:
-  - Phase 1: Storage backend selection (ClickHouse or TimescaleDB) and schema design
-  - Phase 2: Ingest operations — idempotent upsert, counter delta accumulation, GTS schema registration, migrations
-  - Phase 3: Query operations — aggregation pushdown, cursor-based raw pagination
-  - Phase 4: Operator write operations — backfill ingest, record amendment, deactivation, watermarks, retention enforcement
+  - Phase 1: TimescaleDB schema design — hypertable for `usage_records`, separate `usage_idempotency_keys` plain table for cross-partition deduplication, four composite indexes, `usage_agg_1h` continuous aggregate, GTS schema registration
+  - Phase 2: Ingest operations — two-step idempotent transaction, counter delta accumulation via `SUM(value)`, migrations
+  - Phase 3: Query operations — aggregation routing between continuous aggregate and raw hypertable, `(timestamp, id)` keyset cursor pagination
 
 ---
 

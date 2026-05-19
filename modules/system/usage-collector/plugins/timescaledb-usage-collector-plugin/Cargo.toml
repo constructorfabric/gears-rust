@@ -1,0 +1,67 @@
+[package]
+name = "cyberware-timescaledb-usage-collector-plugin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "TimescaleDB production plugin for the usage-collector gateway"
+readme = "README.md"
+keywords = ["cyberfabric", "cyberware", "cyberware-system"]
+categories = ["database"]
+
+[lib]
+name = "timescaledb_usage_collector_plugin"
+
+[features]
+integration = []
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+types-registry-sdk = { workspace = true }
+usage-collector-sdk = { workspace = true }
+
+# ModKit dependencies
+modkit = { workspace = true }
+modkit-macros = { workspace = true }
+modkit-odata = { workspace = true }
+modkit-security = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+modkit-canonical-errors = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Database
+sqlx = { workspace = true, features = ["postgres", "uuid", "chrono", "json"] }
+
+# Data structures
+uuid = { workspace = true, features = ["v4"] }
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Observability
+opentelemetry = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# Duration parsing for config deserialization
+humantime = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { workspace = true }

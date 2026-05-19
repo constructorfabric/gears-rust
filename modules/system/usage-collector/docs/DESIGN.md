@@ -93,6 +93,7 @@ Once records arrive at the gateway, they are persisted via the active storage pl
 |--------|-----------------|
 | `cpt-cf-usage-collector-adr-scoped-emit-source` | `UsageEmitterRuntimeV1.factory(MODULE_NAME)` returns a `UsageEmitterFactory` bound to the source module's authoritative name; the factory stamps source identity on every per-call `UsageEmitter` it produces |
 | `cpt-cf-usage-collector-adr-two-phase-emit-authz` | `factory.with_*().authorize(ctx, resource_id, resource_type)` calls the PDP before any DB transaction; `usage_record_builder(metric, value)?.build()? → enqueue(record)` evaluates returned constraints in-memory inside the transaction — no network I/O on the critical emission path |
+| `cpt-cf-usage-collector-adr-timescaledb-plugin-raw-sqlx` | The TimescaleDB production storage plugin bypasses `SecureConn` / `SecureORM` and uses raw `sqlx::PgPool` with a `scope_to_sql` translator (`domain/scope.rs`) as the single authorization boundary; required because TimescaleDB DDL (`create_hypertable`, continuous aggregates, retention policies), the cross-partition idempotency-key claim transaction, and the dynamic aggregation SQL surface have no SeaORM equivalent. Scoped to this one plugin crate; the `de0706_no_direct_sqlx` lint is suppressed crate-wide with this ADR as the durable justification |
 
 ### 1.3 Architecture Layers
 

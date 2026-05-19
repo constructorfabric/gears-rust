@@ -9,6 +9,8 @@ patterns = ["modules/system/resource-group/docs/rust-traits.md"]
 reason = "Ignore usage-collector codebase and features — code traceability markers added incrementally across PR train. Remove after all PRs merged."
 patterns = [
   "modules/system/usage-collector/plugins/noop-usage-collector-plugin/src/*",
+  "modules/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/*",
+  "modules/system/usage-collector/plugins/timescaledb-usage-collector-plugin/tests/*",
   "modules/system/usage-collector/usage-collector/src/*",
   "modules/system/usage-collector/usage-collector/tests/*",
   "modules/system/usage-collector/usage-collector-rest-client/src/*",
