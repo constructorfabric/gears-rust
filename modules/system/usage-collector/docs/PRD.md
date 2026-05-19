@@ -123,7 +123,7 @@ The Usage Collector addresses this by accepting usage records from sources and p
 
 **ID**: `cpt-cf-usage-collector-actor-usage-source`
 
-- **Role**: Any platform service that produces usage records (e.g., LLM Gateway, Compute Service, API Gateway). Uses the Usage Collector SDK to emit records.
+- **Role**: Any system that produces usage records. This includes in-process platform services using the SDK (e.g., LLM Gateway, Compute Service, API Gateway), remote CyberFabric nodes forwarding collected records via the REST API, and external non-CyberFabric systems submitting records directly via the REST API using OAuth2 client credentials.
 
 #### Usage Consumer
 
@@ -156,7 +156,7 @@ The Usage Collector addresses this by accepting usage records from sources and p
 | `cpt-cf-usage-collector-actor-platform-operator` | Configure and delete retention policies (except global default); submit backfill operations; amend and deactivate individual records; register custom usage types; view watermarks and ingestion metadata | Querying or modifying records belonging to any tenant without an explicit security context; deleting the global default retention policy |
 | `cpt-cf-usage-collector-actor-platform-developer` | Emit usage records via the SDK within the source module's authorized metric namespace and tenant scope | Emitting metrics outside the source module's authorized namespace; attributing records to subjects or resources outside the authorized scope |
 | `cpt-cf-usage-collector-actor-tenant-admin` | Query aggregated and raw usage records scoped to their own tenant; view watermarks for their tenant | Accessing usage data of any other tenant; invoking operator-only operations (backfill, amendment, deactivation, retention policy management) |
-| `cpt-cf-usage-collector-actor-usage-source` | Emit authorized metrics within the source module's namespace via the SDK; the scope of permitted metrics and target tenants is enforced by the platform PDP at emit time — sources authorized only for their own tenant may only emit for that tenant; sources explicitly authorized for multiple tenants may emit records attributed to any tenant within their PDP-returned allowed set | Emitting metrics outside the authorized namespace; emitting records attributed to tenants outside the PDP-authorized scope; bypassing `authorize_emit()`; submitting records attributed to other sources |
+| `cpt-cf-usage-collector-actor-usage-source` | Emit metrics valid for the claimed module type via the SDK or REST API; the scope of permitted target tenants is enforced by the platform PDP at emit time — the caller must be PDP-authorized for the tenant supplied in the record, covering both same-tenant and parent→subtenant scenarios | Emitting records attributed to tenants outside the PDP-authorized scope; emitting metrics not registered for the claimed module type |
 | `cpt-cf-usage-collector-actor-usage-consumer` | Query aggregated and raw usage data scoped to the authenticated tenant; subject to PDP constraint filters | Accessing cross-tenant data; mutating usage records |
 | `cpt-cf-usage-collector-actor-storage-backend` | Receive and persist usage records forwarded by the gateway plugin; respond to query and retention operations initiated by the plugin | Direct access from any actor other than the authorized storage plugin instance |
 | `cpt-cf-usage-collector-actor-types-registry` | Respond to schema registration and validation requests initiated by the gateway | N/A — passive service; does not initiate operations on the Usage Collector |
@@ -198,13 +198,26 @@ No module-specific environment constraints beyond project defaults.
 
 ### 5.1 Usage Ingestion
 
-#### Usage Record Ingestion
+#### SDK Usage Record Ingestion
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-fr-ingestion`
 
-The system **MUST** accept usage records from platform services. Each usage record represents a single measurement of resource consumption attributed to a tenant.
+The system **MUST** accept usage records from in-process platform services via the Usage Collector SDK. Each usage record represents a single measurement of resource consumption attributed to a tenant.
 
 - **Rationale**: Centralizing usage ingestion ensures all downstream consumers operate on the same data.
+- **Actors**: `cpt-cf-usage-collector-actor-usage-source`
+
+#### REST API Usage Record Ingestion
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-fr-rest-ingestion`
+
+The system **MUST** expose a REST API endpoint for usage record submission, enabling remote CyberFabric nodes and external non-CyberFabric systems to submit records over HTTP using OAuth2 client credentials. The REST ingestion path **MUST** be subject to identical PDP authorization and validation rules as the SDK ingestion path.
+
+For trusted CyberFabric forwarder modules (e.g., `usage-collector-rest-client`), a two-level authorization model applies: PDP authorization is enforced at the source side against the original caller's SecurityContext before any record enters the forwarder's outbox; the gateway REST endpoint then authenticates the forwarder via service-to-service bearer token and applies a gateway-level PDP check against the forwarder's service identity. Both checks must pass before any record is accepted for storage.
+
+For external non-CyberFabric systems calling the REST endpoint directly, the gateway PDP check against the caller's OAuth2 identity is the sole authorization boundary.
+
+- **Rationale**: Remote and external sources that cannot embed the SDK — such as remote collection agents forwarding records from distributed locations, or third-party systems integrated with the platform — must be able to contribute usage data through the same authoritative store without requiring a SDK dependency. The two-level model for CyberFabric forwarders preserves per-caller authorization at the source while maintaining gateway-level enforcement against the forwarder's service identity.
 - **Actors**: `cpt-cf-usage-collector-actor-usage-source`
 
 #### Idempotent Ingestion
@@ -264,27 +277,25 @@ The system **MUST** guarantee at-least-once delivery of usage records from sourc
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-fr-tenant-attribution`
 
-The system **MUST** attribute all usage records to a tenant that is authorized by the platform PDP at emit time. For sources that emit only for their own tenant, the tenant is derived from the authenticated SecurityContext. For sources explicitly authorized by the PDP to emit on behalf of multiple tenants (e.g., a platform-level metering agent collecting data from a shared hypervisor), the tenant is taken from the record as supplied by the caller and **MUST** satisfy the PDP-returned tenant constraint evaluated in-memory by `emit()` before the record is accepted. In all cases, tenant identity **MUST NOT** be accepted from request payloads without prior PDP authorization. The gateway **MUST** independently validate tenant attribution on ingest as a defense-in-depth check.
+The system **MUST** attribute all usage records to a tenant supplied by the caller in the request. The system **MUST** authorize the caller's tenant attribution via the platform PDP before any record is accepted, verifying that the authenticated caller is permitted to emit records for the specified tenant. This covers both same-tenant emission and parent→subtenant scenarios (e.g., a platform-level metering agent collecting usage for resources owned by its subtenants). The gateway **MUST** independently validate tenant attribution on ingest as a defense-in-depth check.
 
-- **Rationale**: PDP-gated tenant attribution prevents spoofing while enabling platform-level metering agents that collect usage for resources (e.g., virtual machines) owned by multiple tenants from a single process. Without this capability, such agents would require per-tenant service account credentials, creating operational complexity proportional to tenant count. PDP authorization remains the single source of truth for what tenants any given source is permitted to report for.
+- **Rationale**: Requiring callers to supply the target tenant explicitly supports all emission scenarios — including remote forwarders and external systems that emit records on behalf of multiple tenants — through a single uniform path. PDP authorization remains the security boundary enforcing which tenants a given caller is permitted to report for.
 - **Actors**: `cpt-cf-usage-collector-actor-usage-source`
 
 #### Resource Attribution
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-fr-resource-attribution`
 
-The system **MUST** support attributing usage records to specific resource instances within a tenant, identified by a resource ID and resource type.
+Every usage record **MUST** be attributed to a specific resource instance within a tenant, identified by a resource ID and resource type. Resource attribution is mandatory; the system **MUST** reject records that omit either field.
 
-- **Rationale**: Per-resource attribution enables granular billing, per-resource quota enforcement, and detailed usage analysis at the resource level.
+- **Rationale**: Per-resource attribution enables granular billing, per-resource quota enforcement, and detailed usage analysis at the resource level. Mandatory attribution ensures downstream consumers always have a resource scope to aggregate and filter on, without needing to handle the absence of this field.
 - **Actors**: `cpt-cf-usage-collector-actor-usage-source`
 
 #### Subject Attribution
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-fr-subject-attribution`
 
-The system **MUST** support attributing usage records to a subject (user, service account, or other principal) within a tenant, identified by a subject ID and subject type. Subject attribution **MUST** always be derived from the authenticated SecurityContext — the system **MUST NOT** accept subject identity from request payloads.
-
-Subject attribution is optional per usage record to accommodate system-level resource consumption not attributable to a specific subject (e.g., background jobs where per-user attribution is not meaningful).
+The system **MUST** support attributing usage records to a subject (user, service account, or other principal) within a tenant, identified by a subject ID and an optional subject type. The wire shape is a single nested `subject` object: `{ "subject": { "id": "...", "type": "user" } }`, or the `subject` key is absent. The inner `type` field is itself optional, but `id` is required whenever `subject` is present (the "type without id" payload is not expressible). Subject attribution is **optional** per usage record to accommodate system-level resource consumption not attributable to a specific subject (e.g., background jobs where per-user attribution is not meaningful). The system **MUST** accept usage records where the `subject` field is absent. When `subject` is present, the system **MUST** validate it against PDP authorization; when it is absent, PDP subject validation is skipped.
 
 - **Rationale**: Per-subject attribution enables chargeback, per-subject quota enforcement, and visibility into which principals drive consumption within a tenant. Deriving subject identity server-side from SecurityContext prevents spoofing.
 - **Actors**: `cpt-cf-usage-collector-actor-usage-source`
@@ -303,13 +314,16 @@ The system **MUST** enforce strict tenant isolation on all read and write operat
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-fr-ingestion-authorization`
 
-The system **MUST** authorize each usage record emission before it is persisted. Authorization **MUST** verify that the emitting source module is permitted to report the specific metrics being submitted, and that any attributed resource and subject are within the emitting module's authorized scope.
+The system **MUST** authorize each usage record emission before it is persisted. The security boundary for ingestion authorization is the PDP check on the caller's authenticated identity against the target tenant and resource — the system **MUST** verify the caller is permitted to emit records for the specified tenant and resource before any record is accepted.
 
-Each source module has a fixed, platform-assigned identity that is the basis for authorization. A source module **MUST** only be permitted to emit metrics within its authorized domain; emissions outside that domain **MUST** be rejected before any record is persisted.
+The `module` field in a usage record identifies the originating source for attribution and metric validation purposes. Its semantics differ by ingestion path:
 
-Authorization failures **MUST** be surfaced immediately to the caller before any domain operation is committed. The system **MUST** fail closed: unauthorized records are never persisted, and there is no silent discard of denied emissions.
+- **SDK ingestion**: module identity is set in-process at SDK client construction time and is implicitly trusted as the emitting service's own identity.
+- **REST API ingestion**: the `module` field is caller-supplied attribution metadata, accepted on trust. It is used to validate that the emitted metric is registered for the claimed module type (a data quality check), but it is not a security authorization principal — the PDP check on tenant and resource is the authoritative security enforcement.
 
-- **Rationale**: Without ingestion authorization, any module could report usage for metric types it does not own (e.g., a file-storage service reporting LLM token usage) or attribute usage to subjects and resources beyond its authorized scope, leading to inaccurate metering, billing errors, and cross-boundary data pollution. Binding source identity at initialization time rather than per-call makes the authorization scope auditable and eliminates per-call spoofing surface.
+The system **MUST** validate that the emitted metric is registered for the module type claimed in the record, rejecting records that reference metrics not associated with the claimed module. Authorization failures **MUST** be surfaced immediately to the caller before any domain operation is committed. The system **MUST** fail closed: unauthorized records are never persisted, and there is no silent discard of denied emissions.
+
+- **Rationale**: Decoupling module attribution from the authorization security boundary enables the REST ingestion path to support legitimate forwarding scenarios — such as a remote agent relaying records originally produced by multiple named source modules — without requiring per-module credentials. The PDP remains the authoritative enforcement point for what tenants and resources a caller may emit for. Metric validation against the claimed module type preserves data quality by ensuring records carry a plausible and registered module identity.
 - **Actors**: `cpt-cf-usage-collector-actor-usage-source`
 
 ### 5.5 Pluggable Storage
@@ -451,9 +465,9 @@ Routine ingestion and read operations are not audited via `audit_service`.
 
 The system **MUST** enforce rate limits on usage record emission at two levels:
 
-**Source-level (enforced at the SDK, before any outbox INSERT)**: A configurable per-source emission quota limits the total number of records a source module may emit across all tenants within a rate limit window. `authorize_emit()` fetches the current source-level quota snapshot before any DB transaction opens; `emit()` evaluates it in-memory and rejects the emission if the quota is exhausted. This provides low-latency, source-side flood prevention without requiring per-tenant quota pre-fetching at emit time.
+**Source-level (enforced at the SDK, before any outbox INSERT)**: A configurable per-source emission quota limits the total number of records a source module may emit across all tenants within a rate limit window. The emitter factory's `.authorize(...)` step fetches the current source-level quota snapshot before any DB transaction opens; `enqueue()` evaluates it in-memory and rejects the emission if the quota is exhausted. This provides low-latency, source-side flood prevention without requiring per-tenant quota pre-fetching at emit time.
 
-**Per-tenant (enforced at the gateway on ingest)**: A configurable per-(source module, tenant) quota limits the number of records a source may deliver for any single tenant within a rate limit window. The gateway enforces this on the inbound `persist()` call, after the record's `tenant_id` is known. This provides granular per-tenant protection at delivery time.
+**Per-tenant (enforced at the gateway on ingest)**: A configurable per-(source module, tenant) quota limits the number of records a source may deliver for any single tenant within a rate limit window. The gateway enforces this on the inbound `create_usage_record()` call, after the record's `tenant_id` is known. This provides granular per-tenant protection at delivery time.
 
 Rate limits are configured by the platform operator. An operator **MAY** configure a default quota that applies when no explicit entry exists; if neither applies, no rate limit is enforced.
 
@@ -643,6 +657,15 @@ The following commonly applicable NFR categories are not applicable to this modu
 - **Description**: Public interface for emitting usage records and querying aggregated data; technical interface type and crate naming defined in DESIGN.md
 - **Breaking Change Policy**: Unstable during initial development; will stabilize in future version
 
+#### REST Ingestion API
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-interface-rest-ingestion`
+
+- **Type**: HTTP REST API
+- **Stability**: unstable (v0)
+- **Description**: HTTP endpoint for submitting usage records from remote or external sources; authentication via OAuth2 client credentials; request and response schema defined in DESIGN.md
+- **Breaking Change Policy**: Unstable during initial development; will stabilize in future version
+
 ### 7.2 External Integration Contracts
 
 #### Storage Plugin Contract
@@ -734,11 +757,11 @@ The following commonly applicable NFR categories are not applicable to this modu
 - [ ] Duplicate records with the same idempotency key result in a single stored record
 - [ ] Counter records with negative values are rejected at ingestion
 - [ ] Gauge records are stored as-is without monotonicity constraints
-- [ ] Usage records are attributed to the correct tenant, derived from SecurityContext
-- [ ] Usage records can be attributed to a specific resource (resource ID and type)
-- [ ] Usage records can be attributed to a specific subject (subject ID and type), derived from SecurityContext
+- [ ] Incoming usage records include an explicit tenant attribute; the platform PDP validates that the authenticated caller is authorized to emit records for the specified tenant before the record is accepted, and the gateway independently validates tenant attribution on ingest as a defense-in-depth check
+- [ ] Every usage record includes resource attribution (resource ID and type); records without either field are rejected
+- [ ] Usage records can optionally be attributed to a subject (subject ID and type); when supplied with PDP authorization, subject is accepted from the request payload; when absent, PDP subject validation is skipped
 - [ ] Authorization failures are surfaced immediately to the caller; no record is persisted on denial
-- [ ] An `EmitAuthorization` token older than `MAX_AUTH_AGE` (30 seconds) is rejected by `emit()` with an `AuthorizationExpired` error before any record is accepted for delivery
+- [ ] A `UsageEmitter` handle older than `MAX_AUTH_AGE` (30 seconds) is rejected by `enqueue()` with a `UsageEmitterError::Unauthenticated` (built via `UsageEmitterError::unauthenticated()` with reason "emit authorization has expired") error before any record is accepted for delivery
 - [ ] A source module that exceeds its configured emission quota for a given tenant within the current rate limit window is rejected with an actionable error before any record is accepted for delivery
 - [ ] Rate limit configuration can be set per (source module, tenant) pair; a default per-source quota applies when no tenant-specific entry exists
 - [ ] Rate limit enforcement does not degrade ingestion latency for emissions within quota
@@ -768,6 +791,9 @@ The following commonly applicable NFR categories are not applicable to this modu
 - [ ] Every operator-initiated write operation (backfill, amendment, deactivation) emits a structured audit event to the platform `audit_service` with the required common fields and operation-specific context; justification is required and included in every such event
 - [ ] All API operations require authentication; unauthenticated requests are rejected before any operation is performed
 - [ ] Authorization is enforced on all read and write operations; unauthorized requests are rejected and no data is exposed or modified
+- [ ] The REST ingestion endpoint (`cpt-cf-usage-collector-fr-rest-ingestion`) rejects requests from `cpt-cf-usage-collector-actor-usage-source` that carry no bearer token or an invalid/expired OAuth2 client-credentials token with HTTP 401; requests carrying a valid token proceed to PDP evaluation
+- [ ] When a trusted CyberFabric forwarder (e.g., `usage-collector-rest-client`) acting as `cpt-cf-usage-collector-actor-usage-source` submits records via the REST endpoint (`cpt-cf-usage-collector-fr-rest-ingestion`), the source-side PDP check against the original caller's SecurityContext must pass before any record enters the forwarder's outbox, and the gateway-side PDP check against the forwarder's service identity must also pass; a failure at either level causes the record to be rejected
+- [ ] When an external non-CyberFabric `cpt-cf-usage-collector-actor-usage-source` calls the REST ingestion endpoint (`cpt-cf-usage-collector-fr-rest-ingestion`) directly, only the gateway PDP check against the caller's OAuth2 identity is applied; records are accepted when that check passes and rejected otherwise
 - [ ] Throughput scales linearly as additional instances are added
 - [ ] Durably captured records are eventually persisted to the storage backend and available for querying after storage backend recovery
 - [ ] Retention periods can be configured from 7 days to 7 years per usage type and per tenant

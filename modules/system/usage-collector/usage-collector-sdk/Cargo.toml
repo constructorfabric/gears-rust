@@ -1,0 +1,48 @@
+[package]
+name = "cyberware-usage-collector-sdk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SDK for usage-collector"
+readme = "README.md"
+keywords = ["cyberfabric", "cyberware", "cyberware-system"]
+categories = ["development-tools"]
+
+[lib]
+name = "usage_collector_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+# ModKit dependencies
+modkit = { workspace = true }
+modkit-canonical-errors = { workspace = true }
+modkit-security = { workspace = true }
+
+# AuthZ
+authz-resolver-sdk = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Data structures
+chrono = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+utoipa = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+# GTS
+gts = { workspace = true }
+gts-macros = { workspace = true }
+
+[dev-dependencies]
+# Async runtime
+tokio = { workspace = true }

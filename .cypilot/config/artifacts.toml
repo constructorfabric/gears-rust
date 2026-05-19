@@ -6,6 +6,17 @@ reason = "Ignore rust-traits.md — reference document for planned Rust SDK cont
 patterns = ["modules/system/resource-group/docs/rust-traits.md"]
 
 [[ignore]]
+reason = "Ignore usage-collector codebase and features — code traceability markers added incrementally across PR train. Remove after all PRs merged."
+patterns = [
+  "modules/system/usage-collector/plugins/noop-usage-collector-storage-plugin/src/*",
+  "modules/system/usage-collector/usage-collector/src/*",
+  "modules/system/usage-collector/usage-collector-rest-client/src/*",
+  "modules/system/usage-collector/usage-collector-sdk/src/*",
+  "modules/system/usage-collector/usage-emitter/src/*",
+  "modules/system/usage-collector/docs/features/*",
+]
+
+[[ignore]]
 reason = "Ignore 'modules/system' parent directory — not a module, only a grouping for system submodules."
 patterns = ["modules/system"]
 

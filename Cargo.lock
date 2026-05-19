@@ -3160,6 +3160,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyberware-usage-collector-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cyberware-authz-resolver-sdk",
+ "cyberware-modkit",
+ "cyberware-modkit-canonical-errors",
+ "cyberware-modkit-security",
+ "gts",
+ "gts-macros",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "daemonize"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

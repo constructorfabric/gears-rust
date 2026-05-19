@@ -30,9 +30,14 @@
 
 Usage Collector follows the ModKit Gateway + Plugins pattern. The gateway module (`usage-collector`) is the single centralized service that receives usage records, enforces tenant isolation, and delegates all storage operations to the active plugin. Backend-specific persistence and query logic for ClickHouse or TimescaleDB is encapsulated in storage plugins that register via the GTS type system and are selected by operator configuration. The gateway contains no backend-specific logic.
 
-The SDK crate (`usage-collector-sdk`) defines two trait boundaries: `UsageCollectorClientV1` for usage sources and consumers, and `UsageCollectorPluginClientV1` for storage backend implementations. When a usage source emits a record, the SDK persists it to the source's local database within the same transaction as the caller's domain operation (transactional outbox pattern). The SDK initializes and owns an `OutboxHandle` whose background pipeline automatically delivers enqueued records to the collector gateway, providing at-least-once delivery even when the collector is temporarily unavailable.
+The SDK crate (`usage-collector-sdk`) defines two trait boundaries: `UsageCollectorClientV1` for delivery to the collector gateway (not registered in ClientHub — passing it through the hub would allow any module to push unvalidated records, bypassing authorization), and `UsageCollectorPluginClientV1` for storage backend implementations. The `usage-emitter` crate exposes a three-layer Runtime/Factory/Emitter architecture: `UsageEmitterRuntime` (concrete, implementing the `UsageEmitterRuntimeV1` trait — registered in ClientHub by either the gateway module for in-process delivery or `usage-collector-rest-client` for HTTP delivery to a remote collector) is the process-wide owner of the outbox worker and shared resources; usage sources call `runtime.factory(MODULE_NAME)` once at init to obtain a module-scoped `UsageEmitterFactory`; the factory's `.with_*().authorize(subject)` builder chain produces a per-call `UsageEmitter` after a PDP authorization round-trip. When a usage source emits a record, the per-call `UsageEmitter` persists it to the source's local database within the same transaction as the caller's domain operation (transactional outbox pattern). The outbox background pipeline automatically delivers enqueued records to the collector gateway, providing at-least-once delivery even when the collector is temporarily unavailable.
 
-Once records arrive at the gateway, they are persisted via the active storage plugin and become available for aggregation and raw queries. All query operations are scoped to the authenticated tenant derived from the caller's SecurityContext. For ingest, tenant attribution is PDP-authorized at emit time: standard sources emit for their own tenant (derived from SecurityContext); sources explicitly authorized by the PDP to act on behalf of multiple tenants supply the target tenant in the record, which is validated against PDP-returned constraints before the outbox INSERT and re-validated at gateway ingest as a defense-in-depth check.
+There are two supported deployment modes, differing only in how the outbox background pipeline delivers records:
+
+- **In-process mode** (`usage-collector` registers `UsageEmitterRuntimeV1`): the background delivery pipeline calls the gateway's `UsageCollectorLocalClient` directly as a Rust function call. Used when the usage source and the collector gateway run in the same process.
+- **Remote mode** (`usage-collector-rest-client` registers `UsageEmitterRuntimeV1`): the background delivery pipeline sends an authenticated HTTP POST to the gateway's ingest endpoint (`POST /usage-collector/v1/records`), acquiring a bearer token via the platform AuthN resolver before each request. Used when the usage source runs in a separate process or service binary. The emit path (`factory.with_*().authorize(subject)` → `enqueue(record)`) is identical; only the delivery hop differs.
+
+Once records arrive at the gateway, they are persisted via the active storage plugin and become available for aggregation and raw queries. All query operations are scoped to the authenticated tenant derived from the caller's SecurityContext. For ingest, tenant attribution is PDP-authorized at emit time via the `USAGE_RECORD`/`CREATE` operation — the PDP decision covers both same-tenant and subtenant scenarios; the gateway does not perform a second tenant check on delivery.
 
 ### 1.2 Architecture Drivers
 
@@ -41,28 +46,28 @@ Once records arrive at the gateway, they are persisted via the active storage pl
 | Requirement | Design Response |
 |-------------|-----------------|
 | `cpt-cf-usage-collector-fr-ingestion` | SDK `emit()` persists record to local outbox within the caller's transaction; outbox library background pipeline delivers to gateway |
-| `cpt-cf-usage-collector-fr-idempotency` | Counter records require a non-null idempotency key; `emit()` rejects counter records without one (`EmitError::MissingIdempotencyKey`) before any outbox INSERT; gauge records accept a null key; idempotency key is carried in the outbox payload; storage plugin performs idempotent upsert on non-null keys at delivery |
+| `cpt-cf-usage-collector-fr-idempotency` | Counter records require a non-null idempotency key; `usage_record_builder(metric, value)?.build()? → enqueue(record)` rejects counter records without one (`UsageEmitterError::InvalidRecord`) before any outbox INSERT; gauge records auto-generate a UUID key when none is supplied; idempotency key is carried in the outbox payload; storage plugin performs idempotent upsert on non-null keys at delivery |
 | `cpt-cf-usage-collector-fr-delivery-guarantee` | Transactional outbox in source's local DB; outbox library retries with exponential backoff; messages that exhaust retry budget are moved to the dead-letter store and surfaced via monitoring |
-| `cpt-cf-usage-collector-fr-counter-semantics` | `ScopedUsageCollectorClientV1.emit()` rejects counter records with a negative value or a missing idempotency key before inserting the outbox row; delta records are stored per-event; the persistent total for a (tenant, metric) pair is the SUM of all active delta records — see §3.7 Counter Accumulation for the full strategy including plugin-level acceleration options |
-| `cpt-cf-usage-collector-fr-gauge-semantics` | Gauge records carry `metric_kind = gauge`; `emit()` applies no monotonicity validation; storage plugin stores values as-is |
-| `cpt-cf-usage-collector-fr-tenant-attribution` | `emit()` uses `record.tenant_id` as supplied by the caller and validates it against PDP constraints in `EmitAuthorization`: if the PDP returned a tenant `In` constraint, `record.tenant_id` must be a member of the allowed set; if no tenant constraint was returned, `record.tenant_id` must equal `ctx.subject_tenant_id()` (preserving standard single-tenant behavior). The validated `tenant_id` is stamped into the outbox row. Gateway validates tenant attribution on ingest: when `record.tenant_id ≠ ctx.subject_tenant_id()`, the gateway calls the PDP with `context_tenant_id(record.tenant_id)` and action `"emit_on_behalf"` to re-authorize before delegating to the plugin. |
-| `cpt-cf-usage-collector-fr-resource-attribution` | `UsageRecord` carries optional `resource_id` and `resource_type` fields; persisted in outbox payload and storage backend; gateway and plugin pass them through without interpretation |
-| `cpt-cf-usage-collector-fr-subject-attribution` | `ScopedUsageCollectorClientV1.emit()` captures `subject_id` and `subject_type` from the authenticated SecurityContext and includes them in the outbox payload; never accepted from request payload |
+| `cpt-cf-usage-collector-fr-counter-semantics` | `UsageEmitter.enqueue()` (layer 3) rejects counter records with a negative value or a missing idempotency key before inserting the outbox row; delta records are stored per-event; the persistent total for a (tenant, metric) pair is the SUM of all active delta records — see §3.7 Counter Accumulation for the full strategy including plugin-level acceleration options |
+| `cpt-cf-usage-collector-fr-gauge-semantics` | Gauge records carry `kind = gauge`; `enqueue()` applies no monotonicity validation; storage plugin stores values as-is |
+| `cpt-cf-usage-collector-fr-tenant-attribution` | The caller passes `tenant_id` explicitly via `factory.with_tenant(tenant_id).authorize(...)` (or omits it to default to `ctx.subject_tenant_id()`); the PDP `USAGE_RECORD`/`CREATE` check at that point authorizes the caller to emit for the specified tenant, covering both same-tenant and subtenant cases. The authorized `tenant_id` is bound into the returned `UsageEmitter` and stamped into every outbox row produced by that emitter. The gateway accepts the `tenant_id` from the delivered record without a second PDP check. |
+| `cpt-cf-usage-collector-fr-resource-attribution` | `UsageRecord` carries required `resource_id` (UUID) and `resource_type` (string) fields; both are mandatory at emit time; persisted in outbox payload and storage backend; gateway and plugin pass them through without interpretation |
+| `cpt-cf-usage-collector-fr-subject-attribution` | Subject attribution is carried on `UsageRecord.subject: Option<Subject>`, where `Subject { id: Uuid, r#type: Option<String> }` lives in `usage-collector-sdk::models`. The Rust type expresses the genuine tri-state — "no subject" (`None`), "id only" (`Some(Subject { id, r#type: None })`), "id + type" (`Some(Subject { id, r#type: Some(_) })`). The previously-typeable fourth state ("type without id") is no longer expressible. Forwarders / REST ingest translate their wire-level subject faithfully: `Some(s)` → `factory.with_subject(s)`, `None` → `factory.without_subject()`. In-process modules call neither setter and `.authorize()` falls back to deriving the subject from `SecurityContext`. The factory stores this three-way intent in a `SubjectChoice` enum (`DefaultFromCtx` / `Explicit(Option<Subject>)`) so that "default from ctx" and "explicit no subject" never collapse into the same state — preventing forwarders from silently substituting their own service identity for an absent caller-supplied subject. PDP authorization always runs against the resolved subject; the platform PDP attribute schema is unchanged (`SUBJECT_ID`/`SUBJECT_TYPE` are passed as separate flat properties at the policy boundary). |
 | `cpt-cf-usage-collector-fr-tenant-isolation` | Gateway enforces tenant scoping on all read and write operations; plugins filter by tenant ID; system fails closed on authorization failure |
-| `cpt-cf-usage-collector-fr-ingestion-authorization` | `ScopedUsageCollectorClientV1.authorize_emit()` calls the platform PDP before any transaction opens; returned `EmitAuthorization` carries PDP constraints (including an optional tenant `In` constraint for sources authorized to emit for multiple tenants), source-level rate limit quota snapshot, and the registered usage type schema — all evaluated in-memory by `emit()` before the outbox INSERT; denied or constraint-violating emissions are rejected before any record is persisted |
+| `cpt-cf-usage-collector-fr-ingestion-authorization` | `UsageEmitterFactory.with_*().authorize(ctx, resource_id, resource_type)` calls the platform PDP (`USAGE_RECORD`/`CREATE`) before any transaction opens; a denial is surfaced immediately with no record persisted; the returned `UsageEmitter` (layer 3) carries the allowed-metrics list and authorization context evaluated in-memory by `enqueue()` before the outbox INSERT |
 | `cpt-cf-usage-collector-fr-pluggable-storage` | Gateway resolves active plugin via GTS; plugin implements write and read traits; operator selects backend via configuration |
 | `cpt-cf-usage-collector-fr-query-aggregation` | Gateway enforces PDP decision + constraint on each query; exposes aggregation query API with optional filters (usage type, subject, resource, source) and configurable GROUP BY dimensions (time bucket, usage type, subject, resource, source); delegates to plugin, which pushes aggregation (SUM, COUNT, MIN, MAX, AVG) and grouping down to the storage engine |
 | `cpt-cf-usage-collector-fr-query-raw` | Gateway enforces PDP decision + constraint on each query; exposes raw query API with optional filters (usage type, subject, resource) and cursor-based pagination; delegates to plugin |
-| `cpt-cf-usage-collector-fr-record-metadata` | Gateway enforces configurable 8 KB metadata size limit at ingest; plugin stores metadata as-is in a dedicated payload column; metadata is returned in query results without interpretation |
+| `cpt-cf-usage-collector-fr-record-metadata` | Emitter enforces configurable metadata size limit (default 8 KB, upper bound 1 MiB; value 0 disables metadata) before enqueue; limit is published by the collector via `get_module_config` so emitters share the gateway's policy; plugin stores metadata as-is in a dedicated payload column; metadata is returned in query results without interpretation |
 | `cpt-cf-usage-collector-fr-retention-policies` | Gateway manages retention policy configuration (global, per-tenant, per-usage-type); plugin enforces retention via storage-native TTL or scheduled deletion |
-| `cpt-cf-usage-collector-fr-backfill-api` | Gateway accepts backfill requests and bulk-inserts historical records via the plugin; gateway calls the platform PDP to authorize the caller for the specified `tenant_id` before accepting the request — callers whose SecurityContext tenant differs from the requested `tenant_id` require a dedicated cross-tenant backfill PDP permission and the PDP must return a constraint that includes the target tenant; a PDP denial or constraint violation returns `403 PERMISSION_DENIED` immediately; existing records in the range are not modified; backfill path operates with independent rate limits; gateway emits `WriteAuditEvent` to `audit_service` on completion |
+| `cpt-cf-usage-collector-fr-backfill-api` | Gateway accepts backfill requests and bulk-inserts historical records via the plugin; gateway calls the platform PDP to authorize the caller for the specified `tenant_id` before accepting the request; a PDP denial returns `403 PERMISSION_DENIED` immediately; existing records in the range are not modified; backfill path operates with independent rate limits; gateway emits `WriteAuditEvent` to `audit_service` on completion |
 | `cpt-cf-usage-collector-fr-event-amendment` | Gateway exposes amendment and deactivation endpoints for individual events; plugin updates record status fields; gateway emits `WriteAuditEvent` to `audit_service` on each operation |
 | `cpt-cf-usage-collector-fr-audit` | Gateway emits a structured `WriteAuditEvent` to platform `audit_service` on every operator-initiated write (backfill, amendment, deactivation); event includes common envelope (operation, actor_id, tenant_id, timestamp, justification) and operation-specific context; no audit data is stored locally |
 | `cpt-cf-usage-collector-fr-backfill-boundaries` | Gateway enforces configurable maximum backfill window (default 90 days) and future timestamp tolerance (default 5 minutes); requests beyond the maximum window require elevated authorization verified before any plugin operation |
 | `cpt-cf-usage-collector-fr-metadata-exposure` | Gateway exposes a watermark API endpoint; plugin queries per-source and per-tenant event counts and latest ingested timestamps to populate the response |
-| `cpt-cf-usage-collector-fr-type-validation` | `authorize_emit()` fetches the registered usage type schema from types-registry; `emit()` validates the record against it in-memory before the outbox INSERT, rejecting invalid records immediately; gateway retains schema validation as a defense-in-depth check on delivered records before delegating to the plugin |
+| `cpt-cf-usage-collector-fr-type-validation` | The factory's `.authorize()` step fetches the registered usage type schema from types-registry; `enqueue()` validates the record against it in-memory before the outbox INSERT, rejecting invalid records immediately; gateway retains schema validation as a defense-in-depth check on delivered records before delegating to the plugin |
 | `cpt-cf-usage-collector-fr-custom-units` | Gateway exposes a usage type registration endpoint that delegates to types-registry; operator configures authorization policies per usage type after registration |
-| `cpt-cf-usage-collector-fr-rate-limiting` | `authorize_emit()` fetches the current source-level emission quota and window snapshot for the source module before any transaction opens; `emit()` evaluates the quota in-memory and rejects the emission before the outbox INSERT if the source quota is exhausted; gateway enforces per-(source, tenant) quota on ingest when `record.tenant_id` is known; rejections are surfaced via operational monitoring; rate limit configuration is managed by the platform operator |
+| `cpt-cf-usage-collector-fr-rate-limiting` | The factory's `.authorize()` step fetches the current source-level emission quota and window snapshot for the source module before any transaction opens; `enqueue()` evaluates the quota in-memory and rejects the emission before the outbox INSERT if the source quota is exhausted; gateway enforces per-(source, tenant) quota on ingest when `record.tenant_id` is known; rejections are surfaced via operational monitoring; rate limit configuration is managed by the platform operator |
 
 #### NFR Allocation
 
@@ -71,48 +76,74 @@ Once records arrive at the gateway, they are persisted via the active storage pl
 | `cpt-cf-usage-collector-nfr-query-latency` | Aggregation queries over 30-day range complete within 500ms at p95 | Storage Plugin | Aggregation pushed down to storage engine; plugins SHOULD maintain pre-aggregated acceleration structures (ClickHouse `AggregatingMergeTree` view, TimescaleDB continuous aggregate) to meet this threshold at production record volumes — see §3.7 Counter Accumulation for the full strategy and consistency model | Benchmark test with 30-day synthetic dataset at target production record volume at p95 |
 | `cpt-cf-usage-collector-nfr-availability` | 99.95% monthly availability for ingestion endpoints | Gateway, SDK | Stateless gateway enables horizontal replication; the SDK's outbox pipeline absorbs temporary gateway unavailability, preserving record capture continuity; liveness probes and graceful shutdown ensure fast instance recovery | SLO tracking on gateway uptime; synthetic availability probes on ingestion endpoint |
 | `cpt-cf-usage-collector-nfr-throughput` | ≥ 10,000 records/sec sustained ingestion | Gateway, Storage Plugin | Gateway dispatches records to the storage plugin for batched idempotent upsert; plugin pushes bulk INSERTs to append-optimized storage (ClickHouse column store, TimescaleDB hypertable); stateless gateway scales horizontally | Sustained load test at 10,000 records/sec for 10 minutes; verify no records lost and no latency degradation |
-| `cpt-cf-usage-collector-nfr-ingestion-latency` | Ingestion completes within 200ms at p95 | SDK | `emit()` is a local DB INSERT within the caller's transaction — no network I/O on the critical emission path; p95 latency is bounded by local DB write speed, well within the 200ms threshold | Benchmark `emit()` p95 latency under representative concurrent load |
+| `cpt-cf-usage-collector-nfr-ingestion-latency` | Ingestion completes within 200ms at p95 | SDK | `authorized.usage_record_builder(...).build() + enqueue(record)` is a local DB INSERT within the caller's transaction — no network I/O on the critical emission path; p95 latency is bounded by local DB write speed, well within the 200ms threshold | Benchmark `authorized.usage_record_builder(...).build() + enqueue(record)` p95 latency under representative concurrent load |
 | `cpt-cf-usage-collector-nfr-workload-isolation` | Ingestion p95 ≤ 200ms during concurrent query and retention workloads | Gateway, Storage Plugin | Query and retention workloads run on separate handler paths from the ingest handler; retention enforcement runs as a scheduled background task with lower priority; plugins leverage storage-native query prioritization (ClickHouse query priority classes, TimescaleDB resource groups) to prevent analytical workloads from starving ingest writes | Measure ingest p95 under concurrent aggregation queries and retention enforcement; verify it remains within `cpt-cf-usage-collector-nfr-ingestion-latency` threshold |
 | `cpt-cf-usage-collector-nfr-authentication` | Zero unauthenticated API access | Gateway | All gateway endpoints require a valid authenticated SecurityContext; unauthenticated requests are rejected by the ModKit request pipeline before any handler or plugin is invoked | Integration tests verifying all endpoints return a rejection for requests without valid authentication credentials |
-| `cpt-cf-usage-collector-nfr-authorization` | Zero unauthorized data access or write | Gateway, SDK | SDK `authorize_emit()` contacts the platform PDP before any transaction opens; gateway enforces PDP authorization on all query, backfill, amendment, and deactivation endpoints and applies returned constraints as additional query filters; system fails closed on any authorization failure (`cpt-cf-usage-collector-principle-fail-closed`) | Integration tests verifying unauthorized ingestion, query, backfill, and amendment requests are rejected with no data exposed or modified |
+| `cpt-cf-usage-collector-nfr-authorization` | Zero unauthorized data access or write | Gateway, Emitter | `UsageEmitterFactory.with_*().authorize(...)` contacts the platform PDP (`USAGE_RECORD`/`CREATE`) before any transaction opens; gateway enforces PDP authorization on all query, backfill, amendment, and deactivation endpoints and applies returned constraints as additional query filters; system fails closed on any authorization failure (`cpt-cf-usage-collector-principle-fail-closed`) | Integration tests verifying unauthorized ingestion, query, backfill, and amendment requests are rejected with no data exposed or modified |
 | `cpt-cf-usage-collector-nfr-scalability` | Linear throughput scaling with added instances | Gateway | Gateway is stateless — all per-request state is carried in SecurityContext and request payload; horizontal scaling is achieved by adding gateway instances behind a load balancer with no coordination required | Load test demonstrating linear throughput increase as gateway instance count is increased from 1 to N |
-| `cpt-cf-usage-collector-nfr-fault-tolerance` | Zero data loss for durably captured records during storage backend failures | SDK, Gateway | The SDK's outbox pipeline retries failed gateway deliveries with exponential backoff; gateway retries plugin persist calls on transient storage errors; records durably captured in the source outbox are guaranteed to eventually reach the storage backend; messages that exhaust retry budget are moved to the dead-letter store and surfaced via operational monitoring | Chaos test: take storage backend offline, verify outbox rows survive and are delivered on recovery with zero data loss |
+| `cpt-cf-usage-collector-nfr-fault-tolerance` | Zero data loss for durably captured records during storage backend failures | SDK, Gateway | The SDK's outbox pipeline retries failed gateway deliveries with exponential backoff; gateway retries plugin `create_usage_record` calls on transient storage errors; records durably captured in the source outbox are guaranteed to eventually reach the storage backend; messages that exhaust retry budget are moved to the dead-letter store and surfaced via operational monitoring | Chaos test: take storage backend offline, verify outbox rows survive and are delivered on recovery with zero data loss |
 | `cpt-cf-usage-collector-nfr-recovery` | RTO ≤ 15 minutes from storage backend recovery | SDK, Gateway | The outbox library resumes delivery automatically once the gateway becomes reachable again; gateway re-establishes plugin connection on storage recovery without restart; the RTO bound is determined by the outbox retry schedule — `backoff_max` MUST be configured below 15 minutes to meet this threshold | Chaos test: restore storage backend after outage, measure elapsed time from backend availability to full outbox drain and query availability; verify elapsed time ≤ 15 minutes |
 | `cpt-cf-usage-collector-nfr-retention` | Configurable retention from 7 days to 7 years | Storage Plugin | Retention policy configuration is managed by the gateway; plugin enforces retention via storage-native TTL expressions (ClickHouse) or scheduled deletion (TimescaleDB); policies apply at global, per-tenant, and per-usage-type scope | Test retention enforcement for each plugin: records older than the configured duration are removed within the enforcement window |
-| `cpt-cf-usage-collector-nfr-graceful-degradation` | Zero ingestion failures due to downstream consumer unavailability | SDK | `emit()` writes to the source's local database within the caller's transaction — no runtime dependency on the collector or any downstream consumer; the outbox pipeline delivers asynchronously, fully decoupling the source's emission path from collector and consumer uptime | Integration test: take the collector gateway offline; verify sources continue emitting without errors and records are delivered on gateway recovery |
-| `cpt-cf-usage-collector-nfr-rpo` | RPO = 0 for all records for which `emit()` returned `Ok` | SDK | `emit()` calls `Outbox::enqueue()` within the caller's DB transaction — a record is durable the moment that transaction commits; no committed record can be lost by a subsequent gateway restart, dispatcher crash, or storage outage, because the outbox row persists independently in the source's local DB until confirmed delivered | Test: call `emit()` successfully, kill the gateway process immediately after commit, restart gateway; verify the record is delivered and queryable with no data loss |
+| `cpt-cf-usage-collector-nfr-graceful-degradation` | Zero ingestion failures due to downstream consumer unavailability | SDK | `authorized.usage_record_builder(...).build() + enqueue(record)` writes to the source's local database within the caller's transaction — no runtime dependency on the collector or any downstream consumer; the outbox pipeline delivers asynchronously, fully decoupling the source's emission path from collector and consumer uptime | Integration test: take the collector gateway offline; verify sources continue emitting without errors and records are delivered on gateway recovery |
+| `cpt-cf-usage-collector-nfr-rpo` | RPO = 0 for all records for which `authorized.usage_record_builder(...).build() + enqueue(record)` returned `Ok` | SDK | `authorized.usage_record_builder(...).build() + enqueue(record)` calls `Outbox::enqueue()` within the caller's DB transaction — a record is durable the moment that transaction commits; no committed record can be lost by a subsequent gateway restart, dispatcher crash, or storage outage, because the outbox row persists independently in the source's local DB until confirmed delivered | Test: call `authorized.usage_record_builder(...).build() + enqueue(record)` successfully, kill the gateway process immediately after commit, restart gateway; verify the record is delivered and queryable with no data loss |
 
 #### Key ADRs
 
 | ADR ID | Decision Summary |
 |--------|-----------------|
-| `cpt-cf-usage-collector-adr-scoped-emit-source` | `UsageCollectorClientV1.for_module()` returns a `ScopedUsageCollectorClientV1` bound to the source module's authoritative name; scoped client stamps source identity on every emit |
-| `cpt-cf-usage-collector-adr-two-phase-emit-authz` | `authorize_emit()` calls the PDP before any DB transaction; `emit()` evaluates returned constraints in-memory inside the transaction — no network I/O on the critical emission path |
+| `cpt-cf-usage-collector-adr-scoped-emit-source` | `UsageEmitterRuntimeV1.factory(MODULE_NAME)` returns a `UsageEmitterFactory` bound to the source module's authoritative name; the factory stamps source identity on every per-call `UsageEmitter` it produces |
+| `cpt-cf-usage-collector-adr-two-phase-emit-authz` | `factory.with_*().authorize(ctx, resource_id, resource_type)` calls the PDP before any DB transaction; `usage_record_builder(metric, value)?.build()? → enqueue(record)` evaluates returned constraints in-memory inside the transaction — no network I/O on the critical emission path |
 
 ### 1.3 Architecture Layers
 
-```
+**In-process mode** (source and gateway in the same process):
+
+```text
 ┌────────────────────────────────────────────────────────────────┐
-│                    Usage Sources                               │
-│            (LLM Gateway, Compute Service, etc.)                │
+│  Usage Source (same process as gateway)                        │
 ├────────────────────────────────────────────────────────────────┤
-│  usage-collector-sdk  │  emit() + outbox enqueue + delivery    │
+│  usage-emitter        │  UsageEmitterRuntimeV1 (ClientHub):    │
+│                       │  3-layer Runtime/Factory/Emitter —     │
+│                       │  factory(MODULE_NAME) → with_*()       │
+│                       │  → authorize(subject) → enqueue        │
+│                       │  + background outbox delivery          │
+├────────────────────────────────────────────────────────────────┤
+│  usage-collector-sdk  │  UsageCollectorClientV1 (delivery);    │
+│                       │  UsageCollectorPluginClientV1 (plugin) │
 ├────────────────────────────────────────────────────────────────┤
 │  usage-collector      │  Gateway: ingest, query, tenant iso.   │
+│                       │  outbox bootstrap + migrations         │
 ├────────────────────────────────────────────────────────────────┤
 │  Plugins              │  Backend-specific storage adapters     │
-│  ┌──────────────────────┐  ┌───────────────────────────────┐   │
-│  │ clickhouse-plugin    │  │ timescaledb-plugin            │   │
-│  └──────────────────────┘  └───────────────────────────────┘   │
-├────────────────────────────────────────────────────────────────┤
-│  External              │  ClickHouse, TimescaleDB              │
 └────────────────────────────────────────────────────────────────┘
 ```
 
+**Remote mode** (source and gateway in separate processes):
+
+```text
+┌────────────────────────────────────────┐   ┌───────────────────────────────┐
+│  Usage Source Process                  │   │  Collector Process            │
+│                                        │   │                               │
+│  usage-emitter                         │   │  usage-collector (gateway)    │
+│  usage-collector-rest-client           │──►│  POST /usage-collector/v1/    │
+│  (UsageEmitterRuntimeV1 in ClientHub;  │   │  records (bearer token auth)  │
+│   HTTP delivery via authN token)       │   │                               │
+└────────────────────────────────────────┘   └───────────────────────────────┘
+```
+
+The emitter stack is a 3-layer model — see the research spec
+`RESEARCH-emitter-runtime.md` for the authoritative architecture:
+
+- **Layer 1 — `UsageEmitterRuntime`** (concrete) implementing trait `UsageEmitterRuntimeV1`: process-wide; owns the outbox worker, gateway client, PDP resolver, and shared `Arc`s. Registered in ClientHub. `runtime.factory(module_name) -> UsageEmitterFactory` vends module-scoped factories.
+- **Layer 2 — `UsageEmitterFactory`**: module-scoped, cheaply cloneable. Module name is immutable at construction (no `with_module(...)` setter). Builder method `with_tenant(Uuid)` applies a per-call tenant override; subject identity is bound via the three-state contract `with_subject(Subject)` (explicit caller-supplied) / `without_subject()` (explicit no subject) / unset (`SubjectChoice::DefaultFromCtx` — fall back to `SecurityContext` at `.authorize()` time) — see `ADR-0002` §Subject handling. The terminal `.authorize(ctx, resource_id, resource_type)` runs the PDP authorization round-trip and produces a `UsageEmitter`.
+- **Layer 3 — `UsageEmitter`**: per-call-site, authorized handle. `usage_record_builder(metric, value)?.build()? → enqueue(record)` / `enqueue_in(db, record)` performs in-memory validation and the outbox INSERT inside the caller's DB transaction. No PDP calls on the hot path.
+
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
-| SDK | Emit API; outbox enqueue; owns `OutboxHandle` whose background pipeline automatically delivers records to the gateway | Rust crate (`usage-collector-sdk`), modkit-db outbox |
-| Gateway | Ingest, query, aggregation API; tenant isolation; plugin resolution | Rust crate (`usage-collector`), Axum |
+| Emitter | Source-facing emit API (`UsageEmitterRuntimeV1`); concrete `UsageEmitterRuntime` / `UsageEmitterFactory` / `UsageEmitter` (3-layer Runtime / Factory / Emitter); two-phase auth; outbox enqueue; background delivery pipeline | Rust crate (`usage-emitter`), modkit-db outbox |
+| SDK | `UsageCollectorClientV1` delivery trait (not in ClientHub); `UsageCollectorPluginClientV1` plugin trait; shared model types | Rust crate (`usage-collector-sdk`) |
+| REST Client | Remote `UsageCollectorClientV1` implementation; registers `UsageEmitterRuntimeV1` in ClientHub for out-of-process sources; acquires bearer token via AuthN resolver and HTTP-POSTs records to the gateway ingest endpoint | Rust crate (`usage-collector-rest-client`) |
+| Gateway | Ingest, query, aggregation API; tenant isolation; plugin resolution; outbox queue registration and schema migrations; registers `UsageEmitterRuntimeV1` for in-process sources | Rust crate (`usage-collector`), Axum |
 | Plugins | Backend-specific record persistence and aggregation queries | Rust crates, ClickHouse / TimescaleDB drivers |
 | External | Durable time-series storage and query execution | ClickHouse or TimescaleDB |
 
@@ -136,7 +167,7 @@ All storage operations — write, aggregation query, and raw query — are deleg
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-tenant-from-ctx`
 
-Tenant identity for usage attribution is always PDP-authorized — never freely accepted from request payloads. For standard sources, the SDK derives the tenant from `SecurityContext.subject_tenant_id()` and validates that `record.tenant_id` matches. For sources explicitly authorized by the PDP to emit on behalf of multiple tenants, the PDP returns a tenant `In` constraint; `emit()` validates `record.tenant_id` against that constraint before the outbox INSERT. The gateway re-validates tenant attribution independently on every ingest delivery. Queries are always scoped to the authenticated tenant from SecurityContext.
+Tenant identity for usage attribution is always PDP-authorized — never freely accepted from request payloads. The caller passes the target `tenant_id` to the factory via `factory.with_tenant(tenant_id).authorize(...)` (or omits the `.with_tenant(...)` call to default to `ctx.subject_tenant_id()`); the PDP `USAGE_RECORD`/`CREATE` decision covers both same-tenant and subtenant scenarios. The authorized `tenant_id` is bound into the returned `UsageEmitter` (layer 3) and cannot be changed per-record. The gateway accepts the `tenant_id` from delivered records without re-checking. Queries are always scoped to the authenticated tenant from SecurityContext.
 
 #### Fail-Closed Security
 
@@ -152,7 +183,7 @@ On any authorization failure, the system rejects the request. No fallback to per
 
 **ADRs**: `cpt-cf-usage-collector-adr-scoped-emit-source`
 
-Each consuming module obtains a `ScopedUsageCollectorClientV1` by calling `for_module()` once at module initialization, passing its compile-time `MODULE_NAME` constant. The scoped client stamps every outbox row with the source module identity. Which metrics a source is permitted to emit is governed by authz policy. Source identity is never supplied per-call.
+Each consuming module obtains a `UsageEmitterFactory` by calling `UsageEmitterRuntimeV1::factory()` once at module initialization, passing its compile-time `MODULE_NAME` constant. The factory binds `MODULE_NAME` immutably (layer 2 has no `with_module(...)` builder), and every `UsageEmitter` produced by `.authorize(subject)` stamps that source module identity on every outbox row. Which metrics a source is permitted to emit is governed by authz policy. Source identity is never supplied per-call.
 
 #### Two-Phase Emit
 
@@ -160,14 +191,14 @@ Each consuming module obtains a `ScopedUsageCollectorClientV1` by calling `for_m
 
 **ADRs**: `cpt-cf-usage-collector-adr-two-phase-emit-authz`
 
-Any logic that requires communication with external modules is consolidated in phase 1 (`authorize_emit()`), called before any DB transaction opens. Phase 1 accumulates all constraints and state into the returned `EmitAuthorization` token. Phase 2 (`emit()`) applies every accumulated constraint in-memory inside the caller's DB transaction — no external calls on the critical emission path.
+Any logic that requires communication with external modules is consolidated in phase 1 (the factory's `.with_*().authorize(ctx, resource_id, resource_type)` chain), called before any DB transaction opens. Phase 1 accumulates all constraints and state into the returned `UsageEmitter` (layer 3). Phase 2 (`usage_record_builder(metric, value)?.build()? → enqueue(record)`) applies every accumulated constraint in-memory inside the caller's DB transaction — no external calls on the critical emission path.
 
-`EmitAuthorization` acts as a pre-fetched, in-memory contract for the emission. It currently carries:
-- **PDP authorization constraints**: the platform PDP decision and any returned `Constraint` predicates, evaluated against the `UsageRecord` fields; for sources authorized to emit for multiple tenants, the PDP returns a tenant `In` constraint listing the allowed target tenant IDs
-- **Rate limit state**: the source-level emission quota and current window snapshot for the source module
-- **Usage type schema**: the registered schema for the metric being emitted, used for in-memory record validation
+`UsageEmitter` acts as a pre-fetched, in-memory contract for the emission. It currently carries:
+- **PDP authorization result**: the platform PDP permit decision for `USAGE_RECORD`/`CREATE` for the specified tenant and resource
+- **Allowed metrics list**: the set of metrics the source module is permitted to emit, fetched from the gateway during phase 1
+- **Bound context**: the authorized `tenant_id`, `resource_id`, `resource_type`, and `subject: Option<Subject>` — every record produced by this emitter is stamped with the bound subject value. The subject is resolved at `.authorize()` time from either the caller-supplied `with_subject(req.subject)` value or, when absent, derived from `SecurityContext`. `enqueue()` validates `record.subject == self.subject` as a structural equality check; the builder's `usage_record_builder(...)` prefills `record.subject` from the bound subject so this check passes by default.
 
-Any future requirement that depends on external state at emit time MUST be resolved in phase 1 and included in `EmitAuthorization`, not deferred to phase 2. A denial, quota exhaustion, or validation failure from `authorize_emit()` surfaces immediately to the caller as an error before any domain operation is committed.
+Any future requirement that depends on external state at emit time MUST be resolved in phase 1 and included in the returned `UsageEmitter`, not deferred to phase 2. A denial, quota exhaustion, or validation failure from `.authorize()` surfaces immediately to the caller as an error before any domain operation is committed.
 
 ### 2.2 Constraints
 
@@ -175,7 +206,7 @@ Any future requirement that depends on external state at emit time MUST be resol
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-constraint-outbox-infra`
 
-The SDK requires the modkit-db outbox schema to be present in the source's local database. The schema is installed by running `outbox_migrations()` from `modkit_db::outbox` as part of the source module's migration set. Usage sources that do not have a local database managed by modkit-db cannot use the SDK directly.
+The `usage-collector` gateway module registers the outbox queue and applies the modkit-db outbox schema migrations via its `DatabaseCapability::migrations()` implementation. Source modules that emit usage in-process MUST declare `usage-collector` as a ModKit dependency so that the outbox schema is applied automatically as part of the gateway's migration set. Usage sources that do not have a local database managed by modkit-db cannot use the emitter.
 
 #### Single Active Plugin
 
@@ -219,26 +250,27 @@ All plugin connections to ClickHouse and TimescaleDB MUST use TLS; connection pa
 
 **Technology**: Rust structs
 
-**Location**: [`modules/system/usage-collector-sdk/src/types.rs`](../../usage-collector-sdk/src/types.rs)
+**Location**: [`modules/system/usage-collector/usage-collector-sdk/`](../../usage-collector/usage-collector-sdk/)
 
 **Core Entities**:
 
 | Entity | Description | Schema |
 |--------|-------------|--------|
-| `UsageRecord` | Single measurement of resource consumption: tenant ID, source module, metric kind (counter/gauge), metric name, numeric value, timestamp; idempotency key (required for counter metrics, optional for gauge metrics), resource ID/type, subject ID/type, metadata (opaque JSON); status (`active` \| `inactive`) | [`usage-collector-sdk/src/types.rs`](../../usage-collector-sdk/src/types.rs) |
-| `AggregationQuery` | Query parameters: tenant ID (derived from SecurityContext), time range (mandatory), aggregation function (SUM/COUNT/MIN/MAX/AVG); optional filters: usage type, subject (subject_id, subject_type), resource (resource_id, resource_type), source; optional GROUP BY dimensions: time bucket granularity, usage type, subject, resource, source | [`usage-collector-sdk/src/types.rs`](../../usage-collector-sdk/src/types.rs) |
-| `AggregationResult` | Result row: aggregation function applied, aggregated numeric value; dimension values present for each active GROUP BY dimension: time bucket start timestamp (when grouped by time), usage type (when grouped by usage type), subject ID + subject type (when grouped by subject), resource ID + resource type (when grouped by resource), source module (when grouped by source); absent dimensions are null | [`usage-collector-sdk/src/types.rs`](../../usage-collector-sdk/src/types.rs) |
-| `RawQuery` | Raw record query parameters: tenant ID (derived from SecurityContext), time range (mandatory), optional pagination cursor; optional filters: usage type, subject (subject_id, subject_type), resource (resource_id, resource_type) | [`usage-collector-sdk/src/types.rs`](../../usage-collector-sdk/src/types.rs) |
-| `EmitAuthorization` | Opaque token returned by `authorize_emit()`; carries all constraints evaluated in-memory by `emit()`: PDP authorization constraints (`Vec<Constraint>`, may include a tenant `In` constraint for sources authorized to emit for multiple tenants), source-level rate limit quota snapshot (emission count, window bounds, and configured limit for the source module), the registered usage type schema for the metric being emitted, and a monotonic issuance timestamp with a random nonce. `emit()` verifies the token has not exceeded its maximum age before evaluating any other constraint. | [`usage-collector-sdk/src/types.rs`](../../usage-collector-sdk/src/types.rs) |
-| `RetentionPolicy` | Retention rule: scope (`global` \| `tenant` \| `usage-type`), target identifier, retention duration. The global policy is mandatory and cannot be deleted; it applies when no more-specific policy matches. Precedence: per-usage-type > per-tenant > global. | [`usage-collector-sdk/src/types.rs`](../../usage-collector-sdk/src/types.rs) |
-| `BackfillOperation` | Backfill request: operator identity, target `tenant_id` (PDP-authorized: gateway verifies the caller is permitted to backfill for the specified tenant; cross-tenant operations require a dedicated PDP permission and the returned constraint must include the target tenant), usage type, time range, historical records to insert | [`usage-collector-sdk/src/types.rs`](../../usage-collector-sdk/src/types.rs) |
-| `WriteAuditEvent` | Structured event emitted to platform `audit_service` for each operator-initiated write: operation type (`backfill` \| `amend` \| `deactivate`), actor_id, tenant_id, timestamp, justification, and a `WriteAuditContext` variant with operation-specific context — backfill: (usage type, time range, records added); amendment: (record ID, changed fields before/after); deactivation: (record ID). Not stored locally. | [`usage-collector-sdk/src/types.rs`](../../usage-collector-sdk/src/types.rs) |
+| `UsageRecord` | Single measurement of resource consumption: tenant ID, source module (`module` field), metric kind (`kind` field: counter/gauge), metric name, numeric value, timestamp; idempotency key (required for counter metrics, optional for gauge metrics), resource ID and resource type (both required), optional `subject: Option<Subject>`, metadata (opaque JSON); status (`active` \| `inactive`) | [`usage-collector-sdk/src/models.rs`](../../usage-collector/usage-collector-sdk/src/models.rs) |
+| `Subject` | Unified subject-identity value: `Subject { id: Uuid, r#type: Option<String> }`. Encodes the legal invariant (id required, type optional). Lives in `usage-collector-sdk::models` for this PR — TODO: consider lifting to `modkit-security` next to `SecurityContext` once a second consumer (`mini-chat`, `credstore`, audit call sites) appears. Not committed in this PR. | [`usage-collector-sdk/src/models.rs`](../../usage-collector/usage-collector-sdk/src/models.rs) |
+| `AggregationQuery` | Query parameters: tenant ID (derived from SecurityContext), time range (mandatory), aggregation function (SUM/COUNT/MIN/MAX/AVG); optional filters: usage type, subject (`Option<Subject>`), resource (resource_id, resource_type), source; optional GROUP BY dimensions: time bucket granularity, usage type, subject, resource, source | `AggregationQuery` is not yet present in the SDK (target-state) |
+| `AggregationResult` | Result row: aggregation function applied, aggregated numeric value; dimension values present for each active GROUP BY dimension: time bucket start timestamp (when grouped by time), usage type (when grouped by usage type), `Subject` (when grouped by subject), resource ID + resource type (when grouped by resource), source module (when grouped by source); absent dimensions are null | `AggregationResult` is not yet present in the SDK (target-state) |
+| `RawQuery` | Raw record query parameters: tenant ID (derived from SecurityContext), time range (mandatory), optional pagination cursor; optional filters: usage type, subject (`Option<Subject>`), resource (resource_id, resource_type) | `RawQuery` is not yet present in the SDK (target-state) |
+| `UsageEmitter` | Per-call-site, time-limited authorization handle returned by `UsageEmitterFactory::authorize(...)` (layer 3 of the Runtime / Factory / Emitter model); carries the PDP permit result, the authorized `tenant_id`/`resource_id`/`resource_type`, the bound `subject: Option<Subject>` resolved at authorization time (caller-supplied via `with_subject(...)`, or derived from `SecurityContext` when the in-process default applies), the allowed-metrics list for the source module, and a monotonic issuance timestamp. `enqueue()` verifies the handle has not exceeded its maximum age before proceeding. | `UsageEmitter` is not yet present in the SDK (target-state); see `usage-emitter` crate |
+| `RetentionPolicy` | Retention rule: scope (`global` \| `tenant` \| `usage-type`), target identifier, retention duration. The global policy is mandatory and cannot be deleted; it applies when no more-specific policy matches. Precedence: per-usage-type > per-tenant > global. | `RetentionPolicy` is not yet present in the SDK (target-state) |
+| `BackfillOperation` | Backfill request: operator identity, target `tenant_id` (PDP-authorized: gateway verifies the caller is permitted to backfill for the specified tenant before accepting the request), usage type, time range, historical records to insert | `BackfillOperation` is not yet present in the SDK (target-state) |
+| `WriteAuditEvent` | Structured event emitted to platform `audit_service` for each operator-initiated write: operation type (`backfill` \| `amend` \| `deactivate`), actor_id, tenant_id, timestamp, justification, and a `WriteAuditContext` variant with operation-specific context — backfill: (usage type, time range, records added); amendment: (record ID, changed fields before/after); deactivation: (record ID). Not stored locally. | `WriteAuditEvent` is not yet present in the SDK (target-state) |
 | `UsageType` | Registered usage type schema: type identifier, metric kind, unit label, validation rules | types-registry |
 
 **Relationships**:
 - `UsageRecord` belongs to exactly one tenant via `tenant_id`
-- `UsageRecord` optionally belongs to one resource via `resource_id`/`resource_type`
-- `UsageRecord` optionally belongs to one subject via `subject_id`/`subject_type`, always derived from SecurityContext
+- `UsageRecord` belongs to exactly one resource via `resource_id`/`resource_type` (both required)
+- `UsageRecord` optionally belongs to one subject via `subject: Option<Subject>`; the value is bound on the `UsageEmitter` at `.authorize()` time from either the caller-supplied `with_subject(req.subject)` value or, when absent, derived from `SecurityContext`; the bound subject is then stamped onto every record produced by that emitter
 - `UsageRecord` carries optional `metadata` (opaque JSON); persisted and returned as-is without interpretation
 - `UsageRecord` status is `active` on creation; transitions to `inactive` on operator-initiated deactivation or amendment
 - `AggregationResult` carries dimension values only for dimensions active in the originating `AggregationQuery`; a query with no GROUP BY returns a single row with all dimension fields null
@@ -251,13 +283,22 @@ All plugin connections to ClickHouse and TimescaleDB MUST use TLS; connection pa
 
 ```mermaid
 graph TD
-    subgraph Source["Usage Source Process"]
-        App[Application Code]
-        SDK[usage-collector-sdk]
-        LDB[(Local DB)]
+    subgraph InProcess["In-Process Mode (source + gateway same process)"]
+        App1[Application Code]
+        Emitter1[usage-emitter]
+        LDB1[(Local DB)]
+        GW1[Gateway / UsageCollectorLocalClient]
     end
 
-    subgraph Collector["Usage Collector"]
+    subgraph Remote["Remote Mode (source in separate process)"]
+        App2[Application Code]
+        Emitter2[usage-emitter]
+        LDB2[(Local DB)]
+        RC[usage-collector-rest-client]
+        AuthN[authn-resolver]
+    end
+
+    subgraph Collector["Collector Process"]
         GW[Gateway]
         Plugin[Storage Plugin]
     end
@@ -268,34 +309,41 @@ graph TD
 
     Consumer[Usage Consumer]
 
-    App -->|emit| SDK
-    SDK -->|enqueue within caller tx| LDB
-    SDK -->|"deliver (outbox pipeline)"| GW
+    App1 -->|"factory.with_*().authorize / enqueue"| Emitter1
+    Emitter1 -->|enqueue within caller tx| LDB1
+    Emitter1 -->|"outbox pipeline → in-process call"| GW1
+    GW1 --> GW
+
+    App2 -->|"factory.with_*().authorize / enqueue"| Emitter2
+    Emitter2 -->|enqueue within caller tx| LDB2
+    Emitter2 -->|outbox pipeline| RC
+    RC -->|acquire token| AuthN
+    RC -->|"POST /usage-collector/v1/records (bearer)"| GW
+
     GW -->|write| Plugin
-    Plugin -->|persist| DB
+    Plugin -->|create_usage_record| DB
     Consumer -->|query| GW
     GW -->|read| Plugin
     Plugin -->|aggregate / paginate| DB
 ```
 
-#### Usage Collector SDK
+#### Usage Emitter
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-component-sdk`
-
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-component-emitter`
 
 ##### Why this component exists
 
-Provides the public API for usage sources to emit records. Handles transactional outbox persistence in the source's local database, decoupling sources from collector availability.
+Provides the source-facing API for emitting usage records. The runtime (layer 1) is registered in `ClientHub` as `UsageEmitterRuntimeV1` by either the gateway module (in-process delivery) or `usage-collector-rest-client` (HTTP delivery to a remote collector). The factory (layer 2) and per-call emitter (layer 3) are concrete sized types returned by trait/inherent methods. Handles two-phase authorization and transactional outbox persistence, decoupling sources from collector availability.
 
 ##### Responsibility scope
 
-- At SDK initialization: register the `"usage-records"` outbox queue (idempotent, 4 partitions), start the decoupled outbox pipeline with the SDK's internal delivery handler, and retain the resulting `OutboxHandle` for the process lifetime — no explicit shutdown coordination is required
-- Expose `for_module(name) -> ScopedUsageCollectorClientV1` on `UsageCollectorClientV1`; each consuming module calls this once at initialization with its compile-time `MODULE_NAME` constant
-- `ScopedUsageCollectorClientV1.authorize_emit(ctx, metric_name)` — called before any DB transaction opens; calls the platform PDP (authz constraints for the given metric, which may include a tenant `In` constraint for sources authorized to emit for multiple tenants), fetches the current source-level rate limit quota snapshot, and retrieves the registered usage type schema for `metric_name` from types-registry; returns an opaque `EmitAuthorization` token on success or an error on denial / quota exhaustion
-- `ScopedUsageCollectorClientV1.emit(ctx, record, &EmitAuthorization)` — called inside the caller's DB transaction; first verifies the token has not exceeded its maximum age (`EmitError::AuthorizationExpired` on expiry); then validates metric semantics (rejects counter records with a negative value or a missing idempotency key), captures subject ID and type from SecurityContext, stamps source module identity, then evaluates all `EmitAuthorization` constraints in-memory in order: usage type schema validation, source-level rate limit quota check, PDP constraint satisfaction (including tenant validation: if a tenant `In` constraint is present, `record.tenant_id` must be a member of the allowed set; if no tenant constraint is present, `record.tenant_id` must equal `ctx.subject_tenant_id()`); rejects before the outbox enqueue on any failure; on success stamps the outbox row with `record.tenant_id` and calls `Outbox::enqueue()` within the caller's transaction
-- Serialize the usage record (tenant ID, source module, metric kind, idempotency key, resource attribution, subject attribution) to bytes as the outbox payload with `payload_type = "usage-collector.record.v1"`
-- Pass optional metadata field through to the payload without interpretation; enforce the configurable size limit (default 8 KB) before enqueuing
-- Internally implement a `MessageHandler` that the outbox library calls for each ready message: deserialize the payload, assemble a gateway ingest request, call `persist()`, and return `HandlerResult::Success` on confirmation, `HandlerResult::Retry` on transient failure, or `HandlerResult::Reject` on permanent non-retriable failure (e.g. deserialization error, gateway 400); `backoff_max` MUST be configured below 15 minutes to satisfy `cpt-cf-usage-collector-nfr-recovery`
+- Expose `UsageEmitterRuntimeV1::factory(module_name) -> UsageEmitterFactory`; each consuming module retrieves `dyn UsageEmitterRuntimeV1` from `ClientHub` and calls `runtime.factory(...)` once at initialization with its compile-time `MODULE_NAME` constant
+- `UsageEmitterFactory::with_tenant(Uuid)`, `with_subject(Subject)`, and `without_subject()` — chainable per-call scope overrides that consume `self` and return `Self`. Subject identity uses the three-state contract — `with_subject(s)` binds an explicit caller-supplied subject, `without_subject()` is the explicit opt-out, and not calling either leaves the factory in `SubjectChoice::DefaultFromCtx` which resolves from `SecurityContext` at `.authorize()` time; see `ADR-0002` §Subject handling. Module is *not* overridable: layer 2 has no `with_module(...)` method
+- `UsageEmitterFactory::authorize(ctx, resource_id, resource_type) -> Result<UsageEmitter, UsageEmitterError>` — terminal step of the builder chain; called before any DB transaction opens; calls the platform PDP for `USAGE_RECORD`/`CREATE`, fetches the allowed-metrics configuration for this module from the gateway (`get_module_config()`); returns a `UsageEmitter` (layer 3) on success, or error on PDP denial / module not configured
+- `UsageEmitter::usage_record_builder(metric, value)?.build()? → UsageEmitter::enqueue(record)` / `enqueue_in(db, record)` — called inside the caller's DB transaction; first verifies the handle has not exceeded its maximum age (`EmitError::AuthorizationExpired` on expiry); then validates metric semantics (rejects counter records with a negative value or a missing idempotency key), checks `record.subject == self.subject` against the bound `subject: Option<Subject>`, stamps source module identity, then evaluates all `EmitAuthorization` constraints in-memory in order: usage type schema validation, source-level rate limit quota check, PDP constraint satisfaction (including tenant validation: if a tenant `In` constraint is present, `record.tenant_id` must be a member of the allowed set; if no tenant constraint is present, `record.tenant_id` must equal `ctx.subject_tenant_id()`); rejects before the outbox enqueue on any failure; on success stamps the outbox row with `record.tenant_id` and calls `Outbox::enqueue()` within the caller's transaction
+- Serialize the usage record (tenant ID, module, kind, idempotency key, resource attribution, subject attribution) to bytes as the outbox payload with `payload_type = "usage-collector.record.v1"`
+- Pass optional metadata field through to the payload without interpretation; enforce the configured size limit before enqueuing using `ModuleConfig.max_metadata_bytes` (sourced from `get_module_config` at `.authorize()` time; default 8 KB; a value of `0` disables metadata entirely)
+- Internally implement a `MessageHandler` that the outbox library calls for each ready message: deserialize the payload, assemble a gateway ingest request, call `UsageCollectorClientV1::create_usage_record()`, and return `HandlerResult::Success` on confirmation, `HandlerResult::Retry` on transient failure, or `HandlerResult::Reject` on permanent non-retriable failure (e.g. deserialization error, gateway 400); `backoff_max` MUST be configured below 15 minutes to satisfy `cpt-cf-usage-collector-nfr-recovery`
 
 ##### Responsibility boundaries
 
@@ -305,7 +353,34 @@ Provides the public API for usage sources to emit records. Handles transactional
 
 ##### Related components (by ID)
 
-- `cpt-cf-usage-collector-component-gateway` — delivery target for outbox messages
+- `cpt-cf-usage-collector-component-gateway` — delivery target for outbox messages; also constructs and registers `UsageEmitterRuntimeV1` in `ClientHub` during `init()`
+
+---
+
+#### Usage Collector SDK
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-component-sdk`
+
+##### Why this component exists
+
+Defines the shared trait and model boundaries. `UsageCollectorClientV1` is the delivery trait implemented by the gateway's local client and remote REST client; it is **not** registered in `ClientHub` to prevent bypassing the authorized-emitter path. `UsageCollectorPluginClientV1` is the storage plugin trait.
+
+##### Responsibility scope
+
+- Define `UsageCollectorClientV1` with `create_usage_record()` and `get_module_config()` operations
+- Define `UsageCollectorPluginClientV1` with storage plugin operations
+- Define shared model types (`UsageRecord`, `ModuleConfig`, `AllowedMetric`, `UsageKind`, etc.)
+- Define GTS schema for storage plugin registration (`UsageCollectorPluginSpecV1`)
+
+##### Responsibility boundaries
+
+- Does NOT contain emit, authorization, or outbox logic — those are in `cpt-cf-usage-collector-component-emitter`
+- Does NOT register anything in `ClientHub`
+
+##### Related components (by ID)
+
+- `cpt-cf-usage-collector-component-emitter` — consumes `UsageCollectorClientV1` for outbox delivery
+- `cpt-cf-usage-collector-component-gateway` — implements `UsageCollectorClientV1` via its local client
 
 #### Gateway
 
@@ -317,18 +392,19 @@ The centralized entry point for receiving delivered records and serving aggregat
 
 ##### Responsibility scope
 
-- Accept ingest requests from the SDK's outbox delivery pipeline
-- Derive and enforce tenant ID from SecurityContext on all query operations; on ingest, validate tenant attribution: when `record.tenant_id == ctx.subject_tenant_id()`, accept without additional check; when `record.tenant_id ≠ ctx.subject_tenant_id()`, call the PDP with `context_tenant_id(record.tenant_id)` and action `"emit_on_behalf"` — reject the record if the PDP denies (fail-closed); enforce per-(source, tenant) rate limits on ingest once the record's target tenant is known
+- Register the `"usage-records"` outbox queue (4 partitions, configurable) and apply outbox schema migrations (`outbox_migrations()` from `modkit_db::outbox`) via `DatabaseCapability::migrations()` during module init; construct and register `UsageEmitterRuntimeV1` in `ClientHub` during `init()`
+- Accept ingest requests from the emitter's outbox delivery pipeline
+- Derive and enforce tenant ID from SecurityContext on all query operations; on ingest, accept the `tenant_id` from the delivered record without a second PDP check — tenant attribution was authorized at emit time via `USAGE_RECORD`/`CREATE`; enforce per-(source, tenant) rate limits on ingest
 - Resolve the active storage plugin via GTS
 - Expose aggregation and raw query API to usage consumers
 - Authorize each query via the platform PDP: verify the caller is permitted to query; apply PDP-returned constraints as additional query filters before delegating to the plugin
 - Delegate all storage reads and writes to the resolved plugin
 - Fail closed on authorization failures — no permissive fallback
 - Enforce configurable per-call timeout for all plugin operations (default 5 s); if a plugin call does not complete within the timeout, the gateway returns an error and does not retry within the same request — for ingest, retry is handled by the outbox library on the SDK side
-- Apply a circuit breaker per storage plugin instance: open the circuit after 5 consecutive plugin call failures within a 10-second window; return `503 Service Unavailable` while the circuit is open; probe with a single call after a configurable half-open interval (default 30 s)
-- Enforce configurable metadata size limit (default 8 KB) at ingest; reject oversized records before delegating to plugin
+- Apply a circuit breaker per storage plugin instance: open the circuit after 5 consecutive plugin call failures within a 10-second window; return `503 Service Unavailable` while the circuit is open; admit exactly one probe call after a configurable half-open interval (default 30 s); all other concurrent requests during the half-open window are rejected until the probe completes
+- Publishes the configurable metadata size limit (default 8 KB, upper bound 1 MiB, value 0 disables metadata) to emitters via `get_module_config`; the emitter rejects oversized records before they enter the outbox
 - Validate each inbound record against the schema registered in types-registry before delegating to plugin (defense-in-depth; primary validation occurs at SDK `emit()` time before the outbox INSERT)
-- Accept operator backfill requests; call the platform PDP to verify the caller is authorized to backfill for the specified `tenant_id` before accepting the request — a PDP denial or a `tenant_id` that violates the returned constraint returns `403 PERMISSION_DENIED` immediately; callers whose SecurityContext tenant differs from the requested `tenant_id` require a dedicated cross-tenant backfill PDP permission; validate time boundaries and authorization; enqueue each backfill record as a separate outbox message via `Outbox::enqueue_batch()` within the handler transaction; emit `WriteAuditEvent` to `audit_service` once all records are committed to the outbox; respond `202 Accepted` to the caller
+- Accept operator backfill requests; call the platform PDP to verify the caller is authorized to backfill for the specified `tenant_id` before accepting the request; a PDP denial returns `403 PERMISSION_DENIED` immediately; validate time boundaries and authorization; enqueue each backfill record as a separate outbox message via `Outbox::enqueue_batch()` within the handler transaction; emit `WriteAuditEvent` to `audit_service` once all records are committed to the outbox; respond `202 Accepted` to the caller
 - Internally implement a `MessageHandler` for the backfill outbox that the outbox library calls for each individual backfill record: deserialize the payload into a single `UsageRecord`, call `plugin.backfill_ingest()`, and return `HandlerResult::Success` on confirmation, `HandlerResult::Retry` on transient plugin failure, or `HandlerResult::Reject` on permanent failure; `backoff_max` bounds retry duration; delivery throughput to the plugin is naturally rate-limited by the outbox partition count and `msg_batch_size`
 - Expose amendment and deactivation endpoints for individual usage records; emit `WriteAuditEvent` to `audit_service` on each operation
 - Enforce configurable backfill time boundaries (max window, future tolerance); require elevated authorization for requests beyond the max window
@@ -346,6 +422,38 @@ The centralized entry point for receiving delivered records and serving aggregat
 
 - `cpt-cf-usage-collector-component-sdk` — inbound delivery via the SDK's outbox pipeline
 - `cpt-cf-usage-collector-component-storage-plugin` — delegates all storage operations to plugin
+
+#### REST Client
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-component-rest-client`
+
+##### Why this component exists
+
+Enables usage sources that run in a separate process or service binary (i.e., out-of-process from the collector gateway) to emit records using the same `UsageEmitterRuntimeV1` API as in-process sources. The source's emit path and outbox persistence are identical; only the delivery hop is different — the outbox background pipeline POSTs each record to the gateway's HTTP ingest endpoint instead of calling it in-process.
+
+##### Responsibility scope
+
+- Register `UsageEmitterRuntimeV1` in `ClientHub` during `init()`, backed by a `UsageCollectorRestClient` as the `UsageCollectorClientV1` implementation
+- Implement `UsageCollectorClientV1::create_usage_record()`: acquire a bearer token from the platform AuthN resolver (client credentials flow), then HTTP POST the record to `POST /usage-collector/v1/records`; return `HandlerResult::Retry` on network or transient HTTP errors (5xx, 429); return `HandlerResult::Reject` on permanent errors (4xx excluding 429)
+- Implement `UsageCollectorClientV1::get_module_config()`: HTTP GET `GET /usage-collector/v1/modules/{module_name}/config` with bearer token; called by `UsageEmitterFactory::authorize(...)` during phase 1
+- Apply outbox schema migrations (same `outbox_migrations()` call as the in-process path) — this module owns the source's outbox, not the gateway
+
+##### Responsibility boundaries
+
+- Does NOT bypass the transactional outbox — `enqueue()` always writes to the source's local DB first; HTTP delivery happens asynchronously via the outbox background pipeline
+- Does NOT perform authorization — the factory's `.authorize()` step is still invoked by the source and contacts the PDP directly; this component only handles delivery
+- Does NOT implement gateway-side logic — it is a thin HTTP client over `UsageCollectorClientV1`
+
+##### Delivery guarantees
+
+Delivery guarantees are the same as in-process mode: at-least-once via the transactional outbox. The REST client transport adds a bearer token acquisition step and a network hop per delivery attempt. Token acquisition failures are treated as transient and trigger exponential backoff retry. All records durably committed to the source's local outbox are guaranteed to eventually reach the gateway.
+
+##### Related components (by ID)
+
+- `cpt-cf-usage-collector-component-emitter` — consumes this component's `UsageCollectorClientV1` for outbox delivery
+- `cpt-cf-usage-collector-component-gateway` — HTTP delivery target; exposes the ingest and module-config endpoints consumed by this component
+
+---
 
 #### Storage Plugin
 
@@ -380,35 +488,63 @@ Provides a backend-specific implementation for persisting and querying usage rec
 
 ### 3.3 API Contracts
 
-#### SDK Trait (`UsageCollectorClientV1`)
+#### Runtime Trait (`UsageEmitterRuntimeV1`)
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-interface-emitter-trait`
+
+**Technology**: Rust trait in `usage-emitter` crate (layer 1 of the Runtime / Factory / Emitter model); registered in `ClientHub` as `dyn UsageEmitterRuntimeV1` by the gateway module (in-process) or `usage-collector-rest-client` (HTTP). The concrete `UsageEmitterRuntime` owns the outbox worker, gateway client, PDP resolver, and shared `Arc`s.
+**Data Format**: Rust types shared with SDK
+
+**Operations**:
+
+| Operation | Caller | Description |
+|-----------|--------|-------------|
+| `factory(module_name)` | Usage source at init | Returns a `UsageEmitterFactory` bound to the source module's authoritative name. Module name is immutable thereafter (layer 2 has no `with_module(...)`). |
+
+#### Factory (`UsageEmitterFactory`)
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-interface-scoped-emitter`
+
+**Technology**: Concrete Rust struct in `usage-emitter` crate (layer 2 of the Runtime / Factory / Emitter model); obtained exclusively via `UsageEmitterRuntimeV1::factory(module_name)`; cheaply cloneable; modules store one per `MODULE_NAME` at init and clone it per call.
+**Data Format**: Rust types shared with SDK
+
+**Operations**:
+
+| Operation | Caller | Description |
+|-----------|--------|-------------|
+| `with_tenant(tenant_id)` | Usage source (before transaction) | Override the tenant for this call site. Consumes `self`, returns `Self`. When not called, `.authorize()` defaults `tenant` to `ctx.subject_tenant_id()`. |
+| `with_subject(subject: Subject)` | Usage source / forwarder / REST ingest (before transaction) | Bind an explicit caller-supplied subject for this call site (`SubjectChoice::Explicit(Some(subject))`). Consumes `self`, returns `Self`. The PDP receives this exact subject; gateways/forwarders MUST use this method (not the ctx-default fallback) so their own service identity is never substituted for the caller's. See `ADR-0002` §Subject handling. |
+| `without_subject()` | Usage source / forwarder / REST ingest (before transaction) | Explicitly opt out of any subject identity for this call site (`SubjectChoice::Explicit(None)`). Consumes `self`, returns `Self`. `SUBJECT_ID` / `SUBJECT_TYPE` are omitted from the PDP request and the resulting `UsageEmitter` has `subject = None`. Distinct from the default (neither setter called), which falls back to `SecurityContext`. See `ADR-0002` §Subject handling. |
+| _(neither `with_subject` nor `without_subject` called)_ | In-process module whose caller identity *is* the subject | Default behavior — the factory holds `SubjectChoice::DefaultFromCtx` and `.authorize()` resolves the subject from `SecurityContext` at authorize time. Subject identity is end-to-end tri-state ("no subject," "id only," "id + type"), expressed by `Option<Subject>` plus `Subject.r#type: Option<String>` through DTO, factory, `UsageEmitter`, builder, and outbox payload; the "type without id" payload is no longer expressible. |
+| `authorize(ctx, resource_id, resource_type)` | Usage source (before transaction) | Terminal step of the builder chain. Calls the platform PDP for `USAGE_RECORD`/`CREATE` with the resolved tenant/subject/resource; fetches allowed metrics for this module from the gateway (`get_module_config()`); returns `UsageEmitter` (layer 3) on success, or `UsageEmitterError` on denial / module not configured; never called inside an open DB transaction. |
+
+#### Authorized Emitter (`UsageEmitter`)
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-interface-authorized-emitter`
+
+**Technology**: Concrete Rust struct in `usage-emitter` crate (layer 3 of the Runtime / Factory / Emitter model); obtained exclusively via `UsageEmitterFactory::authorize(...)`; per-call-site, time-limited handle.
+
+**Operations**:
+
+| Operation | Caller | Description |
+|-----------|--------|-------------|
+| `usage_record_builder(metric, value)` | Usage source (before opening transaction) | Returns a `UsageRecordBuilder` prefilled from the authorized handle: `module`, `tenant_id`, `resource_id` / `resource_type`, `subject: Option<Subject>`, `metric`, `kind` (resolved from the allowed-metrics list), and `value`. Returns `UsageEmitterError::PermissionDenied` if `metric` is not in the allowed-metrics list — fails before record assembly so callers do not have to round-trip through validation. |
+| `UsageRecordBuilder::build()` | Usage source | Assembles a `UsageRecord` from the populated fields. Returns `UsageEmitterError::InvalidArgument` enumerating any missing required field (`module`, `tenant_id`, `metric`, `value`, `resource_id`, `resource_type`). The builder itself performs no PDP / metric / metadata validation — those run at `enqueue` time. |
+| `enqueue(record)` / `enqueue_in(db, record)` (on `UsageEmitter`) | Usage source (within transaction for `enqueue_in`) | Validates metric semantics (rejects counter records with a negative value or a missing idempotency key), substitutes a UUID for blank gauge idempotency keys, checks `record.subject == self.subject` (structural equality on `Option<Subject>`), then evaluates all `EmitAuthorization` constraints in-memory: schema validation, source-level rate limit quota, PDP constraint satisfaction including tenant validation (tenant `In` constraint present → `record.tenant_id ∈ allowed set`; no tenant constraint → `record.tenant_id == ctx.subject_tenant_id()`); stamps outbox row with `record.tenant_id` on success; returns `EmitError::MissingIdempotencyKey`, `EmitError::SchemaViolation`, `EmitError::RateLimitExceeded`, or `EmitError::ConstraintViolation` on failure — no outbox INSERT on any error. |
+
+#### Delivery Trait (`UsageCollectorClientV1`)
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-interface-sdk-trait`
 
-**Technology**: Rust trait in `usage-collector-sdk` crate
-**Data Format**: Rust types (`UsageRecord`, `AggregationQuery`, `AggregationResult`, `RawQuery`, `PagedResult`)
+**Technology**: Rust trait in `usage-collector-sdk` crate; **not** registered in `ClientHub`; implemented by `UsageCollectorLocalClient` (gateway) and `usage-collector-rest-client`
+**Data Format**: Rust types (`UsageRecord`, `ModuleConfig`)
 
 **Operations**:
 
 | Operation | Caller | Description |
 |-----------|--------|-------------|
-| `for_module(name)` | Usage source at init | Returns a `ScopedUsageCollectorClientV1` bound to the source module's authoritative name |
-| `persist(records)` | SDK (outbox delivery handler) | Delivers a batch of records to the collector gateway; idempotent on `idempotency_key` |
-| `query_aggregated(ctx, query)` | Usage consumer | Returns aggregated usage data scoped to the authenticated tenant |
-| `query_raw(ctx, query)` | Usage consumer | Returns paginated raw usage records scoped to the authenticated tenant |
-
-#### Scoped Emit Client (`ScopedUsageCollectorClientV1`)
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-interface-scoped-client`
-
-**Technology**: Rust struct in `usage-collector-sdk` crate; obtained exclusively via `UsageCollectorClientV1::for_module()`
-**Data Format**: Rust types shared with SDK trait
-
-**Operations**:
-
-| Operation | Caller | Description |
-|-----------|--------|-------------|
-| `authorize_emit(ctx, metric_name)` | Usage source (before transaction) | Calls the platform PDP for the given metric (PDP may return a tenant `In` constraint for sources authorized to emit for multiple tenants), fetches the source-level rate limit quota snapshot, and fetches the registered usage type schema for `metric_name` from types-registry; returns `EmitAuthorization` on success, or `EmitError::Denied` / `EmitError::RateLimitExceeded` on failure; never called inside an open DB transaction |
-| `emit(ctx, record, &EmitAuthorization)` | Usage source (within transaction) | Validates metric semantics (rejects counter records with a negative value or a missing idempotency key), captures subject from SecurityContext, then evaluates all `EmitAuthorization` constraints in-memory: schema validation, source-level rate limit quota, PDP constraint satisfaction including tenant validation (tenant `In` constraint present → `record.tenant_id ∈ allowed set`; no tenant constraint → `record.tenant_id == ctx.subject_tenant_id()`); stamps outbox row with `record.tenant_id` on success; returns `EmitError::MissingIdempotencyKey`, `EmitError::SchemaViolation`, `EmitError::RateLimitExceeded`, or `EmitError::ConstraintViolation` on failure — no outbox INSERT on any error |
+| `create_usage_record(record)` | Emitter (outbox delivery handler) | Delivers one record to the collector gateway per outbox message; idempotent on `idempotency_key` |
+| `get_module_config(module_name)` | Emitter (`UsageEmitterFactory::authorize`) | Returns allowed metrics (and future config) for the module; called by the factory's `.authorize()` step during phase 1 authorization |
 
 #### Plugin Trait
 
@@ -421,7 +557,7 @@ Provides a backend-specific implementation for persisting and querying usage rec
 
 | Operation | Description |
 |-----------|-------------|
-| `persist(records)` | Persists usage records with idempotent upsert on `idempotency_key`; for counter metrics, each record's `value` is a non-negative delta — the record is stored as-is alongside other deltas; the persistent total for any `(tenant_id, metric)` pair is the SUM of all active delta records for that key (see §3.7 Counter Accumulation); for gauge metrics, values are stored as-is |
+| `create_usage_record(record)` | Stores one usage record with idempotent upsert on `idempotency_key`; for counter metrics, each record's `value` is a non-negative delta — the record is stored as-is alongside other deltas; the persistent total for any `(tenant_id, metric)` pair is the SUM of all active delta records for that key (see §3.7 Counter Accumulation); for gauge metrics, values are stored as-is |
 | `query_aggregated(ctx, query)` | Executes aggregation query within the storage engine; applies optional filters (usage type, subject, resource, source) and GROUP BY dimensions from `AggregationQuery`; pushes aggregation and grouping down to the storage engine |
 | `query_raw(ctx, query)` | Executes raw record query with cursor-based pagination; applies optional filters (usage type, subject, resource) from `RawQuery`; scoped to tenant |
 | `backfill_ingest(ctx, tenant, usage_type, records)` | Bulk-inserts historical records with idempotent upsert on `idempotency_key`; does not modify existing records |
@@ -439,18 +575,20 @@ Provides a backend-specific implementation for persisting and querying usage rec
 
 **Endpoints Overview**:
 
-| Method  | Path                                | Description                                                                                 | Stability |
-| ------- | ----------------------------------- | ------------------------------------------------------------------------------------------- | --------- |
-| `GET`   | `/v1/usage/aggregated`              | Query aggregated usage data for the authenticated tenant                                    | stable    |
-| `GET`   | `/v1/usage/raw`                     | Query raw usage records with cursor-based pagination for the authenticated tenant           | stable    |
-| `POST`  | `/v1/usage/backfill`                | Operator-initiated bulk insert of historical records for a tenant and usage type time range | stable    |
-| `PATCH` | `/v1/usage/records/{id}`            | Amend mutable fields on an individual active record                                         | stable    |
-| `POST`  | `/v1/usage/records/{id}/deactivate` | Deactivate an individual record (marks inactive, retains for audit)                         | stable    |
-| `GET`   | `/v1/usage/metadata/watermarks`     | Per-source and per-tenant event counts and latest timestamps                                | stable    |
-| `POST`  | `/v1/usage/types`                   | Register a custom usage type (name, metric kind, unit label); delegates to types-registry   | stable    |
-| `GET`   | `/v1/usage/retention`               | List configured retention policies                                                          | stable    |
-| `PUT`   | `/v1/usage/retention/{scope}`       | Create or update a retention policy for a scope (global / tenant / usage-type)              | stable    |
-| `DELETE` | `/v1/usage/retention/{scope}`      | Delete a non-global retention policy for a scope (tenant / usage-type); the global default policy cannot be deleted | stable    |
+| Method  | Path                                              | Description                                                                                 | Stability |
+| ------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------- | --------- |
+| `POST`  | `/usage-collector/v1/records`                     | Create a usage record; accepts payload and delegates storage to the configured plugin       | stable    |
+| `GET`   | `/usage-collector/v1/modules/{module_name}/config`| Allowed metrics (and future config) for the specified source module                         | stable    |
+| `GET`   | `/usage-collector/v1/aggregated`                  | Query aggregated usage data for the authenticated tenant                                    | stable    |
+| `GET`   | `/usage-collector/v1/raw`                         | Query raw usage records with cursor-based pagination for the authenticated tenant           | stable    |
+| `POST`  | `/usage-collector/v1/backfill`                    | Operator-initiated bulk insert of historical records for a tenant and usage type time range | stable    |
+| `PATCH` | `/usage-collector/v1/records/{id}`                | Amend mutable fields on an individual active record                                         | stable    |
+| `POST`  | `/usage-collector/v1/records/{id}/deactivate`     | Deactivate an individual record (marks inactive, retains for audit)                         | stable    |
+| `GET`   | `/usage-collector/v1/metadata/watermarks`         | Per-source and per-tenant event counts and latest timestamps                                | stable    |
+| `POST`  | `/usage-collector/v1/types`                       | Register a custom usage type (name, metric kind, unit label); delegates to types-registry   | stable    |
+| `GET`   | `/usage-collector/v1/retention`                   | List configured retention policies                                                          | stable    |
+| `PUT`   | `/usage-collector/v1/retention/{scope}`           | Create or update a retention policy for a scope (global / tenant / usage-type)              | stable    |
+| `DELETE`| `/usage-collector/v1/retention/{scope}`           | Delete a non-global retention policy for a scope (tenant / usage-type); the global default policy cannot be deleted | stable |
 
 #### Error Handling
 
@@ -471,10 +609,11 @@ All endpoints are **stable** (prefixed `/v1/`). Backward compatibility is guaran
 
 | Dependency Module | Interface Used | Purpose |
 |-------------------|----------------|---------|
-| modkit-db | `modkit_db::outbox` — `Outbox::enqueue()`, `OutboxHandle`, `outbox_migrations()`, dead-letter API | Durable outbox persistence, automatic background delivery pipeline, and dead-letter management for at-least-once delivery |
-| types-registry | GTS type system — plugin schema registration and instance resolution; types-registry SDK — usage type schema retrieval | Storage plugin discovery and instantiation at runtime; usage type schema fetching for in-memory validation at emit time (called by `ScopedUsageCollectorClientV1.authorize_emit()`) |
+| modkit-db | `modkit_db::outbox` — `Outbox::enqueue()`, `OutboxHandle`, `outbox_migrations()`, dead-letter API | Durable outbox persistence, automatic background delivery pipeline, and dead-letter management for at-least-once delivery; `outbox_migrations()` is applied by the gateway module (in-process) or the `usage-collector-rest-client` module (remote) |
+| types-registry | GTS type system — plugin schema registration and instance resolution; types-registry SDK — usage type schema retrieval | Storage plugin discovery and instantiation at runtime; usage type schema fetching for in-memory validation at emit time (called by `UsageEmitterFactory::authorize(...)`) |
 | SecurityContext | Platform security primitive | Tenant identity, subject identity derivation and authorization enforcement on all operations |
-| authz-resolver | `authz-resolver-sdk` — `PolicyEnforcer` / `AuthZResolverClient` | Platform PDP for ingestion authorization; called by `ScopedUsageCollectorClientV1.authorize_emit()` to verify the source module is permitted to emit the target metrics |
+| authz-resolver | `authz-resolver-sdk` — `PolicyEnforcer` / `AuthZResolverClient` | Platform PDP for ingestion authorization; called by `UsageEmitterFactory::authorize(...)` to verify the source module is permitted to emit for the target tenant and resource |
+| authn-resolver | `authn-resolver-sdk` — `AuthNResolverClient` | Bearer token acquisition (client credentials flow) for HTTP delivery by `usage-collector-rest-client`; used once per delivery attempt by the outbox background pipeline |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -534,49 +673,47 @@ All endpoints are **stable** (prefixed `/v1/`). Backward compatibility is guaran
 ```mermaid
 sequenceDiagram
     participant App as Usage Source
-    participant SC as ScopedUsageCollectorClientV1
+    participant CH as ClientHub
+    participant RT as UsageEmitterRuntimeV1
+    participant FAC as UsageEmitterFactory
+    participant EM as UsageEmitter
     participant PDP as authz-resolver (PDP)
-    participant TR as types-registry
+    participant GW as UC Gateway (UsageCollectorClientV1)
     participant LDB as Local DB
-    participant OB as Outbox Pipeline (SDK background)
-    participant GW as UC Gateway
+    participant OB as Outbox Pipeline (background)
     participant Plugin as Storage Plugin
     participant DB as ClickHouse / TimescaleDB
 
-    Note over App,SC: Module init (once)
-    App->>SC: for_module(MODULE_NAME)
+    Note over App,RT: Module init (once); gateway init() has registered UsageEmitterRuntimeV1 in ClientHub
+    App->>CH: get::<dyn UsageEmitterRuntimeV1>()
+    CH-->>App: &UsageEmitterRuntimeV1
+    App->>RT: factory(MODULE_NAME)
+    RT-->>App: UsageEmitterFactory
 
     Note over App,LDB: Per-request, before transaction
-    App->>SC: authorize_emit(ctx, metric_name)
-    SC->>PDP: evaluate policy (source_module, metric_name)
-    SC->>TR: fetch schema for metric_name
-    SC->>SC: fetch source-level quota snapshot
-    PDP-->>SC: constraints (incl. optional tenant In constraint) | Denied
-    TR-->>SC: schema
-    SC-->>App: Ok(EmitAuthorization{constraints, schema, quota}) | Err(Denied | RateLimitExceeded)
+    App->>FAC: clone().with_*().authorize(ctx, resource_id, resource_type)
+    FAC->>PDP: USAGE_RECORD/CREATE (source_module, tenant_id, resource, subject)
+    FAC->>GW: get_module_config(module_name) → allowed metrics
+    PDP-->>FAC: permit | deny
+    GW-->>FAC: ModuleConfig{allowed_metrics}
+    FAC-->>App: Ok(UsageEmitter{tenant_id, resource_id, resource_type, subject?}) | Err(UsageEmitterError)
 
     Note over App,LDB: Inside caller's DB transaction
-    App->>SC: emit(ctx, record{tenant_id=T}, &auth)
-    SC->>SC: validate metric semantics (counter ≥ 0, gauge any)
-    SC->>SC: capture subject_id / subject_type from SecurityContext
-    SC->>SC: validate record against schema
-    SC->>SC: check source-level quota (emission count within window limit)
-    SC->>SC: evaluate PDP constraints incl. tenant: In constraint → record.tenant_id ∈ allowed set; no constraint → record.tenant_id == ctx.subject_tenant_id()
-    SC->>LDB: Outbox::enqueue(tenant_id=record.tenant_id) within caller's tx
-    LDB-->>SC: ok
-    SC-->>App: Ok | Err(SchemaViolation | RateLimitExceeded | ConstraintViolation)
+    App->>EM: usage_record_builder("metric", value)?.build()? → enqueue(record)
+    EM->>EM: verify handle freshness
+    EM->>EM: validate metric in allowed list
+    EM->>EM: validate metric semantics (counter ≥ 0, counter requires idempotency_key)
+    EM->>EM: check record.subject == self.subject (structural equality on Option<Subject>)
+    EM->>EM: bind subject from authorized UsageEmitter onto the record (set by builder prefill)
+    EM->>LDB: Outbox::enqueue(record{tenant_id, resource_id, resource_type}) within caller's tx
+    LDB-->>EM: ok
+    EM-->>App: Ok | Err(UsageEmitterError)
 
     Note over OB: Outbox library background pipeline
-    OB->>GW: MessageHandler::handle() → persist(records)
+    OB->>GW: MessageHandler::handle() → create_usage_record(record)
     GW->>GW: validate SecurityContext
-    alt record.tenant_id == ctx.subject_tenant_id()
-        GW->>GW: tenant attribution valid (standard path)
-    else record.tenant_id ≠ ctx.subject_tenant_id()
-        GW->>PDP: emit_on_behalf? (source, record.tenant_id)
-        PDP-->>GW: permit | deny
-    end
     GW->>GW: enforce per-(source, tenant) rate limit
-    GW->>Plugin: persist(records)
+    GW->>Plugin: create_usage_record(record)
     Plugin->>DB: INSERT (idempotent upsert on idempotency_key)
     DB-->>Plugin: ok
     Plugin-->>GW: ok
@@ -584,7 +721,53 @@ sequenceDiagram
     Note over OB: On transient failure: HandlerResult::Retry → exponential backoff<br/>On permanent failure: HandlerResult::Reject → dead-letter store
 ```
 
-**Description**: At module initialization, the usage source calls `for_module()` to obtain a `ScopedUsageCollectorClientV1` bound to its platform identity. For each request that will emit usage, it calls `authorize_emit()` before opening any DB transaction — the scoped client contacts the PDP, fetches the registered usage type schema from types-registry, and fetches the current source-level rate limit quota snapshot; it returns an `EmitAuthorization` token bundling all three (including any tenant `In` constraint from the PDP for sources authorized to emit for multiple tenants), or an immediate `Denied` or `RateLimitExceeded` error. Inside the caller's transaction, `emit()` validates metric semantics, captures subject identity, evaluates all constraints in-memory including tenant validation (`record.tenant_id` must satisfy the PDP tenant constraint or equal `ctx.subject_tenant_id()` if no constraint was returned), and on success stamps the outbox row with `record.tenant_id` and calls `Outbox::enqueue()`. The outbox library's background pipeline then automatically picks up enqueued messages and invokes the SDK's internal `MessageHandler`. The gateway validates tenant attribution on delivery: standard records (where `record.tenant_id == ctx.subject_tenant_id()`) are accepted directly; cross-tenant records trigger a PDP `emit_on_behalf` check per unique target tenant in the batch before plugin delivery. The gateway also enforces per-(source, tenant) rate limits at this point. On `HandlerResult::Success` the outbox advances the partition cursor; on `HandlerResult::Retry` it applies exponential backoff and re-delivers; on `HandlerResult::Reject` it moves the message to the dead-letter store.
+**Description**: At module initialization, the usage source retrieves `dyn UsageEmitterRuntimeV1` from `ClientHub` (registered by the gateway module during service startup) and calls `runtime.factory(MODULE_NAME)` to obtain a `UsageEmitterFactory` bound to its platform identity. For each request that will emit usage, it clones the factory, applies any per-call overrides via `with_tenant(...)` and the three-state subject contract (the default — neither `.with_subject(...)` nor `.without_subject()` called — leaves the factory in `SubjectChoice::DefaultFromCtx`, which resolves the subject from `SecurityContext` at `.authorize()` time and is suitable for in-process modules whose caller identity *is* the subject; forwarders MUST translate their wire-level `Option<Subject>` faithfully — `Some(s) → .with_subject(s)`, `None → .without_subject()` — so the forwarder's own service identity is never substituted for the original caller's), and runs the terminal `.authorize(ctx, resource_id, resource_type)` before opening any DB transaction — the factory contacts the PDP for `USAGE_RECORD`/`CREATE` with the resolved `tenant_id`, subject, and resource, and fetches the allowed-metrics list from the gateway; it returns a `UsageEmitter` (layer 3) with the authorized `tenant_id`, `resource_id`, `resource_type`, and resolved subject bound in, or an immediate error on PDP denial. Inside the caller's transaction, `usage_record_builder(metric, value)?.build()? → enqueue(record)` validates metric semantics and allowed-list membership, applies the subject fields already bound into the `UsageEmitter` (resolved at `.authorize()` time per the table in §2.1's Two-Phase Emit principle), stamps the bound context, and calls `Outbox::enqueue()`. The outbox library's background pipeline then automatically picks up enqueued messages and invokes the emitter's internal `MessageHandler`, calling `UsageCollectorClientV1::create_usage_record()` on the gateway. The gateway accepts the `tenant_id` from the delivered record without a second PDP check — tenant attribution was authorized at emit time. On `HandlerResult::Success` the outbox advances the partition cursor; on `HandlerResult::Retry` it applies exponential backoff and re-delivers; on `HandlerResult::Reject` it moves the message to the dead-letter store.
+
+#### Emit Usage Record — Remote Delivery (REST Client)
+
+**ID**: `cpt-cf-usage-collector-seq-emit-remote`
+
+**Use cases**: `cpt-cf-usage-collector-usecase-emit` (remote deployment mode)
+
+**Actors**: `cpt-cf-usage-collector-actor-usage-source` (out-of-process)
+
+The emit path (`factory.with_*().authorize(ctx, resource_id, resource_type)` → `usage_record_builder(metric, value)?.build()? → enqueue(record)`) is identical to the in-process sequence. The difference is in the outbox delivery step: the background pipeline calls the REST client's `create_usage_record()`, which acquires a bearer token and HTTP-POSTs to the gateway.
+
+```mermaid
+sequenceDiagram
+    participant OB as Outbox Pipeline (background)
+    participant RC as UsageCollectorRestClient
+    participant AuthN as authn-resolver
+    participant GW as UC Gateway (HTTP)
+    participant Plugin as Storage Plugin
+    participant DB as ClickHouse / TimescaleDB
+
+    Note over OB: Outbox library background pipeline (source process)
+    OB->>RC: MessageHandler::handle() → create_usage_record(record)
+    RC->>AuthN: acquire bearer token (client credentials)
+    AuthN-->>RC: Bearer <token>
+    RC->>GW: POST /usage-collector/v1/records (Authorization: Bearer <token>, body: UsageRecord)
+    alt token invalid or expired
+        GW-->>RC: 401 Unauthenticated
+        RC-->>OB: HandlerResult::Retry
+    else permanent error (4xx except 429)
+        GW-->>RC: 4xx
+        RC-->>OB: HandlerResult::Reject → dead-letter store
+    else transient error (5xx, 429, network)
+        GW-->>RC: 5xx / timeout
+        RC-->>OB: HandlerResult::Retry → exponential backoff
+    else success
+        GW->>GW: validate SecurityContext; enforce rate limit
+        GW->>Plugin: create_usage_record(record)
+        Plugin->>DB: INSERT (idempotent upsert on idempotency_key)
+        DB-->>Plugin: ok
+        Plugin-->>GW: ok
+        GW-->>RC: 204 No Content
+        RC-->>OB: HandlerResult::Success (outbox advances cursor)
+    end
+```
+
+**Description**: The source's outbox background pipeline invokes the REST client's `MessageHandler`. The REST client acquires a bearer token from the platform AuthN resolver (client credentials flow) before each delivery attempt — token acquisition failure is treated as transient and triggers retry. The record is HTTP-POSTed to the gateway's ingest endpoint with the bearer token in the `Authorization` header. The gateway processes the ingest request identically to the in-process path: validates the security context, enforces rate limits, and delegates to the storage plugin. On `204 No Content` the outbox advances the partition cursor. On permanent 4xx (excluding 429) the message is moved to the dead-letter store. All other errors trigger exponential backoff retry. At-least-once delivery is guaranteed for all records durably committed to the source outbox.
 
 #### Query Aggregated Usage
 
@@ -602,7 +785,7 @@ sequenceDiagram
     participant Plugin as Storage Plugin
     participant DB as ClickHouse / TimescaleDB
 
-    Consumer->>GW: GET /usage/aggregated (ctx, query params)
+    Consumer->>GW: GET /usage-collector/v1/aggregated (ctx, query params)
     GW->>GW: derive tenant_id from SecurityContext
     GW->>PDP: authorize query (ctx, tenant, usage_type?)
     PDP-->>GW: decision + constraints
@@ -632,7 +815,7 @@ sequenceDiagram
     participant Plugin as Storage Plugin
     participant DB as ClickHouse / TimescaleDB
 
-    Consumer->>GW: GET /usage/raw (ctx, time range, filters, cursor)
+    Consumer->>GW: GET /usage-collector/v1/raw (ctx, time range, filters, cursor)
     GW->>GW: derive tenant_id from SecurityContext
     GW->>PDP: authorize query (ctx, tenant, usage_type?)
     PDP-->>GW: decision + constraints
@@ -664,7 +847,7 @@ sequenceDiagram
     participant DB as ClickHouse / TimescaleDB
     participant AS as audit_service
 
-    Op->>GW: POST /usage/backfill (tenant_id, usage_type, range, records)
+    Op->>GW: POST /usage-collector/v1/backfill (tenant_id, usage_type, range, records)
     GW->>PDP: authorize backfill for tenant_id (actor from SecurityContext)
     alt PDP denies or tenant_id violates returned constraint
         PDP-->>GW: deny
@@ -694,7 +877,7 @@ sequenceDiagram
     Note over OB: On transient failure: HandlerResult::Retry → exponential backoff<br/>On permanent failure: HandlerResult::Reject → dead-letter store
 ```
 
-**Description**: Platform operator submits a backfill request specifying `tenant_id`, usage type, time range, and historical records to insert. The gateway first calls the platform PDP to verify the caller is authorized to backfill for the specified `tenant_id`; a PDP denial or a `tenant_id` that violates the returned constraint returns `403 PERMISSION_DENIED` immediately without touching the outbox. Callers whose SecurityContext tenant differs from the requested `tenant_id` require a dedicated cross-tenant backfill PDP permission; the PDP must return a constraint that includes the target tenant. After PDP authorization succeeds, the gateway enforces time boundaries and requires elevated authorization for windows exceeding the configured maximum. On successful validation, the gateway enqueues all backfill records to a gateway-local backfill outbox in a single transaction, then emits a `WriteAuditEvent` to `audit_service` and returns `202 Accepted` to the caller. The outbox library's background pipeline then automatically calls the gateway's internal `MessageHandler` for each individual record. The plugin inserts each record using idempotent upsert — existing records are not modified. Real-time ingestion continues uninterrupted throughout the operation.
+**Description**: Platform operator submits a backfill request specifying `tenant_id`, usage type, time range, and historical records to insert. The gateway first calls the platform PDP to verify the caller is authorized to backfill for the specified `tenant_id`; a PDP denial returns `403 PERMISSION_DENIED` immediately without touching the outbox. After PDP authorization succeeds, the gateway enforces time boundaries and requires elevated authorization for windows exceeding the configured maximum. On successful validation, the gateway enqueues all backfill records to a gateway-local backfill outbox in a single transaction, then emits a `WriteAuditEvent` to `audit_service` and returns `202 Accepted` to the caller. The outbox library's background pipeline then automatically calls the gateway's internal `MessageHandler` for each individual record. The plugin inserts each record using idempotent upsert — existing records are not modified. Real-time ingestion continues uninterrupted throughout the operation.
 
 #### Amend Individual Record
 
@@ -713,7 +896,7 @@ sequenceDiagram
     participant DB as ClickHouse / TimescaleDB
     participant AS as audit_service
 
-    Op->>GW: PATCH /usage/records/{id} (ctx, justification, updated fields)
+    Op->>GW: PATCH /usage-collector/v1/records/{id} (ctx, justification, updated fields)
     GW->>GW: derive tenant_id from SecurityContext
     GW->>PDP: authorize amendment (ctx, tenant, record_id)
     PDP-->>GW: permit | deny
@@ -759,7 +942,7 @@ sequenceDiagram
     participant DB as ClickHouse / TimescaleDB
     participant AS as audit_service
 
-    Op->>GW: POST /usage/records/{id}/deactivate (ctx, justification)
+    Op->>GW: POST /usage-collector/v1/records/{id}/deactivate (ctx, justification)
     GW->>GW: derive tenant_id from SecurityContext
     GW->>PDP: authorize deactivation (ctx, tenant, record_id)
     PDP-->>GW: permit | deny
@@ -801,23 +984,24 @@ The outbox schema is owned by the `modkit-db` shared infrastructure and installe
 | Field | Type | Description |
 |-------|------|-------------|
 | `tenant_id` | UUID | Tenant owning this usage record |
-| `source_module` | TEXT | Source module name from `ScopedUsageCollectorClientV1` |
-| `metric_kind` | TEXT | `"counter"` or `"gauge"` |
+| `module` | TEXT | Source module name from `UsageEmitterFactory` (bound at `runtime.factory(MODULE_NAME)`) |
+| `kind` | TEXT | `"counter"` or `"gauge"` |
 | `metric` | TEXT | Name of the measured resource metric |
 | `value` | NUMERIC | Numeric measurement value |
 | `timestamp` | TIMESTAMPTZ | When the measurement occurred |
-| `idempotency_key` | TEXT | Client-provided deduplication key; non-null for counter records (enforced by `emit()` before enqueue); nullable for gauge records |
-| `resource_id` | UUID (nullable) | Resource instance this record is attributed to |
-| `resource_type` | TEXT (nullable) | Resource type corresponding to `resource_id` |
-| `subject_id` | UUID (nullable) | Subject (user/service account) from SecurityContext |
-| `subject_type` | TEXT (nullable) | Subject type corresponding to `subject_id` |
-| `metadata` | JSON object (nullable) | Optional opaque metadata; size validated by SDK before enqueue (default 8 KB limit) |
+| `idempotency_key` | TEXT | Client-provided deduplication key; non-null for counter records (enforced by `enqueue()` before outbox INSERT); nullable for gauge records |
+| `resource_id` | UUID | Resource instance this record is attributed to (required) |
+| `resource_type` | TEXT | Resource type corresponding to `resource_id` (required) |
+| `subject` | nested object (optional) | `Option<Subject>`; serialized as `{ "subject": { "id": "...", "type": "..." } }` when `Some`, or the `subject` key is absent when `None`. The inner `type` field is itself optional. The "type without id" payload is no longer expressible. |
+| `metadata` | JSON object (nullable) | Optional opaque metadata; size validated by emitter before enqueue using `ModuleConfig.max_metadata_bytes` (default 8 KB; 0 disables metadata) |
 
-**Payload invariants** (enforced by SDK before `Outbox::enqueue()` is called): `tenant_id`, `source_module`, `metric_kind`, `metric`, `value`, `timestamp` are all non-null. `idempotency_key` is non-null for counter records.
+**Payload invariants** (enforced by emitter before `Outbox::enqueue()` is called): `tenant_id`, `module`, `kind`, `metric`, `value`, `timestamp`, `resource_id`, `resource_type` are all non-null. `idempotency_key` is non-null for counter records.
 
 **Dead letters**: Messages permanently rejected by the SDK's delivery handler (`HandlerResult::Reject`) are moved to the outbox dead-letter store by the library. Dead-letter management (replay, resolve, discard) is available via the `Outbox` dead-letter API.
 
 #### Storage Backend Tables (plugin-owned)
+
+**ID**: `cpt-cf-usage-collector-dbtable-records`
 
 Storage table schemas are defined and owned by each plugin implementation. The gateway does not define, access, or migrate storage tables directly. Each plugin is responsible for its own schema migration lifecycle.
 
@@ -826,14 +1010,14 @@ Storage table schemas are defined and owned by each plugin implementation. The g
 | Column | Purpose |
 |--------|---------|
 | `tenant_id` | Tenant scoping and isolation; required filter on all queries |
-| `source_module` | Source module identity; enables per-module metric auditing |
-| `metric_kind` | `"counter"` or `"gauge"`; governs aggregation semantics |
+| `module` | Source module identity; enables per-module metric auditing |
+| `kind` | `"counter"` or `"gauge"`; governs aggregation semantics |
 | `metric` | Name of the measured resource metric |
 | `value` | Measured numeric value |
 | `timestamp` | Measurement time; primary partitioning and ordering dimension |
 | `idempotency_key` | Deduplication key; NOT NULL for counter records, nullable for gauge records; unique constraint or upsert target per plugin for non-null values |
-| `resource_id` | Resource instance attribution; nullable |
-| `resource_type` | Resource type attribution; nullable |
+| `resource_id` | Resource instance attribution; NOT NULL (required at emit time) |
+| `resource_type` | Resource type attribution; NOT NULL (required at emit time) |
 | `subject_id` | Subject attribution from SecurityContext; nullable |
 | `subject_type` | Subject type attribution; nullable |
 | `ingested_at` | When the collector received and persisted the record |
@@ -850,7 +1034,7 @@ Storage table schemas are defined and owned by each plugin implementation. The g
 | Metric filter index | `(tenant_id, metric, timestamp)` | Supports `usage_type` filter in aggregation and raw queries |
 | Subject filter index | `(tenant_id, subject_id, timestamp)` | Supports `subject` filter in aggregation and raw queries |
 | Resource filter index | `(tenant_id, resource_id, timestamp)` | Supports `resource` filter in aggregation and raw queries |
-| Idempotency deduplication | `(tenant_id, idempotency_key)` — unique or upsert target | Required for idempotent `persist()` and `backfill_ingest()` |
+| Idempotency deduplication | `(tenant_id, idempotency_key)` — unique or upsert target | Required for idempotent `create_usage_record()` and `backfill_ingest()` |
 
 Storage-native index types (ClickHouse sorting key, TimescaleDB btree/brin) are at the plugin's discretion, provided they satisfy the query latency NFR.
 
@@ -860,7 +1044,7 @@ Storage-native index types (ClickHouse sorting key, TimescaleDB btree/brin) are 
 
 Counter semantics (`cpt-cf-usage-collector-fr-counter-semantics`) define the total for a `(tenant_id, metric)` pair as a monotonically increasing value that grows as non-negative deltas are ingested.
 
-**Source of truth — delta records as the persistent store**: The plugin-owned usage records table is the authoritative record of all submitted deltas. There is no separate totals table in the baseline schema. The persistent total for any `(tenant_id, metric)` pair is computed as `SUM(value)` over all active records matching that key for the desired time range. Because all delta values are non-negative (enforced at emit time by `ScopedUsageCollectorClientV1.emit()`), the cumulative SUM is guaranteed to be monotonically increasing.
+**Source of truth — delta records as the persistent store**: The plugin-owned usage records table is the authoritative record of all submitted deltas. There is no separate totals table in the baseline schema. The persistent total for any `(tenant_id, metric)` pair is computed as `SUM(value)` over all active records matching that key for the desired time range. Because all delta values are non-negative (enforced at emit time by `UsageEmitter.enqueue()`), the cumulative SUM is guaranteed to be monotonically increasing.
 
 **Accumulation key vs. full attribution tuple**: `cpt-cf-usage-collector-fr-counter-semantics` scopes the total to `(tenant_id, metric)`. The full record carries additional attribution dimensions — `source_module`, `resource_id`, `resource_type`, `subject_id`, `subject_type` — that enable GROUP BY breakdowns within `query_aggregated`. The counter total per `(tenant_id, metric)` is the SUM across all attribution dimensions for that pair; narrower totals (e.g., per `resource_id`) are query-time GROUP BY variants of the same underlying delta records.
 
@@ -980,7 +1164,7 @@ The outbox pattern implementation relies on the modkit-db outbox infrastructure.
 | **Tampering** | Overwriting existing records on delivery | Idempotent upsert prevents silent overwrite; `version` field enforces optimistic concurrency on amendments; all operator-initiated writes produce a `WriteAuditEvent` to `audit_service` |
 | **Repudiation** | Operator denies issuing a backfill, amendment, or deactivation | `WriteAuditEvent` emitted to `audit_service` for every operator-initiated write; events are not stored locally to prevent local tampering (`cpt-cf-usage-collector-fr-audit`) |
 | **Information Disclosure** | Cross-tenant data access via query API | All queries scoped to the authenticated tenant from `SecurityContext`; PDP constraints applied as additional query filters; system fails closed on any authorization failure (`cpt-cf-usage-collector-principle-fail-closed`) |
-| **Denial of Service** | Outbox flooding or backfill saturation by a single source | Rate limiting enforced by `authorize_emit()` before any transaction (`cpt-cf-usage-collector-fr-rate-limiting`); independent rate limits on the backfill outbox pipeline prevent storage saturation; dead-letter state surfaces unhealthy sources via monitoring |
+| **Denial of Service** | Outbox flooding or backfill saturation by a single source | Rate limiting enforced by the factory's `.authorize()` step before any transaction (`cpt-cf-usage-collector-fr-rate-limiting`); independent rate limits on the backfill outbox pipeline prevent storage saturation; dead-letter state surfaces unhealthy sources via monitoring |
 | **Elevation of Privilege** | Accessing oversized backfill windows without elevated authorization | Elevated authorization required for requests exceeding the configured maximum backfill window; all authorization failures result in immediate rejection with no partial operation (`cpt-cf-usage-collector-principle-fail-closed`) |
 
 **Not applicable — Recovery architecture**: Backup strategy, point-in-time recovery, and disaster recovery for ClickHouse and TimescaleDB storage backends are governed by platform infrastructure policy and managed by the platform SRE team; this module's design does not define storage backup topology. The transactional outbox ensures that records durably captured in source outboxes can be re-delivered if storage data is restored from a backup.
