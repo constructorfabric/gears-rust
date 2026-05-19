@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 /// patch family of a given macOS major (`13.x`, `14.x`, `15.x`), so a
 /// patch-version bump on the deployment host does not invalidate the
 /// claim — only a major-version bump does.
-pub const SUPPORTED_OE_MACOS_MAJOR: &[u32] = &[12, 13, 14, 15];
+pub const SUPPORTED_OE_MACOS_MAJOR: &[u32] = &[12, 13, 14, 15, 26];
 
 /// Environment variable that, when set to a non-empty value other than
 /// `"0"`, forces [`fips_witness_ok`] to return `true` on a macOS major
