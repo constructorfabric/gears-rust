@@ -82,6 +82,7 @@ members = [
     "modules/system/authn-resolver/authn-resolver-sdk",
     "modules/system/authn-resolver/authn-resolver",
     "modules/system/authn-resolver/plugins/static-authn-plugin",
+    "modules/system/authn-resolver/plugins/oidc-authn-plugin",
     "modules/system/authz-resolver/authz-resolver-sdk",
     "modules/system/authz-resolver/authz-resolver",
     "modules/system/authz-resolver/plugins/static-authz-plugin",

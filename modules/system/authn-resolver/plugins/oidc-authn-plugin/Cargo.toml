@@ -1,0 +1,102 @@
+[package]
+name = "cyberware-oidc-authn-plugin"
+edition.workspace = true
+license.workspace = true
+version = "0.1.0"
+description = "OIDC Authentication Resolver Plugin"
+
+[lib]
+name = "oidc_authn_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+authn-resolver-sdk = {
+    package = "cyberware-authn-resolver-sdk",
+    version = "0.3",
+    path = "../../authn-resolver-sdk"
+}
+types-registry-sdk = {
+    package = "cyberware-types-registry-sdk",
+    version = "0.2",
+    path = "../../../types-registry/types-registry-sdk"
+}
+
+# ModKit dependencies
+modkit.workspace = true
+modkit-macros.workspace = true
+modkit-security.workspace = true
+inventory.workspace = true
+
+# JWT validation
+jsonwebtoken.workspace = true
+
+# HTTP client for OIDC Discovery
+reqwest = { workspace = true, features = ["form", "json"] }
+httpdate.workspace = true
+
+# Random jitter for retry backoff
+rand.workspace = true
+
+# Regex-based issuer_pattern matching
+regex.workspace = true
+
+# URL parsing (domain-friendly; reqwest re-exports the same type)
+url.workspace = true
+
+# Concurrent JWKS / discovery cache
+dashmap.workspace = true
+
+# Low-overhead synchronization for circuit-breaker state
+parking_lot.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+# Required by the ModKit `Module` trait (`init() -> anyhow::Result<()>`)
+anyhow.workspace = true
+humantime.workspace = true
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+
+# Logging / metrics
+tracing.workspace = true
+opentelemetry = { workspace = true, features = ["metrics"] }
+
+# UUID for subject_id parsing
+uuid.workspace = true
+
+# Base64 for JWT segment detection
+base64.workspace = true
+
+# Secret string type for S2S client credentials
+secrecy.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+secrecy.workspace = true
+criterion.workspace = true
+httpmock.workspace = true
+serde_urlencoded.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+rcgen.workspace = true
+
+[[bench]]
+name = "jwt_validation"
+harness = false
+
+[[bench]]
+name = "s2s_exchange"
+harness = false
+
+[features]
+e2e-diagnostics = []

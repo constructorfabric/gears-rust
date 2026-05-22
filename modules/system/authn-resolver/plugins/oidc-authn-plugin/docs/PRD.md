@@ -4,73 +4,40 @@ Created:  2026-04-09 by Diffora
 
 <!-- toc -->
 
-- [PRD — OIDC AuthN Resolver Plugin](#prd--oidc-authn-resolver-plugin)
-  - [1. Overview](#1-overview)
-    - [1.1 Purpose](#11-purpose)
-    - [1.2 Background / Problem Statement](#12-background--problem-statement)
-    - [1.3 Goals (Business Outcomes)](#13-goals-business-outcomes)
-    - [1.4 Glossary](#14-glossary)
-  - [2. Actors](#2-actors)
-    - [2.1 Human Actors](#21-human-actors)
-      - [Platform Administrator](#platform-administrator)
-    - [2.2 System Actors](#22-system-actors)
-      - [API Gateway / AuthN Middleware](#api-gateway--authn-middleware)
-      - [Domain Modules (Request Path)](#domain-modules-request-path)
-      - [Domain Modules (Background Tasks)](#domain-modules-background-tasks)
-      - [OIDC Identity Provider](#oidc-identity-provider)
-  - [3. Operational Concept \& Environment](#3-operational-concept--environment)
-  - [4. Scope](#4-scope)
-    - [4.1 In Scope](#41-in-scope)
-    - [4.2 Out of Scope](#42-out-of-scope)
-  - [5. Functional Requirements](#5-functional-requirements)
-    - [5.1 Token Validation](#51-token-validation)
-      - [JWT Local Validation](#jwt-local-validation)
-      - [Non-JWT Token Rejection](#non-jwt-token-rejection)
-      - [Trusted Issuer Enforcement](#trusted-issuer-enforcement)
-      - [JWKS Key Rotation Handling](#jwks-key-rotation-handling)
-      - [Audience Validation](#audience-validation)
-    - [5.2 Claim Extraction \& Mapping](#52-claim-extraction--mapping)
-      - [Configurable Claim Mapping](#configurable-claim-mapping)
-      - [Tenant Claim Requirement](#tenant-claim-requirement)
-      - [First-Party vs Third-Party App Detection](#first-party-vs-third-party-app-detection)
-    - [5.3 OIDC Auto-Configuration](#53-oidc-auto-configuration)
-      - [OIDC Discovery](#oidc-discovery)
-      - [JWKS Caching](#jwks-caching)
-    - [5.4 S2S Client Credentials Exchange](#54-s2s-client-credentials-exchange)
-      - [Client Credentials Grant](#client-credentials-grant)
-      - [S2S Token Caching](#s2s-token-caching)
-      - [S2S Default Subject Type](#s2s-default-subject-type)
-    - [5.5 Plugin Discovery \& Registration](#55-plugin-discovery--registration)
-      - [ClientHub Registration](#clienthub-registration)
-    - [5.6 Resilience \& Timeouts](#56-resilience--timeouts)
-      - [Configurable Request Timeout](#configurable-request-timeout)
-      - [Transient-Failure Retry](#transient-failure-retry)
-      - [Per-Host Circuit Breaker (Toggleable)](#per-host-circuit-breaker-toggleable)
-  - [6. Non-Functional Requirements](#6-non-functional-requirements)
-    - [6.1 Module-Specific NFRs](#61-module-specific-nfrs)
-      - [JWT Validation Latency](#jwt-validation-latency)
-      - [Plugin Availability](#plugin-availability)
-      - [Fail-Closed Guarantee](#fail-closed-guarantee)
-      - [Tenant Isolation](#tenant-isolation)
-      - [S2S Exchange Latency](#s2s-exchange-latency)
-      - [Token Security](#token-security)
-    - [6.2 NFR Exclusions](#62-nfr-exclusions)
-  - [7. Public Library Interfaces](#7-public-library-interfaces)
-    - [7.1 Public API Surface](#71-public-api-surface)
-      - [AuthN Resolver Gateway Interface](#authn-resolver-gateway-interface)
-      - [AuthN Resolver Plugin Interface](#authn-resolver-plugin-interface)
-    - [7.2 External Integration Contracts](#72-external-integration-contracts)
-      - [OIDC Identity Provider Contract](#oidc-identity-provider-contract)
-      - [SecurityContext Contract](#securitycontext-contract)
-  - [8. Use Cases](#8-use-cases)
-    - [Authenticate API Request](#authenticate-api-request)
-    - [Service-to-Service Authentication](#service-to-service-authentication)
-  - [9. Acceptance Criteria](#9-acceptance-criteria)
-  - [10. Dependencies](#10-dependencies)
-  - [11. Assumptions](#11-assumptions)
-  - [12. Risks](#12-risks)
-  - [13. Open Questions](#13-open-questions)
-  - [14. Traceability](#14-traceability)
+- [1. Overview](#1-overview)
+  - [1.1 Purpose](#11-purpose)
+  - [1.2 Background / Problem Statement](#12-background--problem-statement)
+  - [1.3 Goals (Business Outcomes)](#13-goals-business-outcomes)
+  - [1.4 Glossary](#14-glossary)
+- [2. Actors](#2-actors)
+  - [2.1 Human Actors](#21-human-actors)
+  - [2.2 System Actors](#22-system-actors)
+- [3. Operational Concept & Environment](#3-operational-concept--environment)
+- [4. Scope](#4-scope)
+  - [4.1 In Scope](#41-in-scope)
+  - [4.2 Out of Scope](#42-out-of-scope)
+- [5. Functional Requirements](#5-functional-requirements)
+  - [5.1 Token Validation](#51-token-validation)
+  - [5.2 Claim Extraction & Mapping](#52-claim-extraction--mapping)
+  - [5.3 OIDC Auto-Configuration](#53-oidc-auto-configuration)
+  - [5.4 S2S Client Credentials Exchange](#54-s2s-client-credentials-exchange)
+  - [5.5 Plugin Discovery & Registration](#55-plugin-discovery--registration)
+  - [5.6 Resilience & Timeouts](#56-resilience--timeouts)
+- [6. Non-Functional Requirements](#6-non-functional-requirements)
+  - [6.1 Module-Specific NFRs](#61-module-specific-nfrs)
+  - [6.2 NFR Exclusions](#62-nfr-exclusions)
+- [7. Public Library Interfaces](#7-public-library-interfaces)
+  - [7.1 Public API Surface](#71-public-api-surface)
+  - [7.2 External Integration Contracts](#72-external-integration-contracts)
+- [8. Use Cases](#8-use-cases)
+  - [Authenticate API Request](#authenticate-api-request)
+  - [Service-to-Service Authentication](#service-to-service-authentication)
+- [9. Acceptance Criteria](#9-acceptance-criteria)
+- [10. Dependencies](#10-dependencies)
+- [11. Assumptions](#11-assumptions)
+- [12. Risks](#12-risks)
+- [13. Open Questions](#13-open-questions)
+- [14. Traceability](#14-traceability)
 
 <!-- /toc -->
 
@@ -184,7 +151,7 @@ No module-specific environment constraints beyond project defaults. The plugin r
 
 #### JWT Local Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-jwt-validation`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-jwt-validation`
 
 The plugin MUST validate JWT access tokens locally using cached JWKS fetched from the IdP's standard `jwks_uri` endpoint. Validation MUST include: signature verification (RS256, ES256), `exp` claim validation (must be in future, with configurable clock skew leeway — default 60s), `iss` claim validation (must be in trusted issuers allowlist), and `aud` claim validation (when configured). The `alg: none` algorithm MUST never be accepted, even if misconfigured — tokens presenting `alg: none` MUST be rejected.
 
@@ -193,7 +160,7 @@ The plugin MUST validate JWT access tokens locally using cached JWKS fetched fro
 
 #### Non-JWT Token Rejection
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-non-jwt-rejection`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-non-jwt-rejection`
 
 The plugin MUST reject tokens that are not valid JWTs (not three base64url-encoded segments) with `Unauthorized("unsupported token format")`.
 
@@ -202,7 +169,7 @@ The plugin MUST reject tokens that are not valid JWTs (not three base64url-encod
 
 #### Trusted Issuer Enforcement
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-trusted-issuers`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-trusted-issuers`
 
 The plugin MUST maintain a configurable allowlist of trusted issuers. Tokens with an `iss` claim not matching any trusted issuer MUST be rejected with `Unauthorized("untrusted issuer")`.
 
@@ -221,7 +188,7 @@ When an entry matched via `issuer_pattern` is used, the matched pattern and the 
 
 #### JWKS Key Rotation Handling
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-key-rotation`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-key-rotation`
 
 When a JWT presents a `kid` (Key ID) not found in the cached JWKS, the plugin MUST force-refresh the JWKS from the IdP. If the `kid` is still not found after refresh, the plugin MUST reject the token with `Unauthorized("signing key not found")`.
 
@@ -230,7 +197,7 @@ When a JWT presents a `kid` (Key ID) not found in the cached JWKS, the plugin MU
 
 #### Audience Validation
 
-- [ ] `p2` - **ID**: `cpt-cf-authn-plugin-fr-audience-validation`
+- [x] `p2` - **ID**: `cpt-cf-authn-plugin-fr-audience-validation`
 
 When `jwt.require_audience` is `true`, the plugin MUST reject tokens without an `aud` claim. When `jwt.expected_audience` is configured, the plugin MUST verify that at least one `aud` value matches the expected audience list (with glob pattern support).
 
@@ -241,7 +208,7 @@ When `jwt.require_audience` is `true`, the plugin MUST reject tokens without an 
 
 #### Configurable Claim Mapping
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-claim-mapping`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-claim-mapping`
 
 The plugin MUST extract claims from validated JWTs and map them to `SecurityContext` fields using configurable claim names:
 - `subject_id` (default: `"sub"`) — MUST parse as UUID; reject if missing or invalid.
@@ -254,7 +221,7 @@ The plugin MUST extract claims from validated JWTs and map them to `SecurityCont
 
 #### Tenant Claim Requirement
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-tenant-claim`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-tenant-claim`
 
 The plugin MUST require a tenant identifier claim in every access token (claim name is vendor-configurable, e.g., `"tenant_id"`, `"org_id"`, `"account_id"`). The claim value MUST parse as UUID (RFC 4122). Tokens without the tenant claim MUST be rejected with `Unauthorized("missing tenant_id")`; tokens with a non-UUID tenant claim MUST be rejected with `Unauthorized("invalid tenant id")`.
 
@@ -263,7 +230,7 @@ The plugin MUST require a tenant identifier claim in every access token (claim n
 
 #### First-Party vs Third-Party App Detection
 
-- [ ] `p2` - **ID**: `cpt-cf-authn-plugin-fr-first-party-detection`
+- [x] `p2` - **ID**: `cpt-cf-authn-plugin-fr-first-party-detection`
 
 When `jwt.first_party_clients` is configured, the plugin MUST check the token's `client_id`/`azp` claim against the list. First-party apps MUST receive `token_scopes = ["*"]` (unrestricted). Third-party apps MUST receive only their granted OAuth2 scopes from the token.
 
@@ -274,7 +241,7 @@ When `jwt.first_party_clients` is configured, the plugin MUST check the token's 
 
 #### OIDC Discovery
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-oidc-discovery`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-oidc-discovery`
 
 The plugin MUST fetch and cache the IdP's `.well-known/openid-configuration` document to resolve `jwks_uri` and `token_endpoint` dynamically. Only the issuer URL needs to be configured.
 
@@ -283,7 +250,7 @@ The plugin MUST fetch and cache the IdP's `.well-known/openid-configuration` doc
 
 #### JWKS Caching
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-jwks-caching`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-jwks-caching`
 
 The plugin MUST cache JWKS key sets in memory with configurable TTL (default: 1h) and max entries (default: 10). When the cache reaches `max_entries`, it MUST evict the least-recently-used (`LRU`) entry. Cache MUST be refreshable on unknown `kid` with a configurable minimum refresh interval to prevent abuse.
 
@@ -294,7 +261,7 @@ The plugin MUST cache JWKS key sets in memory with configurable TTL (default: 1h
 
 #### Client Credentials Grant
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-s2s-exchange`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-s2s-exchange`
 
 The plugin MUST implement OAuth2 `client_credentials` grant (RFC 6749 §4.4) to obtain access tokens for service-to-service communication. The obtained JWT MUST be validated through the same pipeline as bearer token authentication. The resulting `SecurityContext` MUST include the obtained access token as `bearer_token`.
 
@@ -303,7 +270,7 @@ The plugin MUST implement OAuth2 `client_credentials` grant (RFC 6749 §4.4) to 
 
 #### S2S Token Caching
 
-- [ ] `p2` - **ID**: `cpt-cf-authn-plugin-fr-s2s-caching`
+- [x] `p2` - **ID**: `cpt-cf-authn-plugin-fr-s2s-caching`
 
 The plugin MUST cache S2S authentication results keyed by `(client_id, normalized_scopes, credential_fingerprint)` with TTL = `min(token expires_in, s2s_oauth.token_cache.ttl)`.
 
@@ -318,7 +285,7 @@ Concurrent cache misses for the same full cache key MUST NOT cause duplicate IdP
 
 #### S2S Default Subject Type
 
-- [ ] `p3` - **ID**: `cpt-cf-authn-plugin-fr-s2s-default-subject-type`
+- [x] `p3` - **ID**: `cpt-cf-authn-plugin-fr-s2s-default-subject-type`
 
 When `s2s_oauth.default_subject_type` is configured and the obtained S2S token does not contain a `subject_type` claim, the plugin MUST apply the configured default value as `SecurityContext.subject_type`.
 
@@ -329,7 +296,7 @@ When `s2s_oauth.default_subject_type` is configured and the obtained S2S token d
 
 #### ClientHub Registration
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-clienthub-registration`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-clienthub-registration`
 
 The plugin MUST register `dyn AuthNResolverPluginClient` with Cyber Ware ClientHub using GTS schema identity at startup. Registration MUST include vendor key (`"cyberfabric"`), priority, and display name.
 
@@ -344,7 +311,7 @@ A complete operator configuration example is maintained at [`config-example.yaml
 
 #### Configurable Request Timeout
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-request-timeout`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-request-timeout`
 
 The plugin MUST apply a configurable `http_client.request_timeout` (default `5s`) to every outbound IdP HTTP call — OIDC discovery, JWKS fetch, and the S2S token endpoint. The timeout MUST be applied **per attempt**; a retried call receives a fresh `request_timeout` on each attempt.
 
@@ -353,7 +320,7 @@ The plugin MUST apply a configurable `http_client.request_timeout` (default `5s`
 
 #### Transient-Failure Retry
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-retry-policy`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-retry-policy`
 
 The plugin MUST retry transient outbound IdP failures with exponential backoff plus jitter, bounded by a configurable retry policy:
 
@@ -368,7 +335,7 @@ The plugin MUST retry transient outbound IdP failures with exponential backoff p
 
 #### Per-Host Circuit Breaker (Toggleable)
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-fr-circuit-breaker`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-fr-circuit-breaker`
 
 The plugin MUST maintain circuit-breaker state keyed by the outbound HTTP host so that degradation of one IdP host does not block calls to other hosts (including other trusted issuers served by a different host). When a host's breaker is Open, calls to **that host** that require a fresh IdP response MUST fail with `ServiceUnavailable`; calls to other hosts MUST continue unaffected. The breaker MUST be globally enable/disable-able via `circuit_breaker.enabled` (default `true`). When disabled, every host MUST behave as if permanently Closed — retries and `http_client.request_timeout` still apply.
 
@@ -381,7 +348,7 @@ The plugin MUST maintain circuit-breaker state keyed by the outbound HTTP host s
 
 #### JWT Validation Latency
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-jwt-latency`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-jwt-latency`
 
 JWT local validation MUST complete within 5ms at p95 with a warm JWKS cache at 10K requests per second.
 
@@ -391,7 +358,7 @@ JWT local validation MUST complete within 5ms at p95 with a warm JWKS cache at 1
 
 #### Plugin Availability
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-availability`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-availability`
 
 Plugin availability MUST be ≥ 99.99%. When the IdP is unreachable, the plugin MUST continue to validate JWTs using cached JWKS (stale-while-revalidate). A per-host circuit breaker (globally toggleable via `circuit_breaker.enabled`) MUST prevent cascade failure when one IdP host is degraded, without blocking calls to other healthy hosts. Transient outbound failures (connection errors, HTTP 5xx, HTTP 429) MUST be retried per a configurable retry policy before being treated as terminal.
 
@@ -401,7 +368,7 @@ Plugin availability MUST be ≥ 99.99%. When the IdP is unreachable, the plugin 
 
 #### Fail-Closed Guarantee
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-fail-closed`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-fail-closed`
 
 Every error path MUST return an explicit rejection error — never a default-allow. No authentication bypass is permitted under any failure condition.
 
@@ -411,7 +378,7 @@ Every error path MUST return an explicit rejection error — never a default-all
 
 #### Tenant Isolation
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-tenant-isolation`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-tenant-isolation`
 
 Zero cross-tenant data leaks via the authentication layer. Tokens without a valid tenant claim MUST be rejected.
 
@@ -421,7 +388,7 @@ Zero cross-tenant data leaks via the authentication layer. Tokens without a vali
 
 #### S2S Exchange Latency
 
-- [ ] `p2` - **ID**: `cpt-cf-authn-plugin-nfr-s2s-latency`
+- [x] `p2` - **ID**: `cpt-cf-authn-plugin-nfr-s2s-latency`
 
 S2S credential exchange MUST complete within 500ms at p95 (cold cache, including IdP round-trip). Warm cache (token cached) MUST complete within 1ms at p95.
 
@@ -431,7 +398,7 @@ S2S credential exchange MUST complete within 500ms at p95 (cold cache, including
 
 #### Token Security
 
-- [ ] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-security`
+- [x] `p1` - **ID**: `cpt-cf-authn-plugin-nfr-security`
 
 Bearer tokens and client secrets MUST never be logged, persisted, or included in debug output. Tokens MUST be wrapped in `SecretString` types that are excluded from `Debug`/`Display`/serialization.
 
