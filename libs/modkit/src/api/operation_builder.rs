@@ -1577,6 +1577,35 @@ where
             "Internal Server Error",
         )
     }
+
+    /// Add a 502 Bad Gateway error response.
+    ///
+    /// This is a convenience wrapper around `problem_response`.
+    pub fn error_502(self, registry: &dyn OpenApiRegistry) -> Self {
+        self.problem_response(registry, http::StatusCode::BAD_GATEWAY, "Bad Gateway")
+    }
+
+    /// Add a 503 Service Unavailable error response.
+    ///
+    /// This is a convenience wrapper around `problem_response`.
+    pub fn error_503(self, registry: &dyn OpenApiRegistry) -> Self {
+        self.problem_response(
+            registry,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable",
+        )
+    }
+
+    /// Add a 504 Gateway Timeout error response.
+    ///
+    /// This is a convenience wrapper around `problem_response`.
+    pub fn error_504(self, registry: &dyn OpenApiRegistry) -> Self {
+        self.problem_response(
+            registry,
+            http::StatusCode::GATEWAY_TIMEOUT,
+            "Gateway Timeout",
+        )
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
