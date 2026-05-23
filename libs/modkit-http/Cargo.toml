@@ -99,3 +99,4 @@ httpmock = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-subscriber = { workspace = true }
 flate2 = { workspace = true }
+url = { workspace = true }

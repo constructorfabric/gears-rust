@@ -39,15 +39,21 @@ pub type BufferedService = Buffer<Request<Full<Bytes>>, ServiceFuture>;
 /// # Example
 ///
 /// ```no_run
+/// # use modkit_http::HttpClient;
+/// # use modkit_http::HttpError;
+///
 /// // Just store the client directly - no Mutex needed!
 /// struct MyService {
 ///     http: HttpClient,
 /// }
 ///
+/// # #[derive(serde::Deserialize)]
+/// struct Data;
+///
 /// impl MyService {
 ///     async fn fetch(&self) -> Result<Data, HttpError> {
 ///         // reqwest-like API: response has body-reading methods
-///         self.http.get("https://example.com/api").await?.json().await
+///         self.http.get("https://example.com/api").send().await?.json().await
 ///     }
 /// }
 /// ```
@@ -93,6 +99,9 @@ impl HttpClient {
     /// Query parameters must be encoded into the URL externally (e.g. via `url::Url`):
     ///
     /// ```no_run
+    /// # use modkit_http::HttpClient;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = HttpClient::new()?;
     /// use url::Url;
     ///
     /// let mut url = Url::parse("https://api.example.com/search")?;
@@ -103,13 +112,20 @@ impl HttpClient {
     ///     .header("authorization", "Bearer token")
     ///     .send()
     ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// # Example
     ///
     /// ```no_run
+    /// # use modkit_http::HttpClient;
+    /// # async fn example() -> Result<(), modkit_http::HttpError> {
+    /// # let client = HttpClient::new()?;
     /// // Simple GET
     /// let resp = client.get("https://api.example.com/data").send().await?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// [`HttpError::InvalidUri`]: crate::error::HttpError::InvalidUri
@@ -132,6 +148,11 @@ impl HttpClient {
     /// # Example
     ///
     /// ```no_run
+    /// # use modkit_http::HttpClient;
+    /// # #[derive(serde::Serialize)]
+    /// # struct NewUser { name: &'static str }
+    /// # async fn example() -> Result<(), modkit_http::HttpError> {
+    /// # let client = HttpClient::new()?;
     /// // POST with JSON body
     /// let resp = client
     ///     .post("https://api.example.com/users")
@@ -145,6 +166,8 @@ impl HttpClient {
     ///     .form(&[("grant_type", "client_credentials")])?
     ///     .send()
     ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn post(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(
@@ -164,11 +187,18 @@ impl HttpClient {
     /// # Example
     ///
     /// ```no_run
+    /// # use modkit_http::HttpClient;
+    /// # #[derive(serde::Serialize)]
+    /// # struct UpdateData { value: i32 }
+    /// # async fn example() -> Result<(), modkit_http::HttpError> {
+    /// # let client = HttpClient::new()?;
     /// let resp = client
     ///     .put("https://api.example.com/resource/1")
     ///     .json(&UpdateData { value: 42 })?
     ///     .send()
     ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn put(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(
@@ -188,11 +218,18 @@ impl HttpClient {
     /// # Example
     ///
     /// ```no_run
+    /// # use modkit_http::HttpClient;
+    /// # #[derive(serde::Serialize)]
+    /// # struct PatchData { field: &'static str }
+    /// # async fn example() -> Result<(), modkit_http::HttpError> {
+    /// # let client = HttpClient::new()?;
     /// let resp = client
     ///     .patch("https://api.example.com/resource/1")
     ///     .json(&PatchData { field: "new_value" })?
     ///     .send()
     ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn patch(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(
@@ -212,11 +249,16 @@ impl HttpClient {
     /// # Example
     ///
     /// ```no_run
+    /// # use modkit_http::HttpClient;
+    /// # async fn example() -> Result<(), modkit_http::HttpError> {
+    /// # let client = HttpClient::new()?;
     /// let resp = client
     ///     .delete("https://api.example.com/resource/42")
     ///     .header("authorization", "Bearer token")
     ///     .send()
     ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn delete(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(
@@ -241,12 +283,17 @@ impl HttpClient {
     /// # Example
     ///
     /// ```no_run
+    /// # use modkit_http::HttpClient;
+    /// # async fn example() -> Result<(), modkit_http::HttpError> {
+    /// # let client = HttpClient::new()?;
     /// let resp = client.head("https://api.example.com/big-blob").send().await?;
     /// let len = resp
     ///     .headers()
     ///     .get(http::header::CONTENT_LENGTH)
     ///     .and_then(|v| v.to_str().ok())
     ///     .and_then(|s| s.parse::<u64>().ok());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn head(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(
@@ -271,6 +318,9 @@ impl HttpClient {
     /// # Example
     ///
     /// ```no_run
+    /// # use modkit_http::HttpClient;
+    /// # async fn example() -> Result<(), modkit_http::HttpError> {
+    /// # let client = HttpClient::new()?;
     /// let resp = client
     ///     .options("https://api.example.com/resource")
     ///     .send()
@@ -280,6 +330,8 @@ impl HttpClient {
     ///     .get(http::header::ALLOW)
     ///     .and_then(|v| v.to_str().ok())
     ///     .map(str::to_owned);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn options(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(

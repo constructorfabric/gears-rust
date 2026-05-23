@@ -2536,6 +2536,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "webpki-roots 1.0.6",
 ]
 
