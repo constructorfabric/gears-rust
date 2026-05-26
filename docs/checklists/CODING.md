@@ -70,6 +70,7 @@ These checks are **Cypilot SDLC-specific** because they require Cypilot artifact
 
 - [ ] Verify each requirement in Definition of Done is implemented and testable
 - [ ] Confirm implementation details (API, DB, domain entities) match the requirement section
+- [ ] If the implementation introduces or changes GTS identifiers, type schemas, well-known instances, discriminator/const-enum-like values, `x-gts-traits` / `x-gts-traits-schema`, or type-driven authorization/extension behavior, review against `guidelines/GTS.md`
 - [ ] Validate requirement mappings to flows and algorithms are satisfied
 - [ ] Ensure PRD coverage (FR/NFR) is preserved in implementation outcomes
 - [ ] Ensure Design coverage (principles, constraints, components, sequences, db tables) is satisfied
@@ -84,6 +85,7 @@ These checks are **Cypilot SDLC-specific** because they require Cypilot artifact
 - [ ] Validate domain model entities and invariants are respected by code
 - [ ] Confirm component responsibilities, boundaries, and dependencies match the component model
 - [ ] Validate API contracts and integration boundaries are honored
+- [ ] If the design relies on GTS-based modeling, ensure the code follows `guidelines/GTS.md` for identifier structure, traits usage, well-known instances, and extensibility patterns
 - [ ] Verify interactions and sequences are implemented as described
 - [ ] Ensure database schemas, constraints, and access patterns align with design
 - [ ] Confirm topology and tech stack choices are not contradicted

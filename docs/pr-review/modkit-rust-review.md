@@ -12,7 +12,7 @@ purpose: Idiomatic, engineering-grade checklist for reviewing Rust pull requests
 
 Use this guideline to review Rust pull requests for correctness, idiomatic style, maintainability, safety, and operational quality.
 
-This is a **PR review checklist**, not a language tutorial and not a generic architecture manifesto.  
+This is a **PR review checklist**, not a language tutorial and not a generic architecture manifesto.
 Focus on **real merge risk**, **idiomatic Rust**, and **actionable findings**.
 
 ## Review Goals
@@ -53,6 +53,7 @@ For each issue include:
 - Prefer concrete Rust-specific guidance over generic OO theory
 - If something cannot be verified from the diff or context, do not state it as fact
 - Prefer fewer, higher-signal findings over many weak ones
+- Refer to `guidelines/GTS.md` when the PR touches GTS identifiers, type schemas, well-known instances, discriminator/const-enum-like values, `x-gts-traits` / `x-gts-traits-schema`, type registries, or type-driven authorization/extension behavior
 
 ---
 
@@ -423,17 +424,17 @@ Do **not** equate "idiomatic" with:
 ```markdown
 ### 1. Error context is lost
 
-**Checklist ID**: `RUST-ERR-001`  
+**Checklist ID**: `RUST-ERR-001`
 **Severity**: CRITICAL
 **Location**: `src/service.rs:84-96`
 
-**Issue**  
+**Issue**
 The code converts a specific repository error into a generic string/error variant and drops the original cause.
 
-**Why it matters**  
+**Why it matters**
 This makes production failures harder to diagnose and may prevent correct retry or classification logic.
 
-**Fix**  
+**Fix**
 Preserve the original error as source/context and map only at the service boundary if needed.
 ```
 

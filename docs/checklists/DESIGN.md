@@ -247,6 +247,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Links to machine-readable schemas/types are provided (when available)
 - [ ] Schema location in repo specified
 - [ ] Schema/type format specified (JSON Schema, TypeScript, OpenAPI, etc.)
+- [ ] If the domain model uses GTS identifiers, type schemas, well-known instances, traits, or type registries, validate the modeling against `guidelines/GTS.md`
 
 ### ARCH-DESIGN-006: API Contracts Authority
 **Severity**: CRITICAL
@@ -261,6 +262,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Error handling expectations documented
 - [ ] AuthN/AuthZ entry points documented
 - [ ] Versioning strategy documented (if applicable)
+- [ ] If API discriminator fields, resource types, or extensible constants are modeled, validate that the design uses `guidelines/GTS.md` appropriately instead of closed string enums where extensibility/semantics are required
 
 ### ARCH-DESIGN-007: Interaction Sequences
 **Severity**: HIGH
@@ -282,6 +284,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Internal vs external interfaces distinguished
 - [ ] Coupling between components minimized
 - [ ] Cohesion within components maximized
+- [ ] If extensibility is type-driven, ensure the design references `guidelines/GTS.md` for extension-point modeling
 
 ### ARCH-DESIGN-009: Technology Stack Alignment
 **Severity**: MEDIUM
@@ -421,6 +424,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] API endpoint authorization documented
 - [ ] Least privilege principle applied
 - [ ] Privilege escalation prevention documented
+- [ ] If authorization depends on type/category/discriminator values, check whether `guidelines/GTS.md` should be used for type-driven permissions and extensible authorization semantics
 
 ### SEC-DESIGN-003: Data Protection
 **Severity**: CRITICAL
@@ -586,6 +590,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Integration middleware documented (if applicable)
 - [ ] API gateway strategy documented (if applicable)
 - [ ] Service mesh strategy documented (if applicable)
+- [ ] If API discriminator fields, resource types, or extensible constants are modeled, validate that the design uses `guidelines/GTS.md` appropriately instead of closed string enums where extensibility/semantics are required
 
 ### INT-DESIGN-002: External System Integration
 **Severity**: HIGH
@@ -1029,6 +1034,7 @@ When reviewing PRs that add or change design documents, additionally focus on:
 - [ ] Trade-off analysis — are alternatives considered and justified?
 - [ ] API contract consistency with existing endpoints and conventions
 - [ ] Security considerations — authentication, authorization, data protection
+- [ ] If the design touches GTS identifiers, type schemas, well-known instances, discriminator/const-enum-like values, `x-gts-traits` / `x-gts-traits-schema`, type registries, or type-driven authorization/extension points, review it against `guidelines/GTS.md`
 - [ ] Compliance with `docs/spec-templates/cyberware-sdlc/DESIGN/template.md` template structure
 - [ ] Identify antipatterns — god objects, leaky abstractions, tight coupling
 - [ ] Compare proposed design with existing industry patterns in SaaS platforms

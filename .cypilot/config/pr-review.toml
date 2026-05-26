@@ -10,6 +10,7 @@ prompt_file = ".cypilot/config/kits/sdlc/scripts/prompts/pr/code-review.md"
 checklist = "docs/checklists/CODING.md"
 coding_guidelines = "guidelines/DNA/languages/RUST.md"
 security_guidelines = "guidelines/SECURITY.md"
+gts_guidelines = "guidelines/GTS.md"
 
 [[prompts]]
 name = "Design Review"
@@ -18,6 +19,7 @@ prompt_file = ".cypilot/config/kits/sdlc/scripts/prompts/pr/design-review.md"
 checklist = "docs/checklists/DESIGN.md"
 template = "docs/spec-templates/cyberware-sdlc/DESIGN/template.md"
 architecture = "docs/ARCHITECTURE_MANIFEST.md"
+gts_guidelines = "guidelines/GTS.md"
 
 [[prompts]]
 name = "ADR Review"

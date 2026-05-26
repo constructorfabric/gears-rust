@@ -20,6 +20,7 @@ prompt_file = "{scripts}/prompts/pr/code-review.md"
 checklist   = "{codebase_checklist}"
 # coding_guidelines = "docs/coding-guidelines.md"
 # security_guidelines = "docs/security-guidelines.md"
+# gts_guidelines = "guidelines/GTS.md"
 
 [[prompts]]
 description = "PRD Review"
@@ -42,3 +43,4 @@ prompt_file = "{scripts}/prompts/pr/design-review.md"
 checklist   = "{design_checklist}"
 template    = "{design_template}"
 # architecture = "docs/architecture/"
+# gts_guidelines = "guidelines/GTS.md"
