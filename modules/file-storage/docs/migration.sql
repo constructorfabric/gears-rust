@@ -10,7 +10,7 @@
 -- be run as a single migration unit when its phase ships:
 --
 --   * P1 — initial release; everything required for the P1 scope in PRD.md
---          and DESIGN.md (auth-required CRUD, public-access flag, content
+--          and DESIGN.md (auth-required CRUD, content
 --          and metadata revisions, SHA-256 hash, content-state machine,
 --          backend pointer; one-table custom metadata)
 --
@@ -337,8 +337,8 @@ CREATE INDEX events_outbox_unpublished_idx
 
 
 -- Table: file_storage.policies -----------------------------------------------
--- Tenant and user policies (allowed types, size limits, public-access
--- restriction, sharing model controls). Effective policy is the most
+-- Tenant and user policies (allowed types, size limits, retention and
+-- lifecycle controls). Effective policy is the most
 -- restrictive across applicable rows (per PRD §5.4).
 
 CREATE TABLE file_storage.policies (
