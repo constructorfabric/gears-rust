@@ -225,7 +225,7 @@ operation.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-get-metadata`
 
 The system **MUST** return file metadata (name, size, mime_type, GTS file type, created date, modified date, owner,
-public access flag, and custom metadata) without transferring file content.
+and custom metadata) without transferring file content.
 
 **Rationale**: Consumers validate file properties (size limits, type compatibility) and read custom metadata before
 initiating downloads, avoiding wasted bandwidth on incompatible files.
@@ -693,8 +693,8 @@ update). Audit records **MUST** include the operation type, actor identity, file
 
 The system **MUST** support optional audit logging for read operations (downloads and metadata queries), configurable
 per policy. When enabled by policy, the system **MUST** produce an audit record for every read operation. Because all
-content traffic transits FileStorage, read audit applies uniformly to every download (auth-required and public
-namespace alike) — there are no per-flow carve-outs.
+content traffic transits FileStorage, read audit applies uniformly to every download — there are no per-flow
+carve-outs.
 
 **Rationale**: Regulated environments and security-sensitive owners require visibility into who accessed their files and
 when. Making read audit optional per policy avoids the performance and storage overhead of logging every read
@@ -1127,7 +1127,7 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 **Postconditions**:
 
 - File content removed from storage backend
-- Metadata and ownership records removed; subsequent public-namespace requests for the file return `404`
+- Metadata and ownership records removed; subsequent requests for the file return `404`
 - *(Phase 2)* Audit record emitted
 
 **Alternative Flow — versioned file, no version identifier** (`cpt-cf-file-storage-fr-file-versioning`):
@@ -1140,7 +1140,6 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 **Postconditions**:
 
 - Current version inaccessible through normal file access; non-current versions remain retrievable by version ID
-- Shareable links remain associated but resolve to the soft-deleted state
 - Content is **not** physically removed and continues to count against storage quota
   (`cpt-cf-file-storage-fr-storage-quota`)
 - *(Phase 2)* Audit record emitted

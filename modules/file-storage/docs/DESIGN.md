@@ -153,7 +153,7 @@ graph LR
 |----------------|-----------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------|
 | API            | HTTP routing, request parsing, conditional-request and Range middleware, response shaping                       | axum, hyper, tower middleware                                                    |
 | Application    | Orchestration: upload pipeline, download proxying, metadata CRUD, capability discovery                          | Rust async services (tokio); OperationBuilder for JSON endpoints                 |
-| Domain         | File ownership, public-access flag, revision counters, ETag derivation, content state                           | Rust structs + SeaORM entities                                                   |
+| Domain         | File ownership, revision counters, ETag derivation, content state                                               | Rust structs + SeaORM entities                                                   |
 | Infrastructure | Postgres metadata storage; backend drivers (local FS, S3-compatible); PolicyEnforcer client; TOML config loader | SeaORM + SecureORM + SecureConn (Postgres); `aws-sdk-s3` / `rusoto`; `tokio::fs` |
 
 ## 2. Principles & Constraints
@@ -240,7 +240,7 @@ their credentials requires a restart. Runtime/DB-driven configuration with admin
 
 | Entity                | Description                                                                                                                                |
 |-----------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
-| `File`                | Logical file: identity, tenant, owner, mime, gts type, content state, public-access, download-availability, revisions, hash, timestamps    |
+| `File`                | Logical file: identity, tenant, owner, mime, gts type, content state, revisions, hash, timestamps                                          |
 | `CustomMetadata`      | User-defined key-value pairs attached to a `File`; one row per `(file_id, key)`                                                            |
 | `OwnerPrincipal`      | Tagged union `{User(UserId), App(ModuleId)}`; carried as `(owner_kind, owner_id)` on `File`                                                |
 | `ContentState`        | Enum `{Pending, Available}`; in P1 every successful `POST /files` lands in `Available`. Pending exists only for P2 multipart pre-completion |
