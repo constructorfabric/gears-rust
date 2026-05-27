@@ -1212,6 +1212,13 @@ Common transitions:
 - soft_deleted → active (restoration, before expiry)
 - archived → active (new activity or manual restore)
 
+Administrative / forced transitions (allowed by the SDK state machine, used by GDPR right-to-erasure flows and admin tooling):
+- active → hard_deleted (direct hard delete, bypassing soft-delete grace period)
+- archived → hard_deleted (direct hard delete from archive)
+- archived → soft_deleted (manually mark an archived session for deletion)
+
+Terminal state: `hard_deleted` accepts no outbound transitions. The full set of allowed transitions is enforced programmatically by `LifecycleState::can_transition_to` in `chat-engine-sdk::models`. Self-loops (e.g. `active → active`) are rejected.
+
 **State Inheritance:**
 Messages inherit lifecycle state from their session. When a session transitions, all its messages transition together to maintain referential integrity.
 
