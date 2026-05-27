@@ -16,17 +16,17 @@ use crate::module::ConcreteTypeService;
 
 /// List GTS types with optional `OData` filtering and pagination.
 #[tracing::instrument(
-    skip(svc, _ctx, query),
+    skip(svc, ctx, query),
     fields(request_id = Empty)
 )]
 pub async fn list_types(
-    Extension(_ctx): Extension<SecurityContext>,
+    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteTypeService>>,
     OData(query): OData,
 ) -> ApiResult<Json<modkit_odata::Page<TypeDto>>> {
     info!("Listing GTS types");
 
-    let page = svc.list_types(&query).await?;
+    let page = svc.list_types(&ctx, &query).await?;
     let dto_page = page.map_items(TypeDto::from);
 
     Ok(Json(dto_page))
@@ -34,7 +34,7 @@ pub async fn list_types(
 
 /// Create a new GTS type definition.
 #[tracing::instrument(
-    skip(svc, req_body, _ctx, uri),
+    skip(svc, req_body, ctx, uri),
     fields(
         type.code = %req_body.code,
         request_id = Empty,
@@ -42,7 +42,7 @@ pub async fn list_types(
 )]
 pub async fn create_type(
     uri: Uri,
-    Extension(_ctx): Extension<SecurityContext>,
+    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteTypeService>>,
     Json(req_body): Json<CreateTypeDto>,
 ) -> ApiResult<impl IntoResponse> {
@@ -55,7 +55,7 @@ pub async fn create_type(
 
     let code = req_body.code.clone();
     // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-1
-    let rg_type = svc.create_type(req_body.into()).await?;
+    let rg_type = svc.create_type(&ctx, req_body.into()).await?;
     let dto = TypeDto::from(rg_type);
 
     Ok(created_json(dto, &uri, &code).into_response())
@@ -63,14 +63,14 @@ pub async fn create_type(
 
 /// Get a GTS type definition by code.
 #[tracing::instrument(
-    skip(svc, _ctx),
+    skip(svc, ctx),
     fields(
         type.code = %code,
         request_id = Empty,
     )
 )]
 pub async fn get_type(
-    Extension(_ctx): Extension<SecurityContext>,
+    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteTypeService>>,
     Path(code): Path<String>,
 ) -> ApiResult<Json<TypeDto>> {
@@ -79,20 +79,20 @@ pub async fn get_type(
         "Getting GTS type"
     );
 
-    let rg_type = svc.get_type(&code).await?;
+    let rg_type = svc.get_type(&ctx, &code).await?;
     Ok(Json(TypeDto::from(rg_type)))
 }
 
 /// Update a GTS type definition (full replacement).
 #[tracing::instrument(
-    skip(svc, req_body, _ctx),
+    skip(svc, req_body, ctx),
     fields(
         type.code = %code,
         request_id = Empty,
     )
 )]
 pub async fn update_type(
-    Extension(_ctx): Extension<SecurityContext>,
+    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteTypeService>>,
     Path(code): Path<String>,
     Json(req_body): Json<UpdateTypeDto>,
@@ -104,21 +104,21 @@ pub async fn update_type(
         "Updating GTS type"
     );
 
-    let rg_type = svc.update_type(&code, req_body.into()).await?;
+    let rg_type = svc.update_type(&ctx, &code, req_body.into()).await?;
     // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-1
     Ok(Json(TypeDto::from(rg_type)))
 }
 
 /// Delete a GTS type definition.
 #[tracing::instrument(
-    skip(svc, _ctx),
+    skip(svc, ctx),
     fields(
         type.code = %code,
         request_id = Empty,
     )
 )]
 pub async fn delete_type(
-    Extension(_ctx): Extension<SecurityContext>,
+    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteTypeService>>,
     Path(code): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
@@ -127,6 +127,6 @@ pub async fn delete_type(
         "Deleting GTS type"
     );
 
-    svc.delete_type(&code).await?;
+    svc.delete_type(&ctx, &code).await?;
     Ok(no_content().into_response())
 }

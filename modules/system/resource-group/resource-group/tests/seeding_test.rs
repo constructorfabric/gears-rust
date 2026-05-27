@@ -11,15 +11,12 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use common::{make_ctx, make_group_service, make_membership_service, test_db};
 use uuid::Uuid;
 
 use cyberware_resource_group::domain::seeding::{
     GroupSeedDef, MembershipSeedDef, seed_groups, seed_memberships, seed_types,
 };
-use cyberware_resource_group::domain::type_service::TypeService;
 use cyberware_resource_group::infra::storage::entity::gts_type::{
     Column as TypeColumn, Entity as TypeEntity,
 };
@@ -27,7 +24,6 @@ use cyberware_resource_group::infra::storage::entity::resource_group::Entity as 
 use cyberware_resource_group::infra::storage::entity::resource_group_membership::{
     Column as MbrColumn, Entity as MbrEntity,
 };
-use cyberware_resource_group::infra::storage::type_repo::TypeRepository;
 use modkit_db::secure::SecureEntityExt;
 use modkit_security::AccessScope;
 use resource_group_sdk::CreateTypeRequest;
@@ -54,7 +50,7 @@ fn unique_type_code(suffix: &str) -> String {
 #[tokio::test]
 async fn seed_types_creates_missing() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = unique_type_code("seed");
     let seeds = vec![CreateTypeRequest {
@@ -87,7 +83,7 @@ async fn seed_types_creates_missing() {
 #[tokio::test]
 async fn seed_types_skips_unchanged() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = unique_type_code("seed");
     let seeds = vec![CreateTypeRequest {
@@ -114,12 +110,12 @@ async fn seed_types_skips_unchanged() {
 #[tokio::test]
 async fn seed_types_updates_changed() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     // Create a membership type first so we can reference it
     let mbr_code = unique_type_code("mbr");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: mbr_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -157,7 +153,7 @@ async fn seed_types_updates_changed() {
     assert_eq!(result.updated, 1);
     assert_eq!(result.created, 0);
 
-    let updated = type_svc.get_type(&code).await.expect("get_type");
+    let updated = type_svc.get_type_unscoped(&code).await.expect("get_type");
     assert_eq!(
         updated.allowed_membership_types,
         vec![mbr_code],
@@ -169,7 +165,7 @@ async fn seed_types_updates_changed() {
 #[tokio::test]
 async fn seed_types_idempotent_three_runs() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let code = unique_type_code("seed");
     let seeds = vec![CreateTypeRequest {
@@ -196,14 +192,14 @@ async fn seed_types_idempotent_three_runs() {
 #[tokio::test]
 async fn seed_groups_creates_with_closure() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant = nil_tenant();
 
     let type_code = unique_type_code("sroot");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -258,7 +254,7 @@ async fn seed_groups_creates_with_closure() {
 #[tokio::test]
 async fn seed_groups_skips_existing() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant = nil_tenant();
@@ -266,7 +262,7 @@ async fn seed_groups_skips_existing() {
 
     let type_code = unique_type_code("sgrp");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -299,7 +295,7 @@ async fn seed_groups_skips_existing() {
 #[tokio::test]
 async fn seed_memberships_creates_links() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -309,7 +305,7 @@ async fn seed_memberships_creates_links() {
     let member_type = common::create_root_type(&type_svc, "mbr").await;
     let grp_type_code = unique_type_code("sgrp");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: grp_type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -356,7 +352,7 @@ async fn seed_memberships_creates_links() {
 #[tokio::test]
 async fn seed_memberships_handles_duplicates() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -366,7 +362,7 @@ async fn seed_memberships_handles_duplicates() {
     let member_type = common::create_root_type(&type_svc, "mbr").await;
     let grp_type_code = unique_type_code("sgrp");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: grp_type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -403,7 +399,7 @@ async fn seed_memberships_handles_duplicates() {
 #[tokio::test]
 async fn seed_memberships_skips_tenant_incompatible() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -416,7 +412,7 @@ async fn seed_memberships_skips_tenant_incompatible() {
     let member_type = common::create_root_type(&type_svc, "mbr").await;
     let grp_type_code = unique_type_code("sgrp");
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: grp_type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -455,7 +451,7 @@ async fn seed_memberships_skips_tenant_incompatible() {
 #[tokio::test]
 async fn seed_types_empty_list() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     let result = seed_types(&type_svc, &[]).await.expect("seed_types empty");
     assert_eq!(result.created, 0);
@@ -468,7 +464,7 @@ async fn seed_types_empty_list() {
 #[tokio::test]
 async fn seed_groups_wrong_order_child_before_parent() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant = nil_tenant();
@@ -477,7 +473,7 @@ async fn seed_groups_wrong_order_child_before_parent() {
     let child_code = unique_type_code("schild");
 
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: parent_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -488,7 +484,7 @@ async fn seed_groups_wrong_order_child_before_parent() {
         .expect("create parent type");
 
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: false,
             allowed_parent_types: vec![parent_code.clone()],
@@ -529,7 +525,7 @@ async fn seed_groups_wrong_order_child_before_parent() {
 #[tokio::test]
 async fn seed_memberships_nonexistent_group() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
     let member_type = common::create_root_type(&type_svc, "mbr").await;

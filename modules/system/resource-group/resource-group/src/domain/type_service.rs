@@ -8,8 +8,10 @@
 
 use std::sync::Arc;
 
+use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use modkit_db::secure::{DBRunner, TxConfig};
 use modkit_odata::{ODataQuery, Page};
+use modkit_security::{SecurityContext, pep_properties};
 use resource_group_sdk::models::{CreateTypeRequest, ResourceGroupType, UpdateTypeRequest};
 
 use tracing::{debug, warn};
@@ -20,20 +22,38 @@ use crate::domain::repo::TypeRepositoryTrait;
 #[allow(unused_imports)]
 use crate::domain::validation;
 
+/// `AuthZ` resource type descriptor for GTS type definitions.
+///
+/// Types form a global, tenant-agnostic registry — the `AuthZ` policy is
+/// expected to gate on subject role/action only, not on resource ownership.
+/// `OWNER_TENANT_ID` is listed only so PDP-returned tenant constraints can
+/// be compiled without failing the request; types themselves have no
+/// per-tenant filtering at the data layer.
+pub const RG_TYPE_RESOURCE: ResourceType = ResourceType {
+    name: "gts.cf.core.rg.type.v1~",
+    supported_properties: &[pep_properties::OWNER_TENANT_ID],
+};
+
 // @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-service-crud:p1
 /// Service for GTS type lifecycle management.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Clone)]
 pub struct TypeService<TR: TypeRepositoryTrait> {
     db: Arc<DbProvider>,
+    enforcer: PolicyEnforcer,
     type_repo: Arc<TR>,
 }
 
 impl<TR: TypeRepositoryTrait> TypeService<TR> {
-    /// Create a new `TypeService` with the given database provider.
+    /// Create a new `TypeService` with the given database provider
+    /// and `PolicyEnforcer` for `AuthZ` gating.
     #[must_use]
-    pub fn new(db: Arc<DbProvider>, type_repo: Arc<TR>) -> Self {
-        Self { db, type_repo }
+    pub fn new(db: Arc<DbProvider>, enforcer: PolicyEnforcer, type_repo: Arc<TR>) -> Self {
+        Self {
+            db,
+            enforcer,
+            type_repo,
+        }
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-create-type:p1
@@ -46,6 +66,33 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     /// a partial insert (e.g. type row written but parent-types junction
     /// failed) would leave the registry in an inconsistent state.
     pub async fn create_type(
+        &self,
+        ctx: &SecurityContext,
+        req: CreateTypeRequest,
+    ) -> Result<ResourceGroupType, DomainError> {
+        // AuthZ gate: verify the caller can create GTS types.
+        let _scope = self
+            .enforcer
+            .access_scope(ctx, &RG_TYPE_RESOURCE, "create", None)
+            .await
+            .map_err(DomainError::from)?;
+        self.create_type_inner(req).await
+    }
+
+    /// Create a new GTS type definition without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose through a REST handler. Used by the
+    /// type seeding path (which runs at module init, before any caller
+    /// `SecurityContext` exists). All business invariants still run; only
+    /// the `PolicyEnforcer` gate is skipped.
+    pub async fn create_type_unscoped(
+        &self,
+        req: CreateTypeRequest,
+    ) -> Result<ResourceGroupType, DomainError> {
+        self.create_type_inner(req).await
+    }
+
+    async fn create_type_inner(
         &self,
         req: CreateTypeRequest,
     ) -> Result<ResourceGroupType, DomainError> {
@@ -187,7 +234,24 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     }
 
     /// Get a GTS type definition by its code (GTS type path).
-    pub async fn get_type(&self, code: &str) -> Result<ResourceGroupType, DomainError> {
+    pub async fn get_type(
+        &self,
+        ctx: &SecurityContext,
+        code: &str,
+    ) -> Result<ResourceGroupType, DomainError> {
+        // AuthZ gate: verify the caller can read GTS types.
+        let _scope = self
+            .enforcer
+            .access_scope(ctx, &RG_TYPE_RESOURCE, "read", None)
+            .await
+            .map_err(DomainError::from)?;
+        self.get_type_unscoped(code).await
+    }
+
+    /// Get a GTS type definition without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — used by the type seeding path.
+    pub async fn get_type_unscoped(&self, code: &str) -> Result<ResourceGroupType, DomainError> {
         let conn = self.db.conn()?;
         self.type_repo
             .find_by_code(&conn, code)
@@ -198,8 +262,15 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     /// List GTS type definitions with `OData` filtering and pagination.
     pub async fn list_types(
         &self,
+        ctx: &SecurityContext,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupType>, DomainError> {
+        // AuthZ gate: verify the caller can list GTS types.
+        let _scope = self
+            .enforcer
+            .access_scope(ctx, &RG_TYPE_RESOURCE, "list", None)
+            .await
+            .map_err(DomainError::from)?;
         let conn = self.db.conn()?;
         self.type_repo.list_types(&conn, query).await
     }
@@ -213,6 +284,24 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     /// between the parent-types delete and the membership-types insert
     /// would leave the registry pointing at half the new definition.
     pub async fn update_type(
+        &self,
+        ctx: &SecurityContext,
+        code: &str,
+        req: UpdateTypeRequest,
+    ) -> Result<ResourceGroupType, DomainError> {
+        // AuthZ gate: verify the caller can update GTS types.
+        let _scope = self
+            .enforcer
+            .access_scope(ctx, &RG_TYPE_RESOURCE, "update", None)
+            .await
+            .map_err(DomainError::from)?;
+        self.update_type_unscoped(code, req).await
+    }
+
+    /// Update a GTS type definition without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — used by the type seeding path.
+    pub async fn update_type_unscoped(
         &self,
         code: &str,
         req: UpdateTypeRequest,
@@ -328,7 +417,20 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1
     /// Delete a GTS type definition.
-    pub async fn delete_type(&self, code: &str) -> Result<(), DomainError> {
+    pub async fn delete_type(&self, ctx: &SecurityContext, code: &str) -> Result<(), DomainError> {
+        // AuthZ gate: verify the caller can delete GTS types.
+        let _scope = self
+            .enforcer
+            .access_scope(ctx, &RG_TYPE_RESOURCE, "delete", None)
+            .await
+            .map_err(DomainError::from)?;
+        self.delete_type_unscoped(code).await
+    }
+
+    /// Delete a GTS type definition without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — used by the type seeding path / cleanup utilities.
+    pub async fn delete_type_unscoped(&self, code: &str) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
         // Actor sends DELETE /api/types-registry/v1/types/{code}
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
