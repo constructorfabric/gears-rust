@@ -282,9 +282,9 @@ All Chat Engine instances share a single database cluster. No local caching of s
 **Note**: Sent via HTTP chunked response as newline-delimited JSON (NDJSON)
 
 - **StreamingStartEvent** - Begin streaming (message_id)
-- **StreamingChunkEvent** - Stream chunk (message_id, chunk)
-- **StreamingCompleteEvent** - Streaming finished (message_id, metadata)
-- **StreamingErrorEvent** - Stream error (message_id, error_code, message)
+- **StreamingChunkEvent** - Stream chunk (message_id, chunk: text fragment to append to the message content)
+- **StreamingCompleteEvent** - Streaming finished (message_id, metadata: optional plugin-defined object; omitted from the wire payload when absent)
+- **StreamingErrorEvent** - Stream error (message_id, error: human-readable description; no further events follow)
 
 #### Webhook Protocol (webhook/)
 
@@ -307,31 +307,45 @@ All Chat Engine instances share a single database cluster. No local caching of s
 
 - [x] `p1` - **ID**: `cpt-cf-chat-engine-design-entity-session`
 
-Session entity (session_id, client_id, user_id, tenant_id, session_type_id, enabled_capabilities, metadata, created_at, updated_at, share_token)
+Session entity (session_id, tenant_id, user_id, client_id?, session_type_id?, enabled_capabilities, metadata, lifecycle_state, share_token?, created_at, updated_at).
+
+- `session_type_id` is `Optional`: `None` for sessions whose session type has not yet been configured (e.g. created during admin bootstrap).
+- `share_token` is `Optional`: present only while sharing is active. Bearer secret — redacted from `Debug`/log output (`<redacted>`); never write it to logs, tracing spans, or test fixtures.
+- `tenant_id` and `user_id` are SDK newtypes (`TenantId`, `UserId`) that reject the empty string at construction time — an empty value would silently scope queries to no/all rows and is treated as a latent authorization bug.
+- `metadata` is opaque client-defined JSON, but Chat Engine reserves the keys `memory_strategy`, `retention_policy`, and `share_expires_at` for its own use — clients **MUST NOT** write them. The SDK persists per-session `MemoryStrategy`, `RetentionPolicy`, and share-link expiry under these reserved keys.
 
 ##### Message
 
 - [x] `p1` - **ID**: `cpt-cf-chat-engine-design-entity-message`
 
-Message entity (message_id, session_id, parent_message_id, role, content, file_ids, variant_index, is_active, is_complete, metadata, created_at)
+Message entity (message_id, session_id, parent_message_id?, role, content, file_ids, variant_index, is_active, is_complete, is_hidden_from_user, is_hidden_from_backend, metadata, created_at, updated_at).
+
+Serde deserialization defaults (defined in the SDK on `chat-engine-sdk::models::Message`): `variant_index = 0`, `is_active = false`, `is_complete = true` (note: defaults to **true**, not false, so payloads that omit it represent fully-persisted messages), `is_hidden_from_user = false`, `is_hidden_from_backend = false`, `file_ids = []`. `parent_message_id` is `None` only for the root message of a session.
 
 ##### SessionType
 
 - [x] `p1` - **ID**: `cpt-cf-chat-engine-design-entity-session-type`
 
-Binding of a plugin reference and session type identity (session_type_id, name, plugin_instance_id, available_capabilities, retention_policy). Plugin-specific configuration is stored separately in `PluginConfig` entity (see `cpt-cf-chat-engine-dbtable-plugin-configs`)
+Binding of a plugin reference and session type identity (session_type_id, name, plugin_instance_id?, available_capabilities, retention_policy, created_at, updated_at). `plugin_instance_id` is `Optional`: `None` means the session type is registered but not yet wired to a backend; sessions of this type cannot accept messages until a plugin instance is bound. Plugin-specific configuration is stored separately in `PluginConfig` entity (see `cpt-cf-chat-engine-dbtable-plugin-configs`)
 
 ##### Capability
 
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-design-entity-capability`
 
-Typed capability definition (id, name, type: `bool|enum|str|int`, default_value, enum_values when type=enum)
+Schema declaration of a capability supported by a backend plugin (`chat-engine-sdk::models::Capability`). Returned from `on_session_type_configured` / `on_session_created` / `on_session_updated` to tell Chat Engine what is tunable for the session. Fields: `name` (capability identifier, e.g. `"model"`, `"temperature"`, `"stream"`) and `value` (a plugin-defined JSON descriptor of allowed values). Chat Engine stores the returned `Vec<Capability>` in `Session.enabled_capabilities` and exposes the menu to clients; it does **not** interpret capability semantics.
+
+Typical `value` shapes (plugin-defined; not enforced by Chat Engine):
+
+- Enum: `{ "type": "enum", "enum_values": ["gpt-4", "gpt-4-mini"], "default_value": "gpt-4" }`
+- Float range: `{ "type": "float", "min": 0.0, "max": 2.0, "default_value": 0.7 }`
+- Bool: `{ "type": "bool", "default_value": false }`
+- Integer range: `{ "type": "int", "min": 1, "max": 4096, "default_value": 512 }`
 
 ##### CapabilityValue
 
 - [ ] `p2` - **ID**: `cpt-cf-chat-engine-design-entity-capability-value`
 
-Per-message capability setting (id, value: boolean|string|integer)
+A concrete capability value chosen by the client for a specific call (`chat-engine-sdk::models::CapabilityValue`). Fields: `name` (must match a capability previously declared by the plugin via `Capability`) and `value` (the chosen JSON value; type and range must validate against the schema in the corresponding `Capability.value`, e.g. `"gpt-4"`, `0.9`, `false`). Passed in `PluginCallContext.enabled_capabilities` so plugins know which options were selected.
 
 ##### ContentPart
 
