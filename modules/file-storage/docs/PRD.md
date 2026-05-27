@@ -1,14 +1,66 @@
 # PRD — File Storage
 
+
+<!-- toc -->
+
+- [1. Overview](#1-overview)
+  - [1.1 Purpose](#11-purpose)
+  - [1.2 Background / Problem Statement](#12-background--problem-statement)
+  - [1.3 Goals (Business Outcomes)](#13-goals-business-outcomes)
+  - [1.4 Success Metrics](#14-success-metrics)
+  - [1.5 Glossary](#15-glossary)
+- [2. Actors](#2-actors)
+  - [2.1 Human Actors](#21-human-actors)
+  - [2.2 System Actors](#22-system-actors)
+- [3. Operational Concept & Environment](#3-operational-concept--environment)
+  - [3.1 Module-Specific Environment Constraints](#31-module-specific-environment-constraints)
+- [4. Scope](#4-scope)
+  - [4.1 In Scope](#41-in-scope)
+  - [4.2 Out of Scope](#42-out-of-scope)
+- [5. Functional Requirements](#5-functional-requirements)
+  - [5.1 Core File Operations](#51-core-file-operations)
+  - [5.2 Ownership & Access Control](#52-ownership--access-control)
+  - [5.3 Sharing](#53-sharing)
+  - [5.4 Policies (Phase 2)](#54-policies-phase-2)
+  - [5.5 Metadata](#55-metadata)
+  - [5.6 File Retention & Lifecycle](#56-file-retention--lifecycle)
+  - [5.7 Audit](#57-audit)
+  - [5.8 Pluggable Storage Backends](#58-pluggable-storage-backends)
+  - [5.9 Access Interfaces](#59-access-interfaces)
+  - [5.10 Cache & Idempotency](#510-cache--idempotency)
+- [6. Non-Functional Requirements](#6-non-functional-requirements)
+  - [6.1 Module-Specific NFRs](#61-module-specific-nfrs)
+  - [6.2 NFR Exclusions](#62-nfr-exclusions)
+  - [6.3 Applicability Notes](#63-applicability-notes)
+- [7. Public Library Interfaces](#7-public-library-interfaces)
+  - [7.1 Public API Surface](#71-public-api-surface)
+  - [7.2 External Integration Contracts](#72-external-integration-contracts)
+- [8. Use Cases](#8-use-cases)
+  - [Upload a File](#upload-a-file)
+  - [Fetch File for Module Processing](#fetch-file-for-module-processing)
+  - [Validate File Metadata Before Processing](#validate-file-metadata-before-processing)
+  - [Delete a File](#delete-a-file)
+  - [Multi-Backend Deployment](#multi-backend-deployment)
+  - [Configure Policy](#configure-policy)
+- [9. Acceptance Criteria](#9-acceptance-criteria)
+- [10. Dependencies](#10-dependencies)
+- [11. Assumptions](#11-assumptions)
+- [12. Risks](#12-risks)
+- [13. Open Questions](#13-open-questions)
+- [14. Traceability](#14-traceability)
+
+<!-- /toc -->
+
 ## 1. Overview
 
 ### 1.1 Purpose
 
 FileStorage is a universal file storage and management service for the Cyber Ware middleware. It provides upload,
-download, metadata management, access control, and sharing capabilities for any module or user within the platform.
+download, metadata management, and tenant-scoped access control for any module or user within the platform. All
+access in P1 is authenticated — anonymous/external sharing is deferred to a separate concern (P3, see `§5.3`).
 
 The service supports pluggable storage backends, multiple access protocols (REST, S3-compatible, WebDAV), tenant-scoped
-access control with an ownership model, and policy-driven governance for file types, sizes, and sharing.
+access control with an ownership model, and policy-driven governance for file types and sizes.
 
 ### 1.2 Background / Problem Statement
 
@@ -28,8 +80,7 @@ Cyber Ware security and governance model.
 
 - Unified file storage accessible by all Cyber Ware modules and platform users
 - Tenant-scoped and origin-module-scoped access control with tenant, user and module ownership model
-- Flexible sharing via public, tenant-scoped, and signed URLs
-- Policy-driven governance over file types, sizes, events, and sharing models
+- Policy-driven governance over file types, sizes, and events
 - Audit trail for all write operations
 - Pluggable storage backends without service rebuild
 
@@ -48,13 +99,12 @@ Cyber Ware security and governance model.
 | Term                | Definition                                                                                                                                                                                                                                                                              |
 |---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | File                | Binary content stored in FileStorage with associated metadata                                                                                                                                                                                                                           |
-| File URL            | Persistent URL pointing to content stored in FileStorage                                                                                                                                                                                                                                |
-| Metadata            | File properties: system-managed (name, size, mime_type, GTS file type, dates, owner, availability) and user-defined custom key-value pairs                                                                                                                                              |
+| File URL            | The persistent, unsigned URL by which a file is read from FileStorage. The same URL is returned to every consumer — no expiration, no per-user targeting. Concrete REST paths are defined in [DESIGN.md](./DESIGN.md) and [api.md](./api.md)                                                  |
+| Metadata            | File properties: system-managed (name, size, mime_type, GTS file type, dates, owner) and user-defined custom key-value pairs                                                                                                                                                            |
 | Custom Metadata     | User-defined key-value pairs attached to a file, analogous to S3 object metadata                                                                                                                                                                                                        |
-| Owner               | Entity (user or tenant) that owns a file and controls its sharing and lifecycle                                                                                                                                                                                                         |
-| Shareable Link      | A unique URL served by FileStorage that grants access to a file with a specific scope and expiration; FileStorage validates the link and enforces access control on every request                                                                                                       |
-| Signed URL          | A presigned backend URL (download-only) for sharing with external or unauthenticated consumers; generated by FileStorage using its own backend credentials, time-limited, non-revocable — the storage backend validates the signature and enforces expiration                           |
-| Direct Transfer URL | A presigned backend URL (upload-only) for authenticated clients to upload file content directly to the backend without routing traffic through FileStorage; generated by FileStorage after authorization, time-limited                                                                  |
+| Owner               | The principal that owns a file: `owner_kind ∈ {user, app}` plus `owner_id`. Every file also has a separate immutable `tenant_id`                                                                                                                                                       |
+| FileShare           | Working name for the future (P3) sharing capability built on top of FileStorage. Covers anonymous/public URLs, per-recipient grants, expirations, download counters, etc. Whether it ships as a separate Cyber Ware module or as an extension of FileStorage is deferred to a future ADR  |
+| Sharable Link       | A FileShare-issued (P3) reference to a FileStorage file with optional content/version pinning and access rules (anonymity, expiration, recipients, maximum download count). Out of P1 scope                                                                                                |
 | Storage Backend     | An underlying storage system (S3, GCS, Azure Blob, NFS, FTP, SMB, WebDAV) used for persisting file content                                                                                                                                                                              |
 | Policy              | A set of rules (allowed file types, size limits, events, sharing models) that constrain file operations; applicable at the tenant level and the user level independently — when both apply, the most restrictive value per aspect wins                                                  |
 | File Version        | An immutable snapshot of file content created on each upload to the same logical path when versioning is enabled; identified by an opaque version identifier assigned by the storage backend                                                                                            |
@@ -97,25 +147,18 @@ roles) from the platform authentication middleware.
 
 - Upload, download, delete, and list files
 - Rich file metadata storage, retrieval, and update
-- File ownership by user or tenant
+- File ownership by user or app (Cyber Ware module) within a tenant
 - GTS file type classification for per-actor access control
 - Authorization checks via Authorization Service
-- Shareable links with public, tenant, and tenant-hierarchy scopes
-- Signed URLs for unauthenticated, time-limited downloads
-- Link expiration and lifecycle management
 - Audit trail for all write operations and optional read audit logging
-- Policies (file types, size limits, events, sharing restrictions) at tenant and user levels
+- Policies (file types, size limits, events) at tenant and user levels
 - Pluggable storage backend abstraction
 - Multipart (chunked) upload for large files
 - Content-type validation against actual file content
-- Direct-to-backend upload via presigned URLs for compatible backends
-- Garbage collection for unconfirmed direct uploads
 - File retention and lifecycle management
 - REST API access interface
-- S3-compatible API
-- WebDAV API
-- Streaming and range requests
-- Runtime tenant-configurable storage backends
+- Random read access via HTTP Range requests
+- Static (P1) and runtime (P3) storage backend configuration
 - Storage quota enforcement via Quota Enforcement service
 - Ownership transfer
 - Custom metadata limits
@@ -130,6 +173,9 @@ roles) from the platform authentication middleware.
 - Content transformation or transcoding
 - CDN distribution
 - Full-text search within file content
+- All external/anonymous access (anonymous URLs, scope-based shareable links, per-recipient grants, time-bounded
+  or count-limited access) — deferred to P3 (see `§5.3`). FileStorage P1 exposes only the auth-required surface
+- S3-compatible and WebDAV protocol facades
 
 ## 5. Functional Requirements
 
@@ -139,12 +185,14 @@ roles) from the platform authentication middleware.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-upload-file`
 
-The system **MUST** accept file content with metadata and persist it, returning a persistent, accessible URL. File
-content is immutable after upload — to change content, a new file **MUST** be uploaded.
+The system **MUST** accept file content with metadata and persist it, returning a persistent, accessible URL. The
+content of an existing file can be **replaced wholesale** through dedicated content-replacement operations on the
+same file — partial-byte mutation is **not** supported. When the backing storage backend declares the versioning
+capability, each replacement creates a new immutable backend version.
 
 **Rationale**: All platform modules and users need to store files — modules store generated content, documents, and
-artifacts, users upload files directly. Immutable content simplifies caching, integrity verification, and backend
-replication.
+artifacts, users upload files directly. Coupling content replacement to backend versioning preserves recoverability
+where the backend supports it without forcing consumers to rotate file identifiers.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Download File
@@ -161,16 +209,15 @@ download files directly.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-delete-file`
 
-The system **MUST** allow the file owner to delete a file. For non-versioned files, deletion is permanent — content,
-metadata, ownership records, and all associated shareable links are removed. When versioning is enabled
-(`cpt-cf-file-storage-fr-file-versioning`), deletion without a version identifier places a soft-delete marker;
-shareable links remain associated but resolve to the soft-deleted state. Permanent removal of a specific version
-requires passing its version identifier explicitly.
+The system **MUST** allow any actor authorized for the **delete** action on the file's GTS type
+(`cpt-cf-file-storage-fr-authorization`) to delete a file. For non-versioned files, deletion is permanent — content,
+metadata, and ownership records are removed. When versioning is enabled (`cpt-cf-file-storage-fr-file-versioning`),
+deletion without a version identifier places a soft-delete marker. Permanent removal of a specific version requires
+passing its version identifier explicitly.
 
-**Rationale**: Owners need to remove files that are no longer needed; permanent deletion must cascade to all links to
-prevent dangling references. Versioned files default to soft-delete to enable recovery from accidental deletions —
-shareable links are preserved so they can be restored alongside the file. Permanent removal is an explicit,
-version-targeted operation.
+**Rationale**: Authorized actors need to remove files that are no longer needed. Versioned files default to
+soft-delete to enable recovery from accidental deletions. Permanent removal is an explicit, version-targeted
+operation.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Get File Metadata
@@ -178,7 +225,7 @@ version-targeted operation.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-get-metadata`
 
 The system **MUST** return file metadata (name, size, mime_type, GTS file type, created date, modified date, owner,
-download availability, and custom metadata) without transferring file content.
+and custom metadata) without transferring file content.
 
 **Rationale**: Consumers validate file properties (size limits, type compatibility) and read custom metadata before
 initiating downloads, avoiding wasted bandwidth on incompatible files.
@@ -191,8 +238,8 @@ initiating downloads, avoiding wasted bandwidth on incompatible files.
 The system **MUST** support listing files with their metadata (no content transfer). The caller **MUST** specify the
 owner type as a mandatory filter:
 
-- **User-owned** — files owned by a specific user
-- **Tenant-owned** — files owned by the tenant
+- **User-owned** — files owned by a specific user (`owner_kind = user`)
+- **App-owned** — files owned by a Cyber Ware module (`owner_kind = app`)
 
 The response **MUST** be paginated following the platform API guidelines (cursor-based or offset-based pagination with
 configurable page size). The system **MUST** support optional additional filters (mime_type, date range, custom metadata
@@ -204,7 +251,7 @@ filtering prevents unbounded queries across all files and aligns with the owners
 
 #### Multipart Upload
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
+- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
 
 The system **MUST** support multipart (chunked) upload for large files. Multipart upload requires the multipart
 upload backend capability (`cpt-cf-file-storage-fr-backend-capabilities`). A multipart upload **MUST**:
@@ -229,17 +276,13 @@ the scalability benefits. Rejecting with a clear error lets clients adapt their 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-content-type-validation`
 
 The system **MUST** validate the declared mime_type against the actual file content (magic bytes / file signature) on
-proxied uploads (where file content passes through FileStorage). If the declared type does not match the detected type,
-the system **MUST** reject the upload with an error indicating the mismatch.
+every upload (all upload traffic transits FileStorage). If the declared type does not match the detected type, the
+system **MUST** reject the upload with an error indicating the mismatch.
 
-For proxied multipart uploads (`cpt-cf-file-storage-fr-multipart-upload`), the system **MUST** validate the declared
-mime_type against the content of the **first uploaded part**, which contains the file's magic bytes / file signature.
-Validation **MUST** occur when the first part is received — before subsequent parts are accepted. If the detected type
-does not match the declared mime_type, the system **MUST** abort the multipart upload (`abortMultipartUpload`) and
-reject all subsequent parts.
-
-Content-type validation does not apply to direct uploads (single-part or multipart) via presigned URLs because
-FileStorage does not receive the file content in that flow.
+For multipart uploads (`cpt-cf-file-storage-fr-multipart-upload`), the system **MUST** validate the declared mime_type
+against the content of the **first uploaded part**, which contains the file's magic bytes / file signature. Validation
+**MUST** occur when the first part is received — before subsequent parts are accepted. If the detected type does not
+match the declared mime_type, the system **MUST** abort the multipart upload and reject all subsequent parts.
 
 **Rationale**: Without content inspection, a client can declare `image/png` but upload an executable, trivially
 bypassing file type policies. Content-type validation ensures declared types are trustworthy for downstream consumers
@@ -247,9 +290,7 @@ and policy enforcement. First-part validation for multipart uploads provides the
 validation — magic bytes reside at the start of the file and are always contained in the first part because backends
 that support multipart upload (`cpt-cf-file-storage-fr-backend-capabilities`) enforce a minimum part size (e.g., 5 MB
 for S3) that far exceeds the longest magic-byte sequence (~12 bytes). Backends without native multipart support reject
-multipart uploads entirely, so no fallback is needed. Post-assembly re-validation would require downloading the
-assembled file from the backend, negating the efficiency benefits of multipart upload. Direct uploads trade server-side
-content validation for transfer efficiency — consumers relying on strict type guarantees should use proxied uploads.
+multipart uploads entirely, so no fallback is needed.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 ### 5.2 Ownership & Access Control
@@ -258,13 +299,17 @@ content validation for transfer efficiency — consumers relying on strict type 
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-file-ownership`
 
-The system **MUST** associate every file with an owner. Ownership **MUST** be assignable to either a specific user or a
-tenant at upload time. Ownership is immutable after creation except through explicit ownership transfer
+The system **MUST** associate every file with `tenant_id` (mandatory, immutable) plus `owner_kind ∈ {user, app}` and
+`owner_id`. `user` is a platform user; `app` is a Cyber Ware module (e.g., LLM Gateway owning its generated media).
+The owner principal is immutable after creation except through explicit ownership transfer
 (`cpt-cf-file-storage-fr-ownership-transfer`) or owner deletion workflows (`cpt-cf-file-storage-fr-owner-deletion`).
+`tenant_id` is never mutable.
 
-**Rationale**: Ownership determines who can manage (delete, share, update metadata) a file and establishes the basis for
-access control decisions. Restricting ownership changes to explicit transfer operations simplifies the authorization
-model and prevents accidental privilege escalation.
+**Rationale**: Ownership determines who can manage (delete, update metadata) a file and establishes the basis for
+access control decisions. Separating `tenant_id` from `(owner_kind, owner_id)` reflects how Cyber Ware scopes data:
+tenant is the hard boundary for isolation, while the owner identifies a specific principal within the tenant.
+Modules own platform-generated content (LLM outputs, reports) via `owner_kind = app` without requiring an artificial
+human user.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Authorization Checks
@@ -284,13 +329,10 @@ tenant-scoped, and type-scoped permissions.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-tenant-boundary`
 
-The system **MUST** enforce tenant isolation: file deletion and metadata update operations **MUST NOT** cross tenant
-boundaries. A user in one tenant **MUST NOT** delete or update metadata of files owned by another tenant. Cross-tenant
-read access is intentionally permitted via shareable links with tenant-hierarchy scope (see
-`cpt-cf-file-storage-fr-shareable-links`).
+The system **MUST** enforce tenant isolation on every file operation: a principal in one tenant **MUST NOT**
+access files owned by another tenant.
 
-**Rationale**: Multi-tenant platforms require strict data isolation for write operations to prevent unauthorized
-cross-tenant modification, while supporting controlled read sharing across tenant hierarchies.
+**Rationale**: Multi-tenant platforms require strict data isolation to prevent unauthorized cross-tenant access.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Data Classification
@@ -335,152 +377,33 @@ without requiring separate storage namespaces or custom authorization logic per 
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-ownership-transfer`
 
-The system **MUST** allow the current file owner to transfer ownership of a file to another user or to the tenant.
-Ownership transfer **MUST** be an audited operation and **MUST** require authorization of both the current owner and the
-receiving entity.
+The system **MUST** allow the current file owner to transfer ownership of a file to another principal (user or app)
+within the **same tenant**. Cross-tenant transfer is **NOT** supported. Ownership transfer **MUST** be an audited
+operation and **MUST** require authorization of both the current owner and the receiving principal.
 
-**Rationale**: As teams evolve, files may need to change hands — e.g., when a user leaves the organization or when
-personal files should become shared tenant resources.
+**Rationale**: As teams and modules evolve, files may need to change hands. Restricting transfers to within the
+file's tenant preserves the tenant-isolation invariant.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`
 
-### 5.3 Link Management & Sharing
+### 5.3 Sharing
 
-#### Create Shareable Links
+FileStorage P1 exposes **only an authenticated REST surface**. Anonymous/public access, per-recipient grants,
+expirations, content/version pinning, download counters, and any other sharing primitives are **out of P1 scope
+and deferred to P3**.
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-shareable-links`
+The working name for the deferred capability is "FileShare". Whether it ships as a separate Cyber Ware module or
+as an extension of FileStorage itself is an open architectural decision to be settled by a future ADR at the
+time the functionality is implemented. FileStorage P1 stores no sharing-related state, exposes no anonymous URL
+namespace, and has no JWT-bypass paths — its surface is identical for every consumer and always goes through
+platform authentication and the Authorization Service.
 
-The system **MUST** support creating unique shareable links for files with the following access scopes:
+**Rationale**: Public/anonymous access is a sharing concern, not a storage concern. Keeping FileStorage purely
+internal in P1 (a) lets sharing semantics evolve independently inside a single module with the appropriate
+data model, (b) eliminates JWT-bypass surfaces and owner-private-header redaction logic from FileStorage, and
+(c) matches the main-branch design where external sharing was already a separate (P2) FR rather than a P1
+storage concern.
 
-- **Public** — accessible to anyone, including unauthenticated users
-- **Tenant** — accessible to any authenticated user within the file's tenant
-- **Tenant hierarchy** — accessible to any authenticated user within the file's tenant and its child tenants
-
-Shareable links are served by FileStorage — all requests pass through FileStorage, which validates the link, enforces
-scope-based access control, and serves the file content from the storage backend. The desired sharing scope(s) **MUST**
-be specifiable at file creation time and when creating additional links for existing files.
-
-**Rationale**: Different use cases require different visibility: public links for external sharing, tenant links for
-internal collaboration, hierarchy links for parent-child tenant structures. Routing through FileStorage enables
-scope-based access control, revocation, and audit logging on every access.
-**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
-
-#### Signed Download URLs
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-signed-urls`
-
-The system **MUST** support generating presigned download URLs that point directly to the storage backend, granting
-time-limited download access without requiring authentication. FileStorage generates these URLs using its own backend
-credentials. A signed URL **MUST**:
-
-- Be generated by FileStorage using its own credentials with the storage backend
-- Point directly to the storage backend (bypassing FileStorage for content delivery)
-- Contain a cryptographic signature that the storage backend validates against its own key material
-- Include an expiration timestamp after which the URL becomes invalid
-- Be scoped to a single file (download only)
-- Not require the consumer to present authentication credentials
-
-Signed URLs are **not revocable** — once issued, they remain valid until expiration because the storage backend
-validates the signature independently of FileStorage. If revocable access is needed, use shareable links instead
-(served through FileStorage with revocation support).
-
-Signed URL expiration **MUST** be constrained from two sources:
-
-- **Backend limit** — each storage backend declares its maximum supported signed URL expiration in configuration. This
-  is a hard ceiling that no policy can override.
-- **Policy limits** — tenants and users define maximum and default signed URL expiration. When both tenant and user
-  policies apply, the most restrictive value wins. Requested expiration exceeding the effective limit **MUST** be
-  rejected. When no expiration is specified, the policy default applies.
-
-Signed URL generation requires the presigned URLs backend capability (`cpt-cf-file-storage-fr-backend-capabilities`).
-For backends that do not declare this capability or have it disabled, FileStorage **MUST** reject the signed URL request
-with a clear error indicating the capability is unavailable.
-
-**Rationale**: Signed URLs enable secure file sharing with external systems and unauthenticated consumers (e.g.,
-embedding in emails, third-party integrations) while maintaining time-bounded access control. Routing downloads through
-the storage backend directly eliminates FileStorage as a bottleneck for shared content — following the pattern
-established by S3 presigned URLs, GCS signed URLs, and Azure SAS tokens. The non-revocable nature follows the same
-constraint inherent in S3 presigned URLs, GCS signed URLs, and Azure SAS tokens.
-**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
-
-#### Link Expiration
-
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-link-expiration`
-
-The system **MUST** support configurable expiration for any shareable link or signed URL. Expiration **MUST** be
-specifiable at link creation time. For shareable links, FileStorage enforces expiration and **MUST** return an
-access-denied response after the link expires. For signed URLs, the storage backend enforces expiration — the
-backend validates the signature and rejects expired URLs independently of FileStorage.
-
-**Rationale**: Time-limited access prevents stale links from remaining accessible indefinitely, reducing the attack
-surface for shared files. Expiration enforcement follows the traffic path: FileStorage enforces for shareable links
-(which it serves), and the storage backend enforces for signed URLs (which bypass FileStorage).
-**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
-
-#### Manage Links
-
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-manage-links`
-
-The file owner **MUST** be able to list all active shareable links and issued signed URLs for a file. The owner **MUST**
-be able to revoke (delete) individual shareable links. Signed URLs cannot be revoked (they remain valid until
-expiration) but the owner **MUST** be able to view their expiration status.
-
-**Rationale**: Owners need visibility into how their files are shared and the ability to revoke shareable link access
-when no longer needed. Signed URLs are non-revocable by design (backend validates independently), so short expiration
-is the primary access control mechanism.
-**Actors**: `cpt-cf-file-storage-actor-platform-user`
-
-### 5.4 Direct-to-Backend Transfer
-
-#### Direct Transfer URLs
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-direct-transfer`
-
-The system **MUST** support generating presigned direct transfer URLs that point to the storage backend, allowing
-clients to upload file content directly to the backend without routing traffic through FileStorage. FileStorage
-generates these URLs using its own backend credentials (e.g., AWS access keys, GCS service account). A direct transfer
-URL **MUST**:
-
-- Be generated by FileStorage using its own credentials with the storage backend
-- Point directly to the storage backend (e.g., S3 bucket endpoint)
-- Contain a cryptographic signature that the backend validates against its own key material
-- Support upload (PUT) operations only — direct downloads are covered by signed URLs (
-  `cpt-cf-file-storage-fr-signed-urls`)
-- Be time-limited with a configurable expiration
-- Be scoped to a single file
-
-The client authenticates with FileStorage (using its API token), FileStorage verifies authorization, registers the file
-metadata (including the target backend path), and then issues the presigned URL. The client uses the presigned URL
-directly with the backend — no further authentication or callback is required because the backend trusts the signature
-generated with FileStorage's credentials.
-
-Direct transfer URL generation requires the presigned URLs backend capability
-(`cpt-cf-file-storage-fr-backend-capabilities`). For backends that do not declare this capability or have it disabled,
-FileStorage **MUST** reject the direct transfer request with a clear error indicating the capability is unavailable.
-Clients must use standard (proxied) upload for backends without presigned URL support.
-
-**Rationale**: For large files (video, datasets, backups), proxying upload traffic through FileStorage creates a
-bottleneck and doubles bandwidth consumption. Direct-to-backend upload via presigned URLs eliminates this overhead for
-backends that declare the presigned URLs capability, following the pattern established by S3 presigned URLs, GCS signed
-URLs, and Azure SAS tokens — where the service with backend credentials signs on behalf of the client.
-**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
-
-#### Garbage Collection for Unconfirmed Uploads
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-gc-direct-uploads`
-
-The system **MUST** automatically detect and remove orphaned records from direct uploads that were never completed.
-An unconfirmed or incomplete upload **MUST** become eligible for garbage collection after the expiration of the
-pre-signed URL plus a configurable grace period. After the eligibility window has passed, the system **MUST** reconcile
-file metadata records against actual backend object existence — remove records with no corresponding backend object,
-and confirm records whose corresponding backend object exists but was never acknowledged.
-
-**Rationale**: Since metadata is registered before the presigned URL is issued, failed or abandoned uploads leave
-metadata records pointing to non-existent backend objects. The presigned URL expiration bounds the upload window but
-does not guarantee upload outcome, so garbage collection prevents stale metadata accumulation and
-ensures consistency between FileStorage records and backend state.
-**Actors**: `cpt-cf-file-storage-actor-cf-modules`
-
-### 5.5 Policies (Phase 2)
+### 5.4 Policies (Phase 2)
 
 #### Allowed File Types Policy
 
@@ -522,17 +445,6 @@ policy **MUST** define which event types are enabled.
 moderation, indexing, or backup triggers — without coupling FileStorage to specific consumers.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`
 
-#### Sharing Model Restrictions
-
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-sharing-restrictions`
-
-The system **MUST** allow owners to restrict which sharing models (public, tenant, tenant hierarchy, signed URLs) are
-available within their tenant. Attempts to create links with restricted sharing models **MUST** be rejected.
-
-**Rationale**: Tenants in regulated environments may need to prohibit public sharing or signed URLs to enforce data
-governance policies.
-**Actors**: `cpt-cf-file-storage-actor-platform-user`
-
 #### Storage Usage Reporting
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-usage-reporting`
@@ -563,7 +475,7 @@ exhaustion for the platform. Quota checks must cover all storage-consuming opera
 prevent quota bypass through versioned overwrites.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
-### 5.6 Metadata
+### 5.5 Metadata
 
 #### Rich Metadata Storage
 
@@ -577,8 +489,7 @@ The system **MUST** store and return the following system-managed metadata for e
 - GTS file type (`cpt-cf-file-storage-fr-file-type-classification`)
 - Creation date
 - Last modified date
-- Owner (user or tenant reference)
-- Download availability (whether the file is currently accessible for download; controlled by the file owner)
+- Owner (`owner_kind ∈ {user, app}` + `owner_id`) and `tenant_id`
 
 In addition, the system **MUST** support user-defined custom metadata as arbitrary key-value string pairs. Custom
 metadata **MUST** be specifiable at upload time and updatable after upload. The system **MUST** return custom metadata
@@ -594,13 +505,22 @@ Blob metadata.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-update-metadata`
 
-The file owner **MUST** be able to update custom metadata (user-defined key-value pairs) and download availability on
-an existing file. All other system-managed metadata (name, size, mime_type, GTS file type, creation date, last modified
-date, owner) is **NOT** updatable by users — it is maintained by the system. Updating custom metadata or download
-availability **MUST** update the file's last modified date.
+Any actor authorized for the **write** action on the file's GTS type
+(`cpt-cf-file-storage-fr-authorization`) **MUST** be able to update the file's `custom_metadata` (user-defined
+key-value pairs).
+
+The set of principals admitted by the Authorization Service for this action **MAY** include the file's current owner,
+other principals within the same tenant, or service identities — the model is policy-driven, not hard-coded to
+"owner". All other system-managed metadata (`file_id`, `tenant_id`, `owner_kind`, `owner_id`, `name`, `size`,
+`mime_type`, `gts_file_type`, `created_at`) is **NOT** user-updatable — it is maintained by the system. A successful
+update **MUST** advance the file's last modified date.
 
 **Rationale**: Custom metadata evolves as files are processed, categorized, or annotated by consuming modules. System
-metadata reflects the immutable physical properties of the file and must remain authoritative.
+metadata reflects the immutable physical properties of the file and must remain authoritative. Routing the
+authorization decision through `cpt-cf-file-storage-fr-authorization` (rather than hard-coding "only the owner can
+update") keeps the access-control model centralized in the platform Authorization Service and lets tenants extend
+write permission to additional principals (delegated maintainers, automation service identities, etc.) without
+schema changes.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Custom Metadata Limits
@@ -615,15 +535,15 @@ limits **MUST** be rejected.
 storage costs and degrading query performance.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
-### 5.7 File Retention & Lifecycle
+### 5.6 File Retention & Lifecycle
 
 #### Indefinite Retention
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-retention-indefinite`
 
-In phase 1, files **MUST** be retained indefinitely until explicitly deleted by the file owner. The system **MUST NOT**
-automatically delete or expire file content based on age or inactivity. Shareable links and signed URLs expire per their
-configured expiration, but the underlying file content remains available.
+In phase 1, files **MUST** be retained indefinitely until explicitly deleted by an authorized actor
+(`cpt-cf-file-storage-fr-authorization`). The system **MUST NOT** automatically delete or expire file content based on
+age or inactivity.
 
 **Rationale**: In the absence of tenant-level retention policies (phase 2), indefinite retention is the safest default —
 it prevents accidental data loss and gives consuming modules predictable storage semantics.
@@ -653,7 +573,7 @@ to:
 
 - Delete all files owned by the removed owner
 - Archive files (mark as archived and disable further modifications while preserving content)
-- Transfer ownership to another user or tenant
+- Transfer ownership to another user or app within the same tenant
 - Apply any combination of the above based on file metadata or custom criteria
 
 The specific disposition logic **MUST** be defined as a Serverless Runtime workflow or function, configurable per
@@ -665,6 +585,44 @@ blind deletion risks data loss, while indefinite retention risks compliance viol
 Serverless Runtime workflows enables deployment-specific logic (legal holds, data migration, cascading cleanup) without
 embedding policy decisions in FileStorage.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
+
+#### Orphan Reconciliation
+
+- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-orphan-reconciliation`
+
+The system **MUST** automatically detect and reconcile orphan state between the metadata store and storage backends.
+Even when content traffic transits FileStorage end-to-end, the metadata-DB write and the backend object write are not
+atomic with each other, and several edge cases produce orphans:
+
+- A `POST /files` create transaction committed the file row, but the backend write failed before the row could be
+  transitioned to `content_state = available`
+- A backend write succeeded, but the DB transaction that would have recorded the row failed (or was rolled back)
+- *(P2)* A multipart upload session was initiated (`POST /files/multipart` per
+  `cpt-cf-file-storage-fr-multipart-upload`), but neither `complete` nor `abort` was ever invoked, leaving a
+  `pending` file row and uploaded parts hanging
+
+After a configurable grace period, the system **MUST** reconcile file rows against actual backend object existence and
+apply the following dispositions:
+
+- File rows in `content_state = pending` past the grace window with **no** matching backend object → metadata row
+  deleted
+- File rows in `content_state = available` with **no** matching backend object → flagged for operator attention (do
+  **NOT** auto-delete; this most likely indicates backend data loss and requires manual review)
+- Backend objects with no matching file row → deleted at the backend (orphaned content; no metadata path can resolve
+  them)
+- *(P2)* Multipart upload sessions past the grace window with no `complete` → aborted at the backend
+  (`abortMultipartUpload`), uploaded parts discarded, the corresponding `pending` file row removed
+
+Reconciliation **MUST** be an internal scheduled task — it **MUST NOT** be triggerable from any public API surface —
+and **MUST** emit audit records (`cpt-cf-file-storage-fr-audit-trail`) for every disposition it performs.
+
+**Rationale**: Two-phase commit between metadata DB and storage backend is not free; transient failures inevitably
+produce divergent state, and that divergence accumulates over time as DB rows pointing at nothing or backend objects
+no FileStorage user can see. Reconciliation keeps the two stores converged. Auto-deletion is safe for orphan content
+(no metadata points to it, so no consumer can be broken) and for stale `pending` rows (the create never finished, so
+no consumer is depending on them). The diverged-available case is the only one that requires manual handling, because
+it implies either backend data loss or a long-running inconsistency that auto-deletion would mask.
+**Actors**: `cpt-cf-file-storage-actor-cf-modules`
 
 #### File Versioning
 
@@ -689,9 +647,9 @@ versioning capability is available for a backend, the system **MUST**:
 - Treat version identifiers as opaque strings — the system **MUST NOT** assume any specific format, ordering, or
   parseable structure of version identifiers across storage backends
 
-Garbage collection (`cpt-cf-file-storage-fr-gc-direct-uploads`) does **NOT** apply to soft-deleted versions —
-soft-delete is an intentional owner action, not an orphaned state. Cleanup of soft-deleted versions is governed by
-retention policies (`cpt-cf-file-storage-fr-retention-policies`).
+Automatic garbage collection does **NOT** apply to soft-deleted versions — soft-delete is an intentional owner
+action, not an orphaned state. Cleanup of soft-deleted versions is governed by retention policies
+(`cpt-cf-file-storage-fr-retention-policies`).
 
 The system **MUST** apply the same authorization, tenant boundary enforcement, and audit requirements to all versioned
 operations as to non-versioned file operations.
@@ -716,15 +674,15 @@ requirements (GDPR, HIPAA, SOC 2) and protect stored data against unauthorized p
 storage backend.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
-### 5.8 Audit
+### 5.7 Audit
 
 #### Audit Trail
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-audit-trail`
 
-The system **MUST** produce an audit record for every write operation (upload, delete, metadata update, link creation,
-link revocation). Audit records **MUST** include the operation type, actor identity, file identifier, timestamp, and
-outcome (success or failure).
+The system **MUST** produce an audit record for every write operation (upload, content replacement, delete, metadata
+update). Audit records **MUST** include the operation type, actor identity, file identifier, timestamp, and outcome
+(success or failure).
 
 **Rationale**: Audit trails are required for security forensics, compliance reporting, and operational troubleshooting.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
@@ -734,16 +692,16 @@ outcome (success or failure).
 - [ ] `p3` - **ID**: `cpt-cf-file-storage-fr-read-audit`
 
 The system **MUST** support optional audit logging for read operations (downloads and metadata queries), configurable
-per policy. When enabled by policy, the system **MUST** produce an audit record for every read operation
-that passes through FileStorage — proxied downloads and shareable link access. Read audit logging does not apply to
-presigned URL downloads, which bypass FileStorage and are served directly by the storage backend.
+per policy. When enabled by policy, the system **MUST** produce an audit record for every read operation. Because all
+content traffic transits FileStorage, read audit applies uniformly to every download — there are no per-flow
+carve-outs.
 
 **Rationale**: Regulated environments and security-sensitive owners require visibility into who accessed their files and
 when. Making read audit optional per policy avoids the performance and storage overhead of logging every read
 across the platform, while enabling it where compliance demands it.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
-### 5.9 Pluggable Storage Backends
+### 5.8 Pluggable Storage Backends
 
 #### Backend Abstraction
 
@@ -761,105 +719,106 @@ backend selection without changing the module's core logic.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-capabilities`
 
 The system **MUST** define a capability model for storage backends. Each backend **MUST** declare which optional
-capabilities it supports. The system **MUST** support at least the following capabilities:
+capabilities it supports. The system **MUST** support at least the following client-facing capabilities:
 
-- **Presigned URLs** — the backend can generate cryptographically signed, time-limited URLs for direct client-to-backend
-  upload and download without proxying through FileStorage
 - **Versioning** — the backend can maintain multiple versions of a file, identified by opaque version identifiers
 - **Multipart Upload** — the backend natively supports chunked upload with independent part transfers and server-side
   assembly
 - **Server-Side Encryption** — the backend can encrypt file content at rest using backend-managed or customer-provided
   keys
 
-Each declared capability **MUST** be independently configurable as enabled or disabled per backend. A capability that is
-supported by the backend but disabled by configuration **MUST** behave identically to an unsupported capability — the
-system **MUST NOT** expose or use it. Only capabilities that are both declared by the backend and enabled in
-configuration are considered available.
+Backends **MAY** additionally support internal-only capabilities (e.g., presigned URL generation for
+backend-to-backend replication, migration, or backup tooling). Internal-only capabilities are used by FileStorage
+itself and are **NOT** exposed on the public capability discovery surface — no backend-addressable URL is ever
+returned to a client.
 
-The system **MUST** expose the set of available (declared and enabled) capabilities per backend so that consumers can
-discover them at runtime. When a consumer requests an operation that depends on an unavailable capability, the system
-**MUST** return a clear error indicating the capability is unavailable. Capability declarations **MUST** be part of the
-backend configuration — not inferred at runtime from probing.
+Each declared client-facing capability **MUST** be independently configurable as enabled or disabled per backend. A
+capability that is supported by the backend but disabled by configuration **MUST** behave identically to an
+unsupported capability — the system **MUST NOT** expose or use it. Only capabilities that are both declared by the
+backend and enabled in configuration are considered available.
+
+The system **MUST** expose the set of available (declared and enabled) client-facing capabilities per backend so that
+consumers can discover them at runtime. When a consumer requests an operation that depends on an unavailable
+capability, the system **MUST** return a clear error indicating the capability is unavailable. Capability declarations
+**MUST** be part of the backend configuration — not inferred at runtime from probing.
 
 **Rationale**: Storage backends vary widely in feature support. A formal capability model enables FileStorage to adapt
 behavior per backend, allows consumers to discover and handle feature availability, and replaces ad-hoc fallback logic
-with a consistent, extensible pattern. Per-backend capability toggling allows administrators to disable features for
-security or operational reasons — e.g., disabling presigned URLs to force all traffic through FileStorage for audit
-visibility, even when the backend supports them.
+with a consistent, extensible pattern. Separating client-facing capabilities from internal-only ones preserves backend
+opacity while keeping internal optimizations available to FileStorage itself.
+**Actors**: `cpt-cf-file-storage-actor-cf-modules`
+
+#### Backend Configuration Source
+
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-config-source`
+
+In P1, storage backend configurations (`type`, `endpoint`, `credentials`, `capabilities`, `hash_policy`) **MUST** be
+loaded from a static TOML configuration file at module startup. Adding, removing, or re-configuring a backend
+requires a module restart. The configured set is exposed for read-only runtime introspection.
+
+**Rationale**: A static configuration file is the simplest viable mechanism for P1 — no DB or admin-UI dependency.
+Read-only HTTP introspection is sufficient for clients to discover available backends and their capabilities without
+granting any runtime mutation surface.
 **Actors**: `cpt-cf-file-storage-actor-cf-modules`
 
 #### Runtime Backend Configuration
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-runtime-backends`
+- [ ] `p3` - **ID**: `cpt-cf-file-storage-fr-runtime-backends`
 
-The system **MUST** allow tenants to connect and configure storage backends at runtime without requiring service rebuild
-or redeployment.
+The system **MUST** allow tenants to connect and configure storage backends at runtime without requiring service
+rebuild or redeployment. Runtime backend configurations **MUST** be persisted in the metadata database (replacing the
+P1 TOML source) and propagated to running module instances.
 
 **Rationale**: Enterprise tenants need to bring their own storage (BYOS) and switch backends based on cost, compliance,
 or geographic requirements.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`
 
-### 5.10 Access Interfaces
+### 5.9 Access Interfaces
 
 #### REST API
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-rest-api`
 
-The system **MUST** expose a REST API for all file operations (upload, download, delete, metadata, link management).
+The system **MUST** expose a REST API for all file operations (upload, download, delete, metadata management, backend
+discovery) under a single auth-required namespace (`/api/file-storage/v1`). FileStorage P1 has no anonymous
+namespace — see `§5.3`.
 
 **Rationale**: REST is the standard access interface for Cyber Ware modules and platform UI.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
-#### S3-Compatible API
+#### Random Read Access
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-s3-api`
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-range-requests`
 
-The system **MUST** expose an S3-compatible API for file upload and download operations, enabling integration with
-existing S3 tooling and SDKs.
+Download endpoints **MUST** support random (non-sequential) read access to arbitrary byte ranges of stored content so
+that consumers can seek through large files efficiently — most importantly, so that media players can scrub through
+videos and audio without re-downloading the file.
 
-**Rationale**: S3 is the de facto standard for object storage APIs; compatibility enables direct integration with tools,
-libraries, and workflows that already support S3.
+**Rationale**: Without random read access, every seek in a video forces a full re-download from byte 0, which is
+unusable for any clip longer than a few seconds. The protocol-level mechanics (HTTP `Range`/`Content-Range` semantics,
+`Accept-Ranges` advertisement, backend-level range translation) are documented in DESIGN.md.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
-#### WebDAV API
-
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-webdav-api`
-
-The system **MUST** expose a WebDAV API for file access, enabling native filesystem-like mounting on client operating
-systems.
-
-**Rationale**: WebDAV enables direct OS-level access to stored files without custom client software, supporting use
-cases like document editing and file management through native file explorers.
-**Actors**: `cpt-cf-file-storage-actor-platform-user`
-
-#### Streaming and Range Requests
-
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-range-requests`
-
-The system **MUST** support HTTP Range requests (RFC 7233) for partial content download, enabling seeking within large
-files, resumable downloads, and parallel download of file segments.
-
-**Rationale**: For large files (video, datasets), clients need partial access for seeking, preview generation, and
-resuming interrupted downloads without re-transferring the entire file.
-**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
-
-### 5.11 Cache & Idempotency
+### 5.10 Cache & Idempotency
 
 #### Conditional Requests
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-conditional-requests`
 
-The system **MUST** support conditional HTTP requests (RFC 7232) for all operations served by FileStorage (proxied
-downloads, metadata requests, metadata updates). The system **MUST**:
+The system **MUST** support conditional HTTP requests (RFC 7232) for all operations served by FileStorage (downloads,
+metadata requests, content-replacement and metadata-update operations, deletes). The system **MUST**:
 
-- Return an `ETag` header with every download and metadata response
-- Support `If-None-Match` on download and metadata requests — return `304 Not Modified` when the file has not changed,
-  avoiding content transfer
-- Support `If-Match` on metadata update requests — reject the update with `412 Precondition Failed` when the file state
-  has changed since the client last read it, preventing lost updates from concurrent modifications
+- Return an `ETag` header with every download and metadata response. ETag is opaque, derived from `(file_id,
+  content_revision)`, and **MUST NOT** equal the content hash (which is exposed separately)
+- Support `If-None-Match` on `GET`/`HEAD` requests — return `304 Not Modified` when ETag matches
+- Support `If-Match` on `GET`/`HEAD` — return `412 Precondition Failed` when ETag does not match
+- Require `If-Match` on every write (`PATCH`, `DELETE`) and on multipart-control operations — `412 Precondition Failed`
+  on mismatch
 
-Conditional requests do not apply to presigned URL downloads, which bypass FileStorage and are served directly by the
-storage backend.
+**ETag is content-only.** Metadata-only updates bump an internal `metadata_revision` and `last_modified_at` but
+**MUST NOT** change the ETag or content hash — both remain tied to the content. Consequently `If-Match` on a
+metadata-only update protects against concurrent **content** writes but does **not** detect concurrent metadata
+writes; metadata updates are last-write-wins (S3-style).
 
 **Rationale**: Conditional downloads eliminate redundant bandwidth for unchanged files and enable downstream caching by
 browsers and reverse proxies. Conditional updates prevent silent data loss when multiple clients modify file metadata
@@ -919,11 +878,11 @@ across requests with multiple files.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-nfr-url-availability`
 
-Stored file URLs and shareable links **MUST** remain accessible for the duration of their configured lifetime with
-availability matching the platform SLA.
+Stored file URLs **MUST** remain accessible for the duration of the file's retention with availability matching
+the platform SLA.
 
-**Threshold**: URL availability matches platform SLA for the duration of the retention/expiration period
-**Rationale**: Consumers depend on URL stability — broken links disrupt downstream workflows and user experience.
+**Threshold**: URL availability matches platform SLA for the duration of the retention period
+**Rationale**: Consumers depend on URL stability — broken URLs disrupt downstream workflows and user experience.
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
 
 #### Audit Completeness
@@ -993,7 +952,8 @@ The following NFR categories from the platform checklist are **not applicable** 
 
 **Type**: Rust trait (SDK crate)
 **Stability**: unstable
-**Description**: Async trait providing upload, download, delete, metadata, and link management operations.
+**Description**: Async trait providing upload, download (with Range), delete, metadata read/update, listing, and
+backend-capability discovery.
 **Breaking Change Policy**: Major version bump required for trait signature changes.
 
 #### REST API
@@ -1001,10 +961,11 @@ The following NFR categories from the platform checklist are **not applicable** 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-rest-api`
 
 **Type**: REST API (OpenAPI 3.0)
+**URL Prefix**: `/api/file-storage/v1`
 **Stability**: unstable
-**Description**: HTTP REST API for all file operations, metadata management, and link management.
-**Breaking Change Policy**: Major version bump required for endpoint removal or request/response schema incompatible
-changes.
+**Description**: HTTP REST API for authenticated file operations and metadata management. All endpoints require
+platform JWT — there is no anonymous surface in P1 (see `§5.3`).
+**Breaking Change Policy**: Major version bump required for endpoint removal or incompatible schema changes.
 
 ### 7.2 External Integration Contracts
 
@@ -1060,9 +1021,9 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 
 ## 8. Use Cases
 
-### Upload and Share a File
+### Upload a File
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-usecase-upload-share`
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-upload`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -1077,17 +1038,15 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 2. FileStorage validates the GTS file type format
 3. FileStorage checks authorization for write on `gts.cf.fstorage.file.type.v1~` with the file type in resource context
 4. *(Phase 2)* FileStorage validates file against policies (type, size); in phase 1 all uploads are accepted
-5. FileStorage persists content, assigns ownership to the user, and stores metadata (including GTS file type)
+5. FileStorage persists content, assigns ownership, stores metadata
 6. *(Phase 2)* FileStorage emits audit record for the upload
 7. FileStorage returns persistent URL and file identifier
-8. User creates a shareable link with desired scope and expiration
-9. FileStorage returns the shareable link URL
 
 **Postconditions**:
 
 - File stored with metadata and ownership
-- Shareable link active with configured scope and expiration
-- *(Phase 2)* Audit record emitted
+- File is readable only by principals authorized via `cpt-cf-file-storage-fr-authorization`
+- *(Phase 2)* Audit record emitted for the upload
 
 **Alternative Flows**:
 
@@ -1121,45 +1080,6 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - **File not found**: FileStorage returns file_not_found error
 - **Authorization denied**: FileStorage returns access-denied error
 
-### Generate and Access Signed URL
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-signed-url`
-
-**Actor**: `cpt-cf-file-storage-actor-platform-user`
-
-**Preconditions**:
-
-- User owns the file or has write access
-- Backend supports presigned URLs capability
-- Policy permits signed URL sharing
-
-**Main Flow**:
-
-1. Owner requests a signed URL for a file with a specified expiration
-2. FileStorage checks authorization for the owner on `gts.cf.fstorage.file.type.v1~`
-3. *(Phase 2)* FileStorage validates sharing policy allows signed URLs; in phase 1 all sharing models are
-   permitted
-4. FileStorage generates a presigned download URL using its own backend credentials, scoped to the file and time-limited
-5. FileStorage records the signed URL metadata (file, expiration, owner) for visibility and audit
-6. *(Phase 2)* FileStorage emits audit record for signed URL creation
-7. Owner shares the signed URL with an external consumer
-8. External consumer downloads the file directly from the storage backend using the signed URL — no authentication
-   required, backend validates signature
-
-**Postconditions**:
-
-- File content delivered to external consumer directly from storage backend without authentication
-- Signed URL metadata recorded for visibility and audit
-- *(Phase 2)* Audit record emitted for signed URL creation
-
-**Alternative Flows**:
-
-- **Expired URL**: Storage backend rejects the request (signature expiration enforced by backend)
-- **Invalid signature**: Storage backend rejects the request
-- **Backend does not support presigned URLs or capability is disabled**: FileStorage returns an error indicating the
-  capability is unavailable
-- *(Phase 2)* **Sharing model restricted by policy**: FileStorage returns policy-violation error
-
 ### Validate File Metadata Before Processing
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-get-metadata`
@@ -1185,49 +1105,6 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - **File not found**: FileStorage returns file_not_found error
 - **Authorization denied**: FileStorage returns access-denied error
 
-### Direct Upload from External Client
-
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-direct-upload`
-
-**Actor**: `cpt-cf-file-storage-actor-platform-user`
-
-**Preconditions**:
-
-- Client is authenticated with a valid API token
-- Storage backend supports presigned URLs (e.g., S3, GCS, Azure Blob)
-
-**Main Flow**:
-
-1. Client requests a direct transfer URL for upload from FileStorage, providing file metadata (name, mime_type, size,
-   GTS file type)
-2. FileStorage validates the GTS file type format
-3. FileStorage checks authorization for write on `gts.cf.fstorage.file.type.v1~` with the file type in resource context
-4. *(Phase 2)* FileStorage validates file against policies (type, size); in phase 1 all uploads are accepted
-5. FileStorage registers the file metadata (including GTS file type) and ownership, assigns the target backend path
-6. FileStorage generates a presigned upload URL using its own backend credentials (e.g., AWS access key), scoped to the
-   assigned path and time-limited
-7. *(Phase 2)* FileStorage emits audit record for the upload
-8. FileStorage returns the presigned URL and file identifier to the client
-9. Client uploads file content directly to the storage backend using the presigned URL
-10. Storage backend validates the signature against its own key material and accepts the upload
-
-**Postconditions**:
-
-- File metadata and ownership registered in FileStorage before upload
-- File content stored on backend via presigned URL — never transited through FileStorage
-- *(Phase 2)* Audit record emitted
-
-**Alternative Flows**:
-
-- **Missing or invalid GTS file type at step 2**: FileStorage rejects with a validation error; no presigned URL issued
-- **Authorization denied at step 3**: FileStorage returns access-denied error; no presigned URL issued
-- *(Phase 2)* **Policy violation at step 4**: FileStorage returns error indicating which policy was violated
-- **Presigned URL expired**: Backend rejects the upload; client must request a new presigned URL from FileStorage
-- **Backend does not support presigned URLs or capability is disabled**: FileStorage returns an error indicating the
-  capability is unavailable; client must use standard (proxied) upload instead
-- **Upload never completed (abandoned or failed)**: Metadata registered at step 5 remains unconfirmed; garbage
-  collection handles cleanup per `cpt-cf-file-storage-fr-gc-direct-uploads`
-
 ### Delete a File
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-delete-file`
@@ -1243,17 +1120,14 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 
 1. Owner requests deletion of a file by its identifier
 2. FileStorage checks authorization for delete on `gts.cf.fstorage.file.type.v1~`
-3. FileStorage revokes all active shareable links associated with the file
-4. FileStorage deletes the file content from the storage backend
-5. FileStorage removes file metadata and ownership records
-6. *(Phase 2)* FileStorage emits audit record for the deletion
+3. FileStorage deletes the file content from the storage backend
+4. FileStorage removes file metadata and ownership records
+5. *(Phase 2)* FileStorage emits audit record for the deletion
 
 **Postconditions**:
 
 - File content removed from storage backend
-- All associated shareable links invalidated; issued signed URLs remain valid until their expiration
-  (`cpt-cf-file-storage-fr-signed-urls`) — the underlying content is no longer available on the backend
-- Metadata and ownership records removed
+- Metadata and ownership records removed; subsequent requests for the file return `404`
 - *(Phase 2)* Audit record emitted
 
 **Alternative Flow — versioned file, no version identifier** (`cpt-cf-file-storage-fr-file-versioning`):
@@ -1266,7 +1140,6 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 **Postconditions**:
 
 - Current version inaccessible through normal file access; non-current versions remain retrievable by version ID
-- Shareable links remain associated but resolve to the soft-deleted state
 - Content is **not** physically removed and continues to count against storage quota
   (`cpt-cf-file-storage-fr-storage-quota`)
 - *(Phase 2)* Audit record emitted
@@ -1291,42 +1164,6 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - **File not found**: FileStorage returns file_not_found error
 - **Version not found**: FileStorage returns version_not_found error
 - **Cross-tenant attempt**: FileStorage returns access-denied error (tenant boundary enforcement)
-
-### Manage Shareable Links
-
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-usecase-manage-links`
-
-**Actor**: `cpt-cf-file-storage-actor-platform-user`
-
-**Preconditions**:
-
-- User is authenticated
-- User owns the file
-
-**Main Flow**:
-
-1. Owner requests the list of all active shareable links and signed URLs for a file
-2. FileStorage checks authorization for the owner on `gts.cf.fstorage.file.type.v1~`
-3. FileStorage returns the list with each link's scope, expiration, and creation date
-4. Owner identifies a link to revoke
-5. Owner requests revocation of the link by its identifier
-6. FileStorage checks authorization for the owner on `gts.cf.fstorage.file.type.v1~`
-7. FileStorage invalidates the link immediately
-8. *(Phase 2)* FileStorage emits audit record for the link revocation
-
-**Postconditions**:
-
-- Revoked link returns access-denied on subsequent access
-- Remaining links unaffected
-- *(Phase 2)* Audit record emitted
-
-**Alternative Flows**:
-
-- **Authorization denied**: FileStorage returns access-denied error
-- **No active links**: FileStorage returns an empty list
-- **Link not found**: FileStorage returns link_not_found error
-- **Owner creates a new link**: Owner requests a shareable link with desired scope and expiration; FileStorage creates
-  and returns the link URL; *(Phase 2)* audit record emitted for link creation
 
 ### Multi-Backend Deployment
 
@@ -1354,7 +1191,7 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 **Alternative Flows**:
 
 - **Backend-specific feature unavailable**: FileStorage returns a clear error indicating the capability is unavailable
-  (e.g., signed URL or direct transfer request rejected when backend does not support presigned URLs)
+  (e.g., multipart upload or versioning request rejected when backend does not declare the capability)
 
 ### Configure Policy
 
@@ -1387,43 +1224,37 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 
 - [ ] File upload returns persistent URL and stores metadata (name, size, type, dates, owner)
 - [ ] File download returns content with correct metadata
-- [ ] File deletion of a non-versioned file permanently removes content and cascades to all associated shareable links
+- [ ] File deletion of a non-versioned file permanently removes content
 - [ ] File deletion of a versioned file without version identifier places a soft-delete marker (no physical removal)
 - [ ] Authorization checked for every file operation via Authorization Service
-- [ ] Tenant boundary enforced — cross-tenant modification/deletion rejected
-- [ ] Shareable links work with public, tenant, and tenant-hierarchy scopes
-- [ ] Signed URLs point directly to storage backend, grant download access without authentication, and storage backend
-  rejects after expiration
-- [ ] File owner can list active shareable links and signed URLs; can revoke shareable links (signed URLs are
-  non-revocable)
+- [ ] Tenant boundary enforced — cross-tenant access rejected
 - [ ] Audit record emitted for every write operation
 - [ ] Policies enforce file type and size restrictions on upload (most restrictive wins across tenant and user levels)
-- [ ] Direct transfer presigned URLs allow upload directly to storage backend without proxying through FileStorage
-- [ ] Presigned URLs are generated using FileStorage's own backend credentials and validated by the backend via
-  signature verification
-- [ ] Signed URL and direct transfer requests rejected with clear error when backend does not support presigned URLs
+- [ ] All content traffic flows through FileStorage; no backend-addressable URL is returned to any client
 - [ ] file_not_found error returned for non-existent files
 - [ ] access_denied error returned for unauthorized operations
 - [ ] Metadata-only queries complete without transferring file content
-- [ ] File content is immutable — no in-place content update; changes require a new upload
-- [ ] Custom metadata is updatable by the file owner; system-managed metadata is not user-updatable
+- [ ] Content is mutable through dedicated content-replacement operations; ETag (content-derived) changes on every
+  content write; metadata-only updates do not change ETag or content hash
+- [ ] `custom_metadata` is updatable by any actor authorized for the **write** action on the file's GTS type;
+  system-managed metadata is not user-updatable
 - [ ] Custom metadata update changes the file's last modified date
-- [ ] File ownership is immutable after creation except through explicit ownership transfer or owner deletion workflows
+- [ ] File ownership (`owner_kind`, `owner_id`) is immutable after creation except through explicit ownership transfer
+  or owner deletion workflows; `tenant_id` is never mutable
 - [ ] Every file has a mandatory GTS file type assigned at upload time; uploads without a file type are rejected
 - [ ] GTS file type is immutable after creation
 - [ ] Authorization requests include the file's GTS type, enabling per-type access decisions
 - [ ] A module authorized only for type A cannot access files of type B
 - [ ] FileStorage SDK and REST API behave identically regardless of configured storage backend
-- [ ] File listing returns metadata only, is paginated, and requires owner type filter
+- [ ] File listing returns metadata only, is paginated, and requires a mandatory owner-kind filter (`user` or `app`)
 - [ ] Multipart upload assembles parts into a complete file with correct metadata
 - [ ] Upload rejected when declared mime_type does not match actual file content
-- [ ] Orphaned metadata records from unconfirmed direct uploads are detected, reconciled against backend state, and
-  cleaned up automatically
-- [ ] File owner can toggle download availability via metadata update
-- [ ] Each backend declares its supported capabilities (presigned URLs, versioning, multipart upload)
+- [ ] Each backend declares its supported client-facing capabilities (versioning, multipart upload, server-side
+  encryption); internal-only capabilities are not surfaced on public discovery
 - [ ] Consumers can discover backend capabilities at runtime
 - [ ] Operations requiring an unsupported capability return a clear error
-- [ ] File versioning creates a new version on each upload; previous versions remain accessible by opaque version ID
+- [ ] File versioning creates a new version on each content-replacement when backend versioning capability is enabled;
+  metadata-only updates do not create a new backend version
 - [ ] All versions of a file are listable with version ID, size, timestamp, and current-version flag
 - [ ] Soft-delete places a logical delete marker; current version becomes inaccessible but content is not physically
   removed
@@ -1433,9 +1264,10 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - [ ] Permanent delete of a specific version removes only that version
 - [ ] Declared capabilities are independently configurable (enable/disable) per backend
 - [ ] A capability disabled by configuration behaves identically to an unsupported capability
-- [ ] Download and metadata responses include ETag header
-- [ ] Conditional download with If-None-Match returns 304 Not Modified when file is unchanged
-- [ ] Metadata update with If-Match returns 412 Precondition Failed when file state has changed
+- [ ] Download and metadata responses include `ETag` header derived from `(file_id, content_revision)` and not equal
+  to the content hash
+- [ ] Conditional download with `If-None-Match` returns `304 Not Modified` when file is unchanged
+- [ ] `If-Match` is required on writes (`PATCH`/`DELETE`); missing or mismatching `If-Match` returns `412`
 - [ ] Retried upload with the same idempotency key returns the original result without creating a duplicate file
 - [ ] Retried upload with the same idempotency key by a different owner does not return or create the original owner's
   file
@@ -1447,20 +1279,17 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
   Usage Collector is unavailable
 - [ ] Ownership transfer emits usage reports for both previous and new owner
 - [ ] File events emitted to EventBroker on write operations (upload, update, delete) when enabled by owner policy
-- [ ] HTTP Range requests return partial content for large files; seeking and resumable downloads supported
-- [ ] S3-compatible API exposes upload and download operations usable by standard S3 tooling and SDKs
-- [ ] WebDAV API enables native filesystem-like mounting and file access on client operating systems
+- [ ] HTTP Range requests return partial content for downloads; seeking and resumable downloads supported;
+  `Accept-Ranges: bytes` set on every download response
 - [ ] Retention policies automatically expire and delete files based on configured age, inactivity, or custom metadata
   criteria; per-file retention overrides are honored
-- [ ] Sharing model restrictions reject link creation for policy-disabled sharing models (public, tenant, hierarchy,
-  signed URLs)
-- [ ] Storage backends can be connected and configured at runtime without service rebuild or redeployment
-- [ ] File ownership transferable by current owner to another user or tenant; transfer requires authorization of both
-  parties and emits an audit record
+- [ ] Storage backends in P1 are loaded from a static TOML configuration file at module startup; in P3, backends can
+  be connected and configured at runtime via admin API without service rebuild
+- [ ] File ownership transferable by current owner to another user or app within the same tenant; transfer requires
+  authorization of both parties and emits an audit record
 - [ ] Custom metadata operations rejected when exceeding configurable limits (max pairs, key length, value length, total
   size)
-- [ ] Read audit records emitted for proxied downloads and shareable link access when enabled by policy; not emitted for
-  presigned URL downloads
+- [ ] Read audit records emitted for every download when enabled by policy
 
 ## 10. Dependencies
 
@@ -1479,7 +1308,8 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - Authorization Service is available and supports `gts.cf.fstorage.file.type.v1~` resource type
 - All file access respects tenant boundaries at the platform level
 - Initial storage backend is configured at deployment time; runtime backend switching is phase 2
-- File URLs are internal to Cyber Ware; external access is via shareable links or signed URLs
+- All FileStorage URLs are internal to Cyber Ware and require platform JWT in P1; any external/anonymous sharing
+  is deferred to P3 (see `§5.3`)
 - Policy configuration is available to tenant administrators and users through the platform
 
 ## 12. Risks
@@ -1488,7 +1318,7 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 |---------------------------------------------------------------------|----------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Storage service unavailability blocks all file-dependent operations | High — multimodal AI, document workflows disrupted             | Design for graceful degradation; clear error propagation to consumers                                                                                   |
 | Large file sizes increase request latency for consuming modules     | Medium — slow responses for multimodal and document operations | Metadata pre-fetch enables size validation; streaming support for large files                                                                           |
-| Signed URL key compromise enables unauthorized file access          | High — data exposure                                           | Key rotation is a backend configuration concern (credentials updated in backend config); short default expiration; shareable links for revocable access |
+| Backend credential compromise enables unauthorized backend access  | High — data exposure                                           | Backend credentials held only by FileStorage and never exposed to clients (proxy model — see DESIGN.md); standard credential rotation procedures apply at the FileStorage layer |
 | Policy misconfiguration blocks legitimate uploads                   | Medium — user frustration                                      | Policy validation on save; clear error messages identifying which policy was violated                                                                   |
 
 ## 13. Open Questions
