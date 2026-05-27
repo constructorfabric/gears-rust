@@ -2499,6 +2499,7 @@ const allCategoryIds = new Set(rawNodes.map(node => node.category).filter(Boolea
 const allBucketIds = new Set(rawNodes.map(node => node.bucket).filter(Boolean));
 const allGroupIds = new Set(rawNodes.map(node => node.group).filter(Boolean));
 let filterFromNodeSelection = false;
+let manualFilter = "";
 function normalized(text) {{
   return (text || "").trim().toLowerCase();
 }}
@@ -2963,7 +2964,19 @@ function selectNodeById(nodeId) {{
   selectedNode = nodeId;
   selectedEdge = null;
   setDetails(nodeId);
-  searchInput.value = "./" + nodeId;
+
+  const nodeFilter = "./" + nodeId;
+  const query = normalized(searchInput.value);
+  const depth = Math.max(0, parseInt(document.getElementById("filterDepth").value || "1", 10) || 0);
+  const visibleSet = query
+    ? computeFilterExpansion(matchingNodeIds(query), depth)
+    : new Set(activeViewNodeIds);
+
+  if (!filterFromNodeSelection && query) {{
+    manualFilter = searchInput.value;
+  }}
+
+  searchInput.value = nodeFilter;
   filterFromNodeSelection = true;
   syncFilterDepthVisibility();
   updateStyles();
@@ -3361,6 +3374,7 @@ function clearHighlight() {{
   hoveredNode = null;
   searchInput.value = "";
   filterFromNodeSelection = false;
+  manualFilter = "";
   syncFilterDepthVisibility();
   hideTooltip();
   updateStyles();
@@ -3384,6 +3398,8 @@ network.on("blurNode", () => {{
 network.on("click", params => {{
   if (params.nodes.length) {{
     const clicked = params.nodes[0];
+    const _viewActive = (viewSelect.value || "all") !== "all";
+    if (_viewActive && !activeViewNodeIds.has(clicked)) return;
     if (selectedNode === clicked) {{
       clearHighlight();
     }} else {{
@@ -3394,6 +3410,11 @@ network.on("click", params => {{
     drawMiniMap();
   }} else if (params.edges.length) {{
     const clickedEdgeId = params.edges[0];
+    const _clickedEdgeState = edges.get(clickedEdgeId);
+    if (_clickedEdgeState && _clickedEdgeState.color && _clickedEdgeState.color.opacity != null && _clickedEdgeState.color.opacity < 1) {{
+      clearHighlight();
+      return;
+    }}
     const isCptEdge = typeof clickedEdgeId === "string" && clickedEdgeId.startsWith("cpt-");
     if (isCptEdge) {{
       const cptEdge = cptEdgeById.get(clickedEdgeId);
@@ -3402,8 +3423,6 @@ network.on("click", params => {{
       const fileEdge = edgeById.get(clickedEdgeId);
       if (fileEdge) showEdgeDetailToast(fileEdge.from, fileEdge.to, "file");
     }}
-  }} else {{
-    clearHighlight();
   }}
 }});
 
@@ -3427,7 +3446,9 @@ function zoomBy(multiplier) {{
 
 searchInput.addEventListener("input", () => {{
   filterFromNodeSelection = false;
-  if (!normalized(searchInput.value)) {{
+  const _val = normalized(searchInput.value);
+  manualFilter = _val ? searchInput.value : "";
+  if (!_val) {{
     clearHighlight();
   }} else {{
     syncFilterDepthVisibility();
@@ -3759,12 +3780,32 @@ document.addEventListener("keydown", e => {{
     hideTooltip();
   }} else if (document.getElementById("searchResultsToast").style.display === "flex") {{
     document.getElementById("searchResultsToast").style.display = "none";
-  }} else if (selectedNode) {{
+  }} else if (filterFromNodeSelection && manualFilter) {{
+    searchInput.value = manualFilter;
+    filterFromNodeSelection = false;
+    selectedNode = null;
+    selectedEdge = null;
+    network.unselectAll();
+    details.classList.add("hidden");
+    syncFilterDepthVisibility();
+    updateStyles();
+  }} else if (selectedNode || filterFromNodeSelection) {{
     clearHighlight();
   }} else if (searchInput.value) {{
     searchInput.value = "";
+    manualFilter = "";
     updateStyles();
     searchInput.focus();
+  }} else if ((viewSelect.value || "all") !== "all") {{
+    const curDepth = Math.max(0, parseInt(viewDepth.value || "0", 10) || 0);
+    if (curDepth > 0) {{
+      viewDepth.value = String(curDepth - 1);
+      applyViewState();
+    }} else {{
+      viewSelect.value = "all";
+      syncViewDepthVisibility();
+      applyViewState({{ fit: true }});
+    }}
   }}
 }});
 
