@@ -67,6 +67,18 @@ pub struct ChatEngineConfig {
     /// the test default (`http://localhost`).
     #[serde(default)]
     pub share_base_url: Option<String>,
+
+    /// Mount the message-search REST endpoints
+    /// (`POST /chat-engine/v1/sessions/{id}/search`,
+    /// `POST /chat-engine/v1/sessions/search`). Defaults to `false`
+    /// because the production `tsvector` (Postgres) and `LIKE`
+    /// (SQLite) backends are still stubs that surface
+    /// `Internal` for every call — leaving the routes registered
+    /// would advertise an endpoint that 500s on every real request.
+    /// Operators flip this to `true` once a real backend is wired in
+    /// at module construction time.
+    #[serde(default)]
+    pub enable_search: bool,
 }
 
 impl Default for ChatEngineConfig {
@@ -80,6 +92,7 @@ impl Default for ChatEngineConfig {
             webhook_endpoints: Vec::new(),
             llm_gateway_base_url: None,
             share_base_url: None,
+            enable_search: false,
         }
     }
 }

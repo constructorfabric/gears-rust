@@ -85,6 +85,7 @@ pub fn register_routes(
     openapi: &dyn OpenApiRegistry,
     services: ChatEngineServices,
     webhooks: Arc<dyn WebhookEmitter>,
+    enable_search: bool,
 ) -> Router {
     let mut router = router;
 
@@ -208,40 +209,48 @@ pub fn register_routes(
 
     // -------------------------------------------------------------------
     // Search
+    //
+    // Gated by `enable_search`: the production tsvector/LIKE backends are
+    // still stubs that return `Internal` on every call, so registering
+    // these routes by default would advertise an endpoint that 500s on
+    // every real request. Operators flip the config flag once a real
+    // backend lands.
     // -------------------------------------------------------------------
 
-    router = OperationBuilder::post("/chat-engine/v1/sessions/{id}/search")
-        .operation_id("chat_engine.session.search")
-        .summary("Search inside a single session")
-        .tag(API_TAG)
-        .authenticated()
-        .require_license_features([&ChatEngineLicense])
-        .path_param("id", "Session UUID")
-        .json_request::<SearchRequestDto>(openapi, "Search query")
-        .handler(handlers::glue::search_in_session)
-        .json_response_with_schema::<SearchResultsDto>(
-            openapi,
-            StatusCode::OK,
-            "Search results",
-        )
-        .standard_errors(openapi)
-        .register(router, openapi);
+    if enable_search {
+        router = OperationBuilder::post("/chat-engine/v1/sessions/{id}/search")
+            .operation_id("chat_engine.session.search")
+            .summary("Search inside a single session")
+            .tag(API_TAG)
+            .authenticated()
+            .require_license_features([&ChatEngineLicense])
+            .path_param("id", "Session UUID")
+            .json_request::<SearchRequestDto>(openapi, "Search query")
+            .handler(handlers::glue::search_in_session)
+            .json_response_with_schema::<SearchResultsDto>(
+                openapi,
+                StatusCode::OK,
+                "Search results",
+            )
+            .standard_errors(openapi)
+            .register(router, openapi);
 
-    router = OperationBuilder::post("/chat-engine/v1/sessions/search")
-        .operation_id("chat_engine.sessions.search")
-        .summary("Search across all sessions for the current user")
-        .tag(API_TAG)
-        .authenticated()
-        .require_license_features([&ChatEngineLicense])
-        .json_request::<SearchRequestDto>(openapi, "Search query")
-        .handler(handlers::glue::search_across_sessions)
-        .json_response_with_schema::<SearchResultsDto>(
-            openapi,
-            StatusCode::OK,
-            "Search results",
-        )
-        .standard_errors(openapi)
-        .register(router, openapi);
+        router = OperationBuilder::post("/chat-engine/v1/sessions/search")
+            .operation_id("chat_engine.sessions.search")
+            .summary("Search across all sessions for the current user")
+            .tag(API_TAG)
+            .authenticated()
+            .require_license_features([&ChatEngineLicense])
+            .json_request::<SearchRequestDto>(openapi, "Search query")
+            .handler(handlers::glue::search_across_sessions)
+            .json_response_with_schema::<SearchResultsDto>(
+                openapi,
+                StatusCode::OK,
+                "Search results",
+            )
+            .standard_errors(openapi)
+            .register(router, openapi);
+    }
 
     // -------------------------------------------------------------------
     // Summarize (202 Accepted)
