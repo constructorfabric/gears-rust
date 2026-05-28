@@ -463,7 +463,7 @@ sha2 = "0.10"
 hex = "0.4"
 
 # JWT and authentication
-jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 
 # Configuration management
 figment = { version = "0.10", features = ["yaml", "env"] }
