@@ -114,24 +114,23 @@ pub trait VariantRepo: Send + Sync {
     ) -> Result<Vec<Message>>;
 
     /// INSERT a user message as child of `parent_message_id` with
-    /// `variant_index = MAX+1` (uses [`assign_variant_index`]).
+    /// `variant_index = MAX+1` (uses [`assign_variant_index`]) AND its
+    /// assistant stub (`variant_index = 0`, `is_active=true`,
+    /// `is_complete=false`) inside a single SERIALIZABLE transaction.
     ///
-    /// Returns the new `message_id` and the allocated `variant_index`.
-    async fn insert_user_message(
+    /// Mirrors [`MessageRepo::insert_user_and_assistant_stub`] for the
+    /// branch path: either both rows commit or neither does, so the
+    /// streaming pipeline never observes a user turn with no assistant
+    /// child.
+    ///
+    /// Returns `(user_message_id, user_variant_index, assistant_message_id)`.
+    async fn insert_user_and_assistant_stub_for_branch(
         &self,
         session_id: Uuid,
         parent_message_id: Uuid,
         content: JsonValue,
         file_ids: Option<Vec<Uuid>>,
-    ) -> Result<(Uuid, i32)>;
-
-    /// INSERT an assistant stub under `parent_message_id` with
-    /// `variant_index = 0`, `is_active=true`, `is_complete=false`.
-    async fn insert_assistant_stub_for_branch(
-        &self,
-        session_id: Uuid,
-        parent_message_id: Uuid,
-    ) -> Result<Uuid>;
+    ) -> Result<(Uuid, i32, Uuid)>;
 
     /// Walk the ancestor chain of `message_id` up to the root, returning
     /// `[message_id, ..., root]`.
@@ -242,10 +241,11 @@ impl VariantService {
         // Defer the actual allocation to the repository methods that
         // *immediately* INSERT under the new index (see
         // `MessageRepo::insert_assistant_variant_stub` and
-        // `VariantRepo::insert_user_message`). The helper is exposed as
-        // part of the Phase 6 surface so callers — and downstream
-        // phases — have a single semantic anchor; the underlying
-        // mechanism is the Phase 1 `assign_variant_index` SQL helper.
+        // `VariantRepo::insert_user_and_assistant_stub_for_branch`).
+        // The helper is exposed as part of the Phase 6 surface so
+        // callers — and downstream phases — have a single semantic
+        // anchor; the underlying mechanism is the Phase 1
+        // `assign_variant_index` SQL helper.
         //
         // We return `Internal` if this method is reached directly: the
         // canonical path is "allocate + INSERT in the same SERIALIZABLE
@@ -253,7 +253,7 @@ impl VariantService {
         // actually raced anything yet).
         Err(ChatEngineError::internal(
             "VariantService::assign_variant_index is a documentation anchor — use \
-             insert_assistant_variant_stub / insert_user_message",
+             insert_assistant_variant_stub / insert_user_and_assistant_stub_for_branch",
         ))
     }
 
@@ -671,21 +671,18 @@ impl VariantService {
         })?;
 
         // INSERT user message under the branch point (variant_index =
-        // MAX+1) + an assistant stub under that user message.
-        let (user_message_id, _user_variant_index) = self
+        // MAX+1) + an assistant stub under that user message in a
+        // single SERIALIZABLE transaction — mirrors the send_message
+        // path so we never leave a user turn without its assistant
+        // child if the second insert fails.
+        let (user_message_id, _user_variant_index, assistant_message_id) = self
             .variants
-            .insert_user_message(
+            .insert_user_and_assistant_stub_for_branch(
                 session_id,
                 branch_point_message_id,
                 content,
                 file_ids,
             )
-            .await
-            .map_err(map_unique_violation_to_conflict)?;
-
-        let assistant_message_id = self
-            .variants
-            .insert_assistant_stub_for_branch(session_id, user_message_id)
             .await
             .map_err(map_unique_violation_to_conflict)?;
 
@@ -1206,13 +1203,13 @@ impl VariantRepo for SeaVariantRepo {
         Ok(rows.into_iter().map(Message::from).collect())
     }
 
-    async fn insert_user_message(
+    async fn insert_user_and_assistant_stub_for_branch(
         &self,
         session_id: Uuid,
         parent_message_id: Uuid,
         content: JsonValue,
         file_ids: Option<Vec<Uuid>>,
-    ) -> Result<(Uuid, i32)> {
+    ) -> Result<(Uuid, i32, Uuid)> {
         use crate::infra::db::assign_variant_index;
         use crate::infra::db::entity::message as message_entity;
         use sea_orm::{
@@ -1220,24 +1217,25 @@ impl VariantRepo for SeaVariantRepo {
             TransactionTrait,
         };
 
-        let variant_index =
+        let user_variant_index =
             assign_variant_index(&self.db, session_id, Some(parent_message_id)).await?;
 
-        let new_message_id = Uuid::new_v4();
+        let user_message_id = Uuid::new_v4();
+        let assistant_message_id = Uuid::new_v4();
         let now = OffsetDateTime::now_utc();
         let file_ids_json = file_ids
             .as_ref()
             .filter(|ids| !ids.is_empty())
             .and_then(|ids| serde_json::to_value(ids).ok());
 
-        let active = message_entity::ActiveModel {
-            message_id: Set(new_message_id),
+        let user_active = message_entity::ActiveModel {
+            message_id: Set(user_message_id),
             session_id: Set(session_id),
             parent_message_id: Set(Some(parent_message_id)),
             role: Set("user".to_string()),
             content: Set(content),
             file_ids: Set(file_ids_json),
-            variant_index: Set(variant_index),
+            variant_index: Set(user_variant_index),
             is_active: Set(true),
             is_complete: Set(true),
             is_hidden_from_user: Set(false),
@@ -1246,47 +1244,10 @@ impl VariantRepo for SeaVariantRepo {
             created_at: Set(now),
         };
 
-        let outcome: std::result::Result<(), TransactionError<sea_orm::DbErr>> = self
-            .db
-            .transaction_with_config::<_, (), sea_orm::DbErr>(
-                move |txn| {
-                    Box::pin(async move {
-                        active.insert(txn).await?;
-                        Ok(())
-                    })
-                },
-                Some(IsolationLevel::Serializable),
-                Some(AccessMode::ReadWrite),
-            )
-            .await;
-        match outcome {
-            Ok(()) => Ok((new_message_id, variant_index)),
-            Err(TransactionError::Transaction(e)) | Err(TransactionError::Connection(e)) => {
-                Err(e.into())
-            }
-        }
-    }
-
-    async fn insert_assistant_stub_for_branch(
-        &self,
-        session_id: Uuid,
-        parent_message_id: Uuid,
-    ) -> Result<Uuid> {
-        use crate::infra::db::entity::message as message_entity;
-        use sea_orm::{
-            AccessMode, ActiveModelTrait, ActiveValue::Set, IsolationLevel, TransactionError,
-            TransactionTrait,
-        };
-
-        // variant_index = 0 because the user message just inserted has
-        // no siblings yet under itself.
-        let new_message_id = Uuid::new_v4();
-        let now = OffsetDateTime::now_utc();
-
-        let active = message_entity::ActiveModel {
-            message_id: Set(new_message_id),
+        let assistant_active = message_entity::ActiveModel {
+            message_id: Set(assistant_message_id),
             session_id: Set(session_id),
-            parent_message_id: Set(Some(parent_message_id)),
+            parent_message_id: Set(Some(user_message_id)),
             role: Set("assistant".to_string()),
             content: Set(json!({ "text": "" })),
             file_ids: Set(None),
@@ -1304,7 +1265,8 @@ impl VariantRepo for SeaVariantRepo {
             .transaction_with_config::<_, (), sea_orm::DbErr>(
                 move |txn| {
                     Box::pin(async move {
-                        active.insert(txn).await?;
+                        user_active.insert(txn).await?;
+                        assistant_active.insert(txn).await?;
                         Ok(())
                     })
                 },
@@ -1313,7 +1275,7 @@ impl VariantRepo for SeaVariantRepo {
             )
             .await;
         match outcome {
-            Ok(()) => Ok(new_message_id),
+            Ok(()) => Ok((user_message_id, user_variant_index, assistant_message_id)),
             Err(TransactionError::Transaction(e)) | Err(TransactionError::Connection(e)) => {
                 Err(e.into())
             }
@@ -1488,9 +1450,9 @@ mod tests {
 
     /// Repository double that emulates the variant_index allocator's
     /// race-and-retry behaviour. Configurable: each call to
-    /// `insert_user_message` fails up to `fail_until_attempt` times
-    /// before succeeding (mimics the SERIALIZABLE retry loop's UNIQUE
-    /// constraint contention).
+    /// `insert_user_and_assistant_stub_for_branch` fails up to
+    /// `fail_until_attempt` times before succeeding (mimics the
+    /// SERIALIZABLE retry loop's UNIQUE constraint contention).
     struct RetryingMockRepo {
         /// Counts attempts per `(session_id, parent_message_id)` key.
         attempts: Mutex<std::collections::HashMap<(Uuid, Uuid), usize>>,
@@ -1499,8 +1461,8 @@ mod tests {
         /// On the Nth attempt (0-based) succeed; earlier attempts
         /// surface a UNIQUE-violation-like error.
         succeed_on_attempt: usize,
-        /// Number of times `insert_user_message` has been called
-        /// across all keys.
+        /// Number of times the combined insert has been called across
+        /// all keys.
         total_calls: AtomicUsize,
     }
 
@@ -1534,13 +1496,13 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn insert_user_message(
+        async fn insert_user_and_assistant_stub_for_branch(
             &self,
             session_id: Uuid,
             parent_message_id: Uuid,
             _content: JsonValue,
             _file_ids: Option<Vec<Uuid>>,
-        ) -> Result<(Uuid, i32)> {
+        ) -> Result<(Uuid, i32, Uuid)> {
             self.total_calls.fetch_add(1, Ordering::SeqCst);
             let mut attempts = self.attempts.lock();
             let key = (session_id, parent_message_id);
@@ -1559,15 +1521,11 @@ mod tests {
                     "UNIQUE constraint violated: uq_messages_session_parent_variant",
                 ));
             }
-            Ok((Uuid::new_v4(), i32::try_from(attempt_idx).unwrap_or(0)))
-        }
-
-        async fn insert_assistant_stub_for_branch(
-            &self,
-            _session_id: Uuid,
-            _parent_message_id: Uuid,
-        ) -> Result<Uuid> {
-            Ok(Uuid::new_v4())
+            Ok((
+                Uuid::new_v4(),
+                i32::try_from(attempt_idx).unwrap_or(0),
+                Uuid::new_v4(),
+            ))
         }
 
         async fn ancestor_chain(
@@ -1612,21 +1570,22 @@ mod tests {
     //  loop semantics directly against the mock repo.
     // ------------------------------------------------------------------
 
-    /// Drive `insert_user_message` with up to `max_attempts` retries on
-    /// a UNIQUE-violation-like `Internal` error, then promote a
-    /// final exhaustion into a `Conflict`. Mirrors the production
-    /// retry semantics enforced by `assign_variant_index` + the
-    /// `map_unique_violation_to_conflict` wrapper.
+    /// Drive `insert_user_and_assistant_stub_for_branch` with up to
+    /// `max_attempts` retries on a UNIQUE-violation-like `Internal`
+    /// error, then promote a final exhaustion into a `Conflict`.
+    /// Mirrors the production retry semantics enforced by
+    /// `assign_variant_index` + the `map_unique_violation_to_conflict`
+    /// wrapper.
     async fn insert_with_retry(
         repo: Arc<dyn VariantRepo>,
         session_id: Uuid,
         parent_message_id: Uuid,
         max_attempts: usize,
-    ) -> Result<(Uuid, i32)> {
+    ) -> Result<(Uuid, i32, Uuid)> {
         let mut last_err: Option<ChatEngineError> = None;
         for _ in 0..max_attempts {
             match repo
-                .insert_user_message(
+                .insert_user_and_assistant_stub_for_branch(
                     session_id,
                     parent_message_id,
                     json!({"text": "x"}),
@@ -1661,7 +1620,7 @@ mod tests {
         let repo: Arc<dyn VariantRepo> = RetryingMockRepo::new(2);
         let session_id = Uuid::new_v4();
         let parent = Uuid::new_v4();
-        let (_id, variant_index) =
+        let (_user_id, variant_index, _assistant_id) =
             insert_with_retry(Arc::clone(&repo), session_id, parent, 3)
                 .await
                 .expect("should succeed within 3 retries");
