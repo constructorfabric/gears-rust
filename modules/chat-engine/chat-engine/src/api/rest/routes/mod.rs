@@ -205,6 +205,15 @@ pub fn register_routes(
             StatusCode::OK,
             "Shared session payload",
         )
+        // The handler maps share-expired conflicts to 410 Gone via
+        // `map_share_error`; document the response explicitly so
+        // clients / codegen know about it.
+        .problem_response(
+            openapi,
+            StatusCode::GONE,
+            "Share token has expired or been revoked",
+        )
+        .standard_errors(openapi)
         .register(router, openapi);
 
     // -------------------------------------------------------------------
