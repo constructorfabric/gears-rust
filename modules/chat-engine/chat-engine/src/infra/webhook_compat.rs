@@ -321,8 +321,11 @@ impl WebhookConfig {
             let value = self.auth_value.as_deref().ok_or_else(|| {
                 PluginError::invalid_input(format!("missing key: {CONFIG_KEY_AUTH_VALUE}"))
             })?;
+            // Preserve the InvalidHeaderName source — the header NAME
+            // is operator-supplied config metadata (not a secret), so
+            // surfacing why it was rejected aids debugging.
             let header_name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| PluginError::invalid_input("invalid header name in auth"))?;
+                .map_err(|e| PluginError::invalid_input_with("invalid header name in auth", e))?;
             let header_val = HeaderValue::from_str(value)
                 .map_err(|_| PluginError::invalid_input("invalid header bytes in auth_value"))?;
             headers.insert(header_name, header_val);
