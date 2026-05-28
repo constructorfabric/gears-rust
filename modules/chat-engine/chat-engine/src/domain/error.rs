@@ -15,11 +15,13 @@
 // @cpt-cf-chat-engine-domain-error:p2
 
 use chat_engine_sdk::error::{BoxError, PluginError};
+use modkit_macros::domain_model;
 use sea_orm::DbErr;
 use thiserror::Error;
 
 /// Service-layer error. Each variant carries enough context to be projected
 /// into an RFC-9457 `Problem` document by the API layer.
+#[domain_model]
 #[derive(Debug, Error)]
 pub enum ChatEngineError {
     /// A requested resource does not exist. Maps to HTTP 404.

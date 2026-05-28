@@ -13,12 +13,14 @@
 // @cpt-cf-chat-engine-webhook-emitter:p4
 
 use async_trait::async_trait;
+use modkit_macros::domain_model;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::domain::error::Result;
 
 /// Lifecycle events that Chat Engine emits to webhook subscribers.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub enum WebhookEvent {
     /// `POST /sessions` succeeded — the plugin has accepted the new session
@@ -100,6 +102,7 @@ pub trait WebhookEmitter: Send + Sync {
 }
 
 /// Default no-op emitter used during bring-up and unit tests.
+#[domain_model]
 #[derive(Debug, Default, Clone)]
 pub struct NoopWebhookEmitter;
 

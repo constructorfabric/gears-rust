@@ -10,11 +10,13 @@
 //
 // @cpt-cf-chat-engine-domain-share-token:p2
 
+use modkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// A share-link token granting read-only access to a session.
+#[domain_model]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ShareToken {
     /// The token value itself. Bearer secret — redacted from `Debug`.
