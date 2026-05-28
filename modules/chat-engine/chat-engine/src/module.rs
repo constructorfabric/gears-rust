@@ -387,11 +387,18 @@ impl RestApiCapability for ChatEngineModule {
     ) -> anyhow::Result<Router> {
         let runtime = self.runtime()?;
         let router = router.layer(axum::middleware::from_fn(canonical_error_middleware));
+        if !runtime.config.enable_search {
+            info!(
+                "chat-engine search endpoints disabled (enable_search=false); \
+                 production search backends are still stubs",
+            );
+        }
         let router = crate::api::rest::register_routes(
             router,
             openapi,
             runtime.services.clone(),
             Arc::clone(&runtime.webhooks),
+            runtime.config.enable_search,
         );
         Ok(router)
     }
