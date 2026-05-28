@@ -560,6 +560,36 @@ impl IntelligenceService {
         Ok(RetentionCleanupReport { sessions: outcomes })
     }
 
+    /// Enumerate every tenant that currently owns an `active` session and
+    /// run [`Self::run_retention_cleanup_for_tenant`] for each. Reports
+    /// from all tenants are concatenated in tenant-discovery order; per-
+    /// tenant failures are logged at WARN level and skipped so a single
+    /// faulty tenant cannot starve the rest of the schedule.
+    ///
+    /// The scheduler uses this entry point rather than guessing tenant
+    /// ids: the session repository is the source of truth for which
+    /// tenants are live.
+    #[instrument(skip(self))]
+    pub async fn run_retention_cleanup_all_tenants(
+        &self,
+    ) -> Result<RetentionCleanupReport> {
+        let tenants = self.sessions.list_tenants_with_active_sessions().await?;
+        let mut aggregated: Vec<SessionCleanupOutcome> = Vec::new();
+        for tenant_id in tenants {
+            match self.run_retention_cleanup_for_tenant(&tenant_id).await {
+                Ok(report) => aggregated.extend(report.sessions),
+                Err(err) => warn!(
+                    %tenant_id,
+                    error = %err,
+                    "retention cleanup failed for tenant; continuing with next tenant",
+                ),
+            }
+        }
+        Ok(RetentionCleanupReport {
+            sessions: aggregated,
+        })
+    }
+
     /// Evaluate a retention policy and return the list of message ids
     /// eligible for deletion. Public-ish (visible to tests in this
     /// module) but not exposed to other crates — the entry point for
@@ -1003,6 +1033,21 @@ mod tests {
                 })
                 .cloned()
                 .collect())
+        }
+
+        async fn list_tenants_with_active_sessions(
+            &self,
+        ) -> std::result::Result<Vec<String>, ChatEngineError> {
+            let mut tenants: Vec<String> = self
+                .rows
+                .lock()
+                .iter()
+                .filter(|r| r.lifecycle_state == LifecycleState::Active.as_str())
+                .map(|r| r.tenant_id.clone())
+                .collect();
+            tenants.sort();
+            tenants.dedup();
+            Ok(tenants)
         }
     }
 
@@ -1855,6 +1900,46 @@ mod tests {
         let msgs = MockMessageRepo::new(vec![]);
         let svc = make_service(sessions, msgs);
         let report = svc.run_retention_cleanup_for_tenant("t").await.unwrap();
+        assert!(report.sessions.is_empty());
+    }
+
+    // ----- run_retention_cleanup_all_tenants ------------------------------
+
+    #[tokio::test]
+    async fn run_cleanup_all_tenants_visits_every_distinct_active_tenant() {
+        // Two tenants with active sessions; one with an archived session
+        // that must NOT be visited.
+        let mut a = make_session(Uuid::new_v4(), None);
+        a.tenant_id = "tenant_a".into();
+        let mut b = make_session(Uuid::new_v4(), None);
+        b.tenant_id = "tenant_b".into();
+        let mut c = make_session(Uuid::new_v4(), None);
+        c.tenant_id = "tenant_c".into();
+        c.lifecycle_state = LifecycleState::Archived.as_str().to_string();
+
+        let sessions = MockSessionRepo::new(vec![a, b, c]);
+        let msgs = MockMessageRepo::new(vec![]);
+        let svc = make_service(sessions, msgs);
+
+        let report = svc.run_retention_cleanup_all_tenants().await.unwrap();
+        // Two active tenants → two session outcomes, no archived row.
+        assert_eq!(report.sessions.len(), 2);
+        let mut seen: Vec<String> = report
+            .sessions
+            .iter()
+            .map(|o| o.policy_type.to_owned())
+            .collect();
+        seen.sort();
+        // Both tenants resolve to RetentionPolicy::None (metadata=None).
+        assert_eq!(seen, vec!["none".to_owned(), "none".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn run_cleanup_all_tenants_returns_empty_when_no_active_tenants() {
+        let sessions = MockSessionRepo::new(vec![]);
+        let msgs = MockMessageRepo::new(vec![]);
+        let svc = make_service(sessions, msgs);
+        let report = svc.run_retention_cleanup_all_tenants().await.unwrap();
         assert!(report.sessions.is_empty());
     }
 }

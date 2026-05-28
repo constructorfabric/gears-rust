@@ -178,26 +178,16 @@ impl ChatEngineModule {
 
 /// Single retention-cleanup tick.
 ///
-/// The session repository surface from Phase 8 exposes
-/// `run_retention_cleanup_for_tenant` but does not yet provide a tenant
-/// directory; that helper lands alongside the production `pg_try_advisory_xact_lock`
-/// wiring in a follow-up patch. For Phase 15 the tick runs a sentinel
-/// cleanup against a well-known marker tenant so the loop exercises the
-/// cancellation path and the timing contract without blocking on the
-/// directory's introduction.
-///
-/// The marker tenant is intentionally an opaque, unreachable identifier
-/// (`__chat_engine_retention_marker__`) so production traffic cannot
-/// collide with the placeholder.
+/// Enumerates every tenant that currently owns an `active` session via
+/// [`IntelligenceService::run_retention_cleanup_all_tenants`] and runs
+/// the per-tenant cleanup against each. The session repository is the
+/// source of truth for the tenant directory, so the tick activates
+/// retention for real traffic — no sentinel / marker placeholder.
 async fn run_retention_cleanup_tick(
     intelligence: &IntelligenceService,
 ) -> anyhow::Result<()> {
-    const MARKER_TENANT: &str = "__chat_engine_retention_marker__";
-    let report = intelligence
-        .run_retention_cleanup_for_tenant(MARKER_TENANT)
-        .await?;
+    let report = intelligence.run_retention_cleanup_all_tenants().await?;
     info!(
-        tenant_id = %MARKER_TENANT,
         sessions_scanned = report.sessions.len(),
         sessions_skipped_locked = report.skipped_count(),
         total_messages_deleted = report.total_messages_deleted(),

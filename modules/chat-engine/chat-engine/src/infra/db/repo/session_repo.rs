@@ -173,6 +173,20 @@ pub trait SessionRepo: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Phase 8 hook (retention cleanup). Return the distinct `tenant_id`
+    /// values that currently own at least one `active` session. The
+    /// retention scheduler uses this to enumerate real tenants before
+    /// calling [`Self::list_active_sessions_for_tenant`] for each, so the
+    /// scheduler does not need an external tenant directory.
+    ///
+    /// Default impl returns an empty list so test mocks that don't care
+    /// about retention keep compiling.
+    async fn list_tenants_with_active_sessions(
+        &self,
+    ) -> Result<Vec<String>, ChatEngineError> {
+        Ok(Vec::new())
+    }
+
     /// Phase 8 hook (overflow recovery). Look up a session by primary key
     /// only — NOT scoped by tenant/user. Used **exclusively** by the
     /// internal context-overflow recovery path
@@ -484,6 +498,25 @@ impl SessionRepo for SeaSessionRepo {
                 session_entity::Column::LifecycleState
                     .eq(LifecycleState::Active.as_str().to_string()),
             )
+            .all(&self.db)
+            .await?;
+        Ok(rows)
+    }
+
+    async fn list_tenants_with_active_sessions(
+        &self,
+    ) -> Result<Vec<String>, ChatEngineError> {
+        use sea_orm::QuerySelect;
+
+        let rows: Vec<String> = SessionEntity::find()
+            .select_only()
+            .column(session_entity::Column::TenantId)
+            .distinct()
+            .filter(
+                session_entity::Column::LifecycleState
+                    .eq(LifecycleState::Active.as_str().to_string()),
+            )
+            .into_tuple()
             .all(&self.db)
             .await?;
         Ok(rows)
