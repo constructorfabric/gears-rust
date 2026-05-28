@@ -1,0 +1,21 @@
+server:
+  home_dir: ~/.cyberfabric
+
+database:
+  servers:
+    sqlite_dev:
+      dsn: "sqlite:///Users/ritmix/.cyberfabric/chat_engine.db?mode=rwc"
+
+modules:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+  chat-engine:
+    database:
+      server: sqlite_dev
+  simple-user-settings:
+    database:
+      server: sqlite_dev
+  file-parser:
+    config:
+      allowed_local_base_dir: /tmp/hyperspot-files

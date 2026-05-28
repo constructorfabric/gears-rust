@@ -1684,6 +1684,7 @@
       },
       "StreamingChunkEvent": {
         "type": "object",
+        "description": "A partial content fragment to append to the assistant message in flight. Multiple StreamingChunkEvent payloads concatenate to the full message text.",
         "required": [
           "type",
           "message_id",
@@ -1698,32 +1699,14 @@
             "$ref": "../schemas/common/GtsMessageId.json"
           },
           "chunk": {
-            "type": "object",
-            "required": [
-              "type",
-              "content"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "text",
-                  "code",
-                  "image",
-                  "audio",
-                  "video",
-                  "document"
-                ]
-              },
-              "content": {
-                "type": "string"
-              }
-            }
+            "type": "string",
+            "description": "Text payload to append to the message content."
           }
         }
       },
       "StreamingCompleteEvent": {
         "type": "object",
+        "description": "Signals the assistant message is fully persisted and the stream is closing. The `metadata` field is omitted from the wire payload when no metadata is provided (it is not serialized as `null`).",
         "required": [
           "type",
           "message_id"
@@ -1738,6 +1721,7 @@
           },
           "metadata": {
             "type": "object",
+            "description": "Optional plugin-defined metadata (model used, finish_reason, token usage, etc.). Omitted when the plugin produced no metadata.",
             "properties": {
               "usage": {
                 "type": "object",
@@ -1756,11 +1740,11 @@
       },
       "StreamingErrorEvent": {
         "type": "object",
+        "description": "Signals a mid-stream failure; the assistant message may be incomplete. After an error event no further events are emitted for the stream.",
         "required": [
           "type",
           "message_id",
-          "code",
-          "detail"
+          "error"
         ],
         "properties": {
           "type": {
@@ -1770,11 +1754,9 @@
           "message_id": {
             "$ref": "../schemas/common/GtsMessageId.json"
           },
-          "code": {
-            "$ref": "../schemas/common/ErrorCode.json"
-          },
-          "detail": {
-            "type": "string"
+          "error": {
+            "type": "string",
+            "description": "Human-readable error description. May include a plugin-defined error code as a prefix (for example `context_overflow: context window exceeded`) when the plugin needs to convey a programmatic discriminator."
           }
         }
       },
