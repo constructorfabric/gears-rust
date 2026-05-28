@@ -258,6 +258,48 @@ pub trait MessageRepo: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Phase 8 hook (retention cleanup, bounded). Count non-root
+    /// messages in the session. Used by the count-based policy to
+    /// decide whether anything is over the threshold *without*
+    /// materialising the full message list. Default impl returns 0.
+    async fn count_non_root_messages(
+        &self,
+        session_id: Uuid,
+    ) -> Result<u64, ChatEngineError> {
+        let _ = session_id;
+        Ok(0)
+    }
+
+    /// Phase 8 hook (retention cleanup, bounded). Return the IDs of
+    /// the OLDEST non-root messages in the session — ordered by
+    /// `created_at ASC` — capped at `limit`. Returns only ids (not
+    /// full `Message` rows) so the SQL projection stays cheap even on
+    /// a session with millions of messages. Default impl returns an
+    /// empty list.
+    async fn list_oldest_non_root_message_ids(
+        &self,
+        session_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, ChatEngineError> {
+        let _ = (session_id, limit);
+        Ok(Vec::new())
+    }
+
+    /// Phase 8 hook (retention cleanup, bounded). Return the IDs of
+    /// non-root messages with `created_at < older_than`, ordered by
+    /// `created_at ASC`, capped at `limit`. Mirrors
+    /// [`Self::list_oldest_non_root_message_ids`] for the age-based
+    /// policy. Default impl returns an empty list.
+    async fn list_non_root_message_ids_older_than(
+        &self,
+        session_id: Uuid,
+        older_than: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, ChatEngineError> {
+        let _ = (session_id, older_than, limit);
+        Ok(Vec::new())
+    }
+
     /// Phase 8 hook (retention cleanup). Atomically delete the message
     /// identified by `root_id` and every descendant reachable through
     /// `parent_message_id` within `session_id`. The traversal walks the
@@ -533,6 +575,64 @@ impl MessageRepo for SeaMessageRepo {
             .all(&self.db)
             .await?;
         Ok(rows.into_iter().map(Message::from).collect())
+    }
+
+    async fn count_non_root_messages(
+        &self,
+        session_id: Uuid,
+    ) -> Result<u64, ChatEngineError> {
+        use sea_orm::PaginatorTrait;
+
+        let n = MessageEntity::find()
+            .filter(message_entity::Column::SessionId.eq(session_id))
+            .filter(message_entity::Column::ParentMessageId.is_not_null())
+            .count(&self.db)
+            .await?;
+        Ok(n)
+    }
+
+    async fn list_oldest_non_root_message_ids(
+        &self,
+        session_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, ChatEngineError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<Uuid> = MessageEntity::find()
+            .select_only()
+            .column(message_entity::Column::MessageId)
+            .filter(message_entity::Column::SessionId.eq(session_id))
+            .filter(message_entity::Column::ParentMessageId.is_not_null())
+            .order_by_asc(message_entity::Column::CreatedAt)
+            .limit(u64::from(limit))
+            .into_tuple()
+            .all(&self.db)
+            .await?;
+        Ok(ids)
+    }
+
+    async fn list_non_root_message_ids_older_than(
+        &self,
+        session_id: Uuid,
+        older_than: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, ChatEngineError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<Uuid> = MessageEntity::find()
+            .select_only()
+            .column(message_entity::Column::MessageId)
+            .filter(message_entity::Column::SessionId.eq(session_id))
+            .filter(message_entity::Column::ParentMessageId.is_not_null())
+            .filter(message_entity::Column::CreatedAt.lt(older_than))
+            .order_by_asc(message_entity::Column::CreatedAt)
+            .limit(u64::from(limit))
+            .into_tuple()
+            .all(&self.db)
+            .await?;
+        Ok(ids)
     }
 
     async fn insert_summary_message(

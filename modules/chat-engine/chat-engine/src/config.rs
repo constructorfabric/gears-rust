@@ -45,6 +45,21 @@ pub struct ChatEngineConfig {
     #[serde(default = "defaults::retention_cleanup_interval_hours")]
     pub retention_cleanup_interval_hours: u64,
 
+    /// Maximum number of active sessions processed in a single tenant
+    /// during one retention tick. Bounds the wall-clock latency of a
+    /// tick so a large tenant cannot delay the scheduler indefinitely.
+    /// MUST be > 0.
+    #[serde(default = "defaults::retention_max_sessions_per_tick")]
+    pub retention_max_sessions_per_tick: u32,
+
+    /// Maximum number of eligible subtree roots a single session may
+    /// delete during one tick. Bounds both per-session memory use (the
+    /// SQL query returns only this many ids) and per-session work
+    /// (each id triggers one SERIALIZABLE subtree delete transaction).
+    /// MUST be > 0.
+    #[serde(default = "defaults::retention_max_deletes_per_session")]
+    pub retention_max_deletes_per_session: u32,
+
     /// Default share token TTL (seconds). When `None`, share tokens
     /// inherit the per-request `expires_in_hours` payload.
     #[serde(default)]
@@ -88,6 +103,8 @@ impl Default for ChatEngineConfig {
             ndjson_buffer_size: defaults::ndjson_buffer_size(),
             summary_buffer_size: defaults::summary_buffer_size(),
             retention_cleanup_interval_hours: defaults::retention_cleanup_interval_hours(),
+            retention_max_sessions_per_tick: defaults::retention_max_sessions_per_tick(),
+            retention_max_deletes_per_session: defaults::retention_max_deletes_per_session(),
             default_share_token_ttl: None,
             webhook_endpoints: Vec::new(),
             llm_gateway_base_url: None,
@@ -108,6 +125,10 @@ impl ChatEngineConfig {
     ///   `summary_buffer_size == 0`.
     /// - [`ConfigError::ZeroRetentionInterval`] if
     ///   `retention_cleanup_interval_hours == 0`.
+    /// - [`ConfigError::ZeroRetentionCap`] if either
+    ///   `retention_max_sessions_per_tick == 0` or
+    ///   `retention_max_deletes_per_session == 0` (a zero cap would
+    ///   make every tick a no-op).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.ndjson_buffer_size == 0 {
             return Err(ConfigError::ZeroBufferSize {
@@ -121,6 +142,16 @@ impl ChatEngineConfig {
         }
         if self.retention_cleanup_interval_hours == 0 {
             return Err(ConfigError::ZeroRetentionInterval);
+        }
+        if self.retention_max_sessions_per_tick == 0 {
+            return Err(ConfigError::ZeroRetentionCap {
+                field: "retention_max_sessions_per_tick",
+            });
+        }
+        if self.retention_max_deletes_per_session == 0 {
+            return Err(ConfigError::ZeroRetentionCap {
+                field: "retention_max_deletes_per_session",
+            });
         }
         Ok(())
     }
@@ -138,6 +169,11 @@ pub enum ConfigError {
     /// tight-loop `tokio::time::interval`.
     #[error("chat-engine config: retention_cleanup_interval_hours must be > 0")]
     ZeroRetentionInterval,
+
+    /// One of the retention-cap fields was set to zero — that would
+    /// make the retention scheduler a permanent no-op.
+    #[error("chat-engine config: {field} must be > 0")]
+    ZeroRetentionCap { field: &'static str },
 }
 
 mod defaults {
@@ -157,6 +193,21 @@ mod defaults {
 
     pub(super) fn retention_cleanup_interval_hours() -> u64 {
         24
+    }
+
+    pub(super) fn retention_max_sessions_per_tick() -> u32 {
+        // Tunable per deployment. The default bounds a tick to ~1000
+        // SERIALIZABLE subtree deletes in the worst case (combined
+        // with retention_max_deletes_per_session = 1).
+        1000
+    }
+
+    pub(super) fn retention_max_deletes_per_session() -> u32 {
+        // Per-session ceiling on subtree-root deletions in a single
+        // tick. Older subtree roots that exceed the cap are deferred
+        // to the next tick, which keeps a single heavy session from
+        // monopolising a tick.
+        1000
     }
 }
 

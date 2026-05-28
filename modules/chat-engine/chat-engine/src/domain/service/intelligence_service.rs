@@ -169,7 +169,23 @@ pub struct IntelligenceService {
     plugins: PluginService,
     summary_buffer_size: usize,
     summary_deadline: Duration,
+    /// Per-tick cap on the number of active sessions a single tenant
+    /// can process. See `ChatEngineConfig::retention_max_sessions_per_tick`.
+    retention_max_sessions_per_tick: u32,
+    /// Per-tick cap on the number of subtree-root deletions a single
+    /// session can perform. See
+    /// `ChatEngineConfig::retention_max_deletes_per_session`.
+    retention_max_deletes_per_session: u32,
 }
+
+/// Default per-tick session cap when the service is constructed
+/// without a config (test fixtures). Production wiring overrides this
+/// via [`IntelligenceService::with_retention_caps`].
+pub const DEFAULT_RETENTION_MAX_SESSIONS_PER_TICK: u32 = 1000;
+
+/// Default per-session per-tick deletion cap. See
+/// [`DEFAULT_RETENTION_MAX_SESSIONS_PER_TICK`].
+pub const DEFAULT_RETENTION_MAX_DELETES_PER_SESSION: u32 = 1000;
 
 impl IntelligenceService {
     #[must_use]
@@ -186,6 +202,8 @@ impl IntelligenceService {
             plugins,
             summary_buffer_size: DEFAULT_SUMMARY_BUFFER_SIZE,
             summary_deadline: DEFAULT_SUMMARY_DEADLINE,
+            retention_max_sessions_per_tick: DEFAULT_RETENTION_MAX_SESSIONS_PER_TICK,
+            retention_max_deletes_per_session: DEFAULT_RETENTION_MAX_DELETES_PER_SESSION,
         }
     }
 
@@ -201,6 +219,19 @@ impl IntelligenceService {
     #[must_use]
     pub fn with_summary_deadline(mut self, deadline: Duration) -> Self {
         self.summary_deadline = deadline;
+        self
+    }
+
+    /// Override the retention-cleanup caps. Zero values are clamped to
+    /// 1 so a single tick still makes forward progress.
+    #[must_use]
+    pub fn with_retention_caps(
+        mut self,
+        max_sessions_per_tick: u32,
+        max_deletes_per_session: u32,
+    ) -> Self {
+        self.retention_max_sessions_per_tick = max_sessions_per_tick.max(1);
+        self.retention_max_deletes_per_session = max_deletes_per_session.max(1);
         self
     }
 
@@ -486,7 +517,25 @@ impl IntelligenceService {
         &self,
         tenant_id: &str,
     ) -> Result<RetentionCleanupReport> {
-        let active = self.sessions.list_active_sessions_for_tenant(tenant_id).await?;
+        let mut active = self.sessions.list_active_sessions_for_tenant(tenant_id).await?;
+
+        // Per-tick cap so a single tenant cannot block the scheduler:
+        // sessions beyond the cap are deferred to the next tick. Sort
+        // by session_id first to give deferred sessions a deterministic
+        // order across ticks (without this, the rollover would depend
+        // on whichever order the SELECT happened to return).
+        let cap = self.retention_max_sessions_per_tick as usize;
+        active.sort_by_key(|r| r.session_id);
+        if active.len() > cap {
+            warn!(
+                tenant_id,
+                total = active.len(),
+                cap,
+                "tenant has more active sessions than retention_max_sessions_per_tick; \
+                 deferring the remainder to the next tick",
+            );
+            active.truncate(cap);
+        }
         let mut outcomes: Vec<SessionCleanupOutcome> = Vec::with_capacity(active.len());
 
         for row in active {
@@ -615,36 +664,37 @@ impl IntelligenceService {
             RetentionPolicy::AgeBased { max_age_days } => {
                 let cutoff = OffsetDateTime::now_utc()
                     - Duration::from_secs(u64::from(*max_age_days) * 86_400);
-                let rows = self
-                    .messages
-                    .list_non_root_messages_older_than(session_id, cutoff)
-                    .await?;
-                // Defensive: filter `parent_message_id.is_some()` again so
-                // repository defaults that ignore the predicate cannot
-                // accidentally return root messages.
-                Ok(rows
-                    .into_iter()
-                    .filter(|m| m.parent_message_id.is_some())
-                    .map(|m| m.message_id)
-                    .collect())
+                // Push the WHERE + LIMIT into SQL and project only the
+                // message_id column — the previous form selected every
+                // column for every matching row, then dropped them in
+                // the service. Capped at the per-session tick budget.
+                self.messages
+                    .list_non_root_message_ids_older_than(
+                        session_id,
+                        cutoff,
+                        self.retention_max_deletes_per_session,
+                    )
+                    .await
             }
             RetentionPolicy::CountBased { max_message_count } => {
-                let rows = self.messages.list_non_root_messages_chrono(session_id).await?;
-                let filtered: Vec<Message> = rows
-                    .into_iter()
-                    .filter(|m| m.parent_message_id.is_some())
-                    .collect();
-                let total = filtered.len();
-                let max = *max_message_count as usize;
+                let max = u64::from(*max_message_count);
+                // One cheap COUNT(*) instead of materialising every
+                // non-root row.
+                let total = self.messages.count_non_root_messages(session_id).await?;
                 if total <= max {
                     return Ok(Vec::new());
                 }
                 let surplus = total - max;
-                Ok(filtered
-                    .into_iter()
-                    .take(surplus)
-                    .map(|m| m.message_id)
-                    .collect())
+                // Cap the deletion budget so a session with millions of
+                // surplus rows can't dominate a tick. Anything left
+                // over rolls into the next tick.
+                let limit = surplus
+                    .min(u64::from(self.retention_max_deletes_per_session))
+                    .try_into()
+                    .unwrap_or(self.retention_max_deletes_per_session);
+                self.messages
+                    .list_oldest_non_root_message_ids(session_id, limit)
+                    .await
             }
         }
     }
@@ -1147,6 +1197,60 @@ mod tests {
                         && m.created_at < older_than
                 })
                 .cloned()
+                .collect())
+        }
+        async fn count_non_root_messages(
+            &self,
+            session_id: Uuid,
+        ) -> std::result::Result<u64, ChatEngineError> {
+            Ok(self
+                .all
+                .lock()
+                .iter()
+                .filter(|m| m.session_id == session_id && m.parent_message_id.is_some())
+                .count() as u64)
+        }
+        async fn list_oldest_non_root_message_ids(
+            &self,
+            session_id: Uuid,
+            limit: u32,
+        ) -> std::result::Result<Vec<Uuid>, ChatEngineError> {
+            let mut rows: Vec<Message> = self
+                .all
+                .lock()
+                .iter()
+                .filter(|m| m.session_id == session_id && m.parent_message_id.is_some())
+                .cloned()
+                .collect();
+            rows.sort_by_key(|m| m.created_at);
+            Ok(rows
+                .into_iter()
+                .take(limit as usize)
+                .map(|m| m.message_id)
+                .collect())
+        }
+        async fn list_non_root_message_ids_older_than(
+            &self,
+            session_id: Uuid,
+            older_than: OffsetDateTime,
+            limit: u32,
+        ) -> std::result::Result<Vec<Uuid>, ChatEngineError> {
+            let mut rows: Vec<Message> = self
+                .all
+                .lock()
+                .iter()
+                .filter(|m| {
+                    m.session_id == session_id
+                        && m.parent_message_id.is_some()
+                        && m.created_at < older_than
+                })
+                .cloned()
+                .collect();
+            rows.sort_by_key(|m| m.created_at);
+            Ok(rows
+                .into_iter()
+                .take(limit as usize)
+                .map(|m| m.message_id)
                 .collect())
         }
         async fn delete_message_subtree(
@@ -1902,6 +2006,66 @@ mod tests {
         let svc = make_service(sessions, msgs);
         let report = svc.run_retention_cleanup_for_tenant("t").await.unwrap();
         assert!(report.sessions.is_empty());
+    }
+
+    // ----- retention caps -------------------------------------------------
+
+    #[tokio::test]
+    async fn run_cleanup_caps_sessions_per_tick_and_defers_remainder() {
+        // Five active sessions, cap = 2 → only the first two by
+        // session_id are processed this tick.
+        let session_ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let rows: Vec<_> = session_ids
+            .iter()
+            .map(|sid| make_session(*sid, None))
+            .collect();
+        let sessions = MockSessionRepo::new(rows);
+        let msgs = MockMessageRepo::new(vec![]);
+        let svc = make_service(sessions, msgs).with_retention_caps(2, 1000);
+        let report = svc.run_retention_cleanup_for_tenant("t").await.unwrap();
+        assert_eq!(
+            report.sessions.len(),
+            2,
+            "session cap should limit processed sessions per tick",
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_count_based_caps_deletion_budget_per_session() {
+        // Per-session deletion cap = 2; surplus = 5 (max=1, total=6).
+        // Only the 2 oldest non-root ids are returned.
+        let session_id = Uuid::new_v4();
+        let root_id = Uuid::new_v4();
+        let mut msgs = vec![make_message(session_id, None, 0)];
+        // 6 non-root messages with strictly increasing created_at.
+        for i in 1..=6 {
+            msgs.push(make_message(session_id, Some(root_id), i));
+        }
+        let oldest_two: Vec<Uuid> = {
+            let mut sorted = msgs.clone();
+            sorted.sort_by_key(|m| m.created_at);
+            sorted
+                .iter()
+                .filter(|m| m.parent_message_id.is_some())
+                .take(2)
+                .map(|m| m.message_id)
+                .collect()
+        };
+
+        let sessions = MockSessionRepo::new(vec![]);
+        let messages = MockMessageRepo::new(msgs);
+        let svc = make_service(sessions, messages).with_retention_caps(1000, 2);
+        let eligible = svc
+            .evaluate_retention_policy(
+                session_id,
+                &RetentionPolicy::CountBased {
+                    max_message_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(eligible.len(), 2, "deletion cap should bound eligible ids");
+        assert_eq!(eligible, oldest_two, "should select the OLDEST non-root ids");
     }
 
     // ----- run_retention_cleanup_all_tenants ------------------------------
