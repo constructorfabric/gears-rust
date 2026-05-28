@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::watch;
 use tracing::{debug, warn};
+
+use crate::domain::ports::OagwMetricsPort;
 
 // ---------------------------------------------------------------------------
 // PrefixedReader — prepends buffered bytes before an inner AsyncRead
@@ -478,6 +480,45 @@ pub(crate) struct WebSocketBridgeIo {
     pub close_timeout: Duration,
     pub max_frame_size: Option<usize>,
     pub shutdown_rx: watch::Receiver<bool>,
+    /// Metrics port used to track session lifetime. May be `None` in tests
+    /// that don't exercise metrics — the bridge still runs, just without
+    /// recording.
+    pub metrics: Option<Arc<dyn OagwMetricsPort>>,
+    /// Upstream alias (`host` label) for session metrics. Empty when
+    /// `metrics` is `None`.
+    pub host: String,
+}
+
+/// RAII guard for an active WebSocket session.
+///
+/// Increments `active_websocket_sessions` on construction and, on drop,
+/// decrements the gauge and records `websocket_session_duration_seconds`.
+/// Drop semantics ensure the gauge cannot leak even if the bridge future
+/// is cancelled or panics — `Drop` runs in both cases.
+struct WsSessionGuard {
+    metrics: Arc<dyn OagwMetricsPort>,
+    host: String,
+    start: Instant,
+}
+
+impl WsSessionGuard {
+    fn new(metrics: Arc<dyn OagwMetricsPort>, host: String) -> Self {
+        metrics.increment_active_websocket_sessions(&host);
+        Self {
+            metrics,
+            host,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for WsSessionGuard {
+    fn drop(&mut self) {
+        let duration = self.start.elapsed().as_secs_f64();
+        self.metrics.decrement_active_websocket_sessions(&self.host);
+        self.metrics
+            .record_websocket_session_duration_seconds(&self.host, duration);
+    }
 }
 
 /// Wrapper that satisfies `Clone + Send + Sync + 'static` required by
@@ -517,7 +558,12 @@ pub(crate) async fn websocket_bridge(
         close_timeout,
         max_frame_size,
         shutdown_rx,
+        metrics,
+        host,
     } = bridge;
+    // RAII guard: increments the active-sessions gauge now, records duration
+    // and decrements on drop — even on panic / future cancellation.
+    let _session_guard = metrics.map(|m| WsSessionGuard::new(m, host));
     let (upstream_read, mut upstream_write) = split(io);
     // Prepend any leftover bytes from 101 header parsing to the upstream
     // read stream so they are parsed as WebSocket frames by the relay.

@@ -471,7 +471,7 @@ The OAGW design is decomposed into eight features organized along functional bou
 - **Scope**:
   - Prometheus metrics: `oagw_requests_total`, `oagw_request_duration_seconds`, `oagw_requests_in_flight`, `oagw_errors_total`, `oagw_circuit_breaker_state`, `oagw_rate_limit_exceeded_total`, `oagw_circuit_breaker_transitions_total`, `oagw_rate_limit_usage_ratio`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`, `oagw_upstream_available`, `oagw_upstream_connections`
   - Histogram buckets: `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
-  - Cardinality management: no tenant labels, normalized paths, status class grouping
+  - Cardinality management: no tenant labels; normalized `http.route` from route config; `http.request.method` normalized to standard verbs or `_OTHER`; numeric `http.response.status_code` (OTel HTTP semconv) — status-class queries are expressed at query time over the numeric code
   - Structured JSON audit logging to stdout: request ID, tenant, host, path, method, status, duration, sizes
   - Log level policies: INFO (success), WARN (rate limit/circuit breaker), ERROR (failures/timeouts); plugin execution is traced via structured events and metrics, not log levels
   - No PII, no secrets in logs; high-frequency sampling for volume control

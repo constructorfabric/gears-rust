@@ -709,6 +709,7 @@ impl TestDpBuilder {
             self.token_cache_config,
             backend_selector,
             proxy,
+            std::sync::Arc::new(crate::domain::ports::NoopMetrics),
         )
         .with_allow_http_upstream(true);
         if let Some(timeout) = self.request_timeout {

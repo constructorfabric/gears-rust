@@ -19,10 +19,12 @@ use tracing::info;
 use types_registry_sdk::{RegisterResult, RegisterSummary, TypesRegistryClient};
 
 use crate::api::rest::routes;
+use crate::domain::ports::OagwMetricsPort;
 use crate::domain::services::{
     ControlPlaneService, ControlPlaneServiceImpl, DataPlaneService, EndpointSelector,
     ServiceGatewayClientV1Facade,
 };
+use crate::infra::metrics::OagwMetricsMeter;
 use crate::infra::proxy::DataPlaneServiceImpl;
 use crate::infra::storage::{InMemoryRouteRepo, InMemoryUpstreamRepo};
 
@@ -92,6 +94,14 @@ impl Module for OutboundApiGatewayModule {
             ssrf_guard.clone(),
         ));
 
+        // -- Metrics --
+        let metrics_prefix = cfg.metrics.effective_prefix("oagw");
+        let scope = opentelemetry::InstrumentationScope::builder("oagw").build();
+        let metrics: Arc<dyn OagwMetricsPort> = Arc::new(OagwMetricsMeter::new(
+            &opentelemetry::global::meter_with_scope(scope),
+            &metrics_prefix,
+        ));
+
         // -- Data Plane init (Pingora proxy engine) --
         let server_conf = Arc::new(pingora_core::server::configuration::ServerConf {
             upstream_keepalive_pool_size: 128,
@@ -134,6 +144,7 @@ impl Module for OutboundApiGatewayModule {
                 token_cache_config,
                 backend_selector.clone(),
                 proxy,
+                metrics,
             )
             .with_request_timeout(Duration::from_secs(cfg.proxy_timeout_secs))
             .with_max_body_size(cfg.max_body_size_bytes)

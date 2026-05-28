@@ -46,6 +46,9 @@ types-registry-sdk = { workspace = true }
 authz-resolver-sdk = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
 credstore-sdk = { workspace = true }
+# Metrics / OpenTelemetry
+opentelemetry = { workspace = true }
+heck = { workspace = true }
 # CP deps
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
@@ -76,6 +79,7 @@ rcgen = { workspace = true, optional = true }
 [dev-dependencies]
 cyberware-oagw = { path = ".", features = ["test-utils"] }
 modkit = { workspace = true, features = ["bootstrap"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "net"] }
 tower = { workspace = true, features = ["util"] }

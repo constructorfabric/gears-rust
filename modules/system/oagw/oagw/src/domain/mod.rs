@@ -3,6 +3,7 @@ pub(crate) mod error;
 pub(crate) mod gts_helpers;
 pub(crate) mod model;
 pub(crate) mod plugin;
+pub(crate) mod ports;
 pub(crate) mod rate_limit;
 pub(crate) mod repo;
 pub(crate) mod services;

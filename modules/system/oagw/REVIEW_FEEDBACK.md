@@ -216,7 +216,7 @@
     - Recommendation: Use Redis `INCRBY` returning new value in single command, implement proper distributed rate limiting (Redis Cell or Sliding Window Log)
 
 - [ ] 4.4 **[Medium]** Metrics Host Label Ambiguity with Alias Shadowing (Cascade)
-    - Location: `DESIGN.md` → Metrics labels: `{host, path, method, status_class}` (lines 2428-2466)
+    - Location: `DESIGN.md` → Metrics labels: `{host, path, method, http.response.status_code}` (lines 2428-2466)
     - Issue: `host` label uses hostname, but alias shadowing means same `host` might represent different tenant configs/endpoints
     - Impact: Misleading metrics for incident response
     - Recommendation: Add stable low-cardinality identifier label (e.g., `upstream_key` = first 8 chars of UUID), keep `host` as informational

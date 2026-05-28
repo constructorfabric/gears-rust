@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
@@ -26,6 +26,8 @@ use crate::domain::plugin::{
     AuthContext, GuardContext, GuardDecision, TransformErrorContext, TransformRequestContext,
     TransformResponseContext,
 };
+use crate::domain::ports::OagwMetricsPort;
+use crate::domain::ports::metric_labels::{self, phase};
 use crate::domain::rate_limit::{
     RateLimitKeyContext, RateLimitOutcome, RateLimitResource, RateLimiter, build_rate_limit_key,
 };
@@ -73,9 +75,12 @@ pub struct DataPlaneServiceImpl {
     websocket_max_frame_size: Option<usize>,
     /// Idle timeout for SSE streaming connections (no data from upstream).
     streaming_idle_timeout: Duration,
+    /// Operational metrics port (OTel-backed in production).
+    metrics: Arc<dyn OagwMetricsPort>,
 }
 
 impl DataPlaneServiceImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cp: Arc<dyn ControlPlaneService>,
         credstore: Arc<dyn CredStoreClientV1>,
@@ -84,6 +89,7 @@ impl DataPlaneServiceImpl {
         token_cache_config: TokenCacheConfig,
         backend_selector: Arc<dyn EndpointSelector>,
         proxy: Arc<HttpProxy<PingoraProxy>>,
+        metrics: Arc<dyn OagwMetricsPort>,
     ) -> Self {
         let auth_registry =
             AuthPluginRegistry::with_builtins(credstore, token_http_config, token_cache_config);
@@ -110,6 +116,7 @@ impl DataPlaneServiceImpl {
             websocket_close_timeout: Duration::from_secs(5),
             websocket_max_frame_size: None,
             streaming_idle_timeout: Duration::from_secs(300),
+            metrics,
         }
     }
 
@@ -435,6 +442,92 @@ fn parse_proxy_request(
     })
 }
 
+/// Terminal outcome captured before [`RequestMetricsGuard`] drops.
+///
+/// `Pending` is the unwritten state — the guard treats it as a cancellation
+/// (future dropped before a result was produced) and records an error.
+enum RequestOutcome {
+    Pending,
+    Success(u16),
+    Error(&'static str),
+}
+
+/// RAII guard that owns the per-request metric bookkeeping for
+/// [`DataPlaneServiceImpl::proxy_request`].
+///
+/// On construction it captures the start time. After upstream resolution,
+/// [`Self::mark_resolved`] sets the labels and increments the in-flight
+/// gauge. Before the request returns, the body calls
+/// [`Self::set_success`] or [`Self::set_error`] to record the terminal
+/// outcome. `Drop` then decrements the in-flight gauge (if it was ever
+/// incremented), records the duration histogram, and emits the success or
+/// error counter — even if the future is cancelled or panics.
+struct RequestMetricsGuard {
+    metrics: Arc<dyn OagwMetricsPort>,
+    start: Instant,
+    method: &'static str,
+    host: String,
+    path: String,
+    in_flight: bool,
+    outcome: RequestOutcome,
+}
+
+impl RequestMetricsGuard {
+    fn new(metrics: Arc<dyn OagwMetricsPort>, method: &'static str) -> Self {
+        Self {
+            metrics,
+            start: Instant::now(),
+            method,
+            host: metric_labels::UNKNOWN.to_owned(),
+            path: metric_labels::UNKNOWN.to_owned(),
+            in_flight: false,
+            outcome: RequestOutcome::Pending,
+        }
+    }
+
+    fn mark_resolved(&mut self, host: String, path: String) {
+        self.host = host;
+        self.path = path;
+        self.metrics.increment_in_flight(&self.host);
+        self.in_flight = true;
+    }
+
+    fn set_success(&mut self, status: u16) {
+        self.outcome = RequestOutcome::Success(status);
+    }
+
+    fn set_error(&mut self, variant: &'static str) {
+        self.outcome = RequestOutcome::Error(variant);
+    }
+}
+
+impl Drop for RequestMetricsGuard {
+    fn drop(&mut self) {
+        if self.in_flight {
+            self.metrics.decrement_in_flight(&self.host);
+        }
+        self.metrics.record_request_duration_seconds(
+            &self.host,
+            &self.path,
+            phase::TOTAL,
+            self.start.elapsed().as_secs_f64(),
+        );
+        match self.outcome {
+            RequestOutcome::Success(status) => {
+                self.metrics
+                    .record_request(&self.host, &self.path, self.method, status);
+            }
+            RequestOutcome::Error(variant) => {
+                self.metrics.record_error(&self.host, &self.path, variant);
+            }
+            RequestOutcome::Pending => {
+                self.metrics
+                    .record_error(&self.host, &self.path, "Cancelled");
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl DataPlaneService for DataPlaneServiceImpl {
     async fn proxy_request(
@@ -442,37 +535,55 @@ impl DataPlaneService for DataPlaneServiceImpl {
         ctx: SecurityContext,
         req: http::Request<Body>,
     ) -> Result<http::Response<Body>, DomainError> {
-        let ParsedRequest {
-            instance_uri,
-            alias,
-            path_suffix,
-            mut query_params,
-            method,
-            req_headers,
-            is_upgrade,
-            body_bytes,
-            body_stream,
-        } = parse_proxy_request(req, self.max_body_size)?;
+        let method = crate::infra::metrics::normalize_method(req.method());
+        let mut guard = RequestMetricsGuard::new(Arc::clone(&self.metrics), method);
+        let mut host_label: String = metric_labels::UNKNOWN.to_owned();
+        let mut path_label: String = metric_labels::UNKNOWN.to_owned();
 
-        self.policy_enforcer
-            .access_scope_with(
-                &ctx,
-                &resources::PROXY,
-                actions::INVOKE,
-                None,
-                &AccessRequest::new()
-                    .require_constraints(false)
-                    .context_tenant_id(ctx.subject_tenant_id()),
-            )
-            .await?;
+        let result: Result<http::Response<Body>, DomainError> = async {
+            let ParsedRequest {
+                instance_uri,
+                alias,
+                path_suffix,
+                mut query_params,
+                method,
+                req_headers,
+                is_upgrade,
+                body_bytes,
+                body_stream,
+            } = parse_proxy_request(req, self.max_body_size)?;
 
-        let max_body = self.max_body_size;
+            self.policy_enforcer
+                .access_scope_with(
+                    &ctx,
+                    &resources::PROXY,
+                    actions::INVOKE,
+                    None,
+                    &AccessRequest::new()
+                        .require_constraints(false)
+                        .context_tenant_id(ctx.subject_tenant_id()),
+                )
+                .await?;
 
-        // 1. Resolve upstream + route in one pass (single hierarchy walk).
-        let (upstream, route) = self
-            .cp
-            .resolve_proxy_target(&ctx, &alias, method.as_ref(), &path_suffix)
-            .await?;
+            let max_body = self.max_body_size;
+
+            // 1. Resolve upstream + route in one pass (single hierarchy walk).
+            let (upstream, route) = self
+                .cp
+                .resolve_proxy_target(&ctx, &alias, method.as_ref(), &path_suffix)
+                .await?;
+
+            // Capture metric labels now that upstream + route are known, and
+            // begin tracking this request in the in-flight gauge via the
+            // RAII guard.
+            host_label = upstream.alias.clone();
+            path_label = route
+                .match_rules
+                .http
+                .as_ref()
+                .map_or("/", |h| h.path.as_str())
+                .to_owned();
+            guard.mark_resolved(host_label.clone(), path_label.clone());
 
         // 2. CORS origin enforcement for actual cross-origin requests.
         // Preflight is handled permissively at the handler level (no upstream resolution).
@@ -566,16 +677,29 @@ impl DataPlaneService for DataPlaneServiceImpl {
             }
         }
 
-        // 5. Execute auth plugin.
+        // 5. Execute auth plugin (timed: phase="auth").
+        //
+        // Recorded even on the error path so failures and successes are both
+        // visible in the latency histogram. We intentionally only observe
+        // when an auth plugin is configured — observing on every request
+        // would skew the bucket distribution with zero-cost "no auth" rows.
         if let Some(ref auth) = upstream.auth {
-            outbound_headers = execute_auth_plugin(
+            let auth_start = std::time::Instant::now();
+            let auth_result = execute_auth_plugin(
                 &self.auth_registry,
                 auth,
                 &outbound_headers,
                 &ctx,
                 &instance_uri,
             )
-            .await?;
+            .await;
+            self.metrics.record_request_duration_seconds(
+                &host_label,
+                &path_label,
+                phase::AUTH,
+                auth_start.elapsed().as_secs_f64(),
+            );
+            outbound_headers = auth_result?;
         }
 
         // 5b. Execute guard plugins (upstream then route).
@@ -652,6 +776,9 @@ impl DataPlaneService for DataPlaneServiceImpl {
             &req_headers,
             &ctx,
             &instance_uri,
+            self.metrics.as_ref(),
+            &host_label,
+            &path_label,
         )?;
 
         // 8. Build upstream URL.
@@ -712,6 +839,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             origin: request_origin,
             response_header_rules,
             rate_limit_outcome,
+            host: &host_label,
         };
 
         // 9. WebSocket upgrade: bypass the normal bridge and set up a
@@ -756,6 +884,15 @@ impl DataPlaneService for DataPlaneServiceImpl {
                 Err(err)
             }
         }
+        }
+        .await;
+
+        match &result {
+            Ok(resp) => guard.set_success(resp.status().as_u16()),
+            Err(err) => guard.set_error(domain_error_type_name(err)),
+        }
+
+        result
     }
 
     fn remove_rate_limit_keys_for_upstream(&self, upstream_id: Uuid) {
@@ -861,6 +998,8 @@ impl DataPlaneServiceImpl {
                     close_timeout: self.websocket_close_timeout,
                     max_frame_size: self.websocket_max_frame_size,
                     shutdown_rx: self.shutdown_rx.clone(),
+                    metrics: Some(self.metrics.clone()),
+                    host: pipeline.host.to_string(),
                 },
             ));
         Ok(resp)
@@ -1279,6 +1418,10 @@ fn enforce_cors_origin(
 ///
 /// Both upstream and route buckets are decremented unconditionally — an upstream
 /// token is spent even when a stricter route-level bucket later causes rejection.
+///
+/// Side effect: updates `rate_limit_usage_ratio` and (on rejection)
+/// `rate_limit_exceeded_total` metrics via the injected port.
+#[allow(clippy::too_many_arguments)]
 fn check_rate_limits(
     rate_limiter: &RateLimiter,
     upstream: &Upstream,
@@ -1286,12 +1429,29 @@ fn check_rate_limits(
     req_headers: &HeaderMap,
     ctx: &SecurityContext,
     instance_uri: &str,
+    metrics: &dyn OagwMetricsPort,
+    host_label: &str,
+    path_label: &str,
 ) -> Result<Option<(RateLimitOutcome, bool)>, DomainError> {
     let mut outcome: Option<(RateLimitOutcome, bool)> = None;
     let client_ip = headers::extract_client_ip(req_headers);
     let client_ip_ref = client_ip.as_deref();
     let tenant_id = ctx.subject_tenant_id();
     let subject_id = ctx.subject_id();
+
+    let record_consume_result = |result: &Result<RateLimitOutcome, DomainError>| match result {
+        Ok(outcome) if outcome.limit > 0 => {
+            let used = outcome.limit.saturating_sub(outcome.remaining) as f64;
+            let ratio = used / outcome.limit as f64;
+            metrics.record_rate_limit_usage_ratio(host_label, path_label, ratio);
+        }
+        Ok(_) => {}
+        Err(DomainError::RateLimitExceeded { .. }) => {
+            metrics.record_rate_limit_exceeded(host_label, path_label);
+            metrics.record_rate_limit_usage_ratio(host_label, path_label, 1.0);
+        }
+        Err(_) => {}
+    };
 
     if let Some(ref rl) = upstream.rate_limit {
         // For shared-pool budgets, use the pool owner's ID so all children
@@ -1306,7 +1466,9 @@ fn check_rate_limits(
             client_ip: client_ip_ref,
             window: &rl.sustained.window,
         });
-        let result = rate_limiter.try_consume(&key, rl, instance_uri)?;
+        let raw = rate_limiter.try_consume(&key, rl, instance_uri);
+        record_consume_result(&raw);
+        let result = raw?;
         outcome = Some((result, rl.response_headers));
     }
 
@@ -1320,7 +1482,9 @@ fn check_rate_limits(
             client_ip: client_ip_ref,
             window: &rl.sustained.window,
         });
-        let result = rate_limiter.try_consume(&key, rl, instance_uri)?;
+        let raw = rate_limiter.try_consume(&key, rl, instance_uri);
+        record_consume_result(&raw);
+        let result = raw?;
         match &outcome {
             Some((existing, show_headers)) if existing.remaining <= result.remaining => {
                 // Tighter (or equal) bucket wins for enforcement; on ties
@@ -1487,6 +1651,8 @@ struct ResponsePipelineCtx<'a> {
     origin: Option<String>,
     response_header_rules: Option<&'a ResponseHeaderRules>,
     rate_limit_outcome: Option<(RateLimitOutcome, bool)>,
+    /// Upstream alias — `host` label used by WebSocket session metrics.
+    host: &'a str,
 }
 
 /// Execute `on_error` for all transform bindings, logging errors without aborting.
@@ -1865,6 +2031,7 @@ mod tests {
             TokenCacheConfig::default(),
             selector,
             proxy,
+            Arc::new(crate::domain::ports::NoopMetrics),
         )
     }
 

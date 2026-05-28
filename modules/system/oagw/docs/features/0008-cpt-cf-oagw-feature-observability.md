@@ -152,14 +152,14 @@ Operators need full visibility into outbound API traffic patterns, errors, and p
 **Steps**:
 1. [ ] - `p2` - Extract or generate trace_id from inbound request context (propagate W3C Trace Context `traceparent` header if present; generate new trace_id otherwise) - `inst-mc-0`
 2. [ ] - `p2` - Normalize path from route configuration (use route match pattern, not raw path) to control cardinality - `inst-mc-1`
-3. [ ] - `p2` - Derive status_class from HTTP status code (2xx, 3xx, 4xx, 5xx) - `inst-mc-2`
+3. [ ] - `p2` - Capture the numeric HTTP response status code for the `http.response.status_code` label (OTel HTTP semconv; aligned with the inbound API Gateway) - `inst-mc-2`
 4. [ ] - `p2` - Increment `oagw_requests_in_flight{host}` gauge at request start - `inst-mc-3`
 5. [ ] - `p2` - **TRY** - `inst-mc-4`
    1. [ ] - `p2` - Execute proxy pipeline (auth → guards → transform → upstream call → response transform) - `inst-mc-4a`
 6. [ ] - `p2` - **CATCH** any error - `inst-mc-5`
    1. [ ] - `p2` - Increment `oagw_errors_total{host, path, error_type}` counter - `inst-mc-5a`
 7. [ ] - `p2` - Decrement `oagw_requests_in_flight{host}` gauge at request end - `inst-mc-6`
-8. [ ] - `p2` - Increment `oagw_requests_total{host, path, method, status_class}` counter - `inst-mc-7`
+8. [ ] - `p2` - Increment `oagw_requests_total{host, http.request.method, http.route, http.response.status_code}` counter (label keys per OTel HTTP semconv; method normalized) - `inst-mc-7`
 9. [ ] - `p2` - Observe request duration in `oagw_request_duration_seconds{host, path, phase}` histogram using configured buckets - `inst-mc-8`
 10. [ ] - `p2` - **IF** rate limit was evaluated - `inst-mc-9`
     1. [ ] - `p2` - Update `oagw_rate_limit_usage_ratio{host, path}` gauge with current token ratio (0.0–1.0) - `inst-mc-9a`
@@ -323,7 +323,7 @@ The system **MUST** expose all 12 OAGW Prometheus metrics at the admin `/metrics
 - Histograms: `oagw_request_duration_seconds` with buckets `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
 - Gauges: `oagw_requests_in_flight`, `oagw_circuit_breaker_state`, `oagw_rate_limit_usage_ratio`, `oagw_upstream_available`, `oagw_upstream_connections`
 
-Cardinality **MUST** be controlled: no tenant labels, normalized paths from route config, status class grouping (2xx/3xx/4xx/5xx).
+Cardinality **MUST** be controlled: no tenant labels; `http.route` is the normalized route match pattern from route config; `http.request.method` is normalized to a standard verb or `_OTHER`; `http.response.status_code` is the numeric upstream status (OTel HTTP semconv) — status-class queries (e.g. `5xx` rate) are expressed at query time over the numeric code. Label-key vocabulary matches the inbound API Gateway so both gateways share dashboards.
 
 **Implements**:
 - `cpt-cf-oagw-algo-obs-metrics-collection`

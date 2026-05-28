@@ -876,10 +876,10 @@ Config caching (in-memory caching of effective upstream/route configuration to a
 
 Prometheus metrics at `/metrics` (admin-only):
 
-- `oagw_requests_total{host, path, method, status_class}` — counter
-- `oagw_request_duration_seconds{host, path, phase}` — histogram
+- `oagw_requests_total{host, http.request.method, http.route, http.response.status_code}` — counter (label keys follow OTel HTTP semantic conventions; numeric status; method normalized to a standard verb or `_OTHER`; aligned with the inbound API Gateway)
+- `oagw_request_duration_seconds{host, http.route, phase}` — histogram
 - `oagw_requests_in_flight{host}` — gauge
-- `oagw_errors_total{host, path, error_type}` — counter
+- `oagw_errors_total{host, http.route, error_type}` — counter
 - `oagw_circuit_breaker_state{host}` — gauge
 - `oagw_rate_limit_exceeded_total{host, path}` — counter
 
@@ -897,7 +897,7 @@ Prometheus metrics at `/metrics` (admin-only):
 - `oagw_upstream_available{host, endpoint}` — gauge (0=down, 1=up)
 - `oagw_upstream_connections{host, state}` — gauge (state: `idle`, `active`, `max`)
 
-Cardinality management: no tenant labels, normalized paths from route config, status class grouping (2xx/3xx/4xx/5xx).
+Cardinality management: no tenant labels; `http.route` is the normalized route match pattern, not the raw request path; `http.request.method` is normalized to a standard verb or `_OTHER`; `http.response.status_code` is the numeric upstream status (OTel HTTP semconv). Status-class queries (`5xx` rate, etc.) are expressed at query time via regex on the numeric code. Label-key vocabulary matches the inbound API Gateway so both gateways share dashboards. `host` remains as an OAGW-specific label carrying the upstream alias.
 
 **Histogram Buckets** (request duration, seconds): `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
 

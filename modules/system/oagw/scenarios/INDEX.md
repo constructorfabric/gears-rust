@@ -422,7 +422,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Request metrics increment on success
 - **Scenario**: *Section 22.2 — no separate file.*
-- **Mechanism**: `oagw_requests_total` increments with correct labels (host, path, method, status_class). Histogram `phase=total/upstream/plugins` recorded.
+- **Mechanism**: `oagw_requests_total` increments with correct labels (`host`, `http.request.method`, `http.route`, `http.response.status_code`). Histogram `phase=total/upstream/plugins` recorded.
 
 #### Error metrics increment on gateway errors
 - **Scenario**: *Section 22.3 — no separate file.*
@@ -430,11 +430,11 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Cardinality rules (no tenant labels)
 - **Scenario**: *Section 22.4 — no separate file.*
-- **Mechanism**: Metrics output does not include `tenant_id` label. Path label uses configured route path, not dynamic suffix.
+- **Mechanism**: Metrics output does not include `tenant_id` label. The `http.route` label uses the configured route match pattern, not the dynamic request path suffix.
 
-#### Status metrics use status class grouping
+#### Status label follows OTel HTTP semantic conventions
 - **Scenario**: *Section 22.5 — no separate file.*
-- **Mechanism**: Metrics export uses `status_class=2xx/3xx/4xx/5xx` labels.
+- **Mechanism**: Metrics export uses the numeric `http.response.status_code` attribute (OTel HTTP semconv), matching the inbound API Gateway. Status-class queries (e.g. 5xx error rate) are expressed at query time via regex on the numeric code.
 
 #### Proxy requests produce structured audit log
 - **Scenario**: *Section 23.1 — no separate file.*

@@ -61,6 +61,33 @@ pub struct OagwConfig {
     /// Default: enabled with built-in deny-list, no extra rules.
     #[serde(default)]
     pub ssrf_policy: SsrfPolicy,
+    /// Metrics naming configuration.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Metrics configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Metric name prefix. When empty (the default), derived from the module
+    /// name by converting it to `snake_case` (e.g., `"oagw"` → `"oagw"`).
+    #[serde(default)]
+    pub prefix: String,
+}
+
+impl MetricsConfig {
+    /// Resolve the effective prefix: explicit config value, or
+    /// `snake_case(module_name)`.
+    #[must_use]
+    pub fn effective_prefix(&self, module_name: &str) -> String {
+        let trimmed = self.prefix.trim();
+        if trimmed.is_empty() {
+            heck::ToSnakeCase::to_snake_case(module_name)
+        } else {
+            trimmed.to_owned()
+        }
+    }
 }
 
 impl Default for OagwConfig {
@@ -78,6 +105,7 @@ impl Default for OagwConfig {
             protocol_cache_ttl_secs: default_protocol_cache_ttl_secs(),
             management_api_enabled: true,
             ssrf_policy: SsrfPolicy::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
