@@ -2,4 +2,5 @@
 
 pub mod db;
 pub mod llm_gateway;
+pub mod search;
 pub mod webhook_compat;

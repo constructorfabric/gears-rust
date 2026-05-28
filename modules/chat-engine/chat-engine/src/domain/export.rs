@@ -29,6 +29,7 @@
 use std::str::FromStr;
 
 use async_trait::async_trait;
+use modkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -44,6 +45,7 @@ use crate::domain::message::MessageRole;
 /// [`std::fmt::Display`] or [`serde::Serialize`] — the only sanctioned way
 /// to surface the raw value is to construct a [`ShareTokenIssue`] DTO
 /// inside the share-issuance handler.
+#[domain_model]
 #[derive(Clone, PartialEq, Eq)]
 pub struct ShareToken(String);
 
@@ -95,6 +97,7 @@ pub fn generate_share_token() -> ShareToken {
 }
 
 /// Export format. The wire value is the lowercase variant name.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportFormat {
@@ -153,6 +156,7 @@ impl FromStr for ExportFormat {
 /// to the session owner; `user_id` / `tenant_id` are intentionally
 /// included here because export is an authenticated path (unlike
 /// [`SharedSessionView`]).
+#[domain_model]
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportSessionMeta {
     pub session_id: Uuid,
@@ -170,6 +174,7 @@ pub struct ExportSessionMeta {
 
 /// One message in an export payload. The shape is stable across JSON and
 /// the rendered Markdown (Markdown is built from this view).
+#[domain_model]
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageView {
     pub message_id: Uuid,
@@ -185,6 +190,7 @@ pub struct MessageView {
 /// JSON envelope returned by `POST /sessions/{id}/export`. The Markdown
 /// variant returns plain text; this DTO carries the JSON shape plus the
 /// envelope metadata that the JSON renderer wraps around the messages.
+#[domain_model]
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportedSession {
     pub session: ExportSessionMeta,
@@ -199,6 +205,7 @@ pub struct ExportedSession {
 /// Response shape for `POST /sessions/{id}/share`. Carries the raw token
 /// string — this is the only `Serialize`-able surface in the crate that
 /// embeds the token verbatim.
+#[domain_model]
 #[derive(Debug, Clone, Serialize)]
 pub struct ShareTokenIssue {
     pub share_token: String,
@@ -210,6 +217,7 @@ pub struct ShareTokenIssue {
 /// Wire shape returned by the unauthenticated `GET /share/{token}` route.
 /// Contains a minimal session envelope plus the active-path messages.
 /// `user_id`, `tenant_id`, and the share token are intentionally absent.
+#[domain_model]
 #[derive(Debug, Clone, Serialize)]
 pub struct SharedSessionView {
     pub title: Option<String>,
@@ -222,6 +230,7 @@ pub struct SharedSessionView {
 
 /// Storage error returned by [`ExportStorage::upload`]. Maps to HTTP 502
 /// at the API boundary.
+#[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     /// Backend rejected the upload, refused the connection, or timed out.
@@ -257,6 +266,7 @@ pub trait ExportStorage: Send + Sync {
 /// Deterministic in-memory storage stub. Returns
 /// `memory://exports/{key}` without retaining the uploaded bytes —
 /// sufficient for Phase 10 smoke tests and Phase 15 wiring stubs.
+#[domain_model]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubExportStorage;
 

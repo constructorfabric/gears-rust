@@ -36,6 +36,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
+use modkit_macros::domain_model;
 use serde_json::{Map, Value as JsonValue};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -64,6 +65,7 @@ pub const METADATA_KEY_TITLE: &str = "title";
 /// Configuration for [`ExportService::create_share`]'s URL construction.
 /// Service consumers (Phase 15 module wiring) inject this when assembling
 /// the service so the share URL matches the public-facing host.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct ShareUrlBuilder {
     /// Public base URL (e.g. `https://chat.example.com`). No trailing
@@ -97,6 +99,7 @@ impl Default for ShareUrlBuilder {
 /// Cheap to clone — every field is an `Arc`. The service is generic over
 /// the repo / storage traits so unit tests can swap mocks without
 /// touching a database.
+#[domain_model]
 #[derive(Clone)]
 pub struct ExportService {
     sessions: Arc<dyn SessionRepo>,

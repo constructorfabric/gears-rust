@@ -43,6 +43,7 @@ use chat_engine_sdk::plugin::{
     ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream, SessionPluginCtx,
 };
 use futures::stream::{self, BoxStream, StreamExt};
+use modkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -85,6 +86,7 @@ pub const DEFAULT_PLUGIN_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Validated, owned request for `send_message`. Constructed by the handler
 /// from the wire body + the JWT-derived [`Identity`].
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct SendMessageRequest {
     pub session_id: Uuid,
@@ -101,6 +103,7 @@ pub type SendMessageStream = BoxStream<'static, StreamingEvent>;
 /// Outcome of a successful
 /// [`MessageService::delete_message_cascade`] call. Mirrors the wire
 /// payload of `DELETE /sessions/{session_id}/messages/{message_id}`.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct DeleteOutcome {
     /// Root of the deleted subtree (the message id from the request path).
@@ -119,6 +122,7 @@ pub struct DeleteOutcome {
 /// branch); `Recreate` triggers `on_message_recreate` (a sibling
 /// regeneration). ADR-0013 explicitly distinguishes the two so plugins
 /// can apply different prompting / sampling strategies.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageEventKind {
     /// Normal new-message dispatch (`POST /messages/send` and the Phase 6
@@ -129,6 +133,7 @@ pub enum MessageEventKind {
 }
 
 /// Public service.
+#[domain_model]
 #[derive(Clone)]
 pub struct MessageService {
     sessions: Arc<dyn SessionRepo>,
@@ -1329,6 +1334,7 @@ impl MessageService {
 ///
 /// The struct holds `Arc`s so the spawned task can take ownership
 /// without borrowing anything off the request scope.
+#[domain_model]
 #[derive(Clone)]
 struct OverflowDispatchCtx {
     /// Cloned `MessageService` — used to call `handle_context_overflow`.
@@ -1348,6 +1354,7 @@ struct OverflowDispatchCtx {
 /// Internal state machine result of the driver loop. Bridges the
 /// streaming `select!` arm exits back to the matching
 /// [`FinalizeOutcome`] for persistence.
+#[domain_model]
 #[derive(Debug, Clone)]
 enum DriverOutcome {
     Completed { metadata: Option<JsonValue> },
@@ -1360,6 +1367,7 @@ enum DriverOutcome {
 
 /// Subset of session-derived fields the streaming pipeline needs after
 /// validation has succeeded.
+#[domain_model]
 #[derive(Debug, Clone)]
 struct ValidatedRequest {
     session_type_id: Uuid,

@@ -245,8 +245,9 @@ impl Module for ChatEngineModule {
         > = Arc::new(SeaPluginConfigRepo::new(sea.clone()));
         let reactions_repo: Arc<dyn crate::infra::db::repo::reaction_repo::ReactionRepo> =
             Arc::new(SeaReactionRepo::new(sea.clone()));
-        let variants_repo: Arc<dyn crate::domain::service::VariantRepo> =
-            Arc::new(crate::domain::service::SeaVariantRepo::new(sea.clone()));
+        let variants_repo: Arc<dyn crate::domain::service::VariantRepo> = Arc::new(
+            crate::infra::db::repo::variant_repo::SeaVariantRepo::new(sea.clone()),
+        );
 
         // --- ClientHub plugin registration ----------------------------------
         let client_hub = ctx.client_hub();

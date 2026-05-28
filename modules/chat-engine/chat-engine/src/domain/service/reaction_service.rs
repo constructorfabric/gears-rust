@@ -46,6 +46,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use modkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use tokio::task::JoinHandle;
 use tracing::{info, instrument, warn};
@@ -70,6 +71,7 @@ pub const CAPABILITY_FEEDBACK: &str = "feedback";
 /// Response shape returned by [`ReactionService::set_reaction`]. Mirrors
 /// `schemas/message/MessageReactionResponse.json` (`{message_id,
 /// reaction_type, applied}`).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetReactionResponse {
     pub message_id: Uuid,
@@ -82,6 +84,7 @@ pub struct SetReactionResponse {
 }
 
 /// Listing returned by [`ReactionService::list_reactions`].
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct ReactionsListing {
     pub message_id: Uuid,
@@ -91,6 +94,7 @@ pub struct ReactionsListing {
 /// Reaction orchestration service.
 ///
 /// Cheap to clone (all internal fields are `Arc`s).
+#[domain_model]
 #[derive(Clone)]
 pub struct ReactionService {
     sessions: Arc<dyn SessionRepo>,
@@ -373,6 +377,7 @@ impl ReactionService {
 /// Mutation payload returned alongside the wire response so the REST
 /// handler can hand it to [`ReactionService::spawn_plugin_notification`]
 /// AFTER the response is built.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct ReactionMutation {
     pub session_id: Uuid,

@@ -5,11 +5,12 @@
 //! uses `to_tsvector`/`plainto_tsquery`/`ts_rank_cd` with a GIN index (added
 //! by the Phase 11 deferred migration), and the SQLite/dev-test path falls
 //! back to `LOWER(content) LIKE LOWER(?)` with no ranking. Both backend
-//! impls ship as concrete structs ([`PgSearchBackend`], [`SqliteSearchBackend`])
-//! that compile unconditionally — the `modkit-db` workspace dependency
-//! enables BOTH the `pg` and `sqlite` cargo features, and Phase 15 owns
-//! all per-crate feature wiring. Selection between the two backends
-//! happens at module-wiring time (Phase 15) based on the materialised
+//! impls ship as concrete structs (`crate::infra::search::PgSearchBackend`,
+//! `crate::infra::search::SqliteSearchBackend`) that compile
+//! unconditionally — the `modkit-db` workspace dependency enables BOTH
+//! the `pg` and `sqlite` cargo features, and Phase 15 owns all per-crate
+//! feature wiring. Selection between the two backends happens at
+//! module-wiring time (Phase 15) based on the materialised
 //! `DatabaseConnection::get_database_backend()` discriminant. The service
 //! itself stays backend-agnostic via the [`SearchBackend`] trait.
 //!
@@ -41,6 +42,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use modkit_macros::domain_model;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
@@ -55,6 +57,7 @@ use crate::infra::db::repo::message_repo::MessageRepo;
 use crate::infra::db::repo::session_repo::SessionRepo;
 
 /// Scope label used by the `search_duration_seconds` metric / structured log.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchScope {
     Session,
@@ -72,6 +75,7 @@ impl SearchScope {
 }
 
 /// Parsed search input — sanitised and validated.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
     /// Original (length-checked) query string for ILIKE matching.
@@ -107,6 +111,7 @@ pub fn parse_search_query(raw: &str) -> std::result::Result<ParsedQuery, SearchE
 /// Result row carried back from the search backend. The service enriches
 /// each hit with context messages + the parent chain before returning to
 /// the handler.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct BackendHit {
     pub message_id: Uuid,
@@ -120,6 +125,7 @@ pub struct BackendHit {
 }
 
 /// Pagination + scoping passed to a [`SearchBackend`].
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct SearchScopeFilter {
     pub tenant_id: String,
@@ -129,9 +135,10 @@ pub struct SearchScopeFilter {
     pub session_id: Option<Uuid>,
 }
 
-/// Backend-agnostic search surface. Two concrete impls live in this file
-/// ([`PgSearchBackend`] and [`SqliteSearchBackend`]) — selection happens
-/// at module-wiring time (Phase 15) based on the live `DatabaseBackend`.
+/// Backend-agnostic search surface. Two concrete impls live in
+/// `crate::infra::search::backend` (`PgSearchBackend` and
+/// `SqliteSearchBackend`) — selection happens at module-wiring time
+/// (Phase 15) based on the live `DatabaseBackend`.
 #[async_trait]
 pub trait SearchBackend: Send + Sync {
     /// Execute a paginated search. Backends MUST:
@@ -157,6 +164,7 @@ pub trait SearchBackend: Send + Sync {
 /// In-memory backend used by unit tests and the SQLite/ILIKE path's
 /// fallback. The backend stores a flat list of `(scope_session_id, msg)`
 /// pairs and applies the filter at query time.
+#[domain_model]
 #[derive(Debug, Default)]
 pub struct InMemorySearchBackend {
     rows: Vec<(SearchScopeFilter, Message)>,
@@ -239,6 +247,7 @@ impl SearchBackend for InMemorySearchBackend {
 /// Orchestrates the two search endpoints. Generic over the backend so
 /// production wiring (Phase 15) plugs in the SeaORM-backed implementation
 /// while unit tests use [`InMemorySearchBackend`].
+#[domain_model]
 #[derive(Clone)]
 pub struct SearchService {
     sessions: Arc<dyn SessionRepo>,
@@ -550,82 +559,12 @@ impl SearchScopeFilter {
 // Backend selection (runtime — Phase 15 wires the concrete impl)
 // ----------------------------------------------------------------------------
 //
-// The Phase 11 surface ships TWO concrete backends, one per supported
-// dialect. The crate currently depends on `modkit-db` with BOTH the
-// `sqlite` and `pg` cargo features enabled (see the workspace manifest),
-// so both impls compile unconditionally. Selection between them happens
-// at wiring time inside `module.rs` (Phase 15 builds the
-// `SearchService` with `PgSearchBackend` or `SqliteSearchBackend`
-// depending on the resolved `DatabaseBackend` of the live SeaORM
-// `DatabaseConnection`).
-//
-// The structs below carry the `DatabaseConnection` so production wiring
-// can plug them in; the actual SQL composition lives in Phase 15 because
-// it depends on the materialised connection. Phase 11 supplies the
-// `SearchBackend` trait + an in-memory backend that the unit tests exercise.
-
-/// PostgreSQL `tsvector` + GIN backend. Uses `plainto_tsquery` for plain
-/// searches and `phraseto_tsquery` for quoted phrases. Ranking via
-/// `ts_rank_cd(to_tsvector('english', ...), query)` with document length
-/// normalisation flag `32` (per ADR-0019).
-pub struct PgSearchBackend {
-    #[allow(dead_code)]
-    db: sea_orm::DatabaseConnection,
-}
-
-impl PgSearchBackend {
-    #[must_use]
-    pub fn new(db: sea_orm::DatabaseConnection) -> Self {
-        Self { db }
-    }
-}
-
-#[async_trait]
-impl SearchBackend for PgSearchBackend {
-    async fn search(
-        &self,
-        _scope: &SearchScopeFilter,
-        _query: &ParsedQuery,
-        _cursor: Option<&Cursor>,
-        _skip: u32,
-        _limit: u32,
-    ) -> std::result::Result<(Vec<BackendHit>, u64), ChatEngineError> {
-        Err(ChatEngineError::internal(
-            "PgSearchBackend not yet wired to DatabaseConnection — Phase 15 owns workspace wiring",
-        ))
-    }
-}
-
-/// SQLite-backed search implementation. Uses `LOWER(content_text) LIKE
-/// LOWER(?)` against a runtime-extracted plain-text projection of the
-/// `messages.content` JSONB column.
-pub struct SqliteSearchBackend {
-    #[allow(dead_code)]
-    db: sea_orm::DatabaseConnection,
-}
-
-impl SqliteSearchBackend {
-    #[must_use]
-    pub fn new(db: sea_orm::DatabaseConnection) -> Self {
-        Self { db }
-    }
-}
-
-#[async_trait]
-impl SearchBackend for SqliteSearchBackend {
-    async fn search(
-        &self,
-        _scope: &SearchScopeFilter,
-        _query: &ParsedQuery,
-        _cursor: Option<&Cursor>,
-        _skip: u32,
-        _limit: u32,
-    ) -> std::result::Result<(Vec<BackendHit>, u64), ChatEngineError> {
-        Err(ChatEngineError::internal(
-            "SqliteSearchBackend not yet wired to DatabaseConnection — Phase 15 owns workspace wiring",
-        ))
-    }
-}
+// The two concrete SeaORM-backed implementations live in
+// `crate::infra::search::backend` (see `PgSearchBackend` and
+// `SqliteSearchBackend`) — they carry `DatabaseConnection` so they
+// belong in the infra layer per the `#[domain_model]` boundary.
+// Selection happens at module-wiring time (Phase 15) based on the live
+// `DatabaseBackend`.
 
 // ----------------------------------------------------------------------------
 // Unit tests — exercise the service over the in-memory backend (SQLite-ish).

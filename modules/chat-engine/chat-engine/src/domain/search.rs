@@ -23,6 +23,7 @@
 // @cpt-cf-chat-engine-domain-search:p11
 // @cpt-cf-chat-engine-adr-search-strategy:p11
 
+use modkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -49,6 +50,7 @@ pub const DEFAULT_CONTEXT_RADIUS: u32 = 1;
 /// for the keyset pagination payload (encoded `(rank, message_id)`). The
 /// `modkit-odata`-derived `ODataQuery` lifts these field names verbatim,
 /// hence the leading `$` on the wire (serde rename).
+#[domain_model]
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SearchQuery {
     /// Raw query string. Empty or > `MAX_QUERY_LENGTH` characters → 400.
@@ -102,6 +104,7 @@ impl SearchQuery {
 /// order, hidden rows excluded). `parent_chain` carries the ancestor chain
 /// from the matched message up to the session root, in root-first order, so
 /// the UI can render thread context.
+#[domain_model]
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub message_id: Uuid,
@@ -125,6 +128,7 @@ pub struct SearchResult {
 
 /// Compact reference to a message — enough to render in the search result
 /// page without re-fetching the message body in a follow-up request.
+#[domain_model]
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageRef {
     pub message_id: Uuid,
@@ -137,6 +141,7 @@ pub struct MessageRef {
 }
 
 /// Minimal session envelope embedded in cross-session results.
+#[domain_model]
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMeta {
     pub session_id: Uuid,
@@ -148,6 +153,7 @@ pub struct SessionMeta {
 }
 
 /// Paginated search response — the canonical wire shape.
+#[domain_model]
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchPage {
     pub items: Vec<SearchResult>,
@@ -164,6 +170,7 @@ pub struct SearchPage {
 /// Search-specific error type. Kept distinct from [`ChatEngineError`] so the
 /// service can return structured failures without losing the "this is a
 /// search-input problem" classification at the handler boundary.
+#[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     /// `q` was missing or empty — maps to HTTP 400.
@@ -221,6 +228,7 @@ impl From<ChatEngineError> for SearchError {
 /// short opaque base64-free string of the form `r:<rank>:m:<uuid>` because
 /// the crate intentionally avoids pulling in `base64` (see Phase 10's
 /// `generate_share_token` note on workspace dependency policy).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cursor {
     pub rank: f32,

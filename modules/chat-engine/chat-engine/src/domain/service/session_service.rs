@@ -25,6 +25,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use modkit_macros::domain_model;
 use sea_orm::ActiveValue::{NotSet, Set};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
@@ -56,6 +57,7 @@ pub const DEFAULT_PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// JWT-derived call identity. Constructed at the REST boundary; services
 /// MUST NOT accept tenant / user identifiers from any other source (PRD
 /// §7 Security, ADR-0017).
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct Identity {
     /// Tenant id extracted from the bearer token (`subject_tenant_id`).
@@ -94,6 +96,7 @@ impl Identity {
 /// Request body for `POST /session-types`. The handler maps the wire DTO
 /// into this struct after stripping any `tenant_id` / `user_id` fields the
 /// client may have attempted to send.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct RegisterSessionTypeRequest {
     /// Human-readable name (per ADR-0017 — opaque to Chat Engine).
@@ -107,6 +110,7 @@ pub struct RegisterSessionTypeRequest {
 }
 
 /// Request body for `POST /sessions`.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct CreateSessionRequest {
     /// Optional session-type binding. `None` is allowed for sessions that
@@ -119,6 +123,7 @@ pub struct CreateSessionRequest {
 }
 
 /// Paginated session response envelope.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct PaginatedSessions {
     pub items: Vec<Session>,
@@ -128,6 +133,7 @@ pub struct PaginatedSessions {
 
 /// Service-level result of `delete_session` — handlers decide between
 /// 200 (Soft) and 204 (Hard) based on this value.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub enum SessionDeleteOutcome {
     Soft { session: Session },
@@ -135,6 +141,7 @@ pub enum SessionDeleteOutcome {
 }
 
 /// Orchestration of session lifecycle plus session-type registration.
+#[domain_model]
 #[derive(Clone)]
 pub struct SessionService {
     sessions: Arc<dyn SessionRepo>,

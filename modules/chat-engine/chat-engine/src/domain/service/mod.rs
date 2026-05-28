@@ -42,7 +42,6 @@ pub use session_service::{
     reject_reserved_metadata,
 };
 pub use variant_service::{
-    DEFAULT_SWITCH_TYPE_DEADLINE, SeaVariantRepo, VariantEntry, VariantListing, VariantRepo,
-    VariantService,
+    DEFAULT_SWITCH_TYPE_DEADLINE, VariantEntry, VariantListing, VariantRepo, VariantService,
 };
 pub use webhook::{NoopWebhookEmitter, WebhookEmitter, WebhookEvent};

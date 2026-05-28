@@ -35,6 +35,7 @@
 use std::time::Duration;
 
 use chat_engine_sdk::error::PluginError;
+use modkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 
 /// GTS schema IDs for every type registered by the LLM Gateway plugin.
@@ -86,6 +87,7 @@ pub const DEFAULT_CIRCUIT_BREAKER_COOLDOWN_MS: u32 = 60_000;
 /// the LLM Gateway plugin instance.
 ///
 /// Schema ID: `gtx.cf.chat_engine.llm_gateway_plugin_config.v1~`.
+#[domain_model]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmPluginConfig {
     /// Base URL of the in-process / out-of-process LLM Gateway HTTP
@@ -143,6 +145,7 @@ impl LlmPluginConfig {
 /// Settings controlling the context-overflow summarization split.
 ///
 /// Schema ID: `gtx.cf.chat_engine.llm_gateway.summarization_settings.v1~`.
+#[domain_model]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmSummarizationSettings {
     /// Number of most-recent messages preserved unsummarized; MUST be
@@ -176,6 +179,7 @@ fn default_recent_messages_to_keep() -> u32 {
 
 /// Finish reason returned by the LLM Gateway. Values match the canonical
 /// OpenAI-style enum exposed through ADR-0023.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
@@ -204,6 +208,7 @@ impl FinishReason {
 /// Token-usage block carried inside [`LlmMessageMetadata`].
 ///
 /// Schema ID: `gtx.cf.chat_engine.llm_gateway.usage.v1~`.
+#[domain_model]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmUsage {
     pub prompt_tokens: u32,
@@ -220,6 +225,7 @@ pub struct LlmUsage {
 ///
 /// `Eq` is intentionally **not** derived because `temperature_used: Option<f32>`
 /// is a floating-point value and total equality on floats is unsound.
+#[domain_model]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LlmMessageMetadata {
     pub model_used: String,

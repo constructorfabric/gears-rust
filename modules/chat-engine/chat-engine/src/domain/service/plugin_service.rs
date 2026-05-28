@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use modkit::ClientHub;
 use modkit::client_hub::ClientScope;
+use modkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use tracing::warn;
 use uuid::Uuid;
@@ -50,6 +51,7 @@ use crate::infra::db::repo::plugin_config_repo::PluginConfigRepo;
 /// Construct once at module init (Phase 15) with the process-wide `ClientHub`
 /// and a `SeaPluginConfigRepo` over the shared `DatabaseConnection`. Clone
 /// freely — both fields are `Arc` and the struct itself is cheap to copy.
+#[domain_model]
 #[derive(Clone)]
 pub struct PluginService {
     client_hub: Arc<ClientHub>,

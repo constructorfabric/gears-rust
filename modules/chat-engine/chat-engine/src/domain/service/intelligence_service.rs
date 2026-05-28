@@ -59,6 +59,7 @@ use std::time::{Duration, Instant};
 use chat_engine_sdk::models::{LifecycleState, TenantId, UserId};
 use chat_engine_sdk::plugin::{PluginCallContext, SessionPluginCtx};
 use futures::stream::{self, BoxStream, StreamExt};
+use modkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -98,6 +99,7 @@ pub type SummaryStream = BoxStream<'static, StreamingEvent>;
 
 /// Per-session cleanup report. Aggregated into [`RetentionCleanupReport`]
 /// by [`IntelligenceService::run_retention_cleanup_for_tenant`].
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct SessionCleanupOutcome {
     pub session_id: Uuid,
@@ -119,6 +121,7 @@ pub struct SessionCleanupOutcome {
 /// will surface this in operator metrics; the structure is intentionally
 /// small (one entry per session in the tenant) so the report fits in
 /// memory for any reasonable tenant scale.
+#[domain_model]
 #[derive(Debug, Clone, Default)]
 pub struct RetentionCleanupReport {
     /// Outcomes ordered by session id (deterministic for logs / tests).
@@ -143,6 +146,7 @@ impl RetentionCleanupReport {
 /// Validated retention policy. The wire shape is the SDK enum
 /// [`RetentionPolicy`] (internally tagged on `"type"`); validation happens
 /// inside [`validate_retention_policy`] before any DB write.
+#[domain_model]
 #[derive(Debug, Clone)]
 struct ValidatedPolicy(RetentionPolicy);
 
@@ -156,6 +160,7 @@ impl From<ValidatedPolicy> for RetentionPolicy {
 ///
 /// Construct once at module init (Phase 15) with the shared repositories
 /// + plugin hub. Clone freely — all fields are `Arc`/`Clone`-cheap.
+#[domain_model]
 #[derive(Clone)]
 pub struct IntelligenceService {
     sessions: Arc<dyn SessionRepo>,

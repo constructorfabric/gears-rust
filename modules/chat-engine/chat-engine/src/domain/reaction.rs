@@ -18,6 +18,7 @@
 // @cpt-cf-chat-engine-domain-reaction:p9
 // @cpt-cf-chat-engine-adr-message-reactions:p9
 
+use modkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -27,6 +28,7 @@ use crate::infra::db::entity::message_reaction as reaction_entity;
 /// Wire-level reaction kind. Stored in `message_reactions.reaction_type` as
 /// a lowercase string ("like" / "dislike"); a `None` value is never persisted
 /// — it deletes the row.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactionType {
@@ -72,6 +74,7 @@ impl ReactionType {
 /// Stored reaction row as exposed by [`ReactionRepo`](
 /// crate::infra::db::repo::reaction_repo::ReactionRepo) and the
 /// [`ReactionService`](crate::domain::service::reaction_service::ReactionService).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageReaction {
     pub message_id: Uuid,
@@ -103,6 +106,7 @@ impl From<reaction_entity::Model> for MessageReaction {
 /// Fire-and-forget plugin event payload built by the reaction service after
 /// every successful add / change / remove. Mirrors
 /// `schemas/webhook/MessageReactionEvent.json`.
+#[domain_model]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageReactionEvent {
     /// Static event discriminator (`"message.reaction"`).
