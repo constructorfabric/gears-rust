@@ -544,16 +544,20 @@ impl VariantService {
         let new_message_id = inserted.assistant_message_id;
         let new_variant_index = inserted.user_variant_index;
 
-        // Build history visible to the plugin. For recreate the history
-        // is "up to the parent" — the assistant stub itself MUST NOT
-        // appear in the call's `messages`, and the user message that
-        // triggered the recreate is already in the active history per
-        // ADR-0013. Since the new stub has `is_complete=false`, the
-        // standard `fetch_active_history` filter excludes it
-        // automatically.
+        // Build history visible to the plugin from the explicit
+        // ancestor chain of `parent_message_id` (the user message that
+        // triggered the recreate). This sidesteps the global
+        // `is_active` filter: at this point BOTH the old assistant
+        // sibling (target) and the new stub are `is_active = true` —
+        // the active-path swap doesn't happen until after the stream
+        // closes — so a `fetch_active_history` call would see two
+        // candidate descendants of the parent and the resulting path
+        // would be ambiguous. Walking the parent's ancestry, the way
+        // `build_branched_history` does for branch, gives a stable
+        // history independent of the not-yet-resolved active-path
+        // state. The helper already drops hidden / incomplete rows.
         let history = self
-            .messages
-            .fetch_active_history(session_id, None)
+            .build_branched_history(session_id, parent_message_id)
             .await?;
 
         // Total siblings BEFORE the active-path swap (used to build the
