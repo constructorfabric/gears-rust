@@ -447,6 +447,12 @@ impl VariantService {
         // with the descendants collected through another ancestor).
         deactivate.sort();
         deactivate.dedup();
+        // Never deactivate an id that is also on the active chain — the
+        // SQL writes deactivation last, so any overlap would silently
+        // flip is_active=false on a node we just activated. In a strict
+        // tree this should be a no-op; we enforce it explicitly to stay
+        // safe against malformed subtrees.
+        deactivate.retain(|id| !chain_set.contains(id));
 
         self.variants
             .apply_active_flips(session_id, chain, deactivate)
@@ -1021,6 +1027,9 @@ async fn update_active_path_with_repos(
     }
     deactivate.sort();
     deactivate.dedup();
+    // Never deactivate an id that is also on the active chain — see
+    // the comment in `VariantService::update_active_path`.
+    deactivate.retain(|id| !chain_set.contains(id));
     variants.apply_active_flips(session_id, chain, deactivate).await
 }
 
@@ -1352,6 +1361,17 @@ impl VariantRepo for SeaVariantRepo {
             AccessMode, ColumnTrait, EntityTrait, IsolationLevel, QueryFilter, TransactionError,
             TransactionTrait,
         };
+
+        // Defense in depth: drop any id that appears in both lists from
+        // the deactivate set. The SQL below applies activation first
+        // and deactivation second, so an overlap would silently flip
+        // is_active=false on a node the caller asked to activate.
+        let activate_set: std::collections::HashSet<Uuid> =
+            activate_ids.iter().copied().collect();
+        let deactivate_ids: Vec<Uuid> = deactivate_ids
+            .into_iter()
+            .filter(|id| !activate_set.contains(id))
+            .collect();
 
         let outcome: std::result::Result<(), TransactionError<sea_orm::DbErr>> = self
             .db
