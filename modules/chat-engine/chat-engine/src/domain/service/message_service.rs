@@ -297,6 +297,7 @@ impl MessageService {
                 let _ = self
                     .messages
                     .finalize_assistant(
+                        req.session_id,
                         assistant_message_id,
                         FinalizeOutcome::Errored {
                             text: String::new(),
@@ -319,6 +320,7 @@ impl MessageService {
             user_id: identity.user_id.clone(),
         };
         let stream = self.spawn_driver(
+            req.session_id,
             assistant_message_id,
             plugin_stream,
             messages_repo,
@@ -736,6 +738,7 @@ impl MessageService {
                 let _ = self
                     .messages
                     .finalize_assistant(
+                        session_id,
                         assistant_message_id,
                         FinalizeOutcome::Errored {
                             text: String::new(),
@@ -757,6 +760,7 @@ impl MessageService {
             user_id: identity.user_id.clone(),
         };
         let stream = self.spawn_driver(
+            session_id,
             assistant_message_id,
             plugin_stream,
             messages_repo,
@@ -1064,6 +1068,7 @@ impl MessageService {
     /// promptly.
     fn spawn_driver(
         &self,
+        session_id: Uuid,
         assistant_id: Uuid,
         mut plugin_stream: PluginStream,
         messages: Arc<dyn MessageRepo>,
@@ -1106,6 +1111,7 @@ impl MessageService {
                 cancel.cancel();
                 let _ = messages
                     .finalize_assistant(
+                        session_id,
                         assistant_id,
                         FinalizeOutcome::Cancelled { text: String::new() },
                     )
@@ -1228,6 +1234,7 @@ impl MessageService {
             let persist = match outcome {
                 DriverOutcome::Completed { metadata } => messages
                     .finalize_assistant(
+                        session_id,
                         assistant_id,
                         FinalizeOutcome::Complete {
                             text: accumulator,
@@ -1237,6 +1244,7 @@ impl MessageService {
                     .await,
                 DriverOutcome::CancelledByClient => messages
                     .finalize_assistant(
+                        session_id,
                         assistant_id,
                         FinalizeOutcome::Cancelled { text: accumulator },
                     )
@@ -1246,6 +1254,7 @@ impl MessageService {
                     finish_reason,
                 } => messages
                     .finalize_assistant(
+                        session_id,
                         assistant_id,
                         FinalizeOutcome::Errored {
                             text: accumulator,
@@ -1681,6 +1690,7 @@ mod tests {
 
         async fn finalize_assistant(
             &self,
+            _session_id: Uuid,
             assistant_message_id: Uuid,
             outcome: FinalizeOutcome,
         ) -> std::result::Result<(), ChatEngineError> {
@@ -2126,6 +2136,7 @@ mod tests {
 
         async fn finalize_assistant(
             &self,
+            _session_id: Uuid,
             _id: Uuid,
             _outcome: FinalizeOutcome,
         ) -> std::result::Result<(), ChatEngineError> {
@@ -2755,6 +2766,7 @@ mod tests {
 
         async fn finalize_assistant(
             &self,
+            _session_id: Uuid,
             _id: Uuid,
             _o: FinalizeOutcome,
         ) -> std::result::Result<(), ChatEngineError> {
