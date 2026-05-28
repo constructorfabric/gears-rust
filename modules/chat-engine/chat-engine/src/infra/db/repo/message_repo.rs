@@ -127,10 +127,20 @@ pub trait MessageRepo: Send + Sync {
     /// Atomically finalize the assistant message: updates `content`,
     /// `is_complete`, and `metadata` in one statement.
     ///
+    /// The update is a single scoped `UPDATE … WHERE message_id = ?
+    /// AND session_id = ? AND is_complete = false AND metadata IS NULL`,
+    /// so concurrent finalizes for the same row (e.g., a cancel racing
+    /// a normal completion) cannot interleave a read-modify-write — the
+    /// first writer wins and the second's predicate matches zero rows.
+    /// A successful no-op return therefore means "another finalize
+    /// already terminated this stub"; callers should treat that as
+    /// idempotent.
+    ///
     /// Per the Phase 2 contract `messages` has no `updated_at` column;
     /// freshness is conveyed by the `is_complete=true` transition.
     async fn finalize_assistant(
         &self,
+        session_id: Uuid,
         assistant_message_id: Uuid,
         outcome: FinalizeOutcome,
     ) -> Result<(), ChatEngineError>;
@@ -372,13 +382,11 @@ impl MessageRepo for SeaMessageRepo {
 
     async fn finalize_assistant(
         &self,
+        session_id: Uuid,
         assistant_message_id: Uuid,
         outcome: FinalizeOutcome,
     ) -> Result<(), ChatEngineError> {
-        let row = MessageEntity::find_by_id(assistant_message_id)
-            .one(&self.db)
-            .await?
-            .ok_or_else(|| ChatEngineError::not_found("message", assistant_message_id))?;
+        use sea_orm::sea_query::Expr;
 
         let (content, metadata, is_complete) = match outcome {
             FinalizeOutcome::Complete { text, metadata } => {
@@ -406,11 +414,39 @@ impl MessageRepo for SeaMessageRepo {
             }
         };
 
-        let mut active: message_entity::ActiveModel = row.into();
-        active.content = Set(content);
-        active.is_complete = Set(is_complete);
-        active.metadata = Set(metadata);
-        active.update(&self.db).await?;
+        // Single atomic UPDATE scoped to (message_id, session_id). The
+        // `is_complete = false AND metadata IS NULL` predicate matches
+        // only the still-pending stub state — any prior finalize (which
+        // either flips is_complete or writes metadata) leaves the row
+        // outside the match set, so a concurrent finalize cannot clobber
+        // the winner's terminal state.
+        let result = MessageEntity::update_many()
+            .filter(message_entity::Column::MessageId.eq(assistant_message_id))
+            .filter(message_entity::Column::SessionId.eq(session_id))
+            .filter(message_entity::Column::IsComplete.eq(false))
+            .filter(message_entity::Column::Metadata.is_null())
+            .col_expr(message_entity::Column::Content, Expr::value(content))
+            .col_expr(
+                message_entity::Column::IsComplete,
+                Expr::value(is_complete),
+            )
+            .col_expr(
+                message_entity::Column::Metadata,
+                Expr::value(metadata),
+            )
+            .exec(&self.db)
+            .await?;
+
+        if result.rows_affected == 0 {
+            // Either the row doesn't exist in this session, or another
+            // finalize already terminated the stub. Idempotent no-op for
+            // the racing caller.
+            tracing::debug!(
+                session_id = %session_id,
+                assistant_message_id = %assistant_message_id,
+                "finalize_assistant no-op: stub already terminated or not in session",
+            );
+        }
         Ok(())
     }
 

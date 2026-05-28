@@ -699,6 +699,7 @@ mod tests {
         }
         async fn finalize_assistant(
             &self,
+            _session_id: Uuid,
             _assistant_message_id: Uuid,
             _outcome: crate::infra::db::repo::message_repo::FinalizeOutcome,
         ) -> std::result::Result<(), ChatEngineError> {
