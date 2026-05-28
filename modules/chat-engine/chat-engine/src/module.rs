@@ -331,7 +331,11 @@ impl Module for ChatEngineModule {
                 plugin_service.clone(),
             )
             .with_buffer_size(config.summary_buffer_size)
-            .with_summary_deadline(plugin_deadline),
+            .with_summary_deadline(plugin_deadline)
+            .with_retention_caps(
+                config.retention_max_sessions_per_tick,
+                config.retention_max_deletes_per_session,
+            ),
         );
 
         let share_urls = config
