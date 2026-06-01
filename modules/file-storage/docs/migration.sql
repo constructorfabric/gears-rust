@@ -68,10 +68,15 @@ CREATE TABLE file_storage.files (
     size                    bigint       NOT NULL  CHECK (size >= 0),
 
     -- Revision counters.
-    --   content_revision   bumped only on content writes (P1: single-shot
-    --                      PATCH with content; P2: multipart complete and
-    --                      versioning writes). ETag is derived from
-    --                      (file_id, content_revision).
+    --   content_revision   set on content writes. P1 `POST /files` (create)
+    --                      inserts the row with content_revision = 1 (the
+    --                      first content write); a content-replacing PATCH
+    --                      bumps it; (P2) multipart complete and versioning
+    --                      writes bump it. The DEFAULT 0 baseline applies only
+    --                      to the P2 'pending' row that is created before any
+    --                      content arrives (multipart pre-completion); P1 never
+    --                      persists a content_revision = 0 row. ETag is derived
+    --                      from (file_id, content_revision).
     --   metadata_revision  bumped on every successful write — content or
     --                      metadata-only.
     content_revision        bigint       NOT NULL  DEFAULT 0
@@ -173,8 +178,9 @@ ALTER TABLE file_storage.files
 
 
 -- Table: file_storage.multipart_uploads --------------------------------------
--- In-flight multipart upload sessions. Created on POST /files/{id}/multipart,
--- one row per upload session. Parts go into multipart_upload_parts.
+-- In-flight multipart upload sessions. Created on POST /files/multipart
+-- (initiation also creates the pending `files` row), one row per upload
+-- session. Parts go into multipart_upload_parts.
 
 CREATE TABLE file_storage.multipart_uploads (
     upload_id        uuid         PRIMARY KEY  DEFAULT gen_random_uuid(),

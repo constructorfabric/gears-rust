@@ -111,7 +111,8 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-nfr-transfer-latency`      | `<50 ms` fixed overhead p95 on content transfer                      | `cpt-cf-file-storage-component-stream-proxy`, `cpt-cf-file-storage-component-backend-abstraction`                                         | Streaming I/O end-to-end (axum `Body` ↔ `Stream<Bytes>` ↔ backend client); no full-file buffering. Range translated to backend-native range where supported                                                                                                    | Measure fixed delta between request arrival at FileStorage and first byte returned by backend; histogram per backend driver                           |
 | `cpt-cf-file-storage-nfr-url-availability`      | URLs available for retention duration matching platform SLA          | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-backend-abstraction`                                     | URLs are derived from `file_id` and remain valid as long as the file row exists; deleted files return `404`; ETag changes do not invalidate URLs (only their cached representations)                                                                            | Long-running soak: re-fetch a set of `file_id`s over the SLA window; verify no transient `5xx`/`404` for live files                                  |
 | `cpt-cf-file-storage-nfr-durability`            | RPO=0 for committed writes; RTO ≤ 15 min                              | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-backend-abstraction`                                     | DB row committed *after* backend `put()` returns success; backend durability is inherited from the chosen driver. RTO covered by Postgres HA + module restart procedures                                                                                       | Chaos test: kill module mid-upload — partial uploads MUST NOT leave a committed row pointing to missing content                                       |
-| `cpt-cf-file-storage-nfr-scalability`           | ≥1000 concurrent operations/instance; linear horizontal scaling      | All P1 components — they are stateless except for the metadata DB                                                                         | No instance-local state in the request path; every instance can serve any file given the shared metadata DB and backend driver. Streaming I/O keeps memory bounded per request                                                                                 | Load test: scale N → 2N instances, verify near-2× throughput; per-instance concurrency target measured at saturation                                  |
+| `cpt-cf-file-storage-nfr-scalability`           | ≥1000 concurrent operations/instance; linear horizontal scaling      | All P1 components — they are stateless except for the metadata DB                                                                         | No instance-local state in the request path; every instance can serve any file given the shared metadata DB and backend driver. Streaming I/O keeps **CPU and memory** bounded per request. The **bandwidth** dimension — the cost consciously accepted by ADR-0001 — is modeled separately in `cpt-cf-file-storage-nfr-bandwidth`                                                                  | Load test: scale N → 2N instances, verify near-2× throughput; per-instance concurrency target measured at saturation                                  |
+| `cpt-cf-file-storage-nfr-bandwidth`             | Per-instance ingress+egress budget; full traffic transits FileStorage | `cpt-cf-file-storage-component-stream-proxy`, `cpt-cf-file-storage-component-backend-abstraction`, deployment topology                    | ADR-0001 routes every uploaded and downloaded byte through FileStorage, so per-instance bandwidth — not CPU/memory — is the binding constraint. P1 deployment budget: **target ≥ 2.5 GiB/s combined ingress+egress per instance** (≈ 1.25 GiB/s each way on a 25 GbE NIC, sized so the ≥1000 concurrent-ops target is bandwidth- rather than CPU-bound at typical media object sizes). Capacity = `ceil(peak aggregate transfer rate / per-instance budget)` instances; transfer load scales horizontally with the stateless replicas. Download caching is offloaded to the API-Gateway / CDN layer using the content-only `ETag`, `Cache-Control`, and `Vary` response headers FileStorage already emits, so repeat-read egress need not re-transit FileStorage | Load test: saturate a single instance's NIC with concurrent downloads, confirm it sustains the per-instance budget before CPU saturates; verify CDN/proxy serves conditional re-reads from cache (no FileStorage egress on `304`/cache hit) |
 
 #### Key ADRs
 
@@ -154,7 +155,7 @@ graph LR
 | API            | HTTP routing, request parsing, conditional-request and Range middleware, response shaping                       | axum, hyper, tower middleware                                                    |
 | Application    | Orchestration: upload pipeline, download proxying, metadata CRUD, capability discovery                          | Rust async services (tokio); OperationBuilder for JSON endpoints                 |
 | Domain         | File ownership, revision counters, ETag derivation, content state                                               | Rust structs + SeaORM entities                                                   |
-| Infrastructure | Postgres metadata storage; backend drivers (local FS, S3-compatible); PolicyEnforcer client; TOML config loader | SeaORM + SecureORM + SecureConn (Postgres); `aws-sdk-s3` / `rusoto`; `tokio::fs` |
+| Infrastructure | Postgres metadata storage; backend drivers (local FS, S3-compatible); PolicyEnforcer client; TOML config loader | SeaORM + SecureORM + SecureConn (Postgres); `aws-sdk-s3`; `tokio::fs` |
 
 ## 2. Principles & Constraints
 
@@ -406,9 +407,10 @@ it, what is its current state?" goes through here. Owns ETag derivation and revi
 - CRUD on `files` rows (create on `POST /files`; read on `GET`/`HEAD`/`PATCH`/`DELETE`; update on `PATCH`; delete on
   `DELETE /files/{id}`)
 - CRUD on `files_custom_metadata` (JSON Merge Patch applied row-by-row)
-- Compute and persist `etag_revision = content_revision`; compute opaque `ETag` from
-  `(file_id, content_revision)` per §4.2
-- Bump `content_revision` only on content writes; bump `metadata_revision` on every successful write
+- Derive the opaque `ETag` on the fly from `(file_id, content_revision)` per §4.2 — there is no separate persisted
+  ETag column; `content_revision` is the only stored input
+- Set `content_revision` on content writes: `POST /files` (create) initializes it to `1`; each content-replacing
+  `PATCH`/multipart `complete` bumps it. Bump `metadata_revision` on every successful write
 - Bump `last_modified_at` on every successful write
 - Enforce tenant boundary via SecureConn — every query/mutation passes through the request's `SecurityContext`
 - Tenant + owner filter on `GET /files`; pagination with stable cursor; index-backed by
@@ -660,8 +662,7 @@ sequenceDiagram
     HGW->>HGW: parse `metadata` JSON part
     HGW->>AZ: check(action=write, resource=gts~<type>~)
     AZ-->>HGW: Allow
-    HGW->>MS: create_pending(file, tenant, owner)
-    MS->>DB: INSERT files (content_state=pending)
+    HGW->>HGW: allocate file_id + backend_path (no DB row yet)
     HGW->>SP: stream `content` field through pipeline → backend
     loop per chunk
         SP->>CP: tap(chunk) — update SHA-256, check magic bytes
@@ -670,15 +671,16 @@ sequenceDiagram
     alt magic-bytes mismatch
         CP-->>SP: 415 abort
         SP-->>HGW: error
-        HGW->>MS: rollback (DELETE files row)
+        HGW->>BA: delete(backend_path) — discard partially written object
         HGW-->>C: 415 Unsupported Media Type
     else success
         BA-->>SP: ObjectRef
-        SP-->>HGW: (final hash, ObjectRef)
-        HGW->>MS: finalize(content_state=available, hash, size, etag bump)
-        MS->>DB: UPDATE files SET content_state='available', content_revision=1, hash_value, size, etag_*
+        SP-->>HGW: (final hash, size, ObjectRef)
+        HGW->>MS: persist(file, hash, size, backend_path)
+        MS->>DB: INSERT files (content_state='available', content_revision=1, hash_value, size, backend_*) — single commit
         HGW-->>C: 201 + metadata JSON + headers
     end
+    Note over MS,DB: Write-after model: the files row is committed only after a successful<br/>backend put(), so size/hash_value are always known at INSERT time and no<br/>'pending' row is ever created in P1 (see §4.4 durability). 'pending' is reserved<br/>for the P2 multipart flow, where content arrives across multiple requests.
 ```
 
 #### Download — full file (P1)
@@ -920,18 +922,27 @@ response shape), `stream-proxy` (translation to backend), and the backend driver
 - `bytes=<start>-` → `ByteRange::OpenEnded(start)` — to end of file
 - `bytes=-<suffix-length>` → `ByteRange::Suffix(suffix_length)` — last N bytes
 
-Multiple ranges (`bytes=0-99,200-299`) are parsed but in P1 the server **MAY** respond with the full body or a single
-coalesced range, per RFC 7233 §4.1. P1 chooses the coalesced-range path for simplicity (combine into one
-`Inclusive(min_start, max_end)` range — strictly more bytes than requested, never wrong, never `416`).
+**Unparseable `Range` headers.** A syntactically invalid / unparseable `Range` header (garbage value, unknown unit,
+malformed range-set) is **ignored** per RFC 7233 §3.1: the gateway serves `200 OK` with the full body, exactly as if no
+`Range` had been sent. The `416` path is reserved for headers that parse cleanly but cannot be satisfied against the
+file's `size` (see below). This avoids surfacing an unexpected `416` to clients (browsers, `curl`, `aria2`) that never
+intended a range request.
 
-**Satisfiability check.** Once the gateway has the file's `size` from `metadata-service`, it computes the resolved
-range:
+**Multiple ranges.** RFC 7233 §4.1 permits only two responses to a multi-range request (`bytes=0-99,200-299`): the full
+representation (`200`), or a `multipart/byteranges` document. P1 chooses `200` (full body, no `Content-Range`) for
+simplicity — it is spec-compliant, trivial to implement, and never mislabels the payload. (A "coalesced `206`" spanning
+the union of the ranges is **not** RFC-conformant — it returns bytes the client did not request under an incorrect
+`Content-Range` — and is explicitly not used.) `multipart/byteranges` is deferred; if introduced later it is a
+backward-compatible upgrade from the `200` fallback.
+
+**Satisfiability check (single range).** Once the gateway has the file's `size` from `metadata-service`, it computes the
+resolved range:
 
 - `Inclusive(s, e)`: unsatisfiable if `s ≥ size`. End is clamped to `size - 1`
 - `OpenEnded(s)`: unsatisfiable if `s ≥ size`. End is `size - 1`
 - `Suffix(n)`: unsatisfiable if `n == 0`. Start is `max(0, size - n)`, end is `size - 1`
 
-Unsatisfiable → `416 Range Not Satisfiable` with `Content-Range: bytes */<size>`.
+A **well-formed but unsatisfiable** range → `416 Range Not Satisfiable` with `Content-Range: bytes */<size>`.
 
 Satisfiable → `206 Partial Content` with `Content-Range: bytes <start>-<end>/<size>`,
 `Content-Length: <end - start + 1>`, and the body containing exactly those bytes.
@@ -994,8 +1005,9 @@ Properties:
 
 - Deterministic across replicas — the same `(file_id, content_revision)` yields the same string everywhere. No shared
   secret, no clock dependency
-- Changes **only** when `content_revision` changes — i.e., only on content writes (P1 single-shot `PATCH` with
-  `content`, or P2 multipart `complete`)
+- Changes **only** when `content_revision` changes — i.e., only on content writes: `POST /files` (create) sets it to
+  `1`, a content-replacing `PATCH` bumps it, and (P2) multipart `complete` bumps it. A metadata-only `PATCH` does not
+  change it
 - **Never** equal to `hash_value` — `hash_value` is the SHA-256 of the bytes (32 bytes), ETag is a 16-byte
   `file_id` + 8-byte counter pair encoded to base64url. Different domains, different sizes, different encodings
 - Opaque to clients: the format is internal to FileStorage. Clients **MUST** treat ETag as an arbitrary string and
@@ -1040,8 +1052,9 @@ Concurrency caps:
 | `cpt-cf-file-storage-nfr-metadata-latency`      | Designed              | Single-row Postgres lookup; expected p95 well within budget under target load                                                                        |
 | `cpt-cf-file-storage-nfr-transfer-latency`      | Designed              | Streaming end-to-end; no full-file buffering; range translated to backend-native where supported                                                     |
 | `cpt-cf-file-storage-nfr-url-availability`      | Designed              | URLs derived from `file_id` and stable for the file's lifetime; deleted files return `404`                                                           |
-| `cpt-cf-file-storage-nfr-durability`            | Designed              | DB row committed only after successful backend `put()`; partial uploads do not leave dangling rows                                                   |
-| `cpt-cf-file-storage-nfr-scalability`           | Designed              | Stateless request path; shared metadata DB; streaming I/O bounds per-request memory                                                                  |
+| `cpt-cf-file-storage-nfr-durability`            | Designed              | Write-after model: the `files` row is committed only after a successful backend `put()`, so `size`/`hash_value` are always known at INSERT. P1 never inserts a `content_state='pending'` row, so a crash mid-upload leaves **no dangling DB row** — at most an unreferenced backend object, which the P2 `orphan-reconciler` sweeps. The `415` magic-bytes abort path explicitly calls `backend.delete(backend_path)` on the partially written object (see §3.6 upload sequence), so a rejected upload leaves no backend orphan either |
+| `cpt-cf-file-storage-nfr-scalability`           | Designed              | Stateless request path; shared metadata DB; streaming I/O bounds per-request CPU and memory                                                          |
+| `cpt-cf-file-storage-nfr-bandwidth`             | Designed              | Per-instance ingress+egress budget (≥ 2.5 GiB/s combined on 25 GbE) sized so the concurrency target is bandwidth- not CPU-bound; capacity scales horizontally with stateless replicas; conditional re-reads offloaded to API-Gateway/CDN via `ETag`/`Cache-Control`/`Vary`. Models the cost accepted by ADR-0001 |
 | `cpt-cf-file-storage-nfr-audit-completeness`    | Deferred to P2        | P1 has no audit emission; the seam is reserved in `metadata-service` and `audit-publisher` is declared as P2                                         |
 
 ## 5. Traceability

@@ -84,10 +84,11 @@ Encoding conventions:
 
 ## Range support
 
-- `GET /files/{id}` accepts `Range: bytes=<start>-<end>`, `bytes=<start>-`, and `bytes=-<suffix-length>`. Valid ranges return `206 Partial Content` with `Content-Range: bytes <s>-<e>/<n>`. Unsatisfiable ranges return `416 Range Not Satisfiable` with `Content-Range: bytes */<n>`.
+- `GET /files/{id}` accepts `Range: bytes=<start>-<end>`, `bytes=<start>-`, and `bytes=-<suffix-length>`. A well-formed, satisfiable range returns `206 Partial Content` with `Content-Range: bytes <s>-<e>/<n>`. A well-formed but **unsatisfiable** range (e.g. `start ≥ size`) returns `416 Range Not Satisfiable` with `Content-Range: bytes */<n>`.
+- A **syntactically invalid / unparseable** `Range` header (garbage value, unknown unit, malformed range-set) is **ignored** per RFC 7233 §3.1: the server responds `200 OK` with the full body, as if no `Range` had been sent. `416` is reserved exclusively for well-formed-but-unsatisfiable ranges.
 - Every download response includes `Accept-Ranges: bytes`.
 - `HEAD` ignores the `Range` header and always responds with full-file metadata; the `Accept-Ranges: bytes` header is still set to advertise support on `GET`.
-- Multi-range (`multipart/byteranges`) is optional; when unsupported the server may return the full content or a single coalesced range, per RFC 7233.
+- Multi-range requests (`bytes=0-99,200-299`) are parsed but **not** served as partial content in P1. Per RFC 7233 §4.1 the only conformant responses are the full representation (`200`) or a `multipart/byteranges` document; P1 returns **`200 OK` with the full body** (no `Content-Range`). A coalesced `206` spanning the union of the requested ranges is **not** RFC-conformant and is not used. `multipart/byteranges` may be added later as a backward-compatible upgrade.
 
 ## Response headers (download + HEAD)
 
@@ -124,6 +125,6 @@ X-FS-Meta-<key>: <value>                                # one header per custom 
 - `409 Conflict` — multipart state conflicts (e.g., complete on aborted upload).
 - `412 Precondition Failed` — `If-Match` mismatch.
 - `415 Unsupported Media Type` — declared mime does not match magic-bytes detection.
-- `416 Range Not Satisfiable` — invalid `Range` header.
+- `416 Range Not Satisfiable` — a well-formed `Range` that cannot be satisfied against the file size (e.g. `start ≥ size`). A syntactically invalid / unparseable `Range` is **not** a `416`: it is ignored and the full body is served with `200`.
 - `422 Unprocessable Entity` — semantic validation failure (e.g., invalid GTS file type format).
 - `507 Insufficient Storage` — backend or quota limit exceeded.

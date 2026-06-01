@@ -924,6 +924,26 @@ without introducing coordination bottlenecks between instances.
 requirements, the architecture may adopt patterns (global locks, shared mutable state) that prevent horizontal scaling.
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
 
+#### Bandwidth & Egress
+
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-nfr-bandwidth`
+
+Because every uploaded and downloaded byte transits FileStorage (per ADR-0001 — backends are never addressed directly),
+**bandwidth, not CPU or memory, is the binding capacity constraint**. Each deployment instance **MUST** sustain a
+defined combined ingress+egress budget, and aggregate transfer capacity **MUST** scale horizontally by adding stateless
+instances. Repeat-read egress **MUST** be offloadable to an upstream caching layer (API-Gateway / CDN) using the
+conditional-request headers FileStorage emits (`ETag`, `Cache-Control`, `Vary`), so that cache hits do not re-transit
+FileStorage.
+
+**Threshold**: ≥ 2.5 GiB/s combined ingress+egress per instance (≈ 25 GbE class); aggregate capacity =
+`ceil(peak aggregate transfer rate / per-instance budget)` instances; conditional re-reads served from CDN/proxy cache
+without FileStorage egress
+**Rationale**: ADR-0001 consciously accepts that all terabyte-scale traffic flows through FileStorage. If the NFR set
+only constrains CPU/memory (the scalability NFR), implementers may size and scale the service against the wrong
+dimension and under-provision network capacity. Making the bandwidth budget explicit, and making download caching a
+first-class offload path, keeps the proxy data plane affordable at scale.
+**Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
+
 ### 6.2 NFR Exclusions
 
 None — all project-default NFRs apply to this module.
