@@ -241,7 +241,16 @@ impl AuthPlugin for OAuth2ClientCredAuthPlugin {
     }
 }
 
+// The two cfg gates are kept separate — `#[cfg(test)]` then
+// `#[cfg(not(feature = "fips"))]` — mirroring the same pattern used in
+// `libs/modkit-http/src/client.rs`. The tests below stand up an `httpmock`
+// plaintext server and construct token clients via
+// `HttpClientConfig::for_testing()`, both of which carry
+// `TransportSecurity::AllowInsecureHttp`. Under `--features fips`,
+// `HttpClientBuilder::build()` fails closed with `HttpError::InsecureTransport`,
+// so this whole suite is unrunnable in that configuration and is gated out.
 #[cfg(test)]
+#[cfg(not(feature = "fips"))]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;

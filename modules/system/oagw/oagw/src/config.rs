@@ -12,6 +12,12 @@ pub struct OagwConfig {
     pub proxy_timeout_secs: u64,
     #[serde(default = "default_max_body_size_bytes")]
     pub max_body_size_bytes: usize,
+    /// Allow plaintext HTTP upstreams (and HTTP token endpoints) for the
+    /// proxy. Default: `false`.
+    ///
+    /// **FIPS:** rejected at startup by [`OagwConfig::validate`] under
+    /// `--features fips`; cleartext upstream token endpoints would otherwise
+    /// be refused by `modkit-http` on the first proxied request.
     #[serde(default)]
     pub allow_http_upstream: bool,
     /// TTL in seconds for cached OAuth2 access tokens.
@@ -158,6 +164,14 @@ impl OagwConfig {
         }
         if self.streaming_idle_timeout_secs == 0 {
             return Err("streaming_idle_timeout_secs must be > 0".to_owned());
+        }
+        #[cfg(feature = "fips")]
+        if self.allow_http_upstream {
+            return Err(
+                "allow_http_upstream=true is not permitted under --features fips \
+                 (cleartext upstream token endpoints would be rejected by modkit-http)"
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -321,5 +335,21 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn validate_rejects_allow_http_upstream_under_fips() {
+        let config = OagwConfig {
+            allow_http_upstream: true,
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("allow_http_upstream=true must be rejected under --features fips");
+        assert!(
+            err.contains("allow_http_upstream"),
+            "error must mention the offending field, got: {err}"
+        );
     }
 }

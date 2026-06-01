@@ -249,8 +249,25 @@ impl HttpClientBuilder {
     /// Build the HTTP client with all configured layers
     ///
     /// # Errors
-    /// Returns an error if TLS initialization fails or configuration is invalid
+    /// Returns an error if TLS initialization fails or configuration is invalid.
+    ///
+    /// Under `--features fips`, returns [`HttpError::InsecureTransport`] when
+    /// `config.transport == TransportSecurity::AllowInsecureHttp`. FIPS builds
+    /// must use [`TransportSecurity::TlsOnly`] — there is no opt-out.
     pub fn build(self) -> Result<crate::HttpClient, HttpError> {
+        // Reject AllowInsecureHttp under --features fips before any TLS work.
+        // The check lives here (rather than in HttpClientConfig) so that
+        // constructing a config with AllowInsecureHttp is still cheap and
+        // infallible; only actually building a client fails closed.
+        #[cfg(feature = "fips")]
+        if self.config.transport == TransportSecurity::AllowInsecureHttp {
+            tracing::warn!(
+                target: "modkit_http::security",
+                "rejecting AllowInsecureHttp under --features fips: returning HttpError::InsecureTransport"
+            );
+            return Err(HttpError::InsecureTransport);
+        }
+
         let timeout = self.config.request_timeout;
         let total_timeout = self.config.total_timeout;
 
@@ -602,10 +619,13 @@ mod tests {
         assert_eq!(builder.config.transport, TransportSecurity::TlsOnly);
 
         let builder = HttpClientBuilder::new();
+        #[cfg(not(feature = "fips"))]
         assert_eq!(
             builder.config.transport,
             TransportSecurity::AllowInsecureHttp
         );
+        #[cfg(feature = "fips")]
+        assert_eq!(builder.config.transport, TransportSecurity::TlsOnly);
     }
 
     #[test]
@@ -779,13 +799,16 @@ mod tests {
     /// HTTP/2 support is configured via `enable_all_versions()` on the connector,
     /// which sets up ALPN to negotiate h2 or http/1.1 during TLS handshake.
     /// The hyper client uses `http2_only(false)` to allow both protocols.
+    ///
+    /// The `AllowInsecureHttp` sub-cases are skipped under `--features fips`
+    /// because the FIPS guard in `build()` rejects insecure transport.
     #[tokio::test]
     async fn test_http2_enabled_for_all_configurations() {
-        // Test WebPki with AllowInsecureHttp (default)
+        // Test WebPki with default transport (AllowInsecureHttp without fips, TlsOnly under fips)
         let client = HttpClientBuilder::new().build();
         assert!(
             client.is_ok(),
-            "WebPki + AllowInsecureHttp should build with HTTP/2 enabled"
+            "WebPki + default transport should build with HTTP/2 enabled"
         );
 
         // Test WebPki with TlsOnly (HTTPS only)
@@ -797,17 +820,20 @@ mod tests {
             "WebPki + TlsOnly should build with HTTP/2 enabled"
         );
 
-        // Test Native roots with AllowInsecureHttp
-        let config = HttpClientConfig {
-            tls_roots: TlsRootConfig::Native,
-            transport: TransportSecurity::AllowInsecureHttp,
-            ..Default::default()
-        };
-        let client = HttpClientBuilder::with_config(config).build();
-        assert!(
-            client.is_ok(),
-            "Native + AllowInsecureHttp should build with HTTP/2 enabled"
-        );
+        // Test Native roots with AllowInsecureHttp (non-fips only)
+        #[cfg(not(feature = "fips"))]
+        {
+            let config = HttpClientConfig {
+                tls_roots: TlsRootConfig::Native,
+                transport: TransportSecurity::AllowInsecureHttp,
+                ..Default::default()
+            };
+            let client = HttpClientBuilder::with_config(config).build();
+            assert!(
+                client.is_ok(),
+                "Native + AllowInsecureHttp should build with HTTP/2 enabled"
+            );
+        }
 
         // Test Native roots with TlsOnly (HTTPS only)
         let config = HttpClientConfig {
@@ -1076,10 +1102,14 @@ mod tests {
             .retry(None)
             .build_with_inner_service(inner.boxed_clone());
 
-        // Spawn the request so we can drop it explicitly
+        // Spawn the request so we can drop it explicitly.
+        // URL uses https:// so the scheme validation in RequestBuilder passes
+        // under both the non-fips default (AllowInsecureHttp) and the fips
+        // default (TlsOnly); the connector here is the injected PendingService,
+        // so no real TLS handshake happens.
         let send_handle = tokio::spawn({
             let client = client.clone();
-            async move { client.get("http://fake/slow").send().await }
+            async move { client.get("https://fake/slow").send().await }
         });
 
         // Wait for the request to reach the inner service

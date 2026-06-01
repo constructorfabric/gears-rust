@@ -478,13 +478,32 @@ pub enum TlsRootConfig {
 pub enum TransportSecurity {
     /// Require TLS for all connections (HTTPS only)
     TlsOnly,
-    /// Allow insecure HTTP connections (default)
+    /// Allow insecure HTTP connections
     ///
     /// Use [`HttpClientBuilder::deny_insecure_http`] to switch to `TlsOnly`
     /// when TLS enforcement is required.
+    ///
+    /// **FIPS**: under `--features fips`, configuring this on a builder causes
+    /// [`HttpClientBuilder::build`] to return [`HttpError::InsecureTransport`].
+    /// Use [`HttpClientConfig::for_testing`] only for non-FIPS local mocks.
+    ///
+    /// [`HttpClientBuilder::deny_insecure_http`]: crate::builder::HttpClientBuilder::deny_insecure_http
+    /// [`HttpClientBuilder::build`]: crate::builder::HttpClientBuilder::build
+    /// [`HttpError::InsecureTransport`]: crate::error::HttpError::InsecureTransport
     #[default]
     AllowInsecureHttp,
 }
+
+/// Default transport security for built-in presets.
+///
+/// Under `--features fips` every non-testing preset defaults to
+/// [`TransportSecurity::TlsOnly`] so cleartext HTTP cannot be selected by
+/// accident; otherwise the historical [`TransportSecurity::AllowInsecureHttp`]
+/// default is retained for local development convenience.
+#[cfg(feature = "fips")]
+const DEFAULT_TRANSPORT: TransportSecurity = TransportSecurity::TlsOnly;
+#[cfg(not(feature = "fips"))]
+const DEFAULT_TRANSPORT: TransportSecurity = TransportSecurity::AllowInsecureHttp;
 
 /// Overall HTTP client configuration
 #[derive(Debug, Clone)]
@@ -517,9 +536,17 @@ pub struct HttpClientConfig {
     /// Rate limiting / concurrency configuration
     pub rate_limit: Option<RateLimitConfig>,
 
-    /// Transport security mode (default: `AllowInsecureHttp`)
+    /// Transport security mode.
+    ///
+    /// Default: `TlsOnly` under `--features fips`, `AllowInsecureHttp` otherwise.
+    /// Only [`HttpClientConfig::for_testing`] keeps `AllowInsecureHttp` regardless
+    /// of features. Under `--features fips`, [`HttpClientBuilder::build`] returns
+    /// [`HttpError::InsecureTransport`] when this is `AllowInsecureHttp`.
     ///
     /// Use [`HttpClientBuilder::deny_insecure_http`] to enforce TLS for all connections.
+    ///
+    /// [`HttpClientBuilder::build`]: crate::builder::HttpClientBuilder::build
+    /// [`HttpError::InsecureTransport`]: crate::error::HttpError::InsecureTransport
     pub transport: TransportSecurity,
 
     /// TLS root certificate strategy (default: `WebPki`)
@@ -578,7 +605,7 @@ impl Default for HttpClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             retry: Some(RetryConfig::default()),
             rate_limit: Some(RateLimitConfig::default()),
-            transport: TransportSecurity::AllowInsecureHttp,
+            transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 1024,
@@ -600,7 +627,7 @@ impl HttpClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             retry: None,
             rate_limit: None,
-            transport: TransportSecurity::AllowInsecureHttp,
+            transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 256,
@@ -620,7 +647,7 @@ impl HttpClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             retry: Some(RetryConfig::aggressive()),
             rate_limit: Some(RateLimitConfig::default()),
-            transport: TransportSecurity::AllowInsecureHttp,
+            transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 1024,
@@ -661,7 +688,7 @@ impl HttpClientConfig {
                 ..RetryConfig::default()
             }),
             rate_limit: Some(RateLimitConfig::conservative()),
-            transport: TransportSecurity::AllowInsecureHttp,
+            transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 256,
@@ -671,7 +698,20 @@ impl HttpClientConfig {
         }
     }
 
-    /// Create configuration for testing with mock servers (allows insecure HTTP)
+    /// Create configuration for testing with mock servers.
+    ///
+    /// **This is the only built-in preset that sets
+    /// `transport: TransportSecurity::AllowInsecureHttp`** — every other
+    /// preset (`default`, `minimal`, `infra_default`, `token_endpoint`, `sse`)
+    /// uses `DEFAULT_TRANSPORT`, which is `TlsOnly` under `--features fips`.
+    ///
+    /// Under `--features fips`, [`HttpClientBuilder::build`] still rejects
+    /// `AllowInsecureHttp` and returns [`HttpError::InsecureTransport`]; this
+    /// preset is intended for non-FIPS test code that wires up `httpmock` or
+    /// other plaintext mock servers.
+    ///
+    /// [`HttpClientBuilder::build`]: crate::builder::HttpClientBuilder::build
+    /// [`HttpError::InsecureTransport`]: crate::error::HttpError::InsecureTransport
     #[must_use]
     pub fn for_testing() -> Self {
         Self {
@@ -740,7 +780,7 @@ impl HttpClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             retry: None, // SSE reconnection is protocol-level (Last-Event-ID)
             rate_limit: None,
-            transport: TransportSecurity::AllowInsecureHttp,
+            transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
             otel: false,
             buffer_capacity: 64,
@@ -976,7 +1016,10 @@ mod tests {
         assert_eq!(config.user_agent, DEFAULT_USER_AGENT);
         assert!(config.retry.is_some());
         assert!(config.rate_limit.is_some());
+        #[cfg(not(feature = "fips"))]
         assert_eq!(config.transport, TransportSecurity::AllowInsecureHttp);
+        #[cfg(feature = "fips")]
+        assert_eq!(config.transport, TransportSecurity::TlsOnly);
         assert!(!config.otel);
         assert_eq!(config.buffer_capacity, 1024);
     }

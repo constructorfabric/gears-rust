@@ -3,6 +3,13 @@
 //! Spins up a local TLS server that only speaks HTTP/2 (via ALPN `h2`),
 //! configures OAGW to proxy to it with cert verification disabled, and
 //! asserts that request/response round-trips work correctly over H2.
+//!
+//! Skipped under `--features fips`: the shared `AppHarness` wires its
+//! token HTTP client via `HttpClientConfig::for_testing()` (plaintext),
+//! which `modkit-http` rejects with `HttpError::InsecureTransport` under
+//! FIPS — see PR #1985.
+
+#![cfg(not(feature = "fips"))]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

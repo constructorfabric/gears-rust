@@ -389,7 +389,20 @@ pub async fn try_acquire_buffer_slot(service: &mut BufferedService) -> Result<()
     }
 }
 
+// The in-crate tests below rely on `httpmock` (plaintext HTTP only) and on
+// constructing clients that accept `http://` URLs. Under `--features fips`
+// the default `HttpClientConfig.transport` is `TlsOnly` and
+// `HttpClientBuilder::build()` rejects `AllowInsecureHttp` outright (see
+// issue #1934), so the whole module cannot compile/run there. The FIPS-mode
+// contract is covered by the integration test in
+// `tests/fips_default_transport.rs` and by `tests/no_crypto_provider_fips.rs`.
+//
+// The two cfg gates are kept separate — `#[cfg(test)]` then
+// `#[cfg(not(feature = "fips"))]` — so that clippy's test-aware lint
+// exemptions (e.g. tolerating `unwrap()` in test code) still trigger on the
+// bare `cfg(test)` marker.
 #[cfg(test)]
+#[cfg(not(feature = "fips"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
@@ -2111,13 +2124,13 @@ mod tests {
     }
 
     /// Test: Invalid scheme (e.g., ftp://) rejected
+    ///
+    /// Note: transport security is left at preset default — `ftp://` is rejected
+    /// independently of `TlsOnly`/`AllowInsecureHttp`, so the test runs identically
+    /// under both `--features fips` (`TlsOnly` default) and without.
     #[tokio::test]
     async fn test_url_scheme_invalid_rejected() {
-        let client = HttpClientBuilder::new()
-            .transport(crate::config::TransportSecurity::AllowInsecureHttp)
-            .retry(None)
-            .build()
-            .unwrap();
+        let client = HttpClientBuilder::new().retry(None).build().unwrap();
 
         let result = client.get("ftp://files.example.com/file.txt").send().await;
 
@@ -2135,13 +2148,13 @@ mod tests {
     }
 
     /// Test: Missing scheme rejected (now returns `InvalidUri` with proper parsing)
+    ///
+    /// Note: transport security is left at preset default — a missing scheme is
+    /// rejected independently of `TlsOnly`/`AllowInsecureHttp`, so the test runs
+    /// identically under both `--features fips` (`TlsOnly` default) and without.
     #[tokio::test]
     async fn test_url_scheme_missing_rejected() {
-        let client = HttpClientBuilder::new()
-            .transport(crate::config::TransportSecurity::AllowInsecureHttp)
-            .retry(None)
-            .build()
-            .unwrap();
+        let client = HttpClientBuilder::new().retry(None).build().unwrap();
 
         let result = client.get("example.com/test").send().await;
 

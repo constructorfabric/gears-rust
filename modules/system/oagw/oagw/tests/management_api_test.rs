@@ -1,3 +1,9 @@
+//! Skipped under `--features fips`: `AppHarness` wires its token HTTP client
+//! via `HttpClientConfig::for_testing()` (plaintext), which `modkit-http`
+//! rejects with `HttpError::InsecureTransport` under FIPS — see PR #1985.
+
+#![cfg(not(feature = "fips"))]
+
 use oagw::test_support::{AppHarness, format_upstream_gts};
 use uuid::Uuid;
 
