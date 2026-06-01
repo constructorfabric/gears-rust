@@ -79,15 +79,19 @@ static INIT_RESULT: OnceLock<Result<(), CryptoProviderError>> = OnceLock::new();
 /// construction (`cyberware_rustls_corecrypto_provider::oe::fips_witness_ok`).
 /// On a macOS major outside the active corecrypto CMVP cert OE, **every**
 /// `fips()` impl in the provider returns `false` and a single
-/// `tracing::warn!` is emitted. There is **no panic** — downstream code
-/// that depends on `ClientConfig::fips()` / `ServerConfig::fips()` must
-/// handle the `false` case explicitly (see
-/// `modkit_http::tls::apply_fips_hardening` for the canonical pattern,
-/// which returns `Err` instead of asserting). The
-/// `CYBERWARE_FIPS_OE_OVERRIDE=1` env-var forces the witness to `true`
+/// `tracing::warn!` is emitted. The post-install witness `assert!` then
+/// **panics** — a misconfigured FIPS build must never silently proceed.
+/// Use `CYBERWARE_FIPS_OE_OVERRIDE=1` to force the witness to `true`
 /// for CI on pre-release macOS — never for production. See the
 /// `cyberware-rustls-corecrypto-provider` README "Runtime FIPS witness" section
 /// and FIPS PRD §8.3.
+///
+/// Downstream TLS configuration code (`modkit_http::tls::apply_fips_hardening`)
+/// performs its own `config.fips()` check and returns `Err` rather than
+/// panicking — `ClientConfig::fips()` depends on per-config settings
+/// (`require_ems`, protocol versions) beyond the provider itself, so the
+/// TLS-layer check is a defence-in-depth complement to the bootstrap
+/// assertion here.
 ///
 /// **Linux / Windows**: runtime OE-validation is not yet implemented; OE
 /// coverage is verified via the release checklist (manual CMVP cert search,
@@ -99,6 +103,13 @@ static INIT_RESULT: OnceLock<Result<(), CryptoProviderError>> = OnceLock::new();
 ///   enabled and another rustls provider was installed first.
 /// - [`CryptoProviderError::SystemFipsModeNotEnabled`] on Windows+`fips` when
 ///   the OS is not in system-wide FIPS mode.
+///
+/// # Panics
+///
+/// Panics (via `assert!`) under `--features fips` if the installed crypto
+/// provider does not report `fips() == true`. This is an intentional
+/// fail-closed guard against misconfigured builds (wrong feature flags,
+/// wrong OS, or macOS OE mismatch without the override env-var).
 pub fn init_crypto_provider() -> Result<(), CryptoProviderError> {
     INIT_RESULT
         .get_or_init(|| {
@@ -162,6 +173,18 @@ pub fn init_crypto_provider() -> Result<(), CryptoProviderError> {
                     return Err(CryptoProviderError::FipsProviderConflict);
                 }
                 tracing::info!("FIPS-140-3 crypto provider installed (AWS-LC FIPS module)");
+            }
+
+            #[cfg(feature = "fips")]
+            {
+                let Some(provider) = rustls::crypto::CryptoProvider::get_default() else {
+                    unreachable!("provider must be installed at this point");
+                };
+                assert!(
+                    provider.fips(),
+                    "FIPS post-install witness failed: installed provider does not report fips()==true"
+                );
+                tracing::info!("FIPS post-install witness: OK");
             }
 
             #[cfg(not(feature = "fips"))]

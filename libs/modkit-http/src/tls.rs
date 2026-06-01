@@ -161,9 +161,11 @@ pub enum TlsConfigError {
 
     /// `apply_fips_hardening` rejected the freshly-built `ClientConfig`
     /// because `ClientConfig::fips()` reported `false`. Carries the
-    /// human-readable diagnostic — typically a witness mismatch
-    /// (`cyberware_rustls_corecrypto_provider::oe::fips_witness_ok` on macOS)
-    /// or a missed `init_crypto_provider()` call.
+    /// human-readable diagnostic. Under normal bootstrap flow the
+    /// provider-level witness is already asserted by
+    /// `init_crypto_provider`; this error surfaces per-config issues
+    /// (e.g. missing `require_ems`) or a missed `init_crypto_provider()`
+    /// call.
     #[error("{0}")]
     FipsHardeningFailed(String),
 
@@ -210,10 +212,10 @@ mod fips_test_provider {
 ///   1. forces `require_ems = true` (NIST SP 800-52 Rev. 2 §3.5), and
 ///   2. verifies `config.fips() == true` and returns `Err` otherwise.
 ///
-/// Returning `Err` rather than `panic!` matches the witness contract of
-/// `cyberware-rustls-corecrypto-provider`: an OE mismatch surfaces as a
-/// `fips() == false` witness, and that surfaces here as a recoverable
-/// error rather than process termination.
+/// The bootstrap `assert!` in `init_crypto_provider` is the primary
+/// guard against a non-FIPS provider; this TLS-layer check is
+/// defence-in-depth for per-config settings (`require_ems`, protocol
+/// versions) that also affect `ClientConfig::fips()`.
 fn build_client_config(
     root_store: rustls::RootCertStore,
 ) -> Result<rustls::ClientConfig, TlsConfigError> {
@@ -265,24 +267,22 @@ fn build_client_config(
 ///     `ClientConfig::fips()` to consider TLS 1.2 sessions FIPS-compliant
 ///     when the EMS extension is honoured by the peer).
 ///   * verify the full FIPS chain reports `fips() == true`. If not, return
-///     `Err` rather than panic — the failure mode is recoverable from the
-///     caller's perspective (build a non-FIPS client, surface the error,
-///     etc.). Panic was the previous behaviour; replaced because the
-///     witness rework in `cyberware-rustls-corecrypto-provider` makes
-///     `config.fips() == false` a normal runtime state on unsupported
-///     macOS majors, not a programming error.
+///     `Err` — the bootstrap `assert!` in `init_crypto_provider` already
+///     guarantees the provider reports `fips() == true`, so a failure here
+///     indicates a per-config issue (e.g. missing `require_ems` or
+///     restricted protocol versions) rather than a provider-level problem.
 #[cfg(feature = "fips")]
 fn apply_fips_hardening(cfg: &mut rustls::ClientConfig) -> Result<(), TlsConfigError> {
     cfg.require_ems = true;
     if !cfg.fips() {
         return Err(TlsConfigError::FipsHardeningFailed(
             "TLS ClientConfig does not advertise FIPS after enabling require_ems. \
-             The runtime FIPS witness \
-             (cyberware_rustls_corecrypto_provider::oe::fips_witness_ok on macOS) \
-             is reporting false -- typically because the running macOS major is \
-             outside the active corecrypto CMVP cert OE. \
-             Set CYBERWARE_FIPS_OE_OVERRIDE=1 (CI / pre-release only) to force the \
-             witness to true; never set this in production."
+             The bootstrap assert in init_crypto_provider should have caught a \
+             non-FIPS provider at startup; if you see this error the provider is \
+             FIPS-OK but a per-config setting (protocol versions, require_ems) is \
+             preventing ClientConfig::fips() from reporting true. \
+             If init_crypto_provider was not called, call it before building any \
+             TLS config."
                 .to_owned(),
         ));
     }
