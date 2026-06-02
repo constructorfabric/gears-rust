@@ -59,6 +59,31 @@ pub struct SessionPage {
     pub next_cursor: Option<String>,
 }
 
+/// Typed answer returned by [`SessionRepo::check_session_scope`].
+///
+/// Hand-rolled string scoping in service code is a footgun: any caller
+/// that reaches a row via [`SessionRepo::find_by_session_id_unscoped`]
+/// must remember to compare `tenant_id` / `user_id` against the caller's
+/// identity, AND must avoid leaking other fields. This enum closes that
+/// gap — the only way to learn ownership is to ask the repo, and the
+/// repo only hands back a row when scoping matches. Callers that need
+/// to distinguish 403 vs 404 read the discriminant directly.
+#[derive(Debug, Clone)]
+pub enum SessionScopeCheck {
+    /// Session exists AND is owned by `(tenant_id, user_id)`. The row is
+    /// exposed because the caller proved ownership.
+    Owned(session_entity::Model),
+    /// Session exists but lives in a different tenant. Maps to HTTP 403.
+    WrongTenant,
+    /// Session exists in this tenant but belongs to a different user.
+    /// Maps to HTTP 404 (anti-enumeration, ADR-0021) — the caller MUST
+    /// NOT distinguish this from `NotFound` on the wire.
+    WrongUser,
+    /// Session id does not resolve to any row, or the row is in the
+    /// `HardDeleted` lifecycle state.
+    NotFound,
+}
+
 /// Outcome of a `delete_session` call — carries the lifecycle change applied
 /// so the handler can choose 200 vs 204 accordingly.
 #[derive(Debug, Clone)]
@@ -188,22 +213,50 @@ pub trait SessionRepo: Send + Sync {
     }
 
     /// Phase 8 hook (overflow recovery). Look up a session by primary key
-    /// only — NOT scoped by tenant/user. Used **exclusively** by the
-    /// internal context-overflow recovery path
-    /// ([`crate::domain::service::message_service::MessageService::handle_context_overflow`])
-    /// which is invoked from a post-finalise driver task that owns the
-    /// session reference but does not thread the identity through the
-    /// recovery hook signature.
+    /// only — NOT scoped by tenant/user.
     ///
-    /// External callers MUST use the scoped [`Self::find_by_id`] to
-    /// preserve anti-enumeration semantics (ADR-0021). The default impl
-    /// returns `None` so existing test mocks compile.
+    /// **This method is an internal building block for
+    /// [`Self::check_session_scope`]. Service code MUST NOT call it
+    /// directly — every existing production call site has been migrated
+    /// to `check_session_scope` (which returns a typed scope
+    /// discriminant and never exposes a foreign row) or to the scoped
+    /// [`Self::find_by_id`].** The method is retained on the trait so
+    /// `check_session_scope`'s default impl can reuse a single SQL
+    /// lookup across the four discriminant branches.
+    ///
+    /// The default impl returns `None` so existing test mocks compile.
     async fn find_by_session_id_unscoped(
         &self,
         session_id: Uuid,
     ) -> Result<Option<session_entity::Model>, ChatEngineError> {
         let _ = session_id;
         Ok(None)
+    }
+
+    /// Resolve a session id under the caller's `(tenant_id, user_id)`
+    /// scope and report ownership as a typed discriminant. This is the
+    /// **only** API service code should use when it needs to distinguish
+    /// cross-tenant from cross-user access — the unscoped lookup is no
+    /// longer reachable through a public method that returns the row.
+    ///
+    /// The default impl issues an unscoped lookup and discriminates
+    /// in-process; production [`SeaSessionRepo`] uses the same path.
+    async fn check_session_scope(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        session_id: Uuid,
+    ) -> Result<SessionScopeCheck, ChatEngineError> {
+        let Some(row) = self.find_by_session_id_unscoped(session_id).await? else {
+            return Ok(SessionScopeCheck::NotFound);
+        };
+        if row.tenant_id != tenant_id {
+            return Ok(SessionScopeCheck::WrongTenant);
+        }
+        if row.user_id != user_id {
+            return Ok(SessionScopeCheck::WrongUser);
+        }
+        Ok(SessionScopeCheck::Owned(row))
     }
 
     /// Phase 10 hook (session sharing). Look up a session by its

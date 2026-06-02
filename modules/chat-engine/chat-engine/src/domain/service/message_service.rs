@@ -429,6 +429,8 @@ impl MessageService {
     /// unchanged.
     pub async fn handle_context_overflow(
         &self,
+        tenant_id: &str,
+        user_id: &str,
         session_id: Uuid,
         current_strategy: &MemoryStrategy,
     ) -> Result<()> {
@@ -440,7 +442,8 @@ impl MessageService {
 
         match current_strategy {
             MemoryStrategy::Summarized { .. } => {
-                self.recover_via_session_summary(session_id).await
+                self.recover_via_session_summary(tenant_id, user_id, session_id)
+                    .await
             }
             MemoryStrategy::Full | MemoryStrategy::SlidingWindow { .. } => {
                 Err(ChatEngineError::BackendUnavailable {
@@ -454,23 +457,34 @@ impl MessageService {
 
     /// Phase 8 implementation of the Summarized branch of
     /// [`Self::handle_context_overflow`]. Loads the session via the
-    /// unscoped lookup, resolves its backend plugin, invokes
+    /// **scoped** lookup, resolves its backend plugin, invokes
     /// `on_session_summary`, drains the stream (the original HTTP body
     /// has already closed by the time the driver task fires this), and
     /// atomically persists the summary message plus flips the reported
     /// `summarized_message_ids` to `is_hidden_from_backend=true` so the
     /// NEXT message-send request observes the compressed history.
     ///
-    /// We use `find_by_session_id_unscoped` here because the driver task
-    /// owns the recovery context (it already validated tenant/user
-    /// ownership when the original message-send request landed); the
-    /// recovery method itself only needs to re-fetch the row for the
-    /// plugin-routing metadata (`session_type_id`, etc).
-    async fn recover_via_session_summary(&self, session_id: Uuid) -> Result<()> {
-        let Some(row) = self.sessions.find_by_session_id_unscoped(session_id).await? else {
+    /// `tenant_id` / `user_id` are threaded through from the driver
+    /// task's captured identity (see `OverflowDispatchCtx`) so this
+    /// method can use the scoped `find_by_id` — the prior version
+    /// reached for `find_by_session_id_unscoped` and relied on the
+    /// driver's *previous* scoped fetch validating ownership, which is
+    /// a per-caller convention rather than a repo-level guarantee.
+    async fn recover_via_session_summary(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        session_id: Uuid,
+    ) -> Result<()> {
+        let Some(row) = self
+            .sessions
+            .find_by_id(tenant_id, user_id, session_id)
+            .await?
+        else {
             warn!(
                 session_id = %session_id,
-                "context_overflow recovery skipped: session row not accessible",
+                "context_overflow recovery skipped: session row not accessible \
+                 under the calling identity's scope",
             );
             return Ok(());
         };
@@ -843,23 +857,27 @@ impl MessageService {
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<DeleteOutcome> {
-        // 1. Resolve the session row WITHOUT tenant/user scoping so we
-        //    can distinguish tenant mismatch (403) from user mismatch
-        //    (404, anti-enumeration). Cross-tenant access is the only
-        //    case that surfaces 403 per the Phase 12 rules.
-        let session_row = self
+        // 1. Resolve the session via `check_session_scope` — this is the
+        //    only API that exposes "session exists but in a different
+        //    tenant" (→ 403) without ever returning the foreign row. The
+        //    repo never hands out cross-scope data; we only see the row
+        //    when ownership matches.
+        use crate::infra::db::repo::session_repo::SessionScopeCheck;
+        match self
             .sessions
-            .find_by_session_id_unscoped(session_id)
+            .check_session_scope(&identity.tenant_id, &identity.user_id, session_id)
             .await?
-            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
-
-        if session_row.tenant_id != identity.tenant_id {
-            return Err(ChatEngineError::forbidden(
-                "session belongs to a different tenant",
-            ));
-        }
-        if session_row.user_id != identity.user_id {
-            return Err(ChatEngineError::not_found("session", session_id));
+        {
+            SessionScopeCheck::Owned(_) => {}
+            SessionScopeCheck::WrongTenant => {
+                return Err(ChatEngineError::forbidden(
+                    "session belongs to a different tenant",
+                ));
+            }
+            // WrongUser folds to NotFound per ADR-0021 anti-enumeration.
+            SessionScopeCheck::WrongUser | SessionScopeCheck::NotFound => {
+                return Err(ChatEngineError::not_found("session", session_id));
+            }
         }
 
         // 2. Resolve the target message scoped to `session_id`. A miss
@@ -1293,7 +1311,14 @@ impl MessageService {
                         Ok(Some(row)) => {
                             let meta = row.metadata.clone().unwrap_or(JsonValue::Null);
                             let strategy = read_memory_strategy(&meta);
-                            let res = svc.handle_context_overflow(session_id, &strategy).await;
+                            let res = svc
+                                .handle_context_overflow(
+                                    &identity_tenant,
+                                    &identity_user,
+                                    session_id,
+                                    &strategy,
+                                )
+                                .await;
                             if let Err(err) = res {
                                 debug!(
                                     session_id = %session_id,
@@ -2392,7 +2417,7 @@ mod tests {
     async fn handle_overflow_full_propagates_as_backend_unavailable() {
         let (svc, _repo) = make_strategy_service(vec![]);
         let err = svc
-            .handle_context_overflow(Uuid::new_v4(), &MemoryStrategy::Full)
+            .handle_context_overflow("t", "u", Uuid::new_v4(), &MemoryStrategy::Full)
             .await
             .expect_err("full propagates overflow");
         assert!(matches!(err, ChatEngineError::BackendUnavailable { .. }));
@@ -2403,6 +2428,8 @@ mod tests {
         let (svc, _repo) = make_strategy_service(vec![]);
         let err = svc
             .handle_context_overflow(
+                "t",
+                "u",
                 Uuid::new_v4(),
                 &MemoryStrategy::SlidingWindow { window_size: 5 },
             )
@@ -2413,20 +2440,25 @@ mod tests {
 
     #[tokio::test]
     async fn handle_overflow_summarized_skips_when_session_inaccessible() {
-        // Phase 8 replaces the Phase 7 sentinel: on Summarized the hook
-        // attempts to load the row via `find_by_session_id_unscoped`. The
-        // strategy-test mock SessionRepo uses the default trait impl
-        // (returns `None`), so recovery silently degrades to `Ok(())` —
-        // the spec mandates no panic when the session row is not visible.
+        // Recovery now goes through the SCOPED `find_by_id` — the
+        // strategy-test mock SessionRepo only returns rows when the
+        // tenant/user match its single seeded row. Passing identity
+        // values that do not match (`"t"` / `"u"` here vs the mock's
+        // synthetic `"t"` / `"u"` from `MockSessionRepo::new`) means
+        // the lookup may surface a row OR return None depending on the
+        // fixture's identity. Either way the contract is: NO panic, NO
+        // cross-scope leak.
         let (svc, _repo) = make_strategy_service(vec![]);
         svc.handle_context_overflow(
+            "t",
+            "u",
             Uuid::new_v4(),
             &MemoryStrategy::Summarized {
                 recent_messages_to_keep: 3,
             },
         )
         .await
-        .expect("Phase 8: missing session degrades gracefully");
+        .expect("missing session degrades gracefully under scoped lookup");
     }
 
     // ---- update_memory_strategy (PATCH /sessions/{id}) ----------------
