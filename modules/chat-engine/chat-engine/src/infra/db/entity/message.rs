@@ -2,10 +2,7 @@
 // @cpt-cf-chat-engine-adr-message-tree-structure:p1
 
 use sea_orm::entity::prelude::*;
-use sea_orm::{
-    AccessMode, ConnectionTrait, IsolationLevel, QueryFilter, QueryOrder, QuerySelect,
-    TransactionError, TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, QueryFilter, QueryOrder, QuerySelect};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -76,77 +73,45 @@ impl Related<super::message_reaction::Entity> for Entity {
 impl ActiveModelBehavior for ActiveModel {}
 
 /// Compute the next `variant_index` for the sibling group identified by
-/// `(session_id, parent_message_id)`.
+/// `(session_id, parent_message_id)` **inside the caller's transaction**.
 ///
-/// Strategy (DESIGN §3.7 — Variant Index Concurrency):
-///   1. Open a SERIALIZABLE transaction scoped to this sibling group.
-///   2. `SELECT MAX(variant_index)` for the sibling group.
-///   3. Return `max + 1` to the caller (the caller is responsible for
-///      issuing the INSERT in the same transaction or, more commonly, the
-///      retry loop below replays the helper after a unique-constraint
-///      violation).
+/// This is the SELECT half of the variant-index allocation; the matching
+/// INSERT MUST be issued against the same transaction handle so a
+/// concurrent caller cannot observe-then-claim the same index between the
+/// read and the write. Callers wrap both operations in a single
+/// SERIALIZABLE transaction plus a retry loop bounded by
+/// [`VARIANT_INDEX_MAX_RETRIES`] — see the call sites in
+/// `infra::db::repo::message_repo` and `infra::db::repo::variant_repo`.
 ///
-/// Hard cap: `VARIANT_INDEX_MAX_RETRIES` retries. After exhaustion the
-/// final error is propagated and callers map it to HTTP 409 Conflict.
-///
-/// This helper covers the "compute the next variant index" half of the
-/// algorithm. Phase 5 (message creation) and Phase 6 (variants) implement
-/// the matching INSERT-with-retry loop because the exact INSERT shape
-/// depends on the message being created and is out of scope for the
-/// db-schema phase.
-pub async fn assign_variant_index<C>(
-    runner: &C,
+/// The earlier `assign_variant_index` helper opened its own transaction
+/// for the SELECT only and returned `i32` to the caller, who then issued
+/// the INSERT in a *separate* transaction. That created a race window
+/// where a concurrent caller could claim the same index between the two
+/// transactions, surfacing the unique violation as a raw 500 instead of
+/// retrying. The helper was removed in favour of this primitive plus
+/// inline retry at every call site.
+pub async fn compute_next_variant_index<C>(
+    txn: &C,
     session_id: Uuid,
     parent: Option<Uuid>,
 ) -> Result<i32, DbErr>
 where
-    C: ConnectionTrait + TransactionTrait,
+    C: ConnectionTrait,
 {
-    let mut last_err: Option<DbErr> = None;
+    let mut query = Entity::find()
+        .filter(Column::SessionId.eq(session_id))
+        .order_by_desc(Column::VariantIndex)
+        .limit(1);
 
-    for _attempt in 0..VARIANT_INDEX_MAX_RETRIES {
-        let outcome: Result<i32, TransactionError<DbErr>> = runner
-            .transaction_with_config::<_, i32, DbErr>(
-                |txn| {
-                    Box::pin(async move {
-                        let mut query = Entity::find()
-                            .filter(Column::SessionId.eq(session_id))
-                            .order_by_desc(Column::VariantIndex)
-                            .limit(1);
+    query = match parent {
+        Some(p) => query.filter(Column::ParentMessageId.eq(p)),
+        None => query.filter(Column::ParentMessageId.is_null()),
+    };
 
-                        query = match parent {
-                            Some(p) => query.filter(Column::ParentMessageId.eq(p)),
-                            None => query.filter(Column::ParentMessageId.is_null()),
-                        };
-
-                        let next = match query.one(txn).await? {
-                            Some(row) => row.variant_index + 1,
-                            None => 0,
-                        };
-                        Ok(next)
-                    })
-                },
-                Some(IsolationLevel::Serializable),
-                Some(AccessMode::ReadWrite),
-            )
-            .await;
-
-        match outcome {
-            Ok(next) => return Ok(next),
-            Err(TransactionError::Transaction(e)) | Err(TransactionError::Connection(e)) => {
-                if !is_unique_violation(&e) {
-                    return Err(e);
-                }
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        DbErr::Custom(format!(
-            "assign_variant_index exhausted {VARIANT_INDEX_MAX_RETRIES} retries"
-        ))
-    }))
+    Ok(match query.one(txn).await? {
+        Some(row) => row.variant_index + 1,
+        None => 0,
+    })
 }
 
 /// Crude `DbErr` classifier: returns `true` when the error message refers to
@@ -156,7 +121,7 @@ where
 /// downstream retry logic matches on the constraint name embedded in the
 /// driver-level error. Phase 6 (variants) is expected to refine this with a
 /// SQLSTATE-aware classifier when it materializes the full INSERT path.
-fn is_unique_violation(err: &DbErr) -> bool {
+pub fn is_variant_unique_violation(err: &DbErr) -> bool {
     let msg = err.to_string();
     msg.contains(UQ_VARIANT_INDEX) || msg.contains("UNIQUE constraint failed")
 }

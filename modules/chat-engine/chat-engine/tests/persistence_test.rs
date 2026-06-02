@@ -2,9 +2,9 @@
 //!
 //! These tests construct a real `MessageService` over a SeaORM
 //! SQLite-in-memory stack (every production repo impl, the real
-//! `assign_variant_index` helper, the real `finalize_assistant` UPDATE) and
-//! drive it with a scripted plugin so the finalize-on-cancel and
-//! finalize-on-pre-stream-timeout paths are exercised end-to-end.
+//! variant-index allocation transaction, the real `finalize_assistant`
+//! UPDATE) and drive it with a scripted plugin so the finalize-on-cancel
+//! and finalize-on-pre-stream-timeout paths are exercised end-to-end.
 //!
 //! The earlier `e2e_test.rs::it_streaming_cancel_persists_partial_message`
 //! test mirrored the driver loop in the test body — it never touched the

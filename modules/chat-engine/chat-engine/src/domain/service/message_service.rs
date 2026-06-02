@@ -658,9 +658,11 @@ impl MessageService {
     ///   - The new row is an *assistant* sibling of an existing message —
     ///     it has the same `parent_message_id` as the target user message
     ///     (recreate's `target.parent_message_id`, per the feature spec).
-    ///   - The `variant_index` is allocated via [`assign_variant_index`]
-    ///     (Phase 1 helper) inside a SERIALIZABLE sub-tx with up to 3
-    ///     retries on `uq_messages_session_parent_variant` collisions.
+    ///   - The `variant_index` is computed inside the SAME SERIALIZABLE
+    ///     transaction as the INSERT (via
+    ///     `infra::db::compute_next_variant_index`); the whole pair is
+    ///     retried up to 3 times on `uq_messages_session_parent_variant`
+    ///     collisions, with exhaustion mapping to HTTP 409.
     ///   - `is_active=true` on the new row — the variant becomes the
     ///     active leaf for that parent. Older siblings are deactivated by
     ///     [`VariantService::update_active_path`] *after* the stream
@@ -1054,8 +1056,13 @@ impl MessageService {
     }
 
     /// Atomic SERIALIZABLE insert of the user message + the assistant
-    /// stub. Delegates the variant_index race-handling to
-    /// [`crate::infra::db::assign_variant_index`] (Phase 1 helper).
+    /// stub. The matching `variant_index` is computed inline (via
+    /// `infra::db::compute_next_variant_index`) within the SAME
+    /// transaction as the INSERT, with the whole pair retried under
+    /// `VARIANT_INDEX_MAX_RETRIES` on
+    /// `uq_messages_session_parent_variant` collisions — the previous
+    /// `assign_variant_index` helper had its own transaction for the
+    /// SELECT and left a race window before the INSERT.
     #[instrument(skip(self, req, _identity), fields(session_id = %req.session_id))]
     async fn pre_persist_user_message(
         &self,

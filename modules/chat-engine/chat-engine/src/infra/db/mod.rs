@@ -10,7 +10,8 @@ pub mod migrations;
 pub mod repo;
 
 pub use entity::{
-    assign_variant_index, message, message_reaction, plugin_config, session, session_type,
+    VARIANT_INDEX_MAX_RETRIES, compute_next_variant_index, is_variant_unique_violation, message,
+    message_reaction, plugin_config, session, session_type,
 };
 pub use migrations::Migrator;
 

@@ -4,8 +4,9 @@
 // Creates `messages` per ADR-0001 (immutable message tree). Self-FK on
 // `parent_message_id` has NO cascade — parents are immutable by design and
 // hard-delete cascades start from `sessions`. The named UNIQUE constraint
-// `uq_messages_session_parent_variant` is what the variant-index retry loop in
-// `infra::db::entity::message::assign_variant_index` matches against.
+// `uq_messages_session_parent_variant` is what the variant-index retry
+// loops in `infra::db::repo::message_repo` / `variant_repo` match against
+// (via `infra::db::is_variant_unique_violation`).
 //
 // `file_ids` is stored as JSONB (an array of UUID strings) for backend
 // portability: SeaORM does not currently expose a dialect-portable
