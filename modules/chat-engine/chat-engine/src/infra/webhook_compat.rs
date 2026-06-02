@@ -25,12 +25,21 @@
 //!
 //! Every method that performs HTTP I/O honours the three-state `remaining()`:
 //!
-//! - `None` → use `default_timeout_ms` if configured, otherwise no per-request
-//!   timeout is set (the plugin honours the global `tokio` runtime semantics).
+//! - `None` → use `default_timeout_ms` if configured, else fall back to
+//!   [`DEFAULT_REQUEST_TIMEOUT`]. The per-request timeout is **always set**
+//!   so a missing deadline + missing config cannot leave the outbound HTTP
+//!   call unbounded.
 //! - `Some(Duration::ZERO)` → return [`PluginError::timeout`] **before** any
 //!   request is sent. Collapsing this into the `None` branch would let
 //!   elapsed deadlines silently extend the budget.
 //! - `Some(d > 0)` → forward `d` to the per-request `RequestBuilder::timeout(d)`.
+//!
+//! The underlying `reqwest::Client` is also built with
+//! [`DEFAULT_CONNECT_TIMEOUT`] (TCP/TLS handshake ceiling) and
+//! [`DEFAULT_REQUEST_TIMEOUT`] (request-level ceiling). The client-level
+//! request timeout is a defence-in-depth fallback for any future code
+//! path that issues a request without going through [`build_request`];
+//! `RequestBuilder::timeout` overrides it when set.
 //!
 //! Every HTTP future is raced against `ctx.cancel.cancelled()` via
 //! [`tokio::select!`]. The shared cancellation token is **never** invoked by
@@ -80,6 +89,21 @@ const CONFIG_KEY_AUTH: &str = "auth";
 const CONFIG_KEY_AUTH_VALUE: &str = "auth_value";
 const CONFIG_KEY_DEFAULT_TIMEOUT_MS: &str = "default_timeout_ms";
 
+/// Hard ceiling on TCP / TLS handshake time for the outbound HTTP client.
+/// Without this, a black-holed backend (no SYN-ACK) can wedge a request
+/// task indefinitely — reqwest does not enforce a connect timeout by
+/// default.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Fallback per-request timeout applied when both `PluginCallContext::
+/// remaining()` AND the operator-configured `default_timeout_ms` are
+/// absent. Also installed at the `reqwest::Client` level as a
+/// defence-in-depth ceiling — `RequestBuilder::timeout` set inside
+/// [`build_request`] overrides it on every call we issue today, but the
+/// client-level setting protects any future code path that bypasses that
+/// helper.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Legacy-HTTP-webhook adapter that implements [`ChatEngineBackendPlugin`].
 ///
 /// One instance per `plugin_instance_id`. Internally holds a `reqwest::Client`
@@ -103,6 +127,8 @@ impl WebhookCompatPlugin {
     /// fails to build (e.g., TLS backend init).
     pub fn new(plugin_instance_id: impl Into<String>) -> Result<Self, PluginError> {
         let http = Client::builder()
+            .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| PluginError::internal_with("failed to build reqwest client", e))?;
         Ok(Self {
@@ -283,8 +309,13 @@ struct WebhookConfig {
 }
 
 impl WebhookConfig {
-    fn resolved_timeout(&self, call_ctx: &PluginCallContext) -> Result<Option<Duration>, PluginError> {
+    fn resolved_timeout(&self, call_ctx: &PluginCallContext) -> Result<Duration, PluginError> {
         // Three-state remaining() — explicit branches, no collapsing.
+        // The `None` branch falls back to the operator-configured
+        // `default_timeout_ms` and ultimately to `DEFAULT_REQUEST_TIMEOUT`
+        // so the per-request timeout is *always* a positive `Duration` —
+        // a missing deadline must never produce an unbounded outbound
+        // HTTP call.
         match call_ctx.remaining() {
             Some(d) if d.is_zero() => {
                 Err(PluginError::timeout_with(std::io::Error::new(
@@ -292,8 +323,8 @@ impl WebhookConfig {
                     "deadline elapsed before request",
                 )))
             }
-            Some(d) => Ok(Some(d)),
-            None => Ok(self.default_timeout),
+            Some(d) => Ok(d),
+            None => Ok(self.default_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT)),
         }
     }
 
@@ -338,7 +369,9 @@ impl WebhookConfig {
     }
 }
 
-/// Build a `POST {endpoint}` request with auth + optional timeout applied.
+/// Build a `POST {endpoint}` request with auth + a per-request timeout
+/// applied. The timeout is non-optional — see [`WebhookConfig::
+/// resolved_timeout`] for the fallback chain.
 fn build_request(
     http: &Client,
     cfg: &WebhookConfig,
@@ -346,13 +379,11 @@ fn build_request(
     body: &JsonValue,
 ) -> Result<RequestBuilder, PluginError> {
     let timeout = cfg.resolved_timeout(call_ctx)?;
-    let mut req = http
+    let req = http
         .post(&cfg.endpoint)
         .headers(cfg.auth_headers()?)
-        .json(body);
-    if let Some(d) = timeout {
-        req = req.timeout(d);
-    }
+        .json(body)
+        .timeout(timeout);
     Ok(req)
 }
 
@@ -716,7 +747,28 @@ mod tests {
         };
         let ctx = make_call_ctx(None, CancellationToken::new());
         let out = cfg.resolved_timeout(&ctx).expect("ok");
-        assert_eq!(out, Some(Duration::from_millis(750)));
+        assert_eq!(out, Duration::from_millis(750));
+    }
+
+    #[test]
+    fn resolved_timeout_none_and_no_config_falls_back_to_hard_ceiling() {
+        // Pre-fix this combination returned `Ok(None)` → no per-request
+        // timeout → a hung backend could wedge the outbound HTTP task
+        // forever. The fix collapses the fallback chain into a positive
+        // `Duration`, so the per-request timeout is always set.
+        let cfg = WebhookConfig {
+            endpoint: "x".into(),
+            auth_kind: None,
+            auth_value: None,
+            default_timeout: None,
+        };
+        let ctx = make_call_ctx(None, CancellationToken::new());
+        let out = cfg.resolved_timeout(&ctx).expect("ok");
+        assert_eq!(
+            out, DEFAULT_REQUEST_TIMEOUT,
+            "missing deadline + missing config must fall back to the hard ceiling, \
+             never to an unbounded request",
+        );
     }
 
     #[test]
@@ -729,7 +781,7 @@ mod tests {
         };
         let mut ctx = make_call_ctx(None, CancellationToken::new());
         ctx.deadline = Some(Instant::now() + Duration::from_secs(5));
-        let out = cfg.resolved_timeout(&ctx).expect("ok").expect("some");
+        let out = cfg.resolved_timeout(&ctx).expect("ok");
         assert!(out > Duration::from_secs(4) && out <= Duration::from_secs(5));
     }
 
