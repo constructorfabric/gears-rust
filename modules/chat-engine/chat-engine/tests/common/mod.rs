@@ -21,6 +21,8 @@ use chat_engine_sdk::{
     stream_from_events,
 };
 
+pub mod db;
+
 /// Plugin script — what events (or error / hang) the fake plugin produces on
 /// the *next* `on_message` invocation. Each invocation consumes the script;
 /// subsequent calls return `empty_stream()`.
@@ -32,6 +34,12 @@ pub enum FakePluginScript {
     /// Return a stream that never yields (forever pending). Used to model
     /// upstream stalls so deadline / cancellation branches can fire.
     Hang,
+    /// Replay these events in order then hang (forever pending). The driver
+    /// observes the chunks, flushes them through the bounded channel, and
+    /// then stalls until the parent cancellation token fires. Used to
+    /// exercise the "cancel after partial chunks" persistence path against
+    /// a real `MessageService`.
+    EventsThenHang(Vec<StreamingEvent>),
 }
 
 /// Scriptable fake plugin used across integration tests.
@@ -77,6 +85,17 @@ impl ChatEngineBackendPlugin for FakePlugin {
             FakePluginScript::Events(events) => Ok(stream_from_events(events)),
             FakePluginScript::PreError(e) => Err(e),
             FakePluginScript::Hang => Ok(forever_pending_stream()),
+            FakePluginScript::EventsThenHang(events) => {
+                let items: Vec<Result<StreamingEvent, PluginError>> =
+                    events.into_iter().map(Ok).collect();
+                let head = futures::stream::iter(items);
+                let tail = futures::stream::poll_fn(
+                    |_cx| -> std::task::Poll<Option<Result<StreamingEvent, PluginError>>> {
+                        std::task::Poll::Pending
+                    },
+                );
+                Ok(head.chain(tail).boxed())
+            }
         }
     }
 
