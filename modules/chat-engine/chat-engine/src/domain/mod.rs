@@ -25,22 +25,25 @@ pub mod retention;
 pub mod search;
 pub mod service;
 pub mod session;
-pub mod share;
 
 // ---- Re-exports of SDK types that have no per-type sub-module ----
 pub use chat_engine_sdk::models::{Capability, CapabilityValue, HealthStatus, TenantId, UserId};
 
 // ---- Service-local types ----
 pub use error::{ChatEngineError, Result};
+// `ShareToken` is the redaction-shell newtype defined in
+// `domain::export`. The earlier Phase 2 struct in `domain::share` was a
+// bearer secret that derived Serialize/Deserialize — meaning any future
+// caller that serialised the struct (response body, structured log,
+// `tracing` field) would leak the raw token, defeating the manual
+// Debug redaction. That struct had zero production callers and has
+// been deleted; this `pub use` now points at the safe newtype so the
+// canonical `chat_engine::domain::ShareToken` path is no longer a
+// loaded gun.
 pub use export::{
-    ExportFormat, ExportStorage, ExportedSession, MessageView, ShareTokenIssue, SharedSessionView,
-    StorageError, StubExportStorage, generate_share_token,
+    ExportFormat, ExportStorage, ExportedSession, MessageView, ShareToken, ShareTokenIssue,
+    SharedSessionView, StorageError, StubExportStorage, generate_share_token,
 };
-// `domain::export::ShareToken` (redaction wrapper, Phase 10) is intentionally
-// NOT re-exported at the crate root — the pre-existing
-// `domain::share::ShareToken` (full token record, Phase 2) keeps the canonical
-// `chat_engine::domain::ShareToken` path. Phase 10 callers reach the wrapper
-// via the fully-qualified `domain::export::ShareToken` import.
 pub use memory_strategy::{MemoryStrategy, default_memory_strategy};
 pub use message::{
     Message, MessageRole, StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent,
@@ -60,4 +63,3 @@ pub use session::{
     ensure_can_transition, get_memory_strategy, get_retention_policy, get_share_expires_at,
     public_metadata, set_memory_strategy, set_retention_policy, set_share_expires_at,
 };
-pub use share::ShareToken;
