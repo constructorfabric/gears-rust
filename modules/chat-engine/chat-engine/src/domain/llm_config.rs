@@ -270,11 +270,11 @@ pub fn validate_plugin_config(json: &serde_json::Value) -> Result<LlmPluginConfi
     let parsed: LlmPluginConfig = serde_json::from_value(json.clone())
         .map_err(|e| PluginError::invalid_input_with("invalid LlmPluginConfig blob", e))?;
 
-    if parsed.gateway_url.trim().is_empty() {
-        return Err(PluginError::invalid_input(
-            "LlmPluginConfig.gateway_url must not be empty",
-        ));
-    }
+    // SSRF guard: reject gateway URLs aimed at loopback / link-local /
+    // private / metadata-service hosts before the LLM-gateway client ever
+    // sees the string. This is the only chokepoint for `gateway_url`;
+    // every downstream caller embeds the validated value verbatim.
+    crate::infra::url_guard::validate_outbound_url(&parsed.gateway_url, "gateway_url")?;
 
     if let Some(s) = parsed.summarization_settings {
         if s.recent_messages_to_keep < RECENT_MESSAGES_TO_KEEP_MIN {

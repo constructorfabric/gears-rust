@@ -154,13 +154,19 @@ impl WebhookCompatPlugin {
             .as_ref()
             .ok_or_else(|| PluginError::invalid_input("missing key: plugin_config"))?;
 
-        let endpoint = cfg
+        let raw_endpoint = cfg
             .get(CONFIG_KEY_ENDPOINT)
             .and_then(JsonValue::as_str)
             .ok_or_else(|| {
                 PluginError::invalid_input(format!("missing key: {CONFIG_KEY_ENDPOINT}"))
-            })?
-            .to_owned();
+            })?;
+        // SSRF guard: reject configured URLs that would aim the outbound
+        // POST at loopback / link-local / private / metadata-service IPs
+        // before we even build the request. We keep the original string —
+        // the canonicalised `Url` value differs in trailing-slash handling
+        // and would change the wire payload visible to legacy backends.
+        crate::infra::url_guard::validate_outbound_url(raw_endpoint, CONFIG_KEY_ENDPOINT)?;
+        let endpoint = raw_endpoint.to_owned();
 
         let auth_kind = cfg.get(CONFIG_KEY_AUTH).cloned();
         let auth_value = cfg

@@ -47,6 +47,7 @@ parking_lot = { workspace = true }
 
 reqwest = { workspace = true, features = ["json"] }
 bytes = { workspace = true }
+url = { workspace = true }
 
 modkit = { workspace = true }
 modkit-db = { workspace = true, features = ["sqlite", "pg"] }
