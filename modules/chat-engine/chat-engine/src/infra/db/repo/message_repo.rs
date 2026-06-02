@@ -5,11 +5,15 @@
 //! [`crate::domain::service::message_service::MessageService`] for the
 //! `POST /messages/send` pipeline:
 //!
-//! - [`MessageRepo::insert_user_and_assistant_stub`] runs a single
-//!   SERIALIZABLE transaction that derives a fresh `variant_index` for the
-//!   user message (via [`crate::infra::db::assign_variant_index`]) and
-//!   pre-inserts an assistant stub row (`is_complete=false`) keyed on the
-//!   user message ID.
+//! - [`MessageRepo::insert_user_and_assistant_stub`] runs a SERIALIZABLE
+//!   transaction that computes the next `variant_index` (via
+//!   [`crate::infra::db::compute_next_variant_index`]) and inserts the
+//!   user message + a matching assistant stub (`is_complete=false`) in
+//!   the **same** transaction. The whole pair is retried up to
+//!   `VARIANT_INDEX_MAX_RETRIES` times on
+//!   `uq_messages_session_parent_variant` collisions so a concurrent
+//!   sibling-insert is recovered transparently; exhaustion maps to HTTP
+//!   409.
 //! - [`MessageRepo::finalize_assistant`] atomically writes the assistant
 //!   message's final state (`content`, `is_complete`, `metadata`) once the
 //!   plugin stream resolves (success, error, or cancellation).
@@ -36,7 +40,9 @@ use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
 use crate::domain::message::Message;
-use crate::infra::db::assign_variant_index;
+use crate::infra::db::{
+    VARIANT_INDEX_MAX_RETRIES, compute_next_variant_index, is_variant_unique_violation,
+};
 use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
 /// Inputs for [`MessageRepo::insert_user_and_assistant_stub`].
@@ -112,8 +118,11 @@ pub trait MessageRepo: Send + Sync {
     /// Insert the user message + a pre-allocated assistant stub in a single
     /// SERIALIZABLE transaction.
     ///
-    /// - The user message is assigned a fresh `variant_index` via
-    ///   [`assign_variant_index`] (Phase 1 helper).
+    /// - The user message's `variant_index` is computed inline via
+    ///   [`compute_next_variant_index`] in the same transaction as the
+    ///   INSERT, and the whole pair is retried under
+    ///   `VARIANT_INDEX_MAX_RETRIES` on
+    ///   `uq_messages_session_parent_variant` collisions.
     /// - The assistant stub is created with `parent_message_id = user_id`,
     ///   `is_complete=false`, empty `content`, and `variant_index=0`.
     /// - Returns both IDs and the user `variant_index` so the service can
@@ -183,8 +192,10 @@ pub trait MessageRepo: Send + Sync {
 
     /// Phase 6 hook (recreate). Insert a fresh assistant sibling under
     /// `parent_message_id` with `variant_index = MAX+1`, `is_active=true`,
-    /// `is_complete=false`, empty content. The variant index is allocated
-    /// via [`assign_variant_index`] (Phase 1 helper).
+    /// `is_complete=false`, empty content. The variant index is computed
+    /// inline via [`compute_next_variant_index`] in the same transaction as
+    /// the INSERT, with `VARIANT_INDEX_MAX_RETRIES` retries on
+    /// `uq_messages_session_parent_variant` collisions.
     ///
     /// Returns an [`InsertedPair`] where `user_message_id = parent_message_id`,
     /// `assistant_message_id = new_row_id`, and `user_variant_index = new_variant_index`.
@@ -342,84 +353,102 @@ impl MessageRepo for SeaMessageRepo {
         &self,
         req: NewUserMessage,
     ) -> Result<InsertedPair, ChatEngineError> {
-        // Derive the next variant index for the user message in a
-        // SERIALIZABLE-bound retry loop. The helper handles the unique-
-        // constraint race; the matching INSERT lives in our own
-        // transaction below so the two rows land atomically together.
-        let user_variant_index =
-            assign_variant_index(&self.db, req.session_id, req.parent_message_id).await?;
-
-        let user_message_id = Uuid::new_v4();
-        let assistant_message_id = Uuid::new_v4();
-        let now = OffsetDateTime::now_utc();
-
+        // SERIALIZABLE-bound retry loop that wraps BOTH the
+        // `MAX(variant_index)+1` SELECT and the matching INSERT in a
+        // single transaction. The earlier code computed the index in a
+        // separate transaction and then issued the INSERT outside the
+        // retry guard — a concurrent caller could claim the same index
+        // in the gap, surfacing the unique violation as a raw 500. The
+        // INSERT is now retried in lockstep with the SELECT so the
+        // race window is closed.
+        let session_id = req.session_id;
+        let parent = req.parent_message_id;
         let file_ids_json = req
             .file_ids
             .as_ref()
             .filter(|ids| !ids.is_empty())
             .and_then(|ids| serde_json::to_value(ids).ok());
+        let content = req.content;
+        let metadata = req.metadata;
 
-        let user_active = message_entity::ActiveModel {
-            message_id: Set(user_message_id),
-            session_id: Set(req.session_id),
-            parent_message_id: Set(req.parent_message_id),
-            role: Set("user".to_string()),
-            content: Set(req.content),
-            file_ids: Set(file_ids_json),
-            variant_index: Set(user_variant_index),
-            is_active: Set(true),
-            is_complete: Set(true),
-            is_hidden_from_user: Set(false),
-            is_hidden_from_backend: Set(false),
-            metadata: Set(req.metadata),
-            created_at: Set(now),
-        };
+        let mut last_err: Option<sea_orm::DbErr> = None;
+        for _attempt in 0..VARIANT_INDEX_MAX_RETRIES {
+            // Fresh ids/timestamps each attempt so a retried INSERT
+            // never collides with itself on the primary key after a
+            // partial rollback.
+            let user_message_id = Uuid::new_v4();
+            let assistant_message_id = Uuid::new_v4();
+            let now = OffsetDateTime::now_utc();
+            let content_attempt = content.clone();
+            let metadata_attempt = metadata.clone();
+            let file_ids_attempt = file_ids_json.clone();
 
-        let assistant_active = message_entity::ActiveModel {
-            message_id: Set(assistant_message_id),
-            session_id: Set(req.session_id),
-            parent_message_id: Set(Some(user_message_id)),
-            role: Set("assistant".to_string()),
-            content: Set(empty_content()),
-            file_ids: Set(None),
-            variant_index: Set(0),
-            is_active: Set(true),
-            is_complete: Set(false),
-            is_hidden_from_user: Set(false),
-            is_hidden_from_backend: Set(false),
-            metadata: Set(None),
-            created_at: Set(now),
-        };
+            let outcome: Result<i32, TransactionError<sea_orm::DbErr>> = self
+                .db
+                .transaction_with_config::<_, i32, sea_orm::DbErr>(
+                    move |txn| {
+                        Box::pin(async move {
+                            let user_variant_index =
+                                compute_next_variant_index(txn, session_id, parent).await?;
 
-        // Single SERIALIZABLE transaction: either both rows land or neither
-        // does. The assistant FK to the user row is implicit (FK is on
-        // parent_message_id) — Postgres defers constraint validation to
-        // transaction commit so the inserts can be in either order.
-        let outcome: Result<(), TransactionError<sea_orm::DbErr>> = self
-            .db
-            .transaction_with_config::<_, (), sea_orm::DbErr>(
-                move |txn| {
-                    Box::pin(async move {
-                        user_active.insert(txn).await?;
-                        assistant_active.insert(txn).await?;
-                        Ok(())
-                    })
-                },
-                Some(IsolationLevel::Serializable),
-                Some(AccessMode::ReadWrite),
-            )
-            .await;
+                            let user_active = message_entity::ActiveModel {
+                                message_id: Set(user_message_id),
+                                session_id: Set(session_id),
+                                parent_message_id: Set(parent),
+                                role: Set("user".to_string()),
+                                content: Set(content_attempt),
+                                file_ids: Set(file_ids_attempt),
+                                variant_index: Set(user_variant_index),
+                                is_active: Set(true),
+                                is_complete: Set(true),
+                                is_hidden_from_user: Set(false),
+                                is_hidden_from_backend: Set(false),
+                                metadata: Set(metadata_attempt),
+                                created_at: Set(now),
+                            };
+                            let assistant_active = message_entity::ActiveModel {
+                                message_id: Set(assistant_message_id),
+                                session_id: Set(session_id),
+                                parent_message_id: Set(Some(user_message_id)),
+                                role: Set("assistant".to_string()),
+                                content: Set(empty_content()),
+                                file_ids: Set(None),
+                                variant_index: Set(0),
+                                is_active: Set(true),
+                                is_complete: Set(false),
+                                is_hidden_from_user: Set(false),
+                                is_hidden_from_backend: Set(false),
+                                metadata: Set(None),
+                                created_at: Set(now),
+                            };
+                            user_active.insert(txn).await?;
+                            assistant_active.insert(txn).await?;
+                            Ok(user_variant_index)
+                        })
+                    },
+                    Some(IsolationLevel::Serializable),
+                    Some(AccessMode::ReadWrite),
+                )
+                .await;
 
-        match outcome {
-            Ok(()) => Ok(InsertedPair {
-                user_message_id,
-                assistant_message_id,
-                user_variant_index,
-            }),
-            Err(TransactionError::Transaction(e)) | Err(TransactionError::Connection(e)) => {
-                Err(e.into())
+            match outcome {
+                Ok(user_variant_index) => {
+                    return Ok(InsertedPair {
+                        user_message_id,
+                        assistant_message_id,
+                        user_variant_index,
+                    });
+                }
+                Err(TransactionError::Transaction(e))
+                | Err(TransactionError::Connection(e)) => {
+                    if !is_variant_unique_violation(&e) {
+                        return Err(e.into());
+                    }
+                    last_err = Some(e);
+                }
             }
         }
+        Err(retry_exhausted_conflict(last_err))
     }
 
     async fn finalize_assistant(
@@ -770,57 +799,83 @@ impl MessageRepo for SeaMessageRepo {
         session_id: Uuid,
         parent_message_id: Uuid,
     ) -> Result<InsertedPair, ChatEngineError> {
-        // Allocate the next variant_index under the same parent via the
-        // Phase 1 helper. It internally drives a SERIALIZABLE retry loop
-        // capped at VARIANT_INDEX_MAX_RETRIES against
+        // Same race-free pattern as `insert_user_and_assistant_stub`:
+        // the SELECT for `MAX(variant_index)+1` runs in the SAME
+        // SERIALIZABLE transaction as the INSERT, with the whole pair
+        // retried under `VARIANT_INDEX_MAX_RETRIES` on
         // `uq_messages_session_parent_variant` collisions.
-        let new_variant_index =
-            assign_variant_index(&self.db, session_id, Some(parent_message_id)).await?;
+        let mut last_err: Option<sea_orm::DbErr> = None;
+        for _attempt in 0..VARIANT_INDEX_MAX_RETRIES {
+            let new_message_id = Uuid::new_v4();
+            let now = OffsetDateTime::now_utc();
 
-        let new_message_id = Uuid::new_v4();
-        let now = OffsetDateTime::now_utc();
+            let outcome: Result<i32, TransactionError<sea_orm::DbErr>> = self
+                .db
+                .transaction_with_config::<_, i32, sea_orm::DbErr>(
+                    move |txn| {
+                        Box::pin(async move {
+                            let new_variant_index = compute_next_variant_index(
+                                txn,
+                                session_id,
+                                Some(parent_message_id),
+                            )
+                            .await?;
+                            let assistant_active = message_entity::ActiveModel {
+                                message_id: Set(new_message_id),
+                                session_id: Set(session_id),
+                                parent_message_id: Set(Some(parent_message_id)),
+                                role: Set("assistant".to_string()),
+                                content: Set(empty_content()),
+                                file_ids: Set(None),
+                                variant_index: Set(new_variant_index),
+                                is_active: Set(true),
+                                is_complete: Set(false),
+                                is_hidden_from_user: Set(false),
+                                is_hidden_from_backend: Set(false),
+                                metadata: Set(None),
+                                created_at: Set(now),
+                            };
+                            assistant_active.insert(txn).await?;
+                            Ok(new_variant_index)
+                        })
+                    },
+                    Some(IsolationLevel::Serializable),
+                    Some(AccessMode::ReadWrite),
+                )
+                .await;
 
-        let assistant_active = message_entity::ActiveModel {
-            message_id: Set(new_message_id),
-            session_id: Set(session_id),
-            parent_message_id: Set(Some(parent_message_id)),
-            role: Set("assistant".to_string()),
-            content: Set(empty_content()),
-            file_ids: Set(None),
-            variant_index: Set(new_variant_index),
-            is_active: Set(true),
-            is_complete: Set(false),
-            is_hidden_from_user: Set(false),
-            is_hidden_from_backend: Set(false),
-            metadata: Set(None),
-            created_at: Set(now),
-        };
-
-        let outcome: Result<(), TransactionError<sea_orm::DbErr>> = self
-            .db
-            .transaction_with_config::<_, (), sea_orm::DbErr>(
-                move |txn| {
-                    Box::pin(async move {
-                        assistant_active.insert(txn).await?;
-                        Ok(())
-                    })
-                },
-                Some(IsolationLevel::Serializable),
-                Some(AccessMode::ReadWrite),
-            )
-            .await;
-
-        match outcome {
-            Ok(()) => Ok(InsertedPair {
-                user_message_id: parent_message_id,
-                assistant_message_id: new_message_id,
-                user_variant_index: new_variant_index,
-            }),
-            Err(TransactionError::Transaction(e)) | Err(TransactionError::Connection(e)) => {
-                Err(e.into())
+            match outcome {
+                Ok(new_variant_index) => {
+                    return Ok(InsertedPair {
+                        user_message_id: parent_message_id,
+                        assistant_message_id: new_message_id,
+                        user_variant_index: new_variant_index,
+                    });
+                }
+                Err(TransactionError::Transaction(e))
+                | Err(TransactionError::Connection(e)) => {
+                    if !is_variant_unique_violation(&e) {
+                        return Err(e.into());
+                    }
+                    last_err = Some(e);
+                }
             }
         }
+        Err(retry_exhausted_conflict(last_err))
     }
+}
+
+/// Map a retry-exhaustion outcome to a `Conflict` ChatEngineError that
+/// downstream handlers will render as HTTP 409. The original DbErr is
+/// preserved as the source for log triage.
+fn retry_exhausted_conflict(last_err: Option<sea_orm::DbErr>) -> ChatEngineError {
+    let base = format!(
+        "variant index allocation contended; exhausted {VARIANT_INDEX_MAX_RETRIES} retries"
+    );
+    ChatEngineError::conflict(match last_err {
+        Some(e) => format!("{base}: {e}"),
+        None => base,
+    })
 }
 
 /// Canonical empty content used for a newly-pre-allocated assistant stub.
