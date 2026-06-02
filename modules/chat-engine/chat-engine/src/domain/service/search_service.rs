@@ -221,6 +221,8 @@ impl SearchBackend for InMemorySearchBackend {
             .collect();
 
         // Order by created_at DESC, message_id DESC (deterministic tiebreak).
+        // This MUST be the same key the cursor encodes — see the
+        // `apply_cursor_desc` filter below.
         matches.sort_by(|a, b| {
             b.created_at
                 .cmp(&a.created_at)
@@ -229,10 +231,12 @@ impl SearchBackend for InMemorySearchBackend {
 
         let total = matches.len() as u64;
 
-        // Apply cursor: drop rows ordered at-or-before the cursor.
-        if let Some(c) = cursor {
-            matches.retain(|h| h.message_id != c.message_id);
-        }
+        // Apply cursor: drop EVERY hit ordered at-or-before the cursor
+        // under the sort key, not just the row whose id matches. The
+        // previous `retain(|h| h.message_id != c.message_id)` removed
+        // exactly one row, so page 2 returned page 1 (minus a row)
+        // instead of advancing past it.
+        let matches = apply_cursor_desc(matches, cursor);
 
         let skip = skip as usize;
         let limit = limit as usize;
@@ -241,6 +245,41 @@ impl SearchBackend for InMemorySearchBackend {
         }
         let end = (skip + limit).min(matches.len());
         Ok((matches[skip..end].to_vec(), total))
+    }
+}
+
+/// Drop every hit ordered at-or-before `cursor` under the
+/// `(created_at DESC, message_id DESC)` sort key — the sole keyset
+/// pagination primitive used by [`InMemorySearchBackend`].
+///
+/// Cursor variants:
+/// - `Some(created_at)` (current format) → strict `<` filter on the
+///   `(created_at, message_id)` tuple. This is the canonical keyset skip.
+/// - `None` (legacy cursor minted before the `:t:<unix_ns>` tail) → fall
+///   back to position-based slicing: find the cursor row in `matches`
+///   and keep only rows strictly after it. Misses if the row is no
+///   longer in the candidate set, which is the unavoidable limitation
+///   of a legacy cursor that did not carry the sort key.
+fn apply_cursor_desc(matches: Vec<BackendHit>, cursor: Option<&Cursor>) -> Vec<BackendHit> {
+    let Some(c) = cursor else {
+        return matches;
+    };
+    if let Some(c_ts) = c.created_at {
+        return matches
+            .into_iter()
+            .filter(|h| {
+                // Under DESC ordering, "after the cursor" means a
+                // smaller (created_at, message_id) tuple.
+                h.created_at < c_ts || (h.created_at == c_ts && h.message_id < c.message_id)
+            })
+            .collect();
+    }
+    // Legacy cursor — best-effort position-based skip. matches is
+    // already sorted DESC, so the cursor row (if present) appears once
+    // and everything after it in the slice is the next page.
+    match matches.iter().position(|h| h.message_id == c.message_id) {
+        Some(idx) => matches.into_iter().skip(idx + 1).collect(),
+        None => matches,
     }
 }
 
@@ -379,7 +418,11 @@ impl SearchService {
             hits.truncate(limit as usize);
         }
         let next_cursor = if has_more {
-            hits.last().map(|h| Cursor::new(h.rank, h.message_id).encode())
+            hits.last()
+                // Cursor MUST carry the sort key (created_at) — without
+                // it the backend cannot perform a real keyset skip and
+                // page 2 would replay rows from page 1.
+                .map(|h| Cursor::new(h.rank, h.message_id, h.created_at).encode())
         } else {
             None
         };
@@ -1088,6 +1131,184 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ChatEngineError::BadRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn cursor_pages_advance_strictly_past_prior_page() {
+        // Pre-fix this test would have failed: the backend's cursor
+        // application dropped only the single row whose id matched the
+        // cursor, so page 2 returned the first page again (minus that
+        // row). With the keyset fix, page 2 must be strictly older than
+        // page 1's last row under the `(created_at DESC, message_id
+        // DESC)` ordering.
+        let session_id = Uuid::new_v4();
+        let session = fixture_session("tenant-a", "user-1", session_id);
+        // 5 distinct matches with monotonically increasing created_at.
+        let messages: Vec<Message> = (0..5)
+            .map(|i| {
+                fixture_message(
+                    session_id,
+                    MessageRole::User,
+                    &format!("needle row {i}"),
+                    i64::from(i),
+                    false,
+                )
+            })
+            .collect();
+        let svc = make_service(session, messages);
+
+        // Page size 2 → expect three pages: 2 + 2 + 1.
+        let page1 = svc
+            .search_in_session(
+                &identity(),
+                session_id,
+                &SearchQuery {
+                    q: Some("needle".into()),
+                    top: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page1.items.len(), 2, "page 1 size");
+        let cursor1 = page1
+            .next_cursor
+            .clone()
+            .expect("page 1 must surface a cursor when more rows exist");
+
+        let page2 = svc
+            .search_in_session(
+                &identity(),
+                session_id,
+                &SearchQuery {
+                    q: Some("needle".into()),
+                    top: Some(2),
+                    cursor: Some(cursor1.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2.items.len(), 2, "page 2 size");
+
+        // Strict disjointness: page 2 must NOT replay any page 1 ids.
+        let p1_ids: std::collections::HashSet<Uuid> =
+            page1.items.iter().map(|r| r.message_id).collect();
+        for r in &page2.items {
+            assert!(
+                !p1_ids.contains(&r.message_id),
+                "page 2 leaked page-1 row {} — cursor skip is broken",
+                r.message_id,
+            );
+        }
+
+        // Sort-order invariant: every page-2 row's created_at must be
+        // strictly older than page 1's last row (or equal with a
+        // smaller message_id) — the DESC keyset advance condition.
+        let p1_last = page1.items.last().expect("page 1 non-empty");
+        let p1_last_msg = svc
+            .messages
+            .find_message_in_session(session_id, p1_last.message_id)
+            .await
+            .unwrap()
+            .expect("page 1 last message present in repo");
+        for r in &page2.items {
+            let r_msg = svc
+                .messages
+                .find_message_in_session(session_id, r.message_id)
+                .await
+                .unwrap()
+                .expect("page 2 row present in repo");
+            assert!(
+                r_msg.created_at < p1_last_msg.created_at
+                    || (r_msg.created_at == p1_last_msg.created_at
+                        && r_msg.message_id < p1_last_msg.message_id),
+                "page 2 row {} is not strictly older than page 1's last row {} \
+                 under DESC ordering",
+                r_msg.message_id,
+                p1_last_msg.message_id,
+            );
+        }
+
+        // Third (final) page: one row left, no further cursor.
+        let cursor2 = page2
+            .next_cursor
+            .clone()
+            .expect("page 2 must surface a cursor when more rows exist");
+        let page3 = svc
+            .search_in_session(
+                &identity(),
+                session_id,
+                &SearchQuery {
+                    q: Some("needle".into()),
+                    top: Some(2),
+                    cursor: Some(cursor2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page3.items.len(), 1, "page 3 carries the final row");
+        assert!(page3.next_cursor.is_none(), "no cursor past the final row");
+
+        // Total ids across all three pages: every input row, exactly once.
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for r in page1.items.iter().chain(&page2.items).chain(&page3.items) {
+            assert!(seen.insert(r.message_id), "id {} appeared twice", r.message_id);
+        }
+        assert_eq!(seen.len(), 5, "all 5 rows surfaced across the pages");
+    }
+
+    #[tokio::test]
+    async fn legacy_cursor_without_created_at_still_advances() {
+        // Cursors minted by the pre-fix encoder lack the `:t:<unix_ns>`
+        // tail. The backend falls back to a position-based skip so
+        // clients holding an in-flight legacy cursor at the cutover are
+        // still able to advance instead of looping.
+        let session_id = Uuid::new_v4();
+        let session = fixture_session("tenant-a", "user-1", session_id);
+        let messages: Vec<Message> = (0..4)
+            .map(|i| {
+                fixture_message(
+                    session_id,
+                    MessageRole::User,
+                    &format!("needle row {i}"),
+                    i64::from(i),
+                    false,
+                )
+            })
+            .collect();
+        // Snapshot ids in expected sort order (DESC).
+        let mut snapshot = messages.clone();
+        snapshot.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.message_id.cmp(&a.message_id))
+        });
+        let svc = make_service(session, messages);
+
+        // Hand-craft a legacy cursor (no `:t:` tail) pointing at the
+        // 2nd row in DESC order — page 2 should start from the 3rd.
+        let cursor_target = snapshot[1].message_id;
+        let legacy_cursor = format!("r:0:m:{cursor_target}");
+
+        let page = svc
+            .search_in_session(
+                &identity(),
+                session_id,
+                &SearchQuery {
+                    q: Some("needle".into()),
+                    top: Some(10),
+                    cursor: Some(legacy_cursor),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Expect the 3rd + 4th rows in DESC order.
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].message_id, snapshot[2].message_id);
+        assert_eq!(page.items[1].message_id, snapshot[3].message_id);
     }
 
     #[tokio::test]

@@ -224,35 +224,73 @@ impl From<ChatEngineError> for SearchError {
     }
 }
 
-/// Cursor encoding for the `(rank, message_id)` keyset. We serialise to a
-/// short opaque base64-free string of the form `r:<rank>:m:<uuid>` because
-/// the crate intentionally avoids pulling in `base64` (see Phase 10's
-/// `generate_share_token` note on workspace dependency policy).
+/// Cursor encoding for the `(created_at, message_id)` keyset (with an
+/// optional `rank` carried for backends that score). Keyset pagination
+/// requires the cursor key to match the *sort* key — the backend
+/// produces results ordered by `(created_at DESC, message_id DESC)`, so
+/// the cursor MUST surface enough information to drop every hit ordered
+/// at-or-before it.
+///
+/// ## Wire format
+///
+/// Encoded as `r:<rank>:m:<uuid>:t:<unix_ns>` where `unix_ns` is the
+/// hit's `created_at` expressed as Unix nanoseconds (signed `i128`).
+/// The trailing `:t:<unix_ns>` segment is the load-bearing addition vs.
+/// earlier releases — it carries the sort key the backend actually uses
+/// to skip rows. The leading `r:<rank>:m:<uuid>` prefix is preserved so
+/// any in-flight client cursor minted by the prior release still
+/// decodes; legacy cursors land with `created_at = None` and the backend
+/// falls back to a position-based drop (best-effort).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cursor {
     pub rank: f32,
     pub message_id: Uuid,
+    /// Sort-key timestamp — the cursor row's `created_at`. `None` only
+    /// for legacy cursors minted before this field existed; new cursors
+    /// always populate it so the backend can perform a real keyset skip.
+    pub created_at: Option<time::OffsetDateTime>,
 }
 
 impl Cursor {
     #[must_use]
-    pub fn new(rank: f32, message_id: Uuid) -> Self {
-        Self { rank, message_id }
+    pub fn new(rank: f32, message_id: Uuid, created_at: time::OffsetDateTime) -> Self {
+        Self {
+            rank,
+            message_id,
+            created_at: Some(created_at),
+        }
     }
 
-    /// Encode the cursor as `r:<rank>:m:<uuid>`. Stable across releases —
-    /// the format MUST remain backwards compatible because cursors round-
-    /// trip through clients we do not control.
+    /// Encode the cursor as `r:<rank>:m:<uuid>:t:<unix_ns>`. Stable
+    /// across releases — legacy decoders that stop after the `:m:<uuid>`
+    /// segment silently ignore the trailing `:t:<unix_ns>` (they parse
+    /// the UUID with `Uuid::parse_str` which rejects trailing garbage,
+    /// so a strict legacy parser would surface a malformed-cursor error;
+    /// new encoders intentionally always emit the new shape so a server
+    /// downgrade is detectable rather than silently corrupting paging).
     #[must_use]
     pub fn encode(&self) -> String {
-        format!("r:{}:m:{}", self.rank, self.message_id)
+        match self.created_at {
+            Some(ts) => format!(
+                "r:{}:m:{}:t:{}",
+                self.rank,
+                self.message_id,
+                ts.unix_timestamp_nanos(),
+            ),
+            // Legacy emit — should never happen because Cursor::new
+            // always sets created_at. Defensive: emit the prior wire
+            // format so any code path still using the old constructor
+            // shape remains decodable.
+            None => format!("r:{}:m:{}", self.rank, self.message_id),
+        }
     }
 
-    /// Decode a cursor produced by [`Self::encode`]. Returns
-    /// `SearchError::QueryRequired` for any malformed input — the cursor is
-    /// opaque to the caller, so we treat malformed cursors as a client
-    /// programming bug rather than a backend failure.
+    /// Decode a cursor produced by [`Self::encode`] (current OR legacy
+    /// `r:<rank>:m:<uuid>` form). Returns `SearchError::QueryRequired`
+    /// for any malformed input — the cursor is opaque to the caller, so
+    /// we treat malformed cursors as a client programming bug rather
+    /// than a backend failure.
     pub fn decode(raw: &str) -> Result<Self, SearchError> {
         let mut parts = raw.split(':');
         let r_tag = parts.next().ok_or(SearchError::QueryRequired)?;
@@ -265,7 +303,34 @@ impl Cursor {
         let rank: f32 = rank_str.parse().map_err(|_| SearchError::QueryRequired)?;
         let message_id =
             Uuid::parse_str(id_str).map_err(|_| SearchError::QueryRequired)?;
-        Ok(Self { rank, message_id })
+
+        // Optional `:t:<unix_ns>` tail. Present on cursors minted by
+        // the current encoder; absent on legacy cursors round-tripped
+        // by a pre-fix client.
+        let created_at = match (parts.next(), parts.next()) {
+            (Some("t"), Some(ts_str)) => {
+                let nanos: i128 =
+                    ts_str.parse().map_err(|_| SearchError::QueryRequired)?;
+                Some(
+                    time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
+                        .map_err(|_| SearchError::QueryRequired)?,
+                )
+            }
+            (None, None) => None,
+            // Any other shape is a malformed cursor.
+            _ => return Err(SearchError::QueryRequired),
+        };
+
+        // Reject trailing junk past the optional tail.
+        if parts.next().is_some() {
+            return Err(SearchError::QueryRequired);
+        }
+
+        Ok(Self {
+            rank,
+            message_id,
+            created_at,
+        })
     }
 }
 
@@ -544,11 +609,30 @@ mod tests {
 
     #[test]
     fn cursor_round_trip() {
-        let c = Cursor::new(0.42, Uuid::nil());
+        let ts = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(123);
+        let c = Cursor::new(0.42, Uuid::nil(), ts);
         let encoded = c.encode();
         let decoded = Cursor::decode(&encoded).unwrap();
         assert_eq!(decoded.message_id, Uuid::nil());
         assert!((decoded.rank - 0.42).abs() < 1e-5);
+        assert_eq!(
+            decoded.created_at, Some(ts),
+            "round-tripped cursor must preserve the created_at sort key",
+        );
+    }
+
+    #[test]
+    fn cursor_decodes_legacy_format_without_created_at() {
+        // Cursors minted before the `:t:<unix_ns>` tail was added MUST
+        // still decode — clients in flight at the cutover hold them.
+        let decoded =
+            Cursor::decode("r:0.42:m:00000000-0000-0000-0000-000000000000").unwrap();
+        assert_eq!(decoded.message_id, Uuid::nil());
+        assert!(
+            decoded.created_at.is_none(),
+            "legacy cursor must surface as created_at=None so the backend falls \
+             back to the position-based skip path",
+        );
     }
 
     #[test]
@@ -556,6 +640,19 @@ mod tests {
         assert!(Cursor::decode("garbage").is_err());
         assert!(Cursor::decode("r:notafloat:m:nil").is_err());
         assert!(Cursor::decode("x:1.0:m:00000000-0000-0000-0000-000000000000").is_err());
+        // Trailing junk past the optional `:t:<unix_ns>` tail.
+        assert!(
+            Cursor::decode("r:0:m:00000000-0000-0000-0000-000000000000:t:0:bogus").is_err()
+        );
+        // `t` segment without a value.
+        assert!(
+            Cursor::decode("r:0:m:00000000-0000-0000-0000-000000000000:t:").is_err()
+        );
+        // `t` segment with a non-numeric value.
+        assert!(
+            Cursor::decode("r:0:m:00000000-0000-0000-0000-000000000000:t:notanint")
+                .is_err()
+        );
     }
 
     #[test]
