@@ -52,33 +52,6 @@ impl PublicRouteMatcher {
     }
 }
 
-/// Convert Axum path syntax `:param` to matchit syntax `{param}`
-///
-/// Axum uses `:id` for path parameters, but matchit 0.8 uses `{id}`.
-/// This function converts between the two syntaxes.
-fn convert_axum_path_to_matchit(path: &str) -> String {
-    // Simple regex-free approach: find :word and replace with {word}
-    let mut result = String::with_capacity(path.len());
-    let mut chars = path.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == ':' {
-            // Start of a parameter - collect the parameter name
-            result.push('{');
-            while matches!(chars.peek(), Some(c) if c.is_alphanumeric() || *c == '_') {
-                if let Some(c) = chars.next() {
-                    result.push(c);
-                }
-            }
-            result.push('}');
-        } else {
-            result.push(ch);
-        }
-    }
-
-    result
-}
-
 /// Whether a route requires authentication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthRequirement {
@@ -167,10 +140,8 @@ pub fn build_route_policy(
         let matcher = route_matchers_map
             .entry(method)
             .or_insert_with(RouteMatcher::new);
-        // Convert Axum path syntax (:param) to matchit syntax ({param})
-        let matchit_path = convert_axum_path_to_matchit(&path);
         matcher
-            .insert(&matchit_path)
+            .insert(&path)
             .map_err(|e| anyhow::anyhow!("Failed to insert route pattern '{path}': {e}"))?;
     }
 
@@ -181,10 +152,8 @@ pub fn build_route_policy(
         let matcher = public_matchers_map
             .entry(method)
             .or_insert_with(PublicRouteMatcher::new);
-        // Convert Axum path syntax (:param) to matchit syntax ({param})
-        let matchit_path = convert_axum_path_to_matchit(&path);
         matcher
-            .insert(&matchit_path)
+            .insert(&path)
             .map_err(|e| anyhow::anyhow!("Failed to insert public route pattern '{path}': {e}"))?;
     }
 
@@ -330,22 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_axum_path_to_matchit() {
-        assert_eq!(convert_axum_path_to_matchit("/users/:id"), "/users/{id}");
-        assert_eq!(
-            convert_axum_path_to_matchit("/posts/:post_id/comments/:comment_id"),
-            "/posts/{post_id}/comments/{comment_id}"
-        );
-        assert_eq!(convert_axum_path_to_matchit("/health"), "/health"); // No params
-        assert_eq!(
-            convert_axum_path_to_matchit("/api/v1/:resource/:id/status"),
-            "/api/v1/{resource}/{id}/status"
-        );
-    }
-
-    #[test]
     fn test_matchit_router_with_params() {
-        // matchit 0.8 uses {param} syntax for path parameters (NOT :param)
         let mut router = matchit::Router::new();
         router.insert("/users/{id}", "user_route").unwrap();
 
@@ -358,10 +312,24 @@ mod tests {
     }
 
     #[test]
+    fn build_route_policy_allows_colon_in_literal_paths() {
+        let cfg = crate::config::ApiGatewayConfig::default();
+        let authenticated_routes = std::collections::HashSet::from([
+            (Method::GET, "events:poll".to_owned()),
+            (Method::GET, "events:stream".to_owned()),
+        ]);
+
+        if let Err(err) =
+            build_route_policy(&cfg, authenticated_routes, std::collections::HashSet::new())
+        {
+            panic!("literal colon route paths must not be interpreted as path parameters: {err}");
+        }
+    }
+
+    #[test]
     fn explicit_public_route_with_path_params_returns_none() {
         let mut public_matchers = HashMap::new();
         let mut matcher = PublicRouteMatcher::new();
-        // matchit 0.8 uses {param} syntax (Axum uses :param, so conversion needed in production)
         matcher.insert("/users/{id}").unwrap();
 
         public_matchers.insert(Method::GET, matcher);
@@ -448,7 +416,6 @@ mod tests {
     fn authenticated_route_has_priority_over_default() {
         let mut route_matchers = HashMap::new();
         let mut matcher = RouteMatcher::new();
-        // matchit 0.8 uses {param} syntax
         matcher.insert("/users/{id}").unwrap();
         route_matchers.insert(Method::GET, matcher);
 
