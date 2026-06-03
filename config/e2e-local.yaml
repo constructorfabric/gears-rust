@@ -338,6 +338,11 @@ modules:
         idp_retry_backoff_max: "30s"
         strict: false
       idp:
+        # Must match static-idp-plugin's vendor so LazyIdpProvider
+        # resolves the plugin at bootstrap time. The IdpConfig default
+        # is "cf"; the E2E static-idp-plugin is configured with
+        # vendor "cyberfabric" (consistent with all other E2E plugins).
+        vendor: "cyberfabric"
         # Fail-closed on missing IdP client: `static-idp-plugin` is
         # enabled in this E2E config so the user-management surface
         # (`/tenants/{id}/users`) MUST resolve to a live plugin, not

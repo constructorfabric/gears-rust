@@ -356,21 +356,19 @@ async def test_metadata_distinct_404_codes_propagate_through_envelope(
 ):
     """Seam: AM error -> Problem JSON envelope -> distinguishability.
 
-    AM raises two distinct domain variants on the metadata GET surface
-    (``MetadataSchemaNotRegistered`` vs ``MetadataEntryNotFound``) per
-    ``dod-tenant-metadata-distinct-404-codes``. The structural
-    distinction is carried by ``resource_type`` on the canonical
-    envelope: schema-level 404 uses
-    ``gts.cf.core.am.tenant_metadata_schema.v1~`` while entry-level
-    404 uses ``gts.cf.core.am.tenant_metadata.v1~``. Clients branch
-    on ``resource_type`` without parsing prose.
+    AM collapses both "schema unknown to registry" and "entry missing
+    for tenant" into a unified ``MetadataEntryNotFound`` 404 with
+    ``context.resource_type = gts.cf.core.am.tenant_metadata.v1~``.
+    The two paths are distinguishable by the ``detail`` text: path A
+    mentions "not registered in the types registry" while path B
+    references the missing entry. Both MUST surface as 404 with the
+    unified metadata ``resource_type``.
     """
     schema_id = await create_metadata_schema()
     tenant = await create_tenant("s6codes")
     bogus_schema = "gts.cf.core.am.tenant_metadata.v1~x.never.am.registered.v1~"
 
-    schema_rt = "gts.cf.core.am.tenant_metadata_schema.v1~"
-    entry_rt = "gts.cf.core.am.tenant_metadata.v1~"
+    metadata_rt = "gts.cf.core.am.tenant_metadata.v1~"
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         # Path A: GET with a schema_id that was never registered.
@@ -382,8 +380,13 @@ async def test_metadata_distinct_404_codes_propagate_through_envelope(
             f"unknown schema must be 404, got {r.status_code} {r.text}"
         )
         body_a = r.json()
-        assert body_a.get("resource_type") == schema_rt, (
-            f"schema-not-registered MUST carry resource_type={schema_rt}, "
+        ctx_a = body_a.get("context", {})
+        assert ctx_a.get("resource_type") == metadata_rt, (
+            f"schema-not-registered MUST carry resource_type={metadata_rt}, "
+            f"got: {body_a}"
+        )
+        assert "not registered" in body_a.get("detail", "").lower(), (
+            f"schema-not-registered detail MUST mention registry, "
             f"got: {body_a}"
         )
 
@@ -396,15 +399,20 @@ async def test_metadata_distinct_404_codes_propagate_through_envelope(
             f"missing entry must be 404, got {r.status_code} {r.text}"
         )
         body_b = r.json()
-        assert body_b.get("resource_type") == entry_rt, (
-            f"entry-not-found MUST carry resource_type={entry_rt}, "
+        ctx_b = body_b.get("context", {})
+        assert ctx_b.get("resource_type") == metadata_rt, (
+            f"entry-not-found MUST carry resource_type={metadata_rt}, "
             f"got: {body_b}"
         )
 
-        # Regression guard: the two 404 envelopes are structurally
-        # distinct on the wire, not just by prose.
-        assert body_a["resource_type"] != body_b["resource_type"], (
-            "Distinct 404 variants collapsed to the same resource_type"
+        # Regression guard: the two 404 paths are distinguishable by
+        # both detail text and resource_name even though they share
+        # the same resource_type on the unified metadata envelope.
+        assert body_a.get("detail") != body_b.get("detail"), (
+            "Distinct 404 variants collapsed to identical detail text"
+        )
+        assert ctx_a.get("resource_name") != ctx_b.get("resource_name"), (
+            "Distinct 404 variants collapsed to identical resource_name"
         )
 
 
@@ -564,8 +572,17 @@ async def test_conversion_initiator_cannot_approve_own_request(
             f"{r.status_code} {r.text}"
         )
         body = r.json()
+        # The canonical error envelope puts the specific reason in
+        # context.violations, not the top-level detail (which is a
+        # generic "Operation precondition not met" summary).
+        violations = body.get("context", {}).get("violations", [])
+        violation_text = " ".join(
+            (v.get("description") or "") + " " + (v.get("type") or "")
+            for v in violations
+        ).lower()
         detail = (body.get("detail") or "").lower()
-        assert "invalid actor" in detail or "initiator" in detail, (
+        combined = detail + " " + violation_text
+        assert "invalid actor" in combined or "initiator" in combined, (
             f"detail MUST reference the counterparty-only rule, "
             f"got: {body}"
         )
