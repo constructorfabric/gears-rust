@@ -1,12 +1,20 @@
 // @cpt-cf-chat-engine-dbtable-sessions:p1
 // @cpt-cf-chat-engine-adr-session-deletion-strategy:p1
 
+use modkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+// `tenant_id` / `user_id` here are `String` rather than `Uuid`, so the
+// row-level scoping enforced by `Scopable`'s typed columns does not yet
+// apply. The repos keep filtering manually by `(tenant_id, user_id)`
+// until a follow-up migrates the columns to `Uuid` and lifts the
+// `unrestricted` marker — at which point `scope_with(...)` can replace
+// the manual filters wholesale.
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "sessions")]
+#[secure(unrestricted)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub session_id: Uuid,

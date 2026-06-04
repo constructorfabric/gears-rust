@@ -39,9 +39,12 @@ use modkit::api::OpenApiRegistry;
 use modkit::client_hub::ClientScope;
 use modkit::{DatabaseCapability, Module, ModuleCtx, RestApiCapability};
 use modkit::api::canonical_error_middleware;
+use modkit_db::DBProvider;
 use sea_orm_migration::MigrationTrait;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+use crate::infra::db::repo::ChatEngineDb;
 
 use chat_engine_sdk::plugin::ChatEngineBackendPlugin;
 
@@ -208,35 +211,33 @@ impl Module for ChatEngineModule {
 
         // --- DB wiring ------------------------------------------------------
         //
-        // The chat-engine repos currently embed an owned
-        // `sea_orm::DatabaseConnection`. modkit-db does not surface the raw
-        // connection through `DBProvider`; the migration runner uses it
-        // privately. For Phase 15 we open a sibling SeaORM connection from
-        // the same DSN so the existing repository constructors remain
-        // unchanged. Future refactors should move every repo to the
-        // `&impl DBRunner` shape used by the rest of the workspace.
-        // The modkit-db handle is unused beyond migration registration —
-        // repos take a sibling `sea_orm::DatabaseConnection` opened from
-        // the same DSN below. `db_required()` is invoked so the runtime
-        // refuses to mount the module without a database configured.
-        let _db_provider = ctx.db_required()?;
-        let sea = open_sea_orm_connection(ctx).await?;
+        // Thread the modkit-db `DBProvider` returned by `ctx.db_required()`
+        // straight into every repo so reads/writes land on the same handle
+        // the migration runner used. Earlier revisions opened a sibling
+        // `sea_orm::DatabaseConnection` from a private `database.dsn`
+        // config key — that path silently fell back to in-memory SQLite
+        // when the key was absent and bypassed modkit-db's pool sizing,
+        // observability, and SecureConn enforcement. The provider is
+        // reparameterised over `ChatEngineError` so `?` lifts both
+        // `DbError` and `ScopeError` into the crate's domain enum.
+        let db_raw = ctx.db_required()?;
+        let db: Arc<ChatEngineDb> = Arc::new(DBProvider::new(db_raw.db()));
 
         // --- Repositories ---------------------------------------------------
         let sessions_repo: Arc<dyn crate::infra::db::repo::session_repo::SessionRepo> =
-            Arc::new(SeaSessionRepo::new(sea.clone()));
+            Arc::new(SeaSessionRepo::new(Arc::clone(&db)));
         let session_types_repo: Arc<
             dyn crate::infra::db::repo::session_type_repo::SessionTypeRepo,
-        > = Arc::new(SeaSessionTypeRepo::new(sea.clone()));
+        > = Arc::new(SeaSessionTypeRepo::new(Arc::clone(&db)));
         let messages_repo: Arc<dyn crate::infra::db::repo::message_repo::MessageRepo> =
-            Arc::new(SeaMessageRepo::new(sea.clone()));
+            Arc::new(SeaMessageRepo::new(Arc::clone(&db)));
         let plugin_config_repo: Arc<
             dyn crate::infra::db::repo::plugin_config_repo::PluginConfigRepo,
-        > = Arc::new(SeaPluginConfigRepo::new(sea.clone()));
+        > = Arc::new(SeaPluginConfigRepo::new(Arc::clone(&db)));
         let reactions_repo: Arc<dyn crate::infra::db::repo::reaction_repo::ReactionRepo> =
-            Arc::new(SeaReactionRepo::new(sea.clone()));
+            Arc::new(SeaReactionRepo::new(Arc::clone(&db)));
         let variants_repo: Arc<dyn crate::domain::service::VariantRepo> = Arc::new(
-            crate::infra::db::repo::variant_repo::SeaVariantRepo::new(sea.clone()),
+            crate::infra::db::repo::variant_repo::SeaVariantRepo::new(Arc::clone(&db)),
         );
 
         // --- ClientHub plugin registration ----------------------------------
@@ -408,37 +409,3 @@ impl RestApiCapability for ChatEngineModule {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SeaORM connection helper
-// ---------------------------------------------------------------------------
-
-/// Open a sibling `sea_orm::DatabaseConnection` from the DSN modkit
-/// recorded in the module's config section.
-///
-/// The chat-engine repositories embed an owned `DatabaseConnection`;
-/// modkit-db only exposes the raw connection internally, so we open a
-/// parallel handle from the same DSN. Future refactors should migrate
-/// the repos to the `&impl DBRunner` shape used by sibling modules so
-/// this sibling connection becomes unnecessary.
-///
-/// When no DSN is present (e.g. the module section omits `database`),
-/// falls back to an in-memory SQLite database — sufficient for smoke
-/// tests and bring-up.
-async fn open_sea_orm_connection(
-    ctx: &ModuleCtx,
-) -> anyhow::Result<sea_orm::DatabaseConnection> {
-    let dsn = resolve_db_dsn(ctx).unwrap_or_else(|| "sqlite::memory:".to_owned());
-    sea_orm::Database::connect(dsn.as_str())
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to open sibling sea-orm connection: {e}"))
-}
-
-fn resolve_db_dsn(ctx: &ModuleCtx) -> Option<String> {
-    let raw = ctx.config_provider().get_module_config(ctx.module_name())?;
-    let obj = raw.as_object()?;
-    let database = obj.get("database")?.as_object()?;
-    database
-        .get("dsn")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-}

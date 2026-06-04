@@ -1,16 +1,18 @@
-//! SQLite-backed integration-test harness for chat-engine.
+//! Integration-test harness for chat-engine wired against the same
+//! `DBProvider` the production module uses.
 //!
-//! Constructs a real `DatabaseConnection` against `sqlite::memory:`, runs
-//! the production migration set, and exposes thin helpers to seed a session
-//! type + session row and read message rows back. The repos take a bare
-//! `sea_orm::DatabaseConnection`, so wiring them is just `SeaMessageRepo::
-//! new(db.clone())` and friends — no provider wrappers needed.
+//! The harness opens a single in-memory SQLite database through
+//! `modkit_db::connect_db`, applies the production migration set via
+//! `run_migrations_for_testing`, and wraps the resulting `Db` in a
+//! `DBProvider<ChatEngineError>` keyed on `ChatEngineError`. Every repo
+//! and every test helper receives that same `Arc<ChatEngineDb>`, so
+//! migrations and queries always land on the same connection — no
+//! sibling SQLite pool, no silent fall-back to a private memory DB.
 //!
-//! SQLite's `:memory:` mode keeps each connection isolated, so we MUST cap
-//! the pool at a single connection — otherwise migrations write to one
-//! private database and the repos read from another. We also use a unique
-//! `mode=memory&cache=shared` DSN keyed by a random uuid so concurrent
-//! tests can't accidentally share state.
+//! SQLite's `:memory:` mode keeps each pooled connection isolated, so
+//! the harness caps the pool at a single connection — without that the
+//! migration runner could land on one connection and the repos query
+//! another.
 //
 // @cpt-cf-chat-engine-e2e-harness:p16
 
@@ -18,26 +20,26 @@
 
 use std::sync::Arc;
 
-use chat_engine::infra::db::Migrator;
+use chat_engine::domain::error::ChatEngineError;
 use chat_engine::infra::db::entity::{message, session, session_type};
+use chat_engine::infra::db::repo::ChatEngineDb;
 use chat_engine::infra::db::repo::message_repo::{MessageRepo, SeaMessageRepo};
 use chat_engine::infra::db::repo::plugin_config_repo::{PluginConfigRepo, SeaPluginConfigRepo};
 use chat_engine::infra::db::repo::session_repo::{SeaSessionRepo, SessionRepo};
 use chat_engine::infra::db::repo::session_type_repo::{SeaSessionTypeRepo, SessionTypeRepo};
-use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
-    QueryFilter,
-};
-use sea_orm_migration::MigratorTrait;
+use chat_engine::infra::db::Migrator;
+use modkit_db::secure::{AccessScope, SecureEntityExt};
+use modkit_db::{ConnectOpts, DBProvider, connect_db};
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// Production-shaped DB harness wrapping the live repos. Tests can either
-/// drive the public repo trait surface or reach for `db` to query rows
-/// directly when asserting on persistence side-effects.
+/// Production-shaped DB harness wrapping the live repos. Tests drive the
+/// public repo trait surface; raw row lookups go through the harness's
+/// helpers below which themselves run against the same `DBProvider`.
 pub struct DbHarness {
-    pub db: DatabaseConnection,
+    pub db: Arc<ChatEngineDb>,
     pub sessions: Arc<dyn SessionRepo>,
     pub session_types: Arc<dyn SessionTypeRepo>,
     pub messages: Arc<dyn MessageRepo>,
@@ -45,30 +47,42 @@ pub struct DbHarness {
 }
 
 /// Open a fresh in-memory SQLite database, apply every chat-engine
-/// migration, and wire the production repo impls on top.
+/// migration through modkit-db, and wire the production repo impls on
+/// top of the resulting `DBProvider`.
 ///
-/// `max_connections(1)` is load-bearing: `sqlite::memory:` gives each
+/// `max_conns: Some(1)` is load-bearing: `sqlite::memory:` gives each
 /// connection in the pool its own private database, so without the cap
 /// migrations would land on one connection and the repos would query an
 /// empty one. Mirrors the account-management harness pattern.
 pub async fn setup_sqlite() -> DbHarness {
-    let mut opts = ConnectOptions::new("sqlite::memory:".to_string());
-    opts.max_connections(1);
-    let db = Database::connect(opts)
+    use sea_orm_migration::MigratorTrait;
+
+    let opts = ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let db = connect_db("sqlite::memory:", opts)
         .await
         .expect("connect sqlite::memory:");
 
-    Migrator::up(&db, None)
+    // Apply the production migration set against the modkit-db handle so
+    // every repo built below queries the same connection state.
+    modkit_db::migration_runner::run_migrations_for_testing(&db, Migrator::migrations())
         .await
         .expect("apply chat-engine migrations");
 
-    let sessions: Arc<dyn SessionRepo> = Arc::new(SeaSessionRepo::new(db.clone()));
-    let session_types: Arc<dyn SessionTypeRepo> = Arc::new(SeaSessionTypeRepo::new(db.clone()));
-    let messages: Arc<dyn MessageRepo> = Arc::new(SeaMessageRepo::new(db.clone()));
-    let plugin_configs: Arc<dyn PluginConfigRepo> = Arc::new(SeaPluginConfigRepo::new(db.clone()));
+    let provider: Arc<ChatEngineDb> = Arc::new(DBProvider::new(db));
+
+    let sessions: Arc<dyn SessionRepo> = Arc::new(SeaSessionRepo::new(Arc::clone(&provider)));
+    let session_types: Arc<dyn SessionTypeRepo> =
+        Arc::new(SeaSessionTypeRepo::new(Arc::clone(&provider)));
+    let messages: Arc<dyn MessageRepo> = Arc::new(SeaMessageRepo::new(Arc::clone(&provider)));
+    let plugin_configs: Arc<dyn PluginConfigRepo> =
+        Arc::new(SeaPluginConfigRepo::new(Arc::clone(&provider)));
 
     DbHarness {
-        db,
+        db: provider,
         sessions,
         session_types,
         messages,
@@ -131,22 +145,29 @@ pub async fn seed_active_session(
 /// persistence assertions that cannot rely on the repo's filtered reads
 /// (the assistant stub is `is_complete=false` so `fetch_active_history`
 /// hides it).
-pub async fn find_message(db: &DatabaseConnection, message_id: Uuid) -> Option<message::Model> {
+pub async fn find_message(db: &Arc<ChatEngineDb>, message_id: Uuid) -> Option<message::Model> {
+    let conn = db.conn().expect("conn for find_message");
+    let scope = AccessScope::allow_all();
     message::Entity::find()
-        .filter(message::Column::MessageId.eq(message_id))
-        .one(db)
+        .secure()
+        .scope_with(&scope)
+        .filter(Condition::all().add(message::Column::MessageId.eq(message_id)))
+        .one(&conn)
         .await
         .expect("read messages row")
 }
 
 /// Return every `messages` row for `session_id` in `created_at ASC` order.
 /// Useful for asserting both the user row and the assistant stub landed.
-pub async fn list_messages(db: &DatabaseConnection, session_id: Uuid) -> Vec<message::Model> {
-    use sea_orm::QueryOrder;
+pub async fn list_messages(db: &Arc<ChatEngineDb>, session_id: Uuid) -> Vec<message::Model> {
+    let conn = db.conn().expect("conn for list_messages");
+    let scope = AccessScope::allow_all();
     message::Entity::find()
-        .filter(message::Column::SessionId.eq(session_id))
         .order_by_asc(message::Column::CreatedAt)
-        .all(db)
+        .secure()
+        .scope_with(&scope)
+        .filter(Condition::all().add(message::Column::SessionId.eq(session_id)))
+        .all(&conn)
         .await
         .expect("list messages")
 }
@@ -154,13 +175,20 @@ pub async fn list_messages(db: &DatabaseConnection, session_id: Uuid) -> Vec<mes
 /// Locate the assistant message inserted by `send_message`. There is
 /// exactly one per call.
 pub async fn find_assistant_message(
-    db: &DatabaseConnection,
+    db: &Arc<ChatEngineDb>,
     session_id: Uuid,
 ) -> Option<message::Model> {
+    let conn = db.conn().expect("conn for find_assistant_message");
+    let scope = AccessScope::allow_all();
     message::Entity::find()
-        .filter(message::Column::SessionId.eq(session_id))
-        .filter(message::Column::Role.eq("assistant"))
-        .one(db)
+        .secure()
+        .scope_with(&scope)
+        .filter(
+            Condition::all()
+                .add(message::Column::SessionId.eq(session_id))
+                .add(message::Column::Role.eq("assistant")),
+        )
+        .one(&conn)
         .await
         .expect("find assistant row")
 }
@@ -184,7 +212,7 @@ pub fn message_text(model: &message::Model) -> String {
 /// `tokio::spawn`, so tests can't synchronise on a JoinHandle; this is
 /// the deterministic equivalent of awaiting one.
 pub async fn wait_for_finalize(
-    db: &DatabaseConnection,
+    db: &Arc<ChatEngineDb>,
     session_id: Uuid,
     deadline: std::time::Duration,
 ) -> message::Model {
@@ -210,4 +238,45 @@ pub async fn wait_for_finalize(
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+}
+
+/// Pretty alias used by some assertions — exposes the harness's
+/// `Arc<ChatEngineDb>` under the `db_provider` field name the tests had
+/// historically expected.
+pub fn db_provider(h: &DbHarness) -> &Arc<ChatEngineDb> {
+    &h.db
+}
+
+/// Test-only raw column flip on `sessions.lifecycle_state`. Production
+/// code MUST go through
+/// [`chat_engine::infra::db::repo::session_repo::SessionRepo::update_lifecycle_state`]
+/// so the service-layer transition checks fire; this bypass exists only
+/// to put a fixture row into any state the surrounding test wants
+/// to assert against (e.g. seeding a `soft_deleted` session and then
+/// verifying that `send_message` refuses to write).
+pub async fn force_lifecycle_state(
+    db: &Arc<ChatEngineDb>,
+    session_id: Uuid,
+    new_state: &str,
+) {
+    use modkit_db::secure::SecureUpdateExt;
+    use sea_orm::sea_query::Expr;
+
+    let conn = db.conn().expect("conn for force_lifecycle_state");
+    let scope = AccessScope::allow_all();
+    session::Entity::update_many()
+        .secure()
+        .scope_with(&scope)
+        .filter(Condition::all().add(session::Column::SessionId.eq(session_id)))
+        .col_expr(
+            session::Column::LifecycleState,
+            Expr::value(new_state.to_owned()),
+        )
+        .col_expr(
+            session::Column::UpdatedAt,
+            Expr::value(OffsetDateTime::now_utc()),
+        )
+        .exec(&conn)
+        .await
+        .expect("flip lifecycle state");
 }

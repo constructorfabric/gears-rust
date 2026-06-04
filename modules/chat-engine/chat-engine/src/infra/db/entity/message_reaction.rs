@@ -1,11 +1,17 @@
 // @cpt-cf-chat-engine-dbtable-reactions:p2
 
+use modkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+// Reactions inherit tenant scoping from their owning message + session,
+// which the repos join through per request. `user_id` is `String`
+// rather than `Uuid`, so the typed `Scopable` columns do not yet
+// apply; mark unrestricted and keep scoping explicit in the repo.
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "message_reactions")]
+#[secure(unrestricted)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub message_id: Uuid,

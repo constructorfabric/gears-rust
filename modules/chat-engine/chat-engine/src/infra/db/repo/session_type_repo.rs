@@ -10,14 +10,18 @@
 //
 // @cpt-cf-chat-engine-session-type-repo:p4
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, QueryOrder};
+use modkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
+use sea_orm::{EntityTrait, QueryOrder};
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
 use crate::infra::db::entity::session_type::{
     self as session_type_entity, Entity as SessionTypeEntity,
 };
+use crate::infra::db::repo::ChatEngineDb;
 
 /// Repository surface for the `session_types` table.
 #[async_trait]
@@ -40,13 +44,20 @@ pub trait SessionTypeRepo: Send + Sync {
 }
 
 /// Sea-ORM-backed implementation of [`SessionTypeRepo`].
+///
+/// Holds the modkit-db `DBProvider` so every method runs against the same
+/// connection the migration runner used. `session_types` has no tenant
+/// column (entity is marked `#[secure(unrestricted)]`), so the secure
+/// wrappers run with `AccessScope::allow_all()` — they exist here purely to
+/// give us a `&impl DBRunner` execution path; a follow-up that introduces
+/// per-tenant session types will replace the noop scope with the real one.
 pub struct SeaSessionTypeRepo {
-    db: DatabaseConnection,
+    db: Arc<ChatEngineDb>,
 }
 
 impl SeaSessionTypeRepo {
     #[must_use]
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: Arc<ChatEngineDb>) -> Self {
         Self { db }
     }
 }
@@ -57,7 +68,13 @@ impl SessionTypeRepo for SeaSessionTypeRepo {
         &self,
         model: session_type_entity::ActiveModel,
     ) -> Result<session_type_entity::Model, ChatEngineError> {
-        let inserted = model.insert(&self.db).await?;
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
+        let inserted = SessionTypeEntity::insert(model)
+            .secure()
+            .scope_unchecked(&scope)?
+            .exec_with_returning(&conn)
+            .await?;
         Ok(inserted)
     }
 
@@ -65,16 +82,24 @@ impl SessionTypeRepo for SeaSessionTypeRepo {
         &self,
         session_type_id: Uuid,
     ) -> Result<Option<session_type_entity::Model>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let row = SessionTypeEntity::find_by_id(session_type_id)
-            .one(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .one(&conn)
             .await?;
         Ok(row)
     }
 
     async fn list(&self) -> Result<Vec<session_type_entity::Model>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let rows = SessionTypeEntity::find()
             .order_by_desc(session_type_entity::Column::CreatedAt)
-            .all(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .all(&conn)
             .await?;
         Ok(rows)
     }
@@ -83,7 +108,6 @@ impl SessionTypeRepo for SeaSessionTypeRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     struct MockRepo;
 

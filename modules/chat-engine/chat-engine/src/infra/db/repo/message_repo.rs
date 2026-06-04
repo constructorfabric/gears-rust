@@ -24,26 +24,31 @@
 //!
 //! The trait is object-safe so the service can hold `Arc<dyn MessageRepo>`
 //! and unit tests can drop in an in-memory mock. The Sea-ORM impl
-//! [`SeaMessageRepo`] is the only place that touches `DatabaseConnection`.
+//! [`SeaMessageRepo`] threads the modkit-db `DBProvider` through the same
+//! handle the migration runner uses.
 //
 // @cpt-cf-chat-engine-message-repo:p5
 // @cpt-cf-chat-engine-adr-message-tree-structure:p5
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use sea_orm::{
-    AccessMode, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    IsolationLevel, QueryFilter, QueryOrder, QuerySelect, TransactionError, TransactionTrait,
+use modkit_db::secure::{
+    AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig,
 };
+use sea_orm::sea_query::Expr;
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
 use crate::domain::message::Message;
+use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
+use crate::infra::db::repo::ChatEngineDb;
 use crate::infra::db::{
     VARIANT_INDEX_MAX_RETRIES, compute_next_variant_index, is_variant_unique_violation,
 };
-use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
 /// Inputs for [`MessageRepo::insert_user_and_assistant_stub`].
 #[derive(Debug, Clone)]
@@ -117,17 +122,6 @@ pub enum FinalizeOutcome {
 pub trait MessageRepo: Send + Sync {
     /// Insert the user message + a pre-allocated assistant stub in a single
     /// SERIALIZABLE transaction.
-    ///
-    /// - The user message's `variant_index` is computed inline via
-    ///   [`compute_next_variant_index`] in the same transaction as the
-    ///   INSERT, and the whole pair is retried under
-    ///   `VARIANT_INDEX_MAX_RETRIES` on
-    ///   `uq_messages_session_parent_variant` collisions.
-    /// - The assistant stub is created with `parent_message_id = user_id`,
-    ///   `is_complete=false`, empty `content`, and `variant_index=0`.
-    /// - Returns both IDs and the user `variant_index` so the service can
-    ///   reference the assistant id immediately in the outgoing
-    ///   `StreamingStartEvent`.
     async fn insert_user_and_assistant_stub(
         &self,
         req: NewUserMessage,
@@ -135,18 +129,6 @@ pub trait MessageRepo: Send + Sync {
 
     /// Atomically finalize the assistant message: updates `content`,
     /// `is_complete`, and `metadata` in one statement.
-    ///
-    /// The update is a single scoped `UPDATE … WHERE message_id = ?
-    /// AND session_id = ? AND is_complete = false AND metadata IS NULL`,
-    /// so concurrent finalizes for the same row (e.g., a cancel racing
-    /// a normal completion) cannot interleave a read-modify-write — the
-    /// first writer wins and the second's predicate matches zero rows.
-    /// A successful no-op return therefore means "another finalize
-    /// already terminated this stub"; callers should treat that as
-    /// idempotent.
-    ///
-    /// Per the Phase 2 contract `messages` has no `updated_at` column;
-    /// freshness is conveyed by the `is_complete=true` transition.
     async fn finalize_assistant(
         &self,
         session_id: Uuid,
@@ -174,15 +156,7 @@ pub trait MessageRepo: Send + Sync {
     /// Phase 7 hook (context management). Return the *raw* active path for a
     /// session — every message with `is_active=true AND is_complete=true`
     /// ordered by `created_at ASC`. Unlike [`Self::fetch_active_history`],
-    /// this method does NOT filter out `is_hidden_from_backend=true` rows:
-    /// the [`crate::domain::service::message_service::MessageService::apply_memory_strategy`]
-    /// algorithm needs the full active path so it can apply the "keep last K
-    /// messages regardless of visibility" rule for the `Summarized`
-    /// strategy.
-    ///
-    /// The default impl delegates to [`Self::fetch_active_history`] so
-    /// pre-Phase-7 test mocks keep compiling; the Sea-ORM impl overrides
-    /// this with the correct (un-hidden-filtered) query.
+    /// this method does NOT filter out `is_hidden_from_backend=true` rows.
     async fn list_active_path(
         &self,
         session_id: Uuid,
@@ -191,14 +165,7 @@ pub trait MessageRepo: Send + Sync {
     }
 
     /// Phase 6 hook (recreate). Insert a fresh assistant sibling under
-    /// `parent_message_id` with `variant_index = MAX+1`, `is_active=true`,
-    /// `is_complete=false`, empty content. The variant index is computed
-    /// inline via [`compute_next_variant_index`] in the same transaction as
-    /// the INSERT, with `VARIANT_INDEX_MAX_RETRIES` retries on
-    /// `uq_messages_session_parent_variant` collisions.
-    ///
-    /// Returns an [`InsertedPair`] where `user_message_id = parent_message_id`,
-    /// `assistant_message_id = new_row_id`, and `user_variant_index = new_variant_index`.
+    /// `parent_message_id` with `variant_index = MAX+1`.
     ///
     /// Default impl returns `Internal` so existing test mocks compile;
     /// the Sea-ORM impl overrides this.
@@ -215,17 +182,7 @@ pub trait MessageRepo: Send + Sync {
 
     /// Phase 8 hook (session intelligence). Persist an AI-generated summary
     /// as a `role=system` message and atomically flip the listed messages'
-    /// `is_hidden_from_backend` flag to `true` so future plugin invocations
-    /// see the summary in lieu of the originals.
-    ///
-    /// The summary message has `parent_message_id=NULL`,
-    /// `is_hidden_from_user=true`, and `is_complete=true`. The
-    /// `summarized_ids` set is applied in the same transaction as the
-    /// summary insert, ensuring at-most-once visibility transitions.
-    ///
-    /// Default impl returns `Internal` so existing test mocks compile;
-    /// the SeaORM impl overrides this with a single SERIALIZABLE
-    /// transaction.
+    /// `is_hidden_from_backend` flag to `true`.
     async fn insert_summary_message(
         &self,
         session_id: Uuid,
@@ -239,13 +196,8 @@ pub trait MessageRepo: Send + Sync {
         ))
     }
 
-    /// Phase 8 hook (retention cleanup). List every non-root message
-    /// (`parent_message_id IS NOT NULL`) in the session ordered by
-    /// `created_at ASC`. Used by the count-based retention algorithm to
-    /// pick the oldest messages exceeding the configured threshold.
-    ///
-    /// Default impl returns an empty list so test mocks that don't care
-    /// about retention keep compiling.
+    /// Phase 8 hook (retention cleanup). List every non-root message in the
+    /// session ordered by `created_at ASC`.
     async fn list_non_root_messages_chrono(
         &self,
         session_id: Uuid,
@@ -255,11 +207,7 @@ pub trait MessageRepo: Send + Sync {
     }
 
     /// Phase 8 hook (retention cleanup). List every non-root message in
-    /// the session whose `created_at` is older than `older_than`. Used by
-    /// the age-based retention algorithm.
-    ///
-    /// Default impl returns an empty list so test mocks that don't care
-    /// about retention keep compiling.
+    /// the session whose `created_at` is older than `older_than`.
     async fn list_non_root_messages_older_than(
         &self,
         session_id: Uuid,
@@ -270,9 +218,7 @@ pub trait MessageRepo: Send + Sync {
     }
 
     /// Phase 8 hook (retention cleanup, bounded). Count non-root
-    /// messages in the session. Used by the count-based policy to
-    /// decide whether anything is over the threshold *without*
-    /// materialising the full message list. Default impl returns 0.
+    /// messages in the session.
     async fn count_non_root_messages(
         &self,
         session_id: Uuid,
@@ -283,10 +229,7 @@ pub trait MessageRepo: Send + Sync {
 
     /// Phase 8 hook (retention cleanup, bounded). Return the IDs of
     /// the OLDEST non-root messages in the session — ordered by
-    /// `created_at ASC` — capped at `limit`. Returns only ids (not
-    /// full `Message` rows) so the SQL projection stays cheap even on
-    /// a session with millions of messages. Default impl returns an
-    /// empty list.
+    /// `created_at ASC` — capped at `limit`.
     async fn list_oldest_non_root_message_ids(
         &self,
         session_id: Uuid,
@@ -297,10 +240,7 @@ pub trait MessageRepo: Send + Sync {
     }
 
     /// Phase 8 hook (retention cleanup, bounded). Return the IDs of
-    /// non-root messages with `created_at < older_than`, ordered by
-    /// `created_at ASC`, capped at `limit`. Mirrors
-    /// [`Self::list_oldest_non_root_message_ids`] for the age-based
-    /// policy. Default impl returns an empty list.
+    /// non-root messages with `created_at < older_than`.
     async fn list_non_root_message_ids_older_than(
         &self,
         session_id: Uuid,
@@ -313,16 +253,7 @@ pub trait MessageRepo: Send + Sync {
 
     /// Phase 8 hook (retention cleanup). Atomically delete the message
     /// identified by `root_id` and every descendant reachable through
-    /// `parent_message_id` within `session_id`. The traversal walks the
-    /// entire subtree, including hidden / inactive variants, so no
-    /// orphans remain.
-    ///
-    /// Returns the count of rows physically removed (the root plus all
-    /// descendants).
-    ///
-    /// Default impl returns `Internal` so existing test mocks compile;
-    /// the SeaORM impl overrides this with a single SERIALIZABLE
-    /// transaction wrapping a recursive walk.
+    /// `parent_message_id` within `session_id`.
     async fn delete_message_subtree(
         &self,
         session_id: Uuid,
@@ -336,13 +267,19 @@ pub trait MessageRepo: Send + Sync {
 }
 
 /// Sea-ORM-backed implementation of [`MessageRepo`].
+///
+/// Holds the modkit-db `DBProvider` so every query runs against the same
+/// connection the migration runner used. `messages` is marked
+/// `#[secure(unrestricted)]`; the secure wrappers run with
+/// `AccessScope::allow_all()` and exist to expose a `&impl DBRunner`
+/// execution path.
 pub struct SeaMessageRepo {
-    db: DatabaseConnection,
+    db: Arc<ChatEngineDb>,
 }
 
 impl SeaMessageRepo {
     #[must_use]
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: Arc<ChatEngineDb>) -> Self {
         Self { db }
     }
 }
@@ -355,12 +292,7 @@ impl MessageRepo for SeaMessageRepo {
     ) -> Result<InsertedPair, ChatEngineError> {
         // SERIALIZABLE-bound retry loop that wraps BOTH the
         // `MAX(variant_index)+1` SELECT and the matching INSERT in a
-        // single transaction. The earlier code computed the index in a
-        // separate transaction and then issued the INSERT outside the
-        // retry guard — a concurrent caller could claim the same index
-        // in the gap, surfacing the unique violation as a raw 500. The
-        // INSERT is now retried in lockstep with the SELECT so the
-        // race window is closed.
+        // single transaction.
         let session_id = req.session_id;
         let parent = req.parent_message_id;
         let file_ids_json = req
@@ -371,11 +303,8 @@ impl MessageRepo for SeaMessageRepo {
         let content = req.content;
         let metadata = req.metadata;
 
-        let mut last_err: Option<sea_orm::DbErr> = None;
+        let mut last_err: Option<ChatEngineError> = None;
         for _attempt in 0..VARIANT_INDEX_MAX_RETRIES {
-            // Fresh ids/timestamps each attempt so a retried INSERT
-            // never collides with itself on the primary key after a
-            // partial rollback.
             let user_message_id = Uuid::new_v4();
             let assistant_message_id = Uuid::new_v4();
             let now = OffsetDateTime::now_utc();
@@ -383,52 +312,57 @@ impl MessageRepo for SeaMessageRepo {
             let metadata_attempt = metadata.clone();
             let file_ids_attempt = file_ids_json.clone();
 
-            let outcome: Result<i32, TransactionError<sea_orm::DbErr>> = self
+            let outcome: Result<i32, ChatEngineError> = self
                 .db
-                .transaction_with_config::<_, i32, sea_orm::DbErr>(
-                    move |txn| {
-                        Box::pin(async move {
-                            let user_variant_index =
-                                compute_next_variant_index(txn, session_id, parent).await?;
+                .transaction_with_config(TxConfig::serializable(), move |tx| {
+                    Box::pin(async move {
+                        let scope = AccessScope::allow_all();
+                        let user_variant_index =
+                            compute_next_variant_index(tx, session_id, parent).await?;
 
-                            let user_active = message_entity::ActiveModel {
-                                message_id: Set(user_message_id),
-                                session_id: Set(session_id),
-                                parent_message_id: Set(parent),
-                                role: Set("user".to_string()),
-                                content: Set(content_attempt),
-                                file_ids: Set(file_ids_attempt),
-                                variant_index: Set(user_variant_index),
-                                is_active: Set(true),
-                                is_complete: Set(true),
-                                is_hidden_from_user: Set(false),
-                                is_hidden_from_backend: Set(false),
-                                metadata: Set(metadata_attempt),
-                                created_at: Set(now),
-                            };
-                            let assistant_active = message_entity::ActiveModel {
-                                message_id: Set(assistant_message_id),
-                                session_id: Set(session_id),
-                                parent_message_id: Set(Some(user_message_id)),
-                                role: Set("assistant".to_string()),
-                                content: Set(empty_content()),
-                                file_ids: Set(None),
-                                variant_index: Set(0),
-                                is_active: Set(true),
-                                is_complete: Set(false),
-                                is_hidden_from_user: Set(false),
-                                is_hidden_from_backend: Set(false),
-                                metadata: Set(None),
-                                created_at: Set(now),
-                            };
-                            user_active.insert(txn).await?;
-                            assistant_active.insert(txn).await?;
-                            Ok(user_variant_index)
-                        })
-                    },
-                    Some(IsolationLevel::Serializable),
-                    Some(AccessMode::ReadWrite),
-                )
+                        let user_active = message_entity::ActiveModel {
+                            message_id: Set(user_message_id),
+                            session_id: Set(session_id),
+                            parent_message_id: Set(parent),
+                            role: Set("user".to_string()),
+                            content: Set(content_attempt),
+                            file_ids: Set(file_ids_attempt),
+                            variant_index: Set(user_variant_index),
+                            is_active: Set(true),
+                            is_complete: Set(true),
+                            is_hidden_from_user: Set(false),
+                            is_hidden_from_backend: Set(false),
+                            metadata: Set(metadata_attempt),
+                            created_at: Set(now),
+                        };
+                        let assistant_active = message_entity::ActiveModel {
+                            message_id: Set(assistant_message_id),
+                            session_id: Set(session_id),
+                            parent_message_id: Set(Some(user_message_id)),
+                            role: Set("assistant".to_string()),
+                            content: Set(empty_content()),
+                            file_ids: Set(None),
+                            variant_index: Set(0),
+                            is_active: Set(true),
+                            is_complete: Set(false),
+                            is_hidden_from_user: Set(false),
+                            is_hidden_from_backend: Set(false),
+                            metadata: Set(None),
+                            created_at: Set(now),
+                        };
+                        MessageEntity::insert(user_active)
+                            .secure()
+                            .scope_unchecked(&scope)?
+                            .exec(tx)
+                            .await?;
+                        MessageEntity::insert(assistant_active)
+                            .secure()
+                            .scope_unchecked(&scope)?
+                            .exec(tx)
+                            .await?;
+                        Ok(user_variant_index)
+                    })
+                })
                 .await;
 
             match outcome {
@@ -439,10 +373,13 @@ impl MessageRepo for SeaMessageRepo {
                         user_variant_index,
                     });
                 }
-                Err(TransactionError::Transaction(e))
-                | Err(TransactionError::Connection(e)) => {
-                    if !is_variant_unique_violation(&e) {
-                        return Err(e.into());
+                Err(e) => {
+                    if let Some(db_err) = chat_engine_db_err(&e) {
+                        if !is_variant_unique_violation(db_err) {
+                            return Err(e);
+                        }
+                    } else {
+                        return Err(e);
                     }
                     last_err = Some(e);
                 }
@@ -457,8 +394,6 @@ impl MessageRepo for SeaMessageRepo {
         assistant_message_id: Uuid,
         outcome: FinalizeOutcome,
     ) -> Result<(), ChatEngineError> {
-        use sea_orm::sea_query::Expr;
-
         let (content, metadata, is_complete) = match outcome {
             FinalizeOutcome::Complete { text, metadata } => {
                 (content_with_text(&text), metadata, true)
@@ -485,33 +420,30 @@ impl MessageRepo for SeaMessageRepo {
             }
         };
 
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         // Single atomic UPDATE scoped to (message_id, session_id). The
         // `is_complete = false AND metadata IS NULL` predicate matches
-        // only the still-pending stub state — any prior finalize (which
-        // either flips is_complete or writes metadata) leaves the row
-        // outside the match set, so a concurrent finalize cannot clobber
-        // the winner's terminal state.
+        // only the still-pending stub state — any prior finalize leaves
+        // the row outside the match set, so a concurrent finalize cannot
+        // clobber the winner's terminal state.
         let result = MessageEntity::update_many()
-            .filter(message_entity::Column::MessageId.eq(assistant_message_id))
-            .filter(message_entity::Column::SessionId.eq(session_id))
-            .filter(message_entity::Column::IsComplete.eq(false))
-            .filter(message_entity::Column::Metadata.is_null())
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::MessageId.eq(assistant_message_id))
+                    .add(message_entity::Column::SessionId.eq(session_id))
+                    .add(message_entity::Column::IsComplete.eq(false))
+                    .add(message_entity::Column::Metadata.is_null()),
+            )
             .col_expr(message_entity::Column::Content, Expr::value(content))
-            .col_expr(
-                message_entity::Column::IsComplete,
-                Expr::value(is_complete),
-            )
-            .col_expr(
-                message_entity::Column::Metadata,
-                Expr::value(metadata),
-            )
-            .exec(&self.db)
+            .col_expr(message_entity::Column::IsComplete, Expr::value(is_complete))
+            .col_expr(message_entity::Column::Metadata, Expr::value(metadata))
+            .exec(&conn)
             .await?;
 
         if result.rows_affected == 0 {
-            // Either the row doesn't exist in this session, or another
-            // finalize already terminated the stub. Idempotent no-op for
-            // the racing caller.
             tracing::debug!(
                 session_id = %session_id,
                 assistant_message_id = %assistant_message_id,
@@ -526,22 +458,25 @@ impl MessageRepo for SeaMessageRepo {
         session_id: Uuid,
         depth: Option<u32>,
     ) -> Result<Vec<Message>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let mut query = MessageEntity::find()
-            .filter(message_entity::Column::SessionId.eq(session_id))
-            .filter(message_entity::Column::IsActive.eq(true))
-            .filter(message_entity::Column::IsHiddenFromBackend.eq(false))
-            // Visible history excludes the assistant stub we're about to
-            // fill in (is_complete=false). The stub becomes part of history
-            // only on subsequent calls, after `finalize_assistant` flips
-            // is_complete to true.
-            .filter(message_entity::Column::IsComplete.eq(true))
-            .order_by_asc(message_entity::Column::CreatedAt);
+            .order_by_asc(message_entity::Column::CreatedAt)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::SessionId.eq(session_id))
+                    .add(message_entity::Column::IsActive.eq(true))
+                    .add(message_entity::Column::IsHiddenFromBackend.eq(false))
+                    .add(message_entity::Column::IsComplete.eq(true)),
+            );
 
         if let Some(d) = depth {
             query = query.limit(u64::from(d));
         }
 
-        let rows = query.all(&self.db).await?;
+        let rows = query.all(&conn).await?;
         Ok(rows.into_iter().map(Message::from).collect())
     }
 
@@ -550,10 +485,17 @@ impl MessageRepo for SeaMessageRepo {
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<Option<Message>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let row = MessageEntity::find()
-            .filter(message_entity::Column::MessageId.eq(message_id))
-            .filter(message_entity::Column::SessionId.eq(session_id))
-            .one(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::MessageId.eq(message_id))
+                    .add(message_entity::Column::SessionId.eq(session_id)),
+            )
+            .one(&conn)
             .await?;
         Ok(row.map(Message::from))
     }
@@ -562,6 +504,8 @@ impl MessageRepo for SeaMessageRepo {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<Message>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         // Active-path traversal per the Phase 6 contract: `is_active=true`
         // siblings only, `created_at ASC`. We also require `is_complete=true`
         // so an in-flight assistant stub does not leak into history. Notably
@@ -569,11 +513,16 @@ impl MessageRepo for SeaMessageRepo {
         // strategy may need hidden messages to satisfy the "keep last K"
         // rule.
         let rows = MessageEntity::find()
-            .filter(message_entity::Column::SessionId.eq(session_id))
-            .filter(message_entity::Column::IsActive.eq(true))
-            .filter(message_entity::Column::IsComplete.eq(true))
             .order_by_asc(message_entity::Column::CreatedAt)
-            .all(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::SessionId.eq(session_id))
+                    .add(message_entity::Column::IsActive.eq(true))
+                    .add(message_entity::Column::IsComplete.eq(true)),
+            )
+            .all(&conn)
             .await?;
         Ok(rows.into_iter().map(Message::from).collect())
     }
@@ -582,11 +531,18 @@ impl MessageRepo for SeaMessageRepo {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<Message>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let rows = MessageEntity::find()
-            .filter(message_entity::Column::SessionId.eq(session_id))
-            .filter(message_entity::Column::ParentMessageId.is_not_null())
             .order_by_asc(message_entity::Column::CreatedAt)
-            .all(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::SessionId.eq(session_id))
+                    .add(message_entity::Column::ParentMessageId.is_not_null()),
+            )
+            .all(&conn)
             .await?;
         Ok(rows.into_iter().map(Message::from).collect())
     }
@@ -596,12 +552,19 @@ impl MessageRepo for SeaMessageRepo {
         session_id: Uuid,
         older_than: OffsetDateTime,
     ) -> Result<Vec<Message>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let rows = MessageEntity::find()
-            .filter(message_entity::Column::SessionId.eq(session_id))
-            .filter(message_entity::Column::ParentMessageId.is_not_null())
-            .filter(message_entity::Column::CreatedAt.lt(older_than))
             .order_by_asc(message_entity::Column::CreatedAt)
-            .all(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::SessionId.eq(session_id))
+                    .add(message_entity::Column::ParentMessageId.is_not_null())
+                    .add(message_entity::Column::CreatedAt.lt(older_than)),
+            )
+            .all(&conn)
             .await?;
         Ok(rows.into_iter().map(Message::from).collect())
     }
@@ -610,12 +573,17 @@ impl MessageRepo for SeaMessageRepo {
         &self,
         session_id: Uuid,
     ) -> Result<u64, ChatEngineError> {
-        use sea_orm::PaginatorTrait;
-
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let n = MessageEntity::find()
-            .filter(message_entity::Column::SessionId.eq(session_id))
-            .filter(message_entity::Column::ParentMessageId.is_not_null())
-            .count(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::SessionId.eq(session_id))
+                    .add(message_entity::Column::ParentMessageId.is_not_null()),
+            )
+            .count(&conn)
             .await?;
         Ok(n)
     }
@@ -628,17 +596,27 @@ impl MessageRepo for SeaMessageRepo {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let ids: Vec<Uuid> = MessageEntity::find()
-            .select_only()
-            .column(message_entity::Column::MessageId)
-            .filter(message_entity::Column::SessionId.eq(session_id))
-            .filter(message_entity::Column::ParentMessageId.is_not_null())
+        // The secure layer doesn't yet expose `select_only() +
+        // into_tuple()`, so we fetch full rows and project in-process.
+        // The cost is one extra column per row (the `content` JSONB),
+        // bounded by `limit`. Retention runs in batches sized by
+        // [`crate::config::ChatEngineConfig::retention_max_deletes_per_session`]
+        // so the per-call cap is small (default 100).
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
+        let rows = MessageEntity::find()
             .order_by_asc(message_entity::Column::CreatedAt)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::SessionId.eq(session_id))
+                    .add(message_entity::Column::ParentMessageId.is_not_null()),
+            )
             .limit(u64::from(limit))
-            .into_tuple()
-            .all(&self.db)
+            .all(&conn)
             .await?;
-        Ok(ids)
+        Ok(rows.into_iter().map(|m| m.message_id).collect())
     }
 
     async fn list_non_root_message_ids_older_than(
@@ -650,18 +628,22 @@ impl MessageRepo for SeaMessageRepo {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let ids: Vec<Uuid> = MessageEntity::find()
-            .select_only()
-            .column(message_entity::Column::MessageId)
-            .filter(message_entity::Column::SessionId.eq(session_id))
-            .filter(message_entity::Column::ParentMessageId.is_not_null())
-            .filter(message_entity::Column::CreatedAt.lt(older_than))
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
+        let rows = MessageEntity::find()
             .order_by_asc(message_entity::Column::CreatedAt)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::SessionId.eq(session_id))
+                    .add(message_entity::Column::ParentMessageId.is_not_null())
+                    .add(message_entity::Column::CreatedAt.lt(older_than)),
+            )
             .limit(u64::from(limit))
-            .into_tuple()
-            .all(&self.db)
+            .all(&conn)
             .await?;
-        Ok(ids)
+        Ok(rows.into_iter().map(|m| m.message_id).collect())
     }
 
     async fn insert_summary_message(
@@ -678,9 +660,6 @@ impl MessageRepo for SeaMessageRepo {
         let summary_active = message_entity::ActiveModel {
             message_id: Set(summary_id),
             session_id: Set(session_id),
-            // Summaries are conversation anchors: persisted at the root
-            // level (`parent_message_id = NULL`) so they are excluded from
-            // retention cleanup and don't disturb the variant tree.
             parent_message_id: Set(None),
             role: Set("system".to_string()),
             content: Set(content),
@@ -688,7 +667,6 @@ impl MessageRepo for SeaMessageRepo {
             variant_index: Set(0),
             is_active: Set(true),
             is_complete: Set(true),
-            // System summaries never surface in the user-facing transcript.
             is_hidden_from_user: Set(true),
             is_hidden_from_backend: Set(false),
             metadata: Set(metadata),
@@ -696,39 +674,38 @@ impl MessageRepo for SeaMessageRepo {
         };
 
         let summarized = summarized_ids.clone();
-        let outcome: Result<(), TransactionError<sea_orm::DbErr>> = self
-            .db
-            .transaction_with_config::<_, (), sea_orm::DbErr>(
-                move |txn| {
-                    Box::pin(async move {
-                        summary_active.insert(txn).await?;
-                        if !summarized.is_empty() {
-                            MessageEntity::update_many()
-                                .col_expr(
-                                    message_entity::Column::IsHiddenFromBackend,
-                                    sea_orm::sea_query::Expr::value(true),
-                                )
-                                .filter(message_entity::Column::SessionId.eq(session_id))
-                                .filter(
-                                    message_entity::Column::MessageId.is_in(summarized.clone()),
-                                )
-                                .exec(txn)
-                                .await?;
-                        }
-                        Ok(())
-                    })
-                },
-                Some(IsolationLevel::Serializable),
-                Some(AccessMode::ReadWrite),
-            )
-            .await;
-
-        match outcome {
-            Ok(()) => Ok(summary_id),
-            Err(TransactionError::Transaction(e)) | Err(TransactionError::Connection(e)) => {
-                Err(e.into())
-            }
-        }
+        self.db
+            .transaction_with_config(TxConfig::serializable(), move |tx| {
+                Box::pin(async move {
+                    let scope = AccessScope::allow_all();
+                    MessageEntity::insert(summary_active)
+                        .secure()
+                        .scope_unchecked(&scope)?
+                        .exec(tx)
+                        .await?;
+                    if !summarized.is_empty() {
+                        MessageEntity::update_many()
+                            .secure()
+                            .scope_with(&scope)
+                            .filter(
+                                Condition::all()
+                                    .add(message_entity::Column::SessionId.eq(session_id))
+                                    .add(
+                                        message_entity::Column::MessageId
+                                            .is_in(summarized.clone()),
+                                    ),
+                            )
+                            .col_expr(
+                                message_entity::Column::IsHiddenFromBackend,
+                                Expr::value(true),
+                            )
+                            .exec(tx)
+                            .await?;
+                    }
+                    Ok(summary_id)
+                })
+            })
+            .await
     }
 
     async fn delete_message_subtree(
@@ -738,60 +715,56 @@ impl MessageRepo for SeaMessageRepo {
     ) -> Result<u64, ChatEngineError> {
         // Idempotency: a missing root is a no-op (returns 0). The
         // SERIALIZABLE transaction wraps the recursive walk so concurrent
-        // cleanup runs cannot observe partial deletes; the advisory
-        // lock acquired by
-        // `IntelligenceService::run_retention_cleanup_for_tenant` makes
-        // contention unlikely but the repo must remain safe regardless.
-        let outcome: Result<u64, TransactionError<sea_orm::DbErr>> = self
-            .db
-            .transaction_with_config::<_, u64, sea_orm::DbErr>(
-                move |txn| {
-                    Box::pin(async move {
-                        // BFS through `parent_message_id` to collect every
-                        // descendant. We accumulate ids first so the
-                        // FK-on-parent ordering can be enforced (children
-                        // deleted before parents).
-                        let mut to_visit: Vec<Uuid> = vec![root_id];
-                        let mut ordered: Vec<Uuid> = Vec::new();
-                        while let Some(id) = to_visit.pop() {
-                            ordered.push(id);
-                            let children: Vec<Uuid> = MessageEntity::find()
-                                .filter(message_entity::Column::SessionId.eq(session_id))
-                                .filter(message_entity::Column::ParentMessageId.eq(id))
-                                .all(txn)
-                                .await?
-                                .into_iter()
-                                .map(|m| m.message_id)
-                                .collect();
-                            to_visit.extend(children);
-                        }
-                        // Delete leaves-first (reverse traversal order) so
-                        // the on_delete=Restrict FK from
-                        // `messages.parent_message_id -> messages.message_id`
-                        // is satisfied at every step.
-                        let mut removed: u64 = 0;
-                        for id in ordered.into_iter().rev() {
-                            let res = MessageEntity::delete_many()
-                                .filter(message_entity::Column::MessageId.eq(id))
-                                .filter(message_entity::Column::SessionId.eq(session_id))
-                                .exec(txn)
-                                .await?;
-                            removed += res.rows_affected;
-                        }
-                        Ok(removed)
-                    })
-                },
-                Some(IsolationLevel::Serializable),
-                Some(AccessMode::ReadWrite),
-            )
-            .await;
-
-        match outcome {
-            Ok(n) => Ok(n),
-            Err(TransactionError::Transaction(e)) | Err(TransactionError::Connection(e)) => {
-                Err(e.into())
-            }
-        }
+        // cleanup runs cannot observe partial deletes.
+        self.db
+            .transaction_with_config(TxConfig::serializable(), move |tx| {
+                Box::pin(async move {
+                    let scope = AccessScope::allow_all();
+                    // BFS through `parent_message_id` to collect every
+                    // descendant. We accumulate ids first so the
+                    // FK-on-parent ordering can be enforced (children
+                    // deleted before parents).
+                    let mut to_visit: Vec<Uuid> = vec![root_id];
+                    let mut ordered: Vec<Uuid> = Vec::new();
+                    while let Some(id) = to_visit.pop() {
+                        ordered.push(id);
+                        let children: Vec<Uuid> = MessageEntity::find()
+                            .secure()
+                            .scope_with(&scope)
+                            .filter(
+                                Condition::all()
+                                    .add(message_entity::Column::SessionId.eq(session_id))
+                                    .add(message_entity::Column::ParentMessageId.eq(id)),
+                            )
+                            .all(tx)
+                            .await?
+                            .into_iter()
+                            .map(|m| m.message_id)
+                            .collect();
+                        to_visit.extend(children);
+                    }
+                    // Delete leaves-first (reverse traversal order) so
+                    // the on_delete=Restrict FK from
+                    // `messages.parent_message_id -> messages.message_id`
+                    // is satisfied at every step.
+                    let mut removed: u64 = 0;
+                    for id in ordered.into_iter().rev() {
+                        let res = MessageEntity::delete_many()
+                            .secure()
+                            .scope_with(&scope)
+                            .filter(
+                                Condition::all()
+                                    .add(message_entity::Column::MessageId.eq(id))
+                                    .add(message_entity::Column::SessionId.eq(session_id)),
+                            )
+                            .exec(tx)
+                            .await?;
+                        removed += res.rows_affected;
+                    }
+                    Ok(removed)
+                })
+            })
+            .await
     }
 
     async fn insert_assistant_variant_stub(
@@ -801,47 +774,46 @@ impl MessageRepo for SeaMessageRepo {
     ) -> Result<InsertedPair, ChatEngineError> {
         // Same race-free pattern as `insert_user_and_assistant_stub`:
         // the SELECT for `MAX(variant_index)+1` runs in the SAME
-        // SERIALIZABLE transaction as the INSERT, with the whole pair
-        // retried under `VARIANT_INDEX_MAX_RETRIES` on
-        // `uq_messages_session_parent_variant` collisions.
-        let mut last_err: Option<sea_orm::DbErr> = None;
+        // SERIALIZABLE transaction as the INSERT.
+        let mut last_err: Option<ChatEngineError> = None;
         for _attempt in 0..VARIANT_INDEX_MAX_RETRIES {
             let new_message_id = Uuid::new_v4();
             let now = OffsetDateTime::now_utc();
 
-            let outcome: Result<i32, TransactionError<sea_orm::DbErr>> = self
+            let outcome: Result<i32, ChatEngineError> = self
                 .db
-                .transaction_with_config::<_, i32, sea_orm::DbErr>(
-                    move |txn| {
-                        Box::pin(async move {
-                            let new_variant_index = compute_next_variant_index(
-                                txn,
-                                session_id,
-                                Some(parent_message_id),
-                            )
+                .transaction_with_config(TxConfig::serializable(), move |tx| {
+                    Box::pin(async move {
+                        let scope = AccessScope::allow_all();
+                        let new_variant_index = compute_next_variant_index(
+                            tx,
+                            session_id,
+                            Some(parent_message_id),
+                        )
+                        .await?;
+                        let assistant_active = message_entity::ActiveModel {
+                            message_id: Set(new_message_id),
+                            session_id: Set(session_id),
+                            parent_message_id: Set(Some(parent_message_id)),
+                            role: Set("assistant".to_string()),
+                            content: Set(empty_content()),
+                            file_ids: Set(None),
+                            variant_index: Set(new_variant_index),
+                            is_active: Set(true),
+                            is_complete: Set(false),
+                            is_hidden_from_user: Set(false),
+                            is_hidden_from_backend: Set(false),
+                            metadata: Set(None),
+                            created_at: Set(now),
+                        };
+                        MessageEntity::insert(assistant_active)
+                            .secure()
+                            .scope_unchecked(&scope)?
+                            .exec(tx)
                             .await?;
-                            let assistant_active = message_entity::ActiveModel {
-                                message_id: Set(new_message_id),
-                                session_id: Set(session_id),
-                                parent_message_id: Set(Some(parent_message_id)),
-                                role: Set("assistant".to_string()),
-                                content: Set(empty_content()),
-                                file_ids: Set(None),
-                                variant_index: Set(new_variant_index),
-                                is_active: Set(true),
-                                is_complete: Set(false),
-                                is_hidden_from_user: Set(false),
-                                is_hidden_from_backend: Set(false),
-                                metadata: Set(None),
-                                created_at: Set(now),
-                            };
-                            assistant_active.insert(txn).await?;
-                            Ok(new_variant_index)
-                        })
-                    },
-                    Some(IsolationLevel::Serializable),
-                    Some(AccessMode::ReadWrite),
-                )
+                        Ok(new_variant_index)
+                    })
+                })
                 .await;
 
             match outcome {
@@ -852,10 +824,13 @@ impl MessageRepo for SeaMessageRepo {
                         user_variant_index: new_variant_index,
                     });
                 }
-                Err(TransactionError::Transaction(e))
-                | Err(TransactionError::Connection(e)) => {
-                    if !is_variant_unique_violation(&e) {
-                        return Err(e.into());
+                Err(e) => {
+                    if let Some(db_err) = chat_engine_db_err(&e) {
+                        if !is_variant_unique_violation(db_err) {
+                            return Err(e);
+                        }
+                    } else {
+                        return Err(e);
                     }
                     last_err = Some(e);
                 }
@@ -865,10 +840,30 @@ impl MessageRepo for SeaMessageRepo {
     }
 }
 
+/// Reach into a `ChatEngineError` to recover the underlying `sea_orm::DbErr`
+/// for retry classification. Only the `Internal { source }` branch carries
+/// one; everything else short-circuits the retry.
+fn chat_engine_db_err(err: &ChatEngineError) -> Option<&sea_orm::DbErr> {
+    let ChatEngineError::Internal { source, .. } = err else {
+        return None;
+    };
+    let source = source.as_ref()?;
+    source
+        .downcast_ref::<sea_orm::DbErr>()
+        .or_else(|| {
+            source
+                .downcast_ref::<modkit_db::DbError>()
+                .and_then(|dbe| match dbe {
+                    modkit_db::DbError::Sea(inner) => Some(inner),
+                    _ => None,
+                })
+        })
+}
+
 /// Map a retry-exhaustion outcome to a `Conflict` ChatEngineError that
-/// downstream handlers will render as HTTP 409. The original DbErr is
+/// downstream handlers will render as HTTP 409. The original cause is
 /// preserved as the source for log triage.
-fn retry_exhausted_conflict(last_err: Option<sea_orm::DbErr>) -> ChatEngineError {
+fn retry_exhausted_conflict(last_err: Option<ChatEngineError>) -> ChatEngineError {
     let base = format!(
         "variant index allocation contended; exhausted {VARIANT_INDEX_MAX_RETRIES} retries"
     );

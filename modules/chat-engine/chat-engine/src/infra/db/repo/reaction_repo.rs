@@ -17,18 +17,20 @@
 //!
 //! The trait is object-safe so `Arc<dyn ReactionRepo>` flows into
 //! [`crate::domain::service::reaction_service::ReactionService`]; the
-//! Sea-ORM impl [`SeaReactionRepo`] is the only file that touches
-//! `DatabaseConnection`.
+//! Sea-ORM impl [`SeaReactionRepo`] is the only file that touches the
+//! database.
 //
 // @cpt-cf-chat-engine-reaction-repo:p9
 // @cpt-cf-chat-engine-adr-message-reactions:p9
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use sea_orm::{
-    AccessMode, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, IsolationLevel,
-    QueryFilter, TransactionError, TransactionTrait,
-    sea_query::OnConflict,
+use modkit_db::secure::{
+    AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, TxConfig,
 };
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -37,6 +39,7 @@ use crate::domain::reaction::{MessageReaction, ReactionType};
 use crate::infra::db::entity::message_reaction::{
     self as reaction_entity, Column as ReactionColumn, Entity as ReactionEntity,
 };
+use crate::infra::db::repo::ChatEngineDb;
 
 /// Outcome of [`ReactionRepo::upsert`]. Carries the persisted row plus the
 /// `previous_reaction_type` captured before the write so the service can
@@ -108,13 +111,19 @@ pub trait ReactionRepo: Send + Sync {
 }
 
 /// Sea-ORM-backed implementation of [`ReactionRepo`].
+///
+/// Holds the modkit-db `DBProvider` so every query runs against the same
+/// connection the migration runner used. `message_reactions` has no
+/// tenant column (entity is marked `#[secure(unrestricted)]`); the
+/// secure wrappers run with `AccessScope::allow_all()` and exist to
+/// expose a `&impl DBRunner` execution path.
 pub struct SeaReactionRepo {
-    db: DatabaseConnection,
+    db: Arc<ChatEngineDb>,
 }
 
 impl SeaReactionRepo {
     #[must_use]
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: Arc<ChatEngineDb>) -> Self {
         Self { db }
     }
 }
@@ -126,8 +135,12 @@ impl ReactionRepo for SeaReactionRepo {
         message_id: Uuid,
         user_id: &str,
     ) -> Result<Option<MessageReaction>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let row = ReactionEntity::find_by_id((message_id, user_id.to_owned()))
-            .one(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .one(&conn)
             .await?;
         Ok(row.map(MessageReaction::from))
     }
@@ -151,20 +164,22 @@ impl ReactionRepo for SeaReactionRepo {
         // INSERT ... ON CONFLICT UPDATE. The OnConflict refreshes
         // `reaction_type` + `updated_at` only; `created_at` survives so
         // we keep the first-reaction timestamp.
-        let outcome: Result<
-            (Option<reaction_entity::Model>, reaction_entity::Model),
-            TransactionError<sea_orm::DbErr>,
-        > = self
+        let (prev_row, after_row) = self
             .db
-            .transaction_with_config::<_, (Option<reaction_entity::Model>, reaction_entity::Model), sea_orm::DbErr>(
-                move |txn| {
+            .transaction_with_config::<(Option<reaction_entity::Model>, reaction_entity::Model), _>(
+                TxConfig::serializable(),
+                move |tx| {
                     Box::pin(async move {
+                        let scope = AccessScope::allow_all();
+
                         let previous = ReactionEntity::find_by_id((
                             message_id,
                             user_id_owned.clone(),
                         ))
-                            .one(txn)
-                            .await?;
+                        .secure()
+                        .scope_with(&scope)
+                        .one(tx)
+                        .await?;
 
                         let am = reaction_entity::ActiveModel {
                             message_id: Set(message_id),
@@ -189,43 +204,38 @@ impl ReactionRepo for SeaReactionRepo {
                         .to_owned();
 
                         ReactionEntity::insert(am)
-                            .on_conflict(on_conflict)
-                            .exec(txn)
+                            .secure()
+                            .scope_unchecked(&scope)?
+                            .on_conflict_raw(on_conflict)
+                            .exec(tx)
                             .await?;
 
                         // Read back the post-write row (cheap on the same
                         // session, primary-key lookup).
                         let after = ReactionEntity::find_by_id((message_id, user_id_owned))
-                            .one(txn)
+                            .secure()
+                            .scope_with(&scope)
+                            .one(tx)
                             .await?
                             .ok_or_else(|| {
-                                sea_orm::DbErr::Custom(
-                                    "post-upsert read returned no row (race?)".into(),
+                                ChatEngineError::internal(
+                                    "post-upsert read returned no row (race?)",
                                 )
                             })?;
 
                         Ok((previous, after))
                     })
                 },
-                Some(IsolationLevel::Serializable),
-                Some(AccessMode::ReadWrite),
             )
-            .await;
+            .await?;
 
-        match outcome {
-            Ok((prev_row, after_row)) => {
-                let previous_reaction_type = prev_row
-                    .as_ref()
-                    .and_then(|m| ReactionType::from_str_value(&m.reaction_type));
-                Ok(ReactionUpsertOutcome {
-                    reaction: MessageReaction::from(after_row),
-                    previous_reaction_type,
-                })
-            }
-            Err(TransactionError::Transaction(e)) | Err(TransactionError::Connection(e)) => {
-                Err(e.into())
-            }
-        }
+        let previous_reaction_type = prev_row
+            .as_ref()
+            .and_then(|m| ReactionType::from_str_value(&m.reaction_type));
+        Ok(ReactionUpsertOutcome {
+            reaction: MessageReaction::from(after_row),
+            previous_reaction_type,
+        })
     }
 
     async fn delete(
@@ -233,10 +243,15 @@ impl ReactionRepo for SeaReactionRepo {
         message_id: Uuid,
         user_id: &str,
     ) -> Result<ReactionDeleteOutcome, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
+
         // Capture the prior value so the service can populate
         // `previous_reaction_type` on the fire-and-forget plugin event.
         let prior = ReactionEntity::find_by_id((message_id, user_id.to_owned()))
-            .one(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .one(&conn)
             .await?;
 
         let previous_reaction_type = prior
@@ -244,9 +259,14 @@ impl ReactionRepo for SeaReactionRepo {
             .and_then(|m| ReactionType::from_str_value(&m.reaction_type));
 
         let res = ReactionEntity::delete_many()
-            .filter(ReactionColumn::MessageId.eq(message_id))
-            .filter(ReactionColumn::UserId.eq(user_id.to_owned()))
-            .exec(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(ReactionColumn::MessageId.eq(message_id))
+                    .add(ReactionColumn::UserId.eq(user_id.to_owned())),
+            )
+            .exec(&conn)
             .await?;
 
         Ok(ReactionDeleteOutcome {
@@ -259,9 +279,13 @@ impl ReactionRepo for SeaReactionRepo {
         &self,
         message_id: Uuid,
     ) -> Result<Vec<MessageReaction>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let rows = ReactionEntity::find()
-            .filter(ReactionColumn::MessageId.eq(message_id))
-            .all(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(Condition::all().add(ReactionColumn::MessageId.eq(message_id)))
+            .all(&conn)
             .await?;
         Ok(rows.into_iter().map(MessageReaction::from).collect())
     }
