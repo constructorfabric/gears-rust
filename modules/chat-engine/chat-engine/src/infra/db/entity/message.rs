@@ -1,11 +1,14 @@
 // @cpt-cf-chat-engine-dbtable-messages:p1
 // @cpt-cf-chat-engine-adr-message-tree-structure:p1
 
+use modkit_db::secure::{AccessScope, DBRunner, SecureEntityExt};
+use modkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
-use sea_orm::{ConnectionTrait, QueryFilter, QueryOrder, QuerySelect, SqlErr};
+use sea_orm::{Condition, QueryOrder, QuerySelect, SqlErr};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::domain::error::ChatEngineError;
 use crate::infra::db::migrations::UQ_VARIANT_INDEX;
 
 /// Maximum retries when racing the `uq_messages_session_parent_variant`
@@ -13,8 +16,14 @@ use crate::infra::db::migrations::UQ_VARIANT_INDEX;
 /// HTTP `409 Conflict` (see DESIGN §3.7 "Variant Index Concurrency").
 pub const VARIANT_INDEX_MAX_RETRIES: u32 = 3;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+// Tenant / user scoping for messages is enforced indirectly via the
+// owning `sessions` row, which the repo joins on per request. There is
+// no per-message `tenant_id` column to wire `Scopable` against, so the
+// entity is marked unrestricted and scoping stays in the explicit
+// session join below.
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "messages")]
+#[secure(unrestricted)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -90,25 +99,32 @@ impl ActiveModelBehavior for ActiveModel {}
 /// transactions, surfacing the unique violation as a raw 500 instead of
 /// retrying. The helper was removed in favour of this primitive plus
 /// inline retry at every call site.
-pub async fn compute_next_variant_index<C>(
-    txn: &C,
+pub async fn compute_next_variant_index<R>(
+    runner: &R,
     session_id: Uuid,
     parent: Option<Uuid>,
-) -> Result<i32, DbErr>
+) -> Result<i32, ChatEngineError>
 where
-    C: ConnectionTrait,
+    R: DBRunner,
 {
-    let mut query = Entity::find()
-        .filter(Column::SessionId.eq(session_id))
-        .order_by_desc(Column::VariantIndex)
-        .limit(1);
+    let scope = AccessScope::allow_all();
 
-    query = match parent {
-        Some(p) => query.filter(Column::ParentMessageId.eq(p)),
-        None => query.filter(Column::ParentMessageId.is_null()),
+    let parent_filter = match parent {
+        Some(p) => Condition::all().add(Column::ParentMessageId.eq(p)),
+        None => Condition::all().add(Column::ParentMessageId.is_null()),
     };
 
-    Ok(match query.one(txn).await? {
+    let row = Entity::find()
+        .order_by_desc(Column::VariantIndex)
+        .limit(1)
+        .secure()
+        .scope_with(&scope)
+        .filter(Condition::all().add(Column::SessionId.eq(session_id)))
+        .filter(parent_filter)
+        .one(runner)
+        .await?;
+
+    Ok(match row {
         Some(row) => row.variant_index + 1,
         None => 0,
     })

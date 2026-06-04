@@ -20,13 +20,16 @@
 // @cpt-cf-chat-engine-adr-session-deletion-strategy:p4
 // @cpt-cf-chat-engine-adr-session-metadata:p4
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::{
-    AccessMode, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IsolationLevel,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionError, TransactionTrait,
+use modkit_db::secure::{
+    AccessScope, DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
+    TxConfig,
 };
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -38,6 +41,7 @@ use crate::infra::db::entity::message_reaction::{
     self as reaction_entity, Entity as ReactionEntity,
 };
 use crate::infra::db::entity::session::{self as session_entity, Entity as SessionEntity};
+use crate::infra::db::repo::ChatEngineDb;
 
 /// Default soft-delete grace period applied when the session-type doesn't
 /// declare an explicit [`crate::domain::retention::RetentionPolicy`]. Mirrors
@@ -295,14 +299,60 @@ pub trait SessionRepo: Send + Sync {
 }
 
 /// Sea-ORM-backed implementation of [`SessionRepo`].
+///
+/// Holds the modkit-db `DBProvider` so every method runs against the same
+/// connection the migration runner used. `sessions` carries `String`
+/// tenant/user identifiers rather than `Uuid`, so the entity is marked
+/// `#[secure(unrestricted)]` and scoping stays explicit in the per-method
+/// `.filter(Column::TenantId.eq(...))` clauses. The `.secure()` /
+/// `.scope_with(...)` wrappers exist purely to give us a `&impl DBRunner`
+/// execution path; a follow-up that lifts the columns to `Uuid` can
+/// replace the manual filters with proper `AccessScope` constraints.
 pub struct SeaSessionRepo {
-    db: DatabaseConnection,
+    db: Arc<ChatEngineDb>,
 }
 
 impl SeaSessionRepo {
     #[must_use]
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: Arc<ChatEngineDb>) -> Self {
         Self { db }
+    }
+
+    /// Build the `(session_id, tenant_id, user_id)` AND filter every scoped
+    /// write reuses. Centralising it avoids drift between read and update
+    /// paths.
+    fn owned_filter(
+        session_id: Uuid,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Condition {
+        Condition::all()
+            .add(session_entity::Column::SessionId.eq(session_id))
+            .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
+            .add(session_entity::Column::UserId.eq(user_id.to_owned()))
+    }
+
+    /// Re-read a session by `(tenant_id, user_id, session_id)` after a
+    /// scoped write. Returns `NotFound` when the row vanished — useful as a
+    /// safety net for the write paths.
+    async fn read_owned<R: DBRunner>(
+        runner: &R,
+        tenant_id: &str,
+        user_id: &str,
+        session_id: Uuid,
+    ) -> Result<session_entity::Model, ChatEngineError> {
+        let scope = AccessScope::allow_all();
+        let row = SessionEntity::find()
+            .secure()
+            .scope_with(&scope)
+            .filter(Self::owned_filter(session_id, tenant_id, user_id))
+            .one(runner)
+            .await?;
+        let row = row.ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+        if row.lifecycle_state == LifecycleState::HardDeleted.as_str() {
+            return Err(ChatEngineError::not_found("session", session_id));
+        }
+        Ok(row)
     }
 }
 
@@ -312,7 +362,13 @@ impl SessionRepo for SeaSessionRepo {
         &self,
         model: session_entity::ActiveModel,
     ) -> Result<session_entity::Model, ChatEngineError> {
-        let inserted = model.insert(&self.db).await?;
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
+        let inserted = SessionEntity::insert(model)
+            .secure()
+            .scope_unchecked(&scope)?
+            .exec_with_returning(&conn)
+            .await?;
         Ok(inserted)
     }
 
@@ -322,11 +378,13 @@ impl SessionRepo for SeaSessionRepo {
         user_id: &str,
         session_id: Uuid,
     ) -> Result<Option<session_entity::Model>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let row = SessionEntity::find()
-            .filter(session_entity::Column::SessionId.eq(session_id))
-            .filter(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
-            .filter(session_entity::Column::UserId.eq(user_id.to_owned()))
-            .one(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(Self::owned_filter(session_id, tenant_id, user_id))
+            .one(&conn)
             .await?;
 
         Ok(row.filter(|m| m.lifecycle_state != LifecycleState::HardDeleted.as_str()))
@@ -340,26 +398,33 @@ impl SessionRepo for SeaSessionRepo {
         limit: u32,
     ) -> Result<SessionPage, ChatEngineError> {
         let page_size = limit.clamp(1, MAX_PAGE_SIZE);
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
 
         let mut query = SessionEntity::find()
-            .filter(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
-            .filter(session_entity::Column::UserId.eq(user_id.to_owned()))
+            .secure()
+            .scope_with(&scope)
             .filter(
-                session_entity::Column::LifecycleState
-                    .ne(LifecycleState::HardDeleted.as_str().to_string()),
+                Condition::all()
+                    .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
+                    .add(session_entity::Column::UserId.eq(user_id.to_owned()))
+                    .add(
+                        session_entity::Column::LifecycleState
+                            .ne(LifecycleState::HardDeleted.as_str().to_string()),
+                    ),
             )
-            .order_by_desc(session_entity::Column::CreatedAt)
-            .order_by_desc(session_entity::Column::SessionId);
+            .order_by(session_entity::Column::CreatedAt, sea_orm::Order::Desc)
+            .order_by(session_entity::Column::SessionId, sea_orm::Order::Desc);
 
         if let Some(raw) = cursor {
             let decoded = decode_cursor(raw)?;
             // Tuple keyset: created_at < cursor.created_at
             //               OR (created_at = cursor.created_at AND session_id < cursor.session_id).
             query = query.filter(
-                sea_orm::Condition::any()
+                Condition::any()
                     .add(session_entity::Column::CreatedAt.lt(decoded.created_at))
                     .add(
-                        sea_orm::Condition::all()
+                        Condition::all()
                             .add(session_entity::Column::CreatedAt.eq(decoded.created_at))
                             .add(session_entity::Column::SessionId.lt(decoded.session_id)),
                     ),
@@ -369,7 +434,7 @@ impl SessionRepo for SeaSessionRepo {
         // Fetch page_size + 1 so we know whether another page follows.
         let fetched = query
             .limit(u64::from(page_size) + 1)
-            .all(&self.db)
+            .all(&conn)
             .await?;
 
         let mut items: Vec<session_entity::Model> = fetched.into_iter().collect();
@@ -399,12 +464,32 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
         metadata: Option<JsonValue>,
     ) -> Result<session_entity::Model, ChatEngineError> {
-        let row = load_owned(&self.db, tenant_id, user_id, session_id).await?;
-        let mut active: session_entity::ActiveModel = row.into();
-        active.metadata = Set(metadata);
-        active.updated_at = Set(OffsetDateTime::now_utc());
-        let updated = active.update(&self.db).await?;
-        Ok(updated)
+        // Read-then-update inside one transaction so the read enforces
+        // ownership before the write touches the row, and so concurrent
+        // writers can't slip a different tenant in between the two.
+        let tenant_id = tenant_id.to_owned();
+        let user_id = user_id.to_owned();
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    let scope = AccessScope::allow_all();
+                    SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .col_expr(
+                            session_entity::Column::Metadata,
+                            Expr::value(metadata.clone()),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now))
+                        .exec(tx)
+                        .await?;
+                    Self::read_owned(tx, &tenant_id, &user_id, session_id).await
+                })
+            })
+            .await
     }
 
     async fn update_capabilities(
@@ -414,12 +499,29 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
         capabilities: Option<JsonValue>,
     ) -> Result<session_entity::Model, ChatEngineError> {
-        let row = load_owned(&self.db, tenant_id, user_id, session_id).await?;
-        let mut active: session_entity::ActiveModel = row.into();
-        active.enabled_capabilities = Set(capabilities);
-        active.updated_at = Set(OffsetDateTime::now_utc());
-        let updated = active.update(&self.db).await?;
-        Ok(updated)
+        let tenant_id = tenant_id.to_owned();
+        let user_id = user_id.to_owned();
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    let scope = AccessScope::allow_all();
+                    SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .col_expr(
+                            session_entity::Column::EnabledCapabilities,
+                            Expr::value(capabilities.clone()),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now))
+                        .exec(tx)
+                        .await?;
+                    Self::read_owned(tx, &tenant_id, &user_id, session_id).await
+                })
+            })
+            .await
     }
 
     async fn update_lifecycle_state(
@@ -429,19 +531,43 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
         new_state: LifecycleState,
     ) -> Result<session_entity::Model, ChatEngineError> {
-        let row = load_owned(&self.db, tenant_id, user_id, session_id).await?;
-        let mut active: session_entity::ActiveModel = row.into();
-        active.lifecycle_state = Set(new_state.as_str().to_string());
-        active.updated_at = Set(OffsetDateTime::now_utc());
-        // Restoring out of soft_deleted clears the deletion bookkeeping;
-        // archive transitions leave it intact (a soft-deleted session is the
-        // only state that uses those columns).
-        if matches!(new_state, LifecycleState::Active) {
-            active.deleted_at = Set(None);
-            active.scheduled_hard_delete_at = Set(None);
-        }
-        let updated = active.update(&self.db).await?;
-        Ok(updated)
+        let tenant_id = tenant_id.to_owned();
+        let user_id = user_id.to_owned();
+        let state_str = new_state.as_str().to_string();
+        let clear_deletion = matches!(new_state, LifecycleState::Active);
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    let scope = AccessScope::allow_all();
+                    let mut update = SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .col_expr(
+                            session_entity::Column::LifecycleState,
+                            Expr::value(state_str.clone()),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now));
+                    if clear_deletion {
+                        // Restoring out of soft_deleted clears the deletion
+                        // bookkeeping; archive transitions leave it intact (a
+                        // soft-deleted session is the only state that uses
+                        // those columns).
+                        let null_dt: Option<OffsetDateTime> = None;
+                        update = update
+                            .col_expr(session_entity::Column::DeletedAt, Expr::value(null_dt))
+                            .col_expr(
+                                session_entity::Column::ScheduledHardDeleteAt,
+                                Expr::value(null_dt),
+                            );
+                    }
+                    update.exec(tx).await?;
+                    Self::read_owned(tx, &tenant_id, &user_id, session_id).await
+                })
+            })
+            .await
     }
 
     async fn soft_delete(
@@ -451,18 +577,39 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
         retention_days: i64,
     ) -> Result<session_entity::Model, ChatEngineError> {
-        let row = load_owned(&self.db, tenant_id, user_id, session_id).await?;
-        let now = OffsetDateTime::now_utc();
-        let grace = retention_days.max(0);
-        let scheduled = now + Duration::from_secs((grace as u64) * 86_400);
-
-        let mut active: session_entity::ActiveModel = row.into();
-        active.lifecycle_state = Set(LifecycleState::SoftDeleted.as_str().to_string());
-        active.deleted_at = Set(Some(now));
-        active.scheduled_hard_delete_at = Set(Some(scheduled));
-        active.updated_at = Set(now);
-        let updated = active.update(&self.db).await?;
-        Ok(updated)
+        let tenant_id = tenant_id.to_owned();
+        let user_id = user_id.to_owned();
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    let grace = retention_days.max(0);
+                    let scheduled = now + Duration::from_secs((grace as u64) * 86_400);
+                    let scope = AccessScope::allow_all();
+                    SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .col_expr(
+                            session_entity::Column::LifecycleState,
+                            Expr::value(LifecycleState::SoftDeleted.as_str().to_string()),
+                        )
+                        .col_expr(
+                            session_entity::Column::DeletedAt,
+                            Expr::value(Some(now)),
+                        )
+                        .col_expr(
+                            session_entity::Column::ScheduledHardDeleteAt,
+                            Expr::value(Some(scheduled)),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now))
+                        .exec(tx)
+                        .await?;
+                    Self::read_owned(tx, &tenant_id, &user_id, session_id).await
+                })
+            })
+            .await
     }
 
     async fn hard_delete(
@@ -477,81 +624,97 @@ impl SessionRepo for SeaSessionRepo {
         // out to the caller as 409 (Phase 14 will map them).
         let tenant_id = tenant_id.to_owned();
         let user_id = user_id.to_owned();
-        let outcome: Result<bool, TransactionError<sea_orm::DbErr>> = self
-            .db
-            .transaction_with_config::<_, bool, sea_orm::DbErr>(
-                move |txn| {
-                    Box::pin(async move {
-                        // Re-load inside the transaction to make sure the
-                        // ownership/lifecycle check sees the same snapshot as
-                        // the cascade deletes.
-                        let owned = SessionEntity::find()
-                            .filter(session_entity::Column::SessionId.eq(session_id))
-                            .filter(session_entity::Column::TenantId.eq(tenant_id.clone()))
-                            .filter(session_entity::Column::UserId.eq(user_id.clone()))
-                            .one(txn)
-                            .await?;
+        self.db
+            .transaction_with_config(TxConfig::serializable(), move |tx| {
+                Box::pin(async move {
+                    let scope = AccessScope::allow_all();
+                    // Re-load inside the transaction to make sure the
+                    // ownership/lifecycle check sees the same snapshot as
+                    // the cascade deletes.
+                    let owned = SessionEntity::find()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(SeaSessionRepo::owned_filter(
+                            session_id,
+                            &tenant_id,
+                            &user_id,
+                        ))
+                        .one(tx)
+                        .await?;
 
-                        let Some(_session) = owned else {
-                            return Ok(false);
-                        };
+                    let Some(_session) = owned else {
+                        return Ok(false);
+                    };
 
-                        // Cascade reactions first (they FK onto messages).
-                        let message_ids: Vec<Uuid> = MessageEntity::find()
-                            .filter(message_entity::Column::SessionId.eq(session_id))
-                            .all(txn)
-                            .await?
-                            .into_iter()
-                            .map(|m| m.message_id)
-                            .collect();
-                        if !message_ids.is_empty() {
-                            ReactionEntity::delete_many()
-                                .filter(
+                    // Cascade reactions first (they FK onto messages).
+                    let message_ids: Vec<Uuid> = MessageEntity::find()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(
+                            Condition::all().add(message_entity::Column::SessionId.eq(session_id)),
+                        )
+                        .all(tx)
+                        .await?
+                        .into_iter()
+                        .map(|m| m.message_id)
+                        .collect();
+                    if !message_ids.is_empty() {
+                        ReactionEntity::delete_many()
+                            .secure()
+                            .scope_with(&scope)
+                            .filter(
+                                Condition::all().add(
                                     reaction_entity::Column::MessageId.is_in(message_ids.clone()),
-                                )
-                                .exec(txn)
-                                .await?;
-                        }
-
-                        MessageEntity::delete_many()
-                            .filter(message_entity::Column::SessionId.eq(session_id))
-                            .exec(txn)
+                                ),
+                            )
+                            .exec(tx)
                             .await?;
+                    }
 
-                        SessionEntity::delete_many()
-                            .filter(session_entity::Column::SessionId.eq(session_id))
-                            .filter(session_entity::Column::TenantId.eq(tenant_id))
-                            .filter(session_entity::Column::UserId.eq(user_id))
-                            .exec(txn)
-                            .await?;
+                    MessageEntity::delete_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(
+                            Condition::all().add(message_entity::Column::SessionId.eq(session_id)),
+                        )
+                        .exec(tx)
+                        .await?;
 
-                        Ok(true)
-                    })
-                },
-                Some(IsolationLevel::Serializable),
-                Some(AccessMode::ReadWrite),
-            )
-            .await;
+                    SessionEntity::delete_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(SeaSessionRepo::owned_filter(
+                            session_id,
+                            &tenant_id,
+                            &user_id,
+                        ))
+                        .exec(tx)
+                        .await?;
 
-        match outcome {
-            Ok(removed) => Ok(removed),
-            Err(TransactionError::Transaction(e)) | Err(TransactionError::Connection(e)) => {
-                Err(e.into())
-            }
-        }
+                    Ok(true)
+                })
+            })
+            .await
     }
 
     async fn list_active_sessions_for_tenant(
         &self,
         tenant_id: &str,
     ) -> Result<Vec<session_entity::Model>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let rows = SessionEntity::find()
-            .filter(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
+            .secure()
+            .scope_with(&scope)
             .filter(
-                session_entity::Column::LifecycleState
-                    .eq(LifecycleState::Active.as_str().to_string()),
+                Condition::all()
+                    .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
+                    .add(
+                        session_entity::Column::LifecycleState
+                            .eq(LifecycleState::Active.as_str().to_string()),
+                    ),
             )
-            .all(&self.db)
+            .all(&conn)
             .await?;
         Ok(rows)
     }
@@ -559,29 +722,45 @@ impl SessionRepo for SeaSessionRepo {
     async fn list_tenants_with_active_sessions(
         &self,
     ) -> Result<Vec<String>, ChatEngineError> {
-        use sea_orm::QuerySelect;
-
-        let rows: Vec<String> = SessionEntity::find()
-            .select_only()
-            .column(session_entity::Column::TenantId)
-            .distinct()
+        // The secure layer doesn't yet expose `select_only() +
+        // into_tuple()`, so the original `SELECT DISTINCT tenant_id`
+        // projection has no `&impl DBRunner` execution path. Fall back to
+        // selecting the active rows and deduplicating in-process — the
+        // retention scheduler is the only caller, runs on an interval, and
+        // is bounded by the active-session count which the cleanup task
+        // already polls regularly. Once `SecureSelect::into_tuple` exists
+        // this collapses back to a one-shot `DISTINCT` scan.
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
+        let rows = SessionEntity::find()
+            .secure()
+            .scope_with(&scope)
             .filter(
-                session_entity::Column::LifecycleState
-                    .eq(LifecycleState::Active.as_str().to_string()),
+                Condition::all().add(
+                    session_entity::Column::LifecycleState
+                        .eq(LifecycleState::Active.as_str().to_string()),
+                ),
             )
-            .into_tuple()
-            .all(&self.db)
+            .all(&conn)
             .await?;
-        Ok(rows)
+
+        let mut tenants: Vec<String> = rows.into_iter().map(|m| m.tenant_id).collect();
+        tenants.sort_unstable();
+        tenants.dedup();
+        Ok(tenants)
     }
 
     async fn find_by_session_id_unscoped(
         &self,
         session_id: Uuid,
     ) -> Result<Option<session_entity::Model>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let row = SessionEntity::find()
-            .filter(session_entity::Column::SessionId.eq(session_id))
-            .one(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+            .one(&conn)
             .await?;
         Ok(row.filter(|m| m.lifecycle_state != LifecycleState::HardDeleted.as_str()))
     }
@@ -593,9 +772,15 @@ impl SessionRepo for SeaSessionRepo {
         // UNIQUE index on `sessions.share_token` is exercised by this
         // single equality lookup — keep the query verbatim so EXPLAIN
         // selects the index per ADR-0016.
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let row = SessionEntity::find()
-            .filter(session_entity::Column::ShareToken.eq(share_token.to_owned()))
-            .one(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all().add(session_entity::Column::ShareToken.eq(share_token.to_owned())),
+            )
+            .one(&conn)
             .await?;
         Ok(row.filter(|m| m.lifecycle_state != LifecycleState::HardDeleted.as_str()))
     }
@@ -608,13 +793,33 @@ impl SessionRepo for SeaSessionRepo {
         share_token: Option<String>,
         metadata: Option<JsonValue>,
     ) -> Result<session_entity::Model, ChatEngineError> {
-        let row = load_owned(&self.db, tenant_id, user_id, session_id).await?;
-        let mut active: session_entity::ActiveModel = row.into();
-        active.share_token = Set(share_token);
-        active.metadata = Set(metadata);
-        active.updated_at = Set(OffsetDateTime::now_utc());
-        let updated = active.update(&self.db).await?;
-        Ok(updated)
+        let tenant_id = tenant_id.to_owned();
+        let user_id = user_id.to_owned();
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    let scope = AccessScope::allow_all();
+                    SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .col_expr(
+                            session_entity::Column::ShareToken,
+                            Expr::value(share_token.clone()),
+                        )
+                        .col_expr(
+                            session_entity::Column::Metadata,
+                            Expr::value(metadata.clone()),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now))
+                        .exec(tx)
+                        .await?;
+                    Self::read_owned(tx, &tenant_id, &user_id, session_id).await
+                })
+            })
+            .await
     }
 }
 
@@ -697,29 +902,6 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(b - b'A' + 10),
         _ => Err(format!("invalid hex char: {}", b as char)),
     }
-}
-
-/// Load a session within the caller's `(tenant_id, user_id)` scope or return a
-/// `NotFound` error. Centralised so every write path has the same anti-
-/// enumeration semantics.
-async fn load_owned(
-    db: &DatabaseConnection,
-    tenant_id: &str,
-    user_id: &str,
-    session_id: Uuid,
-) -> Result<session_entity::Model, ChatEngineError> {
-    let found = SessionEntity::find()
-        .filter(session_entity::Column::SessionId.eq(session_id))
-        .filter(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
-        .filter(session_entity::Column::UserId.eq(user_id.to_owned()))
-        .one(db)
-        .await?;
-
-    let row = found.ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
-    if row.lifecycle_state == LifecycleState::HardDeleted.as_str() {
-        return Err(ChatEngineError::not_found("session", session_id));
-    }
-    Ok(row)
 }
 
 #[cfg(test)]

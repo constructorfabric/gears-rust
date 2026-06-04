@@ -1,11 +1,15 @@
 // @cpt-cf-chat-engine-dbtable-session-types:p1
 
+use modkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+// Session types are global lookup rows (no per-tenant column); the
+// `unrestricted` marker advertises that intent to the secure layer.
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "session_types")]
+#[secure(unrestricted)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub session_type_id: Uuid,

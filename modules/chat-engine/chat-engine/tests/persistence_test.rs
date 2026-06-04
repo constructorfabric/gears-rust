@@ -262,18 +262,11 @@ async fn soft_deleted_session_rejects_send_against_sqlite() {
     let session_id =
         db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
 
-    // Flip the seeded session into the soft_deleted lifecycle state.
-    use sea_orm::ActiveModelTrait;
-    use sea_orm::ActiveValue::Set;
-    use sea_orm::EntityTrait;
-    let existing = chat_engine::infra::db::entity::session::Entity::find_by_id(session_id)
-        .one(&harness.db)
-        .await
-        .expect("read seeded session")
-        .expect("seeded session must exist");
-    let mut am: chat_engine::infra::db::entity::session::ActiveModel = existing.into();
-    am.lifecycle_state = Set("soft_deleted".to_string());
-    am.update(&harness.db).await.expect("flip lifecycle state");
+    // Flip the seeded session into the soft_deleted lifecycle state. The
+    // production repo's `update_lifecycle_state` is the right tool, but
+    // tests reach for the raw test-only helper here so the assertion
+    // doesn't depend on the service-layer transition rules.
+    db::force_lifecycle_state(&harness.db, session_id, "soft_deleted").await;
 
     let plugin = FakePlugin::new(plugin_id, FakePluginScript::Events(vec![]));
     let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;

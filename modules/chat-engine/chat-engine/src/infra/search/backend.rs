@@ -3,12 +3,15 @@
 //!
 //! Selection between the two happens at module-wiring time (Phase 15)
 //! based on the live `DatabaseBackend` exposed by SeaORM. The structs
-//! carry a `DatabaseConnection` so production wiring can plug them in;
-//! the actual SQL composition lives in Phase 15 because it depends on
-//! the materialised connection. Phase 11 supplies the `SearchBackend`
+//! carry the chat-engine `DBProvider` so production wiring can plug
+//! them in against the same handle the migration runner uses; the
+//! actual SQL composition lives in Phase 15 because it depends on the
+//! materialised connection. Phase 11 supplies the `SearchBackend`
 //! trait + an in-memory backend that the unit tests exercise.
 //
 // @cpt-cf-chat-engine-infra-search-backend:p11
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -17,6 +20,7 @@ use crate::domain::search::Cursor;
 use crate::domain::service::search_service::{
     BackendHit, ParsedQuery, SearchBackend, SearchScopeFilter,
 };
+use crate::infra::db::repo::ChatEngineDb;
 
 /// PostgreSQL `tsvector` + GIN backend. Uses `plainto_tsquery` for plain
 /// searches and `phraseto_tsquery` for quoted phrases. Ranking via
@@ -24,12 +28,12 @@ use crate::domain::service::search_service::{
 /// normalisation flag `32` (per ADR-0019).
 pub struct PgSearchBackend {
     #[allow(dead_code)]
-    db: sea_orm::DatabaseConnection,
+    db: Arc<ChatEngineDb>,
 }
 
 impl PgSearchBackend {
     #[must_use]
-    pub fn new(db: sea_orm::DatabaseConnection) -> Self {
+    pub fn new(db: Arc<ChatEngineDb>) -> Self {
         Self { db }
     }
 }
@@ -45,7 +49,7 @@ impl SearchBackend for PgSearchBackend {
         _limit: u32,
     ) -> std::result::Result<(Vec<BackendHit>, u64), ChatEngineError> {
         Err(ChatEngineError::internal(
-            "PgSearchBackend not yet wired to DatabaseConnection — Phase 15 owns workspace wiring",
+            "PgSearchBackend not yet wired to DBProvider — Phase 15 owns workspace wiring",
         ))
     }
 }
@@ -55,12 +59,12 @@ impl SearchBackend for PgSearchBackend {
 /// `messages.content` JSONB column.
 pub struct SqliteSearchBackend {
     #[allow(dead_code)]
-    db: sea_orm::DatabaseConnection,
+    db: Arc<ChatEngineDb>,
 }
 
 impl SqliteSearchBackend {
     #[must_use]
-    pub fn new(db: sea_orm::DatabaseConnection) -> Self {
+    pub fn new(db: Arc<ChatEngineDb>) -> Self {
         Self { db }
     }
 }
@@ -76,7 +80,7 @@ impl SearchBackend for SqliteSearchBackend {
         _limit: u32,
     ) -> std::result::Result<(Vec<BackendHit>, u64), ChatEngineError> {
         Err(ChatEngineError::internal(
-            "SqliteSearchBackend not yet wired to DatabaseConnection — Phase 15 owns workspace wiring",
+            "SqliteSearchBackend not yet wired to DBProvider — Phase 15 owns workspace wiring",
         ))
     }
 }

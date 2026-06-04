@@ -12,3 +12,13 @@ pub mod reaction_repo;
 pub mod session_repo;
 pub mod session_type_repo;
 pub mod variant_repo;
+
+/// Crate-wide `DBProvider` alias parameterised over the chat-engine
+/// domain error.
+///
+/// Modules elsewhere in the workspace alias `DBProvider<DomainError>` the
+/// same way — the alias lets repos receive a single `Arc<ChatEngineDb>`
+/// handle whose `conn()` and `transaction_with_config(...)` results map
+/// cleanly into [`crate::domain::error::ChatEngineError`] via the
+/// `From<DbError>` impl on the error enum.
+pub type ChatEngineDb = modkit_db::DBProvider<crate::domain::error::ChatEngineError>;

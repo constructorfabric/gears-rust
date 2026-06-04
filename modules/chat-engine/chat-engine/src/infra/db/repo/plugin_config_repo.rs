@@ -15,11 +15,12 @@
 //
 // @cpt-cf-chat-engine-plugin-config-repo:p3
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use modkit_db::secure::{AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt};
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, Set};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -28,6 +29,7 @@ use crate::domain::error::ChatEngineError;
 use crate::infra::db::entity::plugin_config::{
     ActiveModel, Column, Entity as PluginConfigEntity,
 };
+use crate::infra::db::repo::ChatEngineDb;
 
 /// Repository surface for `plugin_configs`.
 ///
@@ -63,18 +65,18 @@ pub trait PluginConfigRepo: Send + Sync {
 
 /// Sea-ORM-backed implementation of [`PluginConfigRepo`].
 ///
-/// Holds an owned `DatabaseConnection` — clone freely; under the hood SeaORM's
-/// connection is reference-counted. Repositories in other phases use the
-/// `DBRunner` abstraction for transactional scope; the plugin-config repo is
-/// intentionally connection-scoped because its writes are independent of any
-/// session/message transaction.
+/// Holds the modkit-db `DBProvider` so every method runs against the same
+/// connection the migration runner used. `plugin_configs` has no tenant
+/// column (entity is marked `#[secure(unrestricted)]`), so the secure
+/// wrappers run with `AccessScope::allow_all()` — they give us a
+/// `&impl DBRunner` execution path.
 pub struct SeaPluginConfigRepo {
-    db: DatabaseConnection,
+    db: Arc<ChatEngineDb>,
 }
 
 impl SeaPluginConfigRepo {
     #[must_use]
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: Arc<ChatEngineDb>) -> Self {
         Self { db }
     }
 }
@@ -86,11 +88,15 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
         plugin_instance_id: &str,
         session_type_id: Uuid,
     ) -> Result<Option<JsonValue>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         let row = PluginConfigEntity::find_by_id((
             plugin_instance_id.to_owned(),
             session_type_id,
         ))
-        .one(&self.db)
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
         .await?;
         Ok(row.and_then(|m| m.config))
     }
@@ -111,7 +117,9 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
         };
 
         // Composite-PK upsert: refresh `config` and `updated_at`; leave
-        // `created_at` untouched on update.
+        // `created_at` untouched on update. `plugin_configs` has no tenant
+        // column, so `on_conflict_raw` is safe — `SecureOnConflict`'s
+        // tenant-immutability guard would have nothing to check.
         let on_conflict = OnConflict::columns([
             Column::PluginInstanceId,
             Column::SessionTypeId,
@@ -119,9 +127,13 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
         .update_columns([Column::Config, Column::UpdatedAt])
         .to_owned();
 
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         PluginConfigEntity::insert(am)
-            .on_conflict(on_conflict)
-            .exec(&self.db)
+            .secure()
+            .scope_unchecked(&scope)?
+            .on_conflict_raw(on_conflict)
+            .exec(&conn)
             .await?;
         Ok(())
     }
@@ -131,10 +143,17 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
         plugin_instance_id: &str,
         session_type_id: Uuid,
     ) -> Result<(), ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
         PluginConfigEntity::delete_many()
-            .filter(Column::PluginInstanceId.eq(plugin_instance_id.to_owned()))
-            .filter(Column::SessionTypeId.eq(session_type_id))
-            .exec(&self.db)
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(Column::PluginInstanceId.eq(plugin_instance_id.to_owned()))
+                    .add(Column::SessionTypeId.eq(session_type_id)),
+            )
+            .exec(&conn)
             .await?;
         Ok(())
     }
@@ -143,7 +162,6 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     /// In-memory mock used to confirm the trait is object-safe and the service
     /// layer's `Arc<dyn PluginConfigRepo>` parameter compiles.

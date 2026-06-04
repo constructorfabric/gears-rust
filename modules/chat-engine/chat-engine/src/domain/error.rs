@@ -15,6 +15,8 @@
 // @cpt-cf-chat-engine-domain-error:p2
 
 use chat_engine_sdk::error::{BoxError, PluginError};
+use modkit_db::DbError;
+use modkit_db::secure::ScopeError;
 use modkit_macros::domain_model;
 use sea_orm::DbErr;
 use thiserror::Error;
@@ -196,6 +198,40 @@ impl From<PluginError> for ChatEngineError {
             PluginError::Internal { message, source } => Self::Internal {
                 reason: message,
                 source,
+            },
+        }
+    }
+}
+
+impl From<DbError> for ChatEngineError {
+    fn from(err: DbError) -> Self {
+        match err {
+            // Route SeaORM errors through the existing classifier so
+            // `RecordNotFound` keeps its 404 mapping.
+            DbError::Sea(sea) => sea.into(),
+            other => Self::Internal {
+                reason: other.to_string(),
+                source: Some(Box::new(other)),
+            },
+        }
+    }
+}
+
+impl From<ScopeError> for ChatEngineError {
+    fn from(err: ScopeError) -> Self {
+        match err {
+            ScopeError::Db(sea) => sea.into(),
+            ScopeError::Denied(msg) => Self::Forbidden {
+                reason: msg.to_owned(),
+            },
+            ScopeError::TenantNotInScope { tenant_id } => Self::Forbidden {
+                reason: format!("tenant {tenant_id} not in scope"),
+            },
+            // `Invalid` flags a programmer error in scoping config; it
+            // would surface to the operator, not the caller.
+            ScopeError::Invalid(msg) => Self::Internal {
+                reason: format!("invalid scope: {msg}"),
+                source: None,
             },
         }
     }
