@@ -1,6 +1,6 @@
 CI := 1
 
-CFS_VERSION ?= v1.1.2
+CFS_VERSION ?= v1.1.3
 CFS_INSTALL_SPEC ?= git+https://github.com/constructorfabric/studio.git
 
 OPENAPI_URL ?= http://127.0.0.1:8087/cw/openapi.json
