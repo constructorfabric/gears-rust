@@ -1,4 +1,4 @@
-# Cypilot Adapter: Cyber Ware
+# Constructor Studio Adapter: Gears Rust
 
 **Version**: 1.0
 **Last Updated**: 2026-02-05
@@ -7,13 +7,13 @@
 
 ## Variables
 
-**While Cypilot is enabled**, remember these variables:
+**While Constructor Studio is enabled**, remember these variables:
 
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `{cypilot_path}/config` | Directory containing this AGENTS.md | Root path for Cypilot Adapter navigation |
+| `{cf-studio-path}/config` | Directory containing this AGENTS.md | Root path for Constructor Studio Adapter navigation |
 
-Use `{cypilot_path}/config` as the base path for all relative Cypilot Adapter file references.
+Use `{cf-studio-path}/config` as the base path for all relative Constructor Studio Adapter file references.
 
 ---
 
@@ -23,7 +23,7 @@ This repository is a **modular monolith** built on top of **Cyber Ware**.
 
 - **Cyber Ware base**: core apps/libraries live under `apps/`, `libs/`, etc.
 - **Subsystems / modules**: each subsystem is a module under `modules/<module_name>/`.
-- **Cypilot registry convention**: subsystems are registered as `children[]` of the root `cyberware` system in `{cypilot_path}/config/artifacts.toml`.
+- **Constructor Studio registry convention**: subsystems are registered as `children[]` of the root `cyberware` system in `{cf-studio-path}/config/artifacts.toml`.
 - **Docs convention**: each module keeps its artifacts under `modules/<module_name>/docs/`.
 - **Repository Playbook**: `docs/REPO_PLAYBOOK.md` — comprehensive map of all repository artifacts, standards, tooling, and planned gaps (with per-item status, phase, and ID).
 
@@ -33,9 +33,9 @@ This repository is a **modular monolith** built on top of **Cyber Ware**.
 
 ALWAYS sign commits with DCO: use `git commit -s` for all commits
 
-ALWAYS open and follow `{cypilot_path}/requirements/artifacts-registry.md` WHEN working with artifacts.toml
+ALWAYS open and follow `{cf-studio-path}/requirements/artifacts-registry.md` WHEN working with artifacts.toml
 
-ALWAYS open and follow `artifacts.toml` WHEN registering Cypilot artifacts, updating codebase paths, changing traceability settings, or running Cypilot validation
+ALWAYS open and follow `artifacts.toml` WHEN registering Constructor Studio artifacts, updating codebase paths, changing traceability settings, or running Constructor Studio validation
 
 ALWAYS open and follow `CONTRIBUTING.md` WHEN setting up development environment, creating feature branches, running quality checks (make all, cargo clippy, cargo fmt), signing commits with DCO, writing commit messages, creating pull requests, or understanding the review process
 

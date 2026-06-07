@@ -4,37 +4,6 @@
 **Version**: 2.0
 **Last Updated**: 2026-02-03
 **Purpose**: Comprehensive quality checklist for Overall Design artifacts
-
-## Table of Contents
-
-1. [Referenced Standards](#referenced-standards)
-2. [Review Scope Selection](#review-scope-selection)
-3. [Prerequisites](#prerequisites)
-4. [Evidence Requirements (STRICT mode)](#evidence-requirements-strict-mode)
-5. [Applicability Context](#applicability-context)
-6. [Severity Dictionary](#severity-dictionary)
-7. [MUST HAVE](#must-have)
-   - [🏗️ ARCHITECTURE Expertise (ARCH)](#architecture-expertise-arch)
-   - [Semantic Alignment (SEM)](#semantic-alignment-sem)
-   - [⚡ PERFORMANCE Expertise (PERF)](#performance-expertise-perf)
-   - [🔒 SECURITY Expertise (SEC)](#security-expertise-sec)
-   - [🛡️ RELIABILITY Expertise (REL)](#reliability-expertise-rel)
-   - [📊 DATA Expertise (DATA)](#data-expertise-data)
-   - [🔌 INTEGRATION Expertise (INT)](#integration-expertise-int)
-   - [🖥️ OPERATIONS Expertise (OPS)](#operations-expertise-ops)
-   - [🔧 MAINTAINABILITY Expertise (MAINT)](#maintainability-expertise-maint)
-   - [🧪 TESTING Expertise (TEST)](#testing-expertise-test)
-   - [📜 COMPLIANCE Expertise (COMPL)](#compliance-expertise-compl)
-   - [👤 USABILITY Expertise (UX)](#usability-expertise-ux)
-   - [🏢 BUSINESS Expertise (BIZ)](#business-expertise-biz)
-   - [DOC (DOC)](#doc-doc)
-8. [MUST NOT HAVE](#must-not-have)
-9. [Validation Summary](#validation-summary)
-   - [Final Checklist](#final-checklist)
-   - [Reporting Readiness Checklist](#reporting-readiness-checklist)
-   - [Reporting](#reporting)
-   - [Reporting Commitment](#reporting-commitment)
-
 ---
 
 ## Referenced Standards
