@@ -74,3 +74,51 @@ ALWAYS open `docs/modkit_unified_system/10_checklists_and_templates.md` WHEN wri
 ALWAYS open `docs/modkit_unified_system/12_unit_testing.md` WHEN writing unit tests, setting up test infrastructure, creating test fixtures, implementing mock-based tests, or defining test file organization (`*_tests.rs` pattern)
 
 ALWAYS open `docs/modkit_unified_system/13_e2e_testing.md` WHEN writing end-to-end tests, setting up E2E test infrastructure, implementing cross-module integration tests, or working with the `testing/e2e/` directory
+
+---
+
+## Project Documentation (auto-configured)
+<!-- auto-config:docs:start -->
+ALWAYS open and follow `README.md#quick-start` WHEN onboarding, running the example server, or locating local development commands
+
+ALWAYS open and follow `CONTRIBUTING.md#development-workflow` WHEN contributing code, preparing branches, running quality checks, or preparing PRs
+
+ALWAYS open and follow `guidelines/DEPENDENCIES.md` WHEN changing Cargo.toml, adding dependencies, or choosing third-party crates
+
+ALWAYS open and follow `guidelines/SECURITY.md` WHEN handling user input, secrets, AuthN/AuthZ, tenant isolation, or secure persistence
+
+ALWAYS open and follow `guidelines/GTS.md` WHEN adding GTS schemas, GTS IDs, permissions, plugin discovery IDs, or typed extensibility
+
+ALWAYS open and follow `docs/REPO_PLAYBOOK.md` WHEN locating repository standards, tooling, CI, testing strategy, or coverage gaps
+
+ALWAYS open and follow `docs/ARCHITECTURE_MANIFEST.md` WHEN changing high-level architecture, module hierarchy, security architecture, or API/error contracts
+
+ALWAYS open and follow `docs/modkit_unified_system/README.md` WHEN touching ModKit/module architecture, REST wiring, ClientHub, OpenAPI, lifecycle, SSE, standardized errors, DB, or tests
+
+ALWAYS open and follow `docs/MODKIT_PLUGINS.md` WHEN implementing full plugin architecture, GTS plugin registration, plugin selection, or scoped ClientHub clients
+
+ALWAYS open and follow `docs/pr-review/README.md` WHEN reviewing PRs or producing PR status reports
+
+ALWAYS open and follow `docs/spec-templates/README.md` WHEN authoring or revising SDLC artifacts
+
+ALWAYS open and follow `modules/<module>/docs/` WHEN implementing or reviewing behavior for a specific module
+<!-- auto-config:docs:end -->
+
+## Project Rules (auto-configured)
+<!-- auto-config:rules:start -->
+ALWAYS open and follow `{cf-studio-path}/config/rules/architecture.md` WHEN modifying architecture, adding modules, changing module boundaries, or touching ModKit lifecycle/client wiring
+
+ALWAYS open and follow `{cf-studio-path}/config/rules/conventions.md` WHEN writing or reviewing Rust code
+
+ALWAYS open and follow `{cf-studio-path}/config/rules/api-contracts.md` WHEN writing REST endpoints, DTOs, handlers, OpenAPI registration, SSE, or OData surfaces
+
+ALWAYS open and follow `{cf-studio-path}/config/rules/security-data-access.md` WHEN handling AuthN/AuthZ, SecurityContext, tenant scope, secure ORM, repositories, or sensitive input
+
+ALWAYS open and follow `{cf-studio-path}/config/rules/error-handling.md` WHEN adding domain errors, SDK errors, canonical errors, or Problem mappings
+
+ALWAYS open and follow `{cf-studio-path}/config/rules/testing.md` WHEN writing unit, integration, or E2E tests
+
+ALWAYS open and follow `{cf-studio-path}/config/rules/tooling-ci.md` WHEN running quality gates, changing CI, Make targets, coverage, FIPS, or release tooling
+
+ALWAYS open and follow `{cf-studio-path}/config/rules/docs-navigation.md` WHEN authoring docs, locating module SDLC artifacts, or updating documentation navigation
+<!-- auto-config:rules:end -->
