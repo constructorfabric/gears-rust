@@ -56,6 +56,22 @@ make test       # Run tests
 make example    # Run modkit example module
 ```
 
+### Constructor Studio Make Targets
+
+This repository includes Constructor Studio configuration in `.cf-studio/`.
+Use the Makefile targets instead of calling `cfs` directly for routine setup
+and validation:
+
+```bash
+make cfs-init          # Install cfs if needed and run pinned Studio init
+make cfs-init-full     # Run cfs-init, then regenerate agent integration files
+make cfs-validate      # Validate Studio artifacts and code traceability
+make cfs-spec-coverage # Check spec-to-code coverage threshold
+```
+
+`make check` already includes `make cfs-validate`, so the normal quality gate
+also verifies Constructor Studio artifacts.
+
 ### Running the Server
 
 Cyber Ware repository comes with an example server illustrating the modules APIs:

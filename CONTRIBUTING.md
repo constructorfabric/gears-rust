@@ -50,6 +50,33 @@ make quickstart
 cargo run --bin cyberware-example-server --features users-info-example -- --config config/quickstart.yaml run
 ```
 
+### 1.3 Constructor Studio Make Targets
+
+This repository uses Constructor Studio for SDLC artifacts, traceability, and
+agent integration files. Use the Makefile targets for routine Studio work:
+
+```bash
+make cfs-init          # Install cfs if needed and run pinned Studio init
+make cfs-init-full     # Run cfs-init, then regenerate agent integration files
+make cfs-validate      # Validate Studio artifacts and code traceability
+make cfs-spec-coverage # Check spec-to-code coverage threshold
+```
+
+Run the full Studio setup after cloning or after Studio config changes:
+
+```bash
+make cfs-init-full
+```
+
+Run validation before opening a PR:
+
+```bash
+make cfs-validate
+```
+
+`make check` already depends on `cfs-validate`, so the standard quality gate
+also validates Constructor Studio artifacts.
+
 ## 2. Development Workflow
 
 ### 2.1. Create a Feature Branch or Fork
