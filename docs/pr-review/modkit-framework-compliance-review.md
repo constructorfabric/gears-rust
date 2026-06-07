@@ -1,5 +1,5 @@
 ---
-cypilot: true
+cf: true
 type: requirement
 name: ModKit Framework Compliance Review
 version: 1.0

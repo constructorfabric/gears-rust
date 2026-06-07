@@ -1590,9 +1590,9 @@ Risk-to-test ownership:
 
 | Artifact | Owner | Update when | Validation expectation |
 |----------|-------|-------------|------------------------|
-| [PRD.md](./PRD.md) | Product / module owner | Externally observable behavior, scope, actors, or NFR commitments change | `cpt validate --artifact` and TOC regeneration |
-| [DESIGN.md](./DESIGN.md) | Architecture owner | Boundaries, invariants, dependency model, or review-level operational guidance change | `cpt validate --artifact` and TOC regeneration |
-| [account-management-v1.yaml](./account-management-v1.yaml) | API contract owner | Public REST paths, request/response schemas, or public error mappings change | OpenAPI linting plus Cypilot artifact validation |
+| [PRD.md](./PRD.md) | Product / module owner | Externally observable behavior, scope, actors, or NFR commitments change | `cfs validate --artifact` and TOC regeneration |
+| [DESIGN.md](./DESIGN.md) | Architecture owner | Boundaries, invariants, dependency model, or review-level operational guidance change | `cfs validate --artifact` and TOC regeneration |
+| [account-management-v1.yaml](./account-management-v1.yaml) | API contract owner | Public REST paths, request/response schemas, or public error mappings change | OpenAPI linting plus Constructor Studio artifact validation |
 | [migration.sql](./migration.sql) | Persistence owner | Reference schema, indexes, or physical invariants change | Manual review plus consistency with DESIGN storage responsibilities |
 | [schemas/](./schemas/) JSON schema artifacts | Schema owner | GTS-registered metadata or related schema artifacts change | Schema validation and cross-reference review |
 | [ADR/](./ADR/) | Architecture owner | A design decision changes, is superseded, or gains a new tradeoff outcome | ADR checklist validation |
@@ -1602,7 +1602,7 @@ Sync rules:
 - behavioral API changes update OpenAPI in the same change set; PRD changes are needed only when externally observable behavior or promises change
 - storage-detail changes update `migration.sql` in the same change set; `DESIGN.md` changes only when the storage responsibility or invariant changes
 - new GTS schema usage updates the relevant JSON schemas and the OpenAPI references; DESIGN changes only when the new schema kind introduces a new architectural boundary or invariant
-- every changed Markdown artifact in this module must keep its generated TOC in sync and pass Cypilot validation before review
+- every changed Markdown artifact in this module must keep its generated TOC in sync and pass Constructor Studio validation before review
 
 ### Known Limitations & Technical Debt
 

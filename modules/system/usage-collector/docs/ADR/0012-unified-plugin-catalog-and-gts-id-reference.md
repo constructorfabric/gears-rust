@@ -251,7 +251,7 @@ artifact-by-artifact cascade; Phase 10 performs the final consistency sweep.
 
 ### Confirmation
 
-Compliance is confirmed through (a) cross-artifact `cpt --json validate` PASS
+Compliance is confirmed through (a) cross-artifact `cfs --json validate` PASS
 across every modified usage-collector artifact at the end of Phase 11; (b) the
 downstream phase handoffs (`out/phase-02-prd-impact.md` through
 `out/phase-10-openapi-changes.md`) producing matching change summaries that

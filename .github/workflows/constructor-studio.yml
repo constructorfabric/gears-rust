@@ -1,5 +1,5 @@
 # Updated: 2026-04-20 by Constructor Tech
-name: Cypilot
+name: Constructor Studio
 
 on:
   pull_request:
@@ -10,13 +10,13 @@ on:
       - 'modules/**/docs/**'
       - 'modules/**/src/**'
       - 'modules/**/tests/**'
-      - '.cypilot/config/**'
+      - '.cf-studio/config/**'
       - 'Makefile'
   workflow_call:
   workflow_dispatch:
 
 concurrency:
-  group: cypilot-${{ github.workflow }}-${{ github.ref }}
+  group: constructor-studio-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   validate_artifacts:
-    name: Validate Cypilot Artifacts
+    name: Validate Constructor Studio Artifacts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -38,5 +38,10 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install pipx
+        run: |
+          python -m pip install --user pipx
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Validate artifacts
-        run: make cypilot-validate
+        run: make cfs-validate

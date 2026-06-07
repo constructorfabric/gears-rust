@@ -1,21 +1,21 @@
-# PR Review with Cypilot
+# PR Review with Constructor Studio
 
-This project uses **Cypilot** for AI-powered PR reviews and status reports.
+This project uses **Constructor Studio** for AI-powered PR reviews and status reports.
 
 ## Quick Start
 
-Cyber Ware has integrated Cypilot automation for PR review assistance. Use any supported agent
+Cyber Ware has integrated Constructor Studio automation for PR review assistance. Use any supported agent
 (Windsurf, Cursor, Claude, Copilot) — each has thin stubs that redirect to
-the canonical workflows via `/cypilot-pr-review` and `/cypilot-pr-status` commands.
+the canonical workflows via `/cf-sdlc-pr-review` and `/cf-sdlc-pr-status` commands.
 
 You can use the following prompts in your IDE to review PRs or get status:
 
-> cypilot list all open PRs
-> cypilot preview PR 100
-> /cypilot-pr-review 100
-> cypilot preview ALL PRs
-> cypilot get status for PR 300
-> /cypilot-pr-status 300
+> cf list PRs
+> cf review PR 100
+> /cf-sdlc-pr-review 100
+> cf review PR ALL
+> cf PR status 300
+> /cf-sdlc-pr-status 300
 
 See the `.prs/{ID}/` folder for the review results:
 
@@ -85,7 +85,7 @@ The `pr.py` script uses the [GitHub CLI (`gh`)](https://cli.github.com/) to fetc
 
 ### Workflow Reference
 
-1. Fetch PR metadata using `.cypilot/config/kits/sdlc/scripts/pr.py` CLI tool
+1. Fetch PR metadata using `.cf-studio/config/kits/sdlc/scripts/pr.py` CLI tool
 2. Select the most appropriate review prompt (code, design, ADR, or PRD)
 3. Analyze changes against the corresponding checklist
 4. Write a structured review to `.prs/{ID}/review.md` or status report to `.prs/{ID}/status.md`
@@ -100,11 +100,11 @@ Report templates define the expected output format for reviews and status report
 
 | Template | Canonical location | Docs copy |
 |----------|-------------------|-----------|
-| Code review | `.cypilot/config/kits/sdlc/artifacts/PR-CODE-REVIEW-TEMPLATE/template.md` | `docs/pr-review/code-review-template.md` |
-| Status report | `.cypilot/config/kits/sdlc/artifacts/PR-STATUS-REPORT-TEMPLATE/template.md` | `docs/pr-review/status-report-template.md` |
+| Code review | `.cf-studio/config/kits/sdlc/artifacts/PR-CODE-REVIEW-TEMPLATE/template.md` | `docs/pr-review/code-review-template.md` |
+| Status report | `.cf-studio/config/kits/sdlc/artifacts/PR-STATUS-REPORT-TEMPLATE/template.md` | `docs/pr-review/status-report-template.md` |
 
-The canonical templates live inside `.cypilot/config/kits/sdlc/artifacts/`. Kit updates
-via `cpt kit update` will show a diff for any template changes.
+The canonical templates live inside `.cf-studio/config/kits/sdlc/artifacts/`. Kit updates
+via `cfs kit update` will show a diff for any template changes.
 
 ## Review Prompts
 
@@ -112,7 +112,7 @@ Each review type has a dedicated prompt file and checklist:
 
 | Review type | Prompt | Checklist |
 |-------------|--------|-----------|
-| Code Review | `.cypilot/config/kits/sdlc/scripts/prompts/pr/code-review.md` | `docs/checklists/CODING.md` |
-| Design Review | `.cypilot/config/kits/sdlc/scripts/prompts/pr/design-review.md` | `docs/checklists/DESIGN.md` |
-| ADR Review | `.cypilot/config/kits/sdlc/scripts/prompts/pr/adr-review.md` | `docs/checklists/ADR.md` |
-| PRD Review | `.cypilot/config/kits/sdlc/scripts/prompts/pr/prd-review.md` | `docs/checklists/PRD.md` |
+| Code Review | `.cf-studio/config/kits/sdlc/scripts/prompts/pr/code-review.md` | `docs/checklists/CODING.md` |
+| Design Review | `.cf-studio/config/kits/sdlc/scripts/prompts/pr/design-review.md` | `docs/checklists/DESIGN.md` |
+| ADR Review | `.cf-studio/config/kits/sdlc/scripts/prompts/pr/adr-review.md` | `docs/checklists/ADR.md` |
+| PRD Review | `.cf-studio/config/kits/sdlc/scripts/prompts/pr/prd-review.md` | `docs/checklists/PRD.md` |

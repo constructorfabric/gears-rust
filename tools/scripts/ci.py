@@ -22,10 +22,15 @@ from lib.platform import (
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PYTHON = sys.executable or "python"
+CFS_VERSION = os.environ.get("CFS_VERSION", "v1.1.2")
+CFS_INSTALL_SPEC = os.environ.get(
+    "CFS_INSTALL_SPEC",
+    "git+https://github.com/constructorfabric/studio.git",
+)
 
 
 def run_cmd(cmd, env=None, cwd=None):
-    print(f"> {' '.join(cmd)}")
+    print(f"> {' '.join(cmd)}", flush=True)
     result = subprocess.run(cmd, env=env, cwd=cwd)
     if result.returncode != 0:
         sys.exit(result.returncode)
@@ -33,12 +38,38 @@ def run_cmd(cmd, env=None, cwd=None):
 
 
 def run_cmd_allow_fail(cmd, env=None, cwd=None):
-    print(f"> {' '.join(cmd)}")
+    print(f"> {' '.join(cmd)}", flush=True)
     return subprocess.run(cmd, env=env, cwd=cwd)
 
 
 def step(msg):
-    print(f"\n== {msg}")
+    print(f"\n== {msg}", flush=True)
+
+
+def ensure_cfs():
+    step("Ensuring Constructor Studio CLI")
+    cfs = shutil.which("cfs")
+    if cfs is None:
+        print(f"cfs is not installed; installing {CFS_INSTALL_SPEC} with pipx")
+        if not shutil.which("pipx"):
+            print(
+                "ERROR: pipx is required to install cfs. "
+                "Install pipx, then rerun this command."
+            )
+            sys.exit(1)
+        run_cmd(["pipx", "install", CFS_INSTALL_SPEC])
+    else:
+        run_cmd_allow_fail(["cfs", "--version"])
+
+    print(f"Initializing Constructor Studio runtime with cfs init --version {CFS_VERSION}")
+    run_cmd(
+        [
+            "cfs", "init", "--version", CFS_VERSION, "--yes",
+            "--migrate-from-cypilot=no",
+            "--update-legacy-studio=yes",
+        ],
+        cwd=PROJECT_ROOT,
+    )
 
 
 def cmd_fmt(args):
@@ -156,59 +187,21 @@ def cmd_gts_docs(args):
         sys.exit(result.returncode)
 
 
-def cmd_cypilot_validate(_args):
-    step("Validating cypilot artifacts")
-    cypilot_dir = os.path.join(PROJECT_ROOT, ".cypilot")
-    git_dir = os.path.join(cypilot_dir, ".git")
-    submodule_initialized = (
-        os.path.isdir(git_dir) or os.path.isfile(git_dir)
-    )
-    if not submodule_initialized:
-        print("Initializing .cypilot submodule (first run)")
-        run_cmd(
-            [
-                "git", "submodule", "update",
-                "--init", "--recursive",
-                "--", ".cypilot",
-            ],
-            cwd=PROJECT_ROOT,
-        )
-    else:
-        # Skip update if on a branch checkout
-        result = run_cmd_allow_fail(
-            ["git", "-C", cypilot_dir,
-             "symbolic-ref", "-q", "HEAD"]
-        )
-        if result.returncode == 0:
-            print("Skipping .cypilot update "
-                  "(branch checkout detected)")
-        else:
-            print("Updating .cypilot via git "
-                  "submodule update (detached HEAD)")
-            run_cmd(
-                [
-                    "git", "submodule", "update",
-                    "--init", "--recursive",
-                    "--", ".cypilot",
-                ],
-                cwd=PROJECT_ROOT,
-            )
-    script = os.path.join(
-        cypilot_dir, "skills", "cypilot",
-        "scripts", "cypilot.py",
-    )
-    result = run_cmd_allow_fail([PYTHON, script, "validate"])
+def cmd_cfs_validate(_args):
+    ensure_cfs()
+    step("Validating Constructor Studio artifacts")
+    result = run_cmd_allow_fail(["cfs", "validate"])
     if result.returncode == 0:
-        print("OK. cypilot validation PASSED")
+        print("OK. Constructor Studio validation PASSED")
     else:
-        print("ERROR: cypilot validation FAILED")
+        print("ERROR: Constructor Studio validation FAILED")
         sys.exit(result.returncode)
 
 
 def cmd_check(args):
     step("Running full check suite")
     cmd_fmt(args)
-    cmd_cypilot_validate(args)
+    cmd_cfs_validate(args)
     cmd_clippy(args)
     cmd_test(args)
     cmd_dylint_test(args)
@@ -916,9 +909,9 @@ def build_parser():
     p_fuzz_clean = subparsers.add_parser("fuzz-clean", help="Clean fuzzing artifacts")
     p_fuzz_clean.set_defaults(func=cmd_fuzz_clean)
 
-    # cypilot-validate
-    p_cypilot = subparsers.add_parser("cypilot-validate", help="Validate cypilot artifacts (specs, code, templates)")
-    p_cypilot.set_defaults(func=cmd_cypilot_validate)
+    # cfs-validate
+    p_cfs = subparsers.add_parser("cfs-validate", help="Validate Constructor Studio artifacts (specs, code, templates)")
+    p_cfs.set_defaults(func=cmd_cfs_validate)
 
     # gts-docs
     p_gts_docs = subparsers.add_parser("gts-docs", help="Validate GTS identifiers in .md and .json files (DE0903)")

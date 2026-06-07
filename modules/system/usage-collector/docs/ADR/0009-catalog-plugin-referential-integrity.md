@@ -140,7 +140,7 @@ this catalog substrate).
 Compliance is confirmed through (a) a plugin contract conformance test
 verifying the FK constraint — attempting to delete a metric with extant
 `usage_records` rows MUST be rejected by the plugin and surfaced to the gateway
-as a structured "metric referenced" error; (b) `cypilot validate` PASS for the
+as a structured "metric referenced" error; (b) `cfs validate` PASS for the
 usage-collector bundle covering this ADR and every artifact that
 back-references it (ADR-0002, ADR-0007 superseded marker, downstream cascade
 artifacts); (c) PR review by usage-collector maintainers confirming the

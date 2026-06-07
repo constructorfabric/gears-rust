@@ -1,5 +1,5 @@
 ---
-cypilot: true
+cf: true
 type: requirement
 name: Rust PR Review Guidelines
 version: 1.1

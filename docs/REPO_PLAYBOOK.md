@@ -170,7 +170,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 14) Agents, Prompts & AI Automation
 
-> Agents, prompts, and AI workflows are managed by **Cypilot** — see [.cypilot/](../.cypilot) (skills, scripts, templates, workflows) and [.cypilot/config/](../.cypilot/config) (project-specific configuration, `artifacts.toml`, `AGENTS.md`).
+> Agents, prompts, and AI workflows are managed by **Constructor Studio** — see [.cf-studio/](../.cf-studio) (skills, scripts, templates, workflows) and [.cf-studio/config/](../.cf-studio/config) (project-specific configuration, `artifacts.toml`, `AGENTS.md`).
 
 | Item | Status / Phase / ID | Implemented (where) | Planned |
 |---|---|---|---|
@@ -178,14 +178,14 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 | Automation rules | [x] `p2`| [Makefile](../Makefile), [tools/scripts/ci.py](../tools/scripts/ci.py), workflow files | Add automation safety policy |
 | Task automation guidelines | [x] `p2` | [tools/scripts/ci.py](../tools/scripts/ci.py), [Makefile](../Makefile) | Add “when to automate/not automate” guide |
 | Bot behavior rules | [x] `p2` | [docs/pr-review/README.md](./pr-review/README.md), workflow configs | Add standardized bot comment protocol |
-| Agents overview | [x] `p2` | [.cypilot/](../.cypilot), [.cypilot/config/](../.cypilot/config), [docs/pr-review/README.md](./pr-review/README.md) | Add central "AI operations" document |
-| Prompt guidelines | [x] `p2` | [.cypilot/](../.cypilot), [docs/checklists/README.md](./checklists/README.md) | Add universal prompt design guide |
-| Prompt templates | [x] `p2` | [.cypilot/](../.cypilot), `docs/pr-review/` templates | Add non-PR prompt template library |
-| Agent responsibilities | [x] `p2` | [.cypilot/config/AGENTS.md](../.cypilot/config/AGENTS.md), [docs/checklists/README.md](./checklists/README.md) | Add explicit role split per bot/agent |
+| Agents overview | [x] `p2` | [.cf-studio/](../.cf-studio), [.cf-studio/config/](../.cf-studio/config), [docs/pr-review/README.md](./pr-review/README.md) | Add central "AI operations" document |
+| Prompt guidelines | [x] `p2` | [.cf-studio/](../.cf-studio), [docs/checklists/README.md](./checklists/README.md) | Add universal prompt design guide |
+| Prompt templates | [x] `p2` | [.cf-studio/](../.cf-studio), `docs/pr-review/` templates | Add non-PR prompt template library |
+| Agent responsibilities | [x] `p2` | [.cf-studio/config/AGENTS.md](../.cf-studio/config/AGENTS.md), [docs/checklists/README.md](./checklists/README.md) | Add explicit role split per bot/agent |
 | Agent boundaries | [ ] `p3` | Implicit in review workflows | Add hard boundaries + escalation policy |
 | Agent input/output contracts | [ ] `p3` | Templates exist for PR/status outputs | Add formal contract schema |
 | Agent lifecycle | [ ] `p3` | Not formalized | Add lifecycle/run-states doc |
-| Agent orchestration rules | [ ] `p3` | Partial through Cypilot workflows in [.cypilot/](../.cypilot) | Add orchestration and precedence rules |
+| Agent orchestration rules | [ ] `p3` | Partial through Constructor Studio workflows in [.cf-studio/](../.cf-studio) | Add orchestration and precedence rules |
 | Prompt patterns | [ ] `p3` | Not centralized | Add prompt pattern catalog |
 | Prompt anti-patterns | [ ] `p3` | Not centralized | Add anti-pattern checklist |
 | Prompt safety rules | [ ] `p3` | Partially implied in security/review process | Add explicit prompt safety controls |
@@ -265,7 +265,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## Coverage Summary
 
-- Implemented (`[x]`): strong coverage for architecture, standards, CI, testing, release, security, examples, Cypilot-managed AI automation.
+- Implemented (`[x]`): strong coverage for architecture, standards, CI, testing, release, security, examples, Constructor Studio-managed AI automation.
 - Planned (`[ ]`): most gaps are performance benchmarking, AI prompt governance, glossary/FAQ.
 - Out of scope (`N/A`): deployment, rollback, cost/resource limits — downstream responsibility.
 - Highest-value next phase (`p2`/`p3`) additions:

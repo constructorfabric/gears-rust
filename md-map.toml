@@ -1,0 +1,541 @@
+show_uncategorized = true
+
+[[categories]]
+name = "system-account-management"
+paths = ["modules/system/account-management/**"]
+[categories.style]
+color = "#fee2e2"
+background = "#fff5f5"
+
+[[categories]]
+name = "system-oagw"
+paths = ["modules/system/oagw/**"]
+[categories.style]
+color = "#ffedd5"
+background = "#fff8f0"
+
+[[categories]]
+name = "system-resource-group"
+paths = ["modules/system/resource-group/**"]
+[categories.style]
+color = "#fef3c7"
+background = "#fffdf0"
+
+[[categories]]
+name = "chat-engine"
+paths = ["modules/chat-engine/**"]
+[categories.style]
+color = "#fef9c3"
+background = "#fffeeb"
+
+[[categories]]
+name = "mini-chat"
+paths = ["modules/mini-chat/**"]
+[categories.style]
+color = "#ecfccb"
+background = "#f9ffe8"
+
+[[categories]]
+name = "file-parser"
+paths = ["modules/file-parser/**"]
+[categories.style]
+color = "#dcfce7"
+background = "#f0fdf4"
+
+[[categories]]
+name = "system-usage-collector"
+paths = ["modules/system/usage-collector/**"]
+[categories.style]
+color = "#ccfbf1"
+background = "#f0fdfa"
+
+[[categories]]
+name = "serverless-runtime"
+paths = ["modules/serverless-runtime/**"]
+[categories.style]
+color = "#cffafe"
+background = "#ecfeff"
+
+[[categories]]
+name = "system-authn-resolver"
+paths = ["modules/system/authn-resolver/**"]
+[categories.style]
+color = "#dbeafe"
+background = "#eff6ff"
+
+[[categories]]
+name = "system-cluster"
+paths = ["modules/system/cluster/**"]
+[categories.style]
+color = "#e0e7ff"
+background = "#eef2ff"
+
+[[categories]]
+name = "llm-gateway"
+paths = ["modules/llm-gateway/**"]
+[categories.style]
+color = "#fee2e2"
+background = "#fff5f5"
+
+[[categories]]
+name = "simple-resource-registry"
+paths = ["modules/simple-resource-registry/**"]
+[categories.style]
+color = "#ffedd5"
+background = "#fff8f0"
+
+[[categories]]
+name = "model-registry"
+paths = ["modules/model-registry/**"]
+[categories.style]
+color = "#fef3c7"
+background = "#fffdf0"
+
+[[categories]]
+name = "system-quota-enforcement"
+paths = ["modules/system/quota-enforcement/**"]
+[categories.style]
+color = "#fef9c3"
+background = "#fffeeb"
+
+[[categories]]
+name = "system-tenant-resolver"
+paths = ["modules/system/tenant-resolver/**"]
+[categories.style]
+color = "#ecfccb"
+background = "#f9ffe8"
+
+[[categories]]
+name = "credstore"
+paths = ["modules/credstore/**"]
+[categories.style]
+color = "#dcfce7"
+background = "#f0fdf4"
+
+[[categories]]
+name = "system-authz-resolver"
+paths = ["modules/system/authz-resolver/**"]
+[categories.style]
+color = "#ccfbf1"
+background = "#f0fdfa"
+
+[[categories]]
+name = "simple-user-settings"
+paths = ["modules/simple-user-settings/**"]
+[categories.style]
+color = "#cffafe"
+background = "#ecfeff"
+
+[[categories]]
+name = "system-nodes-registry"
+paths = ["modules/system/nodes-registry/**"]
+[categories.style]
+color = "#dbeafe"
+background = "#eff6ff"
+
+[[categories]]
+name = "system-types-registry"
+paths = ["modules/system/types-registry/**"]
+[categories.style]
+color = "#e0e7ff"
+background = "#eef2ff"
+
+[[categories]]
+name = "approval-service"
+paths = ["modules/approval-service/**"]
+[categories.style]
+color = "#fee2e2"
+background = "#fff5f5"
+
+[[categories]]
+name = "file-storage"
+paths = ["modules/file-storage/**"]
+[categories.style]
+color = "#ffedd5"
+background = "#fff8f0"
+
+[[categories]]
+name = "system-api-gateway"
+paths = ["modules/system/api-gateway/**"]
+[categories.style]
+color = "#fef3c7"
+background = "#fffdf0"
+
+[[categories]]
+name = "system-grpc-hub"
+paths = ["modules/system/grpc-hub/**"]
+[categories.style]
+color = "#fef9c3"
+background = "#fffeeb"
+
+[[categories]]
+name = "system-module-orchestrator"
+paths = ["modules/system/module-orchestrator/**"]
+[categories.style]
+color = "#ecfccb"
+background = "#f9ffe8"
+
+[[categories]]
+name = "cf-studio-config"
+paths = [".cf-studio/config/**"]
+[categories.style]
+color = "#dcfce7"
+background = "#f0fdf4"
+
+[[categories]]
+name = "agents-skills"
+paths = [".agents/skills/**"]
+[categories.style]
+color = "#ccfbf1"
+background = "#f0fdfa"
+
+[[categories]]
+name = "claude-agents"
+paths = [".claude/agents/**"]
+[categories.style]
+color = "#cffafe"
+background = "#ecfeff"
+
+[[categories]]
+name = "cursor-agents"
+paths = [".cursor/agents/**"]
+[categories.style]
+color = "#dbeafe"
+background = "#eff6ff"
+
+[[categories]]
+name = "github-agents"
+paths = [".github/agents/**"]
+[categories.style]
+color = "#e0e7ff"
+background = "#eef2ff"
+
+[[categories]]
+name = "claude-skills"
+paths = [".claude/skills/**"]
+[categories.style]
+color = "#fee2e2"
+background = "#fff5f5"
+
+[[categories]]
+name = "cursor-commands"
+paths = [".cursor/commands/**"]
+[categories.style]
+color = "#ffedd5"
+background = "#fff8f0"
+
+[[categories]]
+name = "github-prompts"
+paths = [".github/prompts/**"]
+[categories.style]
+color = "#fef3c7"
+background = "#fffdf0"
+
+[[categories]]
+name = "windsurf-workflows"
+paths = [".windsurf/workflows/**"]
+[categories.style]
+color = "#fef9c3"
+background = "#fffeeb"
+
+[[categories]]
+name = "cf-studio-core"
+paths = [".cf-studio/.core/**"]
+[categories.style]
+color = "#ecfccb"
+background = "#f9ffe8"
+
+[[categories]]
+name = "cf-studio-gen"
+paths = [".cf-studio/.gen/**"]
+[categories.style]
+color = "#dcfce7"
+background = "#f0fdf4"
+
+[[categories]]
+name = "docs-arch-errors"
+paths = ["docs/arch/errors/**"]
+[categories.style]
+color = "#ccfbf1"
+background = "#f0fdfa"
+
+[[categories]]
+name = "docs-arch-authorization"
+paths = ["docs/arch/authorization/**"]
+[categories.style]
+color = "#cffafe"
+background = "#ecfeff"
+
+[[categories]]
+name = "docs-arch-modkit-contract-binding"
+paths = ["docs/arch/modkit-contract-binding/**"]
+[categories.style]
+color = "#dbeafe"
+background = "#eff6ff"
+
+[[categories]]
+name = "docs-arch"
+paths = ["docs/arch/**"]
+[categories.style]
+color = "#e0e7ff"
+background = "#eef2ff"
+
+[[categories]]
+name = "docs-spec-templates-cyberware-sdlc"
+paths = ["docs/spec-templates/cyberware-sdlc/**"]
+[categories.style]
+color = "#fee2e2"
+background = "#fff5f5"
+
+[[categories]]
+name = "docs-spec-templates-examples"
+paths = ["docs/spec-templates/examples/**"]
+[categories.style]
+color = "#ffedd5"
+background = "#fff8f0"
+
+[[categories]]
+name = "docs-spec-templates"
+paths = ["docs/spec-templates/**"]
+[categories.style]
+color = "#fef3c7"
+background = "#fffdf0"
+
+[[categories]]
+name = "docs-modkit-unified-system"
+paths = ["docs/modkit_unified_system/**"]
+[categories.style]
+color = "#fef9c3"
+background = "#fffeeb"
+
+[[categories]]
+name = "docs-checklists"
+paths = ["docs/checklists/**"]
+[categories.style]
+color = "#ecfccb"
+background = "#f9ffe8"
+
+[[categories]]
+name = "docs-security-fips"
+paths = ["docs/security/fips/**"]
+[categories.style]
+color = "#dcfce7"
+background = "#f0fdf4"
+
+[[categories]]
+name = "docs-security"
+paths = ["docs/security/**"]
+[categories.style]
+color = "#ccfbf1"
+background = "#f0fdfa"
+
+[[categories]]
+name = "docs-pr-review"
+paths = ["docs/pr-review/**"]
+[categories.style]
+color = "#cffafe"
+background = "#ecfeff"
+
+[[categories]]
+name = "docs-adrs-modkit"
+paths = ["docs/adrs/modkit/**"]
+[categories.style]
+color = "#dbeafe"
+background = "#eff6ff"
+
+[[categories]]
+name = "docs-adrs"
+paths = ["docs/adrs/**"]
+[categories.style]
+color = "#e0e7ff"
+background = "#eef2ff"
+
+[[categories]]
+name = "docs-md-fabric"
+paths = ["docs/md-fabric/**"]
+[categories.style]
+color = "#fee2e2"
+background = "#fff5f5"
+
+[[categories]]
+name = "docs"
+paths = ["docs/**"]
+[categories.style]
+color = "#ffedd5"
+background = "#fff8f0"
+
+[[categories]]
+name = "lib-modkit-db"
+paths = ["libs/modkit-db/**"]
+[categories.style]
+color = "#cffafe"
+background = "#ecfeff"
+
+[[categories]]
+name = "lib-modkit-auth"
+paths = ["libs/modkit-auth/**"]
+[categories.style]
+color = "#dbeafe"
+background = "#eff6ff"
+
+[[categories]]
+name = "lib-system-sdks"
+paths = ["libs/system-sdks/**"]
+[categories.style]
+color = "#e0e7ff"
+background = "#eef2ff"
+
+[[categories]]
+name = "lib-modkit"
+paths = ["libs/modkit/**"]
+[categories.style]
+color = "#fee2e2"
+background = "#fff5f5"
+
+[[categories]]
+name = "lib-modkit-canonical-errors"
+paths = ["libs/modkit-canonical-errors/**"]
+[categories.style]
+color = "#ffedd5"
+background = "#fff8f0"
+
+[[categories]]
+name = "lib-modkit-db-macros"
+paths = ["libs/modkit-db-macros/**"]
+[categories.style]
+color = "#fef3c7"
+background = "#fffdf0"
+
+[[categories]]
+name = "lib-modkit-gts"
+paths = ["libs/modkit-gts/**"]
+[categories.style]
+color = "#fef9c3"
+background = "#fffeeb"
+
+[[categories]]
+name = "lib-modkit-gts-macros"
+paths = ["libs/modkit-gts-macros/**"]
+[categories.style]
+color = "#ecfccb"
+background = "#f9ffe8"
+
+[[categories]]
+name = "lib-modkit-http"
+paths = ["libs/modkit-http/**"]
+[categories.style]
+color = "#dcfce7"
+background = "#f0fdf4"
+
+[[categories]]
+name = "lib-modkit-macros"
+paths = ["libs/modkit-macros/**"]
+[categories.style]
+color = "#ccfbf1"
+background = "#f0fdfa"
+
+[[categories]]
+name = "lib-modkit-node-info"
+paths = ["libs/modkit-node-info/**"]
+[categories.style]
+color = "#cffafe"
+background = "#ecfeff"
+
+[[categories]]
+name = "lib-modkit-odata"
+paths = ["libs/modkit-odata/**"]
+[categories.style]
+color = "#dbeafe"
+background = "#eff6ff"
+
+[[categories]]
+name = "lib-modkit-odata-macros"
+paths = ["libs/modkit-odata-macros/**"]
+[categories.style]
+color = "#e0e7ff"
+background = "#eef2ff"
+
+[[categories]]
+name = "lib-modkit-sdk"
+paths = ["libs/modkit-sdk/**"]
+[categories.style]
+color = "#fee2e2"
+background = "#fff5f5"
+
+[[categories]]
+name = "lib-modkit-security"
+paths = ["libs/modkit-security/**"]
+[categories.style]
+color = "#ffedd5"
+background = "#fff8f0"
+
+[[categories]]
+name = "lib-modkit-transport-grpc"
+paths = ["libs/modkit-transport-grpc/**"]
+[categories.style]
+color = "#fef3c7"
+background = "#fffdf0"
+
+[[categories]]
+name = "lib-modkit-utils"
+paths = ["libs/modkit-utils/**"]
+[categories.style]
+color = "#fef9c3"
+background = "#fffeeb"
+
+[[categories]]
+name = "lib-rustls-corecrypto-provider"
+paths = ["libs/rustls-corecrypto-provider/**"]
+[categories.style]
+color = "#ecfccb"
+background = "#f9ffe8"
+
+[[categories]]
+name = "tools-dylint-lints"
+paths = ["tools/dylint_lints/**"]
+[categories.style]
+color = "#dcfce7"
+background = "#f0fdf4"
+
+[[categories]]
+name = "guidelines"
+paths = ["guidelines/**"]
+[categories.style]
+color = "#ccfbf1"
+background = "#f0fdfa"
+
+[[categories]]
+name = "examples"
+paths = ["examples/**"]
+[categories.style]
+color = "#cffafe"
+background = "#ecfeff"
+
+[[categories]]
+name = "codex-prompts"
+paths = [".codex/prompts/**"]
+[categories.style]
+color = "#dbeafe"
+background = "#eff6ff"
+
+[[categories]]
+name = "github-copilot"
+paths = [".github/copilot-instructions.md"]
+[categories.style]
+color = "#e0e7ff"
+background = "#eef2ff"
+
+[[categories]]
+name = "repo-root-docs"
+paths = [
+  "AGENTS.md",
+  "CHANGELOG.md",
+  "CLAUDE.md",
+  "CONTRIBUTING.md",
+  "MAINTAINERS.md",
+  "README.md",
+  "SECURITY.md",
+]
+[categories.style]
+color = "#fee2e2"
+background = "#fff5f5"

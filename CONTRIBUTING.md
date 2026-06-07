@@ -28,7 +28,7 @@ We welcome contributions in:
 git clone --recurse-submodules <repository-url>
 cd cyberware-rust
 
-# If you didn't clone with --recurse-submodules (includes Cypilot for PR reviews)
+# If you didn't clone with --recurse-submodules (includes Constructor Studio for PR reviews)
 git submodule update --init --recursive
 
 # Install Rust (if not already installed)
@@ -289,21 +289,21 @@ Merge Strategy:
 - **Rebase and merge** for simple fixes
 - **Merge commit** for release branches
 
-### 2.10. Local PR Review with Cypilot
+### 2.10. Local PR Review with Constructor Studio
 
-After pushing your PR and waiting for the cloud AI bots (CodeRabbit, Qodo, etc.) to complete their reviews, run a local Cypilot review to catch additional issues
+After pushing your PR and waiting for the cloud AI bots (CodeRabbit, Qodo, etc.) to complete their reviews, run a local Constructor Studio review to catch additional issues
 before requesting human review:
 
 ```text
-cypilot review PR <number>
+cf review PR <number>
 ```
 
-Use any supported IDE agent (Windsurf, Cursor, Claude, Copilot) — each redirects to the canonical workflows via `/cypilot-pr-review` and `/cypilot-pr-status` commands.
+Use any supported IDE agent (Windsurf, Cursor, Claude, Copilot) — each redirects to the canonical workflows via `/cf-sdlc-pr-review` and `/cf-sdlc-pr-status` commands.
 
 You can also check the PR status (unreplied comments, severity, etc.):
 
 ```text
-cypilot get status for PR <number>
+cf PR status <number>
 ```
 
 See the results in `.prs/{ID}/` folder.

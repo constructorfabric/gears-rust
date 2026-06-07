@@ -61,7 +61,7 @@ Chosen option: "Gateway-local catalog DB with no SPI referential check", because
 
 ### Confirmation
 
-Compliance is confirmed through (a) design review against this ADR confirming that no catalog SPI methods remain on the plugin surface, that `MetricCatalogRepo` is the sole catalog persistence seam, and that REST handlers and the SDK trait impl share the `MetricCatalogService`; (b) `cypilot validate` on this ADR file and on every back-referencing artifact; (c) the downstream artifact updates that back-reference this ADR — `DESIGN.md`, `PRD.md`, `DECOMPOSITION.md`, `plugin-spi.md`, `sdk-trait.md`, `features/foundation.md`, `features/metric-lifecycle.md`, `domain-model.md`, and `usage-collector-v1.yaml`.
+Compliance is confirmed through (a) design review against this ADR confirming that no catalog SPI methods remain on the plugin surface, that `MetricCatalogRepo` is the sole catalog persistence seam, and that REST handlers and the SDK trait impl share the `MetricCatalogService`; (b) `cfs validate` on this ADR file and on every back-referencing artifact; (c) the downstream artifact updates that back-reference this ADR — `DESIGN.md`, `PRD.md`, `DECOMPOSITION.md`, `plugin-spi.md`, `sdk-trait.md`, `features/foundation.md`, `features/metric-lifecycle.md`, `domain-model.md`, and `usage-collector-v1.yaml`.
 
 ## Pros and Cons of the Options
 

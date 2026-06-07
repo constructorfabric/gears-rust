@@ -1,5 +1,8 @@
 CI := 1
 
+CFS_VERSION ?= v1.1.2
+CFS_INSTALL_SPEC ?= git+https://github.com/constructorfabric/studio.git
+
 OPENAPI_URL ?= http://127.0.0.1:8087/cw/openapi.json
 OPENAPI_OUT ?= docs/api/api.json
 
@@ -215,7 +218,7 @@ validate-module-names:
 # |             | - Use 'make dylint-list' to see all available custom lints           |
 # +-------------+----------------------------------------------------------------------+
 
-.PHONY: clippy lychee kani geiger safety lint dylint dylint-list dylint-test gts-docs cypilot-validate cypilot-spec-coverage
+.PHONY: clippy lychee kani geiger safety lint dylint dylint-list dylint-test gts-docs install-tools cfs-init cfs-init-full cfs-validate cfs-spec-coverage
 
 # Run clippy via cargo-hack with `--each-feature`: one pass per individual
 # feature, plus a `--no-default-features` pass and an `--all-features` pass.
@@ -226,13 +229,31 @@ clippy:
 	$(call check_tool,cargo-hack)
 	cargo hack clippy --workspace --all-targets --each-feature -- -D warnings -D clippy::perf
 
-# Check cypilot spec-to-code traceability coverage
-cypilot-spec-coverage:
-	@python3 .cypilot/.core/skills/cypilot/scripts/cypilot.py spec-coverage --min-coverage 80
+# Initialize Constructor Studio runtime at the pinned version
+cfs-init:
+	@set -eu; \
+	if ! command -v cfs >/dev/null 2>&1; then \
+		if ! command -v pipx >/dev/null 2>&1; then \
+			echo "ERROR: pipx is required to install cfs. Install pipx, then rerun make."; \
+			exit 1; \
+		fi; \
+		echo "cfs is not installed; installing $(CFS_INSTALL_SPEC) with pipx"; \
+		pipx install "$(CFS_INSTALL_SPEC)"; \
+	fi; \
+	echo "Initializing Constructor Studio runtime with cfs init --version $(CFS_VERSION)"; \
+	cfs init --version "$(CFS_VERSION)" --yes --migrate-from-cypilot=no --update-legacy-studio=yes
 
-# Validate cypilot artifacts (specs, code, templates)
-cypilot-validate:
-	@python3 .cypilot/.core/skills/cypilot/scripts/cypilot.py validate && echo "OK. cypilot validation PASSED" || (echo "ERROR: cypilot validation FAILED"; exit 1)
+## Initialize Constructor Studio runtime and regenerate agent files
+cfs-init-full: cfs-init
+	@cfs generate-agents
+
+## Check Constructor Studio spec-to-code traceability coverage
+cfs-spec-coverage: cfs-init
+	@cfs spec-coverage --min-coverage 80
+
+## Validate Constructor Studio artifacts (specs, code, templates)
+cfs-validate: cfs-init
+	@cfs validate && echo "OK. Constructor Studio validation PASSED" || (echo "ERROR: Constructor Studio validation FAILED"; exit 1)
 
 # Run markdown checks with 'lychee'
 lychee:
@@ -266,7 +287,8 @@ gts-docs:
 		--exclude "**/helm/*/templates/*" \
 		docs modules libs examples
 
-install-tools:
+## Install test/tooling prerequisites, including Constructor Studio runtime
+install-tools: cfs-init
 	@command -v cargo-nextest >/dev/null 2>&1 || cargo install cargo-nextest
 
 ## List all custom project compliance lints (see tools/dylint_lints/README.md)
@@ -735,7 +757,7 @@ oop-example:
 	cargo run --bin cyberware-example-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
-check: .setup-stamp fmt cypilot-validate clippy lychee security dylint-test dylint gts-docs test
+check: .setup-stamp fmt cfs-validate clippy lychee security dylint-test dylint gts-docs test
 
 ci_test: fmt clippy
 

@@ -181,7 +181,7 @@ review by usage-collector maintainers covering the floor wording, the tie to
 `cpt-cf-usage-collector-nfr-workload-isolation`, and the §3.12.7 redirect
 patch; (b) `plugin-spi.md` review covering the Consistency profile subsection
 and the explicit absence of a `consistency_profile()` method in v1; (c)
-`cypilot validate` PASS for the usage-collector bundle covering this ADR and
+`cfs validate` PASS for the usage-collector bundle covering this ADR and
 every artifact that back-references it (DESIGN §3.10.8 and §5 inventory,
 PRD §9 wording fix, `plugin-spi.md` subsection, `sdk-trait.md` pointer note,
 the three feature pointers); (d) a deployment-guide checklist item in each

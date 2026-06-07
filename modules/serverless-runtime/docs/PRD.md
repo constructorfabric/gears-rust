@@ -61,7 +61,7 @@
 - [6. Non-Goals](#6-non-goals)
 - [7. Additional context](#7-additional-context)
   - [Target Use Cases](#target-use-cases)
-  - [BR-to-Cypilot ID Cross-Reference](#br-to-cypilot-id-cross-reference)
+  - [BR-to-CPT ID Cross-Reference](#br-to-cpt-id-cross-reference)
 
 <!-- /toc -->
 
@@ -1283,13 +1283,13 @@ The following business scenarios are the primary motivators for this capability.
 <!-- cpt:###:context-title repeat="many" -->
 
 <!-- cpt:###:context-title repeat="many" -->
-### BR-to-Cypilot ID Cross-Reference
+### BR-to-CPT ID Cross-Reference
 
 <!-- cpt:free:prd-context-notes -->
-This PRD was reformatted from the original BR-xxx numbering scheme. The following table maps original BR IDs to Cypilot FR/NFR IDs for traceability:
+This PRD was reformatted from the original BR-xxx numbering scheme. The following table maps original BR IDs to CPT FR/NFR IDs for traceability:
 
-| Original BR | Cypilot ID | Section |
-|-------------|------------|---------|
+| Original BR | CPT ID | Section |
+|-------------|-----------------------|---------|
 | BR-001, BR-011, BR-018, BR-031, BR-032 | `cpt-cf-serverless-runtime-fr-runtime-authoring` | FR-001 |
 | BR-002, BR-020, BR-036 | `cpt-cf-serverless-runtime-fr-tenant-registry` | FR-002 |
 | BR-003, BR-004, BR-009, BR-010 | `cpt-cf-serverless-runtime-fr-execution-engine` | FR-003 |

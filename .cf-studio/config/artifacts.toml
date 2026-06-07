@@ -1,8 +1,8 @@
 # Updated: 2026-03-27 by Constructor Tech
-# Cypilot artifacts registry (migrated from v2)
+# Constructor Studio artifacts registry (migrated from v2)
 
 [[ignore]]
-reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Cypilot SDLC artifact."
+reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Constructor Studio SDLC artifact."
 patterns = ["modules/system/resource-group/docs/rust-traits.md"]
 
 [[ignore]]
@@ -43,7 +43,7 @@ patterns = [
 ]
 
 [[ignore]]
-reason = "Ignore legacy (pre-Cypilot) ADR files in oagw/docs root — converted copies live under docs/ADR/."
+reason = "Ignore legacy (pre-Constructor Studio) ADR files in oagw/docs root — converted copies live under docs/ADR/."
 patterns = ["modules/system/oagw/docs/adr-*.md"]
 
 

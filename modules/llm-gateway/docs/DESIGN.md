@@ -46,7 +46,7 @@ See [PRD.md](./PRD.md) section 1 "Overview" — Key Problems Solved:
 
 #### Functional requirements
 
-| Cypilot ID | Solution short description |
+| CPT ID | Solution short description |
 |--------|----------------------------|
 | `cpt-cf-llm-gateway-fr-chat-completion-v1` | Provider adapters + Outbound API GW |
 | `cpt-cf-llm-gateway-fr-streaming-v1` | SSE streaming forwarded by adapters |

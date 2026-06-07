@@ -257,9 +257,9 @@ jobs:
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cyberware-modkit-http --features fips
 
-  cypilot:
-    name: Cypilot
-    uses: ./.github/workflows/cypilot.yml
+  constructor-studio:
+    name: Constructor Studio
+    uses: ./.github/workflows/constructor-studio.yml
 
   security:
     name: Security (cargo-deny & cargo-audit on Ubuntu)
