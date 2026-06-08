@@ -351,6 +351,9 @@ jobs:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           components: llvm-tools-preview,rustc-dev
 
+      - name: Set Rust nightly for Dylint temp builds
+        run: rustup override set ${{ env.RUSTUP_TOOLCHAIN }} --path /tmp
+
       - name: Install dylint-link and nextest
         uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
