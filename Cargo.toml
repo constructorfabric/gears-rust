@@ -356,7 +356,7 @@ utoipa = { version = "5.4", features = [
 ] }
 
 # HTTP stack dependencies
-hyper = "1.5"
+hyper = "1.10"
 hyper-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = [
     "aws-lc-rs",
