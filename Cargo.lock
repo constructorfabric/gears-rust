@@ -1294,6 +1294,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-chat-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "bytes",
+ "cf-chat-engine-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-odata-macros",
+ "cf-gears-toolkit-security",
+ "futures",
+ "http",
+ "inventory",
+ "parking_lot",
+ "reqwest 0.13.3",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-chat-engine-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-account-management"
 version = "0.1.1"
 dependencies = [
@@ -1727,7 +1778,6 @@ dependencies = [
  "time",
  "tokio-util",
  "tracing",
- "url",
  "utoipa",
  "uuid",
 ]

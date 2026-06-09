@@ -24,7 +24,7 @@
 //!
 //! The trait is object-safe so the service can hold `Arc<dyn MessageRepo>`
 //! and unit tests can drop in an in-memory mock. The Sea-ORM impl
-//! [`SeaMessageRepo`] threads the modkit-db `DBProvider` through the same
+//! [`SeaMessageRepo`] threads the toolkit-db `DBProvider` through the same
 //! handle the migration runner uses.
 //
 // @cpt-cf-chat-engine-message-repo:p5
@@ -33,7 +33,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use modkit_db::secure::{
+use toolkit_db::secure::{
     AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig,
 };
 use sea_orm::sea_query::Expr;
@@ -268,7 +268,7 @@ pub trait MessageRepo: Send + Sync {
 
 /// Sea-ORM-backed implementation of [`MessageRepo`].
 ///
-/// Holds the modkit-db `DBProvider` so every query runs against the same
+/// Holds the toolkit-db `DBProvider` so every query runs against the same
 /// connection the migration runner used. `messages` is marked
 /// `#[secure(unrestricted)]`; the secure wrappers run with
 /// `AccessScope::allow_all()` and exist to expose a `&impl DBRunner`
@@ -852,9 +852,9 @@ fn chat_engine_db_err(err: &ChatEngineError) -> Option<&sea_orm::DbErr> {
         .downcast_ref::<sea_orm::DbErr>()
         .or_else(|| {
             source
-                .downcast_ref::<modkit_db::DbError>()
+                .downcast_ref::<toolkit_db::DbError>()
                 .and_then(|dbe| match dbe {
-                    modkit_db::DbError::Sea(inner) => Some(inner),
+                    toolkit_db::DbError::Sea(inner) => Some(inner),
                     _ => None,
                 })
         })

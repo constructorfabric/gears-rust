@@ -59,7 +59,7 @@ use std::time::{Duration, Instant};
 use chat_engine_sdk::models::{LifecycleState, TenantId, UserId};
 use chat_engine_sdk::plugin::{PluginCallContext, SessionPluginCtx};
 use futures::stream::{self, BoxStream, StreamExt};
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -945,7 +945,7 @@ mod tests {
     use async_trait::async_trait;
     use chat_engine_sdk::models::{LifecycleState, MessageRole};
     use chat_engine_sdk::plugin::ChatEngineBackendPlugin;
-    use modkit::ClientHub;
+    use toolkit::ClientHub;
     use parking_lot::Mutex;
     use std::time::Duration;
     use time::OffsetDateTime;
@@ -956,7 +956,7 @@ mod tests {
         FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage,
     };
     use crate::infra::db::repo::plugin_config_repo::PluginConfigRepo;
-    use crate::infra::db::repo::session_repo::{SessionPage, SessionRepo};
+    use crate::infra::db::repo::session_repo::SessionRepo;
     use crate::infra::db::repo::session_type_repo::SessionTypeRepo;
 
     // ----- Mocks -------------------------------------------------------
@@ -1002,15 +1002,11 @@ mod tests {
 
         async fn list_paginated(
             &self,
-            _t: &str,
-            _u: &str,
-            _c: Option<&str>,
-            _l: u32,
-        ) -> std::result::Result<SessionPage, ChatEngineError> {
-            Ok(SessionPage {
-                items: vec![],
-                next_cursor: None,
-            })
+            _tenant_id: &str,
+            _user_id: &str,
+            _query: &toolkit_odata::ODataQuery,
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
+            Ok(toolkit_odata::Page::empty(0))
         }
 
         async fn update_metadata(
@@ -1655,7 +1651,7 @@ mod tests {
 
     use chat_engine_sdk::error::PluginError;
     use chat_engine_sdk::plugin::{MessagePluginCtx, PluginStream, stream_from_events};
-    use modkit::client_hub::ClientScope;
+    use toolkit::client_hub::ClientScope;
 
     struct ScriptedSummaryPlugin {
         id: String,

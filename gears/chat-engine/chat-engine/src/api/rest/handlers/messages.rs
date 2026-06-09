@@ -34,7 +34,7 @@ use tracing::field::Empty;
 use uuid::Uuid;
 
 use chat_engine_sdk::models::CapabilityValue;
-use modkit_security::SecurityContext;
+use toolkit_security::SecurityContext;
 
 use crate::api::rest::handlers::sessions::{identity_from_ctx, reject_body_identity};
 use crate::domain::error::{ChatEngineError, Result};
@@ -261,8 +261,8 @@ mod tests {
         ChatEngineBackendPlugin, MessagePluginCtx, PluginStream, stream_from_events,
     };
     use chat_engine_sdk::models::LifecycleState;
-    use modkit::ClientHub;
-    use modkit::client_hub::ClientScope;
+    use toolkit::ClientHub;
+    use toolkit::client_hub::ClientScope;
     use parking_lot::Mutex;
     use std::sync::atomic::AtomicUsize;
     use time::OffsetDateTime;
@@ -276,7 +276,7 @@ mod tests {
         FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage,
     };
     use crate::infra::db::repo::plugin_config_repo::PluginConfigRepo;
-    use crate::infra::db::repo::session_repo::{SessionPage, SessionRepo};
+    use crate::infra::db::repo::session_repo::SessionRepo;
     use crate::infra::db::repo::session_type_repo::SessionTypeRepo;
 
     // ---- Minimal mocks (mirror message_service::tests) ----
@@ -333,15 +333,11 @@ mod tests {
 
         async fn list_paginated(
             &self,
-            _t: &str,
-            _u: &str,
-            _c: Option<&str>,
-            _l: u32,
-        ) -> std::result::Result<SessionPage, ChatEngineError> {
-            Ok(SessionPage {
-                items: vec![],
-                next_cursor: None,
-            })
+            _tenant_id: &str,
+            _user_id: &str,
+            _query: &toolkit_odata::ODataQuery,
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
+            Ok(toolkit_odata::Page::empty(0))
         }
 
         async fn update_metadata(

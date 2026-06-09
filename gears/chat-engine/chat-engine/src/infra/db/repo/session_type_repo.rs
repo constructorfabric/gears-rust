@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use modkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
+use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
 use sea_orm::{EntityTrait, QueryOrder};
 use uuid::Uuid;
 
@@ -45,7 +45,7 @@ pub trait SessionTypeRepo: Send + Sync {
 
 /// Sea-ORM-backed implementation of [`SessionTypeRepo`].
 ///
-/// Holds the modkit-db `DBProvider` so every method runs against the same
+/// Holds the toolkit-db `DBProvider` so every method runs against the same
 /// connection the migration runner used. `session_types` has no tenant
 /// column (entity is marked `#[secure(unrestricted)]`), so the secure
 /// wrappers run with `AccessScope::allow_all()` — they exist here purely to

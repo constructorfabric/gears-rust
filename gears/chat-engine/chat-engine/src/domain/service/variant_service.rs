@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use serde_json::{Value as JsonValue, json};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;

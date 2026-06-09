@@ -10,7 +10,7 @@
 //!
 //! The conversion travels through [`crate::api::rest::error`], so the
 //! Phase 14 mapping table is the single source of truth.  The
-//! [`canonical_error_middleware`](modkit::api::canonical_error_middleware)
+//! [`canonical_error_middleware`](toolkit::api::canonical_error_middleware)
 //! installed by the gateway then enriches the resulting `Problem` with
 //! `instance` + `trace_id` from the request scope.
 //
@@ -27,7 +27,7 @@ pub mod sessions;
 pub mod variants;
 
 use axum::response::{IntoResponse, Response};
-use modkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_canonical_errors::{CanonicalError, Problem};
 
 use crate::domain::error::ChatEngineError;
 

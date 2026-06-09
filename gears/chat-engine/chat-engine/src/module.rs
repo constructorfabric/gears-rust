@@ -8,10 +8,10 @@
 //! # Topology
 //!
 //! ```text
-//!  ModuleCtx ─▶ ChatEngineModule::new() (deferred wiring lives in init())
+//!  GearCtx ─▶ ChatEngineModule::new() (deferred wiring lives in init())
 //!                  │
 //!                  ├── ChatEngineConfig ─ validated
-//!                  ├── modkit-db Db ── sea_orm::DatabaseConnection
+//!                  ├── toolkit-db Db ── sea_orm::DatabaseConnection
 //!                  ├── SeaORM repos     (session, message, reaction, plugin_config,
 //!                  │                     session_type)
 //!                  ├── ClientHub        (registers LlmGatewayPlugin + WebhookCompatPlugin
@@ -35,11 +35,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::Router;
-use modkit::api::OpenApiRegistry;
-use modkit::client_hub::ClientScope;
-use modkit::{DatabaseCapability, Module, ModuleCtx, RestApiCapability};
-use modkit::api::canonical_error_middleware;
-use modkit_db::DBProvider;
+use toolkit::api::OpenApiRegistry;
+use toolkit::client_hub::ClientScope;
+use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
+use toolkit::api::canonical_error_middleware;
+use toolkit_db::DBProvider;
 use sea_orm_migration::MigrationTrait;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -73,7 +73,7 @@ use crate::infra::webhook_compat::WebhookCompatPlugin;
 pub const DEFAULT_WEBHOOK_COMPAT_INSTANCE_ID: &str =
     "gtx.cf.chat_engine.webhook_compat_plugin.v1~";
 
-/// Aggregated runtime state filled in during [`Module::init`].
+/// Aggregated runtime state filled in during [`Gear::init`].
 struct RuntimeState {
     services: ChatEngineServices,
     webhooks: Arc<dyn WebhookEmitter>,
@@ -85,10 +85,10 @@ struct RuntimeState {
 ///
 /// Construction is two-phased so the macro-generated registrator can
 /// instantiate the struct with `ChatEngineModule::new()` before
-/// [`Module::init`] runs. All runtime handles live behind a
+/// [`Gear::init`] runs. All runtime handles live behind a
 /// [`OnceLock`] that is populated inside `init()` once the
-/// `ModuleCtx` is available.
-#[modkit::module(
+/// `GearCtx` is available.
+#[toolkit::gear(
     name = "chat-engine",
     capabilities = [db, rest, stateful],
     client = chat_engine_sdk::ChatEngineBackendPlugin,
@@ -109,7 +109,7 @@ impl ChatEngineModule {
     /// Construct an uninitialised module. The macro-generated registrator
     /// uses this at link time; production wiring (config load, repo /
     /// service construction, ClientHub registration) runs in
-    /// [`Module::init`].
+    /// [`Gear::init`].
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -132,11 +132,11 @@ impl ChatEngineModule {
     /// [`IntelligenceService::run_retention_cleanup_for_tenant`].
     ///
     /// `ready.notify()` fires once the interval handle is constructed so
-    /// the modkit runtime can release dependent modules.
+    /// the toolkit runtime can release dependent modules.
     pub async fn serve(
         self: Arc<Self>,
         cancel: CancellationToken,
-        ready: modkit::lifecycle::ReadySignal,
+        ready: toolkit::lifecycle::ReadySignal,
     ) -> anyhow::Result<()> {
         let runtime = self.runtime()?;
         let interval_secs = runtime
@@ -200,8 +200,8 @@ async fn run_retention_cleanup_tick(
 }
 
 #[async_trait]
-impl Module for ChatEngineModule {
-    async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
+impl Gear for ChatEngineModule {
+    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         info!("initialising {} module", Self::MODULE_NAME);
 
         let cfg: ChatEngineConfig = ctx.config_or_default()?;
@@ -211,12 +211,12 @@ impl Module for ChatEngineModule {
 
         // --- DB wiring ------------------------------------------------------
         //
-        // Thread the modkit-db `DBProvider` returned by `ctx.db_required()`
+        // Thread the toolkit-db `DBProvider` returned by `ctx.db_required()`
         // straight into every repo so reads/writes land on the same handle
         // the migration runner used. Earlier revisions opened a sibling
         // `sea_orm::DatabaseConnection` from a private `database.dsn`
         // config key — that path silently fell back to in-memory SQLite
-        // when the key was absent and bypassed modkit-db's pool sizing,
+        // when the key was absent and bypassed toolkit-db's pool sizing,
         // observability, and SecureConn enforcement. The provider is
         // reparameterised over `ChatEngineError` so `?` lifts both
         // `DbError` and `ScopeError` into the crate's domain enum.
@@ -386,7 +386,7 @@ impl DatabaseCapability for ChatEngineModule {
 impl RestApiCapability for ChatEngineModule {
     fn register_rest(
         &self,
-        _ctx: &ModuleCtx,
+        _ctx: &GearCtx,
         router: Router,
         openapi: &dyn OpenApiRegistry,
     ) -> anyhow::Result<Router> {

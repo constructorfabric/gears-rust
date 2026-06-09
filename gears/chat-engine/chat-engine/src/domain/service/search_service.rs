@@ -7,7 +7,7 @@
 //! back to `LOWER(content) LIKE LOWER(?)` with no ranking. Both backend
 //! impls ship as concrete structs (`crate::infra::search::PgSearchBackend`,
 //! `crate::infra::search::SqliteSearchBackend`) that compile
-//! unconditionally — the `modkit-db` workspace dependency enables BOTH
+//! unconditionally — the `toolkit-db` workspace dependency enables BOTH
 //! the `pg` and `sqlite` cargo features, and Phase 15 owns all per-crate
 //! feature wiring. Selection between the two backends happens at
 //! module-wiring time (Phase 15) based on the materialised
@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
@@ -617,7 +617,7 @@ impl SearchScopeFilter {
 mod tests {
     use super::*;
     use crate::infra::db::entity::session as session_entity;
-    use crate::infra::db::repo::session_repo::{SessionPage, SessionRepo};
+    use crate::infra::db::repo::session_repo::SessionRepo;
     use async_trait::async_trait;
     use serde_json::Value as JsonValue;
     use time::{Duration, OffsetDateTime};
@@ -665,9 +665,8 @@ mod tests {
             &self,
             _tenant_id: &str,
             _user_id: &str,
-            _cursor: Option<&str>,
-            _limit: u32,
-        ) -> std::result::Result<SessionPage, ChatEngineError> {
+            _query: &toolkit_odata::ODataQuery,
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
             unimplemented!()
         }
         async fn update_metadata(

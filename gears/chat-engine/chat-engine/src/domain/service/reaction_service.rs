@@ -46,7 +46,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use tokio::task::JoinHandle;
 use tracing::{info, instrument, warn};
@@ -425,7 +425,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use chat_engine_sdk::models::LifecycleState;
-    use modkit::ClientHub;
+    use toolkit::ClientHub;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use time::OffsetDateTime;
@@ -441,7 +441,7 @@ mod tests {
     use crate::infra::db::repo::reaction_repo::{
         ReactionDeleteOutcome, ReactionRepo, ReactionUpsertOutcome,
     };
-    use crate::infra::db::repo::session_repo::{SessionPage, SessionRepo};
+    use crate::infra::db::repo::session_repo::SessionRepo;
     use crate::infra::db::repo::session_type_repo::SessionTypeRepo;
 
     // ----------------------------- Stubs ----------------------------------
@@ -483,15 +483,11 @@ mod tests {
 
         async fn list_paginated(
             &self,
-            _t: &str,
-            _u: &str,
-            _c: Option<&str>,
-            _l: u32,
-        ) -> std::result::Result<SessionPage, ChatEngineError> {
-            Ok(SessionPage {
-                items: vec![],
-                next_cursor: None,
-            })
+            _tenant_id: &str,
+            _user_id: &str,
+            _query: &toolkit_odata::ODataQuery,
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
+            Ok(toolkit_odata::Page::empty(0))
         }
 
         async fn update_metadata(

@@ -3,7 +3,7 @@
 //! The wire-level types live in `cf-chat-engine-sdk`; this crate consumes
 //! the SDK and exposes:
 //!
-//! - [`ChatEngineModule`] — the `#[modkit::module]`-annotated entrypoint
+//! - [`ChatEngineModule`] — the `#[toolkit::module]`-annotated entrypoint
 //!   used by `cyberware-example-server` via the `inventory`-based
 //!   registrator.
 //! - The re-exported SDK types every downstream test / consumer needs so a

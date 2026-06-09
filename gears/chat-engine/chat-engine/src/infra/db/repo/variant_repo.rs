@@ -2,7 +2,7 @@
 //! [`VariantRepo`](crate::domain::service::variant_service::VariantRepo).
 //!
 //! The trait lives in the domain layer alongside [`VariantService`]; the
-//! impl below threads the modkit-db `DBProvider` through the same handle the
+//! impl below threads the toolkit-db `DBProvider` through the same handle the
 //! migration runner uses, so reads and writes always land on the canonical
 //! connection rather than a sibling pool.
 //
@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use modkit_db::secure::{
+use toolkit_db::secure::{
     AccessScope, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig,
 };
 use sea_orm::sea_query::Expr;
@@ -27,7 +27,7 @@ use crate::infra::db::repo::ChatEngineDb;
 
 /// Sea-ORM-backed implementation of [`VariantRepo`].
 ///
-/// Holds the modkit-db `DBProvider` so every query runs against the same
+/// Holds the toolkit-db `DBProvider` so every query runs against the same
 /// connection the migration runner used. `messages` and `sessions` are both
 /// marked `#[secure(unrestricted)]`; the secure wrappers run with
 /// `AccessScope::allow_all()` and exist only to expose a `&impl DBRunner`
@@ -389,12 +389,12 @@ fn chat_engine_db_err(err: &ChatEngineError) -> Option<&sea_orm::DbErr> {
             // into `ChatEngineError::Internal`; the raw downcast above
             // already covers that path. `DbError::Other(anyhow)` errors
             // (used by the transaction helpers when a domain error
-            // bubbles through) appear as `modkit_db::DbError`, not as a
+            // bubbles through) appear as `toolkit_db::DbError`, not as a
             // bare `DbErr` — so peek through that wrapper too.
             source
-                .downcast_ref::<modkit_db::DbError>()
+                .downcast_ref::<toolkit_db::DbError>()
                 .and_then(|dbe| match dbe {
-                    modkit_db::DbError::Sea(inner) => Some(inner),
+                    toolkit_db::DbError::Sea(inner) => Some(inner),
                     _ => None,
                 })
         })

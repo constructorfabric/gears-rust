@@ -36,7 +36,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use serde_json::{Map, Value as JsonValue};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -540,7 +540,7 @@ mod tests {
     use crate::infra::db::repo::message_repo::{
         FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage,
     };
-    use crate::infra::db::repo::session_repo::{SessionPage, SessionRepo};
+    use crate::infra::db::repo::session_repo::SessionRepo;
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use serde_json::json;
@@ -590,13 +590,9 @@ mod tests {
             &self,
             _tenant_id: &str,
             _user_id: &str,
-            _cursor: Option<&str>,
-            _limit: u32,
-        ) -> Result<SessionPage> {
-            Ok(SessionPage {
-                items: Vec::new(),
-                next_cursor: None,
-            })
+            _query: &toolkit_odata::ODataQuery,
+        ) -> Result<toolkit_odata::Page<session_entity::Model>> {
+            Ok(toolkit_odata::Page::empty(0))
         }
 
         async fn update_metadata(

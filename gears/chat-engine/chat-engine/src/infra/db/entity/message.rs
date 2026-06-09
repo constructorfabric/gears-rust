@@ -1,8 +1,8 @@
 // @cpt-cf-chat-engine-dbtable-messages:p1
 // @cpt-cf-chat-engine-adr-message-tree-structure:p1
 
-use modkit_db::secure::{AccessScope, DBRunner, SecureEntityExt};
-use modkit_db_macros::Scopable;
+use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt};
+use toolkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use sea_orm::{Condition, QueryOrder, QuerySelect, SqlErr};
 use time::OffsetDateTime;

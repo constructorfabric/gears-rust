@@ -13,7 +13,7 @@
 // @cpt-cf-chat-engine-webhook-emitter:p4
 
 use async_trait::async_trait;
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use tracing::debug;
 use uuid::Uuid;
 

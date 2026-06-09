@@ -20,14 +20,17 @@
 // @cpt-cf-chat-engine-adr-session-deletion-strategy:p4
 // @cpt-cf-chat-engine-adr-session-metadata:p4
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use modkit_db::secure::{
+use toolkit_db::odata::{LimitCfg, paginate_odata};
+use toolkit_db::secure::{
     AccessScope, DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
     TxConfig,
 };
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use serde_json::Value as JsonValue;
@@ -41,6 +44,7 @@ use crate::infra::db::entity::message_reaction::{
     self as reaction_entity, Entity as ReactionEntity,
 };
 use crate::infra::db::entity::session::{self as session_entity, Entity as SessionEntity};
+use crate::infra::db::odata_mapper::{SessionODataMapper, SessionQueryFilterField};
 use crate::infra::db::repo::ChatEngineDb;
 
 /// Default soft-delete grace period applied when the session-type doesn't
@@ -53,15 +57,6 @@ pub const MAX_PAGE_SIZE: u32 = 100;
 
 /// Default page size used when the caller does not supply `?limit=`.
 pub const DEFAULT_PAGE_SIZE: u32 = 20;
-
-/// One page of session rows + cursor metadata.
-#[derive(Debug, Clone)]
-pub struct SessionPage {
-    /// Session rows in the page (already ordered `created_at DESC, session_id DESC`).
-    pub items: Vec<session_entity::Model>,
-    /// Opaque continuation cursor for the next page; `None` when exhausted.
-    pub next_cursor: Option<String>,
-}
 
 /// Typed answer returned by [`SessionRepo::check_session_scope`].
 ///
@@ -126,15 +121,17 @@ pub trait SessionRepo: Send + Sync {
         session_id: Uuid,
     ) -> Result<Option<session_entity::Model>, ChatEngineError>;
 
-    /// Cursor-paginated list scoped to `(tenant_id, user_id)`. Excludes
-    /// `hard_deleted` rows; orders by `(created_at DESC, session_id DESC)`.
+    /// `OData`-paginated list scoped to `(tenant_id, user_id)`. Excludes
+    /// `hard_deleted` rows. Honours `$filter` / `$orderby` / `$top` from
+    /// `query`; when `$orderby` is omitted the default order is
+    /// `(created_at DESC, session_id DESC)`. Tenant / user scoping is pinned
+    /// from the caller's identity and is never read from `$filter`.
     async fn list_paginated(
         &self,
         tenant_id: &str,
         user_id: &str,
-        cursor: Option<&str>,
-        limit: u32,
-    ) -> Result<SessionPage, ChatEngineError>;
+        query: &ODataQuery,
+    ) -> Result<Page<session_entity::Model>, ChatEngineError>;
 
     /// Replace the session's `metadata` JSONB and bump `updated_at`. Caller
     /// is responsible for ownership / lifecycle-state preconditions; this
@@ -300,7 +297,7 @@ pub trait SessionRepo: Send + Sync {
 
 /// Sea-ORM-backed implementation of [`SessionRepo`].
 ///
-/// Holds the modkit-db `DBProvider` so every method runs against the same
+/// Holds the toolkit-db `DBProvider` so every method runs against the same
 /// connection the migration runner used. `sessions` carries `String`
 /// tenant/user identifiers rather than `Uuid`, so the entity is marked
 /// `#[secure(unrestricted)]` and scoping stays explicit in the per-method
@@ -394,14 +391,15 @@ impl SessionRepo for SeaSessionRepo {
         &self,
         tenant_id: &str,
         user_id: &str,
-        cursor: Option<&str>,
-        limit: u32,
-    ) -> Result<SessionPage, ChatEngineError> {
-        let page_size = limit.clamp(1, MAX_PAGE_SIZE);
+        query: &ODataQuery,
+    ) -> Result<Page<session_entity::Model>, ChatEngineError> {
         let conn = self.db.conn()?;
         let scope = AccessScope::allow_all();
 
-        let mut query = SessionEntity::find()
+        // Tenant / user scoping and the hard-delete exclusion come from the
+        // caller's identity, never from the OData `$filter`, so they live in
+        // the base query rather than the caller-controlled clause.
+        let base_query = SessionEntity::find()
             .secure()
             .scope_with(&scope)
             .filter(
@@ -412,49 +410,35 @@ impl SessionRepo for SeaSessionRepo {
                         session_entity::Column::LifecycleState
                             .ne(LifecycleState::HardDeleted.as_str().to_string()),
                     ),
-            )
-            .order_by(session_entity::Column::CreatedAt, sea_orm::Order::Desc)
-            .order_by(session_entity::Column::SessionId, sea_orm::Order::Desc);
-
-        if let Some(raw) = cursor {
-            let decoded = decode_cursor(raw)?;
-            // Tuple keyset: created_at < cursor.created_at
-            //               OR (created_at = cursor.created_at AND session_id < cursor.session_id).
-            query = query.filter(
-                Condition::any()
-                    .add(session_entity::Column::CreatedAt.lt(decoded.created_at))
-                    .add(
-                        Condition::all()
-                            .add(session_entity::Column::CreatedAt.eq(decoded.created_at))
-                            .add(session_entity::Column::SessionId.lt(decoded.session_id)),
-                    ),
             );
-        }
 
-        // Fetch page_size + 1 so we know whether another page follows.
-        let fetched = query
-            .limit(u64::from(page_size) + 1)
-            .all(&conn)
-            .await?;
-
-        let mut items: Vec<session_entity::Model> = fetched.into_iter().collect();
-        let has_more = items.len() > page_size as usize;
-        if has_more {
-            items.truncate(page_size as usize);
-        }
-
-        let next_cursor = if has_more {
-            items.last().map(|last| {
-                encode_cursor(&CursorPoint {
-                    created_at: last.created_at,
-                    session_id: last.session_id,
-                })
-            })
+        // Default-recent posture: when the caller supplies neither a cursor
+        // nor `$orderby`, sort by `created_at DESC`. `session_id` is appended
+        // as the unique tiebreaker by `paginate_odata`, yielding the legacy
+        // `(created_at DESC, session_id DESC)` total order.
+        let query = if query.cursor.is_none() && query.order.is_empty() {
+            let mut adjusted = query.clone();
+            adjusted.order = adjusted.order.ensure_tiebreaker("created_at", SortDir::Desc);
+            Cow::Owned(adjusted)
         } else {
-            None
+            Cow::Borrowed(query)
         };
 
-        Ok(SessionPage { items, next_cursor })
+        let limit_cfg = LimitCfg {
+            default: u64::from(DEFAULT_PAGE_SIZE),
+            max: u64::from(MAX_PAGE_SIZE),
+        };
+
+        paginate_odata::<SessionQueryFilterField, SessionODataMapper, _, _, _, _>(
+            base_query,
+            &conn,
+            query.as_ref(),
+            ("session_id", SortDir::Desc),
+            limit_cfg,
+            std::convert::identity,
+        )
+        .await
+        .map_err(map_odata_err)
     }
 
     async fn update_metadata(
@@ -823,105 +807,13 @@ impl SessionRepo for SeaSessionRepo {
     }
 }
 
-/// Decoded cursor point used by `list_paginated`.
-#[derive(Debug, Clone)]
-struct CursorPoint {
-    created_at: OffsetDateTime,
-    session_id: Uuid,
-}
-
-/// Encode a cursor point as `hex(<rfc3339_created_at>|<session_uuid>)`.
+/// Classify an `OData` pagination failure into a [`ChatEngineError`].
 ///
-/// The wire format is intentionally opaque to clients — they round-trip the
-/// `next_cursor` returned in the previous response. Hex encoding is used
-/// (rather than base64) to avoid pulling in an additional crate; the cursor
-/// is short enough that the size penalty is negligible.
-fn encode_cursor(point: &CursorPoint) -> String {
-    use time::format_description::well_known::Rfc3339;
-
-    let ts = point
-        .created_at
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| String::new());
-    let raw = format!("{ts}|{}", point.session_id);
-    hex_encode(raw.as_bytes())
-}
-
-fn decode_cursor(s: &str) -> Result<CursorPoint, ChatEngineError> {
-    use time::format_description::well_known::Rfc3339;
-
-    let bytes = hex_decode(s)
-        .map_err(|e| ChatEngineError::bad_request(format!("invalid cursor: {e}")))?;
-    let text = String::from_utf8(bytes)
-        .map_err(|e| ChatEngineError::bad_request(format!("invalid cursor: {e}")))?;
-    let mut parts = text.splitn(2, '|');
-    let ts = parts
-        .next()
-        .ok_or_else(|| ChatEngineError::bad_request("invalid cursor: missing timestamp"))?;
-    let id = parts
-        .next()
-        .ok_or_else(|| ChatEngineError::bad_request("invalid cursor: missing id"))?;
-    let created_at = OffsetDateTime::parse(ts, &Rfc3339)
-        .map_err(|e| ChatEngineError::bad_request(format!("invalid cursor: {e}")))?;
-    let session_id = Uuid::parse_str(id)
-        .map_err(|e| ChatEngineError::bad_request(format!("invalid cursor: {e}")))?;
-    Ok(CursorPoint {
-        created_at,
-        session_id,
-    })
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
-        return Err("odd hex length".into());
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-fn hex_nibble(b: u8) -> Result<u8, String> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(format!("invalid hex char: {}", b as char)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cursor_roundtrip() {
-        let point = CursorPoint {
-            created_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
-            session_id: Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap(),
-        };
-        let encoded = encode_cursor(&point);
-        let decoded = decode_cursor(&encoded).expect("decode");
-        assert_eq!(decoded.session_id, point.session_id);
-        assert_eq!(decoded.created_at, point.created_at);
-    }
-
-    #[test]
-    fn decode_rejects_garbage() {
-        assert!(decode_cursor("!!!not-base64!!!").is_err());
+/// Filter / orderby / cursor problems are caller mistakes (HTTP 400); a
+/// `Db` failure is an internal fault (HTTP 500).
+fn map_odata_err(err: toolkit_odata::Error) -> ChatEngineError {
+    match err {
+        toolkit_odata::Error::Db(msg) => ChatEngineError::internal(msg),
+        other => ChatEngineError::bad_request(other.to_string()),
     }
 }

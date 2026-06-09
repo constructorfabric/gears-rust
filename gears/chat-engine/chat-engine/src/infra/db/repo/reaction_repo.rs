@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use modkit_db::secure::{
+use toolkit_db::secure::{
     AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, TxConfig,
 };
 use sea_orm::sea_query::OnConflict;
@@ -112,7 +112,7 @@ pub trait ReactionRepo: Send + Sync {
 
 /// Sea-ORM-backed implementation of [`ReactionRepo`].
 ///
-/// Holds the modkit-db `DBProvider` so every query runs against the same
+/// Holds the toolkit-db `DBProvider` so every query runs against the same
 /// connection the migration runner used. `message_reactions` has no
 /// tenant column (entity is marked `#[secure(unrestricted)]`); the
 /// secure wrappers run with `AccessScope::allow_all()` and exist to

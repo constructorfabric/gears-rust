@@ -29,7 +29,7 @@ use axum::extract::{Path, Query};
 use tracing::field::Empty;
 use uuid::Uuid;
 
-use modkit_security::SecurityContext;
+use toolkit_security::SecurityContext;
 
 use crate::api::rest::handlers::sessions::identity_from_ctx;
 use crate::domain::error::Result;

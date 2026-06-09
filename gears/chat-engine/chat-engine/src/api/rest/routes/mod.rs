@@ -8,7 +8,7 @@
 //! module.
 //!
 //! `operation_id` naming follows the `chat_engine.<resource>.<action>`
-//! convention from `docs/modkit_unified_system/04_rest_operation_builder.md`.
+//! convention from `docs/toolkit_unified_system/04_rest_operation_builder.md`.
 //!
 //! Service DI is attached **once** at the end via `Extension<Arc<…>>`
 //! layers, matching the ModKit reference wiring.
@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use axum::{Extension, Router};
 use http::StatusCode;
-use modkit::api::operation_builder::{LicenseFeature, OperationBuilder};
-use modkit::api::OpenApiRegistry;
+use toolkit::api::operation_builder::{LicenseFeature, OperationBuilder};
+use toolkit::api::OpenApiRegistry;
 
 use crate::api::rest::dto::{
     CreateSessionRequestDto, ExportAcceptedDto, MessageDto, MessageListDto, ReactionListDto,
