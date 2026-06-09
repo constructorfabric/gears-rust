@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chat_engine::domain::service::message_service::{MessageService, SendMessageRequest};
+use chat_engine::infra::db::repo::message_repo::MessageRepo;
 use chat_engine::domain::service::plugin_service::PluginService;
 use chat_engine::domain::service::session_service::Identity;
 use chat_engine_sdk::{
@@ -296,7 +297,58 @@ async fn soft_deleted_session_rejects_send_against_sqlite() {
 }
 
 // ===========================================================================
-// 4. Auth scoping — a different tenant calling send_message on the same
+// 4. Cascade delete — delete_message_subtree removes the whole subtree
+//    (layered collect + per-level leaf-to-root delete) and leaves unrelated
+//    subtrees intact, against the real DB.
+// ===========================================================================
+
+#[tokio::test]
+async fn delete_message_subtree_removes_whole_tree_against_sqlite() {
+    let harness = db::setup_sqlite().await;
+    let plugin_id = "subtree-delete-plugin";
+    let session_type_id = db::seed_session_type(&harness, plugin_id).await;
+    let session_id =
+        db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+
+    // Deep + wide tree under `root`:  root → {a, b};  a → gc.
+    // Plus an unrelated root (`other`) that must survive the delete.
+    // Siblings under `root` need distinct variant_index (UNIQUE constraint);
+    // the two NULL-parent roots don't conflict (NULLs are distinct).
+    let root = db::seed_message(&harness, session_id, None, 0).await;
+    let a = db::seed_message(&harness, session_id, Some(root), 0).await;
+    let b = db::seed_message(&harness, session_id, Some(root), 1).await;
+    let gc = db::seed_message(&harness, session_id, Some(a), 0).await;
+    let other = db::seed_message(&harness, session_id, None, 0).await;
+
+    let removed = harness
+        .messages
+        .delete_message_subtree(session_id, root)
+        .await
+        .expect("delete subtree");
+    assert_eq!(removed, 4, "root + a + b + gc must all be deleted; got {removed}");
+
+    for (label, id) in [("root", root), ("a", a), ("b", b), ("gc", gc)] {
+        assert!(
+            db::find_message(&harness.db, id).await.is_none(),
+            "{label} ({id}) should be gone after subtree delete",
+        );
+    }
+    assert!(
+        db::find_message(&harness.db, other).await.is_some(),
+        "unrelated subtree must survive the delete",
+    );
+
+    // Idempotency: deleting an already-removed root is a no-op.
+    let again = harness
+        .messages
+        .delete_message_subtree(session_id, root)
+        .await
+        .expect("re-delete missing root");
+    assert_eq!(again, 0, "second delete of the same root must remove nothing");
+}
+
+// ===========================================================================
+// 5. Auth scoping — a different tenant calling send_message on the same
 //    session id must 404 (anti-enumeration). No DB mutation.
 // ===========================================================================
 
