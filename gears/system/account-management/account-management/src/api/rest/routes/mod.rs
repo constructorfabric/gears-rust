@@ -17,6 +17,7 @@ use crate::domain::metadata::service::MetadataService;
 use crate::domain::user::service::UserService;
 
 mod conversions;
+mod me;
 mod metadata;
 mod tenants;
 mod users;
@@ -36,6 +37,7 @@ pub fn register_routes(
     router = metadata::register_metadata_routes(router, openapi);
     router = users::register_users_routes(router, openapi);
     router = conversions::register_conversions_routes(router, openapi);
+    router = me::register_me_routes(router, openapi);
     router = router.layer(axum::Extension(tenant_service));
     router = router.layer(axum::Extension(metadata_service));
     router = router.layer(axum::Extension(user_service));

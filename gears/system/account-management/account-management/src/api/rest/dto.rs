@@ -17,6 +17,7 @@ use account_management_sdk::{
     CreateTenantRequest, IdpNewUser, IdpUser, MetadataEntry, Tenant, TenantStatus,
     UpdateTenantRequest,
 };
+use toolkit_security::SecurityContext;
 
 use crate::domain::conversion::model::{
     ConversionRequest, ConversionSide, ConversionStatus, TargetMode,
@@ -209,6 +210,40 @@ impl UserDto {
             display_name: user.display_name,
             first_name: user.first_name,
             last_name: user.last_name,
+        }
+    }
+}
+
+/// Authenticated subject identity for `GET /account-management/v1/me`.
+///
+/// Projection of [`SecurityContext`]: the caller's subject id, optional
+/// subject type, and single home tenant (`subject_tenant_id`). Pure
+/// reflection of the validated token context — AM performs no
+/// tenant-existence check here. `subject_type` is the optional `IdP` claim
+/// and is omitted from the wire when absent rather than serialised as
+/// `null`.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+// Wire field names mirror the SecurityContext accessor vocabulary
+// (`subject_id`, `subject_type`, `subject_tenant_id`). The shared
+// `subject_` prefix is load-bearing for codegen clients — renaming
+// would break the wire contract, so the lint is suppressed here.
+#[allow(clippy::struct_field_names)]
+pub struct MeDto {
+    pub subject_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_type: Option<String>,
+    pub subject_tenant_id: Uuid,
+}
+
+impl MeDto {
+    /// Project the request's [`SecurityContext`] into the wire shape.
+    #[must_use]
+    pub(crate) fn from_security_context(ctx: &SecurityContext) -> Self {
+        Self {
+            subject_id: ctx.subject_id(),
+            subject_type: ctx.subject_type().map(str::to_owned),
+            subject_tenant_id: ctx.subject_tenant_id(),
         }
     }
 }

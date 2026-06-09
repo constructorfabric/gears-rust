@@ -1,5 +1,5 @@
 # Created:  2026-04-19 by Virtuozzo
-# Updated:  2026-04-19 by Virtuozzo
+# Updated:  2026-06-09 by Virtuozzo
 
 openapi: 3.1.0
 info:
@@ -20,15 +20,17 @@ info:
     within v1 do not rev the path.
 
     **Implementation status:** Tenant CRUD, tenant-metadata, IdP
-    user-ops, and conversion-request REST surfaces are all published.
-    The conversion family covers both sides of the dual-consent pair
-    (`/conversions` for the converting tenant; `/child-conversions`
-    for the parent counterparty).
+    user-ops, conversion-request, and identity (`GET /v1/me`) REST
+    surfaces are all published. The conversion family covers both sides
+    of the dual-consent pair (`/conversions` for the converting tenant;
+    `/child-conversions` for the parent counterparty).
 
 servers:
   - url: https://api.example.com
 
 tags:
+  - name: Identity
+    description: Non-tenant-scoped identity reflection endpoint.
   - name: tenants
     description: Tenant hierarchy lifecycle and direct-child discovery.
   - name: metadata
@@ -55,6 +57,29 @@ security:
   - bearerAuth: []
 
 paths:
+  /api/account-management/v1/me:
+    get:
+      operationId: getMe
+      tags: [Identity]
+      summary: Return the authenticated subject's identity and home tenant
+      description: |
+        Return the authenticated subject's identity — `subject_id`,
+        `subject_type`, and home tenant (`subject_tenant_id`) — read from the
+        validated bearer token's security context. Non-tenant-scoped: call
+        it right after login to discover your single home tenant before
+        issuing tenant-scoped requests. Pure context reflection: AM performs
+        no tenant-existence check here; a dangling or deleted home tenant
+        surfaces on the tenant-scoped resource routes, not on this endpoint.
+      responses:
+        '200':
+          description: Authenticated subject identity and home tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        default:
+          $ref: '#/components/responses/Problem'
+
   /api/account-management/v1/tenants:
     post:
       operationId: createTenant
@@ -757,6 +782,32 @@ components:
     EmptyObject:
       type: object
       additionalProperties: false
+
+    Me:
+      type: object
+      additionalProperties: false
+      required:
+        - subject_id
+        - subject_tenant_id
+      description: |
+        Authenticated subject identity returned by `GET /v1/me`.
+        Pure reflection of the validated bearer token's security context.
+        `subject_type` is the optional IdP claim and is omitted from the
+        wire when absent (never serialised as `null`).
+      properties:
+        subject_id:
+          type: string
+          format: uuid
+          description: Authenticated subject's UUID.
+        subject_type:
+          type: string
+          description: |
+            Optional IdP-supplied subject type claim. Omitted when the
+            validated token carries no subject-type annotation.
+        subject_tenant_id:
+          type: string
+          format: uuid
+          description: Home tenant UUID for the authenticated subject.
 
     TenantStatus:
       type: string

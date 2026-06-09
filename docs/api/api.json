@@ -1485,6 +1485,30 @@
         },
         "type": "object"
       },
+      "MeDto": {
+        "description": "Authenticated subject identity for `GET /account-management/v1/me`.\n\nProjection of [`SecurityContext`]: the caller's subject id, optional\nsubject type, and single home tenant (`subject_tenant_id`). Pure\nreflection of the validated token context — AM performs no\ntenant-existence check here. `subject_type` is the optional `IdP` claim\nand is omitted from the wire when absent rather than serialised as\n`null`.",
+        "properties": {
+          "subject_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "subject_tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "subject_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "subject_id",
+          "subject_tenant_id"
+        ],
+        "type": "object"
+      },
       "MembershipDto": {
         "description": "REST DTO for membership representation.\n\nMembership responses do NOT include `tenant_id` (derived from group).",
         "properties": {
@@ -4430,6 +4454,103 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/account-management/v1/me": {
+      "get": {
+        "description": "Return the authenticated subject's identity -- subject id, subject type, and home tenant (`subject_tenant_id`) -- read from the validated bearer token's security context. Non-tenant-scoped: call it right after login to discover your single home tenant before issuing tenant-scoped requests. Pure context reflection: AM performs no tenant-existence check here; a dangling or deleted home tenant surfaces on the tenant-scoped resource routes, not on this endpoint.",
+        "operationId": "account_management.get_me",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeDto"
+                }
+              }
+            },
+            "description": "Authenticated subject identity and home tenant"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Return the authenticated subject's identity and home tenant",
+        "tags": [
+          "Identity"
+        ]
+      }
+    },
     "/account-management/v1/tenants": {
       "post": {
         "description": "Create a non-root tenant under an existing parent tenant. The server validates the chained `tenant_type` against the published GTS schema, derives the canonical UUIDv5 internally, and checks hierarchy constraints (parent exists + is `active`) before invoking the configured IdP tenant-provisioning contract. The new tenant id is server-allocated; clients receive it in the response body and in the `Location` header. Returns HTTP 201 Created with the post-create tenant projection in `status=active`.",

@@ -1,12 +1,13 @@
 //! Wire-shape tests for the Account Management REST DTOs.
 //!
-//! Three endpoint families:
+//! Four endpoint families:
 //!
 //! * tenant hierarchy — `TenantDto`, `TenantCreateRequestDto`,
 //!   `TenantUpdateRequestDto`.
 //! * tenant-metadata — `TenantMetadataEntryDto`,
 //!   `ResolvedTenantMetadataDto`, `PutTenantMetadataDto`.
 //! * `IdP` user-ops — `UserCreateRequestDto`, `UserDto`.
+//! * identity — `MeDto` (subject id, type, home tenant).
 //!
 //! Focus: serde round-trips that the `OpenAPI` yaml relies on,
 //! plus the SDK ↔ DTO conversion helpers (`from_idp_user`,
@@ -22,9 +23,12 @@ use uuid::Uuid;
 use account_management_sdk::{IdpUser, MetadataEntry, Tenant, TenantId, TenantStatus};
 use gts::GtsTypeId;
 
+use toolkit_security::SecurityContext;
+
 use super::{
-    NewUserPasswordDto, PutTenantMetadataDto, ResolvedTenantMetadataDto, TenantCreateRequestDto,
-    TenantDto, TenantMetadataEntryDto, TenantUpdateRequestDto, UserCreateRequestDto, UserDto,
+    MeDto, NewUserPasswordDto, PutTenantMetadataDto, ResolvedTenantMetadataDto,
+    TenantCreateRequestDto, TenantDto, TenantMetadataEntryDto, TenantUpdateRequestDto,
+    UserCreateRequestDto, UserDto,
 };
 
 fn sample_tenant() -> Uuid {
@@ -993,4 +997,61 @@ mod conversions {
         assert_eq!(input.target_mode, TargetMode::Managed);
         assert!(input.comment.is_none());
     }
+}
+
+// ---- /me identity DTO -------------------------------------------
+
+fn sample_subject_id() -> Uuid {
+    Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap()
+}
+
+fn sample_home_tenant() -> Uuid {
+    Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap()
+}
+
+#[test]
+fn me_dto_carries_subject_id_type_and_home_tenant() {
+    let ctx = SecurityContext::builder()
+        .subject_id(sample_subject_id())
+        .subject_type("user")
+        .subject_tenant_id(sample_home_tenant())
+        .build()
+        .expect("ctx");
+
+    let dto = MeDto::from_security_context(&ctx);
+    let json: Value = serde_json::to_value(&dto).unwrap();
+
+    assert_eq!(
+        json,
+        json!({
+            "subject_id": "33333333-3333-3333-3333-333333333333",
+            "subject_type": "user",
+            "subject_tenant_id": "44444444-4444-4444-4444-444444444444",
+        }),
+        "wire shape mirrors SecurityContext: subject id, type, home tenant",
+    );
+}
+
+#[test]
+fn me_dto_omits_subject_type_when_absent() {
+    // `subject_type` is the optional IdP claim — when the context carries
+    // no type, the field MUST be omitted from the wire (not `null`), so
+    // codegen clients see an absent optional rather than an explicit null.
+    let ctx = SecurityContext::builder()
+        .subject_id(sample_subject_id())
+        .subject_tenant_id(sample_home_tenant())
+        .build()
+        .expect("ctx");
+
+    let dto = MeDto::from_security_context(&ctx);
+    let json: Value = serde_json::to_value(&dto).unwrap();
+
+    assert_eq!(
+        json,
+        json!({
+            "subject_id": "33333333-3333-3333-3333-333333333333",
+            "subject_tenant_id": "44444444-4444-4444-4444-444444444444",
+        }),
+        "absent subject_type serialises with no `subject_type` key",
+    );
 }
