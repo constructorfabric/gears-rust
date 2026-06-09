@@ -5134,9 +5134,9 @@ dependencies = [
 
 [[package]]
 name = "kreuzberg"
-version = "4.9.4"
+version = "4.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "075403eee3e430917b55b195ef90098c6252d737883eba38c80d2297deaccb08"
+checksum = "a9b6e7118097d06f882f62427e6d8722eef31bc20bd0b2f434a8b8785d05c30c"
 dependencies = [
  "ahash 0.8.12",
  "async-trait",
