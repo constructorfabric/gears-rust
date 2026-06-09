@@ -714,48 +714,61 @@ impl MessageRepo for SeaMessageRepo {
         root_id: Uuid,
     ) -> Result<u64, ChatEngineError> {
         // Idempotency: a missing root is a no-op (returns 0). The
-        // SERIALIZABLE transaction wraps the recursive walk so concurrent
-        // cleanup runs cannot observe partial deletes.
+        // SERIALIZABLE transaction wraps the walk so concurrent cleanup runs
+        // cannot observe partial deletes — keeping it short (O(depth)
+        // round-trips, not O(n)) limits serialization-failure / lock
+        // contention on the retention hot path.
         self.db
             .transaction_with_config(TxConfig::serializable(), move |tx| {
                 Box::pin(async move {
                     let scope = AccessScope::allow_all();
-                    // BFS through `parent_message_id` to collect every
-                    // descendant. We accumulate ids first so the
-                    // FK-on-parent ordering can be enforced (children
-                    // deleted before parents).
-                    let mut to_visit: Vec<Uuid> = vec![root_id];
-                    let mut ordered: Vec<Uuid> = Vec::new();
-                    while let Some(id) = to_visit.pop() {
-                        ordered.push(id);
+                    // Collect the subtree breadth-first, one
+                    // `is_in(frontier)` query per tree level instead of one
+                    // `find` per node (mirrors
+                    // `SeaVariantRepo::collect_descendants`). `levels[0]` is
+                    // the root; deeper levels follow.
+                    let mut levels: Vec<Vec<Uuid>> = vec![vec![root_id]];
+                    loop {
+                        let frontier = levels.last().expect("levels is never empty");
                         let children: Vec<Uuid> = MessageEntity::find()
                             .secure()
                             .scope_with(&scope)
                             .filter(
                                 Condition::all()
                                     .add(message_entity::Column::SessionId.eq(session_id))
-                                    .add(message_entity::Column::ParentMessageId.eq(id)),
+                                    .add(
+                                        message_entity::Column::ParentMessageId
+                                            .is_in(frontier.clone()),
+                                    ),
                             )
                             .all(tx)
                             .await?
                             .into_iter()
                             .map(|m| m.message_id)
                             .collect();
-                        to_visit.extend(children);
+                        if children.is_empty() {
+                            break;
+                        }
+                        levels.push(children);
                     }
-                    // Delete leaves-first (reverse traversal order) so
-                    // the on_delete=Restrict FK from
-                    // `messages.parent_message_id -> messages.message_id`
-                    // is satisfied at every step.
+                    // Delete one whole level per round-trip, deepest first.
+                    // A single `is_in(all_ids)` delete is unsafe here: the
+                    // `messages.parent_message_id -> messages.message_id` FK
+                    // is `on_delete = Restrict`, which is checked immediately
+                    // (not deferred to statement end), so a batch that
+                    // removed a parent before its child would fail. Sibling
+                    // nodes within one level never reference each other, so
+                    // each per-level batch is FK-safe once the level below it
+                    // is already gone.
                     let mut removed: u64 = 0;
-                    for id in ordered.into_iter().rev() {
+                    for level in levels.into_iter().rev() {
                         let res = MessageEntity::delete_many()
                             .secure()
                             .scope_with(&scope)
                             .filter(
                                 Condition::all()
-                                    .add(message_entity::Column::MessageId.eq(id))
-                                    .add(message_entity::Column::SessionId.eq(session_id)),
+                                    .add(message_entity::Column::SessionId.eq(session_id))
+                                    .add(message_entity::Column::MessageId.is_in(level)),
                             )
                             .exec(tx)
                             .await?;

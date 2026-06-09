@@ -28,7 +28,7 @@ use chat_engine::infra::db::repo::plugin_config_repo::{PluginConfigRepo, SeaPlug
 use chat_engine::infra::db::repo::session_repo::{SeaSessionRepo, SessionRepo};
 use chat_engine::infra::db::repo::session_type_repo::{SeaSessionTypeRepo, SessionTypeRepo};
 use chat_engine::infra::db::Migrator;
-use toolkit_db::secure::{AccessScope, SecureEntityExt};
+use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
 use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
@@ -138,6 +138,46 @@ pub async fn seed_active_session(
         updated_at: Set(now),
     };
     h.sessions.insert(am).await.expect("insert session row");
+    id
+}
+
+/// Insert a `messages` row under `parent_message_id` (NULL for a root)
+/// with the given `variant_index`. Siblings under the same parent must use
+/// distinct indices (the `uq_messages_session_parent_variant` constraint).
+/// Returns the generated message id. Used to build subtrees for the
+/// cascade-delete tests.
+pub async fn seed_message(
+    h: &DbHarness,
+    session_id: Uuid,
+    parent_message_id: Option<Uuid>,
+    variant_index: i32,
+) -> Uuid {
+    let conn = h.db.conn().expect("conn for seed_message");
+    let scope = AccessScope::allow_all();
+    let id = Uuid::new_v4();
+    let now = OffsetDateTime::now_utc();
+    let am = message::ActiveModel {
+        message_id: Set(id),
+        session_id: Set(session_id),
+        parent_message_id: Set(parent_message_id),
+        role: Set("user".to_string()),
+        content: Set(JsonValue::Object(serde_json::Map::new())),
+        file_ids: Set(None),
+        variant_index: Set(variant_index),
+        is_active: Set(true),
+        is_complete: Set(true),
+        is_hidden_from_user: Set(false),
+        is_hidden_from_backend: Set(false),
+        metadata: Set(None),
+        created_at: Set(now),
+    };
+    message::Entity::insert(am)
+        .secure()
+        .scope_unchecked(&scope)
+        .expect("scope message insert")
+        .exec(&conn)
+        .await
+        .expect("insert message row");
     id
 }
 
