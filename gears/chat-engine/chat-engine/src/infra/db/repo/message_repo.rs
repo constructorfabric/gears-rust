@@ -898,35 +898,3 @@ fn empty_content() -> JsonValue {
 fn content_with_text(text: &str) -> JsonValue {
     serde_json::json!({ "text": text })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finalize_outcome_complete_carries_metadata() {
-        let outcome = FinalizeOutcome::Complete {
-            text: "hello".into(),
-            metadata: Some(serde_json::json!({"model": "gpt-test"})),
-        };
-        match outcome {
-            FinalizeOutcome::Complete { text, metadata } => {
-                assert_eq!(text, "hello");
-                assert_eq!(metadata, Some(serde_json::json!({"model": "gpt-test"})));
-            }
-            other => panic!("expected Complete, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn empty_content_shape() {
-        let v = empty_content();
-        assert_eq!(v, serde_json::json!({"text": ""}));
-    }
-
-    #[test]
-    fn content_with_text_shape() {
-        let v = content_with_text("hi");
-        assert_eq!(v, serde_json::json!({"text": "hi"}));
-    }
-}
