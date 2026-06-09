@@ -348,7 +348,7 @@ uuid = { version = "1.19", features = ["serde"] }
 governor = "0.10"
 
 # OpenAPI documentation (only for api-gateway)
-utoipa = { version = "5.4", features = [
+utoipa = { version = "5.5", features = [
     "macros",
     "openapi_extensions",
     "chrono",
