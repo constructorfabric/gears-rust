@@ -344,7 +344,7 @@ tower-http = { version = "0.6", features = [
     "follow-redirect",
     "catch-panic",
 ] }
-uuid = { version = "1.19", features = ["serde"] }
+uuid = { version = "1.23", features = ["serde"] }
 governor = "0.10"
 
 # OpenAPI documentation (only for api-gateway)
