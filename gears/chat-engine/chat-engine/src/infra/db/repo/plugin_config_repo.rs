@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use modkit_db::secure::{AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt};
+use toolkit_db::secure::{AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Set};
 use serde_json::Value as JsonValue;
@@ -65,7 +65,7 @@ pub trait PluginConfigRepo: Send + Sync {
 
 /// Sea-ORM-backed implementation of [`PluginConfigRepo`].
 ///
-/// Holds the modkit-db `DBProvider` so every method runs against the same
+/// Holds the toolkit-db `DBProvider` so every method runs against the same
 /// connection the migration runner used. `plugin_configs` has no tenant
 /// column (entity is marked `#[secure(unrestricted)]`), so the secure
 /// wrappers run with `AccessScope::allow_all()` — they give us a

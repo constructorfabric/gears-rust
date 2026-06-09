@@ -2,7 +2,7 @@
 //! `DBProvider` the production module uses.
 //!
 //! The harness opens a single in-memory SQLite database through
-//! `modkit_db::connect_db`, applies the production migration set via
+//! `toolkit_db::connect_db`, applies the production migration set via
 //! `run_migrations_for_testing`, and wraps the resulting `Db` in a
 //! `DBProvider<ChatEngineError>` keyed on `ChatEngineError`. Every repo
 //! and every test helper receives that same `Arc<ChatEngineDb>`, so
@@ -28,8 +28,8 @@ use chat_engine::infra::db::repo::plugin_config_repo::{PluginConfigRepo, SeaPlug
 use chat_engine::infra::db::repo::session_repo::{SeaSessionRepo, SessionRepo};
 use chat_engine::infra::db::repo::session_type_repo::{SeaSessionTypeRepo, SessionTypeRepo};
 use chat_engine::infra::db::Migrator;
-use modkit_db::secure::{AccessScope, SecureEntityExt};
-use modkit_db::{ConnectOpts, DBProvider, connect_db};
+use toolkit_db::secure::{AccessScope, SecureEntityExt};
+use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
@@ -47,7 +47,7 @@ pub struct DbHarness {
 }
 
 /// Open a fresh in-memory SQLite database, apply every chat-engine
-/// migration through modkit-db, and wire the production repo impls on
+/// migration through toolkit-db, and wire the production repo impls on
 /// top of the resulting `DBProvider`.
 ///
 /// `max_conns: Some(1)` is load-bearing: `sqlite::memory:` gives each
@@ -66,9 +66,9 @@ pub async fn setup_sqlite() -> DbHarness {
         .await
         .expect("connect sqlite::memory:");
 
-    // Apply the production migration set against the modkit-db handle so
+    // Apply the production migration set against the toolkit-db handle so
     // every repo built below queries the same connection state.
-    modkit_db::migration_runner::run_migrations_for_testing(&db, Migrator::migrations())
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, Migrator::migrations())
         .await
         .expect("apply chat-engine migrations");
 
@@ -259,7 +259,7 @@ pub async fn force_lifecycle_state(
     session_id: Uuid,
     new_state: &str,
 ) {
-    use modkit_db::secure::SecureUpdateExt;
+    use toolkit_db::secure::SecureUpdateExt;
     use sea_orm::sea_query::Expr;
 
     let conn = db.conn().expect("conn for force_lifecycle_state");

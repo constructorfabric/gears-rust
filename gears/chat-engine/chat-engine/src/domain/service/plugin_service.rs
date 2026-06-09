@@ -33,9 +33,9 @@
 
 use std::sync::Arc;
 
-use modkit::ClientHub;
-use modkit::client_hub::ClientScope;
-use modkit_macros::domain_model;
+use toolkit::ClientHub;
+use toolkit::client_hub::ClientScope;
+use toolkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use tracing::warn;
 use uuid::Uuid;

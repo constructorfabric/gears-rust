@@ -37,9 +37,8 @@ pub use search_service::{
     SearchScopeFilter, SearchService, parse_search_query,
 };
 pub use session_service::{
-    CreateSessionRequest, DEFAULT_PLUGIN_CALL_TIMEOUT, Identity, PaginatedSessions,
-    RegisterSessionTypeRequest, SessionDeleteOutcome, SessionService, redact_session,
-    reject_reserved_metadata,
+    CreateSessionRequest, DEFAULT_PLUGIN_CALL_TIMEOUT, Identity, RegisterSessionTypeRequest,
+    SessionDeleteOutcome, SessionService, redact_session, reject_reserved_metadata,
 };
 pub use variant_service::{
     DEFAULT_SWITCH_TYPE_DEADLINE, VariantEntry, VariantListing, VariantRepo, VariantService,

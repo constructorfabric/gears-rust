@@ -18,7 +18,7 @@
 // @cpt-cf-chat-engine-domain-reaction:p9
 // @cpt-cf-chat-engine-adr-message-reactions:p9
 
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;

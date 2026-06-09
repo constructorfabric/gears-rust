@@ -31,8 +31,8 @@ use chat_engine_sdk::{
     ChatEngineBackendPlugin, PluginError, StreamingChunkEvent, StreamingEvent,
 };
 use futures::StreamExt;
-use modkit::ClientHub;
-use modkit::client_hub::ClientScope;
+use toolkit::ClientHub;
+use toolkit::client_hub::ClientScope;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 

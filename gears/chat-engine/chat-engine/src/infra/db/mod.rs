@@ -2,11 +2,12 @@
 //!
 //! Phase 1 populates only schema and entity definitions. Repository
 //! implementations and concrete `DBRunner` integration happen in later phases
-//! (4, 5, 9, 11, 12) — those phases consume `&impl modkit_db::secure::DBRunner`
+//! (4, 5, 9, 11, 12) — those phases consume `&impl toolkit_db::secure::DBRunner`
 //! directly per the workspace pattern in `mini-chat`.
 
 pub mod entity;
 pub mod migrations;
+pub mod odata_mapper;
 pub mod repo;
 
 pub use entity::{
@@ -17,7 +18,7 @@ pub use migrations::Migrator;
 
 use std::sync::Arc;
 
-/// Newtype wrapper over the shared `modkit_db::Db` handle.
+/// Newtype wrapper over the shared `toolkit_db::Db` handle.
 ///
 /// Repositories in later phases accept `&impl DBRunner` directly (the
 /// workspace-wide pattern), so this newtype exists to give the application
@@ -27,7 +28,7 @@ use std::sync::Arc;
 /// `DBRunner` impls on `DbConn` / `SecureConn`.
 #[derive(Clone, Debug)]
 pub struct Connection {
-    inner: Arc<modkit_db::Db>,
+    inner: Arc<toolkit_db::Db>,
 }
 
 impl Connection {
@@ -35,21 +36,21 @@ impl Connection {
     /// by the runtime (`DatabaseCapability::connection()` — wired in Phase
     /// 15).
     #[must_use]
-    pub fn new(db: Arc<modkit_db::Db>) -> Self {
+    pub fn new(db: Arc<toolkit_db::Db>) -> Self {
         Self { inner: db }
     }
 
-    /// Borrow the underlying `modkit_db::Db` for low-level access. Later
+    /// Borrow the underlying `toolkit_db::Db` for low-level access. Later
     /// phases prefer `&impl DBRunner` over this, but the application layer
     /// uses it for migration registration and lifecycle wiring.
     #[must_use]
-    pub fn as_db(&self) -> &modkit_db::Db {
+    pub fn as_db(&self) -> &toolkit_db::Db {
         &self.inner
     }
 
     /// Clone the `Arc<Db>` for ownership transfer into long-lived services.
     #[must_use]
-    pub fn handle(&self) -> Arc<modkit_db::Db> {
+    pub fn handle(&self) -> Arc<toolkit_db::Db> {
         Arc::clone(&self.inner)
     }
 }

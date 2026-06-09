@@ -1,7 +1,7 @@
 //! RFC-9457 error mapping for the Chat Engine REST surface.
 //!
 //! Phase 14 owns the full `ChatEngineError → CanonicalError → Problem`
-//! pipeline. The canonical error layer (`modkit::api::canonical_error_middleware`)
+//! pipeline. The canonical error layer (`toolkit::api::canonical_error_middleware`)
 //! converts the [`CanonicalError`] to a wire [`Problem`] and fills
 //! `instance` / `trace_id` after the handler returns; this module is the
 //! single source of truth for the status / problem-type / detail mapping.
@@ -17,7 +17,7 @@
 //! | `BackendUnavailable { source, retry_after, .. }`  | dyn  | dyn                | Delegates to `PluginError::suggested_status()` + `is_user_facing()`. |
 //! | `Internal { reason, source }`                     | 500  | `Internal`         | Operator detail goes to logs only; wire detail is generic.       |
 //!
-//! `trace_id` is injected by `modkit::api::canonical_error_middleware`
+//! `trace_id` is injected by `toolkit::api::canonical_error_middleware`
 //! on the response path — handlers do not construct `Problem` directly.
 //! The unit tests below verify the **CanonicalError → Problem** wire
 //! shape so the contract is grep-auditable.
@@ -25,7 +25,7 @@
 // @cpt-cf-chat-engine-api-rest-error:p14
 // @cpt-cf-chat-engine-adr-http-client-protocol:p14
 
-use modkit_canonical_errors::{CanonicalError, resource_error};
+use toolkit_canonical_errors::{CanonicalError, resource_error};
 
 use crate::domain::error::ChatEngineError;
 
@@ -231,7 +231,7 @@ fn classify_backend(reason: &str, retry_after: Option<std::time::Duration>) -> B
 mod tests {
     use super::*;
     use chat_engine_sdk::error::PluginError;
-    use modkit_canonical_errors::Problem;
+    use toolkit_canonical_errors::Problem;
     use std::time::Duration;
 
     const NOT_FOUND_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~";

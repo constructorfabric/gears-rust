@@ -25,7 +25,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
+use toolkit_odata::{ODataQuery, Page};
 use sea_orm::ActiveValue::{NotSet, Set};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
@@ -45,8 +46,7 @@ use crate::domain::session::{
 };
 use crate::infra::db::entity::session as session_entity;
 use crate::infra::db::entity::session_type as session_type_entity;
-use crate::infra::db::repo::session_repo::{DEFAULT_SOFT_DELETE_RETENTION_DAYS, DeleteOutcome,
-    SessionPage, SessionRepo};
+use crate::infra::db::repo::session_repo::{DEFAULT_SOFT_DELETE_RETENTION_DAYS, SessionRepo};
 use crate::infra::db::repo::session_type_repo::SessionTypeRepo;
 
 /// Default per-call plugin deadline applied when the service has no other
@@ -120,15 +120,6 @@ pub struct CreateSessionRequest {
     /// Client-supplied metadata. Reserved keys are rejected here so they
     /// can't leak into the persisted row through this surface.
     pub metadata: Option<JsonValue>,
-}
-
-/// Paginated session response envelope.
-#[domain_model]
-#[derive(Debug, Clone)]
-pub struct PaginatedSessions {
-    pub items: Vec<Session>,
-    pub next_cursor: Option<String>,
-    pub has_more: bool,
 }
 
 /// Service-level result of `delete_session` — handlers decide between
@@ -439,30 +430,13 @@ impl SessionService {
     pub async fn list_sessions(
         &self,
         identity: &Identity,
-        cursor: Option<String>,
-        limit: Option<u32>,
-    ) -> Result<PaginatedSessions> {
-        let limit = limit.unwrap_or(crate::infra::db::repo::session_repo::DEFAULT_PAGE_SIZE);
-        let SessionPage { items, next_cursor } = self
+        query: &ODataQuery,
+    ) -> Result<Page<Session>> {
+        let page = self
             .sessions
-            .list_paginated(
-                &identity.tenant_id,
-                &identity.user_id,
-                cursor.as_deref(),
-                limit,
-            )
+            .list_paginated(&identity.tenant_id, &identity.user_id, query)
             .await?;
-        let has_more = next_cursor.is_some();
-        let items: Vec<Session> = items
-            .into_iter()
-            .map(Session::from)
-            .map(redact_session)
-            .collect();
-        Ok(PaginatedSessions {
-            items,
-            next_cursor,
-            has_more,
-        })
+        Ok(page.map_items(|row| redact_session(Session::from(row))))
     }
 
     pub async fn update_metadata(

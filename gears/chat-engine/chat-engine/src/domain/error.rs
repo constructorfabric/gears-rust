@@ -15,9 +15,9 @@
 // @cpt-cf-chat-engine-domain-error:p2
 
 use chat_engine_sdk::error::{BoxError, PluginError};
-use modkit_db::DbError;
-use modkit_db::secure::ScopeError;
-use modkit_macros::domain_model;
+use toolkit_db::DbError;
+use toolkit_db::secure::ScopeError;
+use toolkit_macros::domain_model;
 use sea_orm::DbErr;
 use thiserror::Error;
 

@@ -4,7 +4,7 @@
 // Creates `session_types` (referenced FK target) and `sessions` (with the
 // soft-delete columns mandated by ADR-0021). JSONB / TEXT mapping is delegated
 // to SeaORM's portable `ColumnType::JsonBinary` so the same migration compiles
-// for both the Postgres and SQLite backends exposed by `modkit-db`.
+// for both the Postgres and SQLite backends exposed by `toolkit-db`.
 
 use sea_orm_migration::prelude::*;
 

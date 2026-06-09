@@ -23,7 +23,7 @@
 // @cpt-cf-chat-engine-domain-search:p11
 // @cpt-cf-chat-engine-adr-search-strategy:p11
 
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -48,7 +48,7 @@ pub const DEFAULT_CONTEXT_RADIUS: u32 = 1;
 ///
 /// `$top` and `$skip` mirror the OData spec; the `cursor` field is reserved
 /// for the keyset pagination payload (encoded `(rank, message_id)`). The
-/// `modkit-odata`-derived `ODataQuery` lifts these field names verbatim,
+/// `toolkit-odata`-derived `ODataQuery` lifts these field names verbatim,
 /// hence the leading `$` on the wire (serde rename).
 #[domain_model]
 #[derive(Clone, Debug, Default, Deserialize)]

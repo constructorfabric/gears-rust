@@ -1,7 +1,7 @@
 // @cpt-cf-chat-engine-dbtable-sessions:p1
 // @cpt-cf-chat-engine-adr-session-deletion-strategy:p1
 
-use modkit_db_macros::Scopable;
+use toolkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 use uuid::Uuid;

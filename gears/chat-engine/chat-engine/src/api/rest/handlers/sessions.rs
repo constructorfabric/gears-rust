@@ -27,16 +27,18 @@ use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tracing::field::Empty;
 use uuid::Uuid;
 
-use modkit_security::SecurityContext;
+use toolkit::api::odata::OData;
+use toolkit::api::response::JsonPage;
+use toolkit_security::SecurityContext;
 
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::service::session_service::{
-    CreateSessionRequest, Identity, PaginatedSessions, SessionDeleteOutcome, SessionService,
+    CreateSessionRequest, Identity, SessionDeleteOutcome, SessionService,
 };
 
 /// Body for `POST /sessions`.
@@ -63,13 +65,6 @@ pub struct PatchSessionBody {
     pub user_id: Option<JsonValue>,
 }
 
-/// Query parameters for `GET /sessions`.
-#[derive(Debug, Deserialize)]
-pub struct ListSessionsQuery {
-    pub cursor: Option<String>,
-    pub limit: Option<u32>,
-}
-
 /// Query parameters for `DELETE /sessions/{id}`.
 #[derive(Debug, Deserialize, Default)]
 pub struct DeleteSessionQuery {
@@ -77,16 +72,6 @@ pub struct DeleteSessionQuery {
     /// Default (`?hard=false` or absent) → soft delete.
     #[serde(default)]
     pub hard: Option<bool>,
-}
-
-/// Wire envelope for `GET /sessions`. Phase 14 may rewrap into the canonical
-/// `Page<T>` representation; the field shape here is the contract for
-/// downstream phases.
-#[derive(Debug, Serialize)]
-pub struct ListSessionsResponse {
-    pub items: Vec<chat_engine_sdk::models::Session>,
-    pub next_cursor: Option<String>,
-    pub has_more: bool,
 }
 
 #[tracing::instrument(
@@ -114,23 +99,15 @@ pub async fn create_session(
     Ok((StatusCode::CREATED, Json(session)))
 }
 
-#[tracing::instrument(skip(svc, ctx), fields(request_id = Empty))]
+#[tracing::instrument(skip(svc, ctx, query), fields(request_id = Empty))]
 pub async fn list_sessions(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<SessionService>>,
-    Query(query): Query<ListSessionsQuery>,
-) -> Result<Json<ListSessionsResponse>> {
+    OData(query): OData,
+) -> Result<JsonPage<chat_engine_sdk::models::Session>> {
     let identity = identity_from_ctx(&ctx)?;
-    let PaginatedSessions {
-        items,
-        next_cursor,
-        has_more,
-    } = svc.list_sessions(&identity, query.cursor, query.limit).await?;
-    Ok(Json(ListSessionsResponse {
-        items,
-        next_cursor,
-        has_more,
-    }))
+    let page = svc.list_sessions(&identity, &query).await?;
+    Ok(Json(page))
 }
 
 #[tracing::instrument(skip(svc, ctx), fields(session_id = %session_id))]

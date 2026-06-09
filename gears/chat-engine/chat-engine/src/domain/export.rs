@@ -29,7 +29,7 @@
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;

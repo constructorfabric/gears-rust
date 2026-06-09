@@ -21,4 +21,4 @@ pub mod variant_repo;
 /// handle whose `conn()` and `transaction_with_config(...)` results map
 /// cleanly into [`crate::domain::error::ChatEngineError`] via the
 /// `From<DbError>` impl on the error enum.
-pub type ChatEngineDb = modkit_db::DBProvider<crate::domain::error::ChatEngineError>;
+pub type ChatEngineDb = toolkit_db::DBProvider<crate::domain::error::ChatEngineError>;

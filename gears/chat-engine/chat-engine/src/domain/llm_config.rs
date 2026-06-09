@@ -35,7 +35,7 @@
 use std::time::Duration;
 
 use chat_engine_sdk::error::PluginError;
-use modkit_macros::domain_model;
+use toolkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 
 /// GTS schema IDs for every type registered by the LLM Gateway plugin.

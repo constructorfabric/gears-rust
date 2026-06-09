@@ -18,7 +18,7 @@ use crate::domain::service::{
 
 /// Validated configuration for the Chat Engine module.
 ///
-/// Loaded via [`modkit::context::ModuleCtx::config_or_default`] and then
+/// Loaded via [`toolkit::context::ModuleCtx::config_or_default`] and then
 /// passed through [`ChatEngineConfig::validate`] before being stored in
 /// [`crate::module::ChatEngineModule`]. Every field has a documented
 /// default so the module boots even when the `modules.chat-engine.config`

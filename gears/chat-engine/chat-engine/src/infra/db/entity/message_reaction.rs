@@ -1,6 +1,6 @@
 // @cpt-cf-chat-engine-dbtable-reactions:p2
 
-use modkit_db_macros::Scopable;
+use toolkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 use uuid::Uuid;

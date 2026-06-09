@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::field::Empty;
 use uuid::Uuid;
 
-use modkit_security::SecurityContext;
+use toolkit_security::SecurityContext;
 
 use crate::api::rest::handlers::sessions::{identity_from_ctx, reject_body_identity};
 use crate::domain::error::{ChatEngineError, Result};

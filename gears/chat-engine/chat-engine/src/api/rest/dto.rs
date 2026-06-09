@@ -16,7 +16,7 @@
 // @cpt-cf-chat-engine-api-dto:p14
 // @cpt-cf-chat-engine-adr-http-client-protocol:p14
 
-use modkit_macros::api_dto;
+use toolkit_macros::api_dto;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use utoipa::ToSchema;
@@ -457,11 +457,11 @@ pub enum StreamingEventDto {
 
 // Mark the streaming DTOs as `ResponseApiDto` so they can appear in
 // `OperationBuilder::json_response_with_schema`.
-impl modkit::api::api_dto::ResponseApiDto for StreamingStartDto {}
-impl modkit::api::api_dto::ResponseApiDto for StreamingChunkDto {}
-impl modkit::api::api_dto::ResponseApiDto for StreamingCompleteDto {}
-impl modkit::api::api_dto::ResponseApiDto for StreamingErrorDto {}
-impl modkit::api::api_dto::ResponseApiDto for StreamingEventDto {}
+impl toolkit::api::api_dto::ResponseApiDto for StreamingStartDto {}
+impl toolkit::api::api_dto::ResponseApiDto for StreamingChunkDto {}
+impl toolkit::api::api_dto::ResponseApiDto for StreamingCompleteDto {}
+impl toolkit::api::api_dto::ResponseApiDto for StreamingErrorDto {}
+impl toolkit::api::api_dto::ResponseApiDto for StreamingEventDto {}
 
 // ---------------------------------------------------------------------------
 // Domain → DTO conversions for the streaming events
