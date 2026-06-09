@@ -34,7 +34,7 @@ use crate::infra::db::entity::message as message_entity;
 
 impl From<message_entity::Model> for Message {
     fn from(m: message_entity::Model) -> Self {
-        let role = parse_role(&m.role);
+        let role = role_from_entity(&m.role);
         let file_ids = m
             .file_ids
             .as_ref()
@@ -82,7 +82,7 @@ impl From<Message> for message_entity::ActiveModel {
             message_id: Set(m.message_id),
             session_id: Set(m.session_id),
             parent_message_id: Set(m.parent_message_id),
-            role: Set(role_to_str(&m.role).to_string()),
+            role: Set(role_to_entity(&m.role)),
             content: Set(m.content),
             file_ids: Set(file_ids_json),
             variant_index: Set(i32::try_from(m.variant_index).unwrap_or(i32::MAX)),
@@ -96,24 +96,23 @@ impl From<Message> for message_entity::ActiveModel {
     }
 }
 
-fn parse_role(s: &str) -> MessageRole {
-    match s {
-        "user" => MessageRole::User,
-        "assistant" => MessageRole::Assistant,
-        // System / unknown both fold into `System` — Phase 2 only stores
-        // the raw string, schema validation lives at write time in the
-        // repositories (Phases 4+). Unknown values are surfaced as `System`
-        // so deserialization can't crash if a future migration adds a role
-        // before the corresponding code path lands.
-        _ => MessageRole::System,
+/// Map the persisted entity role enum to the SDK/domain role. Total and
+/// exhaustive — the entity enum makes invalid roles unrepresentable, so the
+/// old string-parse fallback to `System` is gone.
+fn role_from_entity(role: &message_entity::MessageRole) -> MessageRole {
+    match role {
+        message_entity::MessageRole::User => MessageRole::User,
+        message_entity::MessageRole::Assistant => MessageRole::Assistant,
+        message_entity::MessageRole::System => MessageRole::System,
     }
 }
 
-fn role_to_str(r: &MessageRole) -> &'static str {
-    match r {
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::System => "system",
+/// Map the SDK/domain role to the persisted entity role enum.
+fn role_to_entity(role: &MessageRole) -> message_entity::MessageRole {
+    match role {
+        MessageRole::User => message_entity::MessageRole::User,
+        MessageRole::Assistant => message_entity::MessageRole::Assistant,
+        MessageRole::System => message_entity::MessageRole::System,
     }
 }
 
@@ -128,7 +127,7 @@ mod tests {
             message_id: Uuid::nil(),
             session_id: Uuid::nil(),
             parent_message_id: None,
-            role: "assistant".into(),
+            role: message_entity::MessageRole::Assistant,
             content: serde_json::json!({"text": "hi"}),
             file_ids: Some(serde_json::json!([
                 "00000000-0000-0000-0000-000000000001"
@@ -172,7 +171,7 @@ mod tests {
         };
         let am: message_entity::ActiveModel = msg.into();
         match am.role {
-            ActiveValue::Set(s) => assert_eq!(s, "user"),
+            ActiveValue::Set(r) => assert_eq!(r, message_entity::MessageRole::User),
             other => panic!("expected Set, got {other:?}"),
         }
         match am.variant_index {

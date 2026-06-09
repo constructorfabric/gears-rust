@@ -160,7 +160,7 @@ pub async fn seed_message(
         message_id: Set(id),
         session_id: Set(session_id),
         parent_message_id: Set(parent_message_id),
-        role: Set("user".to_string()),
+        role: Set(message::MessageRole::User),
         content: Set(JsonValue::Object(serde_json::Map::new())),
         file_ids: Set(None),
         variant_index: Set(variant_index),

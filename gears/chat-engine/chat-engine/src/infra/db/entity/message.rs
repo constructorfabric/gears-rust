@@ -30,7 +30,7 @@ pub struct Model {
     pub message_id: Uuid,
     pub session_id: Uuid,
     pub parent_message_id: Option<Uuid>,
-    pub role: String,
+    pub role: MessageRole,
     #[sea_orm(column_type = "JsonBinary")]
     pub content: serde_json::Value,
     #[sea_orm(column_type = "JsonBinary", nullable)]
@@ -43,6 +43,23 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<serde_json::Value>,
     pub created_at: OffsetDateTime,
+}
+
+/// Persisted message role. A `DeriveActiveEnum` over the stored string so
+/// invalid roles are unrepresentable at the persistence boundary — the
+/// column can only ever hold `user` / `assistant` / `system`. Mirrors
+/// mini-chat's `MessageRole`. The SDK/domain
+/// [`chat_engine_sdk::models::MessageRole`] is the wire/domain twin; the
+/// `From` impls in `crate::domain::message` map between the two.
+#[derive(Clone, Debug, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::N(16))")]
+pub enum MessageRole {
+    #[sea_orm(string_value = "user")]
+    User,
+    #[sea_orm(string_value = "assistant")]
+    Assistant,
+    #[sea_orm(string_value = "system")]
+    System,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
