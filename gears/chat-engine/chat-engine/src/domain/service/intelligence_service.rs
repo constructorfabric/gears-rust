@@ -53,8 +53,11 @@
 // @cpt-cf-chat-engine-adr-session-metadata:p8
 // @cpt-cf-chat-engine-adr-session-deletion-strategy:p8
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use chat_engine_sdk::models::{LifecycleState, TenantId, UserId};
 use chat_engine_sdk::plugin::{PluginCallContext, SessionPluginCtx};
@@ -64,7 +67,7 @@ use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::domain::error::{ChatEngineError, Result};
@@ -176,6 +179,14 @@ pub struct IntelligenceService {
     /// session can perform. See
     /// `ChatEngineConfig::retention_max_deletes_per_session`.
     retention_max_deletes_per_session: u32,
+    /// Per-tenant round-robin cursor (`tenant_id -> last session_id swept`)
+    /// for the retention scheduler. Each tick fetches only the next
+    /// `retention_max_sessions_per_tick` active sessions after this id, so a
+    /// large tenant is processed in bounded batches across ticks instead of
+    /// being materialised whole. In-process state: a leader failover restarts
+    /// the round-robin from the beginning (the sweep is idempotent, so this
+    /// only delays tail coverage). Shared across `Clone`s via the `Arc`.
+    retention_cursor: Arc<Mutex<HashMap<String, Uuid>>>,
 }
 
 /// Default per-tick session cap when the service is constructed
@@ -204,6 +215,7 @@ impl IntelligenceService {
             summary_deadline: DEFAULT_SUMMARY_DEADLINE,
             retention_max_sessions_per_tick: DEFAULT_RETENTION_MAX_SESSIONS_PER_TICK,
             retention_max_deletes_per_session: DEFAULT_RETENTION_MAX_DELETES_PER_SESSION,
+            retention_cursor: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -517,25 +529,34 @@ impl IntelligenceService {
         &self,
         tenant_id: &str,
     ) -> Result<RetentionCleanupReport> {
-        let mut active = self.sessions.list_active_sessions_for_tenant(tenant_id).await?;
-
-        // Per-tick cap so a single tenant cannot block the scheduler:
-        // sessions beyond the cap are deferred to the next tick. Sort
-        // by session_id first to give deferred sessions a deterministic
-        // order across ticks (without this, the rollover would depend
-        // on whichever order the SELECT happened to return).
-        let cap = self.retention_max_sessions_per_tick as usize;
-        active.sort_by_key(|r| r.session_id);
-        if active.len() > cap {
-            warn!(
-                tenant_id,
-                total = active.len(),
-                cap,
-                "tenant has more active sessions than retention_max_sessions_per_tick; \
-                 deferring the remainder to the next tick",
-            );
-            active.truncate(cap);
+        // Per-tick cap pushed into SQL: fetch only the next `cap` active
+        // sessions (ordered by `session_id`) after the previous tick's
+        // cursor, rather than materialising the tenant's whole active set and
+        // truncating in memory. Processing a session does not make it
+        // inactive, so a bare `LIMIT` would re-scan the head every tick and
+        // starve the tail — the per-tenant cursor round-robins coverage
+        // across ticks instead.
+        let cap = self.retention_max_sessions_per_tick;
+        let after = self.retention_cursor.lock().get(tenant_id).copied();
+        let mut active = self
+            .sessions
+            .list_active_sessions_for_tenant(tenant_id, after, cap)
+            .await?;
+        if active.is_empty() && after.is_some() {
+            // Cursor ran past the end (or the tail shrank below it): wrap to
+            // the start so this tick still makes forward progress.
+            active = self
+                .sessions
+                .list_active_sessions_for_tenant(tenant_id, None, cap)
+                .await?;
         }
+
+        // Capture batch bounds before the batch is consumed below, so the
+        // cursor can be advanced only after the batch is processed (a
+        // mid-batch error leaves the cursor put and retries next tick).
+        let batch_len = active.len();
+        let last_id = active.last().map(|r| r.session_id);
+
         let mut outcomes: Vec<SessionCleanupOutcome> = Vec::with_capacity(active.len());
 
         for row in active {
@@ -603,6 +624,27 @@ impl IntelligenceService {
                 duration_ms,
                 skipped_locked: false,
             });
+        }
+
+        // Advance the round-robin cursor now that the batch is processed. A
+        // full batch (`== cap`) means more sessions may follow — resume after
+        // the last id next tick. A short batch means we reached the end, so
+        // drop the cursor and wrap to the start on the next tick.
+        match last_id {
+            Some(id) if batch_len == cap as usize => {
+                self.retention_cursor
+                    .lock()
+                    .insert(tenant_id.to_owned(), id);
+                debug!(
+                    tenant_id,
+                    cap,
+                    next_after = %id,
+                    "retention sweep filled a full batch; more sessions deferred to next tick",
+                );
+            }
+            _ => {
+                self.retention_cursor.lock().remove(tenant_id);
+            }
         }
 
         outcomes.sort_by_key(|o| o.session_id);
@@ -1068,17 +1110,23 @@ mod tests {
         async fn list_active_sessions_for_tenant(
             &self,
             tenant_id: &str,
+            after: Option<Uuid>,
+            limit: u32,
         ) -> std::result::Result<Vec<session_entity::Model>, ChatEngineError> {
-            Ok(self
+            let mut rows: Vec<session_entity::Model> = self
                 .rows
                 .lock()
                 .iter()
                 .filter(|r| {
                     r.tenant_id == tenant_id
                         && r.lifecycle_state == LifecycleState::Active.as_str()
+                        && after.is_none_or(|a| r.session_id > a)
                 })
                 .cloned()
-                .collect())
+                .collect();
+            rows.sort_by_key(|r| r.session_id);
+            rows.truncate(limit as usize);
+            Ok(rows)
         }
 
         async fn list_tenants_with_active_sessions(
@@ -2024,6 +2072,58 @@ mod tests {
             2,
             "session cap should limit processed sessions per tick",
         );
+    }
+
+    #[tokio::test]
+    async fn run_cleanup_cursor_pages_all_sessions_across_ticks() {
+        // 5 active sessions, cap = 2. Consecutive ticks must page through
+        // every session via the round-robin cursor (2, 2, 1) — no head
+        // re-scan, no starved tail — then wrap back to the head.
+        let session_ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let rows: Vec<_> = session_ids
+            .iter()
+            .map(|sid| make_session(*sid, None))
+            .collect();
+        let sessions = MockSessionRepo::new(rows);
+        let msgs = MockMessageRepo::new(vec![]);
+        let svc = make_service(sessions, msgs).with_retention_caps(2, 1000);
+
+        let tick_ids = |svc: &IntelligenceService| {
+            let svc = svc.clone();
+            async move {
+                svc.run_retention_cleanup_for_tenant("t")
+                    .await
+                    .unwrap()
+                    .sessions
+                    .into_iter()
+                    .map(|o| o.session_id)
+                    .collect::<Vec<Uuid>>()
+            }
+        };
+
+        let t1 = tick_ids(&svc).await;
+        let t2 = tick_ids(&svc).await;
+        let t3 = tick_ids(&svc).await;
+        assert_eq!(t1.len(), 2, "tick 1 processes a full batch");
+        assert_eq!(t2.len(), 2, "tick 2 processes the next full batch");
+        assert_eq!(t3.len(), 1, "tick 3 processes the remaining tail");
+
+        let mut covered: Vec<Uuid> = [t1, t2, t3].concat();
+        let unique: std::collections::HashSet<Uuid> = covered.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            5,
+            "three ticks must cover every session exactly once (no overlap, no gap)",
+        );
+        covered.sort();
+        let mut expected = session_ids.clone();
+        expected.sort();
+        assert_eq!(covered, expected, "every active session is visited across ticks");
+
+        // The short tail batch dropped the cursor, so the next tick wraps to
+        // the head rather than returning nothing.
+        let t4 = tick_ids(&svc).await;
+        assert_eq!(t4.len(), 2, "after the tail, the cursor wraps to the head");
     }
 
     #[tokio::test]

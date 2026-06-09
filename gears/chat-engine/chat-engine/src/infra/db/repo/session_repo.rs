@@ -184,18 +184,23 @@ pub trait SessionRepo: Send + Sync {
         session_id: Uuid,
     ) -> Result<bool, ChatEngineError>;
 
-    /// Phase 8 hook (retention cleanup). List every session in the tenant
-    /// whose `lifecycle_state` is `active` — the retention scheduler only
-    /// touches live sessions; archived / soft-deleted rows are owned by
-    /// the deletion-grace flow (ADR-0021).
+    /// Phase 8 hook (retention cleanup). List `active` sessions in the
+    /// tenant ordered by `session_id`, returning at most `limit` rows whose
+    /// `session_id` is strictly greater than `after` (pass `None` to start at
+    /// the beginning). The retention scheduler pages through a large tenant
+    /// in bounded batches across ticks via this cursor instead of loading
+    /// the entire active set into memory; archived / soft-deleted rows are
+    /// owned by the deletion-grace flow (ADR-0021).
     ///
     /// Default impl returns an empty list so test mocks that don't care
     /// about retention keep compiling.
     async fn list_active_sessions_for_tenant(
         &self,
         tenant_id: &str,
+        after: Option<Uuid>,
+        limit: u32,
     ) -> Result<Vec<session_entity::Model>, ChatEngineError> {
-        let _ = tenant_id;
+        let _ = (tenant_id, after, limit);
         Ok(Vec::new())
     }
 
@@ -684,20 +689,30 @@ impl SessionRepo for SeaSessionRepo {
     async fn list_active_sessions_for_tenant(
         &self,
         tenant_id: &str,
+        after: Option<Uuid>,
+        limit: u32,
     ) -> Result<Vec<session_entity::Model>, ChatEngineError> {
         let conn = self.db.conn()?;
         let scope = AccessScope::allow_all();
+        let mut filter = Condition::all()
+            .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
+            .add(
+                session_entity::Column::LifecycleState
+                    .eq(LifecycleState::Active.as_str().to_string()),
+            );
+        if let Some(after) = after {
+            // Keyset cursor on the `session_id` primary key — pages the
+            // retention sweep across ticks without OFFSET scans.
+            filter = filter.add(session_entity::Column::SessionId.gt(after));
+        }
+        // Push the per-tick cap into SQL so a large tenant returns only the
+        // candidates this tick will process, not its entire active set.
         let rows = SessionEntity::find()
             .secure()
             .scope_with(&scope)
-            .filter(
-                Condition::all()
-                    .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
-                    .add(
-                        session_entity::Column::LifecycleState
-                            .eq(LifecycleState::Active.as_str().to_string()),
-                    ),
-            )
+            .filter(filter)
+            .order_by(session_entity::Column::SessionId, sea_orm::Order::Asc)
+            .limit(u64::from(limit))
             .all(&conn)
             .await?;
         Ok(rows)
