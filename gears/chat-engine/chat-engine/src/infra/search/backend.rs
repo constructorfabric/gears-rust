@@ -48,7 +48,7 @@ impl SearchBackend for PgSearchBackend {
         _skip: u32,
         _limit: u32,
     ) -> std::result::Result<(Vec<BackendHit>, u64), ChatEngineError> {
-        Err(ChatEngineError::internal(
+        Err(ChatEngineError::not_implemented(
             "PgSearchBackend not yet wired to DBProvider — Phase 15 owns workspace wiring",
         ))
     }
@@ -79,8 +79,39 @@ impl SearchBackend for SqliteSearchBackend {
         _skip: u32,
         _limit: u32,
     ) -> std::result::Result<(Vec<BackendHit>, u64), ChatEngineError> {
-        Err(ChatEngineError::internal(
+        Err(ChatEngineError::not_implemented(
             "SqliteSearchBackend not yet wired to DBProvider — Phase 15 owns workspace wiring",
+        ))
+    }
+}
+
+/// Dialect-agnostic placeholder backend wired in production until a real
+/// `tsvector` (Postgres) or `LIKE` (SQLite) backend lands. Every query
+/// refuses with HTTP 501 so an operator who flips `enable_search = true`
+/// gets an honest "not implemented" instead of a silent empty result set
+/// (RUST-NO-001). The in-memory backend remains for unit tests only.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NotImplementedSearchBackend;
+
+impl NotImplementedSearchBackend {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl SearchBackend for NotImplementedSearchBackend {
+    async fn search(
+        &self,
+        _scope: &SearchScopeFilter,
+        _query: &ParsedQuery,
+        _cursor: Option<&Cursor>,
+        _skip: u32,
+        _limit: u32,
+    ) -> std::result::Result<(Vec<BackendHit>, u64), ChatEngineError> {
+        Err(ChatEngineError::not_implemented(
+            "message search backend is not configured",
         ))
     }
 }

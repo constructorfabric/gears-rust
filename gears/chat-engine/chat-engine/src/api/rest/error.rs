@@ -16,6 +16,7 @@
 //! | `BadRequest { reason }`                           | 400  | `InvalidArgument`  | Format-variant message (no field violations array).              |
 //! | `BackendUnavailable { source, retry_after, .. }`  | dyn  | dyn                | Delegates to `PluginError::suggested_status()` + `is_user_facing()`. |
 //! | `Internal { reason, source }`                     | 500  | `Internal`         | Operator detail goes to logs only; wire detail is generic.       |
+//! | `NotImplemented { reason }`                       | 501  | `Unimplemented`    | Endpoint exposed but production backend not yet wired.           |
 //!
 //! `trace_id` is injected by `toolkit::api::canonical_error_middleware`
 //! on the response path — handlers do not construct `Problem` directly.
@@ -125,6 +126,14 @@ impl From<ChatEngineError> for CanonicalError {
                 // canonical `Internal` category emits a generic detail and
                 // the middleware injects `trace_id`.
                 CanonicalError::internal("Internal server error").create()
+            }
+
+            ChatEngineError::NotImplemented { reason } => {
+                // A documented endpoint whose production backend has not
+                // landed (object-storage export, DB-backed search). The
+                // `Unimplemented` category maps to HTTP 501 — an honest
+                // refusal rather than a faked 2xx (RUST-NO-001).
+                ChatEngineResourceError::unimplemented(reason).create()
             }
         }
     }
@@ -244,6 +253,8 @@ mod tests {
     const SERVICE_UNAVAILABLE_TYPE: &str =
         "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~";
     const INTERNAL_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~";
+    const UNIMPLEMENTED_TYPE: &str =
+        "gts://gts.cf.core.errors.err.v1~cf.core.err.unimplemented.v1~";
 
     fn problem_from(err: ChatEngineError) -> Problem {
         Problem::from(CanonicalError::from(err))
@@ -315,6 +326,15 @@ mod tests {
             !body.contains("internal hostname leaked"),
             "operator-only detail must never appear on the wire: {body}"
         );
+    }
+
+    #[test]
+    fn not_implemented_maps_to_501() {
+        let p = problem_from(ChatEngineError::not_implemented(
+            "export storage backend not configured",
+        ));
+        assert_eq!(p.status, 501);
+        assert_eq!(p.problem_type, UNIMPLEMENTED_TYPE);
     }
 
     #[test]

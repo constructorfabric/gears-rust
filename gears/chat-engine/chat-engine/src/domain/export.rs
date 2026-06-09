@@ -228,22 +228,34 @@ pub struct SharedSessionView {
     pub message_count: usize,
 }
 
-/// Storage error returned by [`ExportStorage::upload`]. Maps to HTTP 502
-/// at the API boundary.
+/// Storage error returned by [`ExportStorage::upload`].
 #[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     /// Backend rejected the upload, refused the connection, or timed out.
+    /// Maps to a backend-unavailable response (HTTP 503).
     #[error("export storage unavailable: {0}")]
     Unavailable(String),
+    /// No production storage backend is wired; the export feature is
+    /// exposed but not implemented. Maps to HTTP 501 so the endpoint
+    /// refuses honestly instead of discarding the bytes and handing back a
+    /// dead URL (RUST-NO-001).
+    #[error("export storage not implemented: {0}")]
+    NotImplemented(String),
 }
 
 impl From<StorageError> for ChatEngineError {
     fn from(err: StorageError) -> Self {
-        ChatEngineError::BackendUnavailable {
-            reason: err.to_string(),
-            retry_after: None,
-            source: Some(Box::new(err)),
+        match err {
+            StorageError::Unavailable(msg) => {
+                let err = StorageError::Unavailable(msg);
+                ChatEngineError::BackendUnavailable {
+                    reason: err.to_string(),
+                    retry_after: None,
+                    source: Some(Box::new(err)),
+                }
+            }
+            StorageError::NotImplemented(reason) => ChatEngineError::not_implemented(reason),
         }
     }
 }
@@ -279,6 +291,30 @@ impl ExportStorage for StubExportStorage {
         _content_type: &str,
     ) -> Result<String, StorageError> {
         Ok(format!("memory://exports/{key}"))
+    }
+}
+
+/// Production-default export storage used until a real object-storage
+/// backend is wired. Every upload refuses with
+/// [`StorageError::NotImplemented`] (HTTP 501) so the export endpoint never
+/// fakes success on a path that would otherwise discard the bytes and hand
+/// back a dead `memory://` URL (RUST-NO-001). Swap this for a concrete
+/// backend at module-wiring time to enable the feature.
+#[domain_model]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NotImplementedExportStorage;
+
+#[async_trait]
+impl ExportStorage for NotImplementedExportStorage {
+    async fn upload(
+        &self,
+        _key: &str,
+        _bytes: Vec<u8>,
+        _content_type: &str,
+    ) -> Result<String, StorageError> {
+        Err(StorageError::NotImplemented(
+            "session export storage backend is not configured".into(),
+        ))
     }
 }
 

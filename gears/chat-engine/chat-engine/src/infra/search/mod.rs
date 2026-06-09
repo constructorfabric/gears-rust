@@ -11,4 +11,4 @@
 
 pub mod backend;
 
-pub use backend::{PgSearchBackend, SqliteSearchBackend};
+pub use backend::{NotImplementedSearchBackend, PgSearchBackend, SqliteSearchBackend};

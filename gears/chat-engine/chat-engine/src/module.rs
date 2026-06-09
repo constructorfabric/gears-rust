@@ -51,11 +51,12 @@ use chat_engine_sdk::plugin::ChatEngineBackendPlugin;
 use crate::api::rest::routes::ChatEngineServices;
 use crate::api::rest::{NoopWebhookEmitter, WebhookEmitter, WebhookEmitterAdapter};
 use crate::config::ChatEngineConfig;
-use crate::domain::export::StubExportStorage;
+use crate::domain::export::NotImplementedExportStorage;
 use crate::domain::service::{
-    ExportService, InMemorySearchBackend, IntelligenceService, MessageService, PluginService,
-    ReactionService, SearchService, SessionService, ShareUrlBuilder, VariantService,
+    ExportService, IntelligenceService, MessageService, PluginService, ReactionService,
+    SearchService, SessionService, ShareUrlBuilder, VariantService,
 };
+use crate::infra::search::NotImplementedSearchBackend;
 use crate::domain::service::webhook::WebhookEmitter as DomainWebhookEmitter;
 use crate::infra::db::migrations::Migrator;
 use crate::infra::db::repo::message_repo::SeaMessageRepo;
@@ -316,8 +317,13 @@ impl Gear for ChatEngineModule {
             plugin_service.clone(),
         ));
 
+        // Production wiring intentionally uses the not-implemented backend:
+        // the `tsvector` / `LIKE` backends are not yet wired, so enabling
+        // search must surface an honest 501 rather than the in-memory
+        // backend's silent empty result set (RUST-NO-001). Swap for a real
+        // backend here once it lands.
         let search_backend: Arc<dyn crate::domain::service::SearchBackend> =
-            Arc::new(InMemorySearchBackend::new());
+            Arc::new(NotImplementedSearchBackend::new());
         let search = Arc::new(SearchService::new(
             sessions_repo.clone(),
             messages_repo.clone(),
@@ -345,7 +351,10 @@ impl Gear for ChatEngineModule {
             .map_or_else(ShareUrlBuilder::default, |base| ShareUrlBuilder {
                 base_url: base.clone(),
             });
-        let export_storage = Arc::new(StubExportStorage);
+        // Not-implemented until a real object-storage backend is wired:
+        // returns 501 rather than discarding the bytes behind a dead
+        // `memory://` URL (RUST-NO-001).
+        let export_storage = Arc::new(NotImplementedExportStorage);
         let export = Arc::new(
             ExportService::new(sessions_repo.clone(), messages_repo.clone(), export_storage)
                 .with_share_urls(share_urls),

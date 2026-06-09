@@ -87,6 +87,16 @@ pub enum ChatEngineError {
         #[source]
         source: Option<BoxError>,
     },
+
+    /// A feature is exposed on the REST surface but its production backend
+    /// is not yet wired (object-storage export, DB-backed search). Maps to
+    /// HTTP 501. Used to gate placeholder paths so they refuse honestly
+    /// instead of faking success (RUST-NO-001).
+    #[error("not implemented: {reason}")]
+    NotImplemented {
+        /// Human-readable reason (safe to expose to the client).
+        reason: String,
+    },
 }
 
 impl ChatEngineError {
@@ -138,6 +148,13 @@ impl ChatEngineError {
         Self::Internal {
             reason: reason.into(),
             source: None,
+        }
+    }
+
+    /// Convenience constructor for `NotImplemented` (HTTP 501).
+    pub fn not_implemented(reason: impl Into<String>) -> Self {
+        Self::NotImplemented {
+            reason: reason.into(),
         }
     }
 }
