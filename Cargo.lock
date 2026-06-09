@@ -1314,6 +1314,8 @@ dependencies = [
  "futures",
  "http",
  "inventory",
+ "k8s-openapi",
+ "kube",
  "parking_lot",
  "reqwest 0.13.3",
  "sea-orm",

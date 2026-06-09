@@ -56,6 +56,7 @@ use crate::domain::service::{
     ExportService, IntelligenceService, MessageService, PluginService, ReactionService,
     SearchService, SessionService, ShareUrlBuilder, VariantService,
 };
+use crate::infra::leader::{LeaderElector, work_fn};
 use crate::infra::search::NotImplementedSearchBackend;
 use crate::domain::service::webhook::WebhookEmitter as DomainWebhookEmitter;
 use crate::infra::db::migrations::Migrator;
@@ -80,6 +81,11 @@ struct RuntimeState {
     webhooks: Arc<dyn WebhookEmitter>,
     intelligence: Arc<IntelligenceService>,
     config: Arc<ChatEngineConfig>,
+    /// Leader elector gating the retention-cleanup loop so only one replica
+    /// sweeps at a time under horizontal scaling
+    /// (`@cpt-cf-chat-engine-adr-stateless-scaling`). Single-process / non-k8s
+    /// builds use the noop elector (always leader).
+    leader: Arc<dyn LeaderElector>,
 }
 
 /// Chat Engine module entrypoint.
@@ -124,59 +130,79 @@ impl ChatEngineModule {
             .ok_or_else(|| anyhow::anyhow!("ChatEngineModule not initialised"))
     }
 
-    /// Lifecycle entry — periodic retention cleanup.
+    /// Lifecycle entry — periodic retention cleanup, gated by leader election.
     ///
-    /// Runs a `tokio::time::interval` tick loop, racing each tick against
-    /// `cancel.cancelled()` so the task exits promptly on shutdown. Each
-    /// tick iterates the tenants reported by the session repo (Phase 8
-    /// surface) and calls
-    /// [`IntelligenceService::run_retention_cleanup_for_tenant`].
+    /// The per-tenant sweep is wrapped in
+    /// [`LeaderElector::run_role`](crate::infra::leader::LeaderElector::run_role)
+    /// so that under horizontal scaling
+    /// (`@cpt-cf-chat-engine-adr-stateless-scaling`) only the lease holder
+    /// runs it — every replica running the full sweep concurrently would
+    /// duplicate work, and the per-tenant advisory lock the cleanup relies on
+    /// is a no-op on the SQLite path. Single-process / non-k8s builds use the
+    /// noop elector (always leader), preserving the original behaviour.
     ///
-    /// `ready.notify()` fires once the interval handle is constructed so
-    /// the toolkit runtime can release dependent modules.
+    /// `ready.notify()` fires before entering `run_role`: readiness gates
+    /// dependent gears, not leadership, so a follower replica that never wins
+    /// the lease is still "ready". On lease loss the work token is cancelled
+    /// mid-loop and the elector re-campaigns; `cancel` (gear shutdown) tears
+    /// the whole thing down.
     pub async fn serve(
         self: Arc<Self>,
         cancel: CancellationToken,
         ready: toolkit::lifecycle::ReadySignal,
     ) -> anyhow::Result<()> {
         let runtime = self.runtime()?;
-        let interval_secs = runtime
-            .config
-            .retention_cleanup_interval_hours
-            .saturating_mul(3600);
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        // Skip the immediate tick that `tokio::time::interval` fires
-        // synchronously — we want the first cleanup to happen one period
-        // after startup, not at boot.
-        interval.tick().await;
+        let interval_hours = runtime.config.retention_cleanup_interval_hours;
+        let period = Duration::from_secs(interval_hours.saturating_mul(3600));
+        let intelligence = Arc::clone(&runtime.intelligence);
+        let leader = Arc::clone(&runtime.leader);
 
         ready.notify();
         info!(
-            interval_hours = runtime.config.retention_cleanup_interval_hours,
-            "chat-engine retention-cleanup task running"
+            interval_hours,
+            "chat-engine retention-cleanup task running (leader-gated)"
         );
 
-        let intelligence = Arc::clone(&runtime.intelligence);
+        leader
+            .run_role(
+                "retention-cleanup",
+                cancel,
+                work_fn(move |cancel| {
+                    let intelligence = Arc::clone(&intelligence);
+                    async move {
+                        let mut interval = tokio::time::interval(period);
+                        interval
+                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        // Skip the immediate tick that `tokio::time::interval`
+                        // fires synchronously — the first cleanup runs one
+                        // period after acquiring leadership, not instantly.
+                        interval.tick().await;
 
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => {
-                    info!("chat-engine retention-cleanup task received cancellation; exiting");
-                    break;
-                }
-                _ = interval.tick() => {
-                    if let Err(err) =
-                        run_retention_cleanup_tick(intelligence.as_ref()).await
-                    {
-                        error!(
-                            error = %err,
-                            "chat-engine retention-cleanup tick failed; continuing",
-                        );
+                        loop {
+                            tokio::select! {
+                                () = cancel.cancelled() => {
+                                    info!(
+                                        "chat-engine retention-cleanup loop stopping \
+                                         (leadership lost or shutdown)"
+                                    );
+                                    return Ok(());
+                                }
+                                _ = interval.tick() => {
+                                    if let Err(err) =
+                                        run_retention_cleanup_tick(intelligence.as_ref()).await
+                                    {
+                                        error!(
+                                            error = %err,
+                                            "chat-engine retention-cleanup tick failed; continuing",
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
-                }
-            }
-        }
-        Ok(())
+                }),
+            )
+            .await
     }
 }
 
@@ -200,6 +226,38 @@ async fn run_retention_cleanup_tick(
     Ok(())
 }
 
+/// Construct the leader elector that gates the retention-cleanup loop.
+///
+/// With the `k8s` feature, uses a `coordination.k8s.io/v1` Lease keyed under
+/// `chat-engine-{role}` (requires `POD_NAMESPACE` / `POD_NAME` + kube client
+/// access). Otherwise a noop elector that is always leader — correct for
+/// single-process / on-prem deployments. Mirrors mini-chat's
+/// `background_workers::create_leader_elector`.
+#[allow(
+    clippy::unused_async,
+    reason = "async is needed when the k8s feature is enabled"
+)]
+async fn create_leader_elector() -> anyhow::Result<Arc<dyn LeaderElector>> {
+    #[cfg(feature = "k8s")]
+    {
+        use crate::infra::leader::k8s_lease::{K8sLeaseConfig, K8sLeaseElector};
+        use anyhow::Context as _;
+
+        let config = K8sLeaseConfig::from_env("chat-engine")
+            .context("k8s feature enabled: POD_NAMESPACE and POD_NAME are required")?;
+        let elector = K8sLeaseElector::from_default(config)
+            .await
+            .context("k8s feature enabled: kube client init failed")?;
+        info!("chat-engine: using k8s Lease leader election");
+        Ok(Arc::new(elector))
+    }
+    #[cfg(not(feature = "k8s"))]
+    {
+        info!("chat-engine: using noop leader election (single-process mode)");
+        Ok(crate::infra::leader::noop())
+    }
+}
+
 #[async_trait]
 impl Gear for ChatEngineModule {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
@@ -209,6 +267,11 @@ impl Gear for ChatEngineModule {
         cfg.validate()
             .map_err(|e| anyhow::anyhow!("invalid chat-engine config: {e}"))?;
         let config = Arc::new(cfg);
+
+        // Leader elector gating the retention-cleanup loop (one sweeper per
+        // cluster under horizontal scaling). Constructed up front so a
+        // misconfigured k8s runtime fails init() rather than the serve loop.
+        let leader = create_leader_elector().await?;
 
         // --- DB wiring ------------------------------------------------------
         //
@@ -375,6 +438,7 @@ impl Gear for ChatEngineModule {
             webhooks: webhooks_rest,
             intelligence,
             config,
+            leader,
         };
         self.runtime
             .set(runtime)

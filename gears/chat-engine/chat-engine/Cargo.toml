@@ -17,6 +17,13 @@ name = "chat_engine"
 [lints]
 workspace = true
 
+[features]
+default = []
+# k8s Lease-based leader election for background workers (retention cleanup).
+# Off by default → single-process noop elector; enable in multi-replica
+# Kubernetes deployments so only one replica runs the per-tenant sweep.
+k8s = ["dep:kube", "dep:k8s-openapi"]
+
 [dependencies]
 chat-engine-sdk = { package = "cf-chat-engine-sdk", version = "0.1.0", path = "../chat-engine-sdk" }
 
@@ -57,6 +64,10 @@ toolkit-macros = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-odata-macros = { workspace = true }
+
+# k8s leader election (optional, behind the `k8s` feature)
+kube = { workspace = true, features = ["client", "rustls-tls", "aws-lc-rs"], optional = true }
+k8s-openapi = { workspace = true, features = ["latest"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
