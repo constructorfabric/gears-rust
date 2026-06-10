@@ -1,0 +1,37 @@
+[package]
+name = "cf-gears-standalone-cluster-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "In-process standalone backend plugin for the cluster gear: a native cache plus the SDK default leader-election, lock, and service-discovery backends — the zero-infrastructure dev/test deployment"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "standalone_cluster_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `otel` pulls in the SDK's OpenTelemetry-backed `ClusterMetrics` adapter
+# (`OtelClusterMetrics`) so the standalone backend emits the cluster metrics
+# contract (ADR-004). Spans and log events need no feature (plain `tracing`).
+cluster-sdk = { workspace = true, features = ["otel"] }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+# Reads the provider's flattened operator-config options (e.g. `sweep_interval_ms`)
+# passed through by the wiring crate as a serde map.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# `test-util` enables `tokio::time::pause`/`advance` so the sweeper and the
+# default backends' TTL/renewal logic can be driven deterministically in tests.
+tokio = { workspace = true, features = ["test-util"] }

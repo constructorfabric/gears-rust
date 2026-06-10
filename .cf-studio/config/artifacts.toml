@@ -233,6 +233,16 @@ name = "Nested SDK"
 path = "{system_root}/{system}-sdk/src"
 extensions = [".rs"]
 
+[[systems.autodetect.codebase]]
+name = "Nested SDK Tests"
+path = "{system_root}/{system}-sdk/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested SDK Examples"
+path = "{system_root}/{system}-sdk/examples"
+extensions = [".rs"]
+
 # Nested sub-plugin scope: account-management/docs/tr-plugin/ carries its own PRD/DESIGN/ADR.
 # Declared as a child of the `gears/system/$system` autodetect rule so the sub-plugin
 # artifacts are detected as belonging to tr-plugin, not to account-management.

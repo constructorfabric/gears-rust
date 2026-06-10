@@ -1,0 +1,42 @@
+[package]
+name = "cf-gears-cluster"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The cluster gear: a RunnableCapability that reads operator config, registers per-profile, per-primitive coordination backends in the ClientHub, and owns the cluster lifecycle. Also exposes the wiring builder/handle as embeddable library API."
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "cluster"
+
+[lints]
+workspace = true
+
+[dependencies]
+cluster-sdk = { workspace = true }
+toolkit = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+tokio-util = { workspace = true }
+# The cluster gear assembles its provider registry from the backend plugins it
+# links; the standalone in-process backend is the built-in default.
+cf-gears-standalone-cluster-plugin = { path = "../plugins/standalone-cluster-plugin" }
+# Operator YAML schema (`ClusterConfig`). serde lives in the gear/wiring crate, not
+# the SDK — the SDK coordination contract stays serde-free (`cpt-cf-clst-constraint-no-serde`).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+# Parses the `ClusterConfig` YAML fixtures the config-driven wiring test feeds.
+serde-saphyr = { workspace = true }
+# The gear-lifecycle test builds a `GearCtx`, which needs an instance id.
+uuid = { workspace = true }

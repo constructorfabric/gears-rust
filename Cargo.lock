@@ -1479,6 +1479,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-cluster"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-gears-cluster-sdk",
+ "cf-gears-standalone-cluster-plugin",
+ "cf-gears-toolkit",
+ "serde",
+ "serde-saphyr 0.0.22",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-cluster-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
+ "gts",
+ "gts-macros",
+ "opentelemetry",
+ "parking_lot",
+ "rand 0.10.1",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-test",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-credstore"
 version = "0.1.23"
 dependencies = [
@@ -2048,6 +2089,18 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "cf-gears-standalone-cluster-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-cluster-sdk",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
