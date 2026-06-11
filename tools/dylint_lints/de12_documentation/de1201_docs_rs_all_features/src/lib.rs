@@ -1,9 +1,11 @@
 #![feature(rustc_private)]
 #![warn(unused_extern_crates)]
 
+extern crate rustc_errors;
 extern crate rustc_span;
 
 use cargo_metadata::{Metadata, MetadataCommand, Package};
+use rustc_errors::DiagDecorator;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_span::DUMMY_SP;
 use serde_json::Value;
@@ -75,22 +77,30 @@ impl LateLintPass<'_> for De1201DocsRsAllFeatures {
         {
             Ok(metadata) => metadata,
             Err(error) => {
-                cx.span_lint(DE1201_DOCS_RS_ALL_FEATURES, DUMMY_SP, |diag| {
-                    diag.primary_message(format!(
-                        "could not read Cargo metadata for docs.rs configuration check: {error}"
-                    ));
-                });
+                cx.emit_span_lint(
+                    DE1201_DOCS_RS_ALL_FEATURES,
+                    DUMMY_SP,
+                    DiagDecorator(|diag| {
+                        diag.primary_message(format!(
+                            "could not read Cargo metadata for docs.rs configuration check: {error}"
+                        ));
+                    }),
+                );
                 return;
             }
         };
 
         let Some(package) = find_current_package(&metadata, &manifest_path) else {
-            cx.span_lint(DE1201_DOCS_RS_ALL_FEATURES, DUMMY_SP, |diag| {
-                diag.primary_message(format!(
-                    "could not find current package in Cargo metadata for `{}`",
-                    manifest_path.display()
-                ));
-            });
+            cx.emit_span_lint(
+                DE1201_DOCS_RS_ALL_FEATURES,
+                DUMMY_SP,
+                DiagDecorator(|diag| {
+                    diag.primary_message(format!(
+                        "could not find current package in Cargo metadata for `{}`",
+                        manifest_path.display()
+                    ));
+                }),
+            );
             return;
         };
 
@@ -103,7 +113,10 @@ impl LateLintPass<'_> for De1201DocsRsAllFeatures {
             return;
         };
 
-        cx.span_lint(DE1201_DOCS_RS_ALL_FEATURES, DUMMY_SP, |diag| {
+        cx.emit_span_lint(
+            DE1201_DOCS_RS_ALL_FEATURES,
+            DUMMY_SP,
+            DiagDecorator(|diag| {
             diag.primary_message(format!(
                 "publishable crate `{}` must set `package.metadata.docs.rs.all-features = true` (DE1201)",
                 package.name
@@ -114,7 +127,8 @@ impl LateLintPass<'_> for De1201DocsRsAllFeatures {
                 package.manifest_path,
                 package.name,
             ));
-        });
+            }),
+        );
     }
 }
 

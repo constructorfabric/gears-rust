@@ -4,5 +4,4 @@ error[E0599]: no method named `all` found for struct `SecureSelect<test_entity::
 35 |     let _result = Entity::find().secure().all(conn).await;
    |                                           ^^^ method not found in `SecureSelect<test_entity::Entity, Unscoped>`
    |
-   = note: the method was found for
-           - `SecureSelect<E, Scoped>`
+   = note: the method was found for `SecureSelect<E, Scoped>`

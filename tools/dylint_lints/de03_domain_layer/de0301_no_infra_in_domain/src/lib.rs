@@ -3,6 +3,7 @@
 
 extern crate rustc_ast;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use lint_utils::{is_in_contract_module_ast, is_in_domain_path, use_tree_to_strings};
 use rustc_ast::{Item, ItemKind, Ty, TyKind};
 use rustc_lint::{EarlyLintPass, LintContext};
@@ -101,14 +102,17 @@ fn check_use_in_domain(cx: &rustc_lint::EarlyContext<'_>, item: &Item) {
 
     for path_str in use_tree_to_strings(use_tree) {
         if let Some(pattern) = matches_infra_pattern(&path_str) {
-            cx.span_lint(DE0301_NO_INFRA_IN_DOMAIN, item.span, |diag| {
-                diag.primary_message(format!(
-                    "domain module imports infrastructure dependency `{pattern}` (DE0301)"
-                ));
-                diag.help(
-                    "domain should depend only on abstractions; move infrastructure code to infra/ layer",
-                );
-            });
+            span_lint_and_then(
+                cx,
+                DE0301_NO_INFRA_IN_DOMAIN,
+                item.span,
+                format!("domain module imports infrastructure dependency `{pattern}` (DE0301)"),
+                |diag| {
+                    diag.help(
+                        "domain should depend only on abstractions; move infrastructure code to infra/ layer",
+                    );
+                },
+            );
             return;
         }
     }
@@ -126,14 +130,17 @@ fn check_type_in_domain(cx: &rustc_lint::EarlyContext<'_>, ty: &Ty) {
                 .join("::");
 
             if matches_infra_pattern(&path_str).is_some() {
-                cx.span_lint(DE0301_NO_INFRA_IN_DOMAIN, ty.span, |diag| {
-                    diag.primary_message(format!(
-                        "domain module uses infrastructure type `{path_str}` (DE0301)"
-                    ));
-                    diag.help(
-                        "domain should depend only on abstractions; move infrastructure code to infra/ layer",
-                    );
-                });
+                span_lint_and_then(
+                    cx,
+                    DE0301_NO_INFRA_IN_DOMAIN,
+                    ty.span,
+                    format!("domain module uses infrastructure type `{path_str}` (DE0301)"),
+                    |diag| {
+                        diag.help(
+                            "domain should depend only on abstractions; move infrastructure code to infra/ layer",
+                        );
+                    },
+                );
                 return;
             }
 
@@ -189,14 +196,19 @@ fn check_type_in_domain(cx: &rustc_lint::EarlyContext<'_>, ty: &Ty) {
                         .join("::");
 
                     if matches_infra_pattern(&path_str).is_some() {
-                        cx.span_lint(DE0301_NO_INFRA_IN_DOMAIN, ty.span, |diag| {
-                            diag.primary_message(format!(
+                        span_lint_and_then(
+                            cx,
+                            DE0301_NO_INFRA_IN_DOMAIN,
+                            ty.span,
+                            format!(
                                 "domain module uses infrastructure trait `{path_str}` (DE0301)"
-                            ));
-                            diag.help(
-                                "domain should depend only on abstractions; move infrastructure code to infra/ layer",
-                            );
-                        });
+                            ),
+                            |diag| {
+                                diag.help(
+                                    "domain should depend only on abstractions; move infrastructure code to infra/ layer",
+                                );
+                            },
+                        );
                         return;
                     }
                 }
@@ -216,14 +228,19 @@ fn check_type_in_domain(cx: &rustc_lint::EarlyContext<'_>, ty: &Ty) {
                         .join("::");
 
                     if matches_infra_pattern(&path_str).is_some() {
-                        cx.span_lint(DE0301_NO_INFRA_IN_DOMAIN, ty.span, |diag| {
-                            diag.primary_message(format!(
+                        span_lint_and_then(
+                            cx,
+                            DE0301_NO_INFRA_IN_DOMAIN,
+                            ty.span,
+                            format!(
                                 "domain module uses infrastructure trait `{path_str}` (DE0301)"
-                            ));
-                            diag.help(
-                                "domain should depend only on abstractions; move infrastructure code to infra/ layer",
-                            );
-                        });
+                            ),
+                            |diag| {
+                                diag.help(
+                                    "domain should depend only on abstractions; move infrastructure code to infra/ layer",
+                                );
+                            },
+                        );
                         return;
                     }
                 }

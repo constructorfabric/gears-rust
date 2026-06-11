@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Workspace-feature-unification shim: pulls rustls + hyper-rustls with the `fips` feature on every target where the AWS-LC FIPS backend is the intended TLS provider (i.e. everywhere except macOS, where Apple corecrypto is used, and Windows, where CNG is used instead)."
 keywords = ["constructorfabric", "cf-gears"]
 publish = true
+metadata.docs.rs.all-features = true
 
 [lib]
 name = "rustls_fips_shim"

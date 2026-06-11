@@ -4,8 +4,9 @@
 extern crate rustc_ast;
 extern crate rustc_hir;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_hir::{Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_lint::{LateContext, LateLintPass};
 
 dylint_linting::declare_late_lint! {
     /// ### What it does
@@ -273,11 +274,16 @@ fn check_path_argument<'tcx>(cx: &LateContext<'tcx>, path_arg: &'tcx Expr<'tcx>)
                 ),
             };
 
-            cx.span_lint(DE0801_API_ENDPOINT_VERSION, path_arg.span, |diag| {
-                diag.primary_message(message);
-                diag.help(help);
-                diag.note(note);
-            });
+            span_lint_and_then(
+                cx,
+                DE0801_API_ENDPOINT_VERSION,
+                path_arg.span,
+                message,
+                |diag| {
+                    diag.help(help);
+                    diag.note(note);
+                },
+            );
         }
     }
 }

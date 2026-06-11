@@ -7,11 +7,12 @@ extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_span;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::ty::implements_trait;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{self as hir, Expr, ExprKind, ImplItemKind, ItemKind, QPath};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{Ty, TypeckResults};
 use rustc_span::hygiene::{ExpnKind, MacroKind};
 
@@ -88,7 +89,7 @@ dylint_linting::declare_late_lint! {
 /// Uses the `rustc_diagnostic_item = "Error"` marker and `clippy_utils::ty::implements_trait`
 /// for proper trait resolution. Handles ADTs, type aliases, and generic params with bounds.
 fn implements_error<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
-    let Some(error_did) = cx.tcx.get_diagnostic_item(rustc_span::sym::Error) else {
+    let Some(error_did) = cx.tcx.get_diagnostic_item(clippy_utils::sym::Error) else {
         return false;
     };
     implements_trait(cx, ty, error_did, &[])
@@ -114,17 +115,20 @@ struct ToStringVisitor<'tcx, 'cx> {
 impl<'tcx> ToStringVisitor<'tcx, '_> {
     /// Emit the DE1302 diagnostic at `span`.
     fn emit(&self, span: rustc_span::Span) {
-        self.cx.span_lint(DE1302_ERROR_FROM_TO_STRING, span, |diag| {
-            diag.primary_message(
-                "`.to_string()` in `From`/`TryFrom` impl destroys the error chain (DE1302)",
-            );
-            diag.help(
-                "store the source error directly, use an enum variant, or use `#[from]` with thiserror",
-            );
-            diag.note(
-                "`.to_string()` discards the original error type: `.source()` returns None and the error cannot be downcast",
-            );
-        });
+        span_lint_and_then(
+            self.cx,
+            DE1302_ERROR_FROM_TO_STRING,
+            span,
+            "`.to_string()` in `From`/`TryFrom` impl destroys the error chain (DE1302)",
+            |diag| {
+                diag.help(
+                    "store the source error directly, use an enum variant, or use `#[from]` with thiserror",
+                );
+                diag.note(
+                    "`.to_string()` discards the original error type: `.source()` returns None and the error cannot be downcast",
+                );
+            },
+        );
     }
 
     /// Returns true if `ty` (after peeling references) is a type whose
@@ -166,7 +170,7 @@ impl<'tcx> ToStringVisitor<'tcx, '_> {
 /// both paths verify they're actually hitting the trait method, not a bare
 /// inherent method named `to_string`.
 fn is_to_string_def<'tcx>(cx: &LateContext<'tcx>, def_id: DefId) -> bool {
-    let Some(to_string_trait) = cx.tcx.get_diagnostic_item(rustc_span::sym::ToString) else {
+    let Some(to_string_trait) = cx.tcx.get_diagnostic_item(clippy_utils::sym::ToString) else {
         return false;
     };
     cx.tcx.trait_of_assoc(def_id) == Some(to_string_trait)
@@ -209,12 +213,10 @@ impl<'tcx> hir::intravisit::Visitor<'tcx> for ToStringVisitor<'tcx, '_> {
                 }
             }
             // UFCS form: `ToString::to_string(&e)` or `<E as ToString>::to_string(&e)`.
-            ExprKind::Call(callee, [arg]) if !hidden => {
-                if is_to_string_path(self.cx, callee) {
-                    let arg_ty = self.typeck.expr_ty(arg);
-                    if self.is_relevant_receiver(arg_ty) {
-                        self.emit(expr.span);
-                    }
+            ExprKind::Call(callee, [arg]) if !hidden && is_to_string_path(self.cx, callee) => {
+                let arg_ty = self.typeck.expr_ty(arg);
+                if self.is_relevant_receiver(arg_ty) {
+                    self.emit(expr.span);
                 }
             }
             // Closures have their own typeck tables; delegate to a helper

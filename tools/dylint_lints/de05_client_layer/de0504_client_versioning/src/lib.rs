@@ -4,6 +4,7 @@
 extern crate rustc_ast;
 extern crate rustc_span;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::{Item, ItemKind};
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_span::Span;
@@ -116,14 +117,19 @@ fn emit_lint(
             format!("{}V1", version.base)
         };
 
-    cx.span_lint(DE0504_CLIENT_VERSIONING, span, |diag| {
-        diag.primary_message(format!(
+    span_lint_and_then(
+        cx,
+        DE0504_CLIENT_VERSIONING,
+        span,
+        format!(
             "Client trait `{trait_name}` in non-system gear must have a version suffix (DE0504)"
-        ));
-        diag.help(format!(
-            "rename trait to `{suggestion}` to indicate API version"
-        ));
-    });
+        ),
+        |diag| {
+            diag.help(format!(
+                "rename trait to `{suggestion}` to indicate API version"
+            ));
+        },
+    );
 }
 
 #[cfg(test)]

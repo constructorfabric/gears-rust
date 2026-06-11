@@ -3,6 +3,7 @@
 
 extern crate rustc_ast;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::{Item, ItemKind};
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 
@@ -73,10 +74,15 @@ fn check_dto_uses_api_dto(cx: &EarlyContext<'_>, item: &Item) {
     }
 
     // Report missing api_dto macro
-    cx.span_lint(DE0203_DTOS_MUST_USE_API_DTO, item.span, |diag| {
-        diag.primary_message("api/rest DTO type must use the api_dto macro (DE0203)");
-        diag.help("Use #[toolkit_macros::api_dto(request)] for request DTOs, #[toolkit_macros::api_dto(response)] for response DTOs, or #[toolkit_macros::api_dto(request, response)] for both");
-    });
+    span_lint_and_then(
+        cx,
+        DE0203_DTOS_MUST_USE_API_DTO,
+        item.span,
+        "api/rest DTO type must use the api_dto macro (DE0203)",
+        |diag| {
+            diag.help("Use #[toolkit_macros::api_dto(request)] for request DTOs, #[toolkit_macros::api_dto(response)] for response DTOs, or #[toolkit_macros::api_dto(request, response)] for both");
+        },
+    );
 }
 
 #[cfg(test)]

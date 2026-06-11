@@ -3,6 +3,7 @@
 
 extern crate rustc_ast;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::ItemKind;
 use rustc_lint::{EarlyLintPass, LintContext};
 
@@ -41,13 +42,18 @@ impl EarlyLintPass for De0201DtosOnlyInApiRest {
 
         // Check if the file is in api/rest folder (supports simulated_dir for tests)
         if !lint_utils::is_in_api_rest_folder(cx.sess().source_map(), item.span) {
-            cx.span_lint(DE0201_DTOS_ONLY_IN_API_REST, span, |diag| {
-                diag.primary_message(format!(
+            span_lint_and_then(
+                cx,
+                DE0201_DTOS_ONLY_IN_API_REST,
+                span,
+                format!(
                     "DTO type `{}` is defined outside of api/rest folder (DE0201)",
                     item_name
-                ));
-                diag.help("move DTO types to src/api/rest/dto.rs");
-            });
+                ),
+                |diag| {
+                    diag.help("move DTO types to src/api/rest/dto.rs");
+                },
+            );
         }
     }
 }

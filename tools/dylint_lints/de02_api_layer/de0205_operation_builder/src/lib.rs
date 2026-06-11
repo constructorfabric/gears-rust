@@ -6,7 +6,8 @@ extern crate rustc_hir;
 extern crate rustc_span;
 
 use clippy_utils::consts::{ConstEvalCtxt, Constant};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
+use clippy_utils::diagnostics::span_lint_and_then;
+use rustc_lint::{LateContext, LateLintPass};
 use rustc_span::Span;
 
 dylint_linting::declare_late_lint! {
@@ -71,17 +72,27 @@ impl<'tcx> LateLintPass<'tcx> for De0205OperationBuilder {
                     if let Some(tag_arg) = args.first() {
                         if let Some(tag_string) = extract_tag_value(cx, tag_arg) {
                             if !is_valid_tag_format(&tag_string) {
-                                cx.span_lint(DE0205_OPERATION_BUILDER, tag_arg.span, |diag| {
-                                        diag.primary_message("tag format is invalid");
+                                span_lint_and_then(
+                                    cx,
+                                    DE0205_OPERATION_BUILDER,
+                                    tag_arg.span,
+                                    "tag format is invalid",
+                                    |diag| {
                                         diag.help("tags must contain whitespace-separated words, each starting with a capital letter");
                                         diag.note("example: \"User Management\", \"Simple Resource Registry\"");
-                                    });
+                                    },
+                                );
                             }
                         } else {
-                            cx.span_lint(DE0205_OPERATION_BUILDER, tag_arg.span, |diag| {
-                                    diag.primary_message("tag must be a string literal or const string");
+                            span_lint_and_then(
+                                cx,
+                                DE0205_OPERATION_BUILDER,
+                                tag_arg.span,
+                                "tag must be a string literal or const string",
+                                |diag| {
                                     diag.help("use a string literal like `.tag(\"Your Tag\")` or a const string");
-                                });
+                                },
+                            );
                         }
                     }
                 }
@@ -89,16 +100,26 @@ impl<'tcx> LateLintPass<'tcx> for De0205OperationBuilder {
                     if let Some(summary_arg) = args.first() {
                         if let Some(summary_string) = extract_tag_value(cx, summary_arg) {
                             if summary_string.trim().is_empty() {
-                                cx.span_lint(DE0205_OPERATION_BUILDER, summary_arg.span, |diag| {
-                                    diag.primary_message("summary cannot be empty");
-                                    diag.help("provide a meaningful summary for the operation");
-                                });
+                                span_lint_and_then(
+                                    cx,
+                                    DE0205_OPERATION_BUILDER,
+                                    summary_arg.span,
+                                    "summary cannot be empty",
+                                    |diag| {
+                                        diag.help("provide a meaningful summary for the operation");
+                                    },
+                                );
                             }
                         } else {
-                            cx.span_lint(DE0205_OPERATION_BUILDER, summary_arg.span, |diag| {
-                                    diag.primary_message("summary must be a string literal or const string");
+                            span_lint_and_then(
+                                cx,
+                                DE0205_OPERATION_BUILDER,
+                                summary_arg.span,
+                                "summary must be a string literal or const string",
+                                |diag| {
                                     diag.help("use a string literal like `.summary(\"Your summary\")` or a const string");
-                                });
+                                },
+                            );
                         }
                     }
                 }
@@ -120,26 +141,33 @@ fn check_complete_builder_chain(cx: &LateContext<'_>, expr: &rustc_hir::Expr<'_>
         // Report missing calls
         let builder_span = get_builder_constructor_span(expr);
         if !has_tag || !has_summary {
-            cx.span_lint(DE0205_OPERATION_BUILDER, builder_span, |diag| {
-                match (has_tag, has_summary) {
+            let msg = match (has_tag, has_summary) {
+                (false, false) => "operation builder missing .tag() and .summary() calls",
+                (false, true) => "operation builder missing .tag() call",
+                (true, false) => "operation builder missing .summary() call",
+                (true, true) => "",
+            };
+            span_lint_and_then(
+                cx,
+                DE0205_OPERATION_BUILDER,
+                builder_span,
+                msg,
+                |diag| match (has_tag, has_summary) {
                     (false, false) => {
-                        diag.primary_message("operation builder missing .tag() and .summary() calls");
                         diag.help("add .tag(\"Your Tag\") with properly formatted tag");
                         diag.note("tags must contain whitespace-separated words, each starting with a capital letter");
                         diag.help("add .summary(\"Your summary\") with a meaningful description");
                     }
                     (false, true) => {
-                        diag.primary_message("operation builder missing .tag() call");
                         diag.help("add .tag(\"Your Tag\") with properly formatted tag");
                         diag.note("tags must contain whitespace-separated words, each starting with a capital letter");
                     }
                     (true, false) => {
-                        diag.primary_message("operation builder missing .summary() call");
                         diag.help("add .summary(\"Your summary\") with a meaningful description");
                     }
                     (true, true) => {}
-                }
-            });
+                },
+            );
         }
     }
 }

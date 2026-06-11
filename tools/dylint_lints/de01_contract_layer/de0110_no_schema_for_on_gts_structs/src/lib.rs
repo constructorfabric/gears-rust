@@ -5,6 +5,7 @@ extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_span;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_hir::{Expr, ExprKind, GenericArg};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::ty::{self, Ty};
@@ -113,20 +114,21 @@ impl<'tcx> LateLintPass<'tcx> for De0110NoSchemaForOnGtsStructs {
                             && is_gts_type(cx, ty)
                         {
                             let type_name = get_type_name(ty);
-                            cx.span_lint(
-                                        DE0110_NO_SCHEMA_FOR_ON_GTS_STRUCTS,
-                                        callsite_span,
-                                        |diag| {
-                                            diag.primary_message(format!(
-                                                "do not use `schema_for!({})` on GTS-wrapped struct (DE0110)",
-                                                type_name
-                                            ));
-                                            diag.help(format!(
-                                                "use `{}::gts_json_schema_with_refs()` instead for proper `$id` and `$ref` handling",
-                                                type_name
-                                            ));
-                                        },
-                                    );
+                            span_lint_and_then(
+                                cx,
+                                DE0110_NO_SCHEMA_FOR_ON_GTS_STRUCTS,
+                                callsite_span,
+                                format!(
+                                    "do not use `schema_for!({})` on GTS-wrapped struct (DE0110)",
+                                    type_name
+                                ),
+                                |diag| {
+                                    diag.help(format!(
+                                        "use `{}::gts_json_schema_with_refs()` instead for proper `$id` and `$ref` handling",
+                                        type_name
+                                    ));
+                                },
+                            );
                             return;
                         }
                     }

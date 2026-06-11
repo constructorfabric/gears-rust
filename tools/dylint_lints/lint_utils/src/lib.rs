@@ -465,7 +465,7 @@ pub fn is_utoipa_trait(segments: &[&str], trait_name: &str) -> bool {
 /// - `use foo::*` -> `["foo"]`
 pub fn use_tree_to_strings(tree: &UseTree) -> Vec<String> {
     match &tree.kind {
-        UseTreeKind::Simple(..) | UseTreeKind::Glob => {
+        UseTreeKind::Simple(..) | UseTreeKind::Glob(_) => {
             vec![
                 tree.prefix
                     .segments

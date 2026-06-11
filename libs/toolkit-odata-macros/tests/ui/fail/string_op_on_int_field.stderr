@@ -4,5 +4,4 @@ error[E0599]: no method named `contains` found for struct `FieldRef<UserSchema, 
 11 |     let _ = user::age().contains("test");
    |                         ^^^^^^^^ method not found in `FieldRef<UserSchema, i32>`
    |
-   = note: the method was found for
-           - `FieldRef<S, std::string::String>`
+   = note: the method was found for `FieldRef<S, std::string::String>`
