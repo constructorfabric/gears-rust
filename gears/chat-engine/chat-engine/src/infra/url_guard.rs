@@ -186,7 +186,10 @@ mod tests {
     fn rejects_http_scheme() {
         let err = validate_outbound_url("http://api.example.com/v1", "endpoint").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("https"), "must surface scheme requirement: {msg}");
+        assert!(
+            msg.contains("https"),
+            "must surface scheme requirement: {msg}"
+        );
     }
 
     #[test]
@@ -223,9 +226,8 @@ mod tests {
     fn rejects_cloud_metadata_ip() {
         // 169.254.169.254 — AWS / GCP / Azure IMDS endpoint. Must NEVER
         // be reachable through a tenant-configured URL.
-        let err =
-            validate_outbound_url("https://169.254.169.254/latest/meta-data/", "endpoint")
-                .unwrap_err();
+        let err = validate_outbound_url("https://169.254.169.254/latest/meta-data/", "endpoint")
+            .unwrap_err();
         assert!(matches!(err, PluginError::InvalidInput { .. }));
     }
 
@@ -238,8 +240,7 @@ mod tests {
             "https://172.31.255.254/x",
             "https://192.168.1.1/x",
         ] {
-            let err = validate_outbound_url(raw, "endpoint")
-                .unwrap_err_or_else_helper(raw);
+            let err = validate_outbound_url(raw, "endpoint").unwrap_err_or_else_helper(raw);
             assert!(matches!(err, PluginError::InvalidInput { .. }), "{raw}");
         }
     }
@@ -285,8 +286,7 @@ mod tests {
         // `::ffff:127.0.0.1` is an IPv4-mapped form of loopback; without
         // explicit handling this would slip past `IpAddr::is_loopback()`
         // because the IPv6 representation is NOT `::1`.
-        let err = validate_outbound_url("https://[::ffff:127.0.0.1]/x", "endpoint")
-            .unwrap_err();
+        let err = validate_outbound_url("https://[::ffff:127.0.0.1]/x", "endpoint").unwrap_err();
         assert!(matches!(err, PluginError::InvalidInput { .. }));
     }
 

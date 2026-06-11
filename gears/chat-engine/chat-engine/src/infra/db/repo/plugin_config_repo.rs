@@ -18,17 +18,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use toolkit_db::secure::{AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Set};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
+use toolkit_db::secure::{AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt};
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
-use crate::infra::db::entity::plugin_config::{
-    ActiveModel, Column, Entity as PluginConfigEntity,
-};
+use crate::infra::db::entity::plugin_config::{ActiveModel, Column, Entity as PluginConfigEntity};
 use crate::infra::db::repo::ChatEngineDb;
 
 /// Repository surface for `plugin_configs`.
@@ -90,14 +88,11 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
     ) -> Result<Option<JsonValue>, ChatEngineError> {
         let conn = self.db.conn()?;
         let scope = AccessScope::allow_all();
-        let row = PluginConfigEntity::find_by_id((
-            plugin_instance_id.to_owned(),
-            session_type_id,
-        ))
-        .secure()
-        .scope_with(&scope)
-        .one(&conn)
-        .await?;
+        let row = PluginConfigEntity::find_by_id((plugin_instance_id.to_owned(), session_type_id))
+            .secure()
+            .scope_with(&scope)
+            .one(&conn)
+            .await?;
         Ok(row.and_then(|m| m.config))
     }
 
@@ -120,12 +115,9 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
         // `created_at` untouched on update. `plugin_configs` has no tenant
         // column, so `on_conflict_raw` is safe — `SecureOnConflict`'s
         // tenant-immutability guard would have nothing to check.
-        let on_conflict = OnConflict::columns([
-            Column::PluginInstanceId,
-            Column::SessionTypeId,
-        ])
-        .update_columns([Column::Config, Column::UpdatedAt])
-        .to_owned();
+        let on_conflict = OnConflict::columns([Column::PluginInstanceId, Column::SessionTypeId])
+            .update_columns([Column::Config, Column::UpdatedAt])
+            .to_owned();
 
         let conn = self.db.conn()?;
         let scope = AccessScope::allow_all();

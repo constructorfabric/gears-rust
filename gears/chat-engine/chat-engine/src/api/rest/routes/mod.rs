@@ -20,9 +20,10 @@ use std::sync::Arc;
 
 use axum::{Extension, Router};
 use http::StatusCode;
-use toolkit::api::operation_builder::{LicenseFeature, OperationBuilder};
 use toolkit::api::OpenApiRegistry;
+use toolkit::api::operation_builder::{LicenseFeature, OperationBuilder};
 
+use crate::api::rest::WebhookEmitter;
 use crate::api::rest::dto::{
     CreateSessionRequestDto, ExportAcceptedDto, MessageDto, MessageListDto, ReactionListDto,
     ReactionRequestDto, RecreateMessageRequestDto, SearchRequestDto, SearchResultsDto,
@@ -30,7 +31,6 @@ use crate::api::rest::dto::{
     StreamingEventDto, SummarizeAcceptedDto, SwitchSessionTypeRequestDto, VariantListDto,
 };
 use crate::api::rest::handlers;
-use crate::api::rest::WebhookEmitter;
 use crate::domain::service::{
     ExportService, IntelligenceService, MessageService, ReactionService, SearchService,
     SessionService, VariantService,
@@ -124,7 +124,12 @@ pub fn register_routes(
         .authenticated()
         .require_license_features([&ChatEngineLicense])
         .path_param("id", "Session UUID")
-        .query_param_typed("hard", false, "When true, perform a cascading hard delete", "boolean")
+        .query_param_typed(
+            "hard",
+            false,
+            "When true, perform a cascading hard delete",
+            "boolean",
+        )
         .handler(handlers::sessions::delete_session)
         .json_response_with_schema::<SessionDto>(openapi, StatusCode::OK, "Soft-deleted session")
         .no_content_response(StatusCode::NO_CONTENT, "Hard delete completed")

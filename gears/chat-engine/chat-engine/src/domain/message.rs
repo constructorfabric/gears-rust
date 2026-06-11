@@ -129,9 +129,7 @@ mod tests {
             parent_message_id: None,
             role: message_entity::MessageRole::Assistant,
             content: serde_json::json!({"text": "hi"}),
-            file_ids: Some(serde_json::json!([
-                "00000000-0000-0000-0000-000000000001"
-            ])),
+            file_ids: Some(serde_json::json!(["00000000-0000-0000-0000-000000000001"])),
             variant_index: 2,
             is_active: true,
             is_complete: false,

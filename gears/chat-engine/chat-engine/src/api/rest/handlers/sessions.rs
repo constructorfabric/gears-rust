@@ -23,10 +23,10 @@
 use std::sync::Arc;
 
 use axum::Extension;
+use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tracing::field::Empty;
@@ -162,7 +162,9 @@ pub async fn delete_session(
     let hard = query.hard.unwrap_or(false);
     let outcome = svc.delete_session(&identity, session_id, hard).await?;
     match outcome {
-        SessionDeleteOutcome::Soft { session } => Ok((StatusCode::OK, Json(session)).into_response()),
+        SessionDeleteOutcome::Soft { session } => {
+            Ok((StatusCode::OK, Json(session)).into_response())
+        }
         SessionDeleteOutcome::Hard => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }

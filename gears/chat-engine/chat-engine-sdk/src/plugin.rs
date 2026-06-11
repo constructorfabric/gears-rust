@@ -321,10 +321,7 @@ mod plugin_call_context_tests {
         // Race-tolerant: anything <= 0 is Some(ZERO); a tiny positive value
         // is also acceptable but should be sub-millisecond.
         let r = ctx.remaining().expect("deadline is set");
-        assert!(
-            r <= Duration::from_millis(1),
-            "expected ~ZERO, got {r:?}"
-        );
+        assert!(r <= Duration::from_millis(1), "expected ~ZERO, got {r:?}");
     }
 }
 
@@ -456,10 +453,7 @@ pub trait ChatEngineBackendPlugin: Send + Sync {
     /// The returned [`PluginStream`] must be `'static` — it cannot borrow from
     /// `&self`. See [`PluginStream`]'s docs for the idiomatic way to detach
     /// captured state (clone fields out, or hold `self` in an `Arc`).
-    async fn on_message(
-        &self,
-        _ctx: MessagePluginCtx,
-    ) -> Result<PluginStream, PluginError> {
+    async fn on_message(&self, _ctx: MessagePluginCtx) -> Result<PluginStream, PluginError> {
         Ok(empty_stream())
     }
 

@@ -47,11 +47,11 @@ use chat_engine_sdk::plugin::{
 #[cfg(test)]
 use chat_engine_sdk::plugin::ChatEngineBackendPlugin;
 use futures::stream::{self, BoxStream, StreamExt};
-use toolkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use toolkit_macros::domain_model;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -235,9 +235,7 @@ impl MessageService {
             user_message_id,
             assistant_message_id,
             user_variant_index,
-        } = self
-            .pre_persist_user_message(&req, &identity)
-            .await?;
+        } = self.pre_persist_user_message(&req, &identity).await?;
 
         tracing::Span::current().record(
             "assistant_message_id",
@@ -365,10 +363,7 @@ impl MessageService {
         session: &Session,
         current_msg: &Message,
     ) -> Result<Vec<Message>> {
-        let meta_value = session
-            .metadata
-            .clone()
-            .unwrap_or(JsonValue::Null);
+        let meta_value = session.metadata.clone().unwrap_or(JsonValue::Null);
         let strategy = read_memory_strategy(&meta_value);
 
         let active = self.messages.list_active_path(session.session_id).await?;
@@ -492,27 +487,27 @@ impl MessageService {
             );
             return Ok(());
         };
-        let session_type_id = row.session_type_id.ok_or_else(|| {
-            ChatEngineError::BackendUnavailable {
-                reason: "context_overflow recovery: session has no session_type bound"
-                    .to_string(),
-                retry_after: None,
-                source: None,
-            }
-        })?;
+        let session_type_id =
+            row.session_type_id
+                .ok_or_else(|| ChatEngineError::BackendUnavailable {
+                    reason: "context_overflow recovery: session has no session_type bound"
+                        .to_string(),
+                    retry_after: None,
+                    source: None,
+                })?;
         let st = self
             .session_types
             .find_by_id(session_type_id)
             .await?
             .ok_or_else(|| ChatEngineError::not_found("session_type", session_type_id))?;
-        let plugin_instance_id = st.plugin_instance_id.ok_or_else(|| {
-            ChatEngineError::BackendUnavailable {
-                reason: "context_overflow recovery: session_type has no plugin binding"
-                    .to_string(),
-                retry_after: None,
-                source: None,
-            }
-        })?;
+        let plugin_instance_id =
+            st.plugin_instance_id
+                .ok_or_else(|| ChatEngineError::BackendUnavailable {
+                    reason: "context_overflow recovery: session_type has no plugin binding"
+                        .to_string(),
+                    retry_after: None,
+                    source: None,
+                })?;
         let plugin = self.plugins.resolve(&plugin_instance_id)?;
         let plugin_config = self
             .plugins
@@ -626,9 +621,12 @@ impl MessageService {
             .await?
             .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
 
-        let state = LifecycleState::from_str_value(&row.lifecycle_state)
-            .unwrap_or(LifecycleState::Active);
-        if matches!(state, LifecycleState::SoftDeleted | LifecycleState::HardDeleted) {
+        let state =
+            LifecycleState::from_str_value(&row.lifecycle_state).unwrap_or(LifecycleState::Active);
+        if matches!(
+            state,
+            LifecycleState::SoftDeleted | LifecycleState::HardDeleted
+        ) {
             return Err(ChatEngineError::conflict(format!(
                 "session is {state} and cannot accept memory_strategy updates",
             )));
@@ -986,11 +984,7 @@ impl MessageService {
         // misses fold to 404 (anti-enumeration, ADR-0021).
         let session = self
             .sessions
-            .find_by_id(
-                &identity.tenant_id,
-                &identity.user_id,
-                req.session_id,
-            )
+            .find_by_id(&identity.tenant_id, &identity.user_id, req.session_id)
             .await?
             .ok_or_else(|| ChatEngineError::not_found("session", req.session_id))?;
 
@@ -1025,7 +1019,8 @@ impl MessageService {
 
         // Capabilities must be a subset of the session's enabled set.
         if let Some(ref requested) = req.capabilities {
-            let allowed_names = capability_names_from_session(session.enabled_capabilities.as_ref());
+            let allowed_names =
+                capability_names_from_session(session.enabled_capabilities.as_ref());
             for cap in requested {
                 if !allowed_names.contains(&cap.name) {
                     return Err(ChatEngineError::bad_request(format!(
@@ -1142,7 +1137,9 @@ impl MessageService {
                     .finalize_assistant(
                         session_id,
                         assistant_id,
-                        FinalizeOutcome::Cancelled { text: String::new() },
+                        FinalizeOutcome::Cancelled {
+                            text: String::new(),
+                        },
                     )
                     .await
                     .ok();
@@ -1261,37 +1258,43 @@ impl MessageService {
             // propagated — the wire stream is already closed and a
             // database hiccup must not cause the connection to hang.
             let persist = match outcome {
-                DriverOutcome::Completed { metadata } => messages
-                    .finalize_assistant(
-                        session_id,
-                        assistant_id,
-                        FinalizeOutcome::Complete {
-                            text: accumulator,
-                            metadata,
-                        },
-                    )
-                    .await,
-                DriverOutcome::CancelledByClient => messages
-                    .finalize_assistant(
-                        session_id,
-                        assistant_id,
-                        FinalizeOutcome::Cancelled { text: accumulator },
-                    )
-                    .await,
+                DriverOutcome::Completed { metadata } => {
+                    messages
+                        .finalize_assistant(
+                            session_id,
+                            assistant_id,
+                            FinalizeOutcome::Complete {
+                                text: accumulator,
+                                metadata,
+                            },
+                        )
+                        .await
+                }
+                DriverOutcome::CancelledByClient => {
+                    messages
+                        .finalize_assistant(
+                            session_id,
+                            assistant_id,
+                            FinalizeOutcome::Cancelled { text: accumulator },
+                        )
+                        .await
+                }
                 DriverOutcome::Errored {
                     error,
                     finish_reason,
-                } => messages
-                    .finalize_assistant(
-                        session_id,
-                        assistant_id,
-                        FinalizeOutcome::Errored {
-                            text: accumulator,
-                            error,
-                            finish_reason,
-                        },
-                    )
-                    .await,
+                } => {
+                    messages
+                        .finalize_assistant(
+                            session_id,
+                            assistant_id,
+                            FinalizeOutcome::Errored {
+                                text: accumulator,
+                                error,
+                                finish_reason,
+                            },
+                        )
+                        .await
+                }
             };
 
             if let Err(err) = persist {
@@ -1306,9 +1309,7 @@ impl MessageService {
             // finalised so the assistant stub state is consistent. Errors
             // from the hook are logged but never propagated — the wire
             // stream has already closed and Phase 8 will own the retry.
-            if overflow_observed
-                && let Some(ctx) = overflow_ctx
-            {
+            if overflow_observed && let Some(ctx) = overflow_ctx {
                 let svc = ctx.service.clone();
                 let sessions = ctx.sessions.clone();
                 let session_id = ctx.session_id;
@@ -1362,9 +1363,10 @@ impl MessageService {
         // Bridge `mpsc::Receiver<StreamingEvent>` to a `BoxStream` without
         // pulling `tokio-stream` into our Cargo manifest (workspace
         // wiring is owned by Phase 15).
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|evt| (evt, rx))
-        })
+        stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|evt| (evt, rx)) },
+        )
         .boxed()
     }
 }
@@ -1402,7 +1404,9 @@ struct OverflowDispatchCtx {
 #[domain_model]
 #[derive(Debug, Clone)]
 enum DriverOutcome {
-    Completed { metadata: Option<JsonValue> },
+    Completed {
+        metadata: Option<JsonValue>,
+    },
     CancelledByClient,
     Errored {
         error: String,
@@ -1493,11 +1497,11 @@ mod tests {
 
     use async_trait::async_trait;
     use chat_engine_sdk::plugin::stream_from_events;
-    use toolkit::ClientHub;
-    use toolkit::client_hub::ClientScope;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use time::OffsetDateTime;
+    use toolkit::ClientHub;
+    use toolkit::client_hub::ClientScope;
 
     use crate::infra::db::entity::session as session_entity;
     use crate::infra::db::entity::session_type as session_type_entity;
@@ -1565,7 +1569,8 @@ mod tests {
             _tenant_id: &str,
             _user_id: &str,
             _query: &toolkit_odata::ODataQuery,
-        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError>
+        {
             Ok(toolkit_odata::Page::empty(0))
         }
 
@@ -1769,11 +1774,7 @@ mod tests {
             Ok(())
         }
 
-        async fn delete(
-            &self,
-            _p: &str,
-            _s: Uuid,
-        ) -> std::result::Result<(), ChatEngineError> {
+        async fn delete(&self, _p: &str, _s: Uuid) -> std::result::Result<(), ChatEngineError> {
             Ok(())
         }
     }
@@ -1809,7 +1810,11 @@ mod tests {
             _ctx: MessagePluginCtx,
         ) -> std::result::Result<PluginStream, PluginError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let script = self.script.lock().take().unwrap_or(PluginScript::Events(vec![]));
+            let script = self
+                .script
+                .lock()
+                .take()
+                .unwrap_or(PluginScript::Events(vec![]));
             match script {
                 PluginScript::Events(events) => Ok(stream_from_events(events)),
                 PluginScript::PreError(e) => Err(e),
@@ -1901,8 +1906,7 @@ mod tests {
             ]),
         );
         let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-        let (svc, sessions, messages) =
-            make_service(plugin_id, plugin_dyn, session_type_id, None);
+        let (svc, sessions, messages) = make_service(plugin_id, plugin_dyn, session_type_id, None);
 
         let req = make_request(sessions.session_id());
         let cancel = CancellationToken::new();
@@ -1942,8 +1946,7 @@ mod tests {
         let session_type_id = Uuid::new_v4();
         let plugin = ScriptPlugin::new(plugin_id, PluginScript::Hang);
         let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-        let (svc, sessions, messages) =
-            make_service(plugin_id, plugin_dyn, session_type_id, None);
+        let (svc, sessions, messages) = make_service(plugin_id, plugin_dyn, session_type_id, None);
 
         let req = make_request(sessions.session_id());
         let cancel = CancellationToken::new();
@@ -1981,8 +1984,7 @@ mod tests {
         let session_type_id = Uuid::new_v4();
         let plugin = ScriptPlugin::new(plugin_id, PluginScript::PreError(PluginError::timeout()));
         let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-        let (svc, sessions, messages) =
-            make_service(plugin_id, plugin_dyn, session_type_id, None);
+        let (svc, sessions, messages) = make_service(plugin_id, plugin_dyn, session_type_id, None);
 
         let req = make_request(sessions.session_id());
         let cancel = CancellationToken::new();
@@ -2025,8 +2027,7 @@ mod tests {
             ),
         );
         let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-        let (svc, sessions, messages) =
-            make_service(plugin_id, plugin_dyn, session_type_id, None);
+        let (svc, sessions, messages) = make_service(plugin_id, plugin_dyn, session_type_id, None);
 
         let req = make_request(sessions.session_id());
         let cancel = CancellationToken::new();
@@ -2072,8 +2073,7 @@ mod tests {
         let session_type_id = Uuid::new_v4();
         let plugin = ScriptPlugin::new(plugin_id, PluginScript::Events(vec![]));
         let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-        let (svc, sessions, _messages) =
-            make_service(plugin_id, plugin_dyn, session_type_id, None);
+        let (svc, sessions, _messages) = make_service(plugin_id, plugin_dyn, session_type_id, None);
 
         let mut req = make_request(sessions.session_id());
         req.content = serde_json::json!({"text": ""});
@@ -2124,7 +2124,10 @@ mod tests {
     #[test]
     fn finish_reason_for_maps_variants() {
         assert_eq!(finish_reason_for(&PluginError::timeout()), "timeout");
-        assert_eq!(finish_reason_for(&PluginError::transient("x")), "interrupted");
+        assert_eq!(
+            finish_reason_for(&PluginError::transient("x")),
+            "interrupted"
+        );
         assert_eq!(
             finish_reason_for(&PluginError::rate_limited(None)),
             "interrupted"
@@ -2478,9 +2481,7 @@ mod tests {
         repo
     }
 
-    fn make_service_with_session_repo(
-        sessions: Arc<MockSessionRepo>,
-    ) -> MessageService {
+    fn make_service_with_session_repo(sessions: Arc<MockSessionRepo>) -> MessageService {
         let session_types = MockSessionTypeRepo::new(Uuid::new_v4(), None);
         let messages = Arc::new(MockMessageRepo::default());
         let hub = Arc::new(ClientHub::new());
@@ -2533,11 +2534,7 @@ mod tests {
         let session_id = repo.session_id();
         let svc = make_service_with_session_repo(repo);
         let err = svc
-            .update_memory_strategy(
-                &make_identity(),
-                session_id,
-                MemoryStrategy::Full,
-            )
+            .update_memory_strategy(&make_identity(), session_id, MemoryStrategy::Full)
             .await
             .expect_err("soft_deleted rejected as 409");
         assert!(matches!(err, ChatEngineError::Conflict { .. }));
@@ -2549,11 +2546,7 @@ mod tests {
         let session_id = repo.session_id();
         let svc = make_service_with_session_repo(repo);
         let err = svc
-            .update_memory_strategy(
-                &make_identity(),
-                session_id,
-                MemoryStrategy::Full,
-            )
+            .update_memory_strategy(&make_identity(), session_id, MemoryStrategy::Full)
             .await
             .expect_err("hard_deleted rejected as 409");
         assert!(matches!(err, ChatEngineError::Conflict { .. }));
@@ -2578,13 +2571,9 @@ mod tests {
         let repo = make_repo_with_state("archived");
         let session_id = repo.session_id();
         let svc = make_service_with_session_repo(repo);
-        svc.update_memory_strategy(
-            &make_identity(),
-            session_id,
-            MemoryStrategy::Full,
-        )
-        .await
-        .expect("archived session accepts strategy update");
+        svc.update_memory_strategy(&make_identity(), session_id, MemoryStrategy::Full)
+            .await
+            .expect("archived session accepts strategy update");
     }
 
     #[test]
@@ -2678,7 +2667,8 @@ mod tests {
             _tenant_id: &str,
             _user_id: &str,
             _query: &toolkit_odata::ODataQuery,
-        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError>
+        {
             Ok(toolkit_odata::Page::empty(0))
         }
 
@@ -2852,10 +2842,7 @@ mod tests {
                     ordered.push(id);
                     for child in messages
                         .iter()
-                        .filter(|m| {
-                            m.session_id == session_id
-                                && m.parent_message_id == Some(id)
-                        })
+                        .filter(|m| m.session_id == session_id && m.parent_message_id == Some(id))
                         .map(|m| m.message_id)
                     {
                         to_visit.push(child);
@@ -2869,8 +2856,7 @@ mod tests {
             {
                 let mut messages = self.messages.lock();
                 messages.retain(|m| {
-                    let keep = !(m.session_id == session_id
-                        && removed_set.contains(&m.message_id));
+                    let keep = !(m.session_id == session_id && removed_set.contains(&m.message_id));
                     if !keep {
                         removed += 1;
                     }
@@ -3004,7 +2990,13 @@ mod tests {
         }
         // One reaction per node — only the three in the target subtree
         // should be removed.
-        for id in [root_id, target_id, grandchild_a_id, grandchild_b_id, sibling_id] {
+        for id in [
+            root_id,
+            target_id,
+            grandchild_a_id,
+            grandchild_b_id,
+            sibling_id,
+        ] {
             messages.record_reaction(id);
         }
 
@@ -3173,7 +3165,11 @@ mod tests {
         // Only the first delete fires a webhook.
         drain_webhooks(&webhooks, 1).await;
         let events = webhooks.snapshot();
-        assert_eq!(events.len(), 1, "exactly one webhook for the successful delete");
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one webhook for the successful delete"
+        );
     }
 
     #[tokio::test]

@@ -27,13 +27,11 @@ use std::time::Duration;
 use chat_engine::domain::service::message_service::{MessageService, SendMessageRequest};
 use chat_engine::domain::service::plugin_service::PluginService;
 use chat_engine::domain::service::session_service::Identity;
-use chat_engine_sdk::{
-    ChatEngineBackendPlugin, PluginError, StreamingChunkEvent, StreamingEvent,
-};
+use chat_engine_sdk::{ChatEngineBackendPlugin, PluginError, StreamingChunkEvent, StreamingEvent};
 use futures::StreamExt;
+use tokio_util::sync::CancellationToken;
 use toolkit::ClientHub;
 use toolkit::client_hub::ClientScope;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use common::db::{self, DbHarness};
@@ -89,8 +87,7 @@ async fn cancel_after_partial_chunks_persists_is_complete_false_against_sqlite()
     let harness = db::setup_sqlite().await;
     let plugin_id = "cancel-persists-plugin";
     let session_type_id = db::seed_session_type(&harness, plugin_id).await;
-    let session_id =
-        db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
 
     // Plugin emits two chunks under the SDK's placeholder message_id (the
     // driver re-stamps each chunk with the assistant id before forwarding)
@@ -167,7 +164,9 @@ async fn cancel_after_partial_chunks_persists_is_complete_false_against_sqlite()
         .as_ref()
         .expect("finalize_assistant must write metadata on cancel");
     assert_eq!(
-        metadata.get("cancelled").and_then(serde_json::Value::as_bool),
+        metadata
+            .get("cancelled")
+            .and_then(serde_json::Value::as_bool),
         Some(true),
         "cancel finalize must stamp metadata.cancelled=true; got {metadata}",
     );
@@ -190,8 +189,7 @@ async fn pre_stream_timeout_persists_finish_reason_against_sqlite() {
     let harness = db::setup_sqlite().await;
     let plugin_id = "pre-stream-timeout-plugin";
     let session_type_id = db::seed_session_type(&harness, plugin_id).await;
-    let session_id =
-        db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
 
     // Plugin rejects the request before the stream starts — the canonical
     // upstream-timeout shape from the SDK error taxonomy.
@@ -258,8 +256,7 @@ async fn soft_deleted_session_rejects_send_against_sqlite() {
     let harness = db::setup_sqlite().await;
     let plugin_id = "lifecycle-guard-plugin";
     let session_type_id = db::seed_session_type(&harness, plugin_id).await;
-    let session_id =
-        db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
 
     // Flip the seeded session into the soft_deleted lifecycle state. The
     // production repo's `update_lifecycle_state` is the right tool, but
@@ -304,8 +301,7 @@ async fn delete_message_subtree_removes_whole_tree_against_sqlite() {
     let harness = db::setup_sqlite().await;
     let plugin_id = "subtree-delete-plugin";
     let session_type_id = db::seed_session_type(&harness, plugin_id).await;
-    let session_id =
-        db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
 
     // Deep + wide tree under `root`:  root → {a, b};  a → gc.
     // Plus an unrelated root (`other`) that must survive the delete.
@@ -322,7 +318,10 @@ async fn delete_message_subtree_removes_whole_tree_against_sqlite() {
         .delete_message_subtree(session_id, root)
         .await
         .expect("delete subtree");
-    assert_eq!(removed, 4, "root + a + b + gc must all be deleted; got {removed}");
+    assert_eq!(
+        removed, 4,
+        "root + a + b + gc must all be deleted; got {removed}"
+    );
 
     for (label, id) in [("root", root), ("a", a), ("b", b), ("gc", gc)] {
         assert!(
@@ -341,7 +340,10 @@ async fn delete_message_subtree_removes_whole_tree_against_sqlite() {
         .delete_message_subtree(session_id, root)
         .await
         .expect("re-delete missing root");
-    assert_eq!(again, 0, "second delete of the same root must remove nothing");
+    assert_eq!(
+        again, 0,
+        "second delete of the same root must remove nothing"
+    );
 }
 
 // ===========================================================================
@@ -354,8 +356,7 @@ async fn cross_tenant_send_returns_not_found_against_sqlite() {
     let harness = db::setup_sqlite().await;
     let plugin_id = "cross-tenant-plugin";
     let session_type_id = db::seed_session_type(&harness, plugin_id).await;
-    let session_id =
-        db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
 
     let plugin = FakePlugin::new(plugin_id, FakePluginScript::Events(vec![]));
     let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;

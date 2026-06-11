@@ -33,13 +33,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use toolkit_db::secure::{
-    AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig,
-};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
+use toolkit_db::secure::{
+    AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig,
+};
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
@@ -157,10 +157,7 @@ pub trait MessageRepo: Send + Sync {
     /// session — every message with `is_active=true AND is_complete=true`
     /// ordered by `created_at ASC`. Unlike [`Self::fetch_active_history`],
     /// this method does NOT filter out `is_hidden_from_backend=true` rows.
-    async fn list_active_path(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<Message>, ChatEngineError> {
+    async fn list_active_path(&self, session_id: Uuid) -> Result<Vec<Message>, ChatEngineError> {
         self.fetch_active_history(session_id, None).await
     }
 
@@ -219,10 +216,7 @@ pub trait MessageRepo: Send + Sync {
 
     /// Phase 8 hook (retention cleanup, bounded). Count non-root
     /// messages in the session.
-    async fn count_non_root_messages(
-        &self,
-        session_id: Uuid,
-    ) -> Result<u64, ChatEngineError> {
+    async fn count_non_root_messages(&self, session_id: Uuid) -> Result<u64, ChatEngineError> {
         let _ = session_id;
         Ok(0)
     }
@@ -402,7 +396,11 @@ impl MessageRepo for SeaMessageRepo {
                 let mut meta = serde_json::Map::new();
                 meta.insert("cancelled".into(), JsonValue::Bool(true));
                 meta.insert("partial".into(), JsonValue::Bool(true));
-                (content_with_text(&text), Some(JsonValue::Object(meta)), false)
+                (
+                    content_with_text(&text),
+                    Some(JsonValue::Object(meta)),
+                    false,
+                )
             }
             FinalizeOutcome::Errored {
                 text,
@@ -416,7 +414,11 @@ impl MessageRepo for SeaMessageRepo {
                 );
                 meta.insert("error".into(), JsonValue::String(error));
                 meta.insert("partial".into(), JsonValue::Bool(true));
-                (content_with_text(&text), Some(JsonValue::Object(meta)), false)
+                (
+                    content_with_text(&text),
+                    Some(JsonValue::Object(meta)),
+                    false,
+                )
             }
         };
 
@@ -500,10 +502,7 @@ impl MessageRepo for SeaMessageRepo {
         Ok(row.map(Message::from))
     }
 
-    async fn list_active_path(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<Message>, ChatEngineError> {
+    async fn list_active_path(&self, session_id: Uuid) -> Result<Vec<Message>, ChatEngineError> {
         let conn = self.db.conn()?;
         let scope = AccessScope::allow_all();
         // Active-path traversal per the Phase 6 contract: `is_active=true`
@@ -569,10 +568,7 @@ impl MessageRepo for SeaMessageRepo {
         Ok(rows.into_iter().map(Message::from).collect())
     }
 
-    async fn count_non_root_messages(
-        &self,
-        session_id: Uuid,
-    ) -> Result<u64, ChatEngineError> {
+    async fn count_non_root_messages(&self, session_id: Uuid) -> Result<u64, ChatEngineError> {
         let conn = self.db.conn()?;
         let scope = AccessScope::allow_all();
         let n = MessageEntity::find()
@@ -691,8 +687,7 @@ impl MessageRepo for SeaMessageRepo {
                                 Condition::all()
                                     .add(message_entity::Column::SessionId.eq(session_id))
                                     .add(
-                                        message_entity::Column::MessageId
-                                            .is_in(summarized.clone()),
+                                        message_entity::Column::MessageId.is_in(summarized.clone()),
                                     ),
                             )
                             .col_expr(
@@ -799,12 +794,9 @@ impl MessageRepo for SeaMessageRepo {
                 .transaction_with_config(TxConfig::serializable(), move |tx| {
                     Box::pin(async move {
                         let scope = AccessScope::allow_all();
-                        let new_variant_index = compute_next_variant_index(
-                            tx,
-                            session_id,
-                            Some(parent_message_id),
-                        )
-                        .await?;
+                        let new_variant_index =
+                            compute_next_variant_index(tx, session_id, Some(parent_message_id))
+                                .await?;
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(new_message_id),
                             session_id: Set(session_id),
@@ -862,16 +854,14 @@ fn chat_engine_db_err(err: &ChatEngineError) -> Option<&sea_orm::DbErr> {
         return None;
     };
     let source = source.as_ref()?;
-    source
-        .downcast_ref::<sea_orm::DbErr>()
-        .or_else(|| {
-            source
-                .downcast_ref::<toolkit_db::DbError>()
-                .and_then(|dbe| match dbe {
-                    toolkit_db::DbError::Sea(inner) => Some(inner),
-                    _ => None,
-                })
-        })
+    source.downcast_ref::<sea_orm::DbErr>().or_else(|| {
+        source
+            .downcast_ref::<toolkit_db::DbError>()
+            .and_then(|dbe| match dbe {
+                toolkit_db::DbError::Sea(inner) => Some(inner),
+                _ => None,
+            })
+    })
 }
 
 /// Map a retry-exhaustion outcome to a `Conflict` ChatEngineError that

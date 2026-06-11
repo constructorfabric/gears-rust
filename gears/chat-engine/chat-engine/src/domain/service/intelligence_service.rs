@@ -62,11 +62,11 @@ use parking_lot::Mutex;
 use chat_engine_sdk::models::{LifecycleState, TenantId, UserId};
 use chat_engine_sdk::plugin::{PluginCallContext, SessionPluginCtx};
 use futures::stream::{self, BoxStream, StreamExt};
-use toolkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use toolkit_macros::domain_model;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -78,9 +78,7 @@ use crate::domain::message::{
 use crate::domain::retention::RetentionPolicy;
 use crate::domain::service::plugin_service::PluginService;
 use crate::domain::service::session_service::Identity;
-use crate::domain::session::{
-    Session, get_retention_policy, set_retention_policy,
-};
+use crate::domain::session::{Session, get_retention_policy, set_retention_policy};
 use crate::infra::db::repo::message_repo::MessageRepo;
 use crate::infra::db::repo::session_repo::SessionRepo;
 use crate::infra::db::repo::session_type_repo::SessionTypeRepo;
@@ -362,13 +360,13 @@ impl IntelligenceService {
 
         // Session-type + plugin binding are required for summary routing
         // (422 when unbound per the feature spec).
-        let session_type_id = session.session_type_id.ok_or_else(|| {
-            ChatEngineError::BadRequest {
-                reason:
-                    "session has no session_type bound; summary cannot be generated"
+        let session_type_id =
+            session
+                .session_type_id
+                .ok_or_else(|| ChatEngineError::BadRequest {
+                    reason: "session has no session_type bound; summary cannot be generated"
                         .to_string(),
-            }
-        })?;
+                })?;
         let session_type = self
             .session_types
             .find_by_id(session_type_id)
@@ -380,9 +378,8 @@ impl IntelligenceService {
             // session itself is well-formed. We surface this via a
             // BackendUnavailable so the handler can map to 422.
             ChatEngineError::BackendUnavailable {
-                reason:
-                    "session_type has no plugin_instance_id; summarization unsupported"
-                        .to_string(),
+                reason: "session_type has no plugin_instance_id; summarization unsupported"
+                    .to_string(),
                 retry_after: None,
                 source: None,
             }
@@ -390,8 +387,10 @@ impl IntelligenceService {
 
         // Resolve the plugin. A missing registration is 422 per the
         // feature spec (plugin does not support summarization).
-        let plugin = self.plugins.resolve(&plugin_instance_id).map_err(|err| {
-            match err {
+        let plugin = self
+            .plugins
+            .resolve(&plugin_instance_id)
+            .map_err(|err| match err {
                 ChatEngineError::NotFound { .. } => ChatEngineError::BackendUnavailable {
                     reason: format!(
                         "plugin '{plugin_instance_id}' is not registered; summarization unsupported"
@@ -400,8 +399,7 @@ impl IntelligenceService {
                     source: None,
                 },
                 other => other,
-            }
-        })?;
+            })?;
         let plugin_config = self
             .plugins
             .load_config(&plugin_instance_id, session_type_id)
@@ -410,10 +408,7 @@ impl IntelligenceService {
         // Load the visible history (chronological, excluding
         // `is_hidden_from_backend=true`) — this is the Phase 7 canonical
         // history-visibility filter.
-        let history = self
-            .messages
-            .fetch_active_history(session_id, None)
-            .await?;
+        let history = self.messages.fetch_active_history(session_id, None).await?;
 
         // Build the call context. The plugin's child token observes the
         // handler's cancellation (connection close / explicit cancel).
@@ -661,9 +656,7 @@ impl IntelligenceService {
     /// ids: the session repository is the source of truth for which
     /// tenants are live.
     #[instrument(skip(self))]
-    pub async fn run_retention_cleanup_all_tenants(
-        &self,
-    ) -> Result<RetentionCleanupReport> {
+    pub async fn run_retention_cleanup_all_tenants(&self) -> Result<RetentionCleanupReport> {
         let tenants = self.sessions.list_tenants_with_active_sessions().await?;
         let mut aggregated: Vec<SessionCleanupOutcome> = Vec::new();
         for tenant_id in tenants {
@@ -873,12 +866,7 @@ impl IntelligenceService {
                 // Persist the summary message + flip
                 // `is_hidden_from_backend` on the reported ids.
                 if let Err(err) = messages
-                    .insert_summary_message(
-                        session_id,
-                        accumulator,
-                        last_metadata,
-                        summarized_ids,
-                    )
+                    .insert_summary_message(session_id, accumulator, last_metadata, summarized_ids)
                     .await
                 {
                     warn!(
@@ -900,9 +888,10 @@ impl IntelligenceService {
             }
         });
 
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|evt| (evt, rx))
-        })
+        stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|evt| (evt, rx)) },
+        )
         .boxed()
     }
 }
@@ -986,13 +975,15 @@ mod tests {
     use async_trait::async_trait;
     use chat_engine_sdk::models::{LifecycleState, MessageRole};
     use chat_engine_sdk::plugin::ChatEngineBackendPlugin;
-    use toolkit::ClientHub;
     use parking_lot::Mutex;
     use std::time::Duration;
     use time::OffsetDateTime;
+    use toolkit::ClientHub;
 
     use crate::domain::message::Message;
-    use crate::infra::db::entity::{session as session_entity, session_type as session_type_entity};
+    use crate::infra::db::entity::{
+        session as session_entity, session_type as session_type_entity,
+    };
     use crate::infra::db::repo::message_repo::{
         FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage,
     };
@@ -1034,9 +1025,7 @@ mod tests {
                 .lock()
                 .iter()
                 .find(|r| {
-                    r.session_id == session_id
-                        && r.tenant_id == tenant_id
-                        && r.user_id == user_id
+                    r.session_id == session_id && r.tenant_id == tenant_id && r.user_id == user_id
                 })
                 .cloned())
         }
@@ -1046,7 +1035,8 @@ mod tests {
             _tenant_id: &str,
             _user_id: &str,
             _query: &toolkit_odata::ODataQuery,
-        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError>
+        {
             Ok(toolkit_odata::Page::empty(0))
         }
 
@@ -1324,11 +1314,7 @@ mod tests {
         ) -> std::result::Result<(), ChatEngineError> {
             Ok(())
         }
-        async fn delete(
-            &self,
-            _p: &str,
-            _s: Uuid,
-        ) -> std::result::Result<(), ChatEngineError> {
+        async fn delete(&self, _p: &str, _s: Uuid) -> std::result::Result<(), ChatEngineError> {
             Ok(())
         }
     }
@@ -1428,13 +1414,14 @@ mod tests {
         let msgs = MockMessageRepo::new(vec![m_old, m_new, m_root]);
         let svc = make_service(MockSessionRepo::new(vec![]), msgs);
         let out = svc
-            .evaluate_retention_policy(
-                session_id,
-                &RetentionPolicy::AgeBased { max_age_days: 1 },
-            )
+            .evaluate_retention_policy(session_id, &RetentionPolicy::AgeBased { max_age_days: 1 })
             .await
             .unwrap();
-        assert_eq!(out, vec![old_id], "only the old non-root message is eligible");
+        assert_eq!(
+            out,
+            vec![old_id],
+            "only the old non-root message is eligible"
+        );
     }
 
     #[tokio::test]
@@ -1452,8 +1439,7 @@ mod tests {
         m_root.created_at = OffsetDateTime::from_unix_timestamp(0).unwrap();
 
         let ids = vec![m0.message_id, m1.message_id];
-        let msgs =
-            MockMessageRepo::new(vec![m0, m1, m2, m3, m4, m_root]);
+        let msgs = MockMessageRepo::new(vec![m0, m1, m2, m3, m4, m_root]);
         let svc = make_service(MockSessionRepo::new(vec![]), msgs);
         let out = svc
             .evaluate_retention_policy(
@@ -1464,7 +1450,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, ids, "oldest 2 of 5 selected; newest 3 kept; root excluded");
+        assert_eq!(
+            out, ids,
+            "oldest 2 of 5 selected; newest 3 kept; root excluded"
+        );
     }
 
     #[tokio::test]
@@ -1497,10 +1486,7 @@ mod tests {
         let msgs = MockMessageRepo::new(vec![m_root]);
         let svc = make_service(MockSessionRepo::new(vec![]), msgs);
         let out = svc
-            .evaluate_retention_policy(
-                session_id,
-                &RetentionPolicy::AgeBased { max_age_days: 1 },
-            )
+            .evaluate_retention_policy(session_id, &RetentionPolicy::AgeBased { max_age_days: 1 })
             .await
             .unwrap();
         assert!(out.is_empty(), "root messages must never be eligible");
@@ -1547,8 +1533,8 @@ mod tests {
 
     #[test]
     fn validate_age_based_rejects_zero() {
-        let err = validate_retention_policy(RetentionPolicy::AgeBased { max_age_days: 0 })
-            .unwrap_err();
+        let err =
+            validate_retention_policy(RetentionPolicy::AgeBased { max_age_days: 0 }).unwrap_err();
         match err {
             ChatEngineError::BadRequest { reason } => {
                 assert!(reason.contains("max_age_days"));
@@ -1603,10 +1589,7 @@ mod tests {
             .get_effective_retention_policy(&identity(), session_id)
             .await
             .unwrap();
-        assert!(matches!(
-            out,
-            RetentionPolicy::AgeBased { max_age_days: 7 }
-        ));
+        assert!(matches!(out, RetentionPolicy::AgeBased { max_age_days: 7 }));
     }
 
     #[tokio::test]
@@ -1684,11 +1667,7 @@ mod tests {
         let msgs = MockMessageRepo::new(vec![]);
         let svc = make_service(sessions, msgs);
         let err = svc
-            .update_session_retention_policy(
-                &identity(),
-                session_id,
-                RetentionPolicy::None,
-            )
+            .update_session_retention_policy(&identity(), session_id, RetentionPolicy::None)
             .await
             .unwrap_err();
         assert!(matches!(err, ChatEngineError::Conflict { .. }));
@@ -1730,7 +1709,9 @@ mod tests {
             &self,
             _c: MessagePluginCtx,
         ) -> std::result::Result<PluginStream, PluginError> {
-            Err(PluginError::internal("test plugin does not handle messages"))
+            Err(PluginError::internal(
+                "test plugin does not handle messages",
+            ))
         }
 
         async fn on_session_summary(
@@ -1754,14 +1735,15 @@ mod tests {
         plugin: Arc<dyn ChatEngineBackendPlugin>,
         session_type_id: Uuid,
         session_row: session_entity::Model,
-    ) -> (IntelligenceService, Arc<MockSessionRepo>, Arc<MockMessageRepo>) {
+    ) -> (
+        IntelligenceService,
+        Arc<MockSessionRepo>,
+        Arc<MockMessageRepo>,
+    ) {
         let sessions = MockSessionRepo::new(vec![session_row]);
         let msgs = MockMessageRepo::new(vec![]);
         let hub = Arc::new(ClientHub::new());
-        hub.register_scoped::<dyn ChatEngineBackendPlugin>(
-            ClientScope::gts_id(plugin_id),
-            plugin,
-        );
+        hub.register_scoped::<dyn ChatEngineBackendPlugin>(ClientScope::gts_id(plugin_id), plugin);
         let plugins = PluginService::new(hub, Arc::new(StubPluginConfigRepo));
 
         // session_types mock: return a row with the configured plugin id.
@@ -1790,8 +1772,7 @@ mod tests {
             }
             async fn list(
                 &self,
-            ) -> std::result::Result<Vec<session_type_entity::Model>, ChatEngineError>
-            {
+            ) -> std::result::Result<Vec<session_type_entity::Model>, ChatEngineError> {
                 Ok(vec![self.model.lock().clone()])
             }
         }
@@ -1824,12 +1805,8 @@ mod tests {
         row.session_type_id = Some(session_type_id);
         let plugin = ScriptedSummaryPlugin::pre_error(plugin_id, PluginError::internal("boom"));
         let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-        let (svc, _sessions, _msgs) = make_service_with_plugin(
-            plugin_id,
-            plugin_dyn,
-            session_type_id,
-            row,
-        );
+        let (svc, _sessions, _msgs) =
+            make_service_with_plugin(plugin_id, plugin_dyn, session_type_id, row);
 
         let cancel = CancellationToken::new();
         let result = svc.summarize_session(&identity(), session_id, cancel).await;
@@ -1895,8 +1872,7 @@ mod tests {
             }
             async fn list(
                 &self,
-            ) -> std::result::Result<Vec<session_type_entity::Model>, ChatEngineError>
-            {
+            ) -> std::result::Result<Vec<session_type_entity::Model>, ChatEngineError> {
                 Ok(vec![])
             }
         }
@@ -1955,12 +1931,8 @@ mod tests {
             ],
         );
         let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-        let (svc, _sessions, _msgs) = make_service_with_plugin(
-            plugin_id,
-            plugin_dyn,
-            session_type_id,
-            row,
-        );
+        let (svc, _sessions, _msgs) =
+            make_service_with_plugin(plugin_id, plugin_dyn, session_type_id, row);
 
         let cancel = CancellationToken::new();
         let mut stream = svc
@@ -2117,7 +2089,10 @@ mod tests {
         covered.sort();
         let mut expected = session_ids.clone();
         expected.sort();
-        assert_eq!(covered, expected, "every active session is visited across ticks");
+        assert_eq!(
+            covered, expected,
+            "every active session is visited across ticks"
+        );
 
         // The short tail batch dropped the cursor, so the next tick wraps to
         // the head rather than returning nothing.
@@ -2160,7 +2135,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(eligible.len(), 2, "deletion cap should bound eligible ids");
-        assert_eq!(eligible, oldest_two, "should select the OLDEST non-root ids");
+        assert_eq!(
+            eligible, oldest_two,
+            "should select the OLDEST non-root ids"
+        );
     }
 
     // ----- run_retention_cleanup_all_tenants ------------------------------

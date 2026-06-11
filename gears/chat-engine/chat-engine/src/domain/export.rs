@@ -29,9 +29,9 @@
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use toolkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
@@ -210,7 +210,11 @@ pub struct ExportedSession {
 pub struct ShareTokenIssue {
     pub share_token: String,
     pub share_url: String,
-    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expires_at: Option<OffsetDateTime>,
 }
 
@@ -363,7 +367,9 @@ mod tests {
             raw: &'a str,
         }
         let token = ShareToken::new("RAW-VALUE-MUST-NOT-LEAK");
-        let holder = Holder { raw: token.as_str() };
+        let holder = Holder {
+            raw: token.as_str(),
+        };
         let json = serde_json::to_string(&holder).unwrap();
         assert!(
             json.contains("RAW-VALUE-MUST-NOT-LEAK"),
@@ -406,7 +412,10 @@ mod tests {
             ExportFormat::from_str("markdown").unwrap(),
             ExportFormat::Markdown
         );
-        assert_eq!(ExportFormat::from_str("md").unwrap(), ExportFormat::Markdown);
+        assert_eq!(
+            ExportFormat::from_str("md").unwrap(),
+            ExportFormat::Markdown
+        );
         assert_eq!(ExportFormat::from_str("JSON").unwrap(), ExportFormat::Json);
     }
 

@@ -200,8 +200,14 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
             "session_id": ctx.session_id,
         });
         let cfg = Self::extract_config(&ctx.call_ctx)?;
-        let resp = post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_type_configured")
-            .await?;
+        let resp = post_json(
+            &self.http,
+            &cfg,
+            &ctx.call_ctx,
+            &body,
+            "session_type_configured",
+        )
+        .await?;
         parse_capabilities(resp).await
     }
 
@@ -215,8 +221,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
             "session_id": ctx.session_id,
         });
         let cfg = Self::extract_config(&ctx.call_ctx)?;
-        let resp =
-            post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_created").await?;
+        let resp = post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_created").await?;
         parse_capabilities(resp).await
     }
 
@@ -230,8 +235,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
             "session_id": ctx.session_id,
         });
         let cfg = Self::extract_config(&ctx.call_ctx)?;
-        let resp =
-            post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_updated").await?;
+        let resp = post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_updated").await?;
         parse_capabilities(resp).await
     }
 
@@ -246,7 +250,14 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
             "message_id": ctx.message_id,
             "messages": ctx.messages,
         });
-        run_streaming_request(self.http.clone(), cfg, ctx.call_ctx.clone(), body, "message").await
+        run_streaming_request(
+            self.http.clone(),
+            cfg,
+            ctx.call_ctx.clone(),
+            body,
+            "message",
+        )
+        .await
     }
 
     async fn on_message_recreate(
@@ -270,10 +281,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         .await
     }
 
-    async fn on_session_summary(
-        &self,
-        ctx: SessionPluginCtx,
-    ) -> Result<PluginStream, PluginError> {
+    async fn on_session_summary(&self, ctx: SessionPluginCtx) -> Result<PluginStream, PluginError> {
         let cfg = Self::extract_config(&ctx.call_ctx)?;
         let body = serde_json::json!({
             "event": "session_summary",
@@ -323,12 +331,10 @@ impl WebhookConfig {
         // a missing deadline must never produce an unbounded outbound
         // HTTP call.
         match call_ctx.remaining() {
-            Some(d) if d.is_zero() => {
-                Err(PluginError::timeout_with(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "deadline elapsed before request",
-                )))
-            }
+            Some(d) if d.is_zero() => Err(PluginError::timeout_with(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deadline elapsed before request",
+            ))),
             Some(d) => Ok(d),
             None => Ok(self.default_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT)),
         }
@@ -801,7 +807,10 @@ mod tests {
         };
         let h = cfg.auth_headers().expect("ok");
         assert_eq!(
-            h.get(reqwest::header::AUTHORIZATION).unwrap().to_str().unwrap(),
+            h.get(reqwest::header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer abc"
         );
     }
@@ -841,7 +850,10 @@ mod tests {
             PluginError::NotFound { .. }
         ));
         assert!(matches!(
-            map_status_to_error(StatusCode::from_u16(429).unwrap(), Some(Duration::from_secs(7))),
+            map_status_to_error(
+                StatusCode::from_u16(429).unwrap(),
+                Some(Duration::from_secs(7))
+            ),
             PluginError::RateLimited { .. }
         ));
         assert!(matches!(
@@ -871,15 +883,9 @@ mod tests {
             default_timeout: None,
         };
         let ctx = make_call_ctx(None, cancel);
-        let err = post_json(
-            &Client::new(),
-            &cfg,
-            &ctx,
-            &serde_json::json!({}),
-            "test",
-        )
-        .await
-        .unwrap_err();
+        let err = post_json(&Client::new(), &cfg, &ctx, &serde_json::json!({}), "test")
+            .await
+            .unwrap_err();
         assert!(matches!(err, PluginError::Transient { .. }));
     }
 }

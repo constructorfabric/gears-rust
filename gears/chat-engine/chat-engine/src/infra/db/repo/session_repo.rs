@@ -25,16 +25,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, Condition, EntityTrait};
+use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use toolkit_db::odata::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{
     AccessScope, DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
     TxConfig,
 };
 use toolkit_odata::{ODataQuery, Page, SortDir};
-use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, Condition, EntityTrait};
-use serde_json::Value as JsonValue;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
@@ -222,9 +222,7 @@ pub trait SessionRepo: Send + Sync {
     ///
     /// Default impl returns an empty list so test mocks that don't care
     /// about retention keep compiling.
-    async fn list_tenants_with_active_sessions(
-        &self,
-    ) -> Result<Vec<String>, ChatEngineError> {
+    async fn list_tenants_with_active_sessions(&self) -> Result<Vec<String>, ChatEngineError> {
         Ok(Vec::new())
     }
 
@@ -333,11 +331,7 @@ impl SeaSessionRepo {
     /// Build the `(session_id, tenant_id, user_id)` AND filter every scoped
     /// write reuses. Centralising it avoids drift between read and update
     /// paths.
-    fn owned_filter(
-        session_id: Uuid,
-        tenant_id: &str,
-        user_id: &str,
-    ) -> Condition {
+    fn owned_filter(session_id: Uuid, tenant_id: &str, user_id: &str) -> Condition {
         Condition::all()
             .add(session_entity::Column::SessionId.eq(session_id))
             .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
@@ -414,18 +408,15 @@ impl SessionRepo for SeaSessionRepo {
         // Tenant / user scoping and the hard-delete exclusion come from the
         // caller's identity, never from the OData `$filter`, so they live in
         // the base query rather than the caller-controlled clause.
-        let base_query = SessionEntity::find()
-            .secure()
-            .scope_with(&scope)
-            .filter(
-                Condition::all()
-                    .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
-                    .add(session_entity::Column::UserId.eq(user_id.to_owned()))
-                    .add(
-                        session_entity::Column::LifecycleState
-                            .ne(LifecycleState::HardDeleted.as_str().to_string()),
-                    ),
-            );
+        let base_query = SessionEntity::find().secure().scope_with(&scope).filter(
+            Condition::all()
+                .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
+                .add(session_entity::Column::UserId.eq(user_id.to_owned()))
+                .add(
+                    session_entity::Column::LifecycleState
+                        .ne(LifecycleState::HardDeleted.as_str().to_string()),
+                ),
+        );
 
         // Default-recent posture: when the caller supplies neither a cursor
         // nor `$orderby`, sort by `created_at DESC`. `session_id` is appended
@@ -433,7 +424,9 @@ impl SessionRepo for SeaSessionRepo {
         // `(created_at DESC, session_id DESC)` total order.
         let query = if query.cursor.is_none() && query.order.is_empty() {
             let mut adjusted = query.clone();
-            adjusted.order = adjusted.order.ensure_tiebreaker("created_at", SortDir::Desc);
+            adjusted.order = adjusted
+                .order
+                .ensure_tiebreaker("created_at", SortDir::Desc);
             Cow::Owned(adjusted)
         } else {
             Cow::Borrowed(query)
@@ -594,10 +587,7 @@ impl SessionRepo for SeaSessionRepo {
                             session_entity::Column::LifecycleState,
                             Expr::value(LifecycleState::SoftDeleted.as_str().to_string()),
                         )
-                        .col_expr(
-                            session_entity::Column::DeletedAt,
-                            Expr::value(Some(now)),
-                        )
+                        .col_expr(session_entity::Column::DeletedAt, Expr::value(Some(now)))
                         .col_expr(
                             session_entity::Column::ScheduledHardDeleteAt,
                             Expr::value(Some(scheduled)),
@@ -634,9 +624,7 @@ impl SessionRepo for SeaSessionRepo {
                         .secure()
                         .scope_with(&scope)
                         .filter(SeaSessionRepo::owned_filter(
-                            session_id,
-                            &tenant_id,
-                            &user_id,
+                            session_id, &tenant_id, &user_id,
                         ))
                         .one(tx)
                         .await?;
@@ -683,9 +671,7 @@ impl SessionRepo for SeaSessionRepo {
                         .secure()
                         .scope_with(&scope)
                         .filter(SeaSessionRepo::owned_filter(
-                            session_id,
-                            &tenant_id,
-                            &user_id,
+                            session_id, &tenant_id, &user_id,
                         ))
                         .exec(tx)
                         .await?;
@@ -728,9 +714,7 @@ impl SessionRepo for SeaSessionRepo {
         Ok(rows)
     }
 
-    async fn list_tenants_with_active_sessions(
-        &self,
-    ) -> Result<Vec<String>, ChatEngineError> {
+    async fn list_tenants_with_active_sessions(&self) -> Result<Vec<String>, ChatEngineError> {
         // The secure layer doesn't yet expose `select_only() +
         // into_tuple()`, so the original `SELECT DISTINCT tenant_id`
         // projection has no `&impl DBRunner` execution path. Fall back to

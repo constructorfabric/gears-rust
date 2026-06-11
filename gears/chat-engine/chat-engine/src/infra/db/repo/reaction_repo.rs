@@ -26,12 +26,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use toolkit_db::secure::{
-    AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, TxConfig,
-};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use time::OffsetDateTime;
+use toolkit_db::secure::{
+    AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, TxConfig,
+};
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
@@ -172,14 +172,12 @@ impl ReactionRepo for SeaReactionRepo {
                     Box::pin(async move {
                         let scope = AccessScope::allow_all();
 
-                        let previous = ReactionEntity::find_by_id((
-                            message_id,
-                            user_id_owned.clone(),
-                        ))
-                        .secure()
-                        .scope_with(&scope)
-                        .one(tx)
-                        .await?;
+                        let previous =
+                            ReactionEntity::find_by_id((message_id, user_id_owned.clone()))
+                                .secure()
+                                .scope_with(&scope)
+                                .one(tx)
+                                .await?;
 
                         let am = reaction_entity::ActiveModel {
                             message_id: Set(message_id),
@@ -197,10 +195,7 @@ impl ReactionRepo for SeaReactionRepo {
                             ReactionColumn::MessageId,
                             ReactionColumn::UserId,
                         ])
-                        .update_columns([
-                            ReactionColumn::ReactionType,
-                            ReactionColumn::UpdatedAt,
-                        ])
+                        .update_columns([ReactionColumn::ReactionType, ReactionColumn::UpdatedAt])
                         .to_owned();
 
                         ReactionEntity::insert(am)

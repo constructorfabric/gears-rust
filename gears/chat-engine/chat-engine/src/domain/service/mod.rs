@@ -20,8 +20,8 @@ pub mod webhook;
 pub use export_service::{ExportService, ShareUrlBuilder, is_share_token_expired};
 pub use intelligence_service::{
     DEFAULT_SUMMARY_BUFFER_SIZE, DEFAULT_SUMMARY_DEADLINE, IntelligenceService,
-    RetentionCleanupReport, SessionCleanupOutcome, SummaryStream,
-    resolve_effective_policy, retention_policy_label, validate_retention_policy,
+    RetentionCleanupReport, SessionCleanupOutcome, SummaryStream, resolve_effective_policy,
+    retention_policy_label, validate_retention_policy,
 };
 pub use message_service::{
     DEFAULT_PLUGIN_DEADLINE, DEFAULT_STREAMING_BUFFER_SIZE, MessageEventKind, MessageService,
@@ -29,12 +29,11 @@ pub use message_service::{
 };
 pub use plugin_service::PluginService;
 pub use reaction_service::{
-    CAPABILITY_FEEDBACK, ReactionMutation, ReactionService, ReactionsListing,
-    SetReactionResponse,
+    CAPABILITY_FEEDBACK, ReactionMutation, ReactionService, ReactionsListing, SetReactionResponse,
 };
 pub use search_service::{
-    BackendHit, InMemorySearchBackend, ParsedQuery, SearchBackend, SearchScope,
-    SearchScopeFilter, SearchService, parse_search_query,
+    BackendHit, InMemorySearchBackend, ParsedQuery, SearchBackend, SearchScope, SearchScopeFilter,
+    SearchService, parse_search_query,
 };
 pub use session_service::{
     CreateSessionRequest, DEFAULT_PLUGIN_CALL_TIMEOUT, Identity, RegisterSessionTypeRequest,

@@ -1,8 +1,8 @@
 // @cpt-cf-chat-engine-dbtable-session-types:p1
 
-use toolkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
+use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
 // Session types are global lookup rows (no per-tenant column); the

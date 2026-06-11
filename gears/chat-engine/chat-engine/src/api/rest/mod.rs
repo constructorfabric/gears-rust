@@ -142,8 +142,7 @@ fn serialize_error_line(err: &ChatEngineError) -> Vec<u8> {
         "message_id": Uuid::nil(),
         "error": err.to_string(),
     });
-    serde_json::to_vec(&line)
-        .unwrap_or_else(|_| br#"{"type":"error","error":"unknown"}"#.to_vec())
+    serde_json::to_vec(&line).unwrap_or_else(|_| br#"{"type":"error","error":"unknown"}"#.to_vec())
 }
 
 // ===========================================================================
@@ -473,7 +472,10 @@ mod tests {
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/x-ndjson"
         );
-        assert_eq!(resp.headers().get(header::CACHE_CONTROL).unwrap(), "no-cache");
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
         assert_eq!(resp.headers().get("x-accel-buffering").unwrap(), "no");
     }
 

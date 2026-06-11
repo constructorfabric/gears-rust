@@ -152,7 +152,10 @@ pub async fn set_reaction(
     let span = tracing::Span::current();
     span.record("session_id", tracing::field::display(session_id));
     span.record("message_id", tracing::field::display(message_id));
-    span.record("reaction", tracing::field::display(body.reaction_type.as_str()));
+    span.record(
+        "reaction",
+        tracing::field::display(body.reaction_type.as_str()),
+    );
 
     if let Err(err) = reject_body_identity(&body.tenant_id, &body.user_id) {
         return err.into_response();
@@ -200,7 +203,9 @@ pub async fn list_reactions(
     Path((session_id, message_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ListReactionsResponseDto>> {
     let identity = identity_from_ctx(&ctx)?;
-    let listing = svc.list_reactions(&identity, session_id, message_id).await?;
+    let listing = svc
+        .list_reactions(&identity, session_id, message_id)
+        .await?;
     Ok(Json(ListReactionsResponseDto::from(listing)))
 }
 
@@ -210,16 +215,17 @@ pub async fn list_reactions(
 /// scaffold `IntoResponse for ChatEngineError`.
 fn map_reaction_error(err: ChatEngineError) -> Response {
     if let ChatEngineError::Conflict { reason } = &err
-        && reason.contains(CAPABILITY_FEEDBACK) {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "capability_disabled",
-                    "capability": CAPABILITY_FEEDBACK,
-                })),
-            )
-                .into_response();
-        }
+        && reason.contains(CAPABILITY_FEEDBACK)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "capability_disabled",
+                "capability": CAPABILITY_FEEDBACK,
+            })),
+        )
+            .into_response();
+    }
     err.into_response()
 }
 
@@ -250,9 +256,7 @@ mod tests {
 
     #[test]
     fn map_reaction_error_emits_capability_disabled_body() {
-        let err = ChatEngineError::conflict(
-            "feature 'feedback' is disabled for this session type",
-        );
+        let err = ChatEngineError::conflict("feature 'feedback' is disabled for this session type");
         let response = map_reaction_error(err);
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }

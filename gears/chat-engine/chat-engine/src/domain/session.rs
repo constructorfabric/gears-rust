@@ -250,10 +250,17 @@ mod tests {
     #[test]
     fn retention_policy_roundtrip() {
         let mut s = sample();
-        set_retention_policy(&mut s, RetentionPolicy::CountBased { max_message_count: 50 });
+        set_retention_policy(
+            &mut s,
+            RetentionPolicy::CountBased {
+                max_message_count: 50,
+            },
+        );
         assert!(matches!(
             get_retention_policy(&s),
-            Some(RetentionPolicy::CountBased { max_message_count: 50 })
+            Some(RetentionPolicy::CountBased {
+                max_message_count: 50
+            })
         ));
     }
 
@@ -296,8 +303,8 @@ mod tests {
 
     #[test]
     fn ensure_can_transition_rejects_invalid() {
-        let err = ensure_can_transition(LifecycleState::HardDeleted, LifecycleState::Active)
-            .unwrap_err();
+        let err =
+            ensure_can_transition(LifecycleState::HardDeleted, LifecycleState::Active).unwrap_err();
         assert!(matches!(err, ChatEngineError::Conflict { .. }));
     }
 }

@@ -181,7 +181,9 @@ pub enum ConfigError {
 }
 
 mod defaults {
-    use super::{DEFAULT_PLUGIN_DEADLINE, DEFAULT_STREAMING_BUFFER_SIZE, DEFAULT_SUMMARY_BUFFER_SIZE};
+    use super::{
+        DEFAULT_PLUGIN_DEADLINE, DEFAULT_STREAMING_BUFFER_SIZE, DEFAULT_SUMMARY_BUFFER_SIZE,
+    };
 
     pub(super) fn plugin_deadline_secs() -> u64 {
         DEFAULT_PLUGIN_DEADLINE.as_secs()

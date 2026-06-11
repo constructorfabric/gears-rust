@@ -47,10 +47,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
-use toolkit_macros::domain_model;
 use serde_json::{Value as JsonValue, json};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
+use toolkit_macros::domain_model;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -138,19 +138,11 @@ pub trait VariantRepo: Send + Sync {
 
     /// Walk the ancestor chain of `message_id` up to the root, returning
     /// `[message_id, ..., root]`.
-    async fn ancestor_chain(
-        &self,
-        session_id: Uuid,
-        message_id: Uuid,
-    ) -> Result<Vec<Uuid>>;
+    async fn ancestor_chain(&self, session_id: Uuid, message_id: Uuid) -> Result<Vec<Uuid>>;
 
     /// Collect every descendant of `message_id` (excluding itself) by
     /// recursive walk.
-    async fn collect_descendants(
-        &self,
-        session_id: Uuid,
-        message_id: Uuid,
-    ) -> Result<Vec<Uuid>>;
+    async fn collect_descendants(&self, session_id: Uuid, message_id: Uuid) -> Result<Vec<Uuid>>;
 
     /// Apply the active-path mutation per the Update-Active-Path
     /// algorithm — `activate_ids` go `is_active=true`,
@@ -367,7 +359,8 @@ impl VariantService {
             .await?
             .ok_or_else(|| ChatEngineError::not_found("message", message_id))?;
 
-        self.update_active_path(session_id, target.message_id).await?;
+        self.update_active_path(session_id, target.message_id)
+            .await?;
 
         // Re-load to capture the freshly-applied `is_active=true`.
         let refreshed = self
@@ -412,11 +405,7 @@ impl VariantService {
     ///   3. For each ancestor, deactivate sibling variants at the same
     ///      parent that are NOT in `chain`.
     ///   4. Deactivate descendants of those off-path siblings.
-    pub async fn update_active_path(
-        &self,
-        session_id: Uuid,
-        message_id: Uuid,
-    ) -> Result<()> {
+    pub async fn update_active_path(&self, session_id: Uuid, message_id: Uuid) -> Result<()> {
         let chain = self.variants.ancestor_chain(session_id, message_id).await?;
         if chain.is_empty() {
             return Err(ChatEngineError::not_found("message", message_id));
@@ -611,13 +600,8 @@ impl VariantService {
                 let variants = Arc::clone(&variants_repo);
                 let messages = Arc::clone(&messages_repo);
                 async move {
-                    update_active_path_with_repos(
-                        variants,
-                        messages,
-                        session_id,
-                        new_message_id,
-                    )
-                    .await
+                    update_active_path_with_repos(variants, messages, session_id, new_message_id)
+                        .await
                 }
             },
         );
@@ -737,23 +721,12 @@ impl VariantService {
             let variants = Arc::clone(&variants_repo);
             let messages = Arc::clone(&messages_repo);
             async move {
-                update_active_path_with_repos(
-                    variants,
-                    messages,
-                    session_id,
-                    assistant_message_id,
-                )
-                .await
+                update_active_path_with_repos(variants, messages, session_id, assistant_message_id)
+                    .await
             }
         });
 
-        log_op_finished(
-            started,
-            "branch",
-            session_id,
-            user_message_id,
-            None,
-        );
+        log_op_finished(started, "branch", session_id, user_message_id, None);
         increment_variant_creation_total("branch");
         Ok(wrapped)
     }
@@ -815,29 +788,26 @@ impl VariantService {
             .session_types
             .find_by_id(target_session_type_id)
             .await?
-            .ok_or_else(|| {
-                ChatEngineError::not_found("session_type", target_session_type_id)
-            })?;
+            .ok_or_else(|| ChatEngineError::not_found("session_type", target_session_type_id))?;
         let plugin_instance_id = target.plugin_instance_id.clone().ok_or_else(|| {
-            ChatEngineError::bad_request(
-                "target session_type has no plugin_instance_id",
-            )
+            ChatEngineError::bad_request("target session_type has no plugin_instance_id")
         })?;
 
         // Resolve plugin and refresh capabilities. A missing plugin is
         // a 502 per the feature spec (see Error Semantics §). A plugin
         // error is also a 502 (the standard PluginError → ChatEngineError
         // conversion).
-        let plugin = self.plugins.resolve(&plugin_instance_id).map_err(|err| {
-            match err {
+        let plugin = self
+            .plugins
+            .resolve(&plugin_instance_id)
+            .map_err(|err| match err {
                 ChatEngineError::NotFound { .. } => ChatEngineError::BackendUnavailable {
                     reason: format!("target plugin '{plugin_instance_id}' is not registered"),
                     retry_after: None,
                     source: None,
                 },
                 other => other,
-            }
-        })?;
+            })?;
         let plugin_config = self
             .plugins
             .load_config(&plugin_instance_id, target_session_type_id)
@@ -877,10 +847,8 @@ impl VariantService {
                 .map_err(ChatEngineError::from)?;
 
         let current_names: Vec<String> = enabled_capability_names(&session);
-        let available_names: std::collections::HashSet<&str> = available
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect();
+        let available_names: std::collections::HashSet<&str> =
+            available.iter().map(|c| c.name.as_str()).collect();
         for name in &current_names {
             if !available_names.contains(name.as_str()) {
                 return Err(ChatEngineError::conflict(format!(
@@ -915,8 +883,7 @@ impl VariantService {
             .validate_session_type_switch(identity, session_id, target_session_type_id)
             .await?;
 
-        let caps_json = serde_json::to_value(&capabilities)
-            .unwrap_or(JsonValue::Array(Vec::new()));
+        let caps_json = serde_json::to_value(&capabilities).unwrap_or(JsonValue::Array(Vec::new()));
 
         let updated = self
             .variants
@@ -939,11 +906,7 @@ impl VariantService {
     //  Internal helpers
     // ------------------------------------------------------------------
 
-    async fn load_session(
-        &self,
-        identity: &Identity,
-        session_id: Uuid,
-    ) -> Result<Session> {
+    async fn load_session(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
         let row = self
             .sessions
             .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
@@ -1044,7 +1007,9 @@ async fn update_active_path_with_repos(
     // Never deactivate an id that is also on the active chain — see
     // the comment in `VariantService::update_active_path`.
     deactivate.retain(|id| !chain_set.contains(id));
-    variants.apply_active_flips(session_id, chain, deactivate).await
+    variants
+        .apply_active_flips(session_id, chain, deactivate)
+        .await
 }
 
 /// Names of capabilities currently enabled on a session, decoded from
@@ -1104,10 +1069,7 @@ where
 /// `variant_info` rewrite — used by `branch_message` where the new
 /// branch's variant payload is sent as a normal `Complete` event from
 /// the plugin.
-fn wrap_stream_simple<F, Fut>(
-    upstream: SendMessageStream,
-    finalizer: F,
-) -> SendMessageStream
+fn wrap_stream_simple<F, Fut>(upstream: SendMessageStream, finalizer: F) -> SendMessageStream
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
@@ -1186,7 +1148,10 @@ fn increment_variant_creation_total(operation: &'static str) {
     // FIXME(phase-6): wire variant_creation_total counter once the
     // crate-wide metrics facade lands (tracked by Phase 15 module
     // wiring).
-    debug!(operation, "variant_creation_total += 1 (no metrics facade yet)");
+    debug!(
+        operation,
+        "variant_creation_total += 1 (no metrics facade yet)"
+    );
 }
 
 // The SeaORM-backed `VariantRepo` impl lives at
@@ -1289,11 +1254,7 @@ mod tests {
             ))
         }
 
-        async fn ancestor_chain(
-            &self,
-            _session_id: Uuid,
-            message_id: Uuid,
-        ) -> Result<Vec<Uuid>> {
+        async fn ancestor_chain(&self, _session_id: Uuid, message_id: Uuid) -> Result<Vec<Uuid>> {
             Ok(vec![message_id])
         }
 
@@ -1385,7 +1346,10 @@ mod tests {
             insert_with_retry(Arc::clone(&repo), session_id, parent, 3)
                 .await
                 .expect("should succeed within 3 retries");
-        assert_eq!(variant_index, 2, "should reflect the attempt that succeeded");
+        assert_eq!(
+            variant_index, 2,
+            "should reflect the attempt that succeeded"
+        );
     }
 
     #[tokio::test]
@@ -1480,7 +1444,8 @@ mod tests {
         };
         assert!(enabled_capability_names(&s).is_empty());
 
-        s.enabled_capabilities = Some(json!([{"name": "model", "value": "x"}, {"name": "stream", "value": true}]));
+        s.enabled_capabilities =
+            Some(json!([{"name": "model", "value": "x"}, {"name": "stream", "value": true}]));
         let names = enabled_capability_names(&s);
         assert_eq!(names, vec!["model".to_string(), "stream".to_string()]);
 

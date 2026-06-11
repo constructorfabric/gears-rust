@@ -138,8 +138,7 @@ pub struct LlmGatewayRequest {
 }
 
 /// Boxed async stream of upstream events produced by [`LlmGatewayClient`].
-pub type UpstreamStream =
-    futures::stream::BoxStream<'static, Result<UpstreamEvent, PluginError>>;
+pub type UpstreamStream = futures::stream::BoxStream<'static, Result<UpstreamEvent, PluginError>>;
 
 /// Narrow abstraction over the LLM Gateway HTTP surface. Production code
 /// supplies a `reqwest`-backed implementation (Phase 15); unit tests use
@@ -310,9 +309,9 @@ impl LlmGatewayPlugin {
         previous: Option<&Vec<CapabilityValue>>,
     ) -> Result<Vec<Capability>, PluginError> {
         let _ = previous; // The fast-path "unchanged" decision lives in the
-                          // caller's wiring (Phase 15) — at the trait
-                          // boundary we always rebuild from the registry
-                          // so the schema stays authoritative.
+        // caller's wiring (Phase 15) — at the trait
+        // boundary we always rebuild from the registry
+        // so the schema stays authoritative.
         self.resolve_capabilities(config).await
     }
 }
@@ -322,10 +321,9 @@ impl LlmGatewayPlugin {
     /// shape consumed by `ResponseStream`.
     fn transform_event(message_id: Uuid, ev: UpstreamEvent) -> StreamingEvent {
         match ev {
-            UpstreamEvent::Chunk(chunk) => StreamingEvent::Chunk(StreamingChunkEvent {
-                message_id,
-                chunk,
-            }),
+            UpstreamEvent::Chunk(chunk) => {
+                StreamingEvent::Chunk(StreamingChunkEvent { message_id, chunk })
+            }
             UpstreamEvent::Complete(meta) => StreamingEvent::Complete(StreamingCompleteEvent {
                 message_id,
                 metadata: Some(meta.to_json()),
@@ -351,7 +349,9 @@ impl LlmGatewayPlugin {
     fn deadline_exceeded_event(message_id: Uuid) -> StreamingEvent {
         StreamingEvent::Error(StreamingErrorEvent {
             message_id,
-            error: format!("{ERROR_PREFIX_DEADLINE_EXCEEDED} deadline elapsed before upstream call"),
+            error: format!(
+                "{ERROR_PREFIX_DEADLINE_EXCEEDED} deadline elapsed before upstream call"
+            ),
         })
     }
 
@@ -385,8 +385,7 @@ impl LlmGatewayPlugin {
                 Err(e) => {
                     last_err = Some(e);
                     if attempt + 1 < max_attempts {
-                        let backoff =
-                            base_delay.saturating_mul(2u32.saturating_pow(attempt));
+                        let backoff = base_delay.saturating_mul(2u32.saturating_pow(attempt));
                         select! {
                             _ = cancel.cancelled() => {
                                 return Err(PluginError::transient("cancelled"));
@@ -485,21 +484,17 @@ impl ChatEngineBackendPlugin for LlmGatewayPlugin {
         .await
     }
 
-    async fn on_session_summary(
-        &self,
-        ctx: SessionPluginCtx,
-    ) -> Result<PluginStream, PluginError> {
+    async fn on_session_summary(&self, ctx: SessionPluginCtx) -> Result<PluginStream, PluginError> {
         // The Phase 13 summary contract returns a single-shot stream
         // carrying the summary text in one Complete event whose metadata
         // contains the `SummaryResult` JSON. Phase 8 (`MessageService`)
         // owns persistence — this plugin is stateless.
         let cfg = Self::config_from_ctx(&ctx.call_ctx)?;
-        let settings: LlmSummarizationSettings =
-            cfg.summarization_settings.ok_or_else(|| {
-                PluginError::internal(
-                    "summarization unsupported: LlmPluginConfig.summarization_settings is null",
-                )
-            })?;
+        let settings: LlmSummarizationSettings = cfg.summarization_settings.ok_or_else(|| {
+            PluginError::internal(
+                "summarization unsupported: LlmPluginConfig.summarization_settings is null",
+            )
+        })?;
 
         // The full visible history must be provided via the call context;
         // we accept it via a dedicated key on `plugin_config` only as a
@@ -514,10 +509,7 @@ impl ChatEngineBackendPlugin for LlmGatewayPlugin {
             .and_then(|v| v.get("__summary_messages"))
         {
             Some(raw) => serde_json::from_value(raw.clone()).map_err(|e| {
-                PluginError::invalid_input_with(
-                    "invalid __summary_messages payload",
-                    e,
-                )
+                PluginError::invalid_input_with("invalid __summary_messages payload", e)
             })?,
             None => Vec::new(),
         };
@@ -542,14 +534,13 @@ impl ChatEngineBackendPlugin for LlmGatewayPlugin {
         let client = Arc::clone(&self.gateway_client);
         let cfg_clone = cfg.clone();
 
-        let summary_text =
-            Self::with_retry(&cfg_clone, &cancel, || {
-                let client = Arc::clone(&client);
-                let cfg = cfg_clone.clone();
-                let msgs = to_summarize.clone();
-                async move { client.summarize(&cfg, msgs).await }
-            })
-            .await?;
+        let summary_text = Self::with_retry(&cfg_clone, &cancel, || {
+            let client = Arc::clone(&client);
+            let cfg = cfg_clone.clone();
+            let msgs = to_summarize.clone();
+            async move { client.summarize(&cfg, msgs).await }
+        })
+        .await?;
 
         let session_id = ctx.session_id.unwrap_or_else(Uuid::nil);
         let summary_event = StreamingEvent::Complete(StreamingCompleteEvent {
@@ -806,8 +797,7 @@ mod tests {
             // Collect under the lock so the guard is released before the
             // stream is built (the stream can't borrow the guard).
             #[allow(clippy::needless_collect)]
-            let events: Vec<UpstreamEvent> =
-                self.events.lock().unwrap().drain(..).collect();
+            let events: Vec<UpstreamEvent> = self.events.lock().unwrap().drain(..).collect();
             let s = stream::iter(events.into_iter().map(Ok));
             Ok(s.boxed())
         }
@@ -909,10 +899,7 @@ mod tests {
     }
 
     fn make_plugin(client: FakeLlmGatewayClient) -> LlmGatewayPlugin {
-        LlmGatewayPlugin::new(
-            Arc::new(client),
-            Arc::new(FakeModelRegistry::new()),
-        )
+        LlmGatewayPlugin::new(Arc::new(client), Arc::new(FakeModelRegistry::new()))
     }
 
     fn valid_config() -> serde_json::Value {
@@ -1048,7 +1035,10 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
-        assert!(stream.next().await.is_none(), "stream must close after overflow");
+        assert!(
+            stream.next().await.is_none(),
+            "stream must close after overflow"
+        );
     }
 
     #[tokio::test]
@@ -1104,8 +1094,11 @@ mod tests {
         let plugin = make_plugin(FakeLlmGatewayClient::default());
         let mut call_ctx = make_call_ctx(valid_config());
         // Deadline already elapsed — Some(ZERO) by construction.
-        call_ctx.deadline =
-            Some(Instant::now().checked_sub(std::time::Duration::from_secs(1)).unwrap());
+        call_ctx.deadline = Some(
+            Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
         let msg_id = Uuid::new_v4();
         let ctx = MessagePluginCtx {
             session_id: Uuid::new_v4(),

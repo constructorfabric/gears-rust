@@ -1,9 +1,9 @@
 // @cpt-cf-chat-engine-dbtable-sessions:p1
 // @cpt-cf-chat-engine-adr-session-deletion-strategy:p1
 
-use toolkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
+use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
 // `tenant_id` / `user_id` here are `String` rather than `Uuid`, so the

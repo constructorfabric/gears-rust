@@ -318,9 +318,8 @@ impl SearchService {
         query: &SearchQuery,
     ) -> Result<SearchPage> {
         let started = Instant::now();
-        let parsed = parse_search_query(query.q.as_deref().unwrap_or("")).map_err(
-            ChatEngineError::from,
-        )?;
+        let parsed =
+            parse_search_query(query.q.as_deref().unwrap_or("")).map_err(ChatEngineError::from)?;
 
         // Ownership validation: missing or cross-tenant session → 404.
         let owned = self
@@ -360,9 +359,8 @@ impl SearchService {
         query: &SearchQuery,
     ) -> Result<SearchPage> {
         let started = Instant::now();
-        let parsed = parse_search_query(query.q.as_deref().unwrap_or("")).map_err(
-            ChatEngineError::from,
-        )?;
+        let parsed =
+            parse_search_query(query.q.as_deref().unwrap_or("")).map_err(ChatEngineError::from)?;
 
         let scope = SearchScopeFilter {
             tenant_id: identity.tenant_id.clone(),
@@ -655,9 +653,7 @@ mod tests {
                 .sessions
                 .iter()
                 .find(|s| {
-                    s.session_id == session_id
-                        && s.tenant_id == tenant_id
-                        && s.user_id == user_id
+                    s.session_id == session_id && s.tenant_id == tenant_id && s.user_id == user_id
                 })
                 .cloned())
         }
@@ -666,7 +662,8 @@ mod tests {
             _tenant_id: &str,
             _user_id: &str,
             _query: &toolkit_odata::ODataQuery,
-        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError>
+        {
             unimplemented!()
         }
         async fn update_metadata(
@@ -733,10 +730,8 @@ mod tests {
         async fn insert_user_and_assistant_stub(
             &self,
             _req: crate::infra::db::repo::message_repo::NewUserMessage,
-        ) -> std::result::Result<
-            crate::infra::db::repo::message_repo::InsertedPair,
-            ChatEngineError,
-        > {
+        ) -> std::result::Result<crate::infra::db::repo::message_repo::InsertedPair, ChatEngineError>
+        {
             unimplemented!()
         }
         async fn finalize_assistant(
@@ -837,10 +832,7 @@ mod tests {
         Identity::new("tenant-a", "user-1", None).unwrap()
     }
 
-    fn make_service(
-        session: session_entity::Model,
-        messages: Vec<Message>,
-    ) -> SearchService {
+    fn make_service(session: session_entity::Model, messages: Vec<Message>) -> SearchService {
         let sessions = Arc::new(MockSessionRepo::with(session.clone()));
         let message_repo = Arc::new(MockMessageRepo::with(messages.clone()));
 
@@ -958,7 +950,13 @@ mod tests {
         let session_id = Uuid::new_v4();
         let session = fixture_session("tenant-a", "user-1", session_id);
         let messages = vec![
-            fixture_message(session_id, MessageRole::User, "find me hidden secret", 0, true),
+            fixture_message(
+                session_id,
+                MessageRole::User,
+                "find me hidden secret",
+                0,
+                true,
+            ),
             fixture_message(session_id, MessageRole::User, "find me", 1, false),
         ];
         let svc = make_service(session, messages);
@@ -1253,7 +1251,11 @@ mod tests {
         // Total ids across all three pages: every input row, exactly once.
         let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
         for r in page1.items.iter().chain(&page2.items).chain(&page3.items) {
-            assert!(seen.insert(r.message_id), "id {} appeared twice", r.message_id);
+            assert!(
+                seen.insert(r.message_id),
+                "id {} appeared twice",
+                r.message_id
+            );
         }
         assert_eq!(seen.len(), 5, "all 5 rows surfaced across the pages");
     }

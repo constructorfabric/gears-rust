@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
 use sea_orm::{EntityTrait, QueryOrder};
+use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;

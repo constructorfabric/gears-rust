@@ -22,6 +22,6 @@ pub use models::{
     UserId, VariantInfo,
 };
 pub use plugin::{
-    ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream,
-    SessionPluginCtx, empty_stream, stream_from_events,
+    ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream, SessionPluginCtx,
+    empty_stream, stream_from_events,
 };

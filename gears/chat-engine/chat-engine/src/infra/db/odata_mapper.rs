@@ -14,9 +14,9 @@
 //
 // @cpt-cf-chat-engine-session-repo:p4
 
+use time::OffsetDateTime;
 use toolkit_db::odata::sea_orm_filter::{FieldToColumn, ODataFieldMapping};
 use toolkit_odata_macros::ODataFilterable;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::infra::db::entity::session::{Column, Entity, Model};

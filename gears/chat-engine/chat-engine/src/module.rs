@@ -35,13 +35,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::Router;
-use toolkit::api::OpenApiRegistry;
-use toolkit::client_hub::ClientScope;
-use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
-use toolkit::api::canonical_error_middleware;
-use toolkit_db::DBProvider;
 use sea_orm_migration::MigrationTrait;
 use tokio_util::sync::CancellationToken;
+use toolkit::api::OpenApiRegistry;
+use toolkit::api::canonical_error_middleware;
+use toolkit::client_hub::ClientScope;
+use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
+use toolkit_db::DBProvider;
 use tracing::{error, info, warn};
 
 use crate::infra::db::repo::ChatEngineDb;
@@ -52,28 +52,27 @@ use crate::api::rest::routes::ChatEngineServices;
 use crate::api::rest::{NoopWebhookEmitter, WebhookEmitter, WebhookEmitterAdapter};
 use crate::config::ChatEngineConfig;
 use crate::domain::export::NotImplementedExportStorage;
+use crate::domain::service::webhook::WebhookEmitter as DomainWebhookEmitter;
 use crate::domain::service::{
     ExportService, IntelligenceService, MessageService, PluginService, ReactionService,
     SearchService, SessionService, ShareUrlBuilder, VariantService,
 };
-use crate::infra::leader::{LeaderElector, work_fn};
-use crate::infra::search::NotImplementedSearchBackend;
-use crate::domain::service::webhook::WebhookEmitter as DomainWebhookEmitter;
 use crate::infra::db::migrations::Migrator;
 use crate::infra::db::repo::message_repo::SeaMessageRepo;
 use crate::infra::db::repo::plugin_config_repo::SeaPluginConfigRepo;
 use crate::infra::db::repo::reaction_repo::SeaReactionRepo;
 use crate::infra::db::repo::session_repo::SeaSessionRepo;
 use crate::infra::db::repo::session_type_repo::SeaSessionTypeRepo;
+use crate::infra::leader::{LeaderElector, work_fn};
 use crate::infra::llm_gateway::LlmGatewayPlugin;
+use crate::infra::search::NotImplementedSearchBackend;
 use crate::infra::webhook_compat::WebhookCompatPlugin;
 
 /// GTS plugin instance ID used to register the default `WebhookCompatPlugin`
 /// instance. Operators that want multiple webhook bindings can register
 /// additional `WebhookCompatPlugin` instances themselves; the default one
 /// is keyed under this stable id.
-pub const DEFAULT_WEBHOOK_COMPAT_INSTANCE_ID: &str =
-    "gtx.cf.chat_engine.webhook_compat_plugin.v1~";
+pub const DEFAULT_WEBHOOK_COMPAT_INSTANCE_ID: &str = "gtx.cf.chat_engine.webhook_compat_plugin.v1~";
 
 /// Aggregated runtime state filled in during [`Gear::init`].
 struct RuntimeState {
@@ -171,8 +170,7 @@ impl ChatEngineModule {
                     let intelligence = Arc::clone(&intelligence);
                     async move {
                         let mut interval = tokio::time::interval(period);
-                        interval
-                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         // Skip the immediate tick that `tokio::time::interval`
                         // fires synchronously — the first cleanup runs one
                         // period after acquiring leadership, not instantly.
@@ -213,9 +211,7 @@ impl ChatEngineModule {
 /// the per-tenant cleanup against each. The session repository is the
 /// source of truth for the tenant directory, so the tick activates
 /// retention for real traffic — no sentinel / marker placeholder.
-async fn run_retention_cleanup_tick(
-    intelligence: &IntelligenceService,
-) -> anyhow::Result<()> {
+async fn run_retention_cleanup_tick(intelligence: &IntelligenceService) -> anyhow::Result<()> {
     let report = intelligence.run_retention_cleanup_all_tenants().await?;
     info!(
         sessions_scanned = report.sessions.len(),
@@ -408,12 +404,13 @@ impl Gear for ChatEngineModule {
             ),
         );
 
-        let share_urls = config
-            .share_base_url
-            .as_ref()
-            .map_or_else(ShareUrlBuilder::default, |base| ShareUrlBuilder {
-                base_url: base.clone(),
-            });
+        let share_urls =
+            config
+                .share_base_url
+                .as_ref()
+                .map_or_else(ShareUrlBuilder::default, |base| ShareUrlBuilder {
+                    base_url: base.clone(),
+                });
         // Not-implemented until a real object-storage backend is wired:
         // returns 501 rather than discarding the bytes behind a dead
         // `memory://` URL (RUST-NO-001).
@@ -481,4 +478,3 @@ impl RestApiCapability for ChatEngineModule {
         Ok(router)
     }
 }
-

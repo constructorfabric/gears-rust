@@ -71,10 +71,7 @@ impl FakePlugin {
 
 #[async_trait]
 impl ChatEngineBackendPlugin for FakePlugin {
-    async fn on_message(
-        &self,
-        _ctx: MessagePluginCtx,
-    ) -> Result<PluginStream, PluginError> {
+    async fn on_message(&self, _ctx: MessagePluginCtx) -> Result<PluginStream, PluginError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let script = self
             .script
