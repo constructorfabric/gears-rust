@@ -139,11 +139,13 @@ impl PluginService {
             Err(err) => {
                 // Per Phase 3 rules: do NOT propagate the PluginError —
                 // treat the health probe as advisory and fold to Unhealthy.
-                // Log the *kind* of failure, not its payload.
+                // Log the *kind* of failure (via its suggested status, which
+                // is a 1:1 proxy for the variant), never the payload, which
+                // may carry sensitive upstream detail.
                 warn!(
                     plugin_instance_id = %plugin_instance_id,
                     status = "unhealthy",
-                    error = %err,
+                    error_status = err.suggested_status(),
                     "plugin health check returned an error; treating as unhealthy (advisory)"
                 );
                 Ok(HealthStatus::Unhealthy)
