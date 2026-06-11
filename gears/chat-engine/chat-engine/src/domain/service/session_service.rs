@@ -124,6 +124,13 @@ pub struct CreateSessionRequest {
 
 /// Service-level result of `delete_session` — handlers decide between
 /// 200 (Soft) and 204 (Hard) based on this value.
+//
+// `Soft` carries a full `Session` while `Hard` is a unit; that size skew is
+// intentional. The value is returned by-value and immediately matched at the
+// handler, and `Soft` is the common outcome — boxing it to satisfy
+// `large_enum_variant` would add an allocation on the hot path to shrink the
+// rare `Hard` case, a net pessimisation.
+#[allow(clippy::large_enum_variant)]
 #[domain_model]
 #[derive(Debug, Clone)]
 pub enum SessionDeleteOutcome {
@@ -215,7 +222,7 @@ impl SessionService {
                 tracing::debug!(
                     plugin_instance_id = %plugin_instance_id,
                     session_type_id = %session_type_id,
-                    "plugin_config received on register_session_type — persistence wiring lands in Phase 15"
+                    "plugin_config received on register_session_type \u{2014} persistence wiring lands in Phase 15"
                 );
                 let _ = cfg; // suppress unused warning
             }
@@ -257,7 +264,7 @@ impl SessionService {
                         plugin_instance_id = %plugin_instance_id,
                         session_type_id = %session_type_id,
                         error = %err,
-                        "plugin on_session_type_configured failed — registration kept (advisory)"
+                        "plugin on_session_type_configured failed \u{2014} registration kept (advisory)"
                     );
                 }
             }
@@ -378,10 +385,10 @@ impl SessionService {
                 Err(err) => {
                     // Rollback: hard-delete the orphan session row so the
                     // caller can safely retry.
-                    let _ = self
-                        .sessions
+                    self.sessions
                         .hard_delete(&identity.tenant_id, &identity.user_id, inserted_id)
-                        .await;
+                        .await
+                        .ok();
                     return Err(err);
                 }
             }
@@ -412,7 +419,7 @@ impl SessionService {
             })
             .await
             .unwrap_or_else(|err| {
-                warn!(error = %err, "webhook emit failed for session.created")
+                warn!(error = %err, "webhook emit failed for session.created");
             });
 
         Ok(redact_session(session))
@@ -644,7 +651,7 @@ impl SessionService {
                 })
                 .await
                 .unwrap_or_else(|err| {
-                    warn!(error = %err, "webhook emit failed for session.hard_deleted")
+                    warn!(error = %err, "webhook emit failed for session.hard_deleted");
                 });
             Ok(SessionDeleteOutcome::Hard)
         } else {
@@ -671,7 +678,7 @@ impl SessionService {
                 })
                 .await
                 .unwrap_or_else(|err| {
-                    warn!(error = %err, "webhook emit failed for session.soft_deleted")
+                    warn!(error = %err, "webhook emit failed for session.soft_deleted");
                 });
             Ok(SessionDeleteOutcome::Soft {
                 session: redact_session(updated.into()),

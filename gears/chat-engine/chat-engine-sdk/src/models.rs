@@ -645,19 +645,19 @@ mod id_validation_tests {
     #[test]
     #[should_panic(expected = "TenantId must not be empty")]
     fn tenant_id_new_rejects_empty() {
-        let _ = TenantId::new("");
+        drop(TenantId::new(""));
     }
 
     #[test]
     #[should_panic(expected = "TenantId must not be empty")]
     fn tenant_id_from_string_rejects_empty() {
-        let _ = TenantId::from(String::new());
+        drop(TenantId::from(String::new()));
     }
 
     #[test]
     #[should_panic(expected = "TenantId must not be empty")]
     fn tenant_id_from_str_rejects_empty() {
-        let _ = TenantId::from("");
+        drop(TenantId::from(""));
     }
 
     #[test]
@@ -670,18 +670,18 @@ mod id_validation_tests {
     #[test]
     #[should_panic(expected = "UserId must not be empty")]
     fn user_id_new_rejects_empty() {
-        let _ = UserId::new("");
+        drop(UserId::new(""));
     }
 
     #[test]
     #[should_panic(expected = "UserId must not be empty")]
     fn user_id_from_string_rejects_empty() {
-        let _ = UserId::from(String::new());
+        drop(UserId::from(String::new()));
     }
 
     #[test]
     #[should_panic(expected = "UserId must not be empty")]
     fn user_id_from_str_rejects_empty() {
-        let _ = UserId::from("");
+        drop(UserId::from(""));
     }
 }

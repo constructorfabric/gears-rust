@@ -23,7 +23,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{Extension, Path};
 use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::Json;
 use futures::stream::StreamExt;
 use serde_json::Value as JsonValue;

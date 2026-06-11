@@ -175,7 +175,7 @@ impl MigrationTrait for Migration {
 }
 
 #[derive(DeriveIden)]
-pub(crate) enum Messages {
+pub enum Messages {
     Table,
     MessageId,
     SessionId,

@@ -94,7 +94,7 @@ pub async fn get_search(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
     use crate::domain::search::{SearchQuery, MAX_PAGE_SIZE};
 
     #[test]

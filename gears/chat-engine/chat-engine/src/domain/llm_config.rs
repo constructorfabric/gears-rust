@@ -276,13 +276,12 @@ pub fn validate_plugin_config(json: &serde_json::Value) -> Result<LlmPluginConfi
     // every downstream caller embeds the validated value verbatim.
     crate::infra::url_guard::validate_outbound_url(&parsed.gateway_url, "gateway_url")?;
 
-    if let Some(s) = parsed.summarization_settings {
-        if s.recent_messages_to_keep < RECENT_MESSAGES_TO_KEEP_MIN {
+    if let Some(s) = parsed.summarization_settings
+        && s.recent_messages_to_keep < RECENT_MESSAGES_TO_KEEP_MIN {
             return Err(PluginError::invalid_input(format!(
                 "LlmPluginConfig.summarization_settings.recent_messages_to_keep must be >= {RECENT_MESSAGES_TO_KEEP_MIN}",
             )));
         }
-    }
 
     Ok(parsed)
 }

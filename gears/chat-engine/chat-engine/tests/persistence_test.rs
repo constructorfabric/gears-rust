@@ -1,6 +1,6 @@
 //! Persistence-side integration tests for `MessageService`.
 //!
-//! These tests construct a real `MessageService` over a SeaORM
+//! These tests construct a real `MessageService` over a `SeaORM`
 //! SQLite-in-memory stack (every production repo impl, the real
 //! variant-index allocation transaction, the real `finalize_assistant`
 //! UPDATE) and drive it with a scripted plugin so the finalize-on-cancel
@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chat_engine::domain::service::message_service::{MessageService, SendMessageRequest};
-use chat_engine::infra::db::repo::message_repo::MessageRepo;
 use chat_engine::domain::service::plugin_service::PluginService;
 use chat_engine::domain::service::session_service::Identity;
 use chat_engine_sdk::{
@@ -168,12 +167,12 @@ async fn cancel_after_partial_chunks_persists_is_complete_false_against_sqlite()
         .as_ref()
         .expect("finalize_assistant must write metadata on cancel");
     assert_eq!(
-        metadata.get("cancelled").and_then(|v| v.as_bool()),
+        metadata.get("cancelled").and_then(serde_json::Value::as_bool),
         Some(true),
         "cancel finalize must stamp metadata.cancelled=true; got {metadata}",
     );
     assert_eq!(
-        metadata.get("partial").and_then(|v| v.as_bool()),
+        metadata.get("partial").and_then(serde_json::Value::as_bool),
         Some(true),
         "cancel finalize must stamp metadata.partial=true; got {metadata}",
     );
@@ -204,12 +203,11 @@ async fn pre_stream_timeout_persists_finish_reason_against_sqlite() {
     let svc = build_service(&harness, plugin_id, plugin_dyn);
 
     let cancel = CancellationToken::new();
-    let err = match svc
+    let Err(err) = svc
         .send_message(make_request(session_id), make_identity(), cancel)
         .await
-    {
-        Ok(_) => panic!("pre-stream timeout must surface as Err"),
-        Err(e) => e,
+    else {
+        panic!("pre-stream timeout must surface as Err");
     };
     // ChatEngineError::BackendUnavailable carries the HTTP-504 mapping per
     // the production error matrix; we only need the discriminant here.
@@ -244,7 +242,7 @@ async fn pre_stream_timeout_persists_finish_reason_against_sqlite() {
         "pre-stream timeout must stamp metadata.finish_reason=timeout; got {metadata}",
     );
     assert_eq!(
-        metadata.get("partial").and_then(|v| v.as_bool()),
+        metadata.get("partial").and_then(serde_json::Value::as_bool),
         Some(true),
         "errored finalize must stamp metadata.partial=true; got {metadata}",
     );
@@ -274,12 +272,11 @@ async fn soft_deleted_session_rejects_send_against_sqlite() {
     let svc = build_service(&harness, plugin_id, plugin_dyn);
 
     let cancel = CancellationToken::new();
-    let err = match svc
+    let Err(err) = svc
         .send_message(make_request(session_id), make_identity(), cancel)
         .await
-    {
-        Ok(_) => panic!("soft_deleted session must reject send_message"),
-        Err(e) => e,
+    else {
+        panic!("soft_deleted session must reject send_message");
     };
     let dbg = format!("{err:?}");
     assert!(
@@ -366,12 +363,11 @@ async fn cross_tenant_send_returns_not_found_against_sqlite() {
 
     let intruder = Identity::new("tenant-other", USER_ID, None).unwrap();
     let cancel = CancellationToken::new();
-    let err = match svc
+    let Err(err) = svc
         .send_message(make_request(session_id), intruder, cancel)
         .await
-    {
-        Ok(_) => panic!("cross-tenant send must reject"),
-        Err(e) => e,
+    else {
+        panic!("cross-tenant send must reject");
     };
     let dbg = format!("{err:?}");
     assert!(

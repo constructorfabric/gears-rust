@@ -29,7 +29,7 @@ use axum::Extension;
 use axum::body::Body;
 use axum::extract::Path;
 use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{Json, Response};
 use chat_engine_sdk::models::{CapabilityValue, VariantInfo};
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -190,7 +190,7 @@ pub async fn recreate_variant(
         )
         .await?;
 
-    Ok(stream_to_ndjson_response(stream, cancel)?)
+    stream_to_ndjson_response(stream, cancel)
 }
 
 /// `POST /sessions/{session_id}/messages/{message_id}/branch`.
@@ -223,7 +223,7 @@ pub async fn branch_message(
         )
         .await?;
 
-    Ok(stream_to_ndjson_response(stream, cancel)?)
+    stream_to_ndjson_response(stream, cancel)
 }
 
 /// `GET /sessions/{session_id}/messages/{message_id}/variants`.

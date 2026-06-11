@@ -406,11 +406,11 @@ pub fn make_snippet(content_text: &str, needle: &str) -> String {
             let end = ceil_char_boundary(content_text, end);
             let mut s = String::new();
             if begin > 0 {
-                s.push_str("…");
+                s.push('\u{2026}');
             }
             s.push_str(&content_text[begin..end]);
             if end < content_text.len() {
-                s.push_str("…");
+                s.push('\u{2026}');
             }
             s
         }
@@ -419,7 +419,7 @@ pub fn make_snippet(content_text: &str, needle: &str) -> String {
             let end = ceil_char_boundary(content_text, take);
             let mut s = content_text[..end].to_string();
             if end < content_text.len() {
-                s.push_str("…");
+                s.push('\u{2026}');
             }
             s
         }

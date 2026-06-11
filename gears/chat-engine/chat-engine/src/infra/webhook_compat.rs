@@ -736,7 +736,7 @@ mod tests {
             session_type_id: Uuid::nil(),
             plugin_config: None,
             enabled_capabilities: None,
-            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            deadline: Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap()),
             cancel: CancellationToken::new(),
         };
         let err = cfg.resolved_timeout(&ctx).unwrap_err();

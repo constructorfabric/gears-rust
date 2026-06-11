@@ -49,7 +49,7 @@ impl SearchBackend for PgSearchBackend {
         _limit: u32,
     ) -> std::result::Result<(Vec<BackendHit>, u64), ChatEngineError> {
         Err(ChatEngineError::not_implemented(
-            "PgSearchBackend not yet wired to DBProvider — Phase 15 owns workspace wiring",
+            "PgSearchBackend not yet wired to DBProvider \u{2014} Phase 15 owns workspace wiring",
         ))
     }
 }
@@ -80,7 +80,7 @@ impl SearchBackend for SqliteSearchBackend {
         _limit: u32,
     ) -> std::result::Result<(Vec<BackendHit>, u64), ChatEngineError> {
         Err(ChatEngineError::not_implemented(
-            "SqliteSearchBackend not yet wired to DBProvider — Phase 15 owns workspace wiring",
+            "SqliteSearchBackend not yet wired to DBProvider \u{2014} Phase 15 owns workspace wiring",
         ))
     }
 }

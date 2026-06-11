@@ -41,7 +41,7 @@ fn it_streaming_chunk_event_chunk_is_string_typed_on_wire() {
     let msg_id = Uuid::nil();
     let evt = StreamingEvent::Chunk(StreamingChunkEvent {
         message_id: msg_id,
-        chunk: "hello".to_string(),
+        chunk: "hello".to_owned(),
     });
     let v = serde_json::to_value(&evt).expect("serialize chunk event");
     assert_eq!(v["type"], "chunk");
@@ -59,7 +59,7 @@ fn it_streaming_error_event_uses_message_id_and_error_string() {
     let msg_id = Uuid::nil();
     let evt = StreamingEvent::Error(StreamingErrorEvent {
         message_id: msg_id,
-        error: "upstream 502".to_string(),
+        error: "upstream 502".to_owned(),
     });
     let v = serde_json::to_value(&evt).expect("serialize error event");
     assert_eq!(v["type"], "error");
@@ -297,8 +297,10 @@ fn it_plugin_error_taxonomy_table() {
     // variant later MUST require a new row here — the exhaustive `match`
     // in the SDK's `suggested_status` enforces compile-time discipline; the
     // table here pins the runtime contract.
+    // (error, expected_status, user_facing, retryable, retry_after)
+    type ErrorCase = (PluginError, u16, bool, bool, Option<Duration>);
     let retry_5s = Duration::from_secs(5);
-    let cases: Vec<(PluginError, u16, bool, bool, Option<Duration>)> = vec![
+    let cases: Vec<ErrorCase> = vec![
         (PluginError::transient("net blip"), 503, true, false, None),
         (PluginError::rate_limited(None), 429, true, true, None),
         (
@@ -456,7 +458,7 @@ async fn it_streaming_deadline_persists_partial_message() {
 
     let cancel = CancellationToken::new();
     // Deadline already elapsed.
-    let elapsed_deadline = Instant::now() - Duration::from_secs(1);
+    let elapsed_deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let call_ctx = make_call_ctx(Some(elapsed_deadline), cancel.clone());
 
     // Sanity: the deadline must surface as Some(ZERO) — never None — so a
@@ -530,18 +532,18 @@ async fn it_plugin_call_context_remaining_handles_three_cases() {
     assert!(make_call_ctx(None, cancel.clone()).remaining().is_none());
 
     // (b) future deadline -> positive Duration
-    let future = Instant::now() + Duration::from_secs(60);
+    let future = Instant::now() + Duration::from_mins(1);
     let r = make_call_ctx(Some(future), cancel.clone())
         .remaining()
         .expect("must be Some");
     assert!(r > Duration::from_secs(30));
 
     // (c) elapsed deadline -> Some(ZERO), never None
-    let elapsed = Instant::now() - Duration::from_secs(1);
+    let elapsed = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     assert_eq!(
         make_call_ctx(Some(elapsed), cancel).remaining(),
         Some(Duration::ZERO),
-        "elapsed deadline MUST surface as Some(ZERO) — collapsing to None would let plugins extend their budget"
+        "elapsed deadline MUST surface as Some(ZERO) \u{2014} collapsing to None would let plugins extend their budget"
     );
 }
 
@@ -629,9 +631,8 @@ async fn it_fake_plugin_pre_error_surfaces_before_stream_starts() {
         call_ctx: make_call_ctx(None, cancel),
     };
     let res = plugin_dyn.on_message(ctx).await;
-    let err = match res {
-        Ok(_) => panic!("expected pre-stream Err, got Ok"),
-        Err(e) => e,
+    let Err(err) = res else {
+        panic!("expected pre-stream Err, got Ok");
     };
     assert!(matches!(err, PluginError::InvalidInput { .. }));
     assert_eq!(err.suggested_status(), 400);

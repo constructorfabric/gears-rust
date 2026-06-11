@@ -72,7 +72,7 @@ use uuid::Uuid;
 
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::{
-    Message, StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent,
+    StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent,
     StreamingStartEvent,
 };
 use crate::domain::retention::RetentionPolicy;
@@ -88,7 +88,7 @@ use crate::infra::db::repo::session_type_repo::SessionTypeRepo;
 /// Default per-call plugin deadline for `on_session_summary`. Mirrors the
 /// streaming-message budget — summaries can legitimately take time to emit
 /// a full response.
-pub const DEFAULT_SUMMARY_DEADLINE: Duration = Duration::from_secs(120);
+pub const DEFAULT_SUMMARY_DEADLINE: Duration = Duration::from_mins(2);
 
 /// Bounded backpressure-channel size between the plugin driver and the
 /// NDJSON sink. Mirrors the `MessageService` default; small enough to
@@ -151,7 +151,7 @@ impl RetentionCleanupReport {
 /// inside [`validate_retention_policy`] before any DB write.
 #[domain_model]
 #[derive(Debug, Clone)]
-struct ValidatedPolicy(RetentionPolicy);
+pub struct ValidatedPolicy(RetentionPolicy);
 
 impl From<ValidatedPolicy> for RetentionPolicy {
     fn from(v: ValidatedPolicy) -> Self {
@@ -816,7 +816,6 @@ impl IntelligenceService {
                             Ok(StreamingEvent::Start(_)) => {
                                 // Drop the plugin's own Start; we already
                                 // emitted ours.
-                                continue;
                             }
                             Ok(StreamingEvent::Chunk(c)) => {
                                 accumulator.push_str(&c.chunk);
@@ -843,7 +842,7 @@ impl IntelligenceService {
                                     message_id: summary_message_id,
                                     metadata: c.metadata,
                                 });
-                                let _ = tx_for_driver.send(evt).await;
+                                tx_for_driver.send(evt).await.ok();
                                 break;
                             }
                             Ok(StreamingEvent::Error(e)) => {
@@ -851,7 +850,7 @@ impl IntelligenceService {
                                     message_id: summary_message_id,
                                     error: e.error.clone(),
                                 });
-                                let _ = tx_for_driver.send(evt).await;
+                                tx_for_driver.send(evt).await.ok();
                                 errored = Some(e.error);
                                 break;
                             }
@@ -861,7 +860,7 @@ impl IntelligenceService {
                                     message_id: summary_message_id,
                                     error: s.clone(),
                                 });
-                                let _ = tx_for_driver.send(evt).await;
+                                tx_for_driver.send(evt).await.ok();
                                 errored = Some(s);
                                 break;
                             }
@@ -1486,7 +1485,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.is_empty(), "2 <= 5 → no eligible deletions");
+        assert!(out.is_empty(), "2 <= 5 \u{2192} no eligible deletions");
     }
 
     #[tokio::test]

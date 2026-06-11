@@ -144,7 +144,11 @@ pub async fn patch_session(
         latest = Some(svc.update_capabilities(&identity, session_id, caps).await?);
     }
 
-    Ok(Json(latest.expect("at least one branch ran")))
+    // At least one branch ran (guarded above), so `latest` is `Some`; map the
+    // impossible `None` to an internal error rather than panicking.
+    latest
+        .map(Json)
+        .ok_or_else(|| ChatEngineError::internal("patch produced no session update"))
 }
 
 #[tracing::instrument(skip(svc, ctx), fields(session_id = %session_id))]
@@ -208,6 +212,11 @@ pub(crate) fn identity_from_ctx(ctx: &SecurityContext) -> Result<Identity> {
 /// Reject any client attempt to populate `tenant_id` or `user_id` in the
 /// request body — those values are server-side-only (per PRD §7, anti-
 /// enumeration + anti-spoof).
+//
+// `&Option<_>` (rather than `Option<&_>`) is deliberate: this is a presence
+// guard called at 14 sites that pass `&body.field` directly; the borrow form
+// keeps every call site terse and the function never needs an owned/sub-borrow.
+#[allow(clippy::ref_option)]
 pub(crate) fn reject_body_identity(
     tenant_id: &Option<JsonValue>,
     user_id: &Option<JsonValue>,

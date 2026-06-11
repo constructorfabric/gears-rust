@@ -727,9 +727,9 @@ impl MessageRepo for SeaMessageRepo {
                     // `find` per node (mirrors
                     // `SeaVariantRepo::collect_descendants`). `levels[0]` is
                     // the root; deeper levels follow.
-                    let mut levels: Vec<Vec<Uuid>> = vec![vec![root_id]];
+                    let mut levels: Vec<Vec<Uuid>> = Vec::new();
+                    let mut frontier: Vec<Uuid> = vec![root_id];
                     loop {
-                        let frontier = levels.last().expect("levels is never empty");
                         let children: Vec<Uuid> = MessageEntity::find()
                             .secure()
                             .scope_with(&scope)
@@ -746,10 +746,11 @@ impl MessageRepo for SeaMessageRepo {
                             .into_iter()
                             .map(|m| m.message_id)
                             .collect();
+                        levels.push(frontier);
                         if children.is_empty() {
                             break;
                         }
-                        levels.push(children);
+                        frontier = children;
                     }
                     // Delete one whole level per round-trip, deepest first.
                     // A single `is_in(all_ids)` delete is unsafe here: the

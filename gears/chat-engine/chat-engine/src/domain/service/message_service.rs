@@ -40,8 +40,12 @@ use std::time::{Duration, Instant};
 use chat_engine_sdk::error::PluginError;
 use chat_engine_sdk::models::{CapabilityValue, LifecycleState, TenantId, UserId};
 use chat_engine_sdk::plugin::{
-    ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream, SessionPluginCtx,
+    MessagePluginCtx, PluginCallContext, PluginStream, SessionPluginCtx,
 };
+// Used only by the unit tests below (production code reaches the plugin via
+// `PluginService`); a top-level import would be unused in the lib build.
+#[cfg(test)]
+use chat_engine_sdk::plugin::ChatEngineBackendPlugin;
 use futures::stream::{self, BoxStream, StreamExt};
 use toolkit_macros::domain_model;
 use serde_json::Value as JsonValue;
@@ -82,7 +86,7 @@ pub const DEFAULT_STREAMING_BUFFER_SIZE: usize = 64;
 /// Default plugin-call deadline for streaming. Longer than the lifecycle
 /// hooks' 10s budget because plugins legitimately take time to emit a
 /// full response — but bounded so a hung plugin still releases resources.
-pub const DEFAULT_PLUGIN_DEADLINE: Duration = Duration::from_secs(120);
+pub const DEFAULT_PLUGIN_DEADLINE: Duration = Duration::from_mins(2);
 
 /// Validated, owned request for `send_message`. Constructed by the handler
 /// from the wire body + the JWT-derived [`Identity`].
@@ -294,8 +298,7 @@ impl MessageService {
             Ok(s) => s,
             Err(err) => {
                 let finish_reason = finish_reason_for(&err);
-                let _ = self
-                    .messages
+                self.messages
                     .finalize_assistant(
                         req.session_id,
                         assistant_message_id,
@@ -305,7 +308,8 @@ impl MessageService {
                             finish_reason,
                         },
                     )
-                    .await;
+                    .await
+                    .ok();
                 return Err(err.into());
             }
         };
@@ -333,7 +337,7 @@ impl MessageService {
         info!(
             request_id = %request_id,
             assistant_message_id = %assistant_message_id,
-            "send_message dispatch successful — streaming response"
+            "send_message dispatch successful \u{2014} streaming response"
         );
 
         Ok(stream)
@@ -437,7 +441,7 @@ impl MessageService {
         info!(
             session_id = %session_id,
             strategy_type = %strategy_type_label(current_strategy),
-            "context_overflow observed — dispatching to overflow handler",
+            "context_overflow observed \u{2014} dispatching to overflow handler",
         );
 
         match current_strategy {
@@ -549,7 +553,7 @@ impl MessageService {
 
         while let Some(item) = summary_stream.next().await {
             match item {
-                Ok(StreamingEvent::Start(_)) => continue,
+                Ok(StreamingEvent::Start(_)) => {}
                 Ok(StreamingEvent::Chunk(c)) => accumulator.push_str(&c.chunk),
                 Ok(StreamingEvent::Complete(c)) => {
                     if let Some(ref m) = c.metadata {
@@ -751,8 +755,7 @@ impl MessageService {
             Ok(s) => s,
             Err(err) => {
                 let finish_reason = finish_reason_for(&err);
-                let _ = self
-                    .messages
+                self.messages
                     .finalize_assistant(
                         session_id,
                         assistant_message_id,
@@ -762,7 +765,8 @@ impl MessageService {
                             finish_reason,
                         },
                     )
-                    .await;
+                    .await
+                    .ok();
                 return Err(err.into());
             }
         };
@@ -790,7 +794,7 @@ impl MessageService {
             request_id = %request_id,
             assistant_message_id = %assistant_message_id,
             event_kind = ?event_kind,
-            "dispatch_to_plugin successful — streaming response"
+            "dispatch_to_plugin successful \u{2014} streaming response"
         );
 
         Ok(stream)
@@ -1021,7 +1025,7 @@ impl MessageService {
 
         // Capabilities must be a subset of the session's enabled set.
         if let Some(ref requested) = req.capabilities {
-            let allowed_names = capability_names_from_session(&session.enabled_capabilities);
+            let allowed_names = capability_names_from_session(session.enabled_capabilities.as_ref());
             for cap in requested {
                 if !allowed_names.contains(&cap.name) {
                     return Err(ChatEngineError::bad_request(format!(
@@ -1134,13 +1138,14 @@ impl MessageService {
                 // Receiver dropped before we even started. Treat as
                 // cancellation.
                 cancel.cancel();
-                let _ = messages
+                messages
                     .finalize_assistant(
                         session_id,
                         assistant_id,
                         FinalizeOutcome::Cancelled { text: String::new() },
                     )
-                    .await;
+                    .await
+                    .ok();
                 return;
             }
 
@@ -1164,7 +1169,7 @@ impl MessageService {
                         // exit. The plugin should observe the signal via
                         // its child clone and stop producing.
                         plugin_cancel.cancel();
-                        outcome = DriverOutcome::CancelledByClient;
+                        // `outcome` already initialised to `CancelledByClient`.
                         break;
                     }
 
@@ -1180,7 +1185,6 @@ impl MessageService {
                             Ok(StreamingEvent::Start(_)) => {
                                 // Plugins may emit their own Start; we
                                 // already wrote ours so drop the dup.
-                                continue;
                             }
                             Ok(StreamingEvent::Chunk(c)) => {
                                 accumulator.push_str(&c.chunk);
@@ -1203,7 +1207,7 @@ impl MessageService {
                                     message_id: assistant_id,
                                     metadata: c.metadata,
                                 });
-                                let _ = tx_for_driver.send(evt).await;
+                                tx_for_driver.send(evt).await.ok();
                                 outcome = DriverOutcome::Completed { metadata: last_metadata.clone() };
                                 break;
                             }
@@ -1227,7 +1231,7 @@ impl MessageService {
                                     message_id: assistant_id,
                                     error: e.error.clone(),
                                 });
-                                let _ = tx_for_driver.send(evt).await;
+                                tx_for_driver.send(evt).await.ok();
                                 outcome = DriverOutcome::Errored {
                                     error: e.error,
                                     finish_reason: "error",
@@ -1241,7 +1245,7 @@ impl MessageService {
                                     message_id: assistant_id,
                                     error: error_str.clone(),
                                 });
-                                let _ = tx_for_driver.send(evt).await;
+                                tx_for_driver.send(evt).await.ok();
                                 outcome = DriverOutcome::Errored {
                                     error: error_str,
                                     finish_reason,
@@ -1331,7 +1335,7 @@ impl MessageService {
                                     session_id = %session_id,
                                     strategy_type = %strategy_type_label(&strategy),
                                     error = %err,
-                                    "context_overflow hook returned (Phase 7 dispatch — Phase 8 owns retry)",
+                                    "context_overflow hook returned (Phase 7 dispatch \u{2014} Phase 8 owns retry)",
                                 );
                             }
                         }
@@ -1432,7 +1436,7 @@ fn extract_text(content: &JsonValue) -> String {
 /// Names of capabilities currently enabled on a session, decoded from the
 /// session row's `enabled_capabilities` JSONB. Returns an empty vector if
 /// the column is absent or shape is unexpected.
-fn capability_names_from_session(value: &Option<JsonValue>) -> Vec<String> {
+fn capability_names_from_session(value: Option<&JsonValue>) -> Vec<String> {
     let Some(JsonValue::Array(arr)) = value else {
         return Vec::new();
     };
@@ -1488,7 +1492,7 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use chat_engine_sdk::plugin::{empty_stream, stream_from_events};
+    use chat_engine_sdk::plugin::stream_from_events;
     use toolkit::ClientHub;
     use toolkit::client_hub::ClientScope;
     use parking_lot::Mutex;

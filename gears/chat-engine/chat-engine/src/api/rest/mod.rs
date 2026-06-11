@@ -112,6 +112,8 @@ where
             // The header values are static; this branch should never fire,
             // but degrade to a JSON 500 to keep the response shape sane.
             let fallback_body = json!({"type": "internal", "detail": err.to_string()}).to_string();
+            // Static status + header, so the build cannot realistically fail;
+            // if it ever did, return a bare 500 rather than panicking.
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header(
@@ -119,7 +121,11 @@ where
                     HeaderValue::from_static("application/json"),
                 )
                 .body(Body::from(fallback_body))
-                .expect("static fallback response is well-formed")
+                .unwrap_or_else(|_| {
+                    let mut resp = Response::new(Body::empty());
+                    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    resp
+                })
         })
 }
 
@@ -262,7 +268,7 @@ impl WebhookEmitter for NoopWebhookEmitter {
             %message_id,
             tenant_id,
             user_id,
-            "webhook emitter (noop) — event swallowed",
+            "webhook emitter (noop) \u{2014} event swallowed",
         );
         Ok(())
     }
@@ -280,7 +286,7 @@ impl WebhookEmitter for NoopWebhookEmitter {
             %message_id,
             tenant_id,
             user_id,
-            "webhook emitter (noop) — event swallowed",
+            "webhook emitter (noop) \u{2014} event swallowed",
         );
         Ok(())
     }
@@ -298,7 +304,7 @@ impl WebhookEmitter for NoopWebhookEmitter {
             %message_id,
             tenant_id,
             user_id,
-            "webhook emitter (noop) — event swallowed",
+            "webhook emitter (noop) \u{2014} event swallowed",
         );
         Ok(())
     }
@@ -337,7 +343,7 @@ impl WebhookEmitter for NoopWebhookEmitter {
             %session_id,
             tenant_id,
             user_id,
-            "webhook emitter (noop) — event swallowed",
+            "webhook emitter (noop) \u{2014} event swallowed",
         );
         Ok(())
     }
@@ -349,7 +355,7 @@ impl WebhookEmitter for NoopWebhookEmitter {
         tracing::debug!(
             event = "session_type.health_check",
             %session_type_id,
-            "webhook emitter (noop) — event swallowed",
+            "webhook emitter (noop) \u{2014} event swallowed",
         );
         Ok(())
     }
@@ -405,7 +411,7 @@ where
                     %session_id,
                     tenant_id,
                     user_id,
-                    "lifecycle event (archived/restored) — no dedicated webhook method",
+                    "lifecycle event (archived/restored) \u{2014} no dedicated webhook method",
                 );
                 Ok(())
             }

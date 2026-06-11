@@ -89,11 +89,12 @@ pub fn write_memory_strategy(meta: &mut Value, strategy: &MemoryStrategy) {
     if !meta.is_object() {
         *meta = Value::Object(Map::new());
     }
-    let obj = meta
-        .as_object_mut()
-        .expect("metadata coerced to object above");
-    let encoded = serde_json::to_value(strategy)
-        .expect("MemoryStrategy is always serializable to JSON");
+    // `meta` is an object by the branch above; `MemoryStrategy` is always
+    // JSON-serializable. Both fall-throughs are unreachable in practice, so a
+    // future invariant break degrades to a no-op write rather than a panic.
+    let (Some(obj), Ok(encoded)) = (meta.as_object_mut(), serde_json::to_value(strategy)) else {
+        return;
+    };
     obj.insert(MEMORY_STRATEGY_KEY.to_string(), encoded);
 }
 

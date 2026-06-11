@@ -561,7 +561,7 @@ impl SearchService {
             .as_ref()
             .and_then(|v| v.get("title"))
             .and_then(|t| t.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         let tags = row
             .metadata
             .as_ref()
@@ -569,7 +569,7 @@ impl SearchService {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();

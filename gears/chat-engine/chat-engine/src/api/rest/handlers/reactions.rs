@@ -175,9 +175,9 @@ pub async fn set_reaction(
             // not `await` the spawned task — ADR-0020's contract is that
             // plugin notification never delays the client.
             let http_response = (StatusCode::OK, Json(dto)).into_response();
-            // Detached: the JoinHandle is dropped; the task completes
+            // Detached: drop the JoinHandle; the task completes
             // independently. Errors are logged inside the task.
-            let _ = svc.spawn_plugin_notification(mutation);
+            drop(svc.spawn_plugin_notification(mutation));
             http_response
         }
         Err(err) => map_reaction_error(err),
@@ -209,8 +209,8 @@ pub async fn list_reactions(
 /// "feedback"}`). Every other variant is delegated to the Phase 4
 /// scaffold `IntoResponse for ChatEngineError`.
 fn map_reaction_error(err: ChatEngineError) -> Response {
-    if let ChatEngineError::Conflict { reason } = &err {
-        if reason.contains(CAPABILITY_FEEDBACK) {
+    if let ChatEngineError::Conflict { reason } = &err
+        && reason.contains(CAPABILITY_FEEDBACK) {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -220,7 +220,6 @@ fn map_reaction_error(err: ChatEngineError) -> Response {
             )
                 .into_response();
         }
-    }
     err.into_response()
 }
 

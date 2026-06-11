@@ -1,4 +1,4 @@
-#![allow(clippy::gear_name_repetitions)]
+#![allow(clippy::module_name_repetitions)]
 #![allow(clippy::struct_field_names)]
 #![allow(clippy::struct_excessive_bools)]
 #![allow(clippy::unnested_or_patterns)]

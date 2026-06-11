@@ -238,6 +238,11 @@ impl VariantService {
     /// Returns the allocated index. The caller is responsible for the
     /// matching INSERT (typically inside the repository method that
     /// owns the new row).
+    //
+    // Kept `async` (and a no-op `&self`) deliberately: this is the documented
+    // Phase-6 surface anchor that always errors when called directly, so the
+    // signature matches the eventual real implementation.
+    #[allow(clippy::unused_async, clippy::unused_self)]
     pub async fn assign_variant_index(
         &self,
         _session_id: Uuid,
@@ -257,7 +262,7 @@ impl VariantService {
         // tx". Returning Conflict here would be incorrect (we have not
         // actually raced anything yet).
         Err(ChatEngineError::internal(
-            "VariantService::assign_variant_index is a documentation anchor — use \
+            "VariantService::assign_variant_index is a documentation anchor \u{2014} use \
              insert_assistant_variant_stub / insert_user_and_assistant_stub_for_branch",
         ))
     }
@@ -511,7 +516,7 @@ impl VariantService {
         }
         let parent_message_id = target.parent_message_id.ok_or_else(|| {
             ChatEngineError::bad_request(
-                "target assistant message has no parent — cannot recreate",
+                "target assistant message has no parent \u{2014} cannot recreate",
             )
         })?;
 

@@ -67,6 +67,12 @@ pub const DEFAULT_PAGE_SIZE: u32 = 20;
 /// gap — the only way to learn ownership is to ask the repo, and the
 /// repo only hands back a row when scoping matches. Callers that need
 /// to distinguish 403 vs 404 read the discriminant directly.
+//
+// `Owned` carries a full row while the other variants are units; that skew
+// is intentional. The value is returned by-value and matched immediately,
+// and `Owned` is the common (authorised) case — boxing it to satisfy
+// `large_enum_variant` would add an allocation on the hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum SessionScopeCheck {
     /// Session exists AND is owned by `(tenant_id, user_id)`. The row is
@@ -85,6 +91,10 @@ pub enum SessionScopeCheck {
 
 /// Outcome of a `delete_session` call — carries the lifecycle change applied
 /// so the handler can choose 200 vs 204 accordingly.
+//
+// `Soft` carries a full row, `Hard` is a unit; the skew is intentional (see
+// the `large_enum_variant` rationale on `SessionScopeCheck`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum DeleteOutcome {
     /// Soft delete: lifecycle flipped to `soft_deleted`, `scheduled_hard_delete_at`

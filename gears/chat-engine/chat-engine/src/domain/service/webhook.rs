@@ -111,7 +111,7 @@ impl WebhookEmitter for NoopWebhookEmitter {
     async fn emit(&self, event: WebhookEvent) -> Result<()> {
         debug!(
             event = event.kind(),
-            "webhook emitter (noop) — event swallowed"
+            "webhook emitter (noop) \u{2014} event swallowed"
         );
         Ok(())
     }

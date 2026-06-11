@@ -153,7 +153,7 @@ impl MigrationTrait for Migration {
 }
 
 #[derive(DeriveIden)]
-pub(crate) enum SessionTypes {
+pub enum SessionTypes {
     Table,
     SessionTypeId,
     Name,
@@ -163,7 +163,7 @@ pub(crate) enum SessionTypes {
 }
 
 #[derive(DeriveIden)]
-pub(crate) enum Sessions {
+pub enum Sessions {
     Table,
     SessionId,
     TenantId,

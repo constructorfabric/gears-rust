@@ -475,11 +475,11 @@ fn render_json(meta: &ExportSessionMeta, messages: &[MessageView]) -> Result<Vec
 fn render_markdown(meta: &ExportSessionMeta, messages: &[MessageView]) -> Vec<u8> {
     let mut out = String::new();
     let title = meta.title.as_deref().unwrap_or("Session export");
-    let _ = writeln!(out, "# {title}");
-    let _ = writeln!(out);
+    writeln!(out, "# {title}").ok();
+    writeln!(out).ok();
     if let Ok(ts) = meta.created_at.format(&Rfc3339) {
-        let _ = writeln!(out, "_Exported from session {} (created {})._", meta.session_id, ts);
-        let _ = writeln!(out);
+        writeln!(out, "_Exported from session {} (created {})._", meta.session_id, ts).ok();
+        writeln!(out).ok();
     }
 
     for msg in messages {
@@ -487,10 +487,10 @@ fn render_markdown(meta: &ExportSessionMeta, messages: &[MessageView]) -> Vec<u8
             .created_at
             .format(&Rfc3339)
             .unwrap_or_else(|_| String::from("?"));
-        let _ = writeln!(out, "## {} — {}", role_label(&msg.role), ts);
-        let _ = writeln!(out);
-        let _ = writeln!(out, "{}", content_to_markdown_body(&msg.content));
-        let _ = writeln!(out);
+        writeln!(out, "## {} — {}", role_label(&msg.role), ts).ok();
+        writeln!(out).ok();
+        writeln!(out, "{}", content_to_markdown_body(&msg.content)).ok();
+        writeln!(out).ok();
     }
 
     out.into_bytes()
@@ -533,6 +533,9 @@ fn build_storage_key(
 
 #[cfg(test)]
 mod tests {
+    // The `.ends_with(".md")` asserts below compare a value we generate, not
+    // an untrusted filename, so the case-sensitivity lint does not apply.
+    #![allow(clippy::case_sensitive_file_extension_comparisons)]
     use super::*;
     use crate::domain::message::MessageRole;
     use crate::domain::service::session_service::Identity;
@@ -1105,7 +1108,7 @@ mod tests {
         let bytes = render_markdown(&meta, &views);
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.contains("# My chat"));
-        assert!(s.contains("## user — "));
+        assert!(s.contains("## user \u{2014} "));
         assert!(s.contains("hello"));
     }
 

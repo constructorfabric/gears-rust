@@ -529,10 +529,12 @@ pub fn lifecycle_to_wire(state: LifecycleState) -> &'static str {
 }
 
 mod rfc3339_opt {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::Serializer;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
 
+    // `&Option<_>` is mandated by serde's `serialize_with` signature contract.
+    #[allow(clippy::ref_option)]
     pub fn serialize<S>(value: &Option<OffsetDateTime>, ser: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -543,19 +545,6 @@ mod rfc3339_opt {
                 ser.serialize_str(&s)
             }
             None => ser.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(de: D) -> Result<Option<OffsetDateTime>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = Option::<String>::deserialize(de)?;
-        match s {
-            None => Ok(None),
-            Some(s) => OffsetDateTime::parse(&s, &Rfc3339)
-                .map(Some)
-                .map_err(serde::de::Error::custom),
         }
     }
 }

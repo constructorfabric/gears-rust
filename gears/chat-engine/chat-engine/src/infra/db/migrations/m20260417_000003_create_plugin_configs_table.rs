@@ -76,7 +76,7 @@ impl MigrationTrait for Migration {
 }
 
 #[derive(DeriveIden)]
-pub(crate) enum PluginConfigs {
+pub enum PluginConfigs {
     Table,
     PluginInstanceId,
     SessionTypeId,

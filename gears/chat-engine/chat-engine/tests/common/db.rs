@@ -1,15 +1,15 @@
 //! Integration-test harness for chat-engine wired against the same
 //! `DBProvider` the production module uses.
 //!
-//! The harness opens a single in-memory SQLite database through
+//! The harness opens a single in-memory `SQLite` database through
 //! `toolkit_db::connect_db`, applies the production migration set via
 //! `run_migrations_for_testing`, and wraps the resulting `Db` in a
 //! `DBProvider<ChatEngineError>` keyed on `ChatEngineError`. Every repo
 //! and every test helper receives that same `Arc<ChatEngineDb>`, so
 //! migrations and queries always land on the same connection — no
-//! sibling SQLite pool, no silent fall-back to a private memory DB.
+//! sibling `SQLite` pool, no silent fall-back to a private memory DB.
 //!
-//! SQLite's `:memory:` mode keeps each pooled connection isolated, so
+//! `SQLite`'s `:memory:` mode keeps each pooled connection isolated, so
 //! the harness caps the pool at a single connection — without that the
 //! migration runner could land on one connection and the repos query
 //! another.
@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use chat_engine::domain::error::ChatEngineError;
 use chat_engine::infra::db::entity::{message, session, session_type};
 use chat_engine::infra::db::repo::ChatEngineDb;
 use chat_engine::infra::db::repo::message_repo::{MessageRepo, SeaMessageRepo};
@@ -46,7 +45,7 @@ pub struct DbHarness {
     pub plugin_configs: Arc<dyn PluginConfigRepo>,
 }
 
-/// Open a fresh in-memory SQLite database, apply every chat-engine
+/// Open a fresh in-memory `SQLite` database, apply every chat-engine
 /// migration through toolkit-db, and wire the production repo impls on
 /// top of the resulting `DBProvider`.
 ///
@@ -100,8 +99,8 @@ pub async fn seed_session_type(
     let now = OffsetDateTime::now_utc();
     let am = session_type::ActiveModel {
         session_type_id: Set(id),
-        name: Set("integration-test".to_string()),
-        plugin_instance_id: Set(Some(plugin_instance_id.to_string())),
+        name: Set("integration-test".to_owned()),
+        plugin_instance_id: Set(Some(plugin_instance_id.to_owned())),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -124,13 +123,13 @@ pub async fn seed_active_session(
     let now = OffsetDateTime::now_utc();
     let am = session::ActiveModel {
         session_id: Set(id),
-        tenant_id: Set(tenant_id.to_string()),
-        user_id: Set(user_id.to_string()),
+        tenant_id: Set(tenant_id.to_owned()),
+        user_id: Set(user_id.to_owned()),
         client_id: Set(None),
         session_type_id: Set(Some(session_type_id)),
         enabled_capabilities: Set(None),
         metadata: Set(None),
-        lifecycle_state: Set("active".to_string()),
+        lifecycle_state: Set("active".to_owned()),
         share_token: Set(None),
         deleted_at: Set(None),
         scheduled_hard_delete_at: Set(None),
@@ -181,7 +180,7 @@ pub async fn seed_message(
     id
 }
 
-/// Direct SeaORM lookup of a `messages` row by primary key — used by
+/// Direct `SeaORM` lookup of a `messages` row by primary key — used by
 /// persistence assertions that cannot rely on the repo's filtered reads
 /// (the assistant stub is `is_complete=false` so `fetch_active_history`
 /// hides it).
@@ -249,7 +248,7 @@ pub fn message_text(model: &message::Model) -> String {
 /// Poll until the assistant row for `session_id` reaches `is_complete =
 /// expected_complete`, or `deadline` elapses. Returns the latest snapshot
 /// either way. The driver task finalises the row in a detached
-/// `tokio::spawn`, so tests can't synchronise on a JoinHandle; this is
+/// `tokio::spawn`, so tests can't synchronise on a `JoinHandle`; this is
 /// the deterministic equivalent of awaiting one.
 pub async fn wait_for_finalize(
     db: &Arc<ChatEngineDb>,
@@ -265,12 +264,10 @@ pub async fn wait_for_finalize(
             if m.is_complete || m.metadata.is_some() {
                 return m;
             }
-            if started.elapsed() >= deadline {
-                panic!(
-                    "assistant row for session {session_id} not finalised within \
-                     {deadline:?}; last row = {m:?}",
-                );
-            }
+            assert!(started.elapsed() < deadline, 
+                "assistant row for session {session_id} not finalised within \
+                 {deadline:?}; last row = {m:?}",
+            );
         } else if started.elapsed() >= deadline {
             panic!(
                 "no assistant row appeared for session {session_id} within {deadline:?}",

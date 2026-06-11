@@ -652,8 +652,9 @@ async fn forward_to_gateway(
 
             match next {
                 None => {
-                    // End of upstream stream (clean close) or cancellation.
-                    state.finished = true;
+                    // End of upstream stream (clean close) or cancellation;
+                    // returning `None` terminates the unfold and drops `state`,
+                    // so there is no later read of `finished` to set here.
                     None
                 }
                 Some(Ok(UpstreamEvent::Chunk(chunk))) => {
@@ -802,6 +803,9 @@ mod tests {
             request: LlmGatewayRequest,
         ) -> Result<UpstreamStream, PluginError> {
             *self.last_request.lock().unwrap() = Some(request);
+            // Collect under the lock so the guard is released before the
+            // stream is built (the stream can't borrow the guard).
+            #[allow(clippy::needless_collect)]
             let events: Vec<UpstreamEvent> =
                 self.events.lock().unwrap().drain(..).collect();
             let s = stream::iter(events.into_iter().map(Ok));
@@ -1101,7 +1105,7 @@ mod tests {
         let mut call_ctx = make_call_ctx(valid_config());
         // Deadline already elapsed — Some(ZERO) by construction.
         call_ctx.deadline =
-            Some(Instant::now() - std::time::Duration::from_secs(1));
+            Some(Instant::now().checked_sub(std::time::Duration::from_secs(1)).unwrap());
         let msg_id = Uuid::new_v4();
         let ctx = MessagePluginCtx {
             session_id: Uuid::new_v4(),

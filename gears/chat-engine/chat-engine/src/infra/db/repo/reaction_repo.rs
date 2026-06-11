@@ -153,7 +153,7 @@ impl ReactionRepo for SeaReactionRepo {
     ) -> Result<ReactionUpsertOutcome, ChatEngineError> {
         debug_assert!(
             reaction_type.is_persisted(),
-            "upsert called with ReactionType::None — caller must route to delete"
+            "upsert called with ReactionType::None \u{2014} caller must route to delete"
         );
 
         let user_id_owned = user_id.to_owned();

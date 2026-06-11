@@ -79,7 +79,7 @@ pub fn stream_from_events(events: Vec<StreamingEvent>) -> PluginStream {
     stream::iter(events.into_iter().map(Ok)).boxed()
 }
 
-#[allow(clippy::gear_name_repetitions)]
+#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone)]
 pub struct SessionPluginCtx {
     pub session_type_id: Uuid,
@@ -97,7 +97,7 @@ pub struct SessionPluginCtx {
 /// The summary surfaces `len` and a per-role count so observability is
 /// preserved without leaking text. `call_ctx` keeps its own redaction (see
 /// `PluginCallContext::Debug`).
-#[allow(clippy::gear_name_repetitions)]
+#[allow(clippy::module_name_repetitions)]
 #[derive(Clone)]
 pub struct MessagePluginCtx {
     pub session_id: Uuid,
@@ -141,7 +141,7 @@ impl std::fmt::Debug for MessagePluginCtx {
 /// secrets (API keys, webhook auth, credentials) that must never hit logs.
 /// Wrappers `SessionPluginCtx` / `MessagePluginCtx` derive `Debug` and
 /// transitively inherit this redaction.
-#[allow(clippy::gear_name_repetitions)]
+#[allow(clippy::module_name_repetitions)]
 #[derive(Clone)]
 pub struct PluginCallContext {
     /// Correlation ID for this plugin invocation. Used for log correlation and
@@ -303,7 +303,11 @@ mod plugin_call_context_tests {
     #[test]
     fn remaining_is_zero_when_deadline_already_elapsed() {
         let mut ctx = make_ctx();
-        ctx.deadline = Some(Instant::now() - Duration::from_secs(1));
+        ctx.deadline = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("monotonic clock is at least 1s past its reference"),
+        );
         // Elapsed deadlines must be Some(ZERO), not None — the latter would
         // be indistinguishable from "no deadline set" and let plugins
         // silently extend their budget via `.unwrap_or(default)`.

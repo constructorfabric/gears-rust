@@ -158,6 +158,10 @@ impl ChatEngineConfig {
 }
 
 /// Typed configuration errors surfaced from [`ChatEngineConfig::validate`].
+//
+// The shared `Zero*` prefix is meaningful (each names a value that must be
+// non-zero); renaming to satisfy `enum_variant_names` would lose that intent.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// One of the bounded-channel sizes was configured to zero, which
@@ -227,8 +231,10 @@ mod tests {
 
     #[test]
     fn zero_buffer_rejected() {
-        let mut cfg = ChatEngineConfig::default();
-        cfg.ndjson_buffer_size = 0;
+        let cfg = ChatEngineConfig {
+            ndjson_buffer_size: 0,
+            ..Default::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(
             err,
@@ -240,8 +246,10 @@ mod tests {
 
     #[test]
     fn zero_summary_buffer_rejected() {
-        let mut cfg = ChatEngineConfig::default();
-        cfg.summary_buffer_size = 0;
+        let cfg = ChatEngineConfig {
+            summary_buffer_size: 0,
+            ..Default::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(
             err,
@@ -253,8 +261,10 @@ mod tests {
 
     #[test]
     fn zero_retention_interval_rejected() {
-        let mut cfg = ChatEngineConfig::default();
-        cfg.retention_cleanup_interval_hours = 0;
+        let cfg = ChatEngineConfig {
+            retention_cleanup_interval_hours: 0,
+            ..Default::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::ZeroRetentionInterval));
     }
