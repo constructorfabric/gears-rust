@@ -4,7 +4,9 @@ server:
 database:
   servers:
     sqlite_dev:
-      dsn: "sqlite:///Users/ritmix/.cyberfabric/chat_engine.db?mode=rwc"
+      # Relative filename → resolved under server.home_dir by the toolkit
+      # (same convention as config/server.yaml). No machine-specific path.
+      dsn: "sqlite://chat_engine.db?mode=rwc"
 
 modules:
   api-gateway:
