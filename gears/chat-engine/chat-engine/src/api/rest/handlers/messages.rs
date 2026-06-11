@@ -19,11 +19,11 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::Path;
 use axum::Extension;
 use axum::Json;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::body::Body;
+use axum::extract::Path;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -136,10 +136,7 @@ pub async fn send_message(
         )
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
         // Defeat nginx response buffering so chunks actually flush.
-        .header(
-            "x-accel-buffering",
-            HeaderValue::from_static("no"),
-        )
+        .header("x-accel-buffering", HeaderValue::from_static("no"))
         .body(body)
         .map_err(|err| {
             ChatEngineError::internal(format!("failed to build streaming response: {err}"))
@@ -164,7 +161,10 @@ pub async fn send_message(
 /// the service-side driver task observes it via `cancel.cancelled()`.
 #[derive(Clone)]
 struct DropGuard {
-    #[allow(dead_code, reason = "kept alive for Drop side-effect on response close")]
+    #[allow(
+        dead_code,
+        reason = "kept alive for Drop side-effect on response close"
+    )]
     inner: std::sync::Arc<DropGuardInner>,
 }
 
@@ -257,21 +257,23 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use chat_engine_sdk::error::PluginError;
+    use chat_engine_sdk::models::LifecycleState;
     use chat_engine_sdk::plugin::{
         ChatEngineBackendPlugin, MessagePluginCtx, PluginStream, stream_from_events,
     };
-    use chat_engine_sdk::models::LifecycleState;
-    use toolkit::ClientHub;
-    use toolkit::client_hub::ClientScope;
     use parking_lot::Mutex;
     use std::sync::atomic::AtomicUsize;
     use time::OffsetDateTime;
+    use toolkit::ClientHub;
+    use toolkit::client_hub::ClientScope;
 
     use crate::domain::message::{
         Message, StreamingChunkEvent, StreamingCompleteEvent, StreamingEvent, StreamingStartEvent,
     };
     use crate::domain::service::PluginService;
-    use crate::infra::db::entity::{session as session_entity, session_type as session_type_entity};
+    use crate::infra::db::entity::{
+        session as session_entity, session_type as session_type_entity,
+    };
     use crate::infra::db::repo::message_repo::{
         FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage,
     };
@@ -336,7 +338,8 @@ mod tests {
             _tenant_id: &str,
             _user_id: &str,
             _query: &toolkit_odata::ODataQuery,
-        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError>
+        {
             Ok(toolkit_odata::Page::empty(0))
         }
 
@@ -504,11 +507,7 @@ mod tests {
             Ok(())
         }
 
-        async fn delete(
-            &self,
-            _p: &str,
-            _s: Uuid,
-        ) -> std::result::Result<(), ChatEngineError> {
+        async fn delete(&self, _p: &str, _s: Uuid) -> std::result::Result<(), ChatEngineError> {
             Ok(())
         }
     }
@@ -611,5 +610,4 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&buf[..buf.len() - 1]).unwrap();
         assert_eq!(parsed["type"], "start");
     }
-
 }

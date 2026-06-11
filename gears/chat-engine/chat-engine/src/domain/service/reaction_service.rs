@@ -46,9 +46,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use toolkit_macros::domain_model;
 use serde_json::Value as JsonValue;
 use tokio::task::JoinHandle;
+use toolkit_macros::domain_model;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
@@ -425,10 +425,10 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use chat_engine_sdk::models::LifecycleState;
-    use toolkit::ClientHub;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use time::OffsetDateTime;
+    use toolkit::ClientHub;
 
     use crate::domain::message::{Message, MessageRole};
     use crate::infra::db::entity::{
@@ -486,7 +486,8 @@ mod tests {
             _tenant_id: &str,
             _user_id: &str,
             _query: &toolkit_odata::ODataQuery,
-        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError> {
+        ) -> std::result::Result<toolkit_odata::Page<session_entity::Model>, ChatEngineError>
+        {
             Ok(toolkit_odata::Page::empty(0))
         }
 
@@ -731,11 +732,7 @@ mod tests {
             Ok(())
         }
 
-        async fn delete(
-            &self,
-            _p: &str,
-            _s: Uuid,
-        ) -> std::result::Result<(), ChatEngineError> {
+        async fn delete(&self, _p: &str, _s: Uuid) -> std::result::Result<(), ChatEngineError> {
             Ok(())
         }
     }
@@ -868,10 +865,7 @@ mod tests {
         assert_eq!(resp.reaction_type, ReactionType::None);
         assert!(resp.applied);
         assert_eq!(reactions.delete_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            mutation.previous_reaction_type,
-            Some(ReactionType::Like)
-        );
+        assert_eq!(mutation.previous_reaction_type, Some(ReactionType::Like));
     }
 
     #[tokio::test]
@@ -897,7 +891,10 @@ mod tests {
             .expect_err("cross-tenant collapses to 404");
         assert!(matches!(
             err,
-            ChatEngineError::NotFound { resource: "session", .. }
+            ChatEngineError::NotFound {
+                resource: "session",
+                ..
+            }
         ));
     }
 
@@ -972,7 +969,10 @@ mod tests {
             .expect_err("unknown message must be 404");
         assert!(matches!(
             err,
-            ChatEngineError::NotFound { resource: "message", .. }
+            ChatEngineError::NotFound {
+                resource: "message",
+                ..
+            }
         ));
     }
 

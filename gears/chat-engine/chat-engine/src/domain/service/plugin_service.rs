@@ -33,10 +33,10 @@
 
 use std::sync::Arc;
 
+use serde_json::Value as JsonValue;
 use toolkit::ClientHub;
 use toolkit::client_hub::ClientScope;
 use toolkit_macros::domain_model;
-use serde_json::Value as JsonValue;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -101,9 +101,7 @@ impl PluginService {
         plugin_instance_id: &str,
         session_type_id: Uuid,
     ) -> Result<Option<JsonValue>, ChatEngineError> {
-        self.configs
-            .find(plugin_instance_id, session_type_id)
-            .await
+        self.configs.find(plugin_instance_id, session_type_id).await
     }
 
     /// Probe the plugin's `health_check()` and apply the routing matrix
@@ -258,7 +256,13 @@ mod tests {
             Ok(_) => panic!("expected Err, got Ok"),
             Err(e) => e,
         };
-        assert!(matches!(err, ChatEngineError::NotFound { resource: "plugin", .. }));
+        assert!(matches!(
+            err,
+            ChatEngineError::NotFound {
+                resource: "plugin",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -294,16 +298,16 @@ mod tests {
         let plugin = StubPlugin::new("e", Err(PluginError::transient("boom")));
         let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin.clone();
         let svc = make_service(vec![("e".into(), plugin_dyn)], StubRepo::new(None));
-        let status = svc.health_probe("e").await.expect("must return Ok despite plugin error");
+        let status = svc
+            .health_probe("e")
+            .await
+            .expect("must return Ok despite plugin error");
         assert_eq!(status, HealthStatus::Unhealthy);
     }
 
     #[tokio::test]
     async fn load_config_proxies_to_repo() {
-        let svc = make_service(
-            vec![],
-            StubRepo::new(Some(serde_json::json!({"k": "v"}))),
-        );
+        let svc = make_service(vec![], StubRepo::new(Some(serde_json::json!({"k": "v"}))));
         let cfg = svc
             .load_config("p", Uuid::nil())
             .await

@@ -42,9 +42,7 @@ use toolkit_security::SecurityContext;
 
 use crate::api::rest::handlers::sessions::{identity_from_ctx, reject_body_identity};
 use crate::domain::error::{ChatEngineError, Result};
-use crate::domain::service::variant_service::{
-    VariantEntry, VariantListing, VariantService,
-};
+use crate::domain::service::variant_service::{VariantEntry, VariantListing, VariantService};
 
 // ============================================================================
 //  Request / response DTOs
@@ -326,13 +324,7 @@ pub async fn switch_session_type_compat(
     Path(session_id): Path<Uuid>,
     Json(body): Json<SwitchSessionTypeBody>,
 ) -> Result<Json<chat_engine_sdk::models::Session>> {
-    switch_session_type(
-        Extension(ctx),
-        Extension(svc),
-        Path(session_id),
-        Json(body),
-    )
-    .await
+    switch_session_type(Extension(ctx), Extension(svc), Path(session_id), Json(body)).await
 }
 
 // ============================================================================
@@ -374,7 +366,10 @@ fn stream_to_ndjson_response(
 /// underlying token when the body is dropped (client disconnect).
 #[derive(Clone)]
 struct DropGuard {
-    #[allow(dead_code, reason = "kept alive for Drop side-effect on response close")]
+    #[allow(
+        dead_code,
+        reason = "kept alive for Drop side-effect on response close"
+    )]
     inner: std::sync::Arc<DropGuardInner>,
 }
 

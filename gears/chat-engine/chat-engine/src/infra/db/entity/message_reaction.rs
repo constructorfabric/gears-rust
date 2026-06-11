@@ -1,8 +1,8 @@
 // @cpt-cf-chat-engine-dbtable-reactions:p2
 
-use toolkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
+use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
 // Reactions inherit tenant scoping from their owning message + session,

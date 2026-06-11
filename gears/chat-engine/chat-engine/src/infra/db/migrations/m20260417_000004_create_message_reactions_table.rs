@@ -24,11 +24,7 @@ impl MigrationTrait for Migration {
                             .uuid()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(MessageReactions::UserId)
-                            .string()
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(MessageReactions::UserId).string().not_null())
                     .col(
                         ColumnDef::new(MessageReactions::ReactionType)
                             .string()

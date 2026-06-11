@@ -18,9 +18,9 @@
 // @cpt-cf-chat-engine-domain-reaction:p9
 // @cpt-cf-chat-engine-adr-message-reactions:p9
 
-use toolkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::infra::db::entity::message_reaction as reaction_entity;
@@ -156,7 +156,11 @@ mod tests {
 
     #[test]
     fn reaction_type_roundtrips_known_values() {
-        for v in [ReactionType::Like, ReactionType::Dislike, ReactionType::None] {
+        for v in [
+            ReactionType::Like,
+            ReactionType::Dislike,
+            ReactionType::None,
+        ] {
             let s = v.as_str();
             assert_eq!(ReactionType::from_str_value(s), Some(v));
         }

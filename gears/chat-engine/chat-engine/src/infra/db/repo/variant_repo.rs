@@ -11,13 +11,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use toolkit_db::secure::{
-    AccessScope, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig,
-};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::{Value as JsonValue, json};
 use time::OffsetDateTime;
+use toolkit_db::secure::{
+    AccessScope, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig,
+};
 use uuid::Uuid;
 
 use crate::domain::error::{ChatEngineError, Result};
@@ -184,11 +184,7 @@ impl VariantRepo for SeaVariantRepo {
         }))
     }
 
-    async fn ancestor_chain(
-        &self,
-        session_id: Uuid,
-        message_id: Uuid,
-    ) -> Result<Vec<Uuid>> {
+    async fn ancestor_chain(&self, session_id: Uuid, message_id: Uuid) -> Result<Vec<Uuid>> {
         use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
         let conn = self.db.conn()?;
@@ -207,9 +203,7 @@ impl VariantRepo for SeaVariantRepo {
             let row = MessageEntity::find_by_id(cur)
                 .secure()
                 .scope_with(&scope)
-                .filter(
-                    Condition::all().add(message_entity::Column::SessionId.eq(session_id)),
-                )
+                .filter(Condition::all().add(message_entity::Column::SessionId.eq(session_id)))
                 .one(&conn)
                 .await?;
             cursor = match row {
@@ -220,11 +214,7 @@ impl VariantRepo for SeaVariantRepo {
         Ok(chain)
     }
 
-    async fn collect_descendants(
-        &self,
-        session_id: Uuid,
-        message_id: Uuid,
-    ) -> Result<Vec<Uuid>> {
+    async fn collect_descendants(&self, session_id: Uuid, message_id: Uuid) -> Result<Vec<Uuid>> {
         use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
         let conn = self.db.conn()?;
@@ -266,8 +256,7 @@ impl VariantRepo for SeaVariantRepo {
         // the deactivate set. The SQL below applies activation first
         // and deactivation second, so an overlap would silently flip
         // is_active=false on a node the caller asked to activate.
-        let activate_set: std::collections::HashSet<Uuid> =
-            activate_ids.iter().copied().collect();
+        let activate_set: std::collections::HashSet<Uuid> = activate_ids.iter().copied().collect();
         let deactivate_ids: Vec<Uuid> = deactivate_ids
             .into_iter()
             .filter(|id| !activate_set.contains(id))
@@ -285,7 +274,8 @@ impl VariantRepo for SeaVariantRepo {
                                 Condition::all()
                                     .add(message_entity::Column::SessionId.eq(session_id))
                                     .add(
-                                        message_entity::Column::MessageId.is_in(activate_ids.clone()),
+                                        message_entity::Column::MessageId
+                                            .is_in(activate_ids.clone()),
                                     ),
                             )
                             .col_expr(message_entity::Column::IsActive, Expr::value(true))
@@ -382,20 +372,18 @@ fn chat_engine_db_err(err: &ChatEngineError) -> Option<&sea_orm::DbErr> {
         return None;
     };
     let source = source.as_ref()?;
-    source
-        .downcast_ref::<sea_orm::DbErr>()
-        .or_else(|| {
-            // The `From<DbError>` impl wraps `DbError::Sea(DbErr)` directly
-            // into `ChatEngineError::Internal`; the raw downcast above
-            // already covers that path. `DbError::Other(anyhow)` errors
-            // (used by the transaction helpers when a domain error
-            // bubbles through) appear as `toolkit_db::DbError`, not as a
-            // bare `DbErr` — so peek through that wrapper too.
-            source
-                .downcast_ref::<toolkit_db::DbError>()
-                .and_then(|dbe| match dbe {
-                    toolkit_db::DbError::Sea(inner) => Some(inner),
-                    _ => None,
-                })
-        })
+    source.downcast_ref::<sea_orm::DbErr>().or_else(|| {
+        // The `From<DbError>` impl wraps `DbError::Sea(DbErr)` directly
+        // into `ChatEngineError::Internal`; the raw downcast above
+        // already covers that path. `DbError::Other(anyhow)` errors
+        // (used by the transaction helpers when a domain error
+        // bubbles through) appear as `toolkit_db::DbError`, not as a
+        // bare `DbErr` — so peek through that wrapper too.
+        source
+            .downcast_ref::<toolkit_db::DbError>()
+            .and_then(|dbe| match dbe {
+                toolkit_db::DbError::Sea(inner) => Some(inner),
+                _ => None,
+            })
+    })
 }

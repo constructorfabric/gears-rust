@@ -25,13 +25,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use toolkit_macros::domain_model;
-use toolkit_odata::{ODataQuery, Page};
 use sea_orm::ActiveValue::{NotSet, Set};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use toolkit_macros::domain_model;
+use toolkit_odata::{ODataQuery, Page};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -80,7 +80,9 @@ impl Identity {
         let tenant_id = tenant_id.into();
         let user_id = user_id.into();
         if tenant_id.is_empty() {
-            return Err(ChatEngineError::bad_request("tenant_id missing in identity"));
+            return Err(ChatEngineError::bad_request(
+                "tenant_id missing in identity",
+            ));
         }
         if user_id.is_empty() {
             return Err(ChatEngineError::bad_request("user_id missing in identity"));
@@ -251,7 +253,10 @@ impl SessionService {
 
             // `on_session_type_configured` is best-effort: invalid input
             // is the only outcome that fails registration (per the spec).
-            match self.invoke_with_deadline(plugin.on_session_type_configured(session_ctx), &cancel).await {
+            match self
+                .invoke_with_deadline(plugin.on_session_type_configured(session_ctx), &cancel)
+                .await
+            {
                 Ok(_caps) => {
                     info!(
                         plugin_instance_id = %plugin_instance_id,
@@ -378,7 +383,10 @@ impl SessionService {
                 call_ctx,
             };
 
-            match self.invoke_with_deadline(plugin.on_session_created(session_ctx), &cancel).await {
+            match self
+                .invoke_with_deadline(plugin.on_session_created(session_ctx), &cancel)
+                .await
+            {
                 Ok(caps) => {
                     enabled_capabilities = Some(capabilities_to_json(caps));
                 }
@@ -550,11 +558,7 @@ impl SessionService {
         Ok(redact_session(updated.into()))
     }
 
-    pub async fn archive_session(
-        &self,
-        identity: &Identity,
-        session_id: Uuid,
-    ) -> Result<Session> {
+    pub async fn archive_session(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
         let row = self.load_modifiable(identity, session_id).await?;
         let from = parse_state(&row.lifecycle_state);
         ensure_can_transition(from, LifecycleState::Archived)?;
@@ -579,11 +583,7 @@ impl SessionService {
         Ok(redact_session(updated.into()))
     }
 
-    pub async fn restore_session(
-        &self,
-        identity: &Identity,
-        session_id: Uuid,
-    ) -> Result<Session> {
+    pub async fn restore_session(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
         let row = self.load_modifiable(identity, session_id).await?;
         let from = parse_state(&row.lifecycle_state);
         ensure_can_transition(from, LifecycleState::Active)?;
@@ -706,13 +706,11 @@ impl SessionService {
     /// token (so the plugin observes the signal) and return
     /// `BackendUnavailable` mapped via the standard `PluginError::timeout`
     /// path.
-    async fn invoke_with_deadline<F, T>(
-        &self,
-        fut: F,
-        cancel: &CancellationToken,
-    ) -> Result<T>
+    async fn invoke_with_deadline<F, T>(&self, fut: F, cancel: &CancellationToken) -> Result<T>
     where
-        F: std::future::Future<Output = std::result::Result<T, chat_engine_sdk::error::PluginError>>,
+        F: std::future::Future<
+                Output = std::result::Result<T, chat_engine_sdk::error::PluginError>,
+            >,
     {
         match timeout(self.plugin_timeout, fut).await {
             Ok(Ok(v)) => Ok(v),
@@ -863,5 +861,4 @@ mod tests {
         let to = LifecycleState::Archived;
         ensure_can_transition(from, to).expect("active->archived is valid");
     }
-
 }

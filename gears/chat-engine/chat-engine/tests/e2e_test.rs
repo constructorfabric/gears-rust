@@ -99,9 +99,7 @@ fn it_streaming_complete_event_includes_metadata_when_some() {
 #[test]
 fn it_streaming_start_event_carries_message_id() {
     let msg_id = Uuid::nil();
-    let evt = StreamingEvent::Start(StreamingStartEvent {
-        message_id: msg_id,
-    });
+    let evt = StreamingEvent::Start(StreamingStartEvent { message_id: msg_id });
     let v = serde_json::to_value(&evt).expect("serialize");
     assert_eq!(v["type"], "start");
     assert_eq!(v["message_id"], msg_id.to_string());
@@ -247,8 +245,7 @@ fn it_memory_strategy_rejects_externally_tagged_form() {
     // The legacy `{"SlidingWindow": {"window_size": 10}}` shape MUST fail
     // to deserialise: it would silently re-introduce an old, ambiguous
     // wire format.
-    let bad =
-        serde_json::json!({"SlidingWindow": {"window_size": 10}});
+    let bad = serde_json::json!({"SlidingWindow": {"window_size": 10}});
     let result: Result<MemoryStrategy, _> = serde_json::from_value(bad);
     assert!(
         result.is_err(),
@@ -355,10 +352,7 @@ fn it_plugin_error_user_facing_excludes_internal_and_timeout() {
 //             PluginCallContext deadline + cancellation contract
 // =============================================================================
 
-fn make_call_ctx(
-    deadline: Option<Instant>,
-    cancel: CancellationToken,
-) -> PluginCallContext {
+fn make_call_ctx(deadline: Option<Instant>, cancel: CancellationToken) -> PluginCallContext {
     PluginCallContext {
         request_id: Uuid::nil(),
         tenant_id: TenantId::new("e2e-tenant"),
@@ -662,4 +656,3 @@ async fn it_fake_plugin_on_session_created_returns_no_capabilities() {
         .expect("session created");
     assert!(caps.is_empty());
 }
-

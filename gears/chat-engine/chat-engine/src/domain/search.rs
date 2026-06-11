@@ -23,8 +23,8 @@
 // @cpt-cf-chat-engine-domain-search:p11
 // @cpt-cf-chat-engine-adr-search-strategy:p11
 
-use toolkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
@@ -196,9 +196,9 @@ impl From<SearchError> for ChatEngineError {
             SearchError::QueryRequired => ChatEngineError::bad_request("query required"),
             SearchError::QueryTooLong => ChatEngineError::bad_request("query too long"),
             SearchError::SessionNotFound => ChatEngineError::not_found("session", "<scoped>"),
-            SearchError::Forbidden => ChatEngineError::forbidden(
-                "authenticated identity required to perform search",
-            ),
+            SearchError::Forbidden => {
+                ChatEngineError::forbidden("authenticated identity required to perform search")
+            }
             SearchError::Backend(reason) => ChatEngineError::Internal {
                 reason,
                 source: None,
@@ -301,16 +301,14 @@ impl Cursor {
             return Err(SearchError::QueryRequired);
         }
         let rank: f32 = rank_str.parse().map_err(|_| SearchError::QueryRequired)?;
-        let message_id =
-            Uuid::parse_str(id_str).map_err(|_| SearchError::QueryRequired)?;
+        let message_id = Uuid::parse_str(id_str).map_err(|_| SearchError::QueryRequired)?;
 
         // Optional `:t:<unix_ns>` tail. Present on cursors minted by
         // the current encoder; absent on legacy cursors round-tripped
         // by a pre-fix client.
         let created_at = match (parts.next(), parts.next()) {
             (Some("t"), Some(ts_str)) => {
-                let nanos: i128 =
-                    ts_str.parse().map_err(|_| SearchError::QueryRequired)?;
+                let nanos: i128 = ts_str.parse().map_err(|_| SearchError::QueryRequired)?;
                 Some(
                     time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
                         .map_err(|_| SearchError::QueryRequired)?,
@@ -616,7 +614,8 @@ mod tests {
         assert_eq!(decoded.message_id, Uuid::nil());
         assert!((decoded.rank - 0.42).abs() < 1e-5);
         assert_eq!(
-            decoded.created_at, Some(ts),
+            decoded.created_at,
+            Some(ts),
             "round-tripped cursor must preserve the created_at sort key",
         );
     }
@@ -625,8 +624,7 @@ mod tests {
     fn cursor_decodes_legacy_format_without_created_at() {
         // Cursors minted before the `:t:<unix_ns>` tail was added MUST
         // still decode — clients in flight at the cutover hold them.
-        let decoded =
-            Cursor::decode("r:0.42:m:00000000-0000-0000-0000-000000000000").unwrap();
+        let decoded = Cursor::decode("r:0.42:m:00000000-0000-0000-0000-000000000000").unwrap();
         assert_eq!(decoded.message_id, Uuid::nil());
         assert!(
             decoded.created_at.is_none(),
@@ -641,18 +639,11 @@ mod tests {
         assert!(Cursor::decode("r:notafloat:m:nil").is_err());
         assert!(Cursor::decode("x:1.0:m:00000000-0000-0000-0000-000000000000").is_err());
         // Trailing junk past the optional `:t:<unix_ns>` tail.
-        assert!(
-            Cursor::decode("r:0:m:00000000-0000-0000-0000-000000000000:t:0:bogus").is_err()
-        );
+        assert!(Cursor::decode("r:0:m:00000000-0000-0000-0000-000000000000:t:0:bogus").is_err());
         // `t` segment without a value.
-        assert!(
-            Cursor::decode("r:0:m:00000000-0000-0000-0000-000000000000:t:").is_err()
-        );
+        assert!(Cursor::decode("r:0:m:00000000-0000-0000-0000-000000000000:t:").is_err());
         // `t` segment with a non-numeric value.
-        assert!(
-            Cursor::decode("r:0:m:00000000-0000-0000-0000-000000000000:t:notanint")
-                .is_err()
-        );
+        assert!(Cursor::decode("r:0:m:00000000-0000-0000-0000-000000000000:t:notanint").is_err());
     }
 
     #[test]

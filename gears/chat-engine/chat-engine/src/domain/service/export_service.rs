@@ -36,10 +36,10 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
-use toolkit_macros::domain_model;
 use serde_json::{Map, Value as JsonValue};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use toolkit_macros::domain_model;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
@@ -377,7 +377,8 @@ pub fn is_share_token_expired(err: &ChatEngineError) -> bool {
 }
 
 fn ensure_shareable(model: &session_entity::Model) -> Result<()> {
-    let state = LifecycleState::from_str_value(&model.lifecycle_state).unwrap_or(LifecycleState::Active);
+    let state =
+        LifecycleState::from_str_value(&model.lifecycle_state).unwrap_or(LifecycleState::Active);
     if matches!(state, LifecycleState::Active | LifecycleState::Archived) {
         Ok(())
     } else {
@@ -478,7 +479,12 @@ fn render_markdown(meta: &ExportSessionMeta, messages: &[MessageView]) -> Vec<u8
     writeln!(out, "# {title}").ok();
     writeln!(out).ok();
     if let Ok(ts) = meta.created_at.format(&Rfc3339) {
-        writeln!(out, "_Exported from session {} (created {})._", meta.session_id, ts).ok();
+        writeln!(
+            out,
+            "_Exported from session {} (created {})._",
+            meta.session_id, ts
+        )
+        .ok();
         writeln!(out).ok();
     }
 
@@ -522,9 +528,7 @@ fn build_storage_key(
     now: &OffsetDateTime,
     format: ExportFormat,
 ) -> String {
-    let ts = now
-        .unix_timestamp_nanos()
-        .to_string();
+    let ts = now.unix_timestamp_nanos().to_string();
     format!(
         "exports/{tenant_id}/{session_id}/{ts}.{ext}",
         ext = format.extension()
@@ -582,9 +586,7 @@ mod tests {
                 .lock()
                 .iter()
                 .find(|m| {
-                    m.session_id == session_id
-                        && m.tenant_id == tenant_id
-                        && m.user_id == user_id
+                    m.session_id == session_id && m.tenant_id == tenant_id && m.user_id == user_id
                 })
                 .cloned())
         }
@@ -671,9 +673,7 @@ mod tests {
             let row = rows
                 .iter_mut()
                 .find(|m| {
-                    m.session_id == session_id
-                        && m.tenant_id == tenant_id
-                        && m.user_id == user_id
+                    m.session_id == session_id && m.tenant_id == tenant_id && m.user_id == user_id
                 })
                 .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
             row.share_token = share_token;
@@ -764,11 +764,7 @@ mod tests {
         }
     }
 
-    fn build_service() -> (
-        ExportService,
-        Arc<MockSessionRepo>,
-        Arc<MockMessageRepo>,
-    ) {
+    fn build_service() -> (ExportService, Arc<MockSessionRepo>, Arc<MockMessageRepo>) {
         let sessions = Arc::new(MockSessionRepo::default());
         let messages = Arc::new(MockMessageRepo::default());
         let storage = Arc::new(crate::domain::export::StubExportStorage);
@@ -792,13 +788,10 @@ mod tests {
         let (svc, sessions, messages) = build_service();
         let session_id = Uuid::new_v4();
         sessions.seed(sample_session("tenant-a", "user-a", session_id));
-        messages
-            .messages
-            .lock()
-            .extend(vec![
-                sample_message(MessageRole::User, "hi"),
-                sample_message(MessageRole::Assistant, "hello"),
-            ]);
+        messages.messages.lock().extend(vec![
+            sample_message(MessageRole::User, "hi"),
+            sample_message(MessageRole::Assistant, "hello"),
+        ]);
 
         let exported = svc
             .export(&identity(), session_id, ExportFormat::Json, false)
@@ -822,13 +815,10 @@ mod tests {
         let (svc, sessions, messages) = build_service();
         let session_id = Uuid::new_v4();
         sessions.seed(sample_session("tenant-a", "user-a", session_id));
-        messages
-            .messages
-            .lock()
-            .extend(vec![
-                sample_message(MessageRole::User, "hi"),
-                sample_message(MessageRole::Assistant, "hello"),
-            ]);
+        messages.messages.lock().extend(vec![
+            sample_message(MessageRole::User, "hi"),
+            sample_message(MessageRole::Assistant, "hello"),
+        ]);
 
         let exported = svc
             .export(&identity(), session_id, ExportFormat::Markdown, false)
@@ -897,7 +887,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.share_token.as_deref(), Some(issue.share_token.as_str()));
+        assert_eq!(
+            stored.share_token.as_deref(),
+            Some(issue.share_token.as_str())
+        );
         let metadata_expires = stored
             .metadata
             .as_ref()

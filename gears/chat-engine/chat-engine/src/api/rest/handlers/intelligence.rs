@@ -20,11 +20,11 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
-use axum::Json;
 use futures::stream::StreamExt;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
@@ -166,7 +166,10 @@ pub async fn patch_retention_policy(
 /// service-side driver task observes it via `cancel.cancelled()`.
 #[derive(Clone)]
 struct SummaryDropGuard {
-    #[allow(dead_code, reason = "kept alive for Drop side-effect on response close")]
+    #[allow(
+        dead_code,
+        reason = "kept alive for Drop side-effect on response close"
+    )]
     inner: std::sync::Arc<SummaryDropGuardInner>,
 }
 
@@ -203,8 +206,7 @@ mod tests {
     #[test]
     fn patch_body_deserializes_age_based() {
         let body: PatchRetentionPolicyBody =
-            serde_json::from_value(json!({"type": "age_based", "max_age_days": 7}))
-                .unwrap();
+            serde_json::from_value(json!({"type": "age_based", "max_age_days": 7})).unwrap();
         assert!(matches!(
             body.policy,
             RetentionPolicy::AgeBased { max_age_days: 7 }
@@ -213,10 +215,9 @@ mod tests {
 
     #[test]
     fn patch_body_deserializes_count_based() {
-        let body: PatchRetentionPolicyBody = serde_json::from_value(
-            json!({"type": "count_based", "max_message_count": 100}),
-        )
-        .unwrap();
+        let body: PatchRetentionPolicyBody =
+            serde_json::from_value(json!({"type": "count_based", "max_message_count": 100}))
+                .unwrap();
         assert!(matches!(
             body.policy,
             RetentionPolicy::CountBased {

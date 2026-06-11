@@ -199,17 +199,15 @@ mod tests {
         assert!(matches!(full, MemoryStrategy::Full));
 
         let sliding: MemoryStrategy =
-            serde_json::from_value(json!({"type": "sliding_window", "window_size": 3}))
-                .unwrap();
+            serde_json::from_value(json!({"type": "sliding_window", "window_size": 3})).unwrap();
         assert!(matches!(
             sliding,
             MemoryStrategy::SlidingWindow { window_size: 3 }
         ));
 
-        let summarized: MemoryStrategy = serde_json::from_value(
-            json!({"type": "summarized", "recent_messages_to_keep": 4}),
-        )
-        .unwrap();
+        let summarized: MemoryStrategy =
+            serde_json::from_value(json!({"type": "summarized", "recent_messages_to_keep": 4}))
+                .unwrap();
         assert!(matches!(
             summarized,
             MemoryStrategy::Summarized {
@@ -303,10 +301,7 @@ mod tests {
             "tags": ["alpha", "beta"],
             "retention_policy": {"type": "none"},
         });
-        write_memory_strategy(
-            &mut meta,
-            &MemoryStrategy::SlidingWindow { window_size: 2 },
-        );
+        write_memory_strategy(&mut meta, &MemoryStrategy::SlidingWindow { window_size: 2 });
         let obj = meta.as_object().unwrap();
         assert_eq!(obj.get("title"), Some(&Value::String("session-1".into())));
         assert!(obj.contains_key("tags"));
@@ -411,7 +406,9 @@ mod tests {
     fn is_context_overflow_ignores_non_overflow_errors() {
         assert!(!is_context_overflow_error("timeout: 30s elapsed"));
         assert!(!is_context_overflow_error(""));
-        assert!(!is_context_overflow_error("Context_overflow: case-sensitive"));
+        assert!(!is_context_overflow_error(
+            "Context_overflow: case-sensitive"
+        ));
     }
 
     // ---- Reserved-key constant consistency ---------------------------

@@ -16,9 +16,9 @@
 // @cpt-cf-chat-engine-api-dto:p14
 // @cpt-cf-chat-engine-adr-http-client-protocol:p14
 
-use toolkit_macros::api_dto;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use toolkit_macros::api_dto;
 use utoipa::ToSchema;
 use uuid::Uuid;
 

@@ -240,8 +240,8 @@ fn classify_backend(reason: &str, retry_after: Option<std::time::Duration>) -> B
 mod tests {
     use super::*;
     use chat_engine_sdk::error::PluginError;
-    use toolkit_canonical_errors::Problem;
     use std::time::Duration;
+    use toolkit_canonical_errors::Problem;
 
     const NOT_FOUND_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~";
     const INVALID_ARGUMENT_TYPE: &str =
@@ -302,8 +302,7 @@ mod tests {
 
     #[test]
     fn backend_unavailable_rate_limited_with_retry_after_emits_503_with_hint() {
-        let err: ChatEngineError =
-            PluginError::rate_limited(Some(Duration::from_secs(7))).into();
+        let err: ChatEngineError = PluginError::rate_limited(Some(Duration::from_secs(7))).into();
         let p = problem_from(err);
         assert_eq!(p.status, 503);
         assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);

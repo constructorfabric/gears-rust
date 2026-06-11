@@ -15,11 +15,11 @@
 // @cpt-cf-chat-engine-domain-error:p2
 
 use chat_engine_sdk::error::{BoxError, PluginError};
+use sea_orm::DbErr;
+use thiserror::Error;
 use toolkit_db::DbError;
 use toolkit_db::secure::ScopeError;
 use toolkit_macros::domain_model;
-use sea_orm::DbErr;
-use thiserror::Error;
 
 /// Service-layer error. Each variant carries enough context to be projected
 /// into an RFC-9457 `Problem` document by the API layer.
@@ -274,8 +274,10 @@ mod tests {
 
     #[test]
     fn invalid_transition_yields_conflict() {
-        let err =
-            ChatEngineError::invalid_transition(LifecycleState::HardDeleted, LifecycleState::Active);
+        let err = ChatEngineError::invalid_transition(
+            LifecycleState::HardDeleted,
+            LifecycleState::Active,
+        );
         assert!(matches!(err, ChatEngineError::Conflict { .. }));
         assert!(err.to_string().contains("hard_deleted -> active"));
     }
@@ -283,7 +285,13 @@ mod tests {
     #[test]
     fn db_err_record_not_found_maps_to_not_found() {
         let err: ChatEngineError = DbErr::RecordNotFound("missing".into()).into();
-        assert!(matches!(err, ChatEngineError::NotFound { resource: "record", .. }));
+        assert!(matches!(
+            err,
+            ChatEngineError::NotFound {
+                resource: "record",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -307,13 +315,18 @@ mod tests {
     #[test]
     fn plugin_error_not_found_maps_to_not_found() {
         let err: ChatEngineError = PluginError::not_found("model gpt-99").into();
-        assert!(matches!(err, ChatEngineError::NotFound { resource: "plugin_resource", .. }));
+        assert!(matches!(
+            err,
+            ChatEngineError::NotFound {
+                resource: "plugin_resource",
+                ..
+            }
+        ));
     }
 
     #[test]
     fn plugin_error_rate_limited_preserves_retry_after() {
-        let err: ChatEngineError =
-            PluginError::rate_limited(Some(Duration::from_secs(5))).into();
+        let err: ChatEngineError = PluginError::rate_limited(Some(Duration::from_secs(5))).into();
         match err {
             ChatEngineError::BackendUnavailable { retry_after, .. } => {
                 assert_eq!(retry_after, Some(Duration::from_secs(5)));

@@ -116,10 +116,7 @@ pub async fn search_in_session(
 
 /// `POST /chat-engine/v1/sessions/search` — cross-session JSON-body
 /// variant of the search endpoint.
-#[tracing::instrument(
-    skip(svc, ctx, body),
-    fields(query_length),
-)]
+#[tracing::instrument(skip(svc, ctx, body), fields(query_length))]
 pub async fn search_across_sessions(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<SearchService>>,

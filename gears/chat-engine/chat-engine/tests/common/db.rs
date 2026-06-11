@@ -20,18 +20,18 @@
 
 use std::sync::Arc;
 
+use chat_engine::infra::db::Migrator;
 use chat_engine::infra::db::entity::{message, session, session_type};
 use chat_engine::infra::db::repo::ChatEngineDb;
 use chat_engine::infra::db::repo::message_repo::{MessageRepo, SeaMessageRepo};
 use chat_engine::infra::db::repo::plugin_config_repo::{PluginConfigRepo, SeaPluginConfigRepo};
 use chat_engine::infra::db::repo::session_repo::{SeaSessionRepo, SessionRepo};
 use chat_engine::infra::db::repo::session_type_repo::{SeaSessionTypeRepo, SessionTypeRepo};
-use chat_engine::infra::db::Migrator;
-use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
-use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
+use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
+use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use uuid::Uuid;
 
 /// Production-shaped DB harness wrapping the live repos. Tests drive the
@@ -91,10 +91,7 @@ pub async fn setup_sqlite() -> DbHarness {
 
 /// Insert a `session_types` row bound to `plugin_instance_id`. Returns the
 /// generated session-type id.
-pub async fn seed_session_type(
-    h: &DbHarness,
-    plugin_instance_id: &str,
-) -> Uuid {
+pub async fn seed_session_type(h: &DbHarness, plugin_instance_id: &str) -> Uuid {
     let id = Uuid::new_v4();
     let now = OffsetDateTime::now_utc();
     let am = session_type::ActiveModel {
@@ -264,14 +261,13 @@ pub async fn wait_for_finalize(
             if m.is_complete || m.metadata.is_some() {
                 return m;
             }
-            assert!(started.elapsed() < deadline, 
+            assert!(
+                started.elapsed() < deadline,
                 "assistant row for session {session_id} not finalised within \
                  {deadline:?}; last row = {m:?}",
             );
         } else if started.elapsed() >= deadline {
-            panic!(
-                "no assistant row appeared for session {session_id} within {deadline:?}",
-            );
+            panic!("no assistant row appeared for session {session_id} within {deadline:?}",);
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -291,13 +287,9 @@ pub fn db_provider(h: &DbHarness) -> &Arc<ChatEngineDb> {
 /// to put a fixture row into any state the surrounding test wants
 /// to assert against (e.g. seeding a `soft_deleted` session and then
 /// verifying that `send_message` refuses to write).
-pub async fn force_lifecycle_state(
-    db: &Arc<ChatEngineDb>,
-    session_id: Uuid,
-    new_state: &str,
-) {
-    use toolkit_db::secure::SecureUpdateExt;
+pub async fn force_lifecycle_state(db: &Arc<ChatEngineDb>, session_id: Uuid, new_state: &str) {
     use sea_orm::sea_query::Expr;
+    use toolkit_db::secure::SecureUpdateExt;
 
     let conn = db.conn().expect("conn for force_lifecycle_state");
     let scope = AccessScope::allow_all();

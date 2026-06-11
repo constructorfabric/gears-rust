@@ -52,10 +52,10 @@ pub use message::{
 pub use reaction::{MessageReaction, MessageReactionEvent, ReactionType};
 pub use retention::RetentionPolicy;
 pub use search::{
-    Cursor, MessageRef, SearchError, SearchPage, SearchQuery, SearchResult, SessionMeta,
-    escape_like_pattern, extract_searchable_text, make_snippet, sanitize_for_tsquery,
-    DEFAULT_CONTEXT_RADIUS, DEFAULT_PAGE_SIZE as SEARCH_DEFAULT_PAGE_SIZE,
-    MAX_PAGE_SIZE as SEARCH_MAX_PAGE_SIZE, MAX_QUERY_LENGTH,
+    Cursor, DEFAULT_CONTEXT_RADIUS, DEFAULT_PAGE_SIZE as SEARCH_DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE as SEARCH_MAX_PAGE_SIZE, MAX_QUERY_LENGTH, MessageRef, SearchError, SearchPage,
+    SearchQuery, SearchResult, SessionMeta, escape_like_pattern, extract_searchable_text,
+    make_snippet, sanitize_for_tsquery,
 };
 pub use session::{
     LifecycleState, METADATA_KEY_MEMORY_STRATEGY, METADATA_KEY_RETENTION_POLICY,

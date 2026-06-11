@@ -35,8 +35,8 @@
 use std::time::Duration;
 
 use chat_engine_sdk::error::PluginError;
-use toolkit_macros::domain_model;
 use serde::{Deserialize, Serialize};
+use toolkit_macros::domain_model;
 
 /// GTS schema IDs for every type registered by the LLM Gateway plugin.
 ///
@@ -277,11 +277,12 @@ pub fn validate_plugin_config(json: &serde_json::Value) -> Result<LlmPluginConfi
     crate::infra::url_guard::validate_outbound_url(&parsed.gateway_url, "gateway_url")?;
 
     if let Some(s) = parsed.summarization_settings
-        && s.recent_messages_to_keep < RECENT_MESSAGES_TO_KEEP_MIN {
-            return Err(PluginError::invalid_input(format!(
-                "LlmPluginConfig.summarization_settings.recent_messages_to_keep must be >= {RECENT_MESSAGES_TO_KEEP_MIN}",
-            )));
-        }
+        && s.recent_messages_to_keep < RECENT_MESSAGES_TO_KEEP_MIN
+    {
+        return Err(PluginError::invalid_input(format!(
+            "LlmPluginConfig.summarization_settings.recent_messages_to_keep must be >= {RECENT_MESSAGES_TO_KEEP_MIN}",
+        )));
+    }
 
     Ok(parsed)
 }

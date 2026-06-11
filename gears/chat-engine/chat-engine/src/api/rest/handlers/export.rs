@@ -158,10 +158,7 @@ pub async fn revoke_share(
 /// The token path parameter MUST NOT be logged or surfaced in error
 /// responses (per Phase 10 Rules §Share Token Security). The instrument
 /// macro intentionally redacts the token field.
-#[tracing::instrument(
-    skip(svc, token),
-    fields(token = "***redacted***"),
-)]
+#[tracing::instrument(skip(svc, token), fields(token = "***redacted***"))]
 pub async fn access_shared(
     Extension(svc): Extension<Arc<ExportService>>,
     Path(token): Path<String>,

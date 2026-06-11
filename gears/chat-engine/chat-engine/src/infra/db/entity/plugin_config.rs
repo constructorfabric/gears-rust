@@ -1,8 +1,8 @@
 // @cpt-cf-chat-engine-dbtable-plugin-configs:p1
 
-use toolkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
+use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
 // Plugin configs are global lookup rows keyed by `(plugin_instance_id,
