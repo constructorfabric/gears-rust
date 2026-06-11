@@ -267,7 +267,7 @@ pub async fn wait_for_finalize(
                  {deadline:?}; last row = {m:?}",
             );
         } else if started.elapsed() >= deadline {
-            panic!("no assistant row appeared for session {session_id} within {deadline:?}",);
+            panic!("no assistant row appeared for session {session_id} within {deadline:?}");
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }

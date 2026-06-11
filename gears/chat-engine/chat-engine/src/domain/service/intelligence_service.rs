@@ -823,19 +823,17 @@ impl IntelligenceService {
                             }
                             Ok(StreamingEvent::Complete(c)) => {
                                 // Inspect metadata for an optional list of
-                                // summarized message ids; record it so we
-                                // can flip `is_hidden_from_backend` on the
-                                // matching rows in the persist step.
+                                // summarized message ids; record it so we can
+                                // flip `is_hidden_from_backend` on the matching
+                                // rows in the persist step. The client-facing
+                                // `Complete` is deferred until after the summary
+                                // is persisted (below), so a failed write never
+                                // reports success to the caller.
                                 if let Some(ref meta) = c.metadata {
                                     summarized_ids = extract_summarized_ids(meta);
                                 }
-                                last_metadata = c.metadata.clone();
+                                last_metadata = c.metadata;
                                 completed = true;
-                                let evt = StreamingEvent::Complete(StreamingCompleteEvent {
-                                    message_id: summary_message_id,
-                                    metadata: c.metadata,
-                                });
-                                tx_for_driver.send(evt).await.ok();
                                 break;
                             }
                             Ok(StreamingEvent::Error(e)) => {
@@ -863,18 +861,39 @@ impl IntelligenceService {
             }
 
             if completed {
-                // Persist the summary message + flip
-                // `is_hidden_from_backend` on the reported ids.
-                if let Err(err) = messages
-                    .insert_summary_message(session_id, accumulator, last_metadata, summarized_ids)
+                // Persist the summary message + flip `is_hidden_from_backend`
+                // on the reported ids, THEN emit the client-facing `Complete`
+                // — and only on a successful write. A persistence failure
+                // surfaces as a streaming error rather than a fake success.
+                match messages
+                    .insert_summary_message(
+                        session_id,
+                        accumulator,
+                        last_metadata.clone(),
+                        summarized_ids,
+                    )
                     .await
                 {
-                    warn!(
-                        session_id = %session_id,
-                        summary_message_id = %summary_message_id,
-                        error = %err,
-                        "failed to persist session summary after stream complete",
-                    );
+                    Ok(_) => {
+                        let evt = StreamingEvent::Complete(StreamingCompleteEvent {
+                            message_id: summary_message_id,
+                            metadata: last_metadata,
+                        });
+                        tx_for_driver.send(evt).await.ok();
+                    }
+                    Err(err) => {
+                        warn!(
+                            session_id = %session_id,
+                            summary_message_id = %summary_message_id,
+                            error = %err,
+                            "failed to persist session summary after stream complete",
+                        );
+                        let evt = StreamingEvent::Error(StreamingErrorEvent {
+                            message_id: summary_message_id,
+                            error: format!("failed to persist session summary: {err}"),
+                        });
+                        tx_for_driver.send(evt).await.ok();
+                    }
                 }
             } else if let Some(err) = errored {
                 // Mid-stream error: per the spec the service does NOT
@@ -976,7 +995,6 @@ mod tests {
     use chat_engine_sdk::models::{LifecycleState, MessageRole};
     use chat_engine_sdk::plugin::ChatEngineBackendPlugin;
     use parking_lot::Mutex;
-    use std::time::Duration;
     use time::OffsetDateTime;
     use toolkit::ClientHub;
 
@@ -1162,6 +1180,11 @@ mod tests {
     struct MockMessageRepo {
         all: Mutex<Vec<Message>>,
         deletes: Mutex<Vec<Uuid>>,
+        /// `(session_id, summary_text)` recorded by `insert_summary_message`.
+        summaries: Mutex<Vec<(Uuid, String)>>,
+        /// When set, `insert_summary_message` returns an error so tests can
+        /// exercise the persist-failure path of the summarize driver.
+        fail_summary: Mutex<bool>,
     }
 
     impl MockMessageRepo {
@@ -1169,7 +1192,14 @@ mod tests {
             Arc::new(Self {
                 all: Mutex::new(messages),
                 deletes: Mutex::new(Vec::new()),
+                summaries: Mutex::new(Vec::new()),
+                fail_summary: Mutex::new(false),
             })
+        }
+
+        /// Make `insert_summary_message` fail on subsequent calls.
+        fn fail_summaries(&self) {
+            *self.fail_summary.lock() = true;
         }
     }
 
@@ -1188,6 +1218,19 @@ mod tests {
             _o: FinalizeOutcome,
         ) -> std::result::Result<(), ChatEngineError> {
             Ok(())
+        }
+        async fn insert_summary_message(
+            &self,
+            session_id: Uuid,
+            text: String,
+            _metadata: Option<serde_json::Value>,
+            _summarized_ids: Vec<Uuid>,
+        ) -> std::result::Result<Uuid, ChatEngineError> {
+            if *self.fail_summary.lock() {
+                return Err(ChatEngineError::internal("mock summary persist failure"));
+            }
+            self.summaries.lock().push((session_id, text));
+            Ok(Uuid::new_v4())
         }
         async fn fetch_active_history(
             &self,
@@ -1931,7 +1974,7 @@ mod tests {
             ],
         );
         let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-        let (svc, _sessions, _msgs) =
+        let (svc, _sessions, msgs) =
             make_service_with_plugin(plugin_id, plugin_dyn, session_type_id, row);
 
         let cancel = CancellationToken::new();
@@ -1949,7 +1992,61 @@ mod tests {
             }
         }
         assert_eq!(kinds, vec!["start", "chunk", "chunk", "complete"]);
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // `Complete` is emitted only after a successful persist, so by the
+        // time the stream closes the summary row must have been recorded.
+        assert_eq!(
+            msgs.summaries.lock().len(),
+            1,
+            "happy path must persist the summary before emitting Complete",
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_persist_failure_emits_error_not_complete() {
+        // When persistence fails, the driver must surface a streaming Error
+        // and never emit Complete (which would falsely report success).
+        let plugin_id = "summary-persist-fail";
+        let session_type_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let mut row = make_session(session_id, None);
+        row.session_type_id = Some(session_type_id);
+        let plugin = ScriptedSummaryPlugin::ok(
+            plugin_id,
+            vec![
+                StreamingEvent::Chunk(StreamingChunkEvent {
+                    message_id: Uuid::nil(),
+                    chunk: "summary".into(),
+                }),
+                StreamingEvent::Complete(StreamingCompleteEvent {
+                    message_id: Uuid::nil(),
+                    metadata: Some(serde_json::json!({"summarized_message_ids": []})),
+                }),
+            ],
+        );
+        let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+        let (svc, _sessions, msgs) =
+            make_service_with_plugin(plugin_id, plugin_dyn, session_type_id, row);
+        msgs.fail_summaries();
+
+        let cancel = CancellationToken::new();
+        let mut stream = svc
+            .summarize_session(&identity(), session_id, cancel)
+            .await
+            .expect("summary dispatch");
+        let mut kinds = Vec::new();
+        while let Some(evt) = stream.next().await {
+            match evt {
+                StreamingEvent::Start(_) => kinds.push("start"),
+                StreamingEvent::Chunk(_) => kinds.push("chunk"),
+                StreamingEvent::Complete(_) => kinds.push("complete"),
+                StreamingEvent::Error(_) => kinds.push("error"),
+            }
+        }
+        assert_eq!(kinds, vec!["start", "chunk", "error"]);
+        assert!(
+            msgs.summaries.lock().is_empty(),
+            "no summary should be recorded when persistence fails",
+        );
     }
 
     // ----- summary-related helpers ------------------------------------
