@@ -1,0 +1,146 @@
+# design_publishes_gears_design (gears-rust) — the DESIGN half of the POC.
+#
+# Picks up where prd_to_design.yaml hands off: the design intake, seeded with
+# a pointer to the PRD that prd published into the gears tree. Walks the
+# design pipeline to publish — and proves the design lands in the gears-rust
+# checkout under the FIXED gears-sdlc name, gears/notes-service/docs/DESIGN.md,
+# with NO kitsoki feature ticket (design_ticket_dir="" ⇒ the external target
+# tracks work in its own issues, ticket_id/ticket_path empty).
+#
+# Mirror of stories/dev-story/flows/design_happy_path.yaml, driven through the
+# `core` import alias (states core.*, intents core__*) and seeded at intake
+# the way `continue` from prd_published seeds it (design_seed_idea set). The
+# design author reads this repo's own gears-sdlc DESIGN template
+# (design_template_dir = stories/gears-rust/templates).
+#
+# Intent-only (no LLM). The publish stub returns what publish_design.py
+# produces for the external profile (durable=gears/notes-service/docs,
+# doc_filename=DESIGN, ticket_dir="" ⇒ empty ticket); the real path logic is
+# proven by the direct script test (see the dev-story README doc-profile note).
+
+test_kind: flow
+app: ../app.yaml
+initial_state: core.design
+initial_world:
+  # A flow starts INSIDE the `core` compound, so the instance → core world_in
+  # projection never runs; seed the core__ profile keys directly (the gears
+  # defaults from app.yaml — a real run projects them on entry). The design
+  # seed is what `continue` from prd_published leaves.
+  judge_mode: "human"
+  core__workdir:              "."
+  core__design_durable_path:  "gears/notes-service/docs"
+  core__design_doc_filename:  "DESIGN"
+  core__design_template_dir:  "stories/gears-rust/templates"
+  core__design_ticket_dir:    ""
+  core__design_seed_idea: "Author a design from the PRD at gears/notes-service/docs/PRD.md"
+
+host_handlers:
+  host.ide.open_file:
+    data: { ok: true, connected: true }
+  host.oracle.decide:
+    by_call:
+      name_slug:
+        data:
+          ok: true
+          submitted: { slug: "notes-service", rationale: "the gear the design is authored for" }
+      existing_scan:
+        data:
+          ok: true
+          submitted: { overlaps: [], roadmap_fit: "A net-new gear design; no overlap with existing gears." }
+      references_research:
+        data:
+          ok: true
+          submitted:
+            items:
+              - { path: "gears/notes-service/docs/PRD.md", sections: "§5", rationale: "the PRD this design realizes" }
+      brief_check:
+        data:
+          ok: true
+          submitted: { verdict: "continue", reason: "Crisp why, gears-sdlc DESIGN shape, IDs threaded.", questions: [] }
+  host.oracle.search:
+    data: { hits: [], top: null }
+  host.artifacts_dir:
+    data: { ok: true, path: "docs/proposals/.workspace/notes-service/001-brief.md", message_id: "out#1" }
+  host.oracle.task:
+    by_call:
+      refine_brief:
+        data:
+          ok: true
+          submitted:
+            summary: "Idea is clear; the gears-sdlc DESIGN sections need the component model."
+            gaps:    ["Name the components and their cpt-IDs", "Allocate the PRD NFRs"]
+    data:
+      # The un-id'd draft author task (design_draft.on_enter). Authors a
+      # gears-sdlc DESIGN doc (the real author reads templates/DESIGN/template.md).
+      ok: true
+      submitted:
+        title:               "Technical Design — Notes Service"
+        kind:                "runtime"
+        summary_markdown:    "## Technical Design — Notes Service\n\n- [ ] `p3` - **ID**: `cpt-notes-service-design-overview`\n\nArchitecture overview, component model, and API contracts for the notes-service gear, realizing the PRD requirements."
+        file_path:           "docs/proposals/.workspace/notes-service/004-proposal.md"
+        confidence:          0.82
+        needs_clarification: false
+        follow_up_questions: []
+  host.run:
+    by_call:
+      uniquify:
+        data:
+          ok: true
+          exit_code: 0
+          stdout_json: { slug: "notes-service", workspace: "docs/proposals/.workspace/notes-service" }
+      # The design publish: publish_design.py with design_doc_filename="DESIGN",
+      # design_durable_path="gears/notes-service/docs", design_ticket_dir="" →
+      # writes <workdir>/gears/notes-service/docs/DESIGN.md and mints NO ticket.
+      publish:
+        data:
+          ok: true
+          exit_code: 0
+          stdout_json:
+            design_file:  "gears/notes-service/docs/DESIGN.md"
+            ticket_id:    ""
+            ticket_path:  ""
+            ticket_title: "Technical Design — Notes Service"
+
+turns:
+  # Stage 1: Intake — the seed is carried into design_idea; one message mints
+  # the candidate slug and advances to search (scout fires on entry).
+  - intent: { name: core__discuss, slots: { message: "realize the notes-service PRD as a gears-sdlc DESIGN" } }
+    expect_state: core.design_search
+    expect_world:
+      core__design_slug: "notes-service"
+      # The profile is live on the hub (instance defaults projected into core).
+      core__design_doc_filename:  "DESIGN"
+      core__design_durable_path:  "gears/notes-service/docs"
+      core__design_template_dir:  "stories/gears-rust/templates"
+      core__design_ticket_dir:    ""
+
+  # Stage 2: Search — no overlap → confirm → materialize → (auto-advance) →
+  # design_refine.
+  - intent: { name: core__confirm, slots: {} }
+    expect_state: core.design_refine
+    expect_world:
+      core__design_overlap_decision: "new"
+      core__design_workspace: "docs/proposals/.workspace/notes-service"
+
+  # Stage 3: ready — arms + passes the judge → design_draft (author fires).
+  - intent: { name: core__ready, slots: {} }
+    expect_state: core.design_draft
+    expect_world:
+      core__design_brief_cycle: 1
+      core__design_kind: "runtime"
+
+  # Stage 4: accept — publish inline. The DESIGN lands in the gears tree under
+  # the fixed gears-sdlc name; NO feature ticket was minted (external target).
+  - intent: { name: core__accept, slots: {} }
+    expect_state: core.design_done
+    expect_world:
+      core__design_file: "gears/notes-service/docs/DESIGN.md"
+      core__ticket_id:   ""
+      core__design_ticket_path: ""
+    expect_view_matches: "Published.*DESIGN\\.md"
+
+  # Back to the day landing.
+  - intent: { name: core__go_main, slots: {} }
+    expect_state: core.main
+
+expect_no_errors: true

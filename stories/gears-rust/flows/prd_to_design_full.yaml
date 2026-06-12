@@ -1,0 +1,207 @@
+# prd_to_design_full (gears-rust) — the WHOLE PRD → Design walk, one session.
+#
+# The two split flows (prd_to_design + design_publishes_gears_design) each
+# prove one half in isolation. This flow proves they compose in a SINGLE
+# session, exactly as the operator (and the tour-driven video) walk it:
+#
+#   main → prd → … → prd_published → continue → design → … → design_done → main
+#
+# publishing BOTH gears-sdlc docs into the gears-rust checkout —
+# gears/notes-service/docs/PRD.md and DESIGN.md — with no kitsoki feature
+# ticket. It is also the host-stub source the web video spec
+# (tools/runstatus/tests/playwright/gears-prd-design.spec.ts) drives the UI
+# against.
+#
+# This single-session composition is what the `id: prd_author` /
+# `id: design_author` task ids unlock: the prd author and the design author
+# both run in one session, so the oracle.task stub disambiguates them by_call
+# (distinct PRD vs DESIGN content) instead of one shared shape. The two
+# publish sites share the invoke id `publish`, so a single superset stub
+# carries both prd_file and design_file — each room binds only its own keys.
+#
+# Intent-only (no LLM). Driven through the `core` import alias (states core.*,
+# intents core__*, nested core__prd__*). The profile is seeded on the core__
+# child keys directly (a flow starts inside the compound, so the instance →
+# core projection does not run — see prd_to_design.yaml).
+
+test_kind: flow
+app: ../app.yaml
+initial_state: core.main
+initial_world:
+  judge_mode: "human"
+  core__workdir:               "."
+  core__publish_durable_path:  "gears/notes-service/docs"
+  core__prd_doc_filename:      "PRD"
+  core__design_durable_path:   "gears/notes-service/docs"
+  core__design_doc_filename:   "DESIGN"
+  core__design_template_dir:   "stories/gears-rust/templates"
+  core__design_ticket_dir:     ""
+
+host_handlers:
+  host.ide.open_file:
+    data: { ok: true, connected: true }
+  host.chat.resolve:
+    data: { ok: true, chat_id: "chat-1", title: "PRD idea discovery", is_new: true }
+  host.oracle.converse:
+    data: { ok: true, answer: "A notes service gear for the platform.", chat_id: "chat-1", claude_session_id: "sess-1" }
+  host.oracle.search:
+    data: { hits: [], top: null }
+  host.oracle.decide:
+    # prd clarifying question generation (the un-id'd decide).
+    data:
+      ok: true
+      submitted:
+        questions:
+          - { id: "q1", question: "Who is the primary actor?", why: "scopes the persona" }
+          - { id: "q2", question: "What is the single most important success metric?", why: "defines done" }
+    by_call:
+      match_answer:
+        data:
+          ok: true
+          submitted:
+            answers_block:       "Q1: platform users\nQ2: notes-saved-per-session\n"
+            answered_ids_append: "|1||2|"
+            matched_count:       2
+      name_slug:
+        data:
+          ok: true
+          submitted: { slug: "notes-service", rationale: "the gear the design is authored for" }
+      existing_scan:
+        data:
+          ok: true
+          submitted: { overlaps: [], roadmap_fit: "A net-new gear design; no overlap with existing gears." }
+      references_research:
+        data:
+          ok: true
+          submitted:
+            items:
+              - { path: "gears/notes-service/docs/PRD.md", sections: "§5", rationale: "the PRD this design realizes" }
+      brief_check:
+        data:
+          ok: true
+          submitted: { verdict: "continue", reason: "Crisp why, gears-sdlc DESIGN shape, IDs threaded.", questions: [] }
+  host.artifacts_dir:
+    data: { ok: true, path: "docs/proposals/.workspace/notes-service/001-brief.md", message_id: "out#1" }
+  host.oracle.task:
+    by_call:
+      # PRD author (prd drafting) — id: prd_author.
+      prd_author:
+        data:
+          ok: true
+          submitted:
+            title:               "PRD: Notes Service"
+            summary_markdown:    "## PRD: Notes Service\n\nA sufficiently long summary body to satisfy the schema minimum length for the prd_artifact summary_markdown field, covering problem, actors, goals, and metrics for the notes-service gear."
+            file_path:           ".artifacts/prd/notes-service/004-prd.md"
+            confidence:          0.84
+            needs_clarification: false
+            follow_up_questions: []
+      # DESIGN author (design_draft) — id: design_author.
+      design_author:
+        data:
+          ok: true
+          submitted:
+            title:               "Technical Design — Notes Service"
+            kind:                "runtime"
+            summary_markdown:    "## Technical Design — Notes Service\n\n- [ ] `p3` - **ID**: `cpt-notes-service-design-overview`\n\nArchitecture overview, component model, and API contracts for the notes-service gear, realizing the PRD requirements."
+            file_path:           "docs/proposals/.workspace/notes-service/004-proposal.md"
+            confidence:          0.82
+            needs_clarification: false
+            follow_up_questions: []
+      # DESIGN brief refiner — design_refine on_enter (refine_brief) AND the
+      # conversational re-refine on `discuss` (refine_brief_update). Same shape.
+      refine_brief:
+        data:
+          ok: true
+          submitted:
+            summary: "Idea is clear; the gears-sdlc DESIGN sections need the component model."
+            gaps:    ["Name the components and their cpt-IDs", "Allocate the PRD NFRs"]
+      refine_brief_update:
+        data:
+          ok: true
+          submitted:
+            summary: "Folded in the operator's note — the component model + cpt-IDs are now scoped."
+            gaps:    ["Allocate the PRD NFRs to components"]
+  host.run:
+    by_call:
+      mint_workspace:
+        data:
+          ok: true
+          exit_code: 0
+          stdout_json: { slug: "notes-service", workspace: ".artifacts/prd/notes-service" }
+      uniquify:
+        data:
+          ok: true
+          exit_code: 0
+          stdout_json: { slug: "notes-service", workspace: "docs/proposals/.workspace/notes-service" }
+      # Both publish sites share the invoke id `publish`; the superset carries
+      # prd_file (bound by prd drafting) AND design_file/ticket_* (bound by
+      # design_draft). Each room binds only the keys it reads.
+      publish:
+        data:
+          ok: true
+          exit_code: 0
+          stdout_json:
+            prd_file:     "gears/notes-service/docs/PRD.md"
+            design_file:  "gears/notes-service/docs/DESIGN.md"
+            ticket_id:    ""
+            ticket_path:  ""
+            ticket_title: "Technical Design — Notes Service"
+
+turns:
+  # ── PRD half ───────────────────────────────────────────────────────────────
+  - intent: { name: core__go_prd, slots: {} }
+    expect_state: core.prd.idle
+  - intent: { name: core__prd__discuss, slots: { message: "I want a notes-service gear" } }
+    expect_state: core.prd.idle
+  - intent: { name: core__prd__start, slots: {} }
+    expect_state: core.prd.search
+  - intent: { name: core__prd__confirm, slots: {} }
+    expect_state: core.prd.clarifying
+  # Clarification round 1.
+  - intent: { name: core__prd__answer, slots: { text: "platform users, metric is notes-saved-per-session" } }
+    expect_state: core.prd.clarifying
+  - intent: { name: core__prd__submit_answers, slots: {} }
+    expect_state: core.prd.brief
+  # Clarification round 2 — the brief's `clarify` re-opens clarifying, preserving
+  # the accumulated transcript (clarification is iterative, not one-shot).
+  - intent: { name: core__prd__clarify, slots: {} }
+    expect_state: core.prd.clarifying
+  - intent: { name: core__prd__answer, slots: { text: "tenant isolation is mandatory; admins see only aggregate metrics" } }
+    expect_state: core.prd.clarifying
+  - intent: { name: core__prd__submit_answers, slots: {} }
+    expect_state: core.prd.brief
+  - intent: { name: core__prd__confirm, slots: {} }
+    expect_state: core.prd.references
+  - intent: { name: core__prd__confirm, slots: {} }
+    expect_state: core.prd.drafting
+  - intent: { name: core__prd__accept, slots: {} }
+    expect_state: core.prd_published
+    expect_world:
+      core__prd__prd_file: "gears/notes-service/docs/PRD.md"
+
+  # ── The PRD → Design handoff ───────────────────────────────────────────────
+  - intent: { name: core__continue, slots: {} }
+    expect_state: core.design
+    expect_world:
+      core__design_seed_idea: "Author a design from the PRD at gears/notes-service/docs/PRD.md"
+
+  # ── Design half ────────────────────────────────────────────────────────────
+  - intent: { name: core__discuss, slots: { message: "realize the notes-service PRD as a gears-sdlc DESIGN" } }
+    expect_state: core.design_search
+  - intent: { name: core__confirm, slots: {} }
+    expect_state: core.design_refine
+  # Refine the brief conversationally (the design's clarification loop) before
+  # the quality check — the same iterative shaping the PRD does with questions.
+  - intent: { name: core__discuss, slots: { message: "thread the cpt-IDs and add the component model" } }
+    expect_state: core.design_refine
+  - intent: { name: core__ready, slots: {} }
+    expect_state: core.design_draft
+  - intent: { name: core__accept, slots: {} }
+    expect_state: core.design_done
+    expect_world:
+      core__design_file: "gears/notes-service/docs/DESIGN.md"
+      core__ticket_id:   ""
+  - intent: { name: core__go_main, slots: {} }
+    expect_state: core.main
+
+expect_no_errors: true
