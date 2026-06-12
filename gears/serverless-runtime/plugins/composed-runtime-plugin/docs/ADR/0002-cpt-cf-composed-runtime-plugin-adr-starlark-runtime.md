@@ -294,7 +294,7 @@ The runtime provides a minimal async model so a Starlark callable can issue mult
 
 A `Promise<T>` comes in two flavors:
 
-- **Local-completion promises** — produced by `ctx.http.*`, `ctx.invoke`, `ctx.sleep`, `ctx.steps.run`. They complete inside the current invocation's lifetime; `ctx.await` waits in-process without persisting state.
+- **Local-completion promises** — produced by `ctx.http.*`, `ctx.invoke`, and `ctx.sleep`. They complete inside the current invocation's lifetime; `ctx.await` waits in-process without persisting state. (`ctx.steps.run` is **not** a promise — it is the synchronous, result-returning step API in [Workflow orchestration](#workflow-orchestration-ctxsteps).)
 - **Suspendable promises** — produced by `ctx.events.wait` (and any future helper that registers an event subscription). If awaited, the runtime checkpoints the call frame via `ExecutionContext::write_checkpoint`, releases the worker, and resumes the invocation when the external event arrives. On resume, `ExecutionContext::is_replay()` is true and `attempt()` reflects the resumption.
 
 Authors do not pick the flavor; it follows from which helper produced the promise. The distinction matters only for reasoning about durability and worker occupancy.

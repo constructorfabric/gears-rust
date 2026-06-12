@@ -191,9 +191,9 @@ The plugin **shall** provide a single `ExecutionContext` to every embedded calla
 
 ### FR-004 Durable Checkpoint Store with Per-Executor Schemas
 
-The plugin **shall** persist checkpoint envelopes to a durable store, one row per `(invocation_id, label)`, with columns `schema_id`, `payload` (opaque bytes), `attempt`, `created_at`. The plugin **shall not** interpret payload bytes; each embedded executor owns the GTS schema ID for its checkpoint payload and is responsible for serialization/deserialization.
+The plugin **shall** persist checkpoint envelopes to a durable store, one row per `(invocation_id, label, attempt)`, with columns `schema_id`, `payload` (opaque bytes), `created_at`. `read_checkpoint(label)` **shall** return the envelope written by the latest (highest) `attempt` for that `(invocation_id, label)`. The plugin **shall not** interpret payload bytes; each embedded executor owns the GTS schema ID for its checkpoint payload and is responsible for serialization/deserialization.
 
-Checkpoints written by one embedded executor **shall** be retrievable on resume in the same `(invocation_id, label)` regardless of in-process / managed-OoP mode change between write and read.
+Checkpoints written by one embedded executor **shall** be retrievable on resume under the same `(invocation_id, label)` (latest `attempt`) regardless of in-process / managed-OoP mode change between write and read.
 
 - [ ] `p1` - **ID**: `cpt-cf-composed-runtime-plugin-fr-checkpoint-store`
 

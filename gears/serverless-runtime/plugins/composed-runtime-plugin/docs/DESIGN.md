@@ -65,7 +65,7 @@ Deep integration with external orchestrators (Temporal, cloud FaaS bridges, thir
 | `cpt-cf-composed-runtime-plugin-fr-tenant-scoping` (FR-010) | Tenant / security context enforced at the router; embedded executors read it from `ExecutionContext` |
 | `cpt-cf-composed-runtime-plugin-fr-trace-debug-plane` (FR-011) | One OpenTelemetry span per dispatch; per-invocation timeline event stream; future debug ADR subscribes here |
 | `cpt-cf-composed-runtime-plugin-nfr-dispatch-performance` (NFR-001) | In-process dispatch is a lock-free read + `Arc` clone; no allocation on the hot path |
-| `cpt-cf-composed-runtime-plugin-nfr-replay-correctness` (NFR-003) | Per-`(invocation_id, label)` durable envelopes; schema IDs are part of the envelope so resume validates compatibility |
+| `cpt-cf-composed-runtime-plugin-nfr-replay-correctness` (NFR-003) | Per-`(invocation_id, label, attempt)` durable envelopes (`read_checkpoint` returns the latest attempt); schema IDs are part of the envelope so resume validates compatibility |
 | `cpt-cf-composed-runtime-plugin-nfr-tenant-isolation` (NFR-004) | Tenant-scoped queries on registry + checkpoint store; managed-OoP variant provides OS-level isolation for untrusted callables |
 | `cpt-cf-composed-runtime-plugin-nfr-hot-reload` (NFR-005) | Drain-load-resume protocol on native libraries; no library-resident state; reload built on top of the checkpoint store |
 | `cpt-cf-composed-runtime-plugin-nfr-modkit-reuse` (NFR-007) | No parallel IPC / supervision / RPC; managed-OoP rides ModKit's existing primitives |
@@ -252,7 +252,7 @@ Plugin-local event-bus client. Registers subscriptions when an executor calls `c
 
 - [ ] `p1` - **ID**: `cpt-cf-composed-runtime-plugin-component-checkpoint-store`
 
-Durable per-`(invocation_id, label)` row store for checkpoint envelopes (see §3.6 Database schemas & tables). Backed by `modkit-db`. Payload bytes are opaque to the plugin; each embedded executor owns its own `schema_id` and serialization.
+Durable per-`(invocation_id, label, attempt)` row store for checkpoint envelopes (see §3.6 Database schemas & tables). Backed by `modkit-db`. `read_checkpoint(label)` returns the latest-attempt envelope. Payload bytes are opaque to the plugin; each embedded executor owns its own `schema_id` and serialization.
 
 #### ExecutionContext Factory
 
@@ -538,7 +538,7 @@ CREATE INDEX composed_runtime_checkpoint_tenant_idx
     ON composed_runtime_checkpoint (tenant_id, invocation_id);
 ```
 
-Read by `ExecutionContext::read_checkpoint`; written by `write_checkpoint`. Payload bytes are opaque to the plugin — the schema is owned by the embedded executor identified by `schema_id`.
+Rows are keyed by `(invocation_id, label, attempt)` so each retry attempt records its own envelope; `ExecutionContext::read_checkpoint(label)` returns the row for the latest (highest) `attempt`, and `write_checkpoint` inserts the row for the current attempt. Payload bytes are opaque to the plugin — the schema is owned by the embedded executor identified by `schema_id`.
 
 #### Plugin-internal tables (illustrative)
 
