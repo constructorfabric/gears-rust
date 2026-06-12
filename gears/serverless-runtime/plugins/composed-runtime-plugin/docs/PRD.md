@@ -63,7 +63,7 @@
 
 ### Purpose
 
-Provide a single runtime plugin under the Serverless Runtime thin-host model ([ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)) that hosts multiple **embedded language executors** — Starlark today, native Rust today, and future embedded languages such as CEL — on a shared in-plugin environment (GTS-keyed router, unified `ExecutionContext`, durable checkpoint store, eventing) so that callables written in different embedded languages can compose freely and inherit durability, replay, tracing, tenant scoping, and event-driven suspend/resume for free.
+Provide a single runtime plugin under the Serverless Runtime thin-host model ([serverless-runtime ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)) that hosts multiple **embedded language executors** — Starlark today, native Rust today, and future embedded languages such as CEL — on a shared in-plugin environment (GTS-keyed router, unified `ExecutionContext`, durable checkpoint store, eventing) so that callables written in different embedded languages can compose freely and inherit durability, replay, tracing, tenant scoping, and event-driven suspend/resume for free.
 
 The plugin is delivered in two operational modes from a single binary:
 
@@ -72,11 +72,11 @@ The plugin is delivered in two operational modes from a single binary:
 
 ### Background / Problem Statement
 
-The Serverless Runtime platform allows tenants to author and invoke functions and workflows at runtime ([serverless-runtime PRD](../../../docs/PRD.md)). The thin-host architecture ([ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)) places the invocation engine, scheduler, event-trigger handling, retry, compensation, and checkpoint storage inside **runtime plugins**, with the host owning only the registry, REST/JSON-RPC/MCP surfaces, GTS validation, audit aggregation, plugin dispatch, tenant policy, and a lightweight invocation index.
+The Serverless Runtime platform allows tenants to author and invoke functions and workflows at runtime ([serverless-runtime PRD](../../../docs/PRD.md)). The thin-host architecture ([serverless-runtime ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)) places the invocation engine, scheduler, event-trigger handling, retry, compensation, and checkpoint storage inside **runtime plugins**, with the host owning only the registry, REST/JSON-RPC/MCP surfaces, GTS validation, audit aggregation, plugin dispatch, tenant policy, and a lightweight invocation index.
 
-Within that thin-host model, code-level callables (Starlark, native Rust, future CEL, future Wasm) have a shared set of needs: a router for cross-callable invocation, a checkpoint store, an eventing mechanism, replay-aware execution context, tenant scoping, tracing, and a path to isolation for untrusted code. If each embedded language were its own plugin, each would re-implement that shared core; cross-language composition would degrade into per-pair custom glue. The Composed Runtime plugin solves this by being the single plugin that hosts **all** embedded language executors against one shared environment ([ADR-0006](../../../docs/ADR/0006-cpt-cf-serverless-runtime-adr-composed-runtime.md)).
+Within that thin-host model, code-level callables (Starlark, native Rust, future CEL, future Wasm) have a shared set of needs: a router for cross-callable invocation, a checkpoint store, an eventing mechanism, replay-aware execution context, tenant scoping, tracing, and a path to isolation for untrusted code. If each embedded language were its own plugin, each would re-implement that shared core; cross-language composition would degrade into per-pair custom glue. The Composed Runtime plugin solves this by being the single plugin that hosts **all** embedded language executors against one shared environment ([ADR-0001](ADR/0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md)).
 
-This plugin is the focus runtime for the platform. External orchestrators — Temporal ([ADR-0003](../../../docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [ADR-0004](../../../docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)), cloud FaaS bridges (Lambda, Cloud Functions, Azure Functions), and third-party engines — are out of scope for this plugin; when delivered, they ship as separate fat plugins under the same thin-host model.
+This plugin is the focus runtime for the platform. External orchestrators — Temporal ([serverless-runtime ADR-0003](../../../docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [serverless-runtime ADR-0004](../../../docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)), cloud FaaS bridges (Lambda, Cloud Functions, Azure Functions), and third-party engines — are out of scope for this plugin; when delivered, they ship as separate fat plugins under the same thin-host model.
 
 ### Goals (Business Outcomes)
 
@@ -91,7 +91,7 @@ This plugin is the focus runtime for the platform. External orchestrators — Te
 | Term | Definition |
 |------|------------|
 | **Host** | The serverless-runtime host module (`cyberware-serverless-runtime`). Owns Registry, Tenant Policy, REST/JSON-RPC/MCP surfaces, GTS validation, audit aggregation, plugin dispatch, lightweight invocation index. See [serverless-runtime DESIGN §1.4](../../../docs/DESIGN.md#14-modkit-integration). |
-| **Plugin / fat plugin** | A runtime plugin under [ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md) that owns the full execution stack (invocation engine, scheduler, event-trigger handling, retry, compensation, checkpoint store) and implements the `RuntimeAdapter` trait. |
+| **Plugin / fat plugin** | A runtime plugin under [serverless-runtime ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md) that owns the full execution stack (invocation engine, scheduler, event-trigger handling, retry, compensation, checkpoint store) and implements the `RuntimeAdapter` trait. |
 | **Composed Runtime plugin** | This plugin. Hosts embedded language executors against a shared environment. |
 | **Embedded executor** | An implementation of the in-plugin `EmbeddedExecutor` trait for one language/runtime (Starlark, native Rust, future CEL, etc.) that runs inside the Composed Runtime plugin. |
 | **Callable** | A registered function or workflow definition (GTS-identified) that is dispatched to an embedded executor through the in-plugin router. |
@@ -111,7 +111,7 @@ This plugin is the focus runtime for the platform. External orchestrators — Te
 ### System Actors
 
 - **Serverless Runtime host module** — dispatches invocation/scheduling/trigger operations into this plugin via the `RuntimeAdapter` trait; receives index and timeline events from this plugin via the `ServerlessRuntimeClient`.
-- **Embedded executor implementations** — Starlark ([ADR-0007](../../../docs/ADR/0007-cpt-cf-serverless-runtime-adr-starlark-runtime.md)), native Rust ([ADR-0008](../../../docs/ADR/0008-cpt-cf-serverless-runtime-adr-native-rust-executor.md)), and any future embedded language (e.g. CEL). Each is a separate crate that depends on the Composed Runtime plugin's internal SDK to obtain the `EmbeddedExecutor` trait and `ExecutionContext` types.
+- **Embedded executor implementations** — Starlark ([ADR-0002](ADR/0002-cpt-cf-composed-runtime-plugin-adr-starlark-runtime.md)), native Rust ([ADR-0003](ADR/0003-cpt-cf-composed-runtime-plugin-adr-native-rust-executor.md)), and any future embedded language (e.g. CEL). Each is a separate crate that depends on the Composed Runtime plugin's internal SDK to obtain the `EmbeddedExecutor` trait and `ExecutionContext` types.
 - **ModKit OoP supervisor** — spawns and supervises the managed-OoP variant of this plugin when configured.
 - **Event broker (via runtime services)** — delivers external events to suspended invocations through the in-plugin Event Hub.
 - **Outbound API gateway (via runtime services)** — receives outbound HTTP calls that callables initiate through `ExecutionContext`.
@@ -143,17 +143,17 @@ The plugin does **not** open external listening ports of its own (the host owns 
 - Plugin-local Event Hub for `wait_event` / schedule / event-trigger delivery.
 - Per-callable deployment mode (in-process / managed-OoP variants).
 - Retry, compensation, timeout enforcement inside this plugin.
-- Hosting the Starlark embedded executor ([ADR-0007](../../../docs/ADR/0007-cpt-cf-serverless-runtime-adr-starlark-runtime.md)) and the native Rust embedded executor ([ADR-0008](../../../docs/ADR/0008-cpt-cf-serverless-runtime-adr-native-rust-executor.md)).
+- Hosting the Starlark embedded executor ([ADR-0002](ADR/0002-cpt-cf-composed-runtime-plugin-adr-starlark-runtime.md)) and the native Rust embedded executor ([ADR-0003](ADR/0003-cpt-cf-composed-runtime-plugin-adr-native-rust-executor.md)).
 - An internal `EmbeddedExecutor` trait surface stable enough to host a future CEL embedded executor without plugin-core changes.
 
 ### Out of Scope
 
-- Deep integration with external orchestrators — Temporal ([ADR-0003](../../../docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [ADR-0004](../../../docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)), cloud FaaS bridges (Lambda, Cloud Functions, Azure Functions), or third-party engines. These ship as **separate fat plugins** under the thin-host model.
+- Deep integration with external orchestrators — Temporal ([serverless-runtime ADR-0003](../../../docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [serverless-runtime ADR-0004](../../../docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)), cloud FaaS bridges (Lambda, Cloud Functions, Azure Functions), or third-party engines. These ship as **separate fat plugins** under the thin-host model.
 - The host's REST / JSON-RPC / MCP surfaces, function registry, tenant policy storage, audit aggregation, and lightweight invocation index — those belong to the host module.
 - Defining the Serverless Workflow DSL or a Temporal worker.
 - Authoring tools (IDE, linting, formatting) for the embedded languages.
-- Marketplace / signing / distribution for customer-supplied hot-loaded libraries; this PRD specifies the loader contract via [ADR-0008](../../../docs/ADR/0008-cpt-cf-serverless-runtime-adr-native-rust-executor.md) but defers distribution to a later ADR.
-- The platform security model (execution identity, secret references, privilege scoping); see `NEXT_ADR_SCOPE.md` ADR-9.
+- Marketplace / signing / distribution for customer-supplied hot-loaded libraries; this PRD specifies the loader contract via [ADR-0003](ADR/0003-cpt-cf-composed-runtime-plugin-adr-native-rust-executor.md) but defers distribution to a later ADR.
+- The platform security model (execution identity, secret references, privilege scoping); see `NEXT_ADR_SCOPE.md` ADR-6.
 
 ## 5. Functional Requirements
 
@@ -173,7 +173,7 @@ Adding a new embedded executor **shall not** require changes to the plugin's rou
 
 The plugin **shall** maintain a callable registry keyed by GTS callable ID and **shall** dispatch any embedded callable through `Router::invoke(callable_id, request, ctx)`. The signature **shall** be identical regardless of which embedded executor implements the callable and regardless of whether the callable runs in-process or in the plugin's managed-OoP variant.
 
-Cross-plugin invocations (e.g. into a callable hosted in a separate plugin) **shall not** be served by this router; they go through the host's plugin-dispatch instead.
+Cross-plugin invocations (e.g. into a callable hosted in a separate plugin) **shall not** be served by this router and **shall not** be reachable through `ctx.invoke` at all: `ExecutionContext::invoke` rejects an unknown callable with a "callable not found" error. The SDK defines no plugin→host outbound-routing path; cross-plugin composition, when needed, is a host-orchestration concern arranged above this plugin.
 
 - [ ] `p1` - **ID**: `cpt-cf-composed-runtime-plugin-fr-in-plugin-router`
 
@@ -306,7 +306,7 @@ The plugin **shall** enforce tenant-scoped queries on its callable registry, che
 
 ### NFR-005 Hot Reload — Hot-Loadable Embedded Executors
 
-For embedded executors that support hot reload (today: native Rust per [ADR-0008](../../../docs/ADR/0008-cpt-cf-serverless-runtime-adr-native-rust-executor.md)), the plugin **shall** drain in-flight invocations from the outgoing library version, load the new version, and resume any drained invocations from their checkpoint envelopes without restarting the host process and without leaking threads / file descriptors / memory mappings.
+For embedded executors that support hot reload (today: native Rust per [ADR-0003](ADR/0003-cpt-cf-composed-runtime-plugin-adr-native-rust-executor.md)), the plugin **shall** drain in-flight invocations from the outgoing library version, load the new version, and resume any drained invocations from their checkpoint envelopes without restarting the host process and without leaking threads / file descriptors / memory mappings.
 
 - [ ] `p1` - **ID**: `cpt-cf-composed-runtime-plugin-nfr-hot-reload`
 
@@ -344,7 +344,7 @@ The plugin **shall** be runnable as part of a single host binary in local-dev co
 
 The following non-functional requirement areas are explicitly **not addressed** by this plugin and inherit their treatment from the platform, the host module, or future ADRs:
 
-- **Authentication / authorization of platform callers.** Owned by the host module's API surfaces (REST/JSON-RPC/MCP) and the future security-model ADR (`NEXT_ADR_SCOPE.md` ADR-9).
+- **Authentication / authorization of platform callers.** Owned by the host module's API surfaces (REST/JSON-RPC/MCP) and the future security-model ADR (`NEXT_ADR_SCOPE.md` ADR-6).
 - **Secret management.** Secret references and binding model belong to the platform-wide security ADR; the plugin only consumes resolved values through `ExecutionContext`-provided services.
 - **Long-term retention / archival of checkpoint envelopes and timeline events.** Retention policy is a tenant-policy concern owned by the host; the plugin enforces what the host configures.
 - **Encryption at rest / in transit of checkpoint payloads.** Inherited from `modkit-db` and the platform networking layer; this plugin does not implement bespoke encryption.
@@ -411,10 +411,10 @@ A platform engineer adds support for a new embedded language (e.g. CEL). The eng
 
 | Dependency | Form | Status |
 |------------|------|--------|
-| `serverless-runtime-sdk` (the host SDK contract crate) | Compile-time crate dependency; the plugin trait this plugin implements | **Not yet created** — referenced by [ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md); see Open Questions |
+| `serverless-runtime-sdk` (the host SDK contract crate) | Compile-time crate dependency; the plugin trait this plugin implements | **Not yet created** — referenced by [serverless-runtime ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md); see Open Questions |
 | `cyberware-serverless-runtime` (the host module) | Runtime dispatch caller (resolves this plugin via `ClientHub` by plugin GTS type) | **Not yet created** |
 | ModKit primitives | `ClientHub`, `OopBackend`, `bootstrap::oop`, `DirectoryService`, `modkit-transport-grpc`, `modkit-db` | Exists in `libs/modkit/`, `libs/modkit-transport-grpc/`, `libs/modkit-db/` |
-| Embedded executor crates | Starlark (per ADR-0007), native Rust SDK (per ADR-0008) | **Not yet created** — depend on this plugin's internal SDK |
+| Embedded executor crates | Starlark (per ADR-0002), native Rust SDK (per ADR-0003) | **Not yet created** — depend on this plugin's internal SDK |
 | Outbound API gateway | Reached via `ClientHub` for HTTP egress from callables | Exists |
 | Event broker | Reached via `ClientHub` for `wait_event` and trigger delivery | Exists |
 | GTS schema registry | For checkpoint schema IDs, callable IDs, event type IDs | Exists |
@@ -436,7 +436,7 @@ A platform engineer adds support for a new embedded language (e.g. CEL). The eng
 | Hot-reload of native libraries leaks resources, requiring host restart | High (operational) | Strict no-static-state rule on native callables enforced by SDK proc-macro lints; reload test suite verifies via `/proc/self/maps` and leak detector |
 | Managed-OoP child-process supervisor instability under high churn | Medium | Reuse ModKit's already-operating OoP backend; do not invent a new supervisor |
 | Replay correctness gaps when an embedded executor changes its checkpoint schema across versions | High | Per-version schema IDs; schema migrations are an executor responsibility, not a plugin one |
-| Composability illusion — author thinks cross-plugin `ctx.invoke` to a DSL/Temporal callable works through this plugin's router | Low | Documented in [ADR-0006](../../../docs/ADR/0006-cpt-cf-serverless-runtime-adr-composed-runtime.md) and in author-facing surfaces; cross-plugin invocations route through the host explicitly |
+| Composability illusion — author thinks cross-plugin `ctx.invoke` to a DSL/Temporal callable works through this plugin's router | Low | `ctx.invoke` is documented as in-plugin-only ([ADR-0001](ADR/0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md) Non-goals); an unknown callee is rejected with a clear "callable not found" error rather than silently bridged. Cross-plugin composition is a host-orchestration concern, not reachable from inside a callable. |
 
 ## 13. Open Questions
 
@@ -451,9 +451,9 @@ A platform engineer adds support for a new embedded language (e.g. CEL). The eng
 
 - **Parent module PRD:** [../../../docs/PRD.md](../../../docs/PRD.md)
 - **Parent module DESIGN:** [../../../docs/DESIGN.md](../../../docs/DESIGN.md)
-- **Parent decision (thin host model):** [ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)
-- **Architecture decision realized by this plugin:** [ADR-0006](../../../docs/ADR/0006-cpt-cf-serverless-runtime-adr-composed-runtime.md)
+- **Parent decision (thin host model):** [serverless-runtime ADR-0005](../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)
+- **Architecture decision realized by this plugin:** [ADR-0001](ADR/0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md)
 - **Embedded executors hosted by this plugin:**
-  - Starlark — [ADR-0007](../../../docs/ADR/0007-cpt-cf-serverless-runtime-adr-starlark-runtime.md)
-  - Native Rust — [ADR-0008](../../../docs/ADR/0008-cpt-cf-serverless-runtime-adr-native-rust-executor.md)
-- **Future ADRs that build on this plugin:** Security model (NEXT_ADR_SCOPE.md ADR-9), Runtime Capabilities SDK (ADR-10), Debugging and Observability (ADR-11), Advanced Workflow Patterns (ADR-12). See [../../../docs/NEXT_ADR_SCOPE.md](../../../docs/NEXT_ADR_SCOPE.md).
+  - Starlark — [ADR-0002](ADR/0002-cpt-cf-composed-runtime-plugin-adr-starlark-runtime.md)
+  - Native Rust — [ADR-0003](ADR/0003-cpt-cf-composed-runtime-plugin-adr-native-rust-executor.md)
+- **Future ADRs that build on this plugin:** Security model (NEXT_ADR_SCOPE.md ADR-6), Runtime Capabilities SDK (ADR-7), Debugging and Observability (ADR-8), Advanced Workflow Patterns (ADR-9). See [../../../docs/NEXT_ADR_SCOPE.md](../../../docs/NEXT_ADR_SCOPE.md).

@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-04-29
 ---
 <!--
@@ -51,24 +51,24 @@ date: 2026-04-29
 
 <!-- /toc -->
 
-**ID**: `cpt-cf-serverless-runtime-adr-starlark-runtime`
+**ID**: `cpt-cf-composed-runtime-plugin-adr-starlark-runtime`
 
 ## Context and Problem Statement
 
-Cyber Fabric Serverless Runtime supports functions and workflows defined as GTS-identified JSON Schemas and invoked via a unified invocation API. The platform's thin-host model ([ADR-0005](0005-cpt-cf-serverless-runtime-adr-thin-host.md)) places execution machinery inside runtime plugins. The Composed Runtime plugin ([ADR-0006](0006-cpt-cf-serverless-runtime-adr-composed-runtime.md)) implements `RuntimeAdapter` from [`serverless-runtime-sdk`](../../serverless-sdk/docs/DESIGN.md) and hosts embedded language executors against an in-plugin GTS-keyed router and a unified `ExecutionContext`; each embedded executor implements the `EmbeddedExecutor` trait, and the plugin can run entirely in-process or in a managed-out-of-process child instance via ModKit's existing OoP / `ClientHub` abstraction. This ADR selects the **code-as-orchestration embedded executor** for that plugin — the language and interpreter authors use to write functions and workflows in code, as opposed to the declarative DSL-on-Temporal path which lives in a separate fat plugin under ADR-0005 (see [ADR-0003](0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [ADR-0004](0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)).
+Cyber Fabric Serverless Runtime supports functions and workflows defined as GTS-identified JSON Schemas and invoked via a unified invocation API. The platform's thin-host model ([serverless-runtime ADR-0005](../../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)) places execution machinery inside runtime plugins. The Composed Runtime plugin ([ADR-0001](0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md)) implements `RuntimeAdapter` from [`serverless-runtime-sdk`](../../../../serverless-sdk/docs/DESIGN.md) and hosts embedded language executors against an in-plugin GTS-keyed router and a unified `ExecutionContext`; each embedded executor implements the `EmbeddedExecutor` trait, and the plugin can run entirely in-process or in a managed-out-of-process child instance via ModKit's existing OoP / `ClientHub` abstraction. This ADR selects the **code-as-orchestration embedded executor** for that plugin — the language and interpreter authors use to write functions and workflows in code, as opposed to the declarative DSL-on-Temporal path which lives in a separate fat plugin under serverless-runtime ADR-0005 (see [serverless-runtime ADR-0003](../../../../docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [serverless-runtime ADR-0004](../../../../docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)).
 
-The executor must be deterministic (replay-safe), sandboxable (multi-tenant, with third-party code paths), debuggable, and embeddable in the Rust host. It must also slot cleanly into ADR-0006's contracts: every helper that touches the outside world or persistent state ultimately calls into `ExecutionContext`; suspend/resume uses `read_checkpoint` / `write_checkpoint` with a Starlark-owned schema; cross-callable invocation goes through the in-plugin router and reaches fellow embedded callables (cross-plugin calls — e.g. to a DSL/Temporal callable — go through the host's plugin-dispatch).
+The executor must be deterministic (replay-safe), sandboxable (multi-tenant, with third-party code paths), debuggable, and embeddable in the Rust host. It must also slot cleanly into ADR-0001's contracts: every helper that touches the outside world or persistent state ultimately calls into `ExecutionContext`; suspend/resume uses `read_checkpoint` / `write_checkpoint` with a Starlark-owned schema; cross-callable invocation goes through the in-plugin router and reaches fellow embedded callables only (a callee in another plugin — e.g. a DSL/Temporal callable — is **not** reachable via `ctx.invoke`; see [ADR-0001](0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md) Non-goals).
 
 This ADR defines the Starlark executor:
 - the Starlark program structure (entrypoint contract)
 - strong typing rules and runtime validation
 - the in-language `ctx.*` surface exposed to Starlark code and its versioning
 - asynchronous execution model (promise + await)
-- workflow orchestration hooks (steps, retries, compensation, snapshots, event waiting) layered on top of ADR-0006's checkpoint, replay, and eventing primitives
+- workflow orchestration hooks (steps, retries, compensation, snapshots, event waiting) layered on top of ADR-0001's checkpoint, replay, and eventing primitives
 - how the executor is surfaced to the host as `FunctionHandler<I, O>` / `WorkflowHandler<I, O>` instances built by the Composed Runtime plugin
 - example definitions and Starlark programs for functions and workflows
 
-This ADR is intentionally aligned with `DESIGN.md` (domain model and invocation APIs), `serverless-runtime-sdk` (host-facing handler contract), and ADR-0006 (the Composed Runtime plugin's router, `ExecutionContext`, and shared state).
+This ADR is intentionally aligned with `DESIGN.md` (domain model and invocation APIs), `serverless-runtime-sdk` (host-facing handler contract), and ADR-0001 (the Composed Runtime plugin's router, `ExecutionContext`, and shared state).
 
 ## Decision Drivers
 
@@ -199,25 +199,25 @@ Purpose-built domain-specific language.
 
 ### Relationship to other ADRs
 
-This ADR specifies one of the embedded executors hosted inside the Composed Runtime plugin defined in [ADR-0006](0006-cpt-cf-serverless-runtime-adr-composed-runtime.md). The Starlark executor is the code-as-orchestration option offered by that plugin, parallel to the declarative DSL-on-Temporal path which lives in a separate fat plugin under [ADR-0005](0005-cpt-cf-serverless-runtime-adr-thin-host.md). Both produce first-class `Function` and `Workflow` callables registered with the host; embedded-callable composition (Starlark ↔ native Rust ↔ future embedded languages) happens through the in-plugin router, while cross-plugin composition (e.g. into a DSL/Temporal callable) goes through the host's plugin-dispatch.
+This ADR specifies one of the embedded executors hosted inside the Composed Runtime plugin defined in [ADR-0001](0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md). The Starlark executor is the code-as-orchestration option offered by that plugin, parallel to the declarative DSL-on-Temporal path which lives in a separate fat plugin under [serverless-runtime ADR-0005](../../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md). Both produce first-class `Function` and `Workflow` callables registered with the host; embedded-callable composition (Starlark ↔ native Rust ↔ future embedded languages) happens through the in-plugin router. Composition with a callable in *another* plugin (e.g. a DSL/Temporal callable) is not reachable via `ctx.invoke`; it is a host-orchestration concern (see [ADR-0001](0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md) Non-goals).
 
-- **[ADR-0001](0001-cpt-cf-serverless-runtime-adr-callable-type-hierarchy.md) (Function | Workflow as sibling peer base types):** Starlark-authored callables register as either `Function` or `Workflow`. Workflow-shaped Starlark programs set `workflow_traits` (compensation, checkpointing, suspension — defined in `DESIGN.md` and reified in the SDK's `WorkflowHandler` / `CompensationInput` / `CompensationTrigger` types); the `ctx.*` primitives in this ADR (`ctx.steps`, `ctx.events.wait`, `ctx.checkpoint`) back those traits in-language.
-- **[ADR-0002](0002-cpt-cf-serverless-runtime-adr-jsonrpc-mcp-protocol-surfaces-v1.md) (JSON-RPC 2.0 / MCP protocol surfaces):** Orthogonal. The host owns the protocol surfaces and dispatches into the Composed Runtime plugin via `RuntimeAdapter`; a Starlark callable opts into JSON-RPC and/or MCP through the same trait fields any other callable uses, and the helpers here do not change the invocation surface.
-- **[ADR-0003](0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md) (Serverless Workflow DSL):** Parallel authoring path served by a separate plugin. ADR-0003 standardizes a YAML/JSON DSL for declarative workflow authoring; this ADR standardizes a code-based authoring path in Starlark inside the Composed Runtime plugin. Either may be used to define a `Workflow`; the choice is per-callable and routed by the host to the appropriate plugin.
-- **[ADR-0004](0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md) (Temporal as the workflow engine):** Separate fat plugin under [ADR-0005](0005-cpt-cf-serverless-runtime-adr-thin-host.md). ADR-0004 selects Temporal as the durable engine for the DSL-authored workflow plugin. Starlark workflows do **not** run on Temporal — they execute as embedded callables inside the Composed Runtime plugin, with durability provided through ADR-0006's `ExecutionContext::write_checkpoint` (surfaced in-language as `ctx.checkpoint`). The two plugins coexist as peers under the thin-host model; nothing in ADR-0004 applies to Starlark.
-- **[ADR-0005](0005-cpt-cf-serverless-runtime-adr-thin-host.md) (Thin host, fat runtime plugins):** Grandparent decision. The Composed Runtime plugin (which hosts this executor) is one `RuntimeAdapter` implementation under that model and surfaces its callables and timeline events back to the host through `RuntimeAdapter` and `ServerlessRuntimeClient`.
-- **[ADR-0006](0006-cpt-cf-serverless-runtime-adr-composed-runtime.md) (Composed Runtime plugin):** Parent decision. The Starlark executor is one embedded executor inside this plugin, implementing the `EmbeddedExecutor` trait against the unified `ExecutionContext`. The plugin (and therefore the Starlark interpreter) runs in-process by default or in the plugin's managed-out-of-process variant — used in particular for third-party / untrusted Starlark code where OS-level isolation is required. Caller code is unchanged across modes. `ctx.invoke(callee_id, input)` is the in-language form of `ExecutionContext::invoke` and dispatches through the in-plugin router; so Starlark code can call native Rust callables, other Starlark callables, or future embedded callables (CEL, etc.) interchangeably.
-- **[ADR-0008](0008-cpt-cf-serverless-runtime-adr-native-rust-executor.md) (Hot-loadable native Rust executor):** Fellow embedded executor inside the same Composed Runtime plugin. Starlark code calls native Rust callables through `ctx.invoke` exactly the way it calls any other embedded callable; the in-plugin router resolves whether the native callable runs in-process (linked into a hot-loaded library) or in the plugin's managed-out-of-process variant.
+- **[serverless-runtime ADR-0001](../../../../docs/ADR/0001-cpt-cf-serverless-runtime-adr-callable-type-hierarchy.md) (Function | Workflow as sibling peer base types):** Starlark-authored callables register as either `Function` or `Workflow`. Workflow-shaped Starlark programs set `workflow_traits` (compensation, checkpointing, suspension — defined in `DESIGN.md` and reified in the SDK's `WorkflowHandler` / `CompensationInput` / `CompensationTrigger` types); the `ctx.*` primitives in this ADR (`ctx.steps`, `ctx.events.wait`, `ctx.checkpoint`) back those traits in-language.
+- **[serverless-runtime ADR-0002](../../../../docs/ADR/0002-cpt-cf-serverless-runtime-adr-jsonrpc-mcp-protocol-surfaces-v1.md) (JSON-RPC 2.0 / MCP protocol surfaces):** Orthogonal. The host owns the protocol surfaces and dispatches into the Composed Runtime plugin via `RuntimeAdapter`; a Starlark callable opts into JSON-RPC and/or MCP through the same trait fields any other callable uses, and the helpers here do not change the invocation surface.
+- **[serverless-runtime ADR-0003](../../../../docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md) (Serverless Workflow DSL):** Parallel authoring path served by a separate plugin. serverless-runtime ADR-0003 standardizes a YAML/JSON DSL for declarative workflow authoring; this ADR standardizes a code-based authoring path in Starlark inside the Composed Runtime plugin. Either may be used to define a `Workflow`; the choice is per-callable and routed by the host to the appropriate plugin.
+- **[serverless-runtime ADR-0004](../../../../docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md) (Temporal as the workflow engine):** Separate fat plugin under [serverless-runtime ADR-0005](../../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md). serverless-runtime ADR-0004 selects Temporal as the durable engine for the DSL-authored workflow plugin. Starlark workflows do **not** run on Temporal — they execute as embedded callables inside the Composed Runtime plugin, with durability provided through ADR-0001's `ExecutionContext::write_checkpoint` (surfaced in-language as `ctx.checkpoint`). The two plugins coexist as peers under the thin-host model; nothing in serverless-runtime ADR-0004 applies to Starlark.
+- **[serverless-runtime ADR-0005](../../../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md) (Thin host, fat runtime plugins):** Grandparent decision. The Composed Runtime plugin (which hosts this executor) is one `RuntimeAdapter` implementation under that model and surfaces its callables and timeline events back to the host through `RuntimeAdapter` and `ServerlessRuntimeClient`.
+- **[ADR-0001](0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md) (Composed Runtime plugin):** Parent decision. The Starlark executor is one embedded executor inside this plugin, implementing the `EmbeddedExecutor` trait against the unified `ExecutionContext`. The plugin (and therefore the Starlark interpreter) runs in-process by default or in the plugin's managed-out-of-process variant — used in particular for third-party / untrusted Starlark code where OS-level isolation is required. Caller code is unchanged across modes. `ctx.invoke(callee_id, input)` is the in-language form of `ExecutionContext::invoke` and dispatches through the in-plugin router; so Starlark code can call native Rust callables, other Starlark callables, or future embedded callables (CEL, etc.) interchangeably.
+- **[ADR-0003](0003-cpt-cf-composed-runtime-plugin-adr-native-rust-executor.md) (Hot-loadable native Rust executor):** Fellow embedded executor inside the same Composed Runtime plugin. Starlark code calls native Rust callables through `ctx.invoke` exactly the way it calls any other embedded callable; the in-plugin router resolves whether the native callable runs in-process (linked into a hot-loaded library) or in the plugin's managed-out-of-process variant.
 
 #### Mapping the Starlark surface to the SDK and `ExecutionContext`
 
 Starlark callables ride three concentric layers:
 
-1. **Host ↔ plugin (`serverless-runtime-sdk`).** The Composed Runtime plugin implements `RuntimeAdapter` and, per registered Starlark callable, builds a `FunctionHandler<I, O>` or `WorkflowHandler<I, O>` SDK impl that wraps the Starlark source. When the host calls `RuntimeAdapter::call`, the plugin constructs an `ExecutionContext` (which carries the SDK's read-only `Context` and `Environment`) and dispatches via the in-plugin router. Index/timeline updates flow back to the host through `ServerlessRuntimeClient`; runtime errors are normalized to `ServerlessSdkError` / `RuntimeErrorCategory`.
-2. **Plugin ↔ embedded executor (`EmbeddedExecutor` + `ExecutionContext`).** This is the in-plugin contract from ADR-0006. The Starlark executor implements `EmbeddedExecutor::invoke(ctx, request)`; `ctx` is the unified `ExecutionContext`. SDK identity/deadlines are read via `ctx.sdk_context()`; secrets via `ctx.environment()`. Checkpoint, event-wait, progress, and `invoke` live on the `ExecutionContext` (not on the SDK `Context`).
+1. **Host ↔ plugin (`serverless-runtime-sdk`).** The Composed Runtime plugin implements `RuntimeAdapter` and, per registered Starlark callable, builds a `FunctionHandler<I, O>` or `WorkflowHandler<I, O>` SDK impl that wraps the Starlark source. When the host calls `RuntimeAdapter::execute`, the plugin constructs an `ExecutionContext` (which carries the SDK's read-only `Context` and `Environment`) and dispatches via the in-plugin router. Index/timeline updates flow back to the host through `ServerlessRuntimeClient`; runtime errors are normalized to `ServerlessSdkError` / `RuntimeErrorCategory`.
+2. **Plugin ↔ embedded executor (`EmbeddedExecutor` + `ExecutionContext`).** This is the in-plugin contract from ADR-0001. The Starlark executor implements `EmbeddedExecutor::invoke(ctx, request)`; `ctx` is the unified `ExecutionContext`. SDK identity/deadlines are read via `ctx.sdk_context()`; secrets via `ctx.environment()`. Checkpoint, event-wait, progress, and `invoke` live on the `ExecutionContext` (not on the SDK `Context`).
 3. **Executor ↔ user code (the in-language `ctx.*`).** Starlark user code sees a thin in-language wrapper. Every Starlark `ctx.*` call below maps onto a single `ExecutionContext` primitive — the SDK never appears in Starlark code:
 
-| Starlark in-language surface | `ExecutionContext` primitive (ADR-0006) |
+| Starlark in-language surface | `ExecutionContext` primitive (ADR-0001) |
 |------------------------------|-----------------------------------------|
 | `ctx.checkpoint(label)` | `write_checkpoint(label, "<starlark-snapshot-schema-v1>", payload)` |
 | `ctx.events.wait(...)` resume | `is_replay()` + `read_checkpoint(label)` plus the plugin's event subscription store |
@@ -401,13 +401,13 @@ Calling `ctx.checkpoint(label)` requests the runtime to capture a durable snapsh
 - relevant variable bindings
 - workflow runtime metadata needed for resume
 
-The plugin may automatically take checkpoints at safe points, but `ctx.checkpoint(label)` allows user code to request one explicitly. Maps to `ExecutionContext::write_checkpoint` from [ADR-0006](0006-cpt-cf-serverless-runtime-adr-composed-runtime.md) under the Starlark executor's snapshot schema.
+The plugin may automatically take checkpoints at safe points, but `ctx.checkpoint(label)` allows user code to request one explicitly. Maps to `ExecutionContext::write_checkpoint` from [ADR-0001](0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md) under the Starlark executor's snapshot schema.
 
 #### Cross-callable invocation (`ctx.invoke`)
 
 - `ctx.invoke(callee_id, input) -> Promise<output>`
 
-Routes through the in-plugin router from [ADR-0006](0006-cpt-cf-serverless-runtime-adr-composed-runtime.md), so a Starlark callable can invoke any other embedded callable in the same plugin — Starlark, native Rust, or future embedded languages (CEL, etc.) — without knowing the embedded executor or whether the callee runs in-process or in the plugin's managed-out-of-process variant. Cross-plugin invocations (for example, into a DSL/Temporal callable hosted in a separate plugin) go through the host's plugin-dispatch, not through this in-plugin router.
+Routes through the in-plugin router from [ADR-0001](0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md), so a Starlark callable can invoke any other embedded callable in the same plugin — Starlark, native Rust, or future embedded languages (CEL, etc.) — without knowing the embedded executor or whether the callee runs in-process or in the plugin's managed-out-of-process variant. `ctx.invoke` does **not** reach a callable hosted in a different plugin — `ExecutionContext::invoke` raises "callable not found" for any callee not registered with this plugin. Cross-plugin composition, when needed, is arranged at the host orchestration layer (the SDK exposes no plugin→host outbound-routing path today); see [ADR-0001](0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md) Non-goals.
 
 ### Workflow orchestration (`ctx.steps`)
 
@@ -664,8 +664,10 @@ def main(ctx, input):
 
 ## Traceability
 
-- **PRD**: [PRD.md](../PRD.md)
-- **DESIGN**: [DESIGN.md](../DESIGN.md)
+- **Plugin PRD**: [../PRD.md](../PRD.md)
+- **Plugin DESIGN**: [../DESIGN.md](../DESIGN.md)
+- **Parent gear PRD**: [../../../../docs/PRD.md](../../../../docs/PRD.md)
+- **Parent gear DESIGN**: [../../../../docs/DESIGN.md](../../../../docs/DESIGN.md)
 
 This decision directly addresses the following requirements and design elements:
 
