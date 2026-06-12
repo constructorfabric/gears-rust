@@ -109,8 +109,5 @@ k8s-openapi = { workspace = true, features = ["latest"], optional = true }
 chrono = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
-# End-to-end test of permission registration goes through a real
-# TypesRegistryService instance seeded from the canonical inventory.
-types-registry = { workspace = true }
 
 
