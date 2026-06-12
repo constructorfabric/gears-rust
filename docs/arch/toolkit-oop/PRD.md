@@ -1,4 +1,4 @@
-# PRD — ModKit Distributed Modules
+# PRD — ToolKit Distributed Gears
 
 <!--
 =============================================================================
@@ -23,34 +23,34 @@ STANDARDS ALIGNMENT:
 
 ### 1.1 Purpose
 
-This PRD defines how ModKit modules run as separate OS processes (on-premise) or Kubernetes pods while maintaining full
-developer transparency — the same module code, the same ClientHub resolution, and the same OperationBuilder usage
-regardless of the deployment target. The Platform Host process is managed by the **Flight Control** system module, which
-orchestrates module lifecycle, discovery, and gateway registration.
+This PRD defines how ToolKit gears run as separate OS processes (on-premise) or Kubernetes pods while maintaining full
+developer transparency — the same gear code, the same ClientHub resolution, and the same OperationBuilder usage
+regardless of the deployment target. The Platform Host process is managed by the **Flight Control** system gear, which
+orchestrates gear lifecycle, discovery, and gateway registration.
 
 ### 1.2 Background / Problem Statement
 
-Today all ModKit modules run in a single process managed by `HostRuntime`. While this "embedded" model is simple and
-performant, it creates hard limits: a single module crash can take down the entire platform, horizontal scaling requires
-replicating the full process, and language-locked modules cannot participate.
+Today all ToolKit gears run in a single process managed by `HostRuntime`. While this "embedded" model is simple and
+performant, it creates hard limits: a single gear crash can take down the entire platform, horizontal scaling requires
+replicating the full process, and language-locked gears cannot participate.
 
-The existing OoP bootstrap (`libs/modkit/src/bootstrap/oop.rs`) provides a starting point — it connects to
-`DirectoryService`, sends heartbeats, and runs the module lifecycle. However, several critical capabilities are missing:
-OoP modules have no HTTP server of their own, `DirectoryService` has no REST endpoint resolution, `api-gateway` cannot
-reverse-proxy to remote modules, and there is no mechanism to auto-generate typed REST clients for cross-process calls.
+The existing OoP bootstrap (`libs/toolkit/src/bootstrap/oop.rs`) provides a starting point — it connects to
+`DirectoryService`, sends heartbeats, and runs the gear lifecycle. However, several critical capabilities are missing:
+OoP gears have no HTTP server of their own, `DirectoryService` has no REST endpoint resolution, `api-gateway` cannot
+reverse-proxy to remote gears, and there is no mechanism to auto-generate typed REST clients for cross-process calls.
 SecurityContext propagation also breaks across process boundaries because the `bearer_token` field is explicitly skipped
 during serialization.
 
 Industry platforms (Dapr, Spring Cloud, Quarkus, Akka) solve these problems through a combination of service discovery,
 sidecar or client-based communication, and gateway integration — all hidden behind framework abstractions so that
-application code remains deployment-agnostic. ModKit Distributed Modules bring the same capability to the platform.
+application code remains deployment-agnostic. ToolKit Distributed Gears bring the same capability to the platform.
 
 ### 1.3 Goals (Business Outcomes)
 
-- **G1**: Module developers write code once and deploy it in-process or out-of-process without source changes.
+- **G1**: Gear developers write code once and deploy it in-process or out-of-process without source changes.
 - **G2**: Platform operators select a named deployment profile and get a tested, documented topology — no combinatorial
   explosion of configuration options.
-- **G3**: OoP module REST calls add less than 5 ms overhead at p95, making out-of-process deployment viable for
+- **G3**: OoP gear REST calls add less than 5 ms overhead at p95, making out-of-process deployment viable for
   latency-sensitive workloads.
 - **G4**: The framework generates typed REST clients from OpenAPI specs, eliminating hand-written HTTP boilerplate and
   reducing integration bugs.
@@ -59,21 +59,21 @@ application code remains deployment-agnostic. ModKit Distributed Modules bring t
 
 | Term                            | Definition                                                                                                                                                                                                                                                                                                                                                           |
 |---------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Module                          | The minimal unit of independent deployment in ModKit. In Profile 1 (Embedded), modules are composed into a single process. In Profile 3 (K8s Native), each module is an independently deployable microservice (pod). A module has its own lifecycle, configuration, REST API (via OperationBuilder), and DB schema.                                                  |
-| Plugin                          | A module that implements a specific plugin trait (e.g., `AuthNResolverPluginClient`) for a host module. Plugins have no public REST API — they expose a private trait interface. Discovered via types-registry (GTS pattern), resolved via ClientHub scoped by GTS instance ID. Can be internal (in the host module crate) or a separate module (in-process or OoP). |
-| Plugin Host Module              | A module that defines a plugin trait in its SDK and discovers/consumes plugin implementations at runtime (e.g., authn-resolver, authz-resolver, mini-chat).                                                                                                                                                                                                          |
-| Flight Control                  | The Platform Host system module responsible for OoP module orchestration, lifecycle management, discovery coordination, and gateway registration. Replaces the informal term "master module".                                                                                                                                                                        |
-| Platform Host                   | The main process running the Flight Control module along with other system modules (grpc-hub, optional api-gateway, types-registry). In K8s Native profile, this is just another pod providing infrastructure services — not a central authority.                                                                                                                    |
-| OoP Worker                      | A separate OS process or k8s pod running one or more application modules.                                                                                                                                                                                                                                                                                            |
-| System Module                   | A module providing platform infrastructure (orchestrator, gateway, auth, types-registry).                                                                                                                                                                                                                                                                            |
-| Application Module              | A business module written by framework users.                                                                                                                                                                                                                                                                                                                        |
-| Deployment Profile              | A named, tested configuration of how modules are deployed (Embedded, Host+Workers, K8s Native).                                                                                                                                                                                                                                                                      |
-| ClientHub                       | A type-safe registry for inter-module client resolution. Supports unscoped resolution (one impl per trait) and scoped resolution (keyed by GTS instance ID for plugins). The backing implementation may be in-process or a generated remote client.                                                                                                                  |
-| OperationBuilder                | A ModKit DSL for declaring REST routes, request/response schemas, and OpenAPI metadata.                                                                                                                                                                                                                                                                              |
-| DirectoryService                | A gRPC-based service discovery registry. Modules register instances; consumers resolve endpoints.                                                                                                                                                                                                                                                                    |
+| Gear                          | The minimal unit of independent deployment in ToolKit. In Profile 1 (Embedded), gears are composed into a single process. In Profile 3 (K8s Native), each gear is an independently deployable microservice (pod). A gear has its own lifecycle, configuration, REST API (via OperationBuilder), and DB schema.                                                  |
+| Plugin                          | A gear that implements a specific plugin trait (e.g., `AuthNResolverPluginClient`) for a host gear. Plugins have no public REST API — they expose a private trait interface. Discovered via types-registry (GTS pattern), resolved via ClientHub scoped by GTS instance ID. Can be internal (in the host gear crate) or a separate gear (in-process or OoP). |
+| Plugin Host Gear              | A gear that defines a plugin trait in its SDK and discovers/consumes plugin implementations at runtime (e.g., authn-resolver, authz-resolver, mini-chat).                                                                                                                                                                                                          |
+| Flight Control                  | The Platform Host system gear responsible for OoP gear orchestration, lifecycle management, discovery coordination, and gateway registration. Replaces the informal term "master gear".                                                                                                                                                                        |
+| Platform Host                   | The main process running the Flight Control gear along with other system gears (grpc-hub, optional api-gateway, types-registry). In K8s Native profile, this is just another pod providing infrastructure services — not a central authority.                                                                                                                    |
+| OoP Worker                      | A separate OS process or k8s pod running one or more application gears.                                                                                                                                                                                                                                                                                            |
+| System Gear                   | A gear providing platform infrastructure (orchestrator, gateway, auth, types-registry).                                                                                                                                                                                                                                                                            |
+| Application Gear              | A business gear written by framework users.                                                                                                                                                                                                                                                                                                                        |
+| Deployment Profile              | A named, tested configuration of how gears are deployed (Embedded, Host+Workers, K8s Native).                                                                                                                                                                                                                                                                      |
+| ClientHub                       | A type-safe registry for inter-gear client resolution. Supports unscoped resolution (one impl per trait) and scoped resolution (keyed by GTS instance ID for plugins). The backing implementation may be in-process or a generated remote client.                                                                                                                  |
+| OperationBuilder                | A ToolKit DSL for declaring REST routes, request/response schemas, and OpenAPI metadata.                                                                                                                                                                                                                                                                              |
+| DirectoryService                | A gRPC-based service discovery registry. Gears register instances; consumers resolve endpoints.                                                                                                                                                                                                                                                                    |
 | SecurityContext                 | An internal representation of the authenticated user, including roles, permissions, and the original bearer token (`SecretString`, `#[serde(skip)]`).                                                                                                                                                                                                                |
-| GatewayProvider                 | An abstraction trait for registering and deregistering module routes with a gateway (built-in or external).                                                                                                                                                                                                                                                          |
-| Identity Broker / Login Service | A future platform subsystem (separate module) responsible for login orchestration (OAuth2/OIDC flows, social login), identity binding (external ID → `subject_id`), tenant resolution, and platform token issuance. Distinct from authn-resolver (token validation) and api-gateway (HTTP routing).                                                                  |
+| GatewayProvider                 | An abstraction trait for registering and deregistering gear routes with a gateway (built-in or external).                                                                                                                                                                                                                                                          |
+| Identity Broker / Login Service | A future platform subsystem (separate gear) responsible for login orchestration (OAuth2/OIDC flows, social login), identity binding (external ID → `subject_id`), tenant resolution, and platform token issuance. Distinct from authn-resolver (token validation) and api-gateway (HTTP routing).                                                                  |
 | Embedded Edge (Mode A)          | Deployment where the built-in api-gateway, identity broker, and authn/authz resolvers handle all external traffic. Self-contained on-prem baseline.                                                                                                                                                                                                                  |
 | External Edge (Mode B)          | Deployment where an external gateway (Tyk/Kong/Envoy) sits in front of the platform. Sub-modes: B1 (pass-through platform token) and B2 (token exchange via identity broker).                                                                                                                                                                                        |
 | Token Exchange                  | A pattern (Mode B2) where an external gateway authenticates a user via its own IdP, then calls a platform endpoint to convert the external credential into a platform-internal token.                                                                                                                                                                                |
@@ -82,11 +82,11 @@ application code remains deployment-agnostic. ModKit Distributed Modules bring t
 
 ### 2.1 Human Actors
 
-#### Module Developer
+#### Gear Developer
 
-**ID**: `cpt-cf-actor-module-dev`
+**ID**: `cpt-cf-actor-gear-dev`
 
-- **Role**: Writes application modules using ModKit. Expects to write the same code for in-process and OoP targets.
+- **Role**: Writes application gears using ToolKit. Expects to write the same code for in-process and OoP targets.
 - **Needs**: Transparent ClientHub resolution, automatic REST client generation, zero boilerplate for SecurityContext
   propagation.
 
@@ -95,7 +95,7 @@ application code remains deployment-agnostic. ModKit Distributed Modules bring t
 **ID**: `cpt-cf-actor-platform-op`
 
 - **Role**: Deploys and operates the platform. Chooses a deployment profile, configures networking, monitors health.
-- **Needs**: Named deployment profiles with clear documentation, straightforward configuration, observable module
+- **Needs**: Named deployment profiles with clear documentation, straightforward configuration, observable gear
   health.
 
 ### 2.2 System Actors
@@ -104,7 +104,7 @@ application code remains deployment-agnostic. ModKit Distributed Modules bring t
 
 **ID**: `cpt-cf-actor-platform-host`
 
-- **Role**: The main orchestrating process. Runs system modules, spawns OoP workers (on-premise), provides
+- **Role**: The main orchestrating process. Runs system gears, spawns OoP workers (on-premise), provides
   DirectoryService, and optionally runs the built-in api-gateway.
 
 #### External Gateway
@@ -112,18 +112,18 @@ application code remains deployment-agnostic. ModKit Distributed Modules bring t
 **ID**: `cpt-cf-actor-external-gw`
 
 - **Role**: An external API gateway (Kong, Tyk, Envoy) used in k8s deployments. Receives route registrations from the
-  Flight Control module and handles public API ingress, TLS termination, and auth.
+  Flight Control gear and handles public API ingress, TLS termination, and auth.
 
 #### OoP Worker
 
 **ID**: `cpt-cf-actor-oop-worker`
 
-- **Role**: A separate process or k8s pod running one or more application modules. Starts its own HTTP server, registers
+- **Role**: A separate process or k8s pod running one or more application gears. Starts its own HTTP server, registers
   with DirectoryService, and serves REST and optionally gRPC APIs.
 
 ## 3. Operational Concept & Environment
 
-### 3.1 Module-Specific Environment Constraints
+### 3.1 Gear-Specific Environment Constraints
 
 - OoP Workers MUST run on Linux, macOS, or Windows. K8s Native profile requires Linux containers.
 - On-premise single-host communication uses UDS (Unix) or named pipes (Windows). Multi-host communication uses TCP and
@@ -139,16 +139,16 @@ application code remains deployment-agnostic. ModKit Distributed Modules bring t
 **Priority 1:**
 
 - Deployment Profile 1: Embedded (current behavior, no changes needed)
-- Deployment Profile 3: K8s Native (each module = pod, external gateway, k8s DNS discovery)
+- Deployment Profile 3: K8s Native (each gear = pod, external gateway, k8s DNS discovery)
 - Deployment Profile 2 (simplified): Single-node on-premise with OoP Workers communicating via UDS/pipes
-- Auth at edge only — gateway validates JWT, OoP modules trust SecurityContext from trusted transport
-- Direct module-to-module REST communication (not routed through gateway)
+- Auth at edge only — gateway validates JWT, OoP gears trust SecurityContext from trusted transport
+- Direct gear-to-gear REST communication (not routed through gateway)
 - Public vs. internal API distinction in route registration
 - REST client generation from OpenAPI spec (build-time, Progenitor-inspired)
-- Gateway abstraction trait with built-in ModKit implementation
+- Gateway abstraction trait with built-in ToolKit implementation
 - SecurityContext HTTP propagation (two-header: `Authorization` + `x-secctx-bin`)
-- Internal module authentication: bootstrap token (Profile 2 single-node), K8s ServiceAccount tokens (Profile 3)
-- K8s packaging: Helm library chart (`modkit-common`), per-module charts, umbrella chart (`modkit-platform`) with preset
+- Internal gear authentication: bootstrap token (Profile 2 single-node), K8s ServiceAccount tokens (Profile 3)
+- K8s packaging: Helm library chart (`toolkit-common`), per-gear charts, umbrella chart (`toolkit-platform`) with preset
   values
 - Edge architecture (Mode A): Embedded Edge with built-in api-gateway + identity broker baseline
 - api-gateway scope constraint: must remain minimal HTTP edge (no login orchestration, no token issuance)
@@ -156,20 +156,20 @@ application code remains deployment-agnostic. ModKit Distributed Modules bring t
 **Priority 2:**
 
 - Deployment Profile 2 (full): Multi-node on-premise with mTLS
-- Multi-module OoP Workers (bundled binaries running several modules in one process)
-- OoP plugins: plugin modules running out-of-process with transport-transparent ClientHub resolution (Path C — hybrid
+- Multi-gear OoP Workers (bundled binaries running several gears in one process)
+- OoP plugins: plugin gears running out-of-process with transport-transparent ClientHub resolution (Path C — hybrid
   transport abstraction behind `ClientHub` scoped)
-- `#[modkit::plugin]` proc-macro for plugin module definition, generating both server (trait → REST/gRPC endpoints) and
+- `#[toolkit::plugin]` proc-macro for plugin gear definition, generating both server (trait → REST/gRPC endpoints) and
   client (remote trait impl) from the plugin trait
 - Circuit breaker and advanced resilience patterns in generated REST clients
-- Edge architecture (Mode B): External Edge with Tyk/Kong/external IdP integration, identity broker module, token
+- Edge architecture (Mode B): External Edge with Tyk/Kong/external IdP integration, identity broker gear, token
   exchange endpoint
 
 ### 4.2 Out of Scope
 
-- gRPC-only modules (existing pattern, unchanged)
+- gRPC-only gears (existing pattern, unchanged)
 - Streaming / SSE over OoP boundaries (future work)
-- Non-Rust OoP modules (architecture MUST NOT block this, but no implementation now)
+- Non-Rust OoP gears (architecture MUST NOT block this, but no implementation now)
 - Sidecar-based communication (Dapr-style)
 - Custom load-balancing strategies beyond round-robin
 
@@ -177,27 +177,27 @@ application code remains deployment-agnostic. ModKit Distributed Modules bring t
 
 ### 5.1 Developer Transparency
 
-#### Module Code Portability
+#### Gear Code Portability
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-developer-transparency`
 
-Module code MUST work identically in-process and out-of-process without source changes. The same `impl Module`,
+Gear code MUST work identically in-process and out-of-process without source changes. The same `impl Gear`,
 `register_rest()`, and `register_clients()` calls MUST produce correct behavior in all deployment profiles.
 
-- **Rationale**: Eliminates the cost of maintaining separate in-proc and OoP code paths. Module developers focus on
+- **Rationale**: Eliminates the cost of maintaining separate in-proc and OoP code paths. Gear developers focus on
   business logic, not deployment topology.
-- **Actors**: `cpt-cf-actor-module-dev`
+- **Actors**: `cpt-cf-actor-gear-dev`
 
 #### Client Resolution Transparency
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-client-transparency`
 
-Consumers MUST resolve module clients via ClientHub without knowing whether the target module is in-process or remote.
+Consumers MUST resolve gear clients via ClientHub without knowing whether the target gear is in-process or remote.
 The ClientHub MUST return an in-process implementation when available and a REST client when the target is remote.
 
-- **Rationale**: Decouples callers from deployment topology. A module can be moved from embedded to OoP without changing
+- **Rationale**: Decouples callers from deployment topology. A gear can be moved from embedded to OoP without changing
   any caller code.
-- **Actors**: `cpt-cf-actor-module-dev`
+- **Actors**: `cpt-cf-actor-gear-dev`
 
 ### 5.2 Communication
 
@@ -205,18 +205,18 @@ The ClientHub MUST return an in-process implementation when available and a REST
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-rest-primary`
 
-OoP modules MUST expose REST as their primary public API surface. Each OoP Worker MUST run its own HTTP server using the
-ModKit middleware stack (same OperationBuilder routes, same error format, same OpenAPI generation).
+OoP gears MUST expose REST as their primary public API surface. Each OoP Worker MUST run its own HTTP server using the
+ToolKit middleware stack (same OperationBuilder routes, same error format, same OpenAPI generation).
 
 - **Rationale**: REST is the universal integration protocol. It is debuggable (curl), tooling-rich (Postman, OpenAPI),
   and does not require proto compilation.
-- **Actors**: `cpt-cf-actor-module-dev`, `cpt-cf-actor-oop-worker`
+- **Actors**: `cpt-cf-actor-gear-dev`, `cpt-cf-actor-oop-worker`
 
-#### Direct Inter-Module Communication
+#### Direct Inter-Gear Communication
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-direct-communication`
 
-Inter-module calls MUST go directly from caller to target (resolved via DirectoryService), not through the API gateway.
+Inter-gear calls MUST go directly from caller to target (resolved via DirectoryService), not through the API gateway.
 The gateway is for external traffic only.
 
 - **Rationale**: Avoids an extra network hop and the gateway becoming a bottleneck for internal traffic. Aligns with
@@ -230,13 +230,13 @@ The gateway is for external traffic only.
 SecurityContext MUST be propagated across all OoP boundaries with the original bearer token intact. The propagation
 mechanism MUST use two HTTP headers: `Authorization: Bearer <jwt>` for the original token and
 `x-secctx-bin: <base64(encode_bin(SecurityContext))>` for the pre-parsed context (using the existing
-`modkit_security::encode_bin` with version byte + postcard). The `bearer_token` field (`Option<SecretString>`,
-`#[serde(skip)]`) is excluded from the binary encoding by design; the receiving module MUST reconstruct the full
+`toolkit_security::encode_bin` with version byte + postcard). The `bearer_token` field (`Option<SecretString>`,
+`#[serde(skip)]`) is excluded from the binary encoding by design; the receiving gear MUST reconstruct the full
 SecurityContext by merging both headers.
 
-- **Rationale**: Downstream modules may need the original token for delegation (e.g., calling external services on
+- **Rationale**: Downstream gears may need the original token for delegation (e.g., calling external services on
   behalf of the user). The two-header approach avoids modifying the existing `#[serde(skip)]` on `bearer_token` while
-  ensuring full context propagation. The existing `modkit-transport-grpc` already uses this `x-secctx-bin` key for gRPC
+  ensuring full context propagation. The existing `toolkit-transport-grpc` already uses this `x-secctx-bin` key for gRPC
   binary metadata; the HTTP variant adds base64 encoding.
 - **Actors**: `cpt-cf-actor-oop-worker`, `cpt-cf-actor-platform-host`
 
@@ -246,7 +246,7 @@ SecurityContext by merging both headers.
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-gateway-registration`
 
-Modules with public API MUST register their routes in the gateway. Route registration MUST go through the
+Gears with public API MUST register their routes in the gateway. Route registration MUST go through the
 GatewayProvider abstraction, not directly to api-gateway internals.
 
 - **Rationale**: In k8s, the gateway is external (Kong/Tyk). On-premise, it is the built-in api-gateway. A single
@@ -258,8 +258,8 @@ GatewayProvider abstraction, not directly to api-gateway internals.
 - [ ] `p1` - **ID**: `cpt-cf-fr-gateway-abstraction`
 
 Gateway integration MUST be abstracted behind a `GatewayProvider` trait supporting
-`register_routes(module, openapi, endpoint)` and `deregister_routes(module)`. The framework MUST provide a built-in
-implementation (`ModKitGatewayProvider`) that adds reverse-proxy routes to the api-gateway module.
+`register_routes(gear, openapi, endpoint)` and `deregister_routes(gear)`. The framework MUST provide a built-in
+implementation (`ToolKitGatewayProvider`) that adds reverse-proxy routes to the api-gateway gear.
 
 - **Rationale**: Prevents vendor lock-in to the built-in gateway. Enables k8s deployments with external gateways without
   framework changes.
@@ -269,8 +269,8 @@ implementation (`ModKitGatewayProvider`) that adds reverse-proxy routes to the a
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-k8s-native`
 
-Modules MUST be deployable as independent Kubernetes pods with k8s-native discovery (DNS:
-`{module}.{namespace}.svc.cluster.local`). DirectoryService MAY be used alongside k8s DNS but MUST NOT be required for
+Gears MUST be deployable as independent Kubernetes pods with k8s-native discovery (DNS:
+`{gear}.{namespace}.svc.cluster.local`). DirectoryService MAY be used alongside k8s DNS but MUST NOT be required for
 basic service resolution in k8s.
 
 - **Rationale**: K8s provides built-in service discovery and load balancing. Requiring a custom DirectoryService adds
@@ -283,12 +283,12 @@ basic service resolution in k8s.
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-rest-client-gen`
 
-The framework MUST provide a mechanism to generate typed REST clients from a module's OpenAPI spec. Generated clients
-MUST implement the module's SDK trait, use `modkit-http` for transport, and propagate SecurityContext automatically.
+The framework MUST provide a mechanism to generate typed REST clients from a gear's OpenAPI spec. Generated clients
+MUST implement the gear's SDK trait, use `toolkit-http` for transport, and propagate SecurityContext automatically.
 
 - **Rationale**: Hand-written HTTP clients are error-prone, tedious, and diverge from the spec over time.
   Auto-generation from OpenAPI ensures type-safe, always-in-sync clients.
-- **Actors**: `cpt-cf-actor-module-dev`
+- **Actors**: `cpt-cf-actor-gear-dev`
 
 ### 5.5 Lifecycle
 
@@ -296,43 +296,43 @@ MUST implement the module's SDK trait, use `modkit-http` for transport, and prop
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-eventual-readiness`
 
-The ModKit OoP runtime MUST manage the full module startup lifecycle without module developer involvement:
+The ToolKit OoP runtime MUST manage the full gear startup lifecycle without gear developer involvement:
 
 1. Start the HTTP server immediately and serve liveness probe (`/healthz` → 200).
 2. In the background, retry registration with Flight Control (DirectoryService) using exponential backoff until
    successful. Re-register on connection loss.
-3. In the background, resolve all dependencies declared in the module's `deps` via DirectoryService. Wire REST clients
+3. In the background, resolve all dependencies declared in the gear's `deps` via DirectoryService. Wire REST clients
    into ClientHub as dependencies become available.
 4. Serve readiness probe (`/readyz`) returning 503 with unresolved dependency list until all critical `deps` are
    resolved; then 200.
-5. Module developers MUST NOT write retry loops, health-check polling, or registration code. The `deps` declaration in
-   `#[modkit::module(deps = [...])]` is the only input required.
+5. Gear developers MUST NOT write retry loops, health-check polling, or registration code. The `deps` declaration in
+   `#[toolkit::gear(deps = [...])]` is the only input required.
 
-Modules with no `deps` (e.g., Flight Control, types-registry) become ready immediately after `start()`.
+Gears with no `deps` (e.g., Flight Control, types-registry) become ready immediately after `start()`.
 
-- **Rationale**: Kubernetes-native — no init containers, no deployment ordering, no single point of failure. Modules
+- **Rationale**: Kubernetes-native — no init containers, no deployment ordering, no single point of failure. Gears
   start independently and converge to ready state. Readiness probes gate traffic naturally. The same `deps` metadata
   already used for topo-sort in Profile 1 drives readiness gating in Profiles 2 and 3.
 - **Actors**: `cpt-cf-actor-oop-worker`
 
-#### Internal Module Authentication
+#### Internal Gear Authentication
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-internal-auth`
 
-System-level communication between modules (registration, heartbeats, background inter-module calls without user
-context) MUST be authenticated. The ModKit runtime MUST provide profile-specific authentication transparent to module
+System-level communication between gears (registration, heartbeats, background inter-gear calls without user
+context) MUST be authenticated. The ToolKit runtime MUST provide profile-specific authentication transparent to gear
 developers:
 
 - **Profile 2 (single-node)**: Platform Host generates an ephemeral bootstrap token at startup and passes it to workers
   via env var. All system calls carry this token. Flight Control validates it.
-- **Profile 3 (K8s)**: Modules use projected K8s ServiceAccount tokens (audience: `modkit-internal`). Flight Control
+- **Profile 3 (K8s)**: Gears use projected K8s ServiceAccount tokens (audience: `toolkit-internal`). Flight Control
   validates via TokenReview API.
 - **Profile 2 (multi-node, P2)**: mTLS with platform-managed certificates.
 
-Module developers MUST NOT implement internal auth logic. The `InternalCredential` abstraction and
-`attach_internal_auth` / `validate_internal_auth` are managed entirely by the ModKit runtime.
+Gear developers MUST NOT implement internal auth logic. The `InternalCredential` abstraction and
+`attach_internal_auth` / `validate_internal_auth` are managed entirely by the ToolKit runtime.
 
-- **Rationale**: Without system-level auth, any process that can reach DirectoryService can register as a module or
+- **Rationale**: Without system-level auth, any process that can reach DirectoryService can register as a gear or
   deregister others. User-initiated auth (ADR-0002, SecurityContext) does not cover system calls. Each profile has a
   different threat model requiring a different mechanism, but the API must be uniform.
 - **Actors**: `cpt-cf-actor-oop-worker`, `cpt-cf-actor-platform-host`
@@ -352,15 +352,15 @@ graceful shutdown. The Platform Host MUST detect unresponsive workers via heartb
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-api-visibility`
 
-Modules MUST be able to mark API endpoints as public (registered in gateway for external access) or internal (available
-only for inter-module communication via DirectoryService). The default MUST be internal. The existing
+Gears MUST be able to mark API endpoints as public (registered in gateway for external access) or internal (available
+only for inter-gear communication via DirectoryService). The default MUST be internal. The existing
 `OperationBuilder.public()` / `OperationBuilder.authenticated()` mechanism and the resulting `OperationSpec.is_public`
 field MUST be used to drive this distinction.
 
-- **Rationale**: Not all module APIs should be exposed to external consumers. Separating public and internal APIs
+- **Rationale**: Not all gear APIs should be exposed to external consumers. Separating public and internal APIs
   reduces attack surface and keeps the gateway configuration clean. The `OperationBuilder` already captures this intent
   via `is_public`.
-- **Actors**: `cpt-cf-actor-module-dev`, `cpt-cf-actor-platform-op`
+- **Actors**: `cpt-cf-actor-gear-dev`, `cpt-cf-actor-platform-op`
 
 ### 5.6 Plugin Transparency (P2)
 
@@ -368,29 +368,29 @@ field MUST be used to drive this distinction.
 
 - [ ] `p2` - **ID**: `cpt-cf-fr-plugin-transparency`
 
-Plugin host modules MUST resolve plugin implementations via `ClientHub` scoped (
+Plugin host gears MUST resolve plugin implementations via `ClientHub` scoped (
 `try_get_scoped::<dyn PluginTrait>(gts_id)`) without knowing whether the plugin is in-process or remote. When a plugin
-module runs OoP, the framework MUST provide a transport-generated client that implements the plugin trait and routes
-calls over REST or gRPC to the remote plugin. The existing GTS-based discovery (types-registry + `BaseModkitPluginV1` +
+gear runs OoP, the framework MUST provide a transport-generated client that implements the plugin trait and routes
+calls over REST or gRPC to the remote plugin. The existing GTS-based discovery (types-registry + `BaseToolkitPluginV1` +
 `GtsPluginSelector`) MUST continue to work unchanged.
 
-- **Rationale**: Plugin host modules (authn-resolver, authz-resolver, mini-chat) should not contain transport-specific
-  code. The same `choose_plugin_instance` + `try_get_scoped` pattern must work whether the plugin is an internal module
+- **Rationale**: Plugin host gears (authn-resolver, authz-resolver, mini-chat) should not contain transport-specific
+  code. The same `choose_plugin_instance` + `try_get_scoped` pattern must work whether the plugin is an internal gear
   or a remote OoP process.
-- **Actors**: `cpt-cf-actor-module-dev`
+- **Actors**: `cpt-cf-actor-gear-dev`
 
 #### Plugin Macro
 
 - [ ] `p2` - **ID**: `cpt-cf-fr-plugin-macro`
 
-The framework MUST provide a `#[modkit::plugin]` proc-macro (or equivalent codegen) that, given a plugin trait
+The framework MUST provide a `#[toolkit::plugin]` proc-macro (or equivalent codegen) that, given a plugin trait
 definition, generates: (a) server-side endpoints exposing the trait methods over the chosen transport (REST or gRPC), (
-b) a client-side implementation of the trait that calls those endpoints via `modkit-http` or tonic, and (c) the
+b) a client-side implementation of the trait that calls those endpoints via `toolkit-http` or tonic, and (c) the
 `register_scoped` wiring for ClientHub. This eliminates hand-written boilerplate for OoP plugin authors.
 
 - **Rationale**: Without codegen, every OoP plugin would require manually writing REST endpoints, a client
   implementation, and the ClientHub registration — tripling the effort compared to in-process plugins.
-- **Actors**: `cpt-cf-actor-module-dev`
+- **Actors**: `cpt-cf-actor-gear-dev`
 
 ### 5.7 Edge Architecture
 
@@ -398,7 +398,7 @@ b) a client-side implementation of the trait that calls those endpoints via `mod
 
 - [ ] `p1` (Mode A), `p2` (Mode B) - **ID**: `cpt-cf-fr-edge-modes`
 
-The platform MUST support two named edge modes without requiring changes to internal module code:
+The platform MUST support two named edge modes without requiring changes to internal gear code:
 
 - **Mode A (Embedded Edge)**: self-contained deployment with the built-in api-gateway, authn-resolver, authz-resolver,
   and identity broker handling all external traffic. This is the on-prem baseline.
@@ -408,8 +408,8 @@ The platform MUST support two named edge modes without requiring changes to inte
     - **B2 (token exchange)**: external gateway authenticates via its own IdP, then exchanges the external credential
       for a platform token via a dedicated exchange endpoint.
 
-In both modes, downstream modules receive the same `SecurityContext`. The edge mode is transparent to application
-modules.
+In both modes, downstream gears receive the same `SecurityContext`. The edge mode is transparent to application
+gears.
 
 - **Rationale**: On-prem customers need a self-contained stack. Enterprise customers have existing gateway and IdP
   infrastructure that the platform must integrate with rather than replace. Mandating a single edge topology would force
@@ -429,13 +429,13 @@ API analytics or usage metering, or advanced traffic management (circuit breaker
 - **Rationale**: The built-in gateway is maintained by a small team. Turning it into a Tyk/Kong competitor is neither
   feasible nor desirable. Login orchestration is fundamentally different from HTTP routing and must live in a dedicated
   subsystem.
-- **Actors**: `cpt-cf-actor-module-dev`, `cpt-cf-actor-platform-op`
+- **Actors**: `cpt-cf-actor-gear-dev`, `cpt-cf-actor-platform-op`
 
 #### Identity Broker / Login Service
 
 - [ ] `p2` - **ID**: `cpt-cf-fr-identity-broker`
 
-The platform MUST define a separate identity broker / login service subsystem (future module) responsible for: login
+The platform MUST define a separate identity broker / login service subsystem (future gear) responsible for: login
 orchestration (OAuth2/OIDC flows, social login via GitHub/Google/etc., local username/password), identity binding (
 mapping external identity → platform `subject_id`), tenant resolution (`subject_id` → `tenant_id`, membership
 management), and platform token issuance. The identity broker is the only component that creates platform tokens —
@@ -465,7 +465,7 @@ Tyk-specific or Kong-specific).
 
 ## 6. Non-Functional Requirements
 
-### 6.1 Module-Specific NFRs
+### 6.1 Gear-Specific NFRs
 
 #### OoP Call Latency
 
@@ -485,19 +485,19 @@ and under 10 ms at p95 within a k8s cluster.
 
 - [ ] `p1` - **ID**: `cpt-cf-nfr-no-double-auth`
 
-JWT validation MUST happen exactly once per external request at the gateway edge. OoP modules MUST NOT re-validate the
+JWT validation MUST happen exactly once per external request at the gateway edge. OoP gears MUST NOT re-validate the
 JWT; they MUST trust the SecurityContext received from the trusted transport.
 
 This realizes a classical **DMZ architecture**: the gateway is the perimeter that performs JWT cryptographic validation
-and translates external identity into an internal envelope (`SecurityContext`); OoP modules live in the trusted
+and translates external identity into an internal envelope (`SecurityContext`); OoP gears live in the trusted
 interior and consume the pre-validated envelope. The interior is "trusted" only in the same sense a DMZ interior is —
-mTLS / k8s NetworkPolicy / UDS permissions (per `cpt-cf-adr-internal-module-auth`) restrict who can deliver bytes to a
-module, and the `InternalAuthMiddleware` verifies that the caller is itself a trusted ModKit peer **before** the
+mTLS / k8s NetworkPolicy / UDS permissions (per `cpt-cf-adr-internal-gear-auth`) restrict who can deliver bytes to a
+gear, and the `InternalAuthMiddleware` verifies that the caller is itself a trusted ToolKit peer **before** the
 `x-secctx-bin` is decoded (see DESIGN.md § Validation order).
 
-- **Threshold**: Zero JWT signature verifications inside OoP modules for gateway-proxied requests.
+- **Threshold**: Zero JWT signature verifications inside OoP gears for gateway-proxied requests.
 - **Rationale**: JWT validation involves asymmetric crypto (RS256/ES256). Performing it at every hop wastes CPU and
-  increases latency. The DMZ pattern concentrates the expensive primitive at the edge and lets interior modules be
+  increases latency. The DMZ pattern concentrates the expensive primitive at the edge and lets interior gears be
   cheap, type-safe consumers of an already-trusted envelope.
 - **Verification Method**: Integration test asserting that authn-resolver is called exactly once per external request
   chain.
@@ -510,10 +510,10 @@ module, and the `InternalAuthMiddleware` verifies that the caller is itself a tr
 When an OoP dependency is unavailable, the caller MUST receive an HTTP 503 (Service Unavailable) response with a Problem
 Details body. The caller process MUST NOT crash.
 
-- **Threshold**: 100% of calls to an unavailable OoP module return 503 within the configured timeout.
+- **Threshold**: 100% of calls to an unavailable OoP gear return 503 within the configured timeout.
 - **Rationale**: Cascading failures across OoP boundaries would negate the isolation benefits of out-of-process
   deployment.
-- **Verification Method**: Integration test: stop a target OoP module, verify caller returns 503.
+- **Verification Method**: Integration test: stop a target OoP gear, verify caller returns 503.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation
 
 ## 7. Public Library Interfaces
@@ -526,7 +526,7 @@ Details body. The caller process MUST NOT crash.
 
 - **Type**: Rust trait
 - **Stability**: unstable (will stabilize after Profile 2 and Profile 3 are validated)
-- **Description**: Abstraction for registering/deregistering module routes with a gateway (built-in or external).
+- **Description**: Abstraction for registering/deregistering gear routes with a gateway (built-in or external).
 - **Breaking Change Policy**: Minor version bump during unstable phase; major version bump after stabilization.
 
 #### REST Client Codegen
@@ -535,7 +535,7 @@ Details body. The caller process MUST NOT crash.
 
 - **Type**: Build-time code generation (`build.rs`)
 - **Stability**: unstable
-- **Description**: Generates typed `RestXxxClient` structs implementing module SDK traits from OpenAPI specs.
+- **Description**: Generates typed `RestXxxClient` structs implementing gear SDK traits from OpenAPI specs.
 - **Breaking Change Policy**: Generated code API may change during unstable phase.
 
 #### SecurityContext HTTP Propagation
@@ -568,7 +568,7 @@ Details body. The caller process MUST NOT crash.
 
 ## 8. Use Cases
 
-#### Deploy Module as OoP Worker (On-Premise)
+#### Deploy Gear as OoP Worker (On-Premise)
 
 - [ ] `p1` - **ID**: `cpt-cf-usecase-deploy-oop-onprem`
 
@@ -577,28 +577,28 @@ Details body. The caller process MUST NOT crash.
 **Preconditions**:
 
 - Platform Host is running with DirectoryService and api-gateway.
-- Module binary is available on the same host.
+- Gear binary is available on the same host.
 
 **Main Flow**:
 
-1. Platform operator configures the module in the deployment manifest as OoP.
+1. Platform operator configures the gear in the deployment manifest as OoP.
 2. Platform Host spawns the OoP Worker process.
 3. OoP Worker starts its HTTP server and registers with DirectoryService (REST endpoint + OpenAPI spec).
-4. Platform Host's api-gateway adds reverse-proxy routes for the module's public API.
-5. External clients access the module through the gateway; other modules call it directly via ClientHub.
+4. Platform Host's api-gateway adds reverse-proxy routes for the gear's public API.
+5. External clients access the gear through the gateway; other gears call it directly via ClientHub.
 
 **Postconditions**:
 
-- Module is serving REST API on its own HTTP port.
-- Gateway routes external traffic to the module.
-- DirectoryService holds the module's endpoint for inter-module resolution.
+- Gear is serving REST API on its own HTTP port.
+- Gateway routes external traffic to the gear.
+- DirectoryService holds the gear's endpoint for inter-gear resolution.
 
 **Alternative Flows**:
 
-- **Worker fails to start**: Platform Host logs the error and marks the module as unhealthy. Gateway does not add
+- **Worker fails to start**: Platform Host logs the error and marks the gear as unhealthy. Gateway does not add
   routes.
 
-#### Deploy Module as K8s Pod
+#### Deploy Gear as K8s Pod
 
 - [ ] `p1` - **ID**: `cpt-cf-usecase-deploy-k8s`
 
@@ -606,79 +606,79 @@ Details body. The caller process MUST NOT crash.
 
 **Preconditions**:
 
-- Kubernetes cluster with ModKit operator or Helm chart deployed.
+- Kubernetes cluster with ToolKit operator or Helm chart deployed.
 - External gateway (Kong/Tyk) is configured.
 
 **Main Flow**:
 
-1. Platform operator applies the module's Deployment + Service manifest.
-2. K8s schedules the pod; the module starts its HTTP server.
-3. Module registers with DirectoryService (if available) or relies on k8s DNS.
-4. Module's public routes are registered in the external gateway via GatewayProvider.
-5. External clients access the module through the gateway; other modules resolve via k8s DNS or DirectoryService.
+1. Platform operator applies the gear's Deployment + Service manifest.
+2. K8s schedules the pod; the gear starts its HTTP server.
+3. Gear registers with DirectoryService (if available) or relies on k8s DNS.
+4. Gear's public routes are registered in the external gateway via GatewayProvider.
+5. External clients access the gear through the gateway; other gears resolve via k8s DNS or DirectoryService.
 
 **Postconditions**:
 
-- Module pod is running with a k8s Service exposing its HTTP port.
-- External gateway routes public traffic to the module's Service.
+- Gear pod is running with a k8s Service exposing its HTTP port.
+- External gateway routes public traffic to the gear's Service.
 
 **Alternative Flows**:
 
 - **Pod crashes**: K8s restarts the pod. GatewayProvider deregisters stale routes on health check failure.
 
-#### Inter-Module Call Across Process Boundary
+#### Inter-Gear Call Across Process Boundary
 
-- [ ] `p1` - **ID**: `cpt-cf-usecase-intermodule-oop`
+- [ ] `p1` - **ID**: `cpt-cf-usecase-intergear-oop`
 
-**Actor**: `cpt-cf-actor-module-dev`
+**Actor**: `cpt-cf-actor-gear-dev`
 
 **Preconditions**:
 
-- Module A and Module B are running (in any deployment profile).
-- Module A has Module B's SDK crate with a generated REST client.
+- Gear A and Gear B are running (in any deployment profile).
+- Gear A has Gear B's SDK crate with a generated REST client.
 
 **Main Flow**:
 
-1. Module A calls `client_hub.get::<ModuleBClient>()`.
-2. ClientHub returns a `RestModuleBClient` (resolved via DirectoryService or k8s DNS).
-3. Module A invokes a method on the client. The generated client serializes the request, attaches SecurityContext
-   headers, and sends an HTTP request via `modkit-http`.
-4. Module B's HTTP server receives the request, reconstructs SecurityContext from headers, executes the handler, and
+1. Gear A calls `client_hub.get::<GearBClient>()`.
+2. ClientHub returns a `RestGearBClient` (resolved via DirectoryService or k8s DNS).
+3. Gear A invokes a method on the client. The generated client serializes the request, attaches SecurityContext
+   headers, and sends an HTTP request via `toolkit-http`.
+4. Gear B's HTTP server receives the request, reconstructs SecurityContext from headers, executes the handler, and
    returns the response.
-5. The generated client deserializes the response and returns a typed result to Module A.
+5. The generated client deserializes the response and returns a typed result to Gear A.
 
 **Postconditions**:
 
-- Module A received a typed response from Module B.
+- Gear A received a typed response from Gear B.
 - SecurityContext was propagated with the original bearer token intact.
 
 **Alternative Flows**:
 
-- **Module B is unavailable**: `modkit-http` returns a connection error. The generated client maps it to an HTTP 503
+- **Gear B is unavailable**: `toolkit-http` returns a connection error. The generated client maps it to an HTTP 503
   Problem response.
 
 ## 9. Acceptance Criteria
 
-- [ ] A module compiled once runs both in-process (Profile 1) and as an OoP Worker (Profile 2) without source changes.
-- [ ] ClientHub resolution returns a working REST client for an OoP module and an in-process client for an embedded
-  module, using identical calling code.
+- [ ] A gear compiled once runs both in-process (Profile 1) and as an OoP Worker (Profile 2) without source changes.
+- [ ] ClientHub resolution returns a working REST client for an OoP gear and an in-process client for an embedded
+  gear, using identical calling code.
 - [ ] An external HTTP request passes through api-gateway to an OoP Worker with SecurityContext fully reconstructed (
   including bearer_token).
-- [ ] A generated REST client successfully calls an OoP module and returns a typed response.
+- [ ] A generated REST client successfully calls an OoP gear and returns a typed response.
 - [ ] OoP REST call overhead is below 5 ms at p95 on localhost (benchmark with echo handler).
 - [ ] Stopping an OoP Worker results in 503 responses to its callers within the heartbeat timeout, not a crash.
-- [ ] A module deployed as a k8s pod is reachable via k8s DNS and has its public routes registered in the external
+- [ ] A gear deployed as a k8s pod is reachable via k8s DNS and has its public routes registered in the external
   gateway.
 
 ## 10. Dependencies
 
 | Dependency                             | Description                                                              | Criticality |
 |----------------------------------------|--------------------------------------------------------------------------|-------------|
-| modkit-http                            | HTTP client library used as transport for generated REST clients         | p1          |
-| DirectoryService / module-orchestrator | Service discovery for OoP Workers                                        | p1          |
+| toolkit-http                            | HTTP client library used as transport for generated REST clients         | p1          |
+| DirectoryService / gear-orchestrator | Service discovery for OoP Workers                                        | p1          |
 | api-gateway                            | Built-in gateway for on-premise profiles; reverse-proxies to OoP Workers | p1          |
 | authn-resolver                         | JWT validation at the gateway edge                                       | p1          |
-| OperationBuilder / utoipa              | OpenAPI spec generation from module routes                               | p1          |
+| OperationBuilder / utoipa              | OpenAPI spec generation from gear routes                               | p1          |
 | postcard                               | Binary serialization for SecurityContext in `x-secctx-bin` header        | p1          |
 | Kubernetes 1.26+                       | Required for Profile 3 (K8s Native)                                      | p1          |
 | External gateway (Kong/Tyk)            | Required for Profile 3 public API ingress                                | p2          |
@@ -690,10 +690,10 @@ Details body. The caller process MUST NOT crash.
 - The existing `OperationBuilder` (type-state builder pattern with compile-time enforcement of handler + response +
   auth) already generates correct OpenAPI 3.x specs via `utoipa` and `OpenApiRegistryImpl.build_openapi()`. No major
   changes to OpenAPI generation are needed.
-- Module SDK crates already define client traits (e.g., `UsersClient`). Generated REST clients implement these existing
+- Gear SDK crates already define client traits (e.g., `UsersClient`). Generated REST clients implement these existing
   traits.
-- `postcard` serialization of SecurityContext is deterministic and backward-compatible across module versions. The
-  existing `modkit_security::bin_codec` with `SECCTX_BIN_VERSION = 1` provides versioned encoding.
+- `postcard` serialization of SecurityContext is deterministic and backward-compatible across gear versions. The
+  existing `toolkit_security::bin_codec` with `SECCTX_BIN_VERSION = 1` provides versioned encoding.
 - `SecurityContext` will gain a `set_bearer_token(&mut self, token: SecretString)` method for post-deserialization token
   injection (currently only settable via builder).
 - External gateways (Kong, Tyk) expose a programmatic admin API sufficient for dynamic route registration.
@@ -702,9 +702,9 @@ Details body. The caller process MUST NOT crash.
 
 | Risk                                                             | Impact                                                    | Mitigation                                                                      |
 |------------------------------------------------------------------|-----------------------------------------------------------|---------------------------------------------------------------------------------|
-| OpenAPI spec drift between module and generated client           | Type mismatches at runtime, deserialization failures      | Build-time codegen from the same spec source; CI validates spec freshness       |
+| OpenAPI spec drift between gear and generated client           | Type mismatches at runtime, deserialization failures      | Build-time codegen from the same spec source; CI validates spec freshness       |
 | SecurityContext binary format changes break cross-version calls  | Auth failures during rolling upgrades                     | Version the `x-secctx-bin` encoding; support reading N-1 format                 |
-| OoP latency exceeds threshold under high load                    | Degraded user experience, profile becomes impractical     | Benchmark early; connection pooling in modkit-http; consider gRPC for hot paths |
+| OoP latency exceeds threshold under high load                    | Degraded user experience, profile becomes impractical     | Benchmark early; connection pooling in toolkit-http; consider gRPC for hot paths |
 | External gateway admin APIs differ significantly between vendors | High implementation cost for each GatewayProvider adapter | Start with one adapter (Kong); keep the trait surface minimal                   |
 | UDS/named pipe communication limits on Windows                   | Reduced functionality on Windows on-premise               | Test on Windows CI early; fall back to TCP localhost if needed                  |
 
@@ -713,11 +713,11 @@ Details body. The caller process MUST NOT crash.
 - What is the exact format for the `x-secctx-bin` header — raw base64 or base64url? Does it need a version prefix byte?
 - How should OpenAPI specs be distributed to SDK crates at build time — committed JSON files, a shared spec registry, or
   a build-time HTTP fetch?
-- For k8s Profile 3, should Flight Control provide a CRD + operator for module deployment, or rely on standard
+- For k8s Profile 3, should Flight Control provide a CRD + operator for gear deployment, or rely on standard
   Deployment + Service manifests with a Helm chart?
 - Should the GatewayProvider trait be async or synchronous? (Likely async given network I/O, but impacts trait object
   usage.)
-- How do we handle API versioning across OoP module upgrades (rolling deployments with breaking API changes)?
+- How do we handle API versioning across OoP gear upgrades (rolling deployments with breaking API changes)?
 
 ## 14. Traceability
 

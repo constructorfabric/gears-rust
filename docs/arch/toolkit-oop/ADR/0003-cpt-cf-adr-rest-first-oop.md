@@ -3,7 +3,7 @@ status: accepted
 date: 2026-04-07
 ---
 
-# REST-First OoP Communication — Each Module Runs Its Own HTTP Server
+# REST-First OoP Communication — Each Gear Runs Its Own HTTP Server
 
 **ID**: `cpt-cf-adr-rest-first-oop`
 
@@ -13,19 +13,19 @@ date: 2026-04-07
 
 ## Context and Problem Statement
 
-Earlier ModKit OoP designs (see RESTOverGRPC.MD gist) proposed a REST-over-gRPC bridge pattern where OoP modules would
+Earlier ToolKit OoP designs (see RESTOverGRPC.MD gist) proposed a REST-over-gRPC bridge pattern where OoP gears would
 expose gRPC only, and a `RestBridge` layer would translate REST calls into `UnaryRequest`/`UnaryResponse` proto
-messages. This approach required every OoP module to depend on tonic and proto definitions, added a translation layer
-that obscured errors, and made debugging with standard HTTP tools (curl, Postman) difficult. Should OoP modules
+messages. This approach required every OoP gear to depend on tonic and proto definitions, added a translation layer
+that obscured errors, and made debugging with standard HTTP tools (curl, Postman) difficult. Should OoP gears
 communicate via a gRPC bridge, native REST, or a sidecar proxy?
 
 ## Decision Drivers
 
 * Debuggability: REST requests are inspectable with curl, browser devtools, and standard HTTP tooling. gRPC requires
   specialized tools (grpcurl, Postman gRPC).
-* Language flexibility: Future non-Rust OoP modules can serve REST without adopting tonic/proto. REST is the universal
+* Language flexibility: Future non-Rust OoP gears can serve REST without adopting tonic/proto. REST is the universal
   interop protocol.
-* Existing investment: OperationBuilder already generates REST routes and OpenAPI specs. Modules already define their
+* Existing investment: OperationBuilder already generates REST routes and OpenAPI specs. Gears already define their
   public API as REST endpoints.
 * Proto dependency: The gRPC bridge approach requires `UnaryRequest`/`UnaryResponse` proto definitions and a custom
   codec, adding build complexity.
@@ -34,28 +34,28 @@ communicate via a gRPC bridge, native REST, or a sidecar proxy?
 
 ## Considered Options
 
-* **Option A**: REST-over-gRPC bridge — OoP modules expose gRPC; a bridge translates REST ↔ gRPC.
-* **Option B**: Native REST — each OoP module runs its own Axum HTTP server with the full ModKit middleware stack.
-* **Option C**: Sidecar proxy (Dapr-style) — a sidecar process handles inter-module communication; modules talk to
+* **Option A**: REST-over-gRPC bridge — OoP gears expose gRPC; a bridge translates REST ↔ gRPC.
+* **Option B**: Native REST — each OoP gear runs its own Axum HTTP server with the full ToolKit middleware stack.
+* **Option C**: Sidecar proxy (Dapr-style) — a sidecar process handles inter-gear communication; gears talk to
   localhost sidecar.
 
 ## Decision Outcome
 
 Chosen option: "Native REST", because it leverages the existing OperationBuilder/Axum investment, requires no proto
-dependency for REST modules, is debuggable with standard tools, and aligns with how the industry builds microservices.
-gRPC remains available as an opt-in for performance-critical internal paths but is not required for standard module
+dependency for REST gears, is debuggable with standard tools, and aligns with how the industry builds microservices.
+gRPC remains available as an opt-in for performance-critical internal paths but is not required for standard gear
 communication.
 
 ### Consequences
 
 * The `UnaryRequest`/`UnaryResponse` proto pattern from the earlier design is not adopted. No REST-to-gRPC translation
   layer is needed.
-* The OoP bootstrap (`libs/modkit/src/bootstrap/oop.rs`) must be extended to start an Axum HTTP server from the module's
+* The OoP bootstrap (`libs/toolkit/src/bootstrap/oop.rs`) must be extended to start an Axum HTTP server from the gear's
   OperationBuilder routes.
 * Each OoP Worker serves its own `/openapi.json` endpoint, enabling the gateway to aggregate specs.
 * Generated REST clients (`cpt-cf-component-rest-client-gen`) target HTTP endpoints, not gRPC. This simplifies the
   codegen since OpenAPI (not proto) is the source of truth.
-* gRPC remains available via grpc-hub for modules that explicitly opt in (e.g., `DirectoryService`). The two protocols
+* gRPC remains available via grpc-hub for gears that explicitly opt in (e.g., `DirectoryService`). The two protocols
   coexist without conflict.
 * Latency for REST calls is slightly higher than gRPC (HTTP/1.1 headers vs. HTTP/2 binary framing), but within the 5 ms
   p95 budget for typical payloads.
@@ -64,49 +64,49 @@ communication.
 
 * Code review: verify that OoP bootstrap starts an Axum HTTP server, not a gRPC-only server.
 * Architecture review: verify that no `UnaryRequest`/`UnaryResponse` proto types exist in the codebase.
-* Integration test: an OoP module serves a REST endpoint that is callable with curl and returns a valid
+* Integration test: an OoP gear serves a REST endpoint that is callable with curl and returns a valid
   OpenAPI-documented response.
 
 ## Pros and Cons of the Options
 
 ### Option A: REST-over-gRPC Bridge
 
-OoP modules expose gRPC only. A `RestBridge` component translates between REST and a generic `UnaryRequest`/
+OoP gears expose gRPC only. A `RestBridge` component translates between REST and a generic `UnaryRequest`/
 `UnaryResponse` proto.
 
 * Good, because gRPC HTTP/2 binary framing is efficient for large payloads and streaming.
-* Good, because a single gRPC port per module simplifies networking.
-* Bad, because requires proto compilation and tonic dependency for all OoP modules, even those that only need REST.
+* Good, because a single gRPC port per gear simplifies networking.
+* Bad, because requires proto compilation and tonic dependency for all OoP gears, even those that only need REST.
 * Bad, because the bridge layer obscures HTTP semantics (status codes, headers, content negotiation).
 * Bad, because debugging requires grpcurl or Postman gRPC mode — not standard curl.
 * Bad, because OpenAPI specs cannot be served directly; they must be translated or maintained separately.
-* Bad, because future non-Rust modules must adopt tonic-compatible gRPC stacks.
+* Bad, because future non-Rust gears must adopt tonic-compatible gRPC stacks.
 
 ### Option B: Native REST
 
-Each OoP module runs its own Axum HTTP server. The module's `register_rest()` / OperationBuilder routes are served
+Each OoP gear runs its own Axum HTTP server. The gear's `register_rest()` / OperationBuilder routes are served
 directly.
 
 * Good, because leverages the existing OperationBuilder/Axum/Tower middleware investment — no new abstractions.
 * Good, because debuggable with curl, browser devtools, Postman, and any HTTP client.
-* Good, because OpenAPI spec is served directly from the module (same as in-process behavior).
-* Good, because no proto dependency required for REST-only modules.
-* Good, because future non-Rust modules can serve standard HTTP.
+* Good, because OpenAPI spec is served directly from the gear (same as in-process behavior).
+* Good, because no proto dependency required for REST-only gears.
+* Good, because future non-Rust gears can serve standard HTTP.
 * Good, because aligns with industry-standard microservice communication.
-* Neutral, because each OoP module needs its own port allocation (handled by bootstrap config).
+* Neutral, because each OoP gear needs its own port allocation (handled by bootstrap config).
 * Bad, because HTTP/1.1 has slightly higher per-request overhead than gRPC HTTP/2 binary framing.
 
 ### Option C: Sidecar Proxy (Dapr-Style)
 
-A sidecar process runs alongside each module, handling service discovery, retries, and protocol translation.
+A sidecar process runs alongside each gear, handling service discovery, retries, and protocol translation.
 
-* Good, because modules are fully agnostic to communication protocol.
-* Good, because the sidecar can add observability, mTLS, and retry without module changes.
-* Bad, because adds an extra process per module (resource overhead, operational complexity).
-* Bad, because introduces latency (module → sidecar → target sidecar → target module = 2 extra hops).
+* Good, because gears are fully agnostic to communication protocol.
+* Good, because the sidecar can add observability, mTLS, and retry without gear changes.
+* Bad, because adds an extra process per gear (resource overhead, operational complexity).
+* Bad, because introduces latency (gear → sidecar → target sidecar → target gear = 2 extra hops).
 * Bad, because the sidecar must be built and maintained — significant engineering investment.
 * Bad, because on-premise Windows deployments complicate sidecar lifecycle management.
-* Bad, because Dapr-style sidecars are a heavy dependency for a framework that already has modkit-http and Tower
+* Bad, because Dapr-style sidecars are a heavy dependency for a framework that already has toolkit-http and Tower
   middleware.
 
 ## More Information
@@ -122,7 +122,7 @@ The following existing patterns **are preserved**:
 
 - gRPC for `DirectoryService` (service discovery)
 - gRPC for `grpc-hub` aggregation
-- Optional gRPC interfaces for performance-critical module-to-module paths (explicitly opted in per module)
+- Optional gRPC interfaces for performance-critical gear-to-gear paths (explicitly opted in per gear)
 
 ## Traceability
 

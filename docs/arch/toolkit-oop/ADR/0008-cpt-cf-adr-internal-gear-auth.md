@@ -3,9 +3,9 @@ status: accepted
 date: 2026-04-07
 ---
 
-# Internal Module Authentication — Bootstrap Token (Profile 2) and K8s SA Tokens (Profile 3)
+# Internal Gear Authentication — Bootstrap Token (Profile 2) and K8s SA Tokens (Profile 3)
 
-**ID**: `cpt-cf-adr-internal-module-auth`
+**ID**: `cpt-cf-adr-internal-gear-auth`
 
 ## Table of Contents
 
@@ -14,10 +14,10 @@ date: 2026-04-07
 ## Context and Problem Statement
 
 ADR-0002 (Auth at Edge Only) covers external user traffic: the gateway validates JWTs and propagates SecurityContext to
-modules. But modules also make **system-initiated calls** that carry no user context: registering with
-DirectoryService (Flight Control), sending heartbeats, and making admin/background inter-module calls. These system
+gears. But gears also make **system-initiated calls** that carry no user context: registering with
+DirectoryService (Flight Control), sending heartbeats, and making admin/background inter-gear calls. These system
 calls cross process and network boundaries in Profiles 2 and 3. Without authentication, any process that can reach
-DirectoryService can register itself as a module or deregister others. How should modules prove their identity for
+DirectoryService can register itself as a gear or deregister others. How should gears prove their identity for
 system-level communication, and should the mechanism differ per deployment profile?
 
 ## Decision Drivers
@@ -26,24 +26,24 @@ system-level communication, and should the mechanism differ per deployment profi
   than Profile 3 (k8s, network-accessible pods). The mechanism should match the risk.
 * **No custom PKI for P1 scope**: mTLS with custom CA is operationally expensive. P1 should use simpler mechanisms where
   the threat model allows it.
-* **Zero developer burden**: Module developers must not implement auth logic for system calls. The ModKit runtime
+* **Zero developer burden**: Gear developers must not implement auth logic for system calls. The ToolKit runtime
   handles it transparently.
 * **K8s-native where possible**: In Profile 3, prefer k8s-provided identity (ServiceAccount tokens) over custom
   mechanisms.
 * **Compatibility with existing gRPC and HTTP transport**: The mechanism must work for both gRPC metadata (
-  DirectoryService) and HTTP headers (inter-module REST).
+  DirectoryService) and HTTP headers (inter-gear REST).
 
 ## Considered Options
 
 * **Option A**: Bootstrap token for all profiles — Platform Host generates an ephemeral token at startup, passes to
   workers via env var.
-* **Option B**: mTLS for all profiles — every module has a certificate signed by a platform CA.
+* **Option B**: mTLS for all profiles — every gear has a certificate signed by a platform CA.
 * **Option C**: Profile-specific — bootstrap token for Profile 2 (single-node), K8s ServiceAccount tokens for Profile 3,
   mTLS for Profile 2 multi-node (P2).
 * **Option D**: Network-level trust only — rely on UDS permissions (Profile 2) and k8s NetworkPolicy (Profile 3), no
   application-level auth.
-* **Option E**: Service-to-service JWT — every module is provisioned with a service identity (e.g.
-  `subject_type="application", subject_id="<module-uuid>"`); calls to other modules carry an `Authorization: Bearer
+* **Option E**: Service-to-service JWT — every gear is provisioned with a service identity (e.g.
+  `subject_type="application", subject_id="<gear-uuid>"`); calls to other gears carry an `Authorization: Bearer
   <jwt>` validated by the same `AuthNResolverClient` already used for user JWTs. AuthZ resolver rules grant the
   `application:*` subject the limited set of system endpoints it needs (e.g. `directory.*`).
 
@@ -51,9 +51,9 @@ system-level communication, and should the mechanism differ per deployment profi
 
 Chosen option: **"Option B — mTLS with a platform CA as the primary mechanism for every multi-process profile."**
 
-mTLS is the single security primitive used to authenticate module-to-module calls across the wire. The peer's
-certificate, signed by the platform CA, carries the module's identity (`CN = <module-name>`, `SAN URI =
-spiffe://<trust-domain>/<module>`). The TLS handshake establishes peer identity *before any bytes of application
+mTLS is the single security primitive used to authenticate gear-to-gear calls across the wire. The peer's
+certificate, signed by the platform CA, carries the gear's identity (`CN = <gear-name>`, `SAN URI =
+spiffe://<trust-domain>/<gear>`). The TLS handshake establishes peer identity *before any bytes of application
 payload are read* — including `x-secctx-bin` — which is the property [ADR-0002](0002-cpt-cf-adr-auth-edge-only.md)
 relies on to skip per-hop JWT validation safely.
 
@@ -66,51 +66,51 @@ root:
 * **K8s SA tokens** (Option C) are reused only to bootstrap mTLS in Profile 3: the SA token authenticates to a
   cert-manager / SPIRE agent that mints the workload certificate. Steady-state traffic is mTLS.
 * **JWT** (Option E) remains available as an `internal_auth.mode = "jwt"` escape hatch for operators who explicitly
-  want one auth backend for users and modules. It is NOT the default.
+  want one auth backend for users and gears. It is NOT the default.
 * **Network-level trust only** (Option D) is rejected — UDS perms and NetworkPolicy block the wrong attackers
   (external) and do nothing against a compromised sibling pod inside the trust domain.
 
 | Profile            | Primary mechanism                          | Bootstrap helper                                  | Notes                                            |
 |--------------------|--------------------------------------------|---------------------------------------------------|--------------------------------------------------|
 | 1 (Embedded)       | n/a (same process)                         | n/a                                               | No transport, no auth needed                     |
-| 2 (single-node)    | mTLS over loopback OR plain UDS            | Bootstrap token for cert enrollment               | UDS perms acceptable if all modules run as same uid; mTLS recommended otherwise |
+| 2 (single-node)    | mTLS over loopback OR plain UDS            | Bootstrap token for cert enrollment               | UDS perms acceptable if all gears run as same uid; mTLS recommended otherwise |
 | 2 (multi-node, P2) | **mTLS with platform CA (required)**       | Bootstrap token for first enrollment             | Plain TCP rejected at listener                   |
 | 3 (K8s)            | **mTLS with platform CA (required)**       | K8s SA token authenticates to cert-manager/SPIRE | NetworkPolicy is defense-in-depth, not the primary boundary |
 
 ### Consequences
 
-* **The ModKit OoP runtime MUST refuse plain-TCP inbound connections on every multi-process profile** (Profile 2
+* **The ToolKit OoP runtime MUST refuse plain-TCP inbound connections on every multi-process profile** (Profile 2
   multi-node, Profile 3). The HTTP/gRPC listener binds with `TlsAcceptor` requiring client certificate verification
   against the platform CA. No bytes of application payload — including `x-secctx-bin` — are read from a connection
   whose mTLS handshake has not completed and validated.
-* Module identity is the subject of the validated client certificate (`SAN URI = spiffe://<trust-domain>/<module>`).
-  The runtime exposes this identity on the request extension as `PeerModuleIdentity` for AuthZ rules that need it
+* Gear identity is the subject of the validated client certificate (`SAN URI = spiffe://<trust-domain>/<gear>`).
+  The runtime exposes this identity on the request extension as `PeerGearIdentity` for AuthZ rules that need it
   (e.g., "only `flight-control` may call `DeregisterInstance`").
-* Cert lifecycle is delegated to a cert-manager / SPIRE-like component out of scope of this ADR; ModKit just consumes
+* Cert lifecycle is delegated to a cert-manager / SPIRE-like component out of scope of this ADR; ToolKit just consumes
   rotated certs from a well-known path (Profile 2: file watched by `notify`; Profile 3: projected volume).
-* **`InternalAuthMiddleware` becomes a thin shim**: it asserts the connection-level `PeerModuleIdentity` is present and
+* **`InternalAuthMiddleware` becomes a thin shim**: it asserts the connection-level `PeerGearIdentity` is present and
   routes AuthZ to the existing `AuthZResolverClient` with `subject_type = "application"`. There is no per-request
   token to validate in the hot path.
 * Flight Control still validates inbound `RegisterInstance` / `DeregisterInstance` / `Heartbeat` calls — but by
-  `PeerModuleIdentity` from mTLS, not by a separate token header.
+  `PeerGearIdentity` from mTLS, not by a separate token header.
 * User-initiated calls continue to carry SecurityContext propagation per [ADR-0002](0002-cpt-cf-adr-auth-edge-only.md);
   the per-request layer (`x-secctx-bin`) is decoded ONLY after the connection-level mTLS layer has authenticated the
   peer (see DESIGN.md § Validation order).
-* Profile 2 single-node MAY skip mTLS if all modules run as the same uid and communicate over UDS — the OS process
+* Profile 2 single-node MAY skip mTLS if all gears run as the same uid and communicate over UDS — the OS process
   boundary plus filesystem perms is the trust root in that narrow case. This is the ONE place where Option D applies.
 * The optional JWT mode (`internal_auth.mode = "jwt"`) coexists with mTLS — the mTLS handshake still validates the
   peer, JWT replaces the AuthZ subject. Operators choose at deploy time; mixing in the same cluster is not supported.
 * Profile 2 multi-node (P2 scope) will require mTLS. The `InternalCredential` abstraction must support this as a future
-  variant without changing module code.
+  variant without changing gear code.
 
 ### Confirmation
 
 * Integration test (Profile 2): an unauthorized process attempts to call `RegisterInstance` on DirectoryService without
   the bootstrap token — request is rejected with `UNAUTHENTICATED`.
-* Integration test (Profile 3): a module pod registers with DirectoryService using its SA token — Flight Control
+* Integration test (Profile 3): a gear pod registers with DirectoryService using its SA token — Flight Control
   validates and accepts; a pod with a wrong audience token is rejected.
-* Code review: verify that no module source code touches `InternalCredential` or auth headers for system calls — all
-  handled by ModKit runtime.
+* Code review: verify that no gear source code touches `InternalCredential` or auth headers for system calls — all
+  handled by ToolKit runtime.
 
 ## Pros and Cons of the Options
 
@@ -120,18 +120,18 @@ A single random token generated by Platform Host, shared with all workers.
 
 * Good, because simple — one mechanism, one code path, no PKI.
 * Good, because zero external dependencies (no k8s API, no CA).
-* Neutral, because the token is a shared secret — all modules share the same credential (no per-module identity).
+* Neutral, because the token is a shared secret — all gears share the same credential (no per-gear identity).
 * Bad, because in k8s the token must be distributed via k8s Secret or env var — if the Secret leaks, any pod can
-  impersonate any module.
-* Bad, because does not provide module-level identity (all modules look the same to Flight Control).
+  impersonate any gear.
+* Bad, because does not provide gear-level identity (all gears look the same to Flight Control).
 * Bad, because in multi-node Profile 2, the token travels over the network without TLS protecting it (unless layered
   with TLS separately).
 
 ### Option B: mTLS for All Profiles
 
-Every module gets a certificate from a platform CA. TLS client auth proves identity.
+Every gear gets a certificate from a platform CA. TLS client auth proves identity.
 
-* Good, because strongest security — mutual authentication, per-module identity, encrypted transport.
+* Good, because strongest security — mutual authentication, per-gear identity, encrypted transport.
 * Good, because works across all network topologies (UDS, TCP, k8s).
 * Bad, because requires PKI infrastructure — CA management, certificate rotation, revocation.
 * Bad, because operationally heavy for Profile 2 single-node where processes are on the same machine communicating over
@@ -146,8 +146,8 @@ Bootstrap token for Profile 2 single-node, K8s SA tokens for Profile 3, mTLS for
 * Good, because security matches the threat model — no over-engineering for low-risk profiles, proper identity for
   high-risk ones.
 * Good, because k8s SA tokens are zero-config (auto-mounted by kubelet, auto-rotated).
-* Good, because k8s SA tokens give per-pod identity — Flight Control knows exactly which module is calling.
-* Good, because the `InternalCredential` abstraction hides the mechanism from module code — same API regardless of
+* Good, because k8s SA tokens give per-pod identity — Flight Control knows exactly which gear is calling.
+* Good, because the `InternalCredential` abstraction hides the mechanism from gear code — same API regardless of
   profile.
 * Good, because bootstrap token for single-node is trivial to implement and has no external dependencies.
 * Neutral, because Flight Control needs a small validation layer that dispatches by credential type.
@@ -162,8 +162,8 @@ No application-level auth. Trust UDS permissions and k8s NetworkPolicy.
 * Good, because no latency overhead from token validation.
 * Bad, because a compromised process on the same host (Profile 2) can call DirectoryService freely.
 * Bad, because k8s NetworkPolicy is namespace-level, not pod-level — any pod in the namespace can impersonate any
-  module.
-* Bad, because no audit trail — Flight Control cannot log which module made which call.
+  gear.
+* Bad, because no audit trail — Flight Control cannot log which gear made which call.
 * Bad, because does not meet enterprise security requirements for regulated environments.
 
 ## More Information
@@ -191,13 +191,13 @@ system calls go through `attach_internal_auth(request, credential)` which adds t
 | Call type                             | Auth mechanism              | Header/metadata                  |
 |---------------------------------------|-----------------------------|----------------------------------|
 | External → Gateway                    | JWT (Bearer token)          | `Authorization: Bearer <jwt>`    |
-| Gateway → Module (user request)       | SecurityContext propagation | `Authorization` + `x-secctx-bin` |
-| Module → Module (user-propagated)     | SecurityContext propagation | `Authorization` + `x-secctx-bin` |
-| Module → Flight Control (system)      | Internal credential         | `x-modkit-internal-token`        |
-| Module → Module (system, no user ctx) | Internal credential         | `X-ModKit-Internal-Token`        |
+| Gateway → Gear (user request)       | SecurityContext propagation | `Authorization` + `x-secctx-bin` |
+| Gear → Gear (user-propagated)     | SecurityContext propagation | `Authorization` + `x-secctx-bin` |
+| Gear → Flight Control (system)      | Internal credential         | `x-toolkit-internal-token`        |
+| Gear → Gear (system, no user ctx) | Internal credential         | `X-ToolKit-Internal-Token`        |
 
-A single request may carry **both** layers: SecurityContext (user identity) + internal credential (module identity). The
-SecurityContext identifies *who initiated* the action; the internal credential identifies *which module is calling*.
+A single request may carry **both** layers: SecurityContext (user identity) + internal credential (gear identity). The
+SecurityContext identifies *who initiated* the action; the internal credential identifies *which gear is calling*.
 
 ## Traceability
 
