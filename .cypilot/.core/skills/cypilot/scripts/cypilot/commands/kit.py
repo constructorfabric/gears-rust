@@ -853,6 +853,9 @@ def install_kit_with_manifest(
         if interactive and manifest.user_modifiable and sys.stdin.isatty():
             try:
                 user_input = input(
+                    "Why this input is needed: choose where this kit's files should be installed.\n"
+                    "Press Enter to accept the suggested path, or type a different absolute or relative path.\n"
+                    "Suggested: keep the default unless you intentionally want this kit under a custom root.\n"
                     f"Kit root directory [{kit_root}]: "
                 ).strip()
                 if user_input:
@@ -872,9 +875,11 @@ def install_kit_with_manifest(
         target_rel = res.default_path
         if interactive and res.user_modifiable and sys.stdin.isatty():
             try:
-                prompt_default = str(kit_root / res.default_path)
                 user_input = input(
-                    f"  Resource '{res.id}' path [{prompt_default}]: "
+                    "Why this input is needed: choose where this resource should be installed.\n"
+                    "Press Enter to accept the suggested path, or type a different absolute or relative path.\n"
+                    "Suggested: keep the default unless this resource must live somewhere else in your project.\n"
+                    f"Resource '{res.id}' path [{kit_root / res.default_path}]: "
                 ).strip()
                 if user_input:
                     user_path = Path(user_input)
@@ -1100,7 +1105,10 @@ def migrate_legacy_kit_to_manifest(
         if interactive and res.user_modifiable and sys.stdin.isatty():
             try:
                 user_input = input(
-                    f"  New resource '{res.id}' path [{expected_path}]: "
+                    "Why this input is needed: choose where this resource should be installed.\n"
+                    "Press Enter to accept the suggested path, or type a different absolute path or a path relative to the kit root.\n"
+                    "Suggested: keep the default unless this resource must live somewhere else in your project.\n"
+                    f"New resource '{res.id}' path [{expected_path}]: "
                 ).strip()
                 if user_input:
                     user_path = Path(user_input)
@@ -1172,7 +1180,7 @@ def _resolve_install_source_github(
         return (Path("."), "", "", "", None, 1)
 
     conf_file = kit_source / _KIT_CONF_FILE
-    kit_slug = _read_kit_slug(kit_source) or repo.removeprefix("studio-kit-")
+    kit_slug = _read_kit_slug(kit_source) or repo.removeprefix("cyber-pilot-kit-")
     kit_version = (
         resolved_version or _read_kit_version(conf_file)
         if conf_file.is_file() else resolved_version
@@ -1201,7 +1209,7 @@ def cmd_kit_install(argv: List[str]) -> int:
     )
     p.add_argument(
         "source", nargs="?", default=None,
-        help="GitHub source: owner/repo[@version] (e.g. constructorfabric/studio-kit-sdlc@v1.0.0)",
+        help="GitHub source: owner/repo[@version] (e.g. cyberfabric/cyber-pilot-kit-sdlc@v1.0.0)",
     )
     p.add_argument(
         "--path", dest="local_path", default=None,

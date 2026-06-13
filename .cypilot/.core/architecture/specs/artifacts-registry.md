@@ -442,7 +442,7 @@ fail_on_unmatched_markdown = true
 
 [[systems.autodetect.children]]
 kit = "cypilot-sdlc"
-system_root = "{parent_root}/gears/{system}"
+system_root = "{parent_root}/modules/{system}"
 artifacts_root = "{system_root}/specs"
 
 [systems.autodetect.children.artifacts.PRD]
@@ -785,8 +785,8 @@ else:
 # version and project_root are in core.toml
 
 [[ignore]]
-reason = "Third-party gear"
-patterns = ["gears/my_gear/*"]
+reason = "Third-party module"
+patterns = ["modules/my_module/*"]
 
 # ── Root system ──────────────────────────────────────────────
 
@@ -844,7 +844,7 @@ fail_on_unmatched_markdown = true
 
 [[systems.autodetect.children]]
 kit = "cypilot-sdlc"
-system_root = "{parent_root}/gears/{system}"
+system_root = "{parent_root}/modules/{system}"
 artifacts_root = "{system_root}/specs"
 
 [systems.autodetect.children.artifacts.PRD]
@@ -907,21 +907,21 @@ end = "*/"
 name = "Auth"
 slug = "auth"
 kit = "cypilot-sdlc"
-artifacts_dir = "gears/auth/architecture"
+artifacts_dir = "modules/auth/architecture"
 
 [[systems.children.artifacts]]
-path = "gears/auth/architecture/PRD.md"
+path = "modules/auth/architecture/PRD.md"
 kind = "PRD"
 traceability = "DOCS-ONLY"
 
 [[systems.children.artifacts]]
-path = "gears/auth/architecture/features/sso.md"
+path = "modules/auth/architecture/features/sso.md"
 kind = "FEATURE"
 traceability = "FULL"
 
 [[systems.children.codebase]]
-name = "Auth Gear"
-path = "src/gears/auth"
+name = "Auth Module"
+path = "src/modules/auth"
 extensions = [".ts"]
 ```
 

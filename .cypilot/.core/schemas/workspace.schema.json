@@ -60,6 +60,9 @@
     },
     "resolve": {
       "$ref": "#/$defs/resolve_config"
+    },
+    "validation": {
+      "$ref": "#/$defs/validation_config"
     }
   },
   "$defs": {
@@ -137,6 +140,22 @@
             "type": "string"
           },
           "description": "Maps Git host to local directory template via exact host match. Keys are hostnames, values are path templates with {org} and {repo} placeholders. When no rule matches, the default template {org}/{repo} is used. Example: {\"gitlab.com\": \"{org}/{repo}\"}."
+        }
+      }
+    },
+    "validation_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Artifact content validation settings.",
+      "properties": {
+        "allowed_content_languages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["en", "ru", "ar", "zh", "ja", "ko", "he", "hi", "th", "ka", "hy"]
+          },
+          "minItems": 1,
+          "description": "Language codes permitted in Markdown artifact content. Default when absent: English only. Add codes to allow additional Unicode scripts (e.g. [\"en\", \"ru\"])."
         }
       }
     }

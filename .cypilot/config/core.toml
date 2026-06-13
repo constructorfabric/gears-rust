@@ -8,7 +8,7 @@ project_root = ".."
 format = "Cypilot"
 path = "config/kits/sdlc"
 source = "github:constructorfabric/studio-kit-sdlc"
-version = "1.3.0"
+version = "1.0.0"
 
 [kits.sdlc.resources]
 [kits.sdlc.resources.adr_template]
@@ -115,3 +115,30 @@ path = "config/kits/sdlc/AGENTS.md"
 
 [kits.sdlc.resources.workflow_migrate_openspec]
 path = "config/kits/sdlc/workflows/migrate-openspec.md"
+
+[kits.sdlc.resources.workflow_doc_prd]
+path = "config/kits/sdlc/workflows/doc-prd.md"
+
+[kits.sdlc.resources.workflow_doc_adr]
+path = "config/kits/sdlc/workflows/doc-adr.md"
+
+[kits.sdlc.resources.workflow_doc_design]
+path = "config/kits/sdlc/workflows/doc-design.md"
+
+[kits.sdlc.resources.workflow_decompose]
+path = "config/kits/sdlc/workflows/decompose.md"
+
+[kits.sdlc.resources.workflow_doc_feature]
+path = "config/kits/sdlc/workflows/doc-feature.md"
+
+[kits.sdlc.resources.workflow_implement]
+path = "config/kits/sdlc/workflows/implement.md"
+
+[kits.sdlc.resources.workflow_change_impact_analysis]
+path = "config/kits/sdlc/workflows/change-impact-analysis.md"
+
+[kits.sdlc.resources.workflow_reverse_engineer]
+path = "config/kits/sdlc/workflows/reverse-engineer.md"
+
+[kits.sdlc.resources.change_impact_config]
+path = "config/kits/sdlc/scripts/change-impact-analysis.toml"

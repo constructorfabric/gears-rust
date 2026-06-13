@@ -116,7 +116,7 @@ purpose: Generic (kit-agnostic) quality checklist for code changes and reviews
 - [ ] Changes stay localized.
 - [ ] Dependencies are explicit and minimal.
 - [ ] Hidden coupling is absent.
-- [ ] Gear boundaries are clear.
+- [ ] Module boundaries are clear.
 ### QUAL-CODE-003: Testability [HIGH]
 - [ ] Core logic is testable without external systems.
 - [ ] Dependencies are injectable for tests.

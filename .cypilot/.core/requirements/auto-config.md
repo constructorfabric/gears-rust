@@ -7,7 +7,7 @@ purpose: Systematic methodology for scanning brownfield projects and generating 
 ---
 
 # Auto-Configuration Methodology
-
+ 
 
 <!-- toc -->
 
@@ -26,25 +26,25 @@ purpose: Systematic methodology for scanning brownfield projects and generating 
 <!-- /toc -->
 
  **Scope**: Brownfield projects where Cypilot is installed but no project-specific rules or specs exist yet.
-
+ 
  **Out of scope**: Greenfield projects with no code to scan, and projects that already have configured specs/rules.
-
+ 
  ## Agent Instructions
-
+ 
  **ALWAYS open and follow** this file WHEN the user asks to configure Cypilot for a project or an auto-config workflow is triggered.
-
+ 
  **ALWAYS open and follow** `{cypilot_path}/.core/requirements/reverse-engineering.md` for scan methodology (`L1-L3`, `L8`).
-
+ 
  **ALWAYS open and follow** `{cypilot_path}/.core/requirements/prompt-engineering.md` for rule-quality validation.
-
+ 
  **Prerequisites**: confirm the agent has read this methodology, has source access, will follow phases `1 -> 6` in order, will checkpoint after each phase, and will **NOT** write files without user confirmation.
-
+ 
  ## Overview
-
+ 
  Auto-config scans a brownfield project and generates **per-topic** rule files in `{cypilot_path}/config/rules/` plus contextual `WHEN` rules in `{cypilot_path}/config/AGENTS.md`. Files are split by **topic** (`conventions`, `architecture`, `patterns`, etc.), not by system path, so the agent loads only the guidance relevant to the current activity.
-
+ 
  **Core principle**: extract conventions from code, do not impose them.
-
+ 
  | Output | Location | Purpose |
  |---|---|---|
  | Per-topic rule files | `{cypilot_path}/config/rules/{topic}.md` | Focused rules per semantic topic |
@@ -52,18 +52,18 @@ purpose: Systematic methodology for scanning brownfield projects and generating 
  | Rule-file navigation rules | `{cypilot_path}/config/AGENTS.md` | `WHEN` rules that load generated topic files contextually |
  | Registry entries | `{cypilot_path}/config/artifacts.toml` | Detected systems with source paths |
  | TOC updates | Existing docs + generated rule files | Navigability for docs and rules |
-
+ 
  **Upstream methodologies used**:
  - **Reverse Engineering** (`L1-L3`, `L8`): surface scan, entry points, structure, pattern recognition
  - **Prompt Engineering** (`L2`, `L5`, `L6`): clarity, anti-pattern prevention, context efficiency
-
+ 
  ## Preconditions
-
+ 
  **Trigger conditions** (`ANY`):
  - Automatic brownfield detection with no project specs in config (`cypilot.py info` reports `specs: []` or no specs dir, and source-code directories exist)
  - Manual invocation via `cypilot auto-config` or equivalent user request
  - Rescan via `cpt init --rescan` or equivalent reconfigure request
-
+ 
  **Pre-checks**:
  - [ ] Cypilot is initialized (`cypilot.py info` returns `FOUND`)
  - [ ] Source-code repository is accessible
@@ -71,34 +71,34 @@ purpose: Systematic methodology for scanning brownfield projects and generating 
  - [ ] `{cypilot_path}/config/rules/` is empty, or `--force` is explicitly in use
 
  ## Phase 1: Project Scan
-
+ 
  **Goal**: extract raw project data using reverse-engineering methodology.
-
+ 
  **Use**: `{cypilot_path}/.core/requirements/reverse-engineering.md` Layers `1`, `2`, `3`, and `8`.
-
+ 
  | Subphase | Focus | Capture |
  |---|---|---|
  | `1.1` Surface Reconnaissance | Repository structure scan (`1.1.1-1.1.3`), language detection (`1.2.1-1.2.2`), documentation inventory (`1.3.1-1.3.2`) | `project_surface` — structure, languages, docs, git patterns |
  | `1.2` Entry Point Analysis | Application entry points (`2.1.1-2.1.2`), request entry points (`2.2.1-2.2.3`), bootstrap sequence (`2.3.1`) | `entry_points` — main files, HTTP routes, CLI commands, workers |
  | `1.3` Structural Decomposition | Architecture pattern (`3.1.1`), module/package boundaries (`3.1.2`), organization patterns (`3.2.1-3.2.2`), component inventory (`3.3.1-3.3.2`) | `structure` — architecture style, modules, boundaries, components |
  | `1.4` Pattern Recognition | Code patterns (`8.1.1-8.1.3`), project conventions (`8.2.1-8.2.3`), testing conventions (`8.3.1-8.3.2`) | `conventions` — naming, style, error handling, testing patterns |
-
+ 
  **Scan checkpoint**: after `1.1-1.4`, present and confirm:
-
+ 
  ```markdown
  ### Auto-Config Scan Summary
-
+ 
  **Project**: {name}
  **Languages**: {primary}, {secondary}
  **Architecture**: {pattern}
  **Entry points**: {count} ({types})
- **Gears**: {count} ({list})
+ **Modules**: {count} ({list})
  **Key conventions**:
  - Naming: {convention}
  - Error handling: {pattern}
  - Testing: {pattern}
  - File organization: {pattern}
-
+ 
  **Systems detected**: {count}
  ```
 
@@ -157,7 +157,7 @@ Present for confirmation and naming adjustments.
 | Topic | Typical `WHEN` | Focus |
 |---|---|---|
 | `conventions` | writing or reviewing code | Naming, code style, imports, file organization |
-| `architecture` | modifying architecture, adding components, or refactoring gear boundaries | System design, boundaries, data flow, abstractions |
+| `architecture` | modifying architecture, adding components, or refactoring module boundaries | System design, boundaries, data flow, abstractions |
 | `patterns` | implementing features or writing business logic | Error handling, data access, state management, DI, idioms |
 | `testing` | writing or running tests | Structure, naming, bootstrap helpers, fixtures, coverage |
 | `api-contracts` | writing API endpoints or CLI commands | Request/response shape, error codes, output contracts, versioning |
@@ -174,7 +174,7 @@ Present for confirmation and naming adjustments.
 | # | Topic | File | Rules | WHEN condition |
 |---|---|---|---|---|
 | 1 | Conventions | `rules/conventions.md` | ~{n} rules | writing or reviewing code |
-| 2 | Architecture | `rules/architecture.md` | ~{n} rules | modifying architecture or gear boundaries |
+| 2 | Architecture | `rules/architecture.md` | ~{n} rules | modifying architecture or module boundaries |
 | 3 | Patterns | `rules/patterns.md` | ~{n} rules | implementing features |
 → Confirm topic split before generating? [yes / adjust]
 ```
@@ -205,7 +205,7 @@ version: 1.0
 Evidence: `{file}:{line}` — {what was observed}
 ```
 
-**Topic structure guidance**: `conventions.md` → Naming / Imports / File Organization / Code Style; `architecture.md` → Package Design / Gear Boundaries / Communication Patterns / Key Abstractions + `Source Layout`; `patterns.md` → Error Handling / Data Access / State Management; `testing.md` → Structure / Naming / Fixtures / Coverage + bootstrap helpers; `api-contracts.md` → Output Format / Error Codes / Exit Codes / Versioning; `anti-patterns.md` → flat list of anti-pattern / why / safer alternative.
+**Topic structure guidance**: `conventions.md` → Naming / Imports / File Organization / Code Style; `architecture.md` → Package Design / Module Boundaries / Communication Patterns / Key Abstractions + `Source Layout`; `patterns.md` → Error Handling / Data Access / State Management; `testing.md` → Structure / Naming / Fixtures / Coverage + bootstrap helpers; `api-contracts.md` → Output Format / Error Codes / Exit Codes / Versioning; `anti-patterns.md` → flat list of anti-pattern / why / safer alternative.
 
 **Required checks**: [ ] focused [ ] has TOC [ ] specific [ ] observable [ ] grounded [ ] actionable [ ] `<120` lines [ ] no hallucination [ ] no overlap. One topic file, usually `architecture.md`, **MUST** include a `Critical Files` table.
 
@@ -221,7 +221,7 @@ Evidence: `{file}:{line}` — {what was observed}
 
 ```markdown
 ALWAYS open and follow `{cypilot_path}/config/rules/conventions.md` WHEN writing or reviewing code
-ALWAYS open and follow `{cypilot_path}/config/rules/architecture.md` WHEN modifying architecture, adding components, or refactoring gear boundaries
+ALWAYS open and follow `{cypilot_path}/config/rules/architecture.md` WHEN modifying architecture, adding components, or refactoring module boundaries
 ALWAYS open and follow `{cypilot_path}/config/rules/patterns.md` WHEN implementing features or writing business logic
 ALWAYS open and follow `{cypilot_path}/config/rules/testing.md` WHEN writing or running tests
 ALWAYS open and follow `{cypilot_path}/config/rules/api-contracts.md` WHEN writing API endpoints or CLI commands
@@ -332,7 +332,7 @@ version: 1.0
 
 ```text
 WHEN writing or reviewing code
-WHEN modifying architecture, adding components, or refactoring gear boundaries
+WHEN modifying architecture, adding components, or refactoring module boundaries
 WHEN implementing features or writing business logic
 WHEN writing or running tests
 WHEN writing API endpoints or CLI commands

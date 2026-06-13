@@ -87,7 +87,7 @@ All CLI output is JSON to stdout. Human-readable messages go to stderr. This ena
 ## Installation
 
 ```bash
-pipx install git+https://github.com/constructorfabric/studio.git
+pipx install git+https://github.com/cyberfabric/cyber-pilot.git
 ```
 
 After installation, `cpt` is available globally as the CLI command. The `cypilot` keyword is reserved for agent chat prompts.
@@ -600,7 +600,7 @@ cpt doctor
 
 ### self-check
 
-Validate example artifacts against their templates.
+Validate all example artifacts against their templates.
 
 ```
 cpt self-check [--kit KIT] [--verbose]

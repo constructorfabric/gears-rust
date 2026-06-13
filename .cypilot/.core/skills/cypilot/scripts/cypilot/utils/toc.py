@@ -1,4 +1,3 @@
-# Updated: 2026-04-07 by Constructor Tech
 """
 Unified TOC (Table of Contents) generation for Markdown files.
 
@@ -83,11 +82,8 @@ def github_anchor(text: str) -> str:
     text = text.strip().lower()
     # Remove markdown links but keep link text
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-    # Remove formatting markers: **, __, *, `, ~
-    # Underscores between word chars (e.g. function_name) are preserved;
-    # emphasis underscores (_italic_) are removed only when not flanked by \w.
-    text = re.sub(r"\*\*|__|[*`~]", "", text)
-    text = re.sub(r"(?<!\w)_|_(?!\w)", "", text)
+    # Remove formatting markers: **, __, *, _, `, ~
+    text = re.sub(r"\*\*|__|[*_`~]", "", text)
     # Keep only word chars, spaces, hyphens
     text = re.sub(r"[^\w\s\-]", "", text)
     # Each space → hyphen individually (GitHub preserves consecutive hyphens)

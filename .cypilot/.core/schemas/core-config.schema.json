@@ -15,7 +15,7 @@
           "format": "Cypilot",
           "path": "config/kits/sdlc",
           "version": "1.0.0",
-          "source": "github:constructorfabric/studio-kit-sdlc"
+          "source": "github:cyberfabric/cyber-pilot-kit-sdlc"
         }
       }
     },

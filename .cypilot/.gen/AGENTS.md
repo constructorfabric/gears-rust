@@ -1,4 +1,4 @@
-# Cypilot: g
+# Cypilot: cf-gears
 
 ## Navigation Rules
 

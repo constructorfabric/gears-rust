@@ -1,5 +1,5 @@
 """
-ralphex Discovery Gear - Locate and validate the ralphex executable.
+ralphex Discovery Module - Locate and validate the ralphex executable.
 
 Handles PATH lookup, persisted config reuse, and availability validation
 for the ralphex external executor integration.

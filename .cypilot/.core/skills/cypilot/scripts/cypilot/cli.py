@@ -154,6 +154,10 @@ def _cmd_doctor(argv: List[str]) -> int:
 def _cmd_delegate(argv: List[str]) -> int:
     from .commands.delegate import cmd_delegate
     return cmd_delegate(argv)
+
+def _cmd_check_language(argv: List[str]) -> int:
+    from .commands.check_language import cmd_check_language
+    return cmd_check_language(argv)
 # @cpt-end:cpt-cypilot-algo-core-infra-route-command:p1:inst-route-helpers
 
 # =============================================================================
@@ -180,7 +184,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Context may be None if Cypilot not initialized - that's OK for some commands like init
 
     # Define all available commands
-    analysis_commands = ["validate", "validate-kits", "validate-toc", "spec-coverage"]
+    analysis_commands = ["validate", "validate-kits", "validate-toc", "spec-coverage", "check-language"]
     legacy_aliases = ["validate-code", "validate-rules"]
     kit_commands = ["kit"]
     utility_commands = ["toc", "chunk-input"]
@@ -209,6 +213,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "validate-kits": "Validate kit structure, templates, and examples",
             "validate-toc": "Validate Table of Contents in Markdown files",
             "spec-coverage": "Measure CDSL marker coverage in code",
+            "check-language": "Check artifacts for disallowed Unicode scripts (LANG001)",
             "kit": "Kit management (install, update)",
             "init": "Initialize Cypilot in a project",
             "update": "Update Cypilot to the latest version",
@@ -234,7 +239,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         }
         _sections = [
             ("Setup & Configuration", ["init", "update", "info", "resolve-vars", "generate-agents", "agents"]),
-            ("Validation", ["validate", "validate-kits", "validate-toc", "spec-coverage"]),
+            ("Validation", ["validate", "validate-kits", "validate-toc", "spec-coverage", "check-language"]),
             ("Search & Navigation", ["list-ids", "list-id-kinds", "get-content", "where-defined", "where-used"]),
             ("Kit Management", ["kit"]),
             ("Utility", ["toc", "chunk-input"]),
@@ -359,6 +364,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_delegate(rest)
     elif cmd == "doctor":
         return _cmd_doctor(rest)
+    elif cmd == "check-language":
+        return _cmd_check_language(rest)
     else:
         # @cpt-begin:cpt-cypilot-algo-core-infra-route-command:p1:inst-if-no-handler
         # @cpt-begin:cpt-cypilot-algo-core-infra-route-command:p1:inst-return-unknown

@@ -111,4 +111,9 @@ TOC_STALE = "toc-stale"
 # ---------------------------------------------------------------------------
 FILE_READ_ERROR = "file-read-error"
 FILE_LOAD_ERROR = "file-load-error"
+
+# ---------------------------------------------------------------------------
+# Content language validation
+# ---------------------------------------------------------------------------
+CONTENT_LANGUAGE_VIOLATION = "LANG001"
 # @cpt-end:cpt-cypilot-algo-traceability-validation-validate-structure:p1:inst-check-headings

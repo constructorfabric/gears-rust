@@ -155,6 +155,42 @@ class ResolveConfig:
 # @cpt-end:cpt-cypilot-algo-workspace-resolve-git-url:p1:inst-git-datamodel
 
 
+@dataclass
+class ValidationConfig:
+    """Workspace-level artifact content validation settings.
+
+    Parsed from the ``[validation]`` section of ``.cypilot-workspace.toml``.
+
+    Example config::
+
+        [validation]
+        allowed_content_languages = ["en"]
+        ignore_paths = ["translations/**/*.md", "vendor/**/*.md"]
+    """
+
+    allowed_content_languages: List[str] = field(default_factory=list)
+    ignore_paths: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ValidationConfig":
+        raw = (data or {}).get("allowed_content_languages", [])
+        if isinstance(raw, list):
+            langs = [str(x).strip().lower() for x in raw if str(x).strip()]
+        else:
+            langs = []
+        raw_ignore = (data or {}).get("ignore_paths", [])
+        ignore = list(raw_ignore) if isinstance(raw_ignore, list) else []
+        return cls(allowed_content_languages=langs, ignore_paths=ignore)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        if self.allowed_content_languages:
+            result["allowed_content_languages"] = list(self.allowed_content_languages)
+        if self.ignore_paths:
+            result["ignore_paths"] = list(self.ignore_paths)
+        return result
+
+
 # @cpt-begin:cpt-cypilot-algo-workspace-find-config:p1:inst-find-config-datamodel
 @dataclass
 class WorkspaceConfig:
@@ -164,6 +200,7 @@ class WorkspaceConfig:
     sources: Dict[str, SourceEntry] = field(default_factory=dict)
     traceability: TraceabilityConfig = field(default_factory=TraceabilityConfig)
     resolve: Optional[ResolveConfig] = None  # Git URL resolution config
+    validation: Optional[ValidationConfig] = None  # Content validation settings
     workspace_file: Optional[Path] = None  # Absolute path to the workspace file
     is_inline: bool = False  # True if loaded from core.toml inline workspace
     resolution_base: Optional[Path] = None  # Override for source path resolution base directory
@@ -198,11 +235,17 @@ class WorkspaceConfig:
         if isinstance(raw_resolve, dict):
             resolve_cfg = ResolveConfig.from_dict(raw_resolve)
 
+        validation_cfg: Optional[ValidationConfig] = None
+        raw_validation = (data or {}).get("validation", None)
+        if isinstance(raw_validation, dict):
+            validation_cfg = ValidationConfig.from_dict(raw_validation)
+
         return cls(
             version=version,
             sources=sources,
             traceability=traceability,
             resolve=resolve_cfg,
+            validation=validation_cfg,
             workspace_file=workspace_file,
             is_inline=is_inline,
             resolution_base=resolution_base,
@@ -216,6 +259,10 @@ class WorkspaceConfig:
             d["traceability"] = trace
         if self.resolve is not None:
             d["resolve"] = self.resolve.to_dict()
+        if self.validation is not None:
+            val_dict = self.validation.to_dict()
+            if val_dict:
+                d["validation"] = val_dict
         return d
 
     @classmethod
@@ -314,6 +361,21 @@ class WorkspaceConfig:
                 errors.append(f"Source '{name}' must have either 'path' or 'url'")
             if src.role not in VALID_ROLES:
                 errors.append(f"Source '{name}' has invalid role '{src.role}' (valid: {', '.join(sorted(VALID_ROLES))})")
+        if self.validation is not None and self.validation.allowed_content_languages:
+            try:
+                from .content_language import SUPPORTED_LANGUAGES as _SUPPORTED
+                unknown = [
+                    lang for lang in self.validation.allowed_content_languages
+                    if lang not in _SUPPORTED
+                ]
+                if unknown:
+                    errors.append(
+                        f"[validation] allowed_content_languages contains unknown code(s): "
+                        f"{', '.join(sorted(unknown))} "
+                        f"(supported: {', '.join(sorted(_SUPPORTED))})"
+                    )
+            except ImportError:
+                pass
         return errors
 
     def add_source(

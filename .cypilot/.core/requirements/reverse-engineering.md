@@ -92,7 +92,7 @@ Reverse engineering builds a progressive mental model of a system. The rule is: 
 | Area | Required checks |
 |---|---|
 | Architecture pattern | Identify the dominant pattern: Layered, Hexagonal / Ports & Adapters, Clean Architecture, Microservices, Monolith, Modular Monolith, Event-Driven, or Serverless. |
-| Gear boundaries | Identify top-level modules/packages; map each module responsibility in one sentence; identify module dependencies; check for circular deps; identify shared/common modules; identify vendor or third-party wrappers. |
+| Module boundaries | Identify top-level modules/packages; map each module responsibility in one sentence; identify module dependencies; check for circular deps; identify shared/common modules; identify vendor or third-party wrappers. |
 | Grouping strategy | Determine whether code is grouped by layer, spec/feature, domain, or a hybrid. |
 | File organization | Identify naming patterns; file-per-class vs file-per-module usage; index/barrel files; test file locations (adjacent, separate, nested). |
 | Core components | For each module, record module name/location, primary responsibility, public interface, key dependencies, persistence involvement, and external integrations. |
@@ -227,7 +227,7 @@ Reverse engineering builds a progressive mental model of a system. The rule is: 
 | # | Check | Required | How to Verify |
 |---|---|---|---|
 | `L3.1` | Architecture pattern identified | YES | Pattern named with evidence |
-| `L3.2` | Gear boundaries mapped | YES | Gears listed with responsibilities |
+| `L3.2` | Module boundaries mapped | YES | Modules listed with responsibilities |
 | `L3.3` | Component inventory complete | YES | Core + cross-cutting components listed |
 | `L4.1` | Representative flows traced | YES | `3-5` flows documented entry-to-exit |
 | `L4.2` | Domain entities identified | YES | Entities with attributes listed |
@@ -237,7 +237,7 @@ Reverse engineering builds a progressive mental model of a system. The rule is: 
 
 | # | Check | Required | How to Verify |
 |---|---|---|---|
-| `L5.1` | Gear dependency graph built | YES | Import relationships mapped |
+| `L5.1` | Module dependency graph built | YES | Import relationships mapped |
 | `L5.2` | External dependencies cataloged | YES | Libraries categorized by purpose |
 | `L5.3` | External services documented | YES | API calls with auth/error handling noted |
 | `L6.1` | Application state locations identified | YES | Global, request-scoped, cached state listed |
