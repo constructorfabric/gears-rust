@@ -53,8 +53,8 @@ communication.
 * The OoP bootstrap (`libs/toolkit/src/bootstrap/oop.rs`) must be extended to start an Axum HTTP server from the gear's
   OperationBuilder routes.
 * Each OoP Worker serves its own `/openapi.json` endpoint, enabling the gateway to aggregate specs.
-* Generated REST clients (`cpt-cf-component-rest-client-gen`) target HTTP endpoints, not gRPC. This simplifies the
-  codegen since OpenAPI (not proto) is the source of truth.
+* Generated REST clients (`cpt-cf-component-rest-client-gen`) target HTTP endpoints, not gRPC. The Rust SDK trait is
+  the single source of truth for codegen (`#[toolkit::rest_contract]`); `openapi.json` is a published output.
 * gRPC remains available via grpc-hub for gears that explicitly opt in (e.g., `DirectoryService`). The two protocols
   coexist without conflict.
 * Latency for REST calls is slightly higher than gRPC (HTTP/1.1 headers vs. HTTP/2 binary framing), but within the 5 ms
@@ -133,6 +133,6 @@ This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-fr-rest-primary` — REST is the primary OoP protocol by this decision
 * `cpt-cf-fr-developer-transparency` — Same OperationBuilder/Axum routes work in-process and OoP without code changes
-* `cpt-cf-fr-rest-client-gen` — REST clients are generated from OpenAPI (not proto), enabled by this decision
+* `cpt-cf-fr-rest-client-gen` — REST clients are generated trait-first (`#[toolkit::rest_contract]`), enabled by this decision
 * `cpt-cf-nfr-oop-latency` — Native REST avoids the bridge translation overhead; HTTP/1.1 overhead is within budget
 * `cpt-cf-component-oop-bootstrap` — Bootstrap must start an Axum HTTP server per this decision

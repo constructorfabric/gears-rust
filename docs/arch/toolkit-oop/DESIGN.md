@@ -34,16 +34,18 @@ OoP gear lifecycle, discovery coordination, and gateway registration. The archit
    OpenAPI generation) as in-process gears. The gear's `register_rest()` builds routes on a local Axum router
    regardless of where the process runs.
 
-2. **REST clients are generated from OpenAPI specs** at build time. SDK crates include a `build.rs` that reads the
-   gear's `openapi.json` and emits a `RestXxxClient` implementing the SDK trait. The generated client uses
-   `toolkit-http` for transport and propagates SecurityContext automatically.
+2. **REST clients are generated trait-first.** The SDK author declares one Rust trait; the `#[toolkit::rest_contract]`
+   macro emits a `RestXxxClient` implementing it over `toolkit-http`, forwarding the bearer token automatically.
+   `openapi.json` is a published *output* for non-Rust consumers, **not** an input to client codegen (see § 3.2
+   `cpt-cf-component-rest-client-gen`).
 
 3. **A gateway abstraction** routes public APIs regardless of the backing implementation. On-premise, the built-in
    `ToolKitGatewayProvider` adds reverse-proxy routes to `api-gateway`. In Kubernetes, a `KongGatewayProvider` (or
    similar) registers routes via the gateway's admin API or CRDs.
 
-4. **SecurityContext propagates across process boundaries** via two HTTP headers: the original JWT in `Authorization`
-   and the pre-parsed context in `x-secctx-bin`. Auth validation happens exactly once at the gateway edge.
+4. **SecurityContext propagates across process boundaries** (tenant plane) by forwarding `Authorization: Bearer <jwt>`,
+   which each hop **re-validates** via AuthN Resolver (ADR-0010). Infra calls use a separate tenant-less platform-plane
+   identity (SA token first phase, mTLS+SPIFFE next). `x-secctx-bin` is not used over HTTP.
 
 ### 1.2 Architecture Drivers
 
@@ -55,10 +57,10 @@ OoP gear lifecycle, discovery coordination, and gateway registration. The archit
 | `cpt-cf-fr-client-transparency`    | ClientHub returns in-process impl or generated `RestXxxClient` based on DirectoryService resolution. Callers use the same SDK trait.                                                     |
 | `cpt-cf-fr-rest-primary`           | Each OoP gear runs Axum with full ToolKit middleware. No gRPC bridge or transcoding layer.                                                                                              |
 | `cpt-cf-fr-direct-communication`   | Generated REST clients resolve target endpoints via DirectoryService (or k8s DNS) and call directly. Gateway is not in the inter-gear path.                                            |
-| `cpt-cf-fr-secctx-propagation`     | `toolkit-http` middleware attaches `Authorization` + `x-secctx-bin` headers. OoP gear middleware reconstructs SecurityContext.                                                          |
+| `cpt-cf-fr-secctx-propagation`     | `toolkit-http` forwards `Authorization: Bearer <jwt>`; OoP `secctx_middleware` re-validates it via AuthN Resolver and reconstructs SecurityContext (ADR-0010). No `x-secctx-bin` over HTTP.                                                          |
 | `cpt-cf-fr-gateway-registration`   | OoP bootstrap calls `GatewayProvider::register_routes()` after HTTP server starts.                                                                                                       |
 | `cpt-cf-fr-gateway-abstraction`    | `GatewayProvider` trait with `ToolKitGatewayProvider` as first implementation.                                                                                                            |
-| `cpt-cf-fr-rest-client-gen`        | `build.rs` codegen from `openapi.json` produces `RestXxxClient` structs.                                                                                                                 |
+| `cpt-cf-fr-rest-client-gen`        | Trait-first codegen: `#[toolkit::rest_contract]` emits `RestXxxClient` from the SDK trait (`openapi.json` is a published output, not a codegen input).                                     |
 | `cpt-cf-fr-k8s-native`             | K8s profile uses k8s DNS for discovery. DirectoryService is optional. GatewayProvider handles external gateway registration.                                                             |
 
 #### NFR Allocation
@@ -66,7 +68,7 @@ OoP gear lifecycle, discovery coordination, and gateway registration. The archit
 | NFR ID                            | NFR Summary                  | Allocated To                                               | Design Response                                                                           | Verification Approach                                            |
 |-----------------------------------|------------------------------|------------------------------------------------------------|-------------------------------------------------------------------------------------------|------------------------------------------------------------------|
 | `cpt-cf-nfr-oop-latency`          | OoP call overhead < 5 ms p95 | `toolkit-http`, OoP HTTP server                             | Connection pooling in `toolkit-http`; Axum's zero-copy routing; UDS transport on same-host | Automated benchmark: 1000 echo requests, measure p95             |
-| `cpt-cf-nfr-no-double-auth`       | JWT validated once at edge   | `api-gateway` authn middleware, `x-secctx-bin` propagation | Gateway runs `authn-resolver`; OoP gears trust the propagated SecurityContext           | Integration test: count `authn-resolver` calls per request chain |
+| `cpt-cf-nfr-per-hop-revalidation`  | One JWT verify per hop (~0.5 ms) | `api-gateway` authn + OoP `secctx_middleware` | Each hop re-validates via `authn-resolver` with cached JWKS (ADR-0010); single IdP trust root | Latency benchmark + forged-signature rejection test |
 | `cpt-cf-nfr-graceful-degradation` | Unavailable OoP → 503        | Generated REST client, `toolkit-http`                       | `toolkit-http` timeout + connection error → mapped to 503 Problem response                 | Integration test: stop target, assert 503                        |
 
 #### Key ADRs
@@ -74,9 +76,10 @@ OoP gear lifecycle, discovery coordination, and gateway registration. The archit
 | ADR ID                              | Decision Summary                                                                                       |
 |-------------------------------------|--------------------------------------------------------------------------------------------------------|
 | `cpt-cf-adr-deployment-profiles`    | Three named deployment profiles (Embedded, Host+Workers, K8s Native) instead of arbitrary combinations |
-| `cpt-cf-adr-auth-edge-only`         | JWT validation at gateway edge only; OoP gears trust SecurityContext                                 |
+| `cpt-cf-adr-two-plane-auth`         | Two-plane auth: tenant plane re-validates JWT per hop; platform plane uses SA tokens (mTLS+SPIFFE next) |
+| `cpt-cf-adr-internal-gear-auth`   | Platform-plane credential abstraction: bootstrap token (Profile 2), K8s SA tokens (Profile 3), mTLS (next phase) |
 | `cpt-cf-adr-rest-first-oop`         | REST as primary OoP protocol; each gear runs its own HTTP server                                     |
-| `cpt-cf-adr-rest-client-generation` | Build-time REST client generation from OpenAPI specs                                                   |
+| `cpt-cf-adr-rest-client-generation` | Trait-first REST client generation via `#[toolkit::rest_contract]` proc-macro; `openapi.json` is a published output  |
 | `cpt-cf-adr-gateway-abstraction`    | GatewayProvider trait abstracts built-in and external gateways                                         |
 
 ### 1.3 Architecture Layers
@@ -93,7 +96,7 @@ OoP gear lifecycle, discovery coordination, and gateway registration. The archit
 │  - JWT validation → SecurityContext                           │
 │  - Route to target gear (reverse-proxy or k8s Service)        │
 └──────────────────────────┬────────────────────────────────────┘
-                           │ HTTP + Authorization + x-secctx-bin
+                           │ HTTP + Authorization: Bearer <jwt> (re-validated per hop)
                            ▼
 ┌───────────────────────────────────────────────────────────────┐
 │  Gear HTTP Layer  (per-gear Axum server)                      │
@@ -205,11 +208,13 @@ MUST continue to work without modification.
 
 - [ ] `p1` - **ID**: `cpt-cf-constraint-secctx-serde`
 
-The `bearer_token` field on SecurityContext is `#[serde(skip)]` and MUST NOT be included in the `x-secctx-bin` payload.
-The original token MUST be carried separately in the `Authorization` header. The receiving side reconstructs the full
-SecurityContext by merging both.
+The `bearer_token` field on SecurityContext is `#[serde(skip)]`. Per
+[ADR-0010](ADR/0010-cpt-cf-adr-two-plane-auth.md), HTTP propagation carries only `Authorization: Bearer <jwt>`; the
+receiving gear re-validates it via AuthN Resolver and reconstructs the full SecurityContext (including the bearer
+token). `encode_bin` / `decode_bin` (which exclude `bearer_token`) remain in use only for in-process gRPC metadata
+(Profile 1).
 
-**ADRs**: `cpt-cf-adr-auth-edge-only`
+**ADRs**: `cpt-cf-adr-auth-edge-only`, `cpt-cf-adr-two-plane-auth`
 
 ## 3. Technical Architecture
 
@@ -226,7 +231,7 @@ SecurityContext by merging both.
 | ServiceEndpoint          | Extended with `rest_url` field. Represents a discovered gear's HTTP endpoint.                   |
 | RegisterInstanceInfo     | Extended with `rest_endpoint` and `openapi_spec` fields for REST service registration.            |
 | GatewayRouteRegistration | Struct carrying gear name, OpenAPI spec, and target endpoint for gateway registration.          |
-| SecurityContextHeaders   | Helper struct encapsulating the two-header propagation (Authorization + x-secctx-bin).            |
+| SecurityContextHeaders   | Helper for single-header tenant-plane propagation (`Authorization: Bearer <jwt>`), re-validated per hop (ADR-0010). |
 
 ### 3.2 Component Model
 
@@ -336,8 +341,10 @@ What is **missing** and needs to be added:
 - Register the gear's REST endpoint and OpenAPI spec with DirectoryService.
 - **Initialize `InternalCredential`** from configuration (bootstrap token from env, SA token from projected volume) and
   attach to all system-level outgoing calls automatically.
-- **Install `InternalAuthMiddleware`** on the HTTP server to validate incoming system calls.
-- Attach SecurityContext reconstruction middleware to the HTTP server.
+- **Install `InternalAuthMiddleware`** (platform plane) to validate incoming system calls — SA token in the first
+  phase; sets `PeerAuthenticated` for workload policy (ADR-0010).
+- Attach `secctx_middleware` (tenant plane) that re-validates the forwarded JWT via AuthN Resolver and reconstructs
+  SecurityContext.
 - Send heartbeats to DirectoryService (already implemented).
 - Deregister from DirectoryService on graceful shutdown.
 - Call GatewayProvider to register/deregister public routes.
@@ -497,8 +504,8 @@ gears, the gateway needs to reverse-proxy requests to remote OoP gears.
   implementation to re-parse a string.
 - Provide `ToolKitGatewayProvider`: parses the OpenAPI spec to extract public route paths (where
   `OperationSpec.is_public == true`), adds reverse-proxy routes to the built-in api-gateway using
-  `toolkit-http::HttpClient` to forward requests to OoP gears. Must propagate SecurityContext headers (
-  `Authorization` + `x-secctx-bin`) on the proxied request.
+  `toolkit-http::HttpClient` to forward requests to OoP gears. Must forward the `Authorization: Bearer <jwt>` header
+  (re-validated downstream per ADR-0010) on the proxied request.
 - Future: `KongGatewayProvider`, `TykGatewayProvider`.
 
 ##### Responsibility boundaries
@@ -642,28 +649,24 @@ SecurityContext must cross process boundaries with the original bearer token int
 
 ##### Responsibility scope
 
-- Define the two-header HTTP propagation contract:
-    - `Authorization: Bearer <original_jwt>` — carries the original token.
-    - `x-secctx-bin: <base64(encode_bin(SecurityContext))>` — carries the binary-encoded context (version byte +
-      postcard, base64-wrapped for HTTP header transport). `bearer_token` is excluded by `#[serde(skip)]`.
-- Provide `attach_secctx_http(request, secctx)` — adds both headers to an outgoing HTTP request. Extracts the bearer
-  token from `secctx.bearer_token()` (which returns `Option<&SecretString>`), calls `toolkit_security::encode_bin()` for
-  the context body, and base64-encodes it.
-- Provide `extract_secctx_http(headers) -> Result<SecurityContext>` — base64-decodes the `x-secctx-bin` header, calls
-  `toolkit_security::decode_bin()`, then merges the bearer token from the `Authorization` header to reconstruct the full
-  SecurityContext.
-- Provide Axum middleware (`secctx_middleware`) that runs `extract_secctx_http` and inserts the result into request
-  extensions.
+- Define the single-header HTTP propagation contract: `Authorization: Bearer <jwt>` carries the original token,
+  forwarded as-is across hops.
+- Provide `attach_bearer_http(request, secctx)` — sets `Authorization: Bearer <jwt>` from `secctx.bearer_token()` on an
+  outgoing request. No binary encoding.
+- Provide Axum middleware (`secctx_middleware`) that extracts the bearer token and **re-validates it** via
+  `AuthNResolverClient::authenticate()`, then inserts the reconstructed `SecurityContext` into request extensions. One
+  code path; no `x-secctx-bin` decode.
+- `encode_bin` / `decode_bin` remain for in-process gRPC metadata only (Profile 1).
 
 ##### Responsibility boundaries
 
-- Does NOT validate the JWT (the gateway already did that).
+- Re-validates the JWT at each hop (the gateway validated it too — intentional defense in depth per ADR-0010).
 - Does NOT decide whether to propagate (callers decide by including SecurityContext in the call context).
 
 ##### Related components (by ID)
 
 - `cpt-cf-component-oop-bootstrap` — installs the Axum middleware
-- `cpt-cf-component-rest-client-gen` — generated clients call `attach_secctx_http`
+- `cpt-cf-component-rest-client-gen` — generated clients call `attach_bearer_http`
 
 #### Internal Gear Authentication
 
@@ -709,33 +712,89 @@ pub enum InternalCredential {
 
 1. Each gear pod has a projected SA token with audience `toolkit-internal` (auto-mounted by kubelet).
 2. Gear reads the token from the projected volume at startup and on rotation.
-3. Attaches it to system calls as `Authorization: Bearer <sa-token>`.
+3. Attaches it to system calls as `X-ToolKit-Internal-Token: <sa-token>` (never `Authorization`, to avoid colliding
+   with the tenant-plane user JWT).
 4. Flight Control validates via k8s TokenReview API (cached, configurable TTL).
 5. Response includes gear identity: `{namespace, serviceAccountName, podName}`.
 
-**Dual-layer requests**: a single request may carry both SecurityContext (user identity) and internal credential (gear
-identity). They serve different purposes and travel in different headers.
+**One plane per request** (per [ADR-0010](ADR/0010-cpt-cf-adr-two-plane-auth.md)): a request carries either the tenant
+plane (user JWT) or the platform plane (gear identity), not both. The two planes travel in distinct headers.
 
-| Call type                            | Auth layer          | Header                                                    |
-|--------------------------------------|---------------------|-----------------------------------------------------------|
-| User-propagated (gear → gear)    | SecurityContext     | `Authorization` + `x-secctx-bin`                          |
-| System (gear → Flight Control)     | Internal credential | `x-toolkit-internal-token` or `Authorization: Bearer <sa>` |
-| Both (system call on behalf of user) | Both layers         | All headers present                                       |
+| Call type                            | Plane          | Header                                                       |
+|--------------------------------------|----------------|-------------------------------------------------------------|
+| User-propagated (gear → gear)    | Tenant (JWT)   | `Authorization: Bearer <jwt>` (re-validated each hop)       |
+| System (gear → Flight Control)     | Platform       | `X-ToolKit-Internal-Token` (SA token; mTLS+SPIFFE next phase) |
 
-###### Validation order (mandatory)
+###### Middleware order
 
-The receiving gear's middleware MUST validate the two auth layers in this strict order, rejecting the request before
-the next step on any failure:
+When both middlewares are installed, `InternalAuthMiddleware` (platform plane) runs before `secctx_middleware` (tenant
+plane). On a system call it sets `PeerAuthenticated { gear }` for workload-policy decisions; on a user-propagated call
+`secctx_middleware` **re-validates** the JWT via `AuthNResolverClient` and reconstructs `SecurityContext`.
 
-1. **Internal credential first** — `InternalAuthMiddleware` validates `x-toolkit-internal-token` /
-   `Authorization: Bearer <sa>`. On failure: respond `401 Unauthenticated` and do NOT inspect any other auth header.
-2. **SecurityContext second** — only after internal auth establishes that the caller is a trusted ToolKit peer, the
-   `secctx_middleware` MAY decode `x-secctx-bin` and install it on the request extension. On failure: respond
-   `401 Unauthenticated`.
+Note: `PeerAuthenticated` is **not** a prerequisite for trusting the user context — the JWT is self-authenticating, so
+`secctx_middleware` re-validates it regardless of peer trust. There is no unsigned envelope to gate behind peer
+authentication.
 
-The order is hard-required because `x-secctx-bin` is a deserialization of caller-supplied bytes; trusting it before the
-peer is authenticated would let any TCP-reachable process forge arbitrary `SecurityContext` values (`subject_id`,
-`roles`, tenant). The reverse order is a documented anti-pattern.
+###### Platform SecurityContext (non-tenant operations)
+
+Platform-scoped operations carry a dedicated **`PlatformSecurityContext`** — a type **distinct** from the tenant
+`SecurityContext`, per [ADR-0010](ADR/0010-cpt-cf-adr-two-plane-auth.md). It is **not** a tenant context with a
+nil/sentinel tenant id. The separation is deliberate: reusing the request-scoped tenant context for platform
+calls is the seam where confused-deputy / cross-tenant-leak regressions begin, so a separate type makes "no tenant"
+unrepresentable-as-a-tenant.
+
+```rust
+/// Identity for non-tenant, platform-scoped operations. NEVER carries a tenant subject,
+/// and is NEVER passed to the tenant `PolicyEnforcer`.
+pub struct PlatformSecurityContext {
+    /// The authenticated platform identity. The variant reflects which credential
+    /// authenticated the caller; the surrounding struct does not change between phases.
+    pub identity: PlatformIdentity,
+}
+
+/// Method-agnostic platform identity. `InternalAuthMiddleware` builds the variant
+/// matching the validated credential; platform handlers consume `PlatformIdentity`
+/// without branching on how the caller authenticated. New AuthN methods add a variant —
+/// they do not change `PlatformSecurityContext`.
+#[non_exhaustive]
+pub enum PlatformIdentity {
+    /// First phase: K8s ServiceAccount (from a validated projected SA token / TokenReview).
+    ServiceAccount { namespace: String, service_account: String, pod: Option<String> },
+    /// Next phase: mTLS + SPIFFE workload identity, parsed from the X.509 SAN.
+    /// SPIFFE ID format: `spiffe://<trust_domain>/gear/<gear>/<version>` (per platform-authn).
+    Spiffe { trust_domain: String, gear: String, version: String },
+}
+```
+
+- **First-class from P1** The *context type* is stable from day one; only the populating *mechanism* is phased.
+  `PlatformIdentity` is a method-agnostic enum: phase 1 builds the `ServiceAccount` variant from the validated SA
+  identity, and the mTLS phase adds the `Spiffe` variant — `PlatformSecurityContext`'s shape is unchanged. The enum is
+  `#[non_exhaustive]` so future AuthN methods add variants without breaking consumers.
+- **Never evaluated by tenant AuthZ.** `PlatformSecurityContext` is never passed to the tenant `PolicyEnforcer`.
+- **Auth method ⟂ structure.** Adding a platform AuthN method (mTLS+SPIFFE, or any future mechanism) only changes how
+  `PlatformSecurityContext` is *populated* — never its shape or how handlers consume it. All method selection/validation
+  is contained in `InternalAuthMiddleware`; downstream platform handlers see a stable struct regardless of credential.
+
+**The plane is chosen by *tenant-scoped vs non-tenant-scoped*, not *user vs system*.** A system/root actor performing a
+*tenant-scoped* operation (e.g. posting an event for a tenant, writing tenant data) stays on the **tenant plane**: it
+carries a tenant `SecurityContext` — from a user JWT or an **S2S client-credentials** JWT — and is authorized through the
+normal `PolicyEnforcer`. The **root tenant uses the identical AuthZ flow** as any tenant (treat all tenants the same), so
+consumers like the Event Broker do not care whether a tenant-scoped event arrived under a root S2S token or a regular
+tenant token. Only genuinely **non-tenant** operations (e.g. registering a *global* GTS type in the Types Registry) use
+`PlatformSecurityContext` and bypass AuthZ.
+
+**Existing AuthZ-exempt platform surfaces** are the concrete consumers and must migrate off
+the nil-tenant `SecurityContext` shim:
+
+| Surface | Location | Today | Target |
+|---------|----------|-------|--------|
+| account-management — *global* RG type registration | `domain/system_actor.rs` `for_gear_init` (nil tenant, workspace-wide) | Tenant `SecurityContext` with `subject_tenant_id = Uuid::nil()` | `PlatformSecurityContext` (non-tenant) |
+| account-management — *tenant-bound* system flows | `domain/system_actor.rs` `for_bootstrap` / `for_provisioning_reaper` / `for_retention_sweep` / `for_user_groups_cascade` (carry a real tenant id, incl. root) | `am.system` tenant `SecurityContext` | **Tenant plane** — real tenant `SecurityContext` via S2S client-credentials + normal AuthZ (NOT `PlatformSecurityContext`) |
+| resource-group hierarchy reads (PDP self-reference) | `ResourceGroupReadHierarchy` (`read_service.rs`) | `AccessScope::allow_all()`, "do NOT expose via REST" | `PlatformSecurityContext` (non-tenant infra read) |
+
+Note the split: per the tenant-scoped-vs-non-tenant criterion above, only `for_gear_init` is a genuine platform-plane
+operation. The tenant-bound `am.system` factories are tenant-scoped (a specific tenant, including the platform root) and
+belong on the tenant plane — they are *not* candidates for `PlatformSecurityContext`.
 
 ##### Responsibility scope
 
@@ -888,24 +947,23 @@ Key design decisions:
 - **Technology**: Rust async trait
 - **Location**: `libs/toolkit/src/gateway/`
 
+Typed wrappers (`GearName`, `OpenApiSpec`, `Endpoint`) make argument swaps a compile-time error and give an explicit
+`GatewayError`. `health_check()` is not on the trait — gateway liveness is an operational probe concern, not part of
+the registration contract.
+
 ```rust
 #[async_trait]
 pub trait GatewayProvider: Send + Sync {
     /// Register a gear's public routes in the gateway.
-    /// `openapi` is the gear's OpenAPI JSON spec.
-    /// `endpoint` is the gear's HTTP base URL.
     async fn register_routes(
         &self,
-        gear: &str,
-        openapi: &str,
-        endpoint: &str,
-    ) -> Result<()>;
+        gear: &GearName,
+        spec: OpenApiSpec<'_>,
+        endpoint: &Endpoint,
+    ) -> Result<(), GatewayError>;
 
     /// Remove a gear's routes from the gateway.
-    async fn deregister_routes(&self, gear: &str) -> Result<()>;
-
-    /// Check if the gateway is healthy and accepting registrations.
-    async fn health_check(&self) -> Result<()>;
+    async fn deregister_routes(&self, gear: &GearName) -> Result<(), GatewayError>;
 }
 ```
 
@@ -961,17 +1019,17 @@ sequenceDiagram
     Client->>GW: HTTP POST /api/users + Authorization: Bearer <jwt>
     GW->>AuthN: authenticate(bearer_token)
     AuthN-->>GW: SecurityContext
-    GW->>GW: attach x-secctx-bin header
-    GW->>Worker: HTTP POST /api/users + Authorization + x-secctx-bin
-    Worker->>Worker: extract_secctx(headers) → SecurityContext with bearer_token
+    GW->>Worker: HTTP POST /api/users + Authorization: Bearer <jwt>
+    Worker->>AuthN: authenticate(bearer_token) [re-validate per hop]
+    AuthN-->>Worker: SecurityContext (with bearer_token)
     Worker->>Worker: execute handler
     Worker-->>GW: HTTP 200 + JSON body
     GW-->>Client: HTTP 200 + JSON body
 ```
 
-**Description**: An external request enters through api-gateway, which validates the JWT via authn-resolver, serializes
-the SecurityContext into headers, and reverse-proxies to the target OoP gear. The worker reconstructs SecurityContext
-and executes the handler.
+**Description**: An external request enters through api-gateway, which validates the JWT via authn-resolver and
+reverse-proxies to the target OoP gear, forwarding `Authorization: Bearer <jwt>`. The worker **re-validates** the JWT
+(per ADR-0010) to reconstruct SecurityContext and executes the handler.
 
 #### Inter-Gear Call (OoP → OoP)
 
@@ -991,11 +1049,11 @@ sequenceDiagram
     ModA->>Hub: get::<GearBClient>()
     Hub-->>ModA: RestGearBClient
     ModA->>ModA: client.get_user(id, secctx)
-    Note over ModA: Generated client attaches<br/>Authorization + x-secctx-bin
+    Note over ModA: Generated client attaches<br/>Authorization: Bearer <jwt>
     ModA->>Dir: resolve_rest_service("gear-b")
     Dir-->>ModA: ServiceEndpoint { rest_url: "http://..." }
     ModA->>ModB: HTTP GET /api/users/{id} + headers
-    ModB->>ModB: extract_secctx → SecurityContext
+    ModB->>ModB: re-validate JWT via AuthN Resolver → SecurityContext
     ModB->>ModB: execute handler
     ModB-->>ModA: HTTP 200 + JSON
     Note over ModA: Generated client deserializes<br/>response into typed Result
@@ -1132,7 +1190,7 @@ sequenceDiagram
     Note over Host: Runtime — plugin call
     Host->>Hub: try_get_scoped::<dyn AuthNPluginClient>(gts_id)
     Hub-->>Host: Arc<RemoteAuthNPluginClient>
-    Host->>Plugin: HTTP POST /plugin/authenticate<br/>+ Authorization + x-secctx-bin
+    Host->>Plugin: HTTP POST /plugin/authenticate<br/>+ Authorization: Bearer <jwt>
     Plugin->>Plugin: #[toolkit::plugin] generated handler<br/>→ delegates to trait impl
     Plugin-->>Host: HTTP 200 + JSON result
     Note over Host: Identical call path whether<br/>plugin is in-process or remote
@@ -1230,7 +1288,7 @@ state. Persistent state (if needed for multi-host P2) will be addressed in a fut
 - Each gear is an independent k8s Deployment + Service.
 - External gateway (Kong, Tyk, Envoy) handles public API ingress.
 - k8s DNS provides service discovery; DirectoryService is optional for metadata.
-- Platform services (orchestrator, types-registry) run as separate pods.
+- Platform services (gear-orchestrator, types-registry, credstore) run as separate pods. The trust-coupled core (authz-resolver, tenant-resolver, resource-group, account-management) remains in the Platform Host pod (see § Platform Host Composition).
 - No built-in api-gateway in this profile.
 
 ### 3.9 K8s Packaging (Helm Charts)
@@ -1636,81 +1694,73 @@ Regardless of edge mode, the following is always true:
 
 ## 4. Additional context
 
-### REST Client Generation — Build Flow
+### REST Client Generation — Flow
 
-The build-time codegen flow for REST clients works as follows:
+The canonical mechanism is trait-first codegen (§ 3.2 `cpt-cf-component-rest-client-gen`, implemented in
+`libs/toolkit-contract*`). `openapi.json` is a published consumer-facing artifact, not an input to client codegen.
 
-1. **Gear exports OpenAPI**: During CI or a dedicated build step, the gear's `register_rest()` is called on a mock
-   registry that captures routes and generates `openapi.json` via utoipa. The resulting spec is committed to the
-   gear's SDK crate (e.g., `sdks/users/openapi.json`).
+The flow for REST clients:
 
-2. **SDK crate's `build.rs`**: Reads `openapi.json` and generates Rust source:
-    - A `RestUsersClient` struct with a `toolkit_http::HttpClient` field.
-    - `impl UsersClient for RestUsersClient` — each method maps to an HTTP call.
-    - SecurityContext propagation via `attach_secctx()`.
-    - Problem Details error mapping from non-2xx responses.
-    - A `wire_rest_client(hub: &mut ClientHub, base_url: &str)` helper.
+1. **SDK author declares the trait** and its REST projection via `#[toolkit::rest_contract]` in
+   `<gear>-sdk/src/rest.rs` (HTTP method/path attributes on each method).
 
-3. **ClientHub wiring**: At startup, the bootstrap layer checks the deployment profile:
-    - **Embedded**: wires the in-process implementation directly.
-    - **OoP**: resolves the target gear's base URL via DirectoryService and calls `wire_rest_client(hub, base_url)`.
+2. **Macro expansion** emits a `RestXxxClient` struct (gated on the `rest-client` feature) implementing the base trait
+   over `toolkit_http::HttpClient`: each method maps to an HTTP call, forwards the bearer token via
+   `attach_bearer_http`, and maps non-2xx responses to Problem Details.
+
+3. **ClientHub wiring**: at startup the gear's `init` picks the transport by deployment profile —
+    - **Embedded**: registers the in-process implementation directly.
+    - **OoP**: resolves the target gear's base URL via DirectoryService (`ApiContractsConfig.remote_endpoints`) and
+      registers the `RestXxxClient`.
 
 ### SecurityContext Reconstruction
 
-The reconstruction function uses the existing `toolkit_security::decode_bin` (which handles the version byte + postcard
-deserialization) and merges the bearer token from the `Authorization` header. Note that `bearer_token` is
-`Option<SecretString>` (from `secrecy` crate), not a plain `String`.
+The OoP middleware extracts the bearer token from the `Authorization` header and re-validates it via
+`AuthNResolverClient::authenticate()`, which returns a fully-populated `SecurityContext` (including the bearer token).
+There is no `x-secctx-bin` envelope on the HTTP path.
 
 ```rust
-use base64::Engine as _;
-use toolkit_security::{SecurityContext, decode_bin};
-use secrecy::SecretString;
+use toolkit_security::SecurityContext;
 
-fn extract_secctx_http(headers: &HeaderMap) -> Result<SecurityContext> {
-    let secctx_b64 = headers
-        .get("x-secctx-bin")
-        .ok_or(Error::MissingSecCtx)?
-        .to_str()?;
-    let secctx_bytes = base64::engine::general_purpose::STANDARD.decode(secctx_b64)?;
-    // decode_bin handles version byte check + postcard deserialization
-    // bearer_token will be None (excluded by #[serde(skip)])
-    let mut secctx: SecurityContext = decode_bin(&secctx_bytes)?;
+// Tenant-plane reconstruction: re-validate the JWT at every hop.
+async fn secctx_from_request(
+    headers: &HeaderMap,
+    authn: &AuthNResolverClient,
+) -> Result<SecurityContext, SecCtxHttpError> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(SecCtxHttpError::MissingAuth)?;
 
-    // Merge the original bearer token from the Authorization header
-    if let Some(auth_header) = headers.get("authorization") {
-        let token = auth_header
-            .to_str()?
-            .strip_prefix("Bearer ")
-            .ok_or(Error::InvalidAuthHeader)?;
-        secctx.set_bearer_token(SecretString::from(token.to_owned()));
-    }
-
-    Ok(secctx)
+    // Signature + claims check, JWKS-cached (~0.5 ms on hit). Returns a fully
+    // populated SecurityContext, so no post-deserialization bearer-token merge.
+    authn
+        .authenticate(token)
+        .await
+        .map_err(|_| SecCtxHttpError::Unauthorized)
 }
 
-fn attach_secctx_http(request: &mut Request, secctx: &SecurityContext) -> Result<()> {
-    // Encode SecurityContext (without bearer_token) to binary
-    let bin = toolkit_security::encode_bin(secctx)?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bin);
-    request.headers_mut().insert("x-secctx-bin", b64.parse()?);
-
-    // Propagate original bearer token in Authorization header
+fn attach_bearer_http(request: &mut Request, secctx: &SecurityContext) -> Result<()> {
     if let Some(token) = secctx.bearer_token() {
         use secrecy::ExposeSecret;
         let header_val = format!("Bearer {}", token.expose_secret());
         request.headers_mut().insert("authorization", header_val.parse()?);
     }
-
     Ok(())
 }
 ```
 
 ### SecurityContext API Gap
 
+On the HTTP path this is irrelevant: the OoP middleware obtains `SecurityContext` from
+`AuthNResolverClient::authenticate()`, which already populates the bearer token. The gap applies only to the
+in-process gRPC `decode_bin` path.
+
 The current `SecurityContext` struct has private fields and exposes `bearer_token()` as a getter only. There is no
 `set_bearer_token()` setter — the only way to set it is via `SecurityContextBuilder::bearer_token()` during initial
-construction. The reconstruction flow in `extract_secctx_http` needs to merge the bearer token after deserialization.
-This requires either:
+construction. Any flow that rebuilds context from `decode_bin` (gRPC metadata) may need to merge the bearer token after
+deserialization. This requires either:
 
 1. Adding a `pub fn set_bearer_token(&mut self, token: SecretString)` method to `SecurityContext`, or
 2. Reconstructing via the builder (deserialize fields individually, then build with bearer_token), which is more
@@ -1720,15 +1770,29 @@ Option 1 is the minimal change. The method should be added to `toolkit-security`
 
 ### Platform Host Composition
 
-The Platform Host process contains at minimum:
+#### OoP-eligible services
 
-| Component                              | Required          | Purpose                                                                        |
-|----------------------------------------|-------------------|--------------------------------------------------------------------------------|
-| gear-orchestrator (DirectoryService) | Yes               | Service discovery for all profiles                                             |
-| grpc-hub                               | Yes               | Hosts gRPC services                                                            |
-| api-gateway                            | Profile 1, 2 only | Built-in HTTP gateway; not used in K8s Native                                  |
-| types-registry                         | Yes               | Shared type definitions                                                        |
-| authn-resolver                         | Profile 1, 2 only | JWT validation (in K8s, this moves to the external gateway or a dedicated pod) |
+These services have no trust-coupling and can run as separate pods in K8s (Profile 3):
+
+| Component | REST surface needed | Persistence | Notes |
+|-----------|-------------------|-------------|-------|
+| gear-orchestrator (DirectoryService) | Yes — REST extension for service discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Already has gRPC via grpc-hub; REST surface enables k8s-native discovery. |
+| types-registry | Yes — REST write (registration) and read (query) endpoints | Needs persistence or re-registration. Currently in-memory (link-time inventory). As a separate pod, gears register over REST at startup; heartbeat re-registration handles pod restarts. DB persistence is a future optimization. | Critical path: `post_init` graph validation must work across distributed registrations. |
+| credstore | Yes — REST endpoint for secret retrieval | No DB; stateless plugin-based lookups. | Alternative: embed per-pod (like authn-resolver) to avoid secrets-in-transit. If separate, mTLS protects the wire. |
+| api-gateway | Already HTTP; GatewayProvider registers routes via API | No DB; route table is in-memory, populated by GatewayProvider registrations. | Separate pod in Mode A; absent in Mode B (external gateway). |
+| authn-resolver | None (embeds in each OoP pod) | No DB; JWKS cache only. | Stateless; zero network latency for JWT validation. |
+
+#### Trust-coupled core (must remain co-located)
+
+These services use synthetic or anonymous `SecurityContext` internally and cannot cross a network boundary
+without migrating to IdP-issued credentials:
+
+| Component | Why co-located | OoP path |
+|-----------|---------------|----------|
+| authz-resolver | Chains to tenant-resolver → resource-group via `SecurityContext::anonymous()` | Requires REST surface on resource-group + IdP-issued credentials for the AuthZ→TR→RG chain |
+| tenant-resolver | `rg-tr-plugin` reads resource-group's DB directly | Requires REST surface on resource-group or shared DB access |
+| resource-group | Foundation for AuthZ + TR chain; DB-level coupling | Would need its own REST surface for hierarchy reads |
+| account-management | Synthetic system actor (`am.system`) for background flows | OoP-eligible after migrating `am.system` to S2S credentials (see migration table above) |
 
 ## 5. Traceability
 

@@ -51,11 +51,15 @@ system-level communication, and should the mechanism differ per deployment profi
 
 Chosen option: **"Option B — mTLS with a platform CA as the primary mechanism for every multi-process profile."**
 
-mTLS is the single security primitive used to authenticate gear-to-gear calls across the wire. The peer's
+The mTLS destination stands. [ADR-0010](0010-cpt-cf-adr-two-plane-auth.md) changes the **sequencing**: the platform
+plane runs on K8s SA tokens as the first-phase steady state, and mTLS+SPIFFE via cert-manager is the next phase (not
+day one). SA token and mTLS are two backends of one stable `PlatformIdentity` abstraction. Platform calls carry a
+dedicated `PlatformSecurityContext` (distinct from the tenant `SecurityContext`), first-class from the first phase.
+
+mTLS is the target security primitive for authenticating gear-to-gear calls across the wire. The peer's
 certificate, signed by the platform CA, carries the gear's identity (`CN = <gear-name>`, `SAN URI =
-spiffe://<trust-domain>/<gear>`). The TLS handshake establishes peer identity *before any bytes of application
-payload are read* — including `x-secctx-bin` — which is the property [ADR-0002](0002-cpt-cf-adr-auth-edge-only.md)
-relies on to skip per-hop JWT validation safely.
+spiffe://<trust_domain>/gear/<gear>/<version>`). The TLS handshake establishes peer identity before application payload is read,
+providing defense in depth alongside per-hop JWT re-validation (see [ADR-0010](0010-cpt-cf-adr-two-plane-auth.md)).
 
 Bootstrap tokens, K8s SA tokens, and JWT (Options A, C, E) are kept as **supplemental** mechanisms, not as the trust
 root:
@@ -81,9 +85,8 @@ root:
 
 * **The ToolKit OoP runtime MUST refuse plain-TCP inbound connections on every multi-process profile** (Profile 2
   multi-node, Profile 3). The HTTP/gRPC listener binds with `TlsAcceptor` requiring client certificate verification
-  against the platform CA. No bytes of application payload — including `x-secctx-bin` — are read from a connection
-  whose mTLS handshake has not completed and validated.
-* Gear identity is the subject of the validated client certificate (`SAN URI = spiffe://<trust-domain>/<gear>`).
+  against the platform CA. No application payload is read from a connection whose mTLS handshake has not completed.
+* Gear identity is the subject of the validated client certificate (`SAN URI = spiffe://<trust_domain>/gear/<gear>/<version>`).
   The runtime exposes this identity on the request extension as `PeerGearIdentity` for AuthZ rules that need it
   (e.g., "only `flight-control` may call `DeregisterInstance`").
 * Cert lifecycle is delegated to a cert-manager / SPIRE-like component out of scope of this ADR; ToolKit just consumes
@@ -93,9 +96,9 @@ root:
   token to validate in the hot path.
 * Flight Control still validates inbound `RegisterInstance` / `DeregisterInstance` / `Heartbeat` calls — but by
   `PeerGearIdentity` from mTLS, not by a separate token header.
-* User-initiated calls continue to carry SecurityContext propagation per [ADR-0002](0002-cpt-cf-adr-auth-edge-only.md);
-  the per-request layer (`x-secctx-bin`) is decoded ONLY after the connection-level mTLS layer has authenticated the
-  peer (see DESIGN.md § Validation order).
+* User-initiated calls carry `Authorization: Bearer <jwt>`, **re-validated at every hop** per
+  [ADR-0010](0010-cpt-cf-adr-two-plane-auth.md). `x-secctx-bin` is not used over HTTP, so there is no envelope to gate
+  behind mTLS; the JWT is self-authenticating.
 * Profile 2 single-node MAY skip mTLS if all gears run as the same uid and communicate over UDS — the OS process
   boundary plus filesystem perms is the trust root in that narrow case. This is the ONE place where Option D applies.
 * The optional JWT mode (`internal_auth.mode = "jwt"`) coexists with mTLS — the mTLS handshake still validates the
@@ -186,18 +189,22 @@ pub enum InternalCredential {
 The OoP bootstrap reads the credential source from configuration and creates the appropriate variant. All outgoing
 system calls go through `attach_internal_auth(request, credential)` which adds the correct header/metadata.
 
-### Two Authentication Layers
+### Two Authentication Planes
 
-| Call type                             | Auth mechanism              | Header/metadata                  |
-|---------------------------------------|-----------------------------|----------------------------------|
-| External → Gateway                    | JWT (Bearer token)          | `Authorization: Bearer <jwt>`    |
-| Gateway → Gear (user request)       | SecurityContext propagation | `Authorization` + `x-secctx-bin` |
-| Gear → Gear (user-propagated)     | SecurityContext propagation | `Authorization` + `x-secctx-bin` |
-| Gear → Flight Control (system)      | Internal credential         | `x-toolkit-internal-token`        |
-| Gear → Gear (system, no user ctx) | Internal credential         | `X-ToolKit-Internal-Token`        |
+A request carries **one** plane, not both. The tenant plane uses a single `Authorization` header; `x-secctx-bin` is
+not used over HTTP. See [ADR-0010](0010-cpt-cf-adr-two-plane-auth.md).
 
-A single request may carry **both** layers: SecurityContext (user identity) + internal credential (gear identity). The
-SecurityContext identifies *who initiated* the action; the internal credential identifies *which gear is calling*.
+| Call type                             | Plane          | Header/metadata                  |
+|---------------------------------------|----------------|----------------------------------|
+| External → Gateway                    | Tenant (JWT)   | `Authorization: Bearer <jwt>`    |
+| Gateway → Gear (user request)       | Tenant (JWT)   | `Authorization: Bearer <jwt>` (re-validated each hop) |
+| Gear → Gear (user-propagated)     | Tenant (JWT)   | `Authorization: Bearer <jwt>` (re-validated each hop) |
+| Gear → Flight Control (system)      | Platform       | `X-ToolKit-Internal-Token` (SA token; mTLS+SPIFFE next phase) |
+| Gear → Gear (system, no user ctx) | Platform       | `X-ToolKit-Internal-Token` (SA token; mTLS+SPIFFE next phase) |
+
+The **tenant plane** carries *who initiated* the action (the user, via a re-validated JWT, reconstructed into a tenant
+`SecurityContext`). The **platform plane** carries *which gear is calling* (a tenant-less `PlatformSecurityContext`,
+never the tenant `SecurityContext`). A request uses one plane, not both.
 
 ## Traceability
 

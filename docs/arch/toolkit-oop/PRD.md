@@ -52,8 +52,8 @@ application code remains deployment-agnostic. ToolKit Distributed Gears bring th
   explosion of configuration options.
 - **G3**: OoP gear REST calls add less than 5 ms overhead at p95, making out-of-process deployment viable for
   latency-sensitive workloads.
-- **G4**: The framework generates typed REST clients from OpenAPI specs, eliminating hand-written HTTP boilerplate and
-  reducing integration bugs.
+- **G4**: The framework generates typed REST clients from annotated Rust traits (`#[toolkit::rest_contract]`),
+  eliminating hand-written HTTP boilerplate and reducing integration bugs.
 
 ### 1.4 Glossary
 
@@ -141,13 +141,15 @@ application code remains deployment-agnostic. ToolKit Distributed Gears bring th
 - Deployment Profile 1: Embedded (current behavior, no changes needed)
 - Deployment Profile 3: K8s Native (each gear = pod, external gateway, k8s DNS discovery)
 - Deployment Profile 2 (simplified): Single-node on-premise with OoP Workers communicating via UDS/pipes
-- Auth at edge only — gateway validates JWT, OoP gears trust SecurityContext from trusted transport
+- Two-plane auth — gateway validates the JWT at the edge; OoP gears **re-validate it per hop** (tenant plane) and use a tenant-less identity for infra calls (platform plane). See [ADR-0010](ADR/0010-cpt-cf-adr-two-plane-auth.md)
 - Direct gear-to-gear REST communication (not routed through gateway)
 - Public vs. internal API distinction in route registration
-- REST client generation from OpenAPI spec (build-time, Progenitor-inspired)
+- REST client generation from annotated Rust traits (trait-first, `#[toolkit::rest_contract]` proc-macro)
 - Gateway abstraction trait with built-in ToolKit implementation
-- SecurityContext HTTP propagation (two-header: `Authorization` + `x-secctx-bin`)
-- Internal gear authentication: bootstrap token (Profile 2 single-node), K8s ServiceAccount tokens (Profile 3)
+- SecurityContext propagation (tenant plane): `Authorization: Bearer <jwt>` forwarded and **re-validated at every hop**
+  via AuthN Resolver; `x-secctx-bin` is not used over HTTP (see [ADR-0010](ADR/0010-cpt-cf-adr-two-plane-auth.md))
+- Platform-plane authentication: tenant-less identity for infra calls (Directory/GTS registration, heartbeats) — K8s
+  ServiceAccount tokens in the first phase; mTLS+SPIFFE (cert-manager) next phase
 - K8s packaging: Helm library chart (`toolkit-common`), per-gear charts, umbrella chart (`toolkit-platform`) with preset
   values
 - Edge architecture (Mode A): Embedded Edge with built-in api-gateway + identity broker baseline
@@ -227,17 +229,15 @@ The gateway is for external traffic only.
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-secctx-propagation`
 
-SecurityContext MUST be propagated across all OoP boundaries with the original bearer token intact. The propagation
-mechanism MUST use two HTTP headers: `Authorization: Bearer <jwt>` for the original token and
-`x-secctx-bin: <base64(encode_bin(SecurityContext))>` for the pre-parsed context (using the existing
-`toolkit_security::encode_bin` with version byte + postcard). The `bearer_token` field (`Option<SecretString>`,
-`#[serde(skip)]`) is excluded from the binary encoding by design; the receiving gear MUST reconstruct the full
-SecurityContext by merging both headers.
+The tenant `SecurityContext` MUST be propagated across OoP boundaries by forwarding the original
+`Authorization: Bearer <jwt>` header **as-is**. Each receiving OoP gear MUST **re-validate** the token via
+`AuthNResolverClient::authenticate()` and reconstruct `SecurityContext` from the validated claims. `x-secctx-bin` MUST
+NOT be used over HTTP. `encode_bin` / `decode_bin` remain only for in-process gRPC metadata (Profile 1).
 
-- **Rationale**: Downstream gears may need the original token for delegation (e.g., calling external services on
-  behalf of the user). The two-header approach avoids modifying the existing `#[serde(skip)]` on `bearer_token` while
-  ensuring full context propagation. The existing `toolkit-transport-grpc` already uses this `x-secctx-bin` key for gRPC
-  binary metadata; the HTTP variant adds base64 encoding.
+- **Rationale**: The JWT is self-authenticating — the IdP signature is the trust root, so tenant integrity does not
+  depend on transport trust being correctly deployed at every boundary. Re-validation is ~0.5 ms with a cached JWKS,
+  well within the latency budget, and gives defense in depth: a compromised peer cannot forward a forged token
+  undetected.
 - **Actors**: `cpt-cf-actor-oop-worker`, `cpt-cf-actor-platform-host`
 
 ### 5.3 Gateway & Discovery
@@ -283,11 +283,13 @@ basic service resolution in k8s.
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-rest-client-gen`
 
-The framework MUST provide a mechanism to generate typed REST clients from a gear's OpenAPI spec. Generated clients
-MUST implement the gear's SDK trait, use `toolkit-http` for transport, and propagate SecurityContext automatically.
+The framework MUST provide a mechanism to generate typed REST clients from an annotated Rust trait
+(`#[toolkit::rest_contract]`). Generated clients MUST implement the gear's SDK trait, use `toolkit-http` for transport,
+and propagate SecurityContext automatically. `openapi.json` is a published *output* for non-Rust consumers, not a
+codegen input.
 
 - **Rationale**: Hand-written HTTP clients are error-prone, tedious, and diverge from the spec over time.
-  Auto-generation from OpenAPI ensures type-safe, always-in-sync clients.
+  Trait-first codegen ensures type-safe, always-in-sync clients with a single Rust trait as the source of truth.
 - **Actors**: `cpt-cf-actor-gear-dev`
 
 ### 5.5 Lifecycle
@@ -320,21 +322,38 @@ Gears with no `deps` (e.g., Flight Control, types-registry) become ready immedia
 - [ ] `p1` - **ID**: `cpt-cf-fr-internal-auth`
 
 System-level communication between gears (registration, heartbeats, background inter-gear calls without user
-context) MUST be authenticated. The ToolKit runtime MUST provide profile-specific authentication transparent to gear
-developers:
+context) MUST be authenticated. The ToolKit runtime MUST provide this authentication transparently to gear
+developers.
 
-- **Profile 2 (single-node)**: Platform Host generates an ephemeral bootstrap token at startup and passes it to workers
-  via env var. All system calls carry this token. Flight Control validates it.
-- **Profile 3 (K8s)**: Gears use projected K8s ServiceAccount tokens (audience: `toolkit-internal`). Flight Control
-  validates via TokenReview API.
-- **Profile 2 (multi-node, P2)**: mTLS with platform-managed certificates.
+These calls use the **platform plane**: a dedicated **`PlatformSecurityContext`** — a type **distinct** from the tenant
+`SecurityContext`, **not** a tenant context with a nil/sentinel tenant id, per
+[ADR-0010](ADR/0010-cpt-cf-adr-two-plane-auth.md). It is first-class from the first phase and MUST NOT be passed to the
+tenant `PolicyEnforcer`. Reusing the request-scoped tenant context for platform calls is the seam where confused-deputy
+/ cross-tenant-leak regressions begin, so the type makes "no tenant" unrepresentable-as-a-tenant.
 
-Gear developers MUST NOT implement internal auth logic. The `InternalCredential` abstraction and
-`attach_internal_auth` / `validate_internal_auth` are managed entirely by the ToolKit runtime.
+The plane is chosen by **tenant-scoped vs non-tenant-scoped**, not user-vs-system. System/root actors performing a
+*tenant-scoped* operation (e.g. posting an event for a tenant) stay on the **tenant plane** with a real tenant
+`SecurityContext` (from a user JWT or S2S client-credentials) and are authorized normally — the root tenant uses the
+identical AuthZ flow as any tenant. Only genuinely **non-tenant** operations (e.g. registering a *global* GTS type) use
+`PlatformSecurityContext`. Adding a new platform AuthN method (mTLS+SPIFFE, future methods) MUST NOT change the structure
+of `PlatformSecurityContext` — it is only another way to populate it, dispatched entirely inside `InternalAuthMiddleware`.
+
+- **First phase (K8s)**: projected K8s ServiceAccount tokens (audience: `toolkit-internal`), validated via the
+  TokenReview API. Builds the `PlatformSecurityContext` from the validated SA identity and sets
+  `PeerAuthenticated { gear }` for workload-policy decisions only.
+- **Next phase**: mTLS + SPIFFE issued by cert-manager (embedded CA / boot-token on-prem), populating the same
+  `PlatformSecurityContext` with the SPIFFE variant of the tenant-less, method-agnostic `PlatformIdentity` enum
+  (`ServiceAccount` from phase 1, `Spiffe { trust_domain, gear, version }` added here from the X.509 SAN
+  `spiffe://<trust_domain>/gear/<gear>/<version>`; `#[non_exhaustive]` for future methods).
+- **Profile 2 (single-node)**: ephemeral bootstrap token, or plain UDS when all gears share one uid.
+
+Gear developers MUST NOT implement internal auth logic. The `InternalCredential` abstraction (`attach_internal_auth`
+/ `validate_internal_auth`) is managed entirely by the ToolKit runtime; the SA token and the mTLS identity are two
+backends of it, so swapping does not change gear code.
 
 - **Rationale**: Without system-level auth, any process that can reach DirectoryService can register as a gear or
-  deregister others. User-initiated auth (ADR-0002, SecurityContext) does not cover system calls. Each profile has a
-  different threat model requiring a different mechanism, but the API must be uniform.
+  deregister others. Tenant-plane auth (re-validated JWT) does not cover system calls, which carry no user. SA tokens
+  are K8s-native and ship without PKI; mTLS+SPIFFE hardens the same plane later without touching gear code.
 - **Actors**: `cpt-cf-actor-oop-worker`, `cpt-cf-actor-platform-host`
 
 #### OoP Worker Registration and Deregistration
@@ -481,26 +500,21 @@ and under 10 ms at p95 within a k8s cluster.
   handler).
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation
 
-#### No Double Authentication
+#### Per-Hop JWT Re-validation
 
-- [ ] `p1` - **ID**: `cpt-cf-nfr-no-double-auth`
+- [ ] `p1` - **ID**: `cpt-cf-nfr-per-hop-revalidation`
 
-JWT validation MUST happen exactly once per external request at the gateway edge. OoP gears MUST NOT re-validate the
-JWT; they MUST trust the SecurityContext received from the trusted transport.
+The JWT MUST be re-validated at every hop via `AuthNResolverClient::authenticate()` (~0.5 ms with cached JWKS). The
+verification is a local crypto operation on cache hit, not a network call. There is a single trust root (the IdP
+signature), re-checked at each boundary — tenant integrity does not depend on transport trust. There is no fast path
+that skips signature verification; `PeerAuthenticated` (platform plane) never substitutes for tenant-plane validation.
 
-This realizes a classical **DMZ architecture**: the gateway is the perimeter that performs JWT cryptographic validation
-and translates external identity into an internal envelope (`SecurityContext`); OoP gears live in the trusted
-interior and consume the pre-validated envelope. The interior is "trusted" only in the same sense a DMZ interior is —
-mTLS / k8s NetworkPolicy / UDS permissions (per `cpt-cf-adr-internal-gear-auth`) restrict who can deliver bytes to a
-gear, and the `InternalAuthMiddleware` verifies that the caller is itself a trusted ToolKit peer **before** the
-`x-secctx-bin` is decoded (see DESIGN.md § Validation order).
-
-- **Threshold**: Zero JWT signature verifications inside OoP gears for gateway-proxied requests.
-- **Rationale**: JWT validation involves asymmetric crypto (RS256/ES256). Performing it at every hop wastes CPU and
-  increases latency. The DMZ pattern concentrates the expensive primitive at the edge and lets interior gears be
-  cheap, type-safe consumers of an already-trusted envelope.
-- **Verification Method**: Integration test asserting that authn-resolver is called exactly once per external request
-  chain.
+- **Threshold**: ≤ ~0.5 ms per hop with warm JWKS cache; ≤ 1 ms for a typical 2-hop chain (budget: 5 ms p95).
+- **Rationale**: The JWT is self-authenticating, so re-validating is cheap and removes the dependency on mTLS being
+  correctly deployed everywhere before an unsigned envelope can be trusted. Defense in depth: a compromised peer cannot
+  forward a forged token undetected.
+- **Verification Method**: Latency benchmark of per-hop re-validation; security test asserting a forged-signature token
+  is rejected even when `PeerAuthenticated` is set.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation
 
 #### Graceful Degradation
@@ -533,9 +547,10 @@ Details body. The caller process MUST NOT crash.
 
 - [ ] `p1` - **ID**: `cpt-cf-interface-rest-codegen`
 
-- **Type**: Build-time code generation (`build.rs`)
+- **Type**: Proc-macro code generation (`#[toolkit::rest_contract]`)
 - **Stability**: unstable
-- **Description**: Generates typed `RestXxxClient` structs implementing gear SDK traits from OpenAPI specs.
+- **Description**: Generates typed `RestXxxClient` structs implementing gear SDK traits from annotated Rust traits.
+  `openapi.json` is a published output, not a codegen input.
 - **Breaking Change Policy**: Generated code API may change during unstable phase.
 
 #### SecurityContext HTTP Propagation
@@ -544,9 +559,9 @@ Details body. The caller process MUST NOT crash.
 
 - **Type**: HTTP header contract
 - **Stability**: stable
-- **Description**: Two-header propagation: `Authorization: Bearer <jwt>` and
-  `x-secctx-bin: <base64(postcard(SecurityContext))>`. Middleware for extraction and reconstruction.
-- **Breaking Change Policy**: Header names and encoding are stable. Changes require a new ADR.
+- **Description**: Single-header propagation: `Authorization: Bearer <jwt>`, re-validated at each hop via AuthN
+  Resolver (see [ADR-0010](ADR/0010-cpt-cf-adr-two-plane-auth.md)). `x-secctx-bin` is not used over HTTP.
+- **Breaking Change Policy**: Header name is stable. Changes require a new ADR.
 
 ### 7.2 External Integration Contracts
 
@@ -679,7 +694,7 @@ Details body. The caller process MUST NOT crash.
 | api-gateway                            | Built-in gateway for on-premise profiles; reverse-proxies to OoP Workers | p1          |
 | authn-resolver                         | JWT validation at the gateway edge                                       | p1          |
 | OperationBuilder / utoipa              | OpenAPI spec generation from gear routes                               | p1          |
-| postcard                               | Binary serialization for SecurityContext in `x-secctx-bin` header        | p1          |
+| postcard                               | Binary serialization for SecurityContext in gRPC metadata (Profile 1 in-process only) | p1          |
 | Kubernetes 1.26+                       | Required for Profile 3 (K8s Native)                                      | p1          |
 | External gateway (Kong/Tyk)            | Required for Profile 3 public API ingress                                | p2          |
 
@@ -693,7 +708,8 @@ Details body. The caller process MUST NOT crash.
 - Gear SDK crates already define client traits (e.g., `UsersClient`). Generated REST clients implement these existing
   traits.
 - `postcard` serialization of SecurityContext is deterministic and backward-compatible across gear versions. The
-  existing `toolkit_security::bin_codec` with `SECCTX_BIN_VERSION = 1` provides versioned encoding.
+  existing `toolkit_security::bin_codec` with `SECCTX_BIN_VERSION = 1` provides versioned encoding. This encoding is
+  used only for in-process gRPC metadata (Profile 1); HTTP propagation uses JWT re-validation per ADR-0010.
 - `SecurityContext` will gain a `set_bearer_token(&mut self, token: SecretString)` method for post-deserialization token
   injection (currently only settable via builder).
 - External gateways (Kong, Tyk) expose a programmatic admin API sufficient for dynamic route registration.
@@ -702,21 +718,14 @@ Details body. The caller process MUST NOT crash.
 
 | Risk                                                             | Impact                                                    | Mitigation                                                                      |
 |------------------------------------------------------------------|-----------------------------------------------------------|---------------------------------------------------------------------------------|
-| OpenAPI spec drift between gear and generated client           | Type mismatches at runtime, deserialization failures      | Build-time codegen from the same spec source; CI validates spec freshness       |
-| SecurityContext binary format changes break cross-version calls  | Auth failures during rolling upgrades                     | Version the `x-secctx-bin` encoding; support reading N-1 format                 |
+| SDK trait and server implementation diverge                    | Type mismatches at runtime, deserialization failures      | Trait-first codegen: the SDK trait IS the source of truth; `#[rest_contract]` generates client and server from it |
+| SecurityContext binary format changes break cross-version calls  | Auth failures during rolling upgrades                     | `x-secctx-bin` used only for in-process gRPC (Profile 1); HTTP uses JWT re-validation (ADR-0010)                 |
 | OoP latency exceeds threshold under high load                    | Degraded user experience, profile becomes impractical     | Benchmark early; connection pooling in toolkit-http; consider gRPC for hot paths |
 | External gateway admin APIs differ significantly between vendors | High implementation cost for each GatewayProvider adapter | Start with one adapter (Kong); keep the trait surface minimal                   |
 | UDS/named pipe communication limits on Windows                   | Reduced functionality on Windows on-premise               | Test on Windows CI early; fall back to TCP localhost if needed                  |
 
 ## 13. Open Questions
 
-- What is the exact format for the `x-secctx-bin` header — raw base64 or base64url? Does it need a version prefix byte?
-- How should OpenAPI specs be distributed to SDK crates at build time — committed JSON files, a shared spec registry, or
-  a build-time HTTP fetch?
-- For k8s Profile 3, should Flight Control provide a CRD + operator for gear deployment, or rely on standard
-  Deployment + Service manifests with a Helm chart?
-- Should the GatewayProvider trait be async or synchronous? (Likely async given network I/O, but impacts trait object
-  usage.)
 - How do we handle API versioning across OoP gear upgrades (rolling deployments with breaking API changes)?
 
 ## 14. Traceability

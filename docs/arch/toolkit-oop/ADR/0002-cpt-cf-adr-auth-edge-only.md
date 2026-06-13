@@ -1,6 +1,7 @@
 ---
-status: accepted
+status: superseded
 date: 2026-04-07
+superseded-by: 0010-cpt-cf-adr-two-plane-auth
 ---
 
 # Authenticate at the Gateway Edge Only — No Double JWT Validation
@@ -42,35 +43,24 @@ it means OoP gears must fully trust the transport between the gateway and themse
 Chosen option: "Auth at edge only", because it eliminates redundant crypto operations, simplifies gear code (no JWKS
 management), and aligns with the dominant industry pattern.
 
-**The internal transport is NOT "trusted by design" in the abstract.** Trust is established explicitly by the
-service-to-service authentication layer specified in [ADR-0008](0008-cpt-cf-adr-internal-gear-auth.md): **mTLS with a
-platform CA is the primary mechanism for all multi-process profiles** (Profile 2 multi-node, Profile 3 K8s). Without
-mTLS, any TCP-reachable process could forge `SecurityContext` headers and escalate privileges — the optimisation in
-this ADR (no per-hop JWT validation) only holds because mTLS guarantees the *peer* is a known ToolKit gear before
-`x-secctx-bin` is decoded. The validation order is mandatory: peer identity first (mTLS handshake), then envelope
-(`x-secctx-bin`).
+**This decision has been superseded by [ADR-0010](0010-cpt-cf-adr-two-plane-auth.md)**, which adopts per-hop JWT
+re-validation and drops the unsigned `x-secctx-bin` envelope. The core principle — gear developers write no auth
+code — is preserved in ADR-0010; only the mechanism changed.
 
 ### Consequences
 
-* OoP gears MUST NOT be exposed directly to untrusted networks without a gateway in front. This is a hard
-  architectural constraint.
-* The gateway (built-in api-gateway or external Kong/Tyk) MUST populate both `Authorization: Bearer <jwt>` and
-  `x-secctx-bin: <base64(postcard(SecurityContext))>` headers before forwarding to OoP Workers.
-* OoP Workers MUST install the `secctx_middleware` that reconstructs SecurityContext from these headers without
-  re-validating the JWT signature.
-* **For every multi-process profile (Profile 2 multi-node, Profile 3 K8s) the transport between gears MUST use mTLS
-  with a platform CA per [ADR-0008](0008-cpt-cf-adr-internal-gear-auth.md).** Profile 2 single-node MAY skip mTLS
-  because the transport is UDS and trust is the OS process boundary; Profile 1 (embedded) has no transport.
-* `secctx_middleware` MUST only consume `x-secctx-bin` from a connection whose peer was authenticated by the
-  mTLS-terminating layer (see ADR-0008 § InternalAuthMiddleware). Plain-TCP inbound connections MUST be rejected on
-  multi-process profiles regardless of header validity.
+* OoP gears MUST NOT be exposed directly to untrusted networks without a gateway in front.
+* The gateway forwards `Authorization: Bearer <jwt>` to OoP gears. Each hop re-validates the JWT via AuthN Resolver.
+* `secctx_middleware` re-validates the JWT and reconstructs `SecurityContext` — there is no unsigned envelope.
+* mTLS for multi-process profiles is the platform-plane target per
+  [ADR-0008](0008-cpt-cf-adr-internal-gear-auth.md), but tenant identity does not depend on transport trust — the JWT
+  is self-authenticating.
 * Gear developers do not need to handle authentication — it is fully transparent via middleware.
 
 ### Confirmation
 
-* Integration test: send a request through the gateway to an OoP gear; assert `authn-resolver` is called exactly once
-  in the entire chain.
-* Security review: verify that the OoP Worker does not have code paths that validate JWT signatures.
+* Integration test: send a request through the gateway to an OoP gear; assert `SecurityContext` is reconstructed from
+  the re-validated JWT at the OoP gear.
 * Architecture review: verify that all deployment profiles place a trusted boundary (UDS, k8s network policy, mTLS)
   between the gateway and OoP gears.
 
@@ -110,22 +100,22 @@ Gateway validates; gears optionally re-validate based on config flag.
 
 ## More Information
 
-The SecurityContext HTTP propagation mechanism is defined in DESIGN.md § 3.2 (`cpt-cf-component-secctx-http`). The
-two-header approach (`Authorization` + `x-secctx-bin`) preserves the original JWT for delegation to external services
-while carrying the pre-parsed SecurityContext for internal use.
-
-The existing `bearer_token` field on SecurityContext is `#[serde(skip)]`, which means standard serialization (including
-`postcard`) excludes it. The two-header approach works around this constraint without modifying the SecurityContext
-struct's serialization behavior.
+The SecurityContext HTTP propagation mechanism is defined in DESIGN.md § 3.2 (`cpt-cf-component-secctx-http`). Per
+[ADR-0010](0010-cpt-cf-adr-two-plane-auth.md), propagation uses a single `Authorization: Bearer <jwt>` header,
+re-validated at each hop. `x-secctx-bin` is not used over HTTP.
 
 ## Traceability
 
+> **Note**: This ADR is superseded by [ADR-0010](0010-cpt-cf-adr-two-plane-auth.md). The traceability items below are
+> now satisfied by ADR-0010.
+
 - **PRD**: [PRD.md](../PRD.md)
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
+- **Superseded by**: [ADR-0010](0010-cpt-cf-adr-two-plane-auth.md)
 
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-fr-secctx-propagation` — Defines how SecurityContext crosses OoP boundaries with the bearer token intact
-* `cpt-cf-nfr-no-double-auth` — Directly satisfies the zero-double-validation requirement
-* `cpt-cf-nfr-oop-latency` — Eliminates 0.5–2 ms of redundant JWT crypto per hop
+* `cpt-cf-nfr-per-hop-revalidation` — One verification per hop (~0.5 ms), within latency budget (see ADR-0010)
+* `cpt-cf-nfr-oop-latency` — Per-hop re-validation adds ~0.5 ms; within the 5 ms p95 budget
 * `cpt-cf-component-secctx-http` — The SecurityContext HTTP propagation component implements this decision
