@@ -9,7 +9,7 @@ purpose: Fetch latest PR data, generate status reports, assess comment severity,
 
 # PR Status Workflow
 
-ALWAYS open and follow `{cf-studio-path}/.core/skills/cypilot/SKILL.md` FIRST WHEN {cypilot_mode} is `off`
+ALWAYS open and follow `{cf-studio-path}/.core/skills/cf-studio/SKILL.md` FIRST WHEN {cypilot_mode} is `off`
 
 **Type**: Analysis
 **Role**: Reviewer

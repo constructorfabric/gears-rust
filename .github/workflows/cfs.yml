@@ -1,0 +1,74 @@
+# Updated: 2026-04-20 by Constructor Tech
+name: CFS
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '**/*.md'
+      - 'docs/**'
+      - 'gears/**/docs/**'
+      - 'gears/**/src/**'
+      - 'gears/**/tests/**'
+      - '.cf-studio/config/**'
+      - '.cf-studio-kit.toml'
+      - 'studio-kit-gears/**'
+      - 'docs/spec-templates/**'
+      - 'Makefile'
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: cfs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate_artifacts:
+    name: Validate CFS Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          clean: 'true'
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.1
+        with:
+          python-version: '3.11'
+
+      - name: Validate artifacts
+        run: make cfs-validate
+
+      - name: Validate registered kits
+        run: make cfs-validate-kits
+
+      - name: Detect local kit changes
+        id: local_kit_changes
+        shell: bash
+        run: |
+          base_ref="${{ github.base_ref }}"
+
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "$base_ref" ]; then
+            git fetch --no-tags --depth=1 origin "$base_ref"
+            changed_files="$(git diff --name-only "origin/$base_ref"...HEAD)"
+          else
+            changed_files="$(
+              git diff --name-only HEAD~1 HEAD 2>/dev/null || true
+              git status --short | sed 's/^...//'
+            )"
+          fi
+
+          if printf '%s\n' "$changed_files" | grep -Eq '^(studio-kit-gears/|docs/spec-templates/|\.cf-studio-kit\.toml$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate local Gears kit
+        if: steps.local_kit_changes.outputs.changed == 'true'
+        run: make cfs-validate-kit-local

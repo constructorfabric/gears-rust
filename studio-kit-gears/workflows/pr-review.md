@@ -9,7 +9,7 @@ purpose: Read-only PR review — fetch diffs/metadata from GitHub, analyze again
 
 # PR Review Workflow
 
-ALWAYS open and follow `{cf-studio-path}/.core/skills/cypilot/SKILL.md` FIRST WHEN {cypilot_mode} is `off`
+ALWAYS open and follow `{cf-studio-path}/.core/skills/cf-studio/SKILL.md` FIRST WHEN {cypilot_mode} is `off`
 
 **Type**: Analysis
 **Role**: Reviewer
