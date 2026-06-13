@@ -1,5 +1,8 @@
-<!-- @cpt:root-agents -->
+<!-- @cf:root-agents -->
 ```toml
-cypilot_path = ".cypilot"
+cf-studio-path = ".cf-studio"
 ```
-<!-- /@cpt:root-agents -->
+
+ALWAYS resolve and enforce prerequisites of skills/workflows/commands BEFORE applying user intent.
+<!-- /@cf:root-agents -->
+
