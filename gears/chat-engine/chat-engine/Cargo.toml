@@ -1,0 +1,73 @@
+[package]
+name = "cf-chat-engine"
+description = "Chat Engine module: multi-tenant conversational infrastructure with plugin-driven backends"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["cyberfabric", "cyberfabric-modules"]
+categories = ["artificial-intelligence"]
+
+[lib]
+name = "chat_engine"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# k8s Lease-based leader election for background workers (retention cleanup).
+# Off by default → single-process noop elector; enable in multi-replica
+# Kubernetes deployments so only one replica runs the per-tenant sweep.
+k8s = ["dep:kube", "dep:k8s-openapi"]
+
+[dependencies]
+chat-engine-sdk = { package = "cf-chat-engine-sdk", version = "0.1.0", path = "../chat-engine-sdk" }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+inventory = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
+
+axum = { workspace = true, features = ["macros"] }
+http = { workspace = true }
+
+time = { workspace = true }
+uuid = { workspace = true }
+
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+
+reqwest = { workspace = true, features = ["json"] }
+bytes = { workspace = true }
+url = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-db-macros = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-odata-macros = { workspace = true }
+
+# k8s leader election (optional, behind the `k8s` feature)
+kube = { workspace = true, features = ["client", "rustls-tls", "aws-lc-rs"], optional = true }
+k8s-openapi = { workspace = true, features = ["latest"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
