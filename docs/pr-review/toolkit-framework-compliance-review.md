@@ -1,5 +1,5 @@
 ---
-cypilot: true
+cf: true
 type: requirement
 name: ToolKit Framework Compliance Review
 version: 1.0

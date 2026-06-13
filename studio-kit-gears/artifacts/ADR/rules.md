@@ -153,7 +153,7 @@ Keep REJECTED ADRs for historical record — do not delete.
 - `{cf-studio-path}/.core/schemas/kit-constraints.schema.json`
 
 **Validation Checks**:
-- `cypilot validate` enforces `identifiers[<kind>].references` rules for ADR coverage in DESIGN
+- `cfs validate` enforces `identifiers[<kind>].references` rules for ADR coverage in DESIGN
 
 ### Deliberate Omissions (MUST NOT HAVE)
 
@@ -242,7 +242,7 @@ ADRs must NOT contain the following — report as violation if found:
 - [ ] Generate ID: `cpt-{hierarchy-prefix}-adr-{slug}` (e.g., `cpt-myapp-adr-use-postgresql`)
 - [ ] Assign priority based on impact
 - [ ] Link to DESIGN if applicable
-- [ ] Verify uniqueness with `cypilot list-ids`
+- [ ] Verify uniqueness with `cfs list-ids`
 
 ### Phase 4: Quality Check
 
@@ -256,8 +256,8 @@ ADRs must NOT contain the following — report as violation if found:
 
 ### Phase 5: Table of Contents
 
-- [ ] Run `cypilot toc <artifact-file>` to generate/update Table of Contents
-- [ ] Verify TOC is present and complete with `cypilot validate-toc <artifact-file>`
+- [ ] Run `cfs toc <artifact-file>` to generate/update Table of Contents
+- [ ] Verify TOC is present and complete with `cfs validate-toc <artifact-file>`
 
 ---
 
@@ -265,7 +265,7 @@ ADRs must NOT contain the following — report as violation if found:
 
 ### Phase 1: Structural Validation (Deterministic)
 
-Run `cypilot validate` for:
+Run `cfs validate` for:
 - [ ] Template structure compliance
 - [ ] ID format validation
 - [ ] No placeholders
@@ -423,7 +423,7 @@ When reviewing PRs that add or change Architecture Decision Records, additionall
 - [ ] All TOC anchors point to actual headings in the document
 - [ ] All headings are represented in the TOC
 - [ ] TOC order matches document heading order
-- [ ] Run `cypilot validate-toc <artifact-file>` — must report PASS
+- [ ] Run `cfs validate-toc <artifact-file>` — must report PASS
 
 ---
 
@@ -463,7 +463,7 @@ When reviewing PRs that add or change Architecture Decision Records, additionall
 | Condition | Suggested Next Step |
 |-----------|---------------------|
 | ADR PROPOSED | Share for review, then update status to ACCEPTED |
-| ADR ACCEPTED | `/cypilot-generate DESIGN` — incorporate decision into design |
-| Related ADR needed | `/cypilot-generate ADR` — create related decision record |
+| ADR ACCEPTED | `/cf-generate DESIGN` — incorporate decision into design |
+| Related ADR needed | `/cf-generate ADR` — create related decision record |
 | ADR supersedes another | Update original ADR status to SUPERSEDED |
-| Want checklist review only | `/cypilot-analyze semantic` — semantic validation (skip deterministic) |
+| Want checklist review only | `/cf-analyze semantic` — semantic validation (skip deterministic) |

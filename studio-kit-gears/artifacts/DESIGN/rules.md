@@ -137,9 +137,9 @@ Read parent PRD for context (if exists).
 - `{cf-studio-path}/.core/schemas/kit-constraints.schema.json`
 
 **Validation Checks**:
-- `cypilot validate` enforces `identifiers[<kind>].references` rules (required / optional / prohibited)
-- `cypilot validate` enforces headings scoping for ID definitions and references
-- `cypilot validate` enforces "checked ref implies checked def" consistency
+- `cfs validate` enforces `identifiers[<kind>].references` rules (required / optional / prohibited)
+- `cfs validate` enforces headings scoping for ID definitions and references
+- `cfs validate` enforces "checked ref implies checked def" consistency
 
 ### Deliberate Omissions (MUST NOT HAVE)
 
@@ -226,7 +226,7 @@ If DESIGN cannot be completed in a single session:
 - [ ] Generate component IDs (if needed)
 - [ ] Link to PRD actors/capabilities
 - [ ] Reference relevant ADRs
-- [ ] Verify uniqueness with `cypilot list-ids`
+- [ ] Verify uniqueness with `cfs list-ids`
 
 ### Phase 4: Quality Check
 
@@ -236,8 +236,8 @@ If DESIGN cannot be completed in a single session:
 
 ### Phase 5: Table of Contents
 
-- [ ] Run `cypilot toc <artifact-file>` to generate/update Table of Contents
-- [ ] Verify TOC is present and complete with `cypilot validate-toc <artifact-file>`
+- [ ] Run `cfs toc <artifact-file>` to generate/update Table of Contents
+- [ ] Verify TOC is present and complete with `cfs validate-toc <artifact-file>`
 
 ---
 
@@ -245,7 +245,7 @@ If DESIGN cannot be completed in a single session:
 
 ### Phase 1: Structural Validation (Deterministic)
 
-- [ ] Run `cypilot validate --artifact <path>` for:
+- [ ] Run `cfs validate --artifact <path>` for:
   - Template structure compliance
   - ID format validation
   - Cross-reference validity
@@ -358,7 +358,7 @@ When reviewing PRs that add or change design documents, additionally focus on:
 - [ ] All TOC anchors point to actual headings in the document
 - [ ] All headings are represented in the TOC
 - [ ] TOC order matches document heading order
-- [ ] Run `cypilot validate-toc <artifact-file>` — must report PASS
+- [ ] Run `cfs validate-toc <artifact-file>` — must report PASS
 
 ---
 
@@ -367,14 +367,14 @@ When reviewing PRs that add or change design documents, additionally focus on:
 ### Missing Prd
 
 - [ ] If parent PRD not found:
-  - Option 1: Run `/cypilot-generate PRD` first (recommended)
+  - Option 1: Run `/cf-generate PRD` first (recommended)
   - Option 2: Continue without PRD (DESIGN will lack traceability)
   - If Option 2: document "PRD pending" in DESIGN frontmatter, skip PRD reference validation
 
 ### Incomplete Prd
 
 - [ ] If PRD exists but is outdated: review PRD before proceeding
-- [ ] If PRD needs updates: `/cypilot-generate PRD UPDATE`
+- [ ] If PRD needs updates: `/cf-generate PRD UPDATE`
 - [ ] If PRD is current: proceed with DESIGN
 
 ### Escalation
@@ -389,8 +389,8 @@ When reviewing PRs that add or change design documents, additionally focus on:
 
 ### Options
 
-- [ ] DESIGN complete → `/cypilot-generate DECOMPOSITION` — create specs manifest
-- [ ] Need architecture decision → `/cypilot-generate ADR` — document key decision
-- [ ] PRD missing/incomplete → `/cypilot-generate PRD` — create/update PRD first
+- [ ] DESIGN complete → `/cf-generate DECOMPOSITION` — create specs manifest
+- [ ] Need architecture decision → `/cf-generate ADR` — document key decision
+- [ ] PRD missing/incomplete → `/cf-generate PRD` — create/update PRD first
 - [ ] DESIGN needs revision → continue editing DESIGN
-- [ ] Want checklist review only → `/cypilot-analyze semantic` — semantic validation
+- [ ] Want checklist review only → `/cf-analyze semantic` — semantic validation

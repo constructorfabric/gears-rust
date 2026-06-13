@@ -134,7 +134,7 @@ UPSTREAM_REQS must NOT contain the following — report as violation if found:
 
 - [ ] Generate requirement IDs: `cpt-{system}-upreq-{slug}`
 - [ ] Assign priorities based on requesting modules' needs
-- [ ] Verify uniqueness with `cypilot list-ids`
+- [ ] Verify uniqueness with `cfs list-ids`
 
 ### Phase 4: Quality Check
 
@@ -144,8 +144,8 @@ UPSTREAM_REQS must NOT contain the following — report as violation if found:
 
 ### Phase 5: Table of Contents
 
-- [ ] Run `cypilot toc <artifact-file>` to generate/update Table of Contents
-- [ ] Verify TOC is present and complete with `cypilot validate-toc <artifact-file>`
+- [ ] Run `cfs toc <artifact-file>` to generate/update Table of Contents
+- [ ] Verify TOC is present and complete with `cfs validate-toc <artifact-file>`
 
 ---
 
@@ -153,7 +153,7 @@ UPSTREAM_REQS must NOT contain the following — report as violation if found:
 
 ### Phase 1: Structural Validation (Deterministic)
 
-- [ ] Run `cypilot validate --artifact <path>` for:
+- [ ] Run `cfs validate --artifact <path>` for:
   - Template structure compliance
   - ID format validation
   - Priority markers present
@@ -186,7 +186,7 @@ Issues:
 - [ ] All TOC anchors point to actual headings in the document
 - [ ] All headings are represented in the TOC
 - [ ] TOC order matches document heading order
-- [ ] Run `cypilot validate-toc <artifact-file>` — must report PASS
+- [ ] Run `cfs validate-toc <artifact-file>` — must report PASS
 
 ---
 
@@ -213,6 +213,6 @@ Issues:
 
 ### Options
 
-- [ ] UPSTREAM_REQS complete → `/cypilot-generate PRD` — create PRD for the new gear (tracing back to UPSTREAM_REQS)
+- [ ] UPSTREAM_REQS complete → `/cf-generate PRD` — create PRD for the new gear (tracing back to UPSTREAM_REQS)
 - [ ] Need to add more requesting modules → continue editing UPSTREAM_REQS
-- [ ] Want checklist review only → `/cypilot-analyze semantic` — semantic validation
+- [ ] Want checklist review only → `/cf-analyze semantic` — semantic validation

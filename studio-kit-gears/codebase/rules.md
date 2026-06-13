@@ -19,7 +19,7 @@
 3. [Tasks](#tasks)
    - [Phase 1: Setup](#phase-1-setup)
    - [Phase 2: Implementation (Work Packages)](#phase-2-implementation-work-packages)
-   - [Phase 3: Constructor Studio Markers (Traceability Mode ON only)](#phase-3-cypilot-markers-traceability-mode-on-only)
+   - [Phase 3: Constructor Studio Markers (Traceability Mode ON only)](#phase-3-constructor-studio-markers-traceability-mode-on-only)
    - [Phase 4: Sync FEATURE (Traceability Mode ON only)](#phase-4-sync-feature-traceability-mode-on-only)
    - [Phase 5: Quality Check](#phase-5-quality-check)
    - [Phase 6: Tag Verification (Traceability Mode ON only)](#phase-6-tag-verification-traceability-mode-on-only)
@@ -117,9 +117,9 @@ PRD/DESIGN: referenced IDs [x] when ALL downstream refs [x]
 - [ ] Never mark a reference as `[x]` if its definition is still `[ ]` (cross-artifact consistency is validated)
 
 **Validation Checks**:
-- `cypilot validate` will warn if code marker exists but FEATURE checkbox is `[ ]`
-- `cypilot validate` will warn if FEATURE checkbox is `[x]` but code marker is missing
-- `cypilot validate` will report coverage: N% of FEATURE IDs have code markers
+- `cfs validate` will warn if code marker exists but FEATURE checkbox is `[ ]`
+- `cfs validate` will warn if FEATURE checkbox is `[x]` but code marker is missing
+- `cfs validate` will report coverage: N% of FEATURE IDs have code markers
 
 ### Versioning
 
@@ -167,7 +167,7 @@ PRD/DESIGN: referenced IDs [x] when ALL downstream refs [x]
 2. Other Constructor Studio artifact (PRD/DESIGN/ADR) — DOCS-ONLY
 3. User-provided description — DOCS-ONLY
 4. Prompt only — DOCS-ONLY
-5. None — suggest `/cypilot-generate FEATURE` first
+5. None — suggest `/cf-generate FEATURE` first
 
 **Load Context**:
 - [ ] Read project `AGENTS.md` for code conventions
@@ -393,18 +393,18 @@ Run expert panel review after producing validation output.
 ### After Success
 
 - [ ] Feature complete → update feature status to IMPLEMENTED in DECOMPOSITION
-- [ ] All features done → `/cypilot-analyze DESIGN` — validate overall design completion
-- [ ] New feature needed → `/cypilot-generate FEATURE` — design next feature
-- [ ] Want expert review only → `/cypilot-analyze semantic` — semantic validation
+- [ ] All features done → `/cf-analyze DESIGN` — validate overall design completion
+- [ ] New feature needed → `/cf-generate FEATURE` — design next feature
+- [ ] Want expert review only → `/cf-analyze semantic` — semantic validation
 
 ### After Issues
 
-- [ ] Design mismatch → `/cypilot-generate FEATURE` — update feature design
-- [ ] Missing tests → continue `/cypilot-generate CODE` — add tests
-- [ ] Code quality issues → continue `/cypilot-generate CODE` — refactor
+- [ ] Design mismatch → `/cf-generate FEATURE` — update feature design
+- [ ] Missing tests → continue `/cf-generate CODE` — add tests
+- [ ] Code quality issues → continue `/cf-generate CODE` — refactor
 
 ### No Design
 
-- [ ] Implementing new feature → `/cypilot-generate FEATURE` first
-- [ ] Implementing from PRD → `/cypilot-generate DESIGN` then DECOMPOSITION
+- [ ] Implementing new feature → `/cf-generate FEATURE` first
+- [ ] Implementing from PRD → `/cf-generate DESIGN` then DECOMPOSITION
 - [ ] Quick prototype → proceed without traceability, suggest FEATURE later

@@ -127,9 +127,9 @@
 - `{cf-studio-path}/.core/schemas/kit-constraints.schema.json`
 
 **Validation Checks**:
-- `cypilot validate` enforces `identifiers[<kind>].references` rules (required / optional / prohibited)
-- `cypilot validate` enforces headings scoping for ID definitions and references
-- `cypilot validate` enforces "checked ref implies checked def" consistency
+- `cfs validate` enforces `identifiers[<kind>].references` rules (required / optional / prohibited)
+- `cfs validate` enforces headings scoping for ID definitions and references
+- `cfs validate` enforces "checked ref implies checked def" consistency
 
 ---
 
@@ -158,7 +158,7 @@
 - [ ] Assign priorities based on dependency order
 - [ ] Set initial status to NOT_STARTED
 - [ ] Link to DESIGN elements being implemented
-- [ ] Verify uniqueness with `cypilot list-ids`
+- [ ] Verify uniqueness with `cfs list-ids`
 
 ### Phase 4: Quality Check
 
@@ -184,19 +184,19 @@
 
 **Feature Completion (Marking Feature Done)**:
 1. Verify ALL referenced IDs within the feature entry have `[x]`
-2. Run `cypilot validate` to confirm no checkbox inconsistencies
+2. Run `cfs validate` to confirm no checkbox inconsistencies
 3. Change the feature ID line from `[ ]` to `[x]`
 4. Update feature status emoji (e.g., ⏳ → ✅)
 
 **Manifest Completion (Marking Overall Done)**:
 1. Verify ALL feature entries have `[x]`
-2. Run `cypilot validate` to confirm cascade consistency
+2. Run `cfs validate` to confirm cascade consistency
 3. Change the `status-overall` line from `[ ]` to `[x]`
 
 ### Phase 6: Table of Contents
 
-- [ ] Run `cypilot toc <artifact-file>` to generate/update Table of Contents
-- [ ] Verify TOC is present and complete with `cypilot validate-toc <artifact-file>`
+- [ ] Run `cfs toc <artifact-file>` to generate/update Table of Contents
+- [ ] Verify TOC is present and complete with `cfs validate-toc <artifact-file>`
 
 ---
 
@@ -204,7 +204,7 @@
 
 ### Phase 1: Structural Validation (Deterministic)
 
-- [ ] Run `cypilot validate --artifact <path>` for:
+- [ ] Run `cfs validate --artifact <path>` for:
   - Template structure compliance
   - ID format validation
   - Priority markers present
@@ -340,7 +340,7 @@ For each issue include:
 - [ ] All TOC anchors point to actual headings in the document
 - [ ] All headings are represented in the TOC
 - [ ] TOC order matches document heading order
-- [ ] Run `cypilot validate-toc <artifact-file>` — must report PASS
+- [ ] Run `cfs validate-toc <artifact-file>` — must report PASS
 
 ---
 
@@ -368,8 +368,8 @@ For each issue include:
 
 ### Options
 
-- [ ] Features defined → `/cypilot-generate FEATURE` — design first/next feature
+- [ ] Features defined → `/cf-generate FEATURE` — design first/next feature
 - [ ] Feature IMPLEMENTED → update feature status in decomposition
-- [ ] All features IMPLEMENTED → `/cypilot-analyze DESIGN` — validate design completion
-- [ ] New feature needed → add to decomposition, then `/cypilot-generate FEATURE`
-- [ ] Want checklist review only → `/cypilot-analyze semantic` — decomposition quality validation
+- [ ] All features IMPLEMENTED → `/cf-analyze DESIGN` — validate design completion
+- [ ] New feature needed → add to decomposition, then `/cf-generate FEATURE`
+- [ ] Want checklist review only → `/cf-analyze semantic` — decomposition quality validation
