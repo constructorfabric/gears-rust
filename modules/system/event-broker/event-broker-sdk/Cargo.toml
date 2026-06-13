@@ -1,0 +1,46 @@
+[package]
+name = "cyberware-event-broker-sdk"
+description = "SDK for the Event Broker: high-level typed event publishing and consumption"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["cyberfabric", "cyberware", "cyberfabric-system"]
+categories = ["asynchronous"]
+
+[lib]
+name = "event_broker_sdk"
+path = "src/lib.rs"
+
+[features]
+default = []
+outbox = ["dep:modkit-db"]
+integration = []
+mock = ["async-stream"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
+chrono = { workspace = true, features = ["serde"] }
+tracing = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
+async-stream = { workspace = true, optional = true }
+modkit-security = { workspace = true }
+modkit = { workspace = true }
+types-registry-sdk = { workspace = true }
+jsonschema = { workspace = true }
+
+gts-id = { workspace = true }
+modkit-db = { workspace = true, optional = true, features = ["preview-outbox"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }

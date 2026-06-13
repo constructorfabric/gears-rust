@@ -1,0 +1,88 @@
+# Flow: PositionsNotSet recovery
+
+The full HTTP transcript of the recovery sequence when a client opens the stream before seeding a partition: the broker replies `409 PositionsNotSet`, the client SEEKs the listed partitions, and the retried stream succeeds.
+
+Every exchange is shown inline. This is the bare broker-observable call sequence; the *control flow* that decides to retry (and the retry budget) is SDK behavior, covered in `event-broker-sdk-scenarios`.
+
+Subscription `{sub_id}` has JOINed group `{group_id}` and is assigned `("acme.orders.v1", 0)`; no SEEK has happened yet.
+
+---
+
+## Exchange 1 — Open the stream without seeding (rejected)
+
+```http
+GET /v1/events:stream?subscription_id={sub_id} HTTP/1.1
+Host: broker.example.com
+Authorization: Bearer <tenant-token>
+Accept: multipart/mixed
+```
+
+```http
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{
+  "type": "https://errors.cf.core/events/positions-not-set",
+  "title": "PositionsNotSet",
+  "status": 409,
+  "detail": "1 assigned partition(s) have no committed cursor",
+  "instance": "/v1/events:stream",
+  "unseeded": [
+    { "topic": "gts.cf.core.events.topic.v1~acme.orders.v1", "partition": 0 }
+  ],
+  "recovery_hint": "Call POST /v1/subscriptions/{id}/positions for the unseeded partitions before re-opening the stream."
+}
+```
+
+## Exchange 2 — SEEK the unseeded partitions
+
+The client SEEKs exactly the partitions named in `unseeded[]`:
+
+```http
+POST /v1/subscriptions/{sub_id}/positions HTTP/1.1
+Host: broker.example.com
+Authorization: Bearer <tenant-token>
+Content-Type: application/json
+
+{
+  "partition_positions": {
+    "gts.cf.core.events.topic.v1~acme.orders.v1:0": "earliest"
+  }
+}
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{ "partition_positions": { "gts.cf.core.events.topic.v1~acme.orders.v1:0": 99 } }
+```
+
+## Exchange 3 — Retry the stream (succeeds)
+
+```http
+GET /v1/events:stream?subscription_id={sub_id} HTTP/1.1
+Host: broker.example.com
+Authorization: Bearer <tenant-token>
+Accept: multipart/mixed
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: multipart/mixed; boundary=evbkR1
+Transfer-Encoding: chunked
+
+--evbkR1
+Content-Type: application/json
+
+{ "kind": "event", "event": { "offset": 100, "partition": 0, ... } }
+```
+
+---
+
+## Side effects
+
+- After Exchange 1: no stream established, `evbk_group_offsets(group, "acme.orders.v1", 0)` still absent (the 409 changes nothing).
+- After Exchange 2: `evbk_group_offsets(group, "acme.orders.v1", 0)` is set to `99`.
+- After Exchange 3: `subsequent GET /v1/events:stream returns 200`; emission begins at offset `100`.
+- `metric stream_positions_not_set incremented by 1` (the broker counts the rejected open).

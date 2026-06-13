@@ -1,0 +1,484 @@
+# Created: 2026-05-11 by Constructor Tech
+
+openapi: 3.1.0
+info:
+  title: Event Broker API
+  version: 1.0.0
+  description: |
+    Event Broker is a tenant-scoped event streaming primitive for Cyber Ware modules.
+    Producers publish typed events to topics via single or batch submissions; consumers
+    subscribe via `multipart/mixed` streaming (`/v1/events:stream`) or browser-native
+    Server-Sent Events (`/v1/events:sse`) — see `features/0004-consumption-transport.md`
+    — and receive events filtered by type, subject, and per-member filter expressions.
+
+    This file is the authoritative machine-readable public contract for the Event Broker
+    v1 REST surface. PRD.md and DESIGN.md intentionally summarize behavior and refer
+    here for wire shapes, field semantics, and HTTP-level error mapping.
+
+servers:
+  - url: https://api.example.com
+
+tags:
+  - name: events
+    description: Producer-side event submission (single + batch) and consumer-side long-poll.
+  - name: topics
+    description: Topic introspection and storage-segment metadata.
+  - name: consumer-groups
+    description: Consumer group registry (anonymous create path + read/list/delete).
+  - name: subscriptions
+    description: Consumer subscription lifecycle — JOIN, poll, seek, leave.
+
+paths:
+
+  /v1/events:
+    post:
+      tags: [events]
+      summary: Publish a single event
+      description: |
+        Enqueue one event into the per-topic ingest outbox. Default response is
+        `202 Accepted` once the event is durably enqueued; opt into synchronous
+        backend persistence via the `Sync-Wait: true` header or `?wait=persisted`
+        query parameter. Offset is assigned asynchronously by the storage backend
+        and is never returned inline.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./schemas/event.v1.schema.json"
+      responses:
+        "202":
+          description: Accepted, durably enqueued in the outbox
+        "201":
+          description: Persisted to backend (sync mode)
+        "400":
+          description: Validation error (InvalidPartition, InvalidTraceParent, etc.)
+        "403":
+          description: Forbidden
+        "412":
+          description: SequenceViolation — producer's `previous`/`sequence` does not match the broker's stored `last_sequence`. Response body includes the broker's current `last_sequence` so the producer can resync.
+
+  /v1/events:batch:
+    post:
+      tags: [events]
+      summary: Publish a batch of events (atomic per topic)
+      description: |
+        Atomic per-topic batch of up to 100 events. All-or-nothing per topic.
+        Mixing topics in one batch is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events:
+                  type: array
+                  items:
+                    $ref: "./schemas/event.v1.schema.json"
+                  minItems: 1
+                  maxItems: 100
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Validation error
+        "403":
+          description: Forbidden
+        "412":
+          description: SequenceViolation — atomic batch rejection when any event in the batch fails dedup validation
+        "413":
+          description: BatchTooLarge
+
+  /v1/events:stream:
+    get:
+      tags: [events]
+      summary: Multipart event consumption (default transport)
+      description: |
+        The single consumption endpoint for `multipart/mixed`-framed delivery.
+        Long-lived: the response stays open and emits frames as events arrive;
+        heartbeat frames keep intermediaries from cutting idle connections.
+        Wire format is `multipart/mixed; boundary=<...>` carried over
+        `Transfer-Encoding: chunked`. Each multipart part carries exactly one
+        frame whose JSON body has a top-level `kind` field of `event`,
+        `heartbeat`, `advisory`, or `topology`. See
+        `features/0004-consumption-transport.md` for the frame schema.
+
+        Consumers acknowledge processed events via the dedicated endpoint
+        `POST /v1/subscriptions/{id}/positions` — this stream endpoint is
+        delivery-only.
+
+        Browser consumers wanting Server-Sent Events use `/v1/events:sse`
+        instead — this endpoint serves multipart only.
+      parameters:
+        - name: subscription_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Long-lived multipart/mixed event stream (Transfer-Encoding chunked).
+          content:
+            multipart/mixed:
+              schema:
+                description: |
+                  Stream of multipart parts. Each part has `Content-Type: application/json`
+                  and a JSON body with top-level `kind` of `event | heartbeat | advisory | topology`.
+                type: string
+        "400":
+          description: Bad Request (missing or invalid `subscription_id`).
+        "404":
+          description: SubscriptionNotFound — consumer must re-JOIN with a new subscription.
+        "406":
+          description: |
+            Not Acceptable. The client's `Accept` header excludes `multipart/mixed`.
+            Response body lists the supported media types.
+        "409":
+          description: |
+            PositionsNotSet — one or more assigned `(topic, partition)` pairs have
+            no committed cursor for the subscription's group. The consumer SHALL
+            SEEK the listed partitions via `POST /v1/subscriptions/{id}/positions`
+            and retry. Response body:
+            `{ unseeded: [{topic, partition}, ...], recovery_hint: "..." }`.
+            A well-behaved SDK seeds positions before opening the stream and
+            should not normally observe this response.
+        "410":
+          description: SubscriptionTerminated — consumer must re-JOIN.
+
+  /v1/events:sse:
+    get:
+      tags: [events]
+      summary: Server-Sent Events consumption (opt-in)
+      description: |
+        Browser-native `text/event-stream` consumption endpoint. Same frame
+        kinds as `/v1/events:stream` (`event | heartbeat | advisory | topology`),
+        but framed as SSE events with the `event:` line carrying the kind and
+        the JSON payload on a `data:` line. Reconnect resume uses `cursor.acked`
+        (not `Last-Event-ID`). Disabled by default in v1; enabled via deployment
+        configuration. See `features/0004-consumption-transport.md`.
+      parameters:
+        - name: subscription_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Long-lived text/event-stream
+          content:
+            text/event-stream: {}
+        "404":
+          description: SubscriptionNotFound (or transport disabled in deployment)
+        "410":
+          description: SubscriptionTerminated — consumer must re-JOIN
+
+  /v1/topics:
+    get:
+      tags: [topics]
+      summary: List topics visible to the caller
+      responses:
+        "200":
+          description: Page of topics
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "./schemas/topic.v1.schema.json"
+
+  /v1/topics/segments:
+    get:
+      tags: [topics]
+      summary: Get storage segments for a (topic, partition)
+      description: |
+        Returns the backend's segment manifest for a specific (topic, partition).
+        Backend-specific in shape; consumers treat `segments[]` entries as opaque
+        except for the documented envelope. See
+        `features/0003-topic-segment-introspection.md` for use cases and pagination
+        semantics.
+      parameters:
+        - name: topic
+          in: query
+          required: true
+          schema: { type: string }
+        - name: partition
+          in: query
+          required: true
+          schema: { type: integer, minimum: 0 }
+        - name: $orderby
+          in: query
+          schema: { type: string, default: "start_sequence asc" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 100 }
+      responses:
+        "200":
+          description: Segment manifest
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic, partition, start_sequence, end_sequence, start_time, end_time, segments]
+                properties:
+                  topic: { type: string }
+                  partition: { type: integer }
+                  start_sequence: { type: integer, format: int64 }
+                  end_sequence: { type: integer, format: int64 }
+                  start_time: { type: string, format: date-time }
+                  end_time: { type: string, format: date-time }
+                  segments:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+        "400":
+          description: InvalidPartition
+        "404":
+          description: TopicNotFound
+
+  /v1/consumer_groups:
+    post:
+      tags: [consumer-groups]
+      summary: Register an anonymous consumer group (broker-minted id)
+      description: |
+        Mints `gts.cf.core.events.consumer_group.v1~<uuid>` server-side. The request
+        body MUST NOT carry an `id`. The minted identifier is returned in the
+        response body and the `Location` header. Caller distributes it to its
+        consumer fleet via its own coordination mechanism (DB, ConfigMap, env var).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "./schemas/consumer_group.v1.schema.json#/definitions/CreateRequest"
+      responses:
+        "201":
+          description: Created
+          headers:
+            Location:
+              description: URL of the newly created consumer-group resource (`/v1/consumer_groups/<encoded-gts-id>`)
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/consumer_group.v1.schema.json"
+        "403":
+          description: Forbidden (caller lacks `consumer_group:define` permission)
+    get:
+      tags: [consumer-groups]
+      summary: List consumer groups visible to the caller
+      responses:
+        "200":
+          description: Page of consumer groups
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "./schemas/consumer_group.v1.schema.json"
+
+  /v1/consumer_groups/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+        description: Full GTS consumer-group identifier (URL-encoded).
+    get:
+      tags: [consumer-groups]
+      summary: Read a registered consumer group
+      responses:
+        "200":
+          description: Consumer group record
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/consumer_group.v1.schema.json"
+        "403":
+          description: Forbidden
+        "404":
+          description: ConsumerGroupNotFound
+    delete:
+      tags: [consumer-groups]
+      summary: Remove a consumer group from the registry
+      description: Allowed only when there are no active members (cache state empty for this group).
+      responses:
+        "204":
+          description: Deleted
+        "403":
+          description: Forbidden
+        "404":
+          description: ConsumerGroupNotFound
+        "409":
+          description: ConsumerGroupHasActiveMembers
+
+  /v1/subscriptions:
+    post:
+      tags: [subscriptions]
+      summary: JOIN — register a subscription against a consumer group
+      description: |
+        Creates a subscription with one or more typed-filter `interests[]` entries. Each
+        interest is topic-anchored, declares event-type patterns scoped to that topic, and
+        optionally carries a paired engine-typed filter expression. See
+        `ADR/0004-subscription-filter-typing.md` and
+        `features/0002-consumer-subscription-lifecycle.md`. Subject to per-tenant rate cap
+        (default 60/min).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./schemas/subscription.v1.schema.json"
+      responses:
+        "201":
+          description: Subscription created; assignment computed
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/subscription.v1.schema.json"
+        "400":
+          description: |
+            Validation error. Common codes:
+            `BadRequest` (missing required field, paired-optional violation: exactly one of
+            `expression_type` / `expression` present),
+            `BadTypePattern` (pattern violates GTS spec §10 wildcard rules — wildcard not at
+            segment boundary, mid-pattern wildcard, multiple wildcards, substring within segment),
+            `NoTypesMatched` (a `types[]` pattern resolved to zero registered types under the
+            declared topic),
+            `TypeNotInTopic` (defense-in-depth: resolved type's `parent_topic` differs from
+            `interest.topic`),
+            `TooManyInterests` (>64), `TooManyTypes` (>32 per interest),
+            `ExpressionTooLong` (>4096 bytes), `CompiledFilterTooLarge` (>64KiB),
+            `InvalidFilterExpression` (engine compile failed; engine diagnostic in body),
+            `UnknownFilterEngine` (`expression_type` GTS does not resolve to a registered
+            engine).
+        "403":
+          description: |
+            `TopicNotAuthorized` (calling principal lacks `consume` on `interest.topic`),
+            `EventTypeNotAuthorized` (principal lacks `consume` on a resolved event type;
+            the offending type is in the response body),
+            `TenantIdNotAuthorized` (platform tenant resolver denied `interest.tenant_id`).
+        "404":
+          description: |
+            `ConsumerGroupNotFound` (anonymous: must POST /v1/consumer_groups first; named:
+            must register via types_registry),
+            `TopicNotFound` (an `interest.topic` is not registered in `evbk_topic`).
+        "429":
+          description: RateLimitExceeded — per-tenant JOIN rate cap breached. `Retry-After` populated.
+
+  /v1/subscriptions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [subscriptions]
+      summary: LEAVE — terminate a subscription
+      responses:
+        "204":
+          description: Subscription removed; rebalance triggered
+        "404":
+          description: SubscriptionNotFound
+
+  /v1/subscriptions/{id}/positions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [subscriptions]
+      summary: SEEK — set the group cursor for assigned (topic, partition) pairs
+      description: |
+        Serves two roles for the same subscription:
+
+        1. **Pre-stream seed** — the consumer SDK calls this once after JOIN
+           (before opening `:stream`) to declare the starting position for each
+           assigned partition. The SDK resolves the position via
+           `OffsetManager::position(...)`; the response is either an exact
+           last-processed offset (server emits from `offset + 1`) or a sentinel
+           (`"earliest"` / `"latest"`) the broker resolves at admission. Pre-stream
+           SEEK may set any value in the valid range (no forward-only check).
+        2. **Forward ack during streaming** — the SDK calls this to advance the
+           cursor past acknowledged events. While a stream is open against the
+           subscription, the broker enforces `MAX(stored, requested)`
+           per-partition. Backward moves are rejected with
+           `409 SeekBackwardNotAllowed`.
+
+        Each integer is interpreted as the **last offset the consumer has
+        processed** (symmetric with the SDK's ack semantic). The broker emits
+        from `cursor + 1`.
+
+        Per-partition behavior when a partition is no longer assigned is
+        documented in `features/0002-consumer-subscription-lifecycle.md`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [partition_positions]
+              properties:
+                partition_positions:
+                  type: object
+                  description: |
+                    Map keyed by `"<topic>:<partition>"` (e.g., `"orders:0"`).
+                    Values are either an integer (last-processed offset) or one
+                    of the string sentinels `"earliest"` / `"latest"`.
+
+                    Sentinel resolution at admission:
+                    - `"earliest"` → cursor set to `retention_floor - 1`
+                      (broker emits from `retention_floor` onwards).
+                    - `"latest"` → cursor set to the current high-water mark
+                      (broker emits only future events).
+                  additionalProperties:
+                    oneOf:
+                      - type: integer
+                        format: int64
+                        description: |
+                          Last-processed offset. Valid range:
+                          `[retention_floor - 1, high_water_mark]`.
+                      - type: string
+                        enum: ["earliest", "latest"]
+                        description: Server-resolved sentinel.
+      responses:
+        "200":
+          description: |
+            Cursor seeded / updated. Response body returns the resolved integer
+            offsets per partition (so callers can audit what was actually stored).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  partition_positions:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                      format: int64
+        "400":
+          description: |
+            InvalidInitialPosition — an integer offset falls outside the valid
+            last-processed range `[retention_floor - 1, high_water_mark]` for
+            one or more partitions. RFC-9457 Problem Details body identifies
+            offending partitions, requested values, and valid ranges.
+        "404":
+          description: SubscriptionNotFound
+        "409":
+          description: |
+            PartitionNotAssigned — request references a partition not currently
+            assigned to this subscription. Also: SeekBackwardNotAllowed —
+            mid-stream SEEK attempting to move the cursor backward (forward-only
+            enforced while `:stream` is open).
+
+components:
+  schemas:
+    Topic:
+      $ref: "./schemas/topic.v1.schema.json"
+    EventType:
+      $ref: "./schemas/event_type.v1.schema.json"
+    Event:
+      $ref: "./schemas/event.v1.schema.json"
+    Subscription:
+      $ref: "./schemas/subscription.v1.schema.json"
+    ConsumerGroup:
+      $ref: "./schemas/consumer_group.v1.schema.json"

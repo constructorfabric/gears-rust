@@ -1,0 +1,43 @@
+# Pre-stream SEEK to an exact offset
+
+A consumer seeds with an explicit integer offset — the last-processed offset. This is the wire path a client with its own durable offset store uses on restart, and the replay/backfill path (start from a known offset). The integer is stored verbatim; the broker emits from `offset + 1`.
+
+> Covers the broker-observable half of consumer-seek-semantics §5.4, `Exact` path — the `POST .../positions` wire contract for an integer value.
+
+## Setup
+
+- Run [Cold JOIN against a fresh group](../subscriptions/positive-2.1-cold-join-fresh-group.md). Subscription id `{sub_id}`; assigned `("acme.orders.v1", 0)`.
+- Partition `("acme.orders.v1", 0)` has `RF = 0`, `HWM = 5000` → valid range `[-1, 5000]`. (Here the value `42` is the consumer's last-processed offset, e.g. read back from its local DB.)
+
+## Request
+
+```http
+POST /v1/subscriptions/{sub_id}/positions HTTP/1.1
+Host: broker.example.com
+Authorization: Bearer <tenant-token>
+Content-Type: application/json
+
+{
+  "partition_positions": {
+    "gts.cf.core.events.topic.v1~acme.orders.v1:0": 42
+  }
+}
+```
+
+## Expected response
+
+- `200 OK`
+- The integer is stored verbatim (no `+1` adjustment on the wire — the value already means "last processed").
+
+```json
+{
+  "partition_positions": {
+    "gts.cf.core.events.topic.v1~acme.orders.v1:0": 42
+  }
+}
+```
+
+## Side effects
+
+- `evbk_group_offsets(group, "acme.orders.v1", 0)` is set to `42`.
+- `subsequent GET /v1/events:stream` emits `("acme.orders.v1", 0)` events starting at offset `43` (`Cursor + 1`).
