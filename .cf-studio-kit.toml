@@ -281,6 +281,42 @@ install_path = "constraints.toml"
 type = "file"
 user_modifiable = true
 
+[kits.resources.artifacts.PRD]
+template = "prd_template"
+rules = "prd_rules"
+checklist = "prd_checklist"
+examples = "prd_example"
+
+[kits.resources.artifacts.ADR]
+template = "adr_template"
+rules = "adr_rules"
+checklist = "adr_checklist"
+examples = "adr_example"
+
+[kits.resources.artifacts.DESIGN]
+template = "design_template"
+rules = "design_rules"
+checklist = "design_checklist"
+examples = "design_example"
+
+[kits.resources.artifacts.DECOMPOSITION]
+template = "decomposition_template"
+rules = "decomposition_rules"
+checklist = "decomposition_checklist"
+examples = "decomposition_example"
+
+[kits.resources.artifacts.FEATURE]
+template = "feature_template"
+rules = "feature_rules"
+checklist = "feature_checklist"
+examples = "feature_example"
+
+[kits.resources.artifacts.UPSTREAM_REQS]
+template = "upstream_reqs_template"
+rules = "upstream_reqs_rules"
+checklist = "upstream_reqs_checklist"
+examples = "upstream_reqs_example"
+
 [[kits.resources]]
 id = "router"
 kind = "skill"

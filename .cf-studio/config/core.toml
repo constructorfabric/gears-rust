@@ -6,117 +6,226 @@ project_root = ".."
 [kits]
 [kits.gears]
 format = "CFS"
-path = ".."
+path = "../studio-kit-gears"
 version = "0.1.0"
 
 [kits.gears.resources]
 [kits.gears.resources.adr_template]
 path = "../docs/spec-templates/gears-sdlc/ADR/template.md"
+kind = "template"
+public = false
 
 [kits.gears.resources.adr_rules]
 path = "../studio-kit-gears/artifacts/ADR/rules.md"
+kind = "rule"
+public = false
 
 [kits.gears.resources.adr_checklist]
 path = "../docs/checklists/ADR.md"
+kind = "checklist"
+public = false
 
 [kits.gears.resources.adr_example]
 path = "../docs/spec-templates/gears-sdlc/ADR/examples"
+kind = "directory"
+public = false
 
 [kits.gears.resources.decomposition_template]
 path = "../docs/spec-templates/gears-sdlc/DECOMPOSITION/template.md"
+kind = "template"
+public = false
 
 [kits.gears.resources.decomposition_rules]
 path = "../studio-kit-gears/artifacts/DECOMPOSITION/rules.md"
+kind = "rule"
+public = false
 
 [kits.gears.resources.decomposition_checklist]
 path = "../docs/checklists/DECOMPOSITION.md"
+kind = "checklist"
+public = false
 
 [kits.gears.resources.decomposition_example]
 path = "../docs/spec-templates/gears-sdlc/DECOMPOSITION/examples"
+kind = "directory"
+public = false
 
 [kits.gears.resources.design_template]
 path = "../docs/spec-templates/gears-sdlc/DESIGN/template.md"
+kind = "template"
+public = false
 
 [kits.gears.resources.design_rules]
 path = "../studio-kit-gears/artifacts/DESIGN/rules.md"
+kind = "rule"
+public = false
 
 [kits.gears.resources.design_checklist]
 path = "../docs/checklists/DESIGN.md"
+kind = "checklist"
+public = false
 
 [kits.gears.resources.design_example]
 path = "../docs/spec-templates/gears-sdlc/DESIGN/examples"
+kind = "directory"
+public = false
 
 [kits.gears.resources.feature_template]
 path = "../docs/spec-templates/gears-sdlc/FEATURE/template.md"
+kind = "template"
+public = false
 
 [kits.gears.resources.feature_rules]
 path = "../studio-kit-gears/artifacts/FEATURE/rules.md"
+kind = "rule"
+public = false
 
 [kits.gears.resources.feature_checklist]
 path = "../docs/checklists/FEATURE.md"
+kind = "checklist"
+public = false
 
 [kits.gears.resources.feature_example]
 path = "../docs/spec-templates/gears-sdlc/FEATURE/examples"
+kind = "directory"
+public = false
 
 [kits.gears.resources.prd_template]
 path = "../docs/spec-templates/gears-sdlc/PRD/template.md"
+kind = "template"
+public = false
 
 [kits.gears.resources.prd_rules]
 path = "../studio-kit-gears/artifacts/PRD/rules.md"
+kind = "rule"
+public = false
 
 [kits.gears.resources.prd_checklist]
 path = "../docs/checklists/PRD.md"
+kind = "checklist"
+public = false
 
 [kits.gears.resources.prd_example]
 path = "../docs/spec-templates/gears-sdlc/PRD/examples"
+kind = "directory"
+public = false
 
 [kits.gears.resources.upstream_reqs_template]
 path = "../docs/spec-templates/gears-sdlc/UPSTREAM_REQS/template.md"
+kind = "template"
+public = false
 
 [kits.gears.resources.upstream_reqs_rules]
 path = "../studio-kit-gears/artifacts/UPSTREAM_REQS/rules.md"
+kind = "rule"
+public = false
 
 [kits.gears.resources.upstream_reqs_checklist]
 path = "../docs/checklists/UPSTREAM_REQS.md"
+kind = "checklist"
+public = false
 
 [kits.gears.resources.upstream_reqs_example]
 path = "../docs/spec-templates/gears-sdlc/UPSTREAM_REQS/examples"
+kind = "directory"
+public = false
 
 [kits.gears.resources.pr_code_review_template]
 path = "../studio-kit-gears/artifacts/PR-CODE-REVIEW-TEMPLATE/template.md"
+kind = "template"
+public = false
 
 [kits.gears.resources.pr_status_report_template]
 path = "../studio-kit-gears/artifacts/PR-STATUS-REPORT-TEMPLATE/template.md"
+kind = "template"
+public = false
 
 [kits.gears.resources.codebase_rules]
 path = "../studio-kit-gears/codebase/rules.md"
+kind = "rule"
+public = false
 
 [kits.gears.resources.codebase_checklist]
 path = "../docs/checklists/CODING.md"
+kind = "checklist"
+public = false
 
 [kits.gears.resources.workflow_pr_review]
 path = "../studio-kit-gears/workflows/pr-review.md"
+kind = "skill"
+public = true
 
 [kits.gears.resources.workflow_pr_status]
 path = "../studio-kit-gears/workflows/pr-status.md"
+kind = "skill"
+public = true
 
 [kits.gears.resources.scripts]
 path = "../studio-kit-gears/scripts"
+kind = "script"
+public = false
 
 [kits.gears.resources.constraints]
 path = "../studio-kit-gears/constraints.toml"
+kind = "constraints"
+public = false
+
+[kits.gears.resources.constraints.artifacts]
+[kits.gears.resources.constraints.artifacts.PRD]
+template = "prd_template"
+rules = "prd_rules"
+checklist = "prd_checklist"
+examples = "prd_example"
+
+[kits.gears.resources.constraints.artifacts.ADR]
+template = "adr_template"
+rules = "adr_rules"
+checklist = "adr_checklist"
+examples = "adr_example"
+
+[kits.gears.resources.constraints.artifacts.DESIGN]
+template = "design_template"
+rules = "design_rules"
+checklist = "design_checklist"
+examples = "design_example"
+
+[kits.gears.resources.constraints.artifacts.DECOMPOSITION]
+template = "decomposition_template"
+rules = "decomposition_rules"
+checklist = "decomposition_checklist"
+examples = "decomposition_example"
+
+[kits.gears.resources.constraints.artifacts.FEATURE]
+template = "feature_template"
+rules = "feature_rules"
+checklist = "feature_checklist"
+examples = "feature_example"
+
+[kits.gears.resources.constraints.artifacts.UPSTREAM_REQS]
+template = "upstream_reqs_template"
+rules = "upstream_reqs_rules"
+checklist = "upstream_reqs_checklist"
+examples = "upstream_reqs_example"
 
 [kits.gears.resources.router]
 path = "../studio-kit-gears/SKILL.md"
+kind = "skill"
+public = false
 
 [kits.gears.resources.agents]
 path = "../studio-kit-gears/AGENTS.md"
+kind = "rule"
+public = true
 
 [kits.gears.resources.workflow_migrate_openspec]
 path = "../studio-kit-gears/workflows/migrate-openspec.md"
+kind = "skill"
+public = true
 
 [kits.gears.resources.rules]
 path = "../studio-kit-gears/rules.md"
+kind = "rule"
+public = false
 
 [install]
 version_source = "project_config"
