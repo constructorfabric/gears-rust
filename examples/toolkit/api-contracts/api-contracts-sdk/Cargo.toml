@@ -1,0 +1,67 @@
+[package]
+name = "cf-api-contracts-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SDK for the api-contracts example module — PaymentService contract, models, and errors"
+rust-version.workspace = true
+
+[features]
+default = []
+# `toolkit-contract/rest-client` transitively pulls `canonical-errors` so the
+# `From<TransportError> for CanonicalError` impl is available.
+rest-client = [
+    "toolkit-contract/rest-client",
+    "dep:toolkit-http",
+    "dep:secrecy",
+    "dep:async-stream",
+    "dep:futures-util",
+]
+grpc-client = [
+    "toolkit-contract/grpc-client",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:prost",
+    "dep:tonic-prost-build",
+    "dep:async-stream",
+    "dep:futures-util",
+    "dep:secrecy",
+]
+
+[lints]
+workspace = true
+
+[dependencies]
+toolkit.workspace = true
+toolkit-contract.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-canonical-errors-macro.workspace = true
+toolkit-security.workspace = true
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+schemars.workspace = true
+utoipa = { workspace = true, features = ["uuid"] }
+uuid.workspace = true
+futures-core.workspace = true
+
+# Direct deps required when the macro emits the REST client. They appear
+# directly in generated code paths (`::toolkit_http::*`, `::secrecy::*`, ...).
+toolkit-http = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+# Direct deps required when the macro emits the gRPC client.
+tonic = { workspace = true, features = ["transport"], optional = true }
+tonic-prost = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true, optional = true }
+
+[dev-dependencies]
+toolkit-contract-protogen.workspace = true
+anyhow.workspace = true

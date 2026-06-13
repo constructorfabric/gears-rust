@@ -1,0 +1,5 @@
+error: grpc_contract trait must be named `PaymentApiGrpc` to project base trait `PaymentApi` (PRD #1536 D1: projection trait extends `{Base}` and is named `{Base}Grpc`)
+  --> tests/ui/fail/grpc_wrong_projection_name.rs:15:11
+   |
+15 | pub trait PaymentApiOverGrpc: PaymentApi {
+   |           ^^^^^^^^^^^^^^^^^^
