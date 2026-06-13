@@ -4,144 +4,119 @@ version = "1.0"
 project_root = ".."
 
 [kits]
-[kits.sdlc]
+[kits.gears]
 format = "CFS"
-path = "config/kits/sdlc"
-source = "github:constructorfabric/studio-kit-sdlc"
-version = "0"
+path = ".."
+version = "0.1.0"
 
-[kits.sdlc.resources]
-[kits.sdlc.resources.adr_template]
+[kits.gears.resources]
+[kits.gears.resources.adr_template]
 path = "../docs/spec-templates/gears-sdlc/ADR/template.md"
 
-[kits.sdlc.resources.adr_rules]
-path = "config/kits/sdlc/artifacts/ADR/rules.md"
+[kits.gears.resources.adr_rules]
+path = "../studio-kit-gears/artifacts/ADR/rules.md"
 
-[kits.sdlc.resources.adr_checklist]
+[kits.gears.resources.adr_checklist]
 path = "../docs/checklists/ADR.md"
 
-[kits.sdlc.resources.adr_example]
+[kits.gears.resources.adr_example]
 path = "../docs/spec-templates/gears-sdlc/ADR/examples"
 
-[kits.sdlc.resources.decomposition_template]
+[kits.gears.resources.decomposition_template]
 path = "../docs/spec-templates/gears-sdlc/DECOMPOSITION/template.md"
 
-[kits.sdlc.resources.decomposition_rules]
-path = "config/kits/sdlc/artifacts/DECOMPOSITION/rules.md"
+[kits.gears.resources.decomposition_rules]
+path = "../studio-kit-gears/artifacts/DECOMPOSITION/rules.md"
 
-[kits.sdlc.resources.decomposition_checklist]
+[kits.gears.resources.decomposition_checklist]
 path = "../docs/checklists/DECOMPOSITION.md"
 
-[kits.sdlc.resources.decomposition_example]
+[kits.gears.resources.decomposition_example]
 path = "../docs/spec-templates/gears-sdlc/DECOMPOSITION/examples"
 
-[kits.sdlc.resources.design_template]
+[kits.gears.resources.design_template]
 path = "../docs/spec-templates/gears-sdlc/DESIGN/template.md"
 
-[kits.sdlc.resources.design_rules]
-path = "config/kits/sdlc/artifacts/DESIGN/rules.md"
+[kits.gears.resources.design_rules]
+path = "../studio-kit-gears/artifacts/DESIGN/rules.md"
 
-[kits.sdlc.resources.design_checklist]
+[kits.gears.resources.design_checklist]
 path = "../docs/checklists/DESIGN.md"
 
-[kits.sdlc.resources.design_example]
+[kits.gears.resources.design_example]
 path = "../docs/spec-templates/gears-sdlc/DESIGN/examples"
 
-[kits.sdlc.resources.feature_template]
+[kits.gears.resources.feature_template]
 path = "../docs/spec-templates/gears-sdlc/FEATURE/template.md"
 
-[kits.sdlc.resources.feature_rules]
-path = "config/kits/sdlc/artifacts/FEATURE/rules.md"
+[kits.gears.resources.feature_rules]
+path = "../studio-kit-gears/artifacts/FEATURE/rules.md"
 
-[kits.sdlc.resources.feature_checklist]
+[kits.gears.resources.feature_checklist]
 path = "../docs/checklists/FEATURE.md"
 
-[kits.sdlc.resources.feature_example]
+[kits.gears.resources.feature_example]
 path = "../docs/spec-templates/gears-sdlc/FEATURE/examples"
 
-[kits.sdlc.resources.prd_template]
+[kits.gears.resources.prd_template]
 path = "../docs/spec-templates/gears-sdlc/PRD/template.md"
 
-[kits.sdlc.resources.prd_rules]
-path = "config/kits/sdlc/artifacts/PRD/rules.md"
+[kits.gears.resources.prd_rules]
+path = "../studio-kit-gears/artifacts/PRD/rules.md"
 
-[kits.sdlc.resources.prd_checklist]
+[kits.gears.resources.prd_checklist]
 path = "../docs/checklists/PRD.md"
 
-[kits.sdlc.resources.prd_example]
+[kits.gears.resources.prd_example]
 path = "../docs/spec-templates/gears-sdlc/PRD/examples"
 
-[kits.sdlc.resources.upstream_reqs_template]
+[kits.gears.resources.upstream_reqs_template]
 path = "../docs/spec-templates/gears-sdlc/UPSTREAM_REQS/template.md"
 
-[kits.sdlc.resources.upstream_reqs_rules]
-path = "config/kits/sdlc/artifacts/UPSTREAM_REQS/rules.md"
+[kits.gears.resources.upstream_reqs_rules]
+path = "../studio-kit-gears/artifacts/UPSTREAM_REQS/rules.md"
 
-[kits.sdlc.resources.upstream_reqs_checklist]
+[kits.gears.resources.upstream_reqs_checklist]
 path = "../docs/checklists/UPSTREAM_REQS.md"
 
-[kits.sdlc.resources.upstream_reqs_example]
+[kits.gears.resources.upstream_reqs_example]
 path = "../docs/spec-templates/gears-sdlc/UPSTREAM_REQS/examples"
 
-[kits.sdlc.resources.pr_code_review_template]
-path = "config/kits/sdlc/artifacts/PR-CODE-REVIEW-TEMPLATE/template.md"
+[kits.gears.resources.pr_code_review_template]
+path = "../studio-kit-gears/artifacts/PR-CODE-REVIEW-TEMPLATE/template.md"
 
-[kits.sdlc.resources.pr_status_report_template]
-path = "config/kits/sdlc/artifacts/PR-STATUS-REPORT-TEMPLATE/template.md"
+[kits.gears.resources.pr_status_report_template]
+path = "../studio-kit-gears/artifacts/PR-STATUS-REPORT-TEMPLATE/template.md"
 
-[kits.sdlc.resources.codebase_rules]
-path = "config/kits/sdlc/codebase/rules.md"
+[kits.gears.resources.codebase_rules]
+path = "../studio-kit-gears/codebase/rules.md"
 
-[kits.sdlc.resources.codebase_checklist]
+[kits.gears.resources.codebase_checklist]
 path = "../docs/checklists/CODING.md"
 
-[kits.sdlc.resources.workflow_pr_review]
-path = "config/kits/sdlc/workflows/pr-review.md"
+[kits.gears.resources.workflow_pr_review]
+path = "../studio-kit-gears/workflows/pr-review.md"
 
-[kits.sdlc.resources.workflow_pr_status]
-path = "config/kits/sdlc/workflows/pr-status.md"
+[kits.gears.resources.workflow_pr_status]
+path = "../studio-kit-gears/workflows/pr-status.md"
 
-[kits.sdlc.resources.scripts]
-path = "config/kits/sdlc/scripts"
+[kits.gears.resources.scripts]
+path = "../studio-kit-gears/scripts"
 
-[kits.sdlc.resources.constraints]
-path = "config/kits/sdlc/constraints.toml"
+[kits.gears.resources.constraints]
+path = "../studio-kit-gears/constraints.toml"
 
-[kits.sdlc.resources.skill]
-path = "config/kits/sdlc/SKILL.md"
+[kits.gears.resources.router]
+path = "../studio-kit-gears/SKILL.md"
 
-[kits.sdlc.resources.agents]
-path = "config/kits/sdlc/AGENTS.md"
+[kits.gears.resources.agents]
+path = "../studio-kit-gears/AGENTS.md"
 
-[kits.sdlc.resources.workflow_migrate_openspec]
-path = "config/kits/sdlc/workflows/migrate-openspec.md"
+[kits.gears.resources.workflow_migrate_openspec]
+path = "../studio-kit-gears/workflows/migrate-openspec.md"
 
-[kits.sdlc.resources.workflow_doc_prd]
-path = "config/kits/sdlc/workflows/doc-prd.md"
-
-[kits.sdlc.resources.workflow_doc_adr]
-path = "config/kits/sdlc/workflows/doc-adr.md"
-
-[kits.sdlc.resources.workflow_doc_design]
-path = "config/kits/sdlc/workflows/doc-design.md"
-
-[kits.sdlc.resources.workflow_decompose]
-path = "config/kits/sdlc/workflows/decompose.md"
-
-[kits.sdlc.resources.workflow_doc_feature]
-path = "config/kits/sdlc/workflows/doc-feature.md"
-
-[kits.sdlc.resources.workflow_implement]
-path = "config/kits/sdlc/workflows/implement.md"
-
-[kits.sdlc.resources.workflow_change_impact_analysis]
-path = "config/kits/sdlc/workflows/change-impact-analysis.md"
-
-[kits.sdlc.resources.workflow_reverse_engineer]
-path = "config/kits/sdlc/workflows/reverse-engineer.md"
-
-[kits.sdlc.resources.change_impact_config]
-path = "config/kits/sdlc/scripts/change-impact-analysis.toml"
+[kits.gears.resources.rules]
+path = "../studio-kit-gears/rules.md"
 
 [install]
 version_source = "project_config"

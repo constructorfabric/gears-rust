@@ -100,10 +100,10 @@ patterns = ["gears/model-registry/*"]
 [[systems]]
 name = "cf-gears"
 slug = "cf"
-kit = "sdlc"
+kit = "gears"
 
 [[systems.autodetect]]
-kit = "sdlc"
+kit = "gears"
 system_root = "{project_root}/gears/$system"
 artifacts_root = "{system_root}/docs"
 
@@ -154,7 +154,7 @@ path = "{system_root}/tests"
 extensions = [".rs"]
 
 [[systems.autodetect]]
-kit = "sdlc"
+kit = "gears"
 system_root = "{project_root}/gears/system/$system"
 artifacts_root = "{system_root}/docs"
 
@@ -237,7 +237,7 @@ extensions = [".rs"]
 # Declared as a child of the `gears/system/$system` autodetect rule so the sub-plugin
 # artifacts are detected as belonging to tr-plugin, not to account-management.
 [[systems.autodetect.children]]
-kit = "sdlc"
+kit = "gears"
 system_root = "{project_root}/gears/system/account-management/docs/tr-plugin"
 artifacts_root = "{system_root}"
 
@@ -275,7 +275,7 @@ fail_on_unmatched_markdown = true
 # Nested sub-plugin scope: OIDC AuthN plugin carries its own PRD/DESIGN/DECOMPOSITION
 # under gears/system/authn-resolver/plugins/oidc-authn-plugin/docs.
 [[systems.autodetect.children]]
-kit = "sdlc"
+kit = "gears"
 system_root = "{project_root}/gears/system/authn-resolver/plugins/oidc-authn-plugin/docs"
 artifacts_root = "{system_root}"
 
@@ -313,10 +313,10 @@ fail_on_unmatched_markdown = true
 [[systems]]
 name = "examples"
 slug = "examples"
-kit = "sdlc"
+kit = "gears"
 
 [[systems.autodetect]]
-kit = "sdlc"
+kit = "gears"
 system_root = "{project_root}/docs/spec-templates/examples/$system"
 artifacts_root = "{system_root}"
 codebase = []

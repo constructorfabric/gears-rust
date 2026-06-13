@@ -123,6 +123,8 @@ This table maps non-functional requirements from PRD to specific design/architec
 
 **Core Entities**:
 
+- [ ] `p2` - **ID**: `cpt-{system}-entity-{slug}`
+
 | Entity | Description | Schema |
 |--------|-------------|--------|
 | {EntityName} | {Purpose} | [{file}]({path}) |
