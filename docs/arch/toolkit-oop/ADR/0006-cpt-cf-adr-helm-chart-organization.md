@@ -13,33 +13,33 @@ date: 2026-04-07
 
 ## Context and Problem Statement
 
-ModKit modules are independently deployable units. In Profile 3 (K8s Native), each module runs as a separate pod and
+ToolKit gears are independently deployable units. In Profile 3 (K8s Native), each gear runs as a separate pod and
 needs a Helm chart for packaging, configuration, and deployment. The platform also needs a way to deploy a full set of
-modules (Flight Control + system modules + application modules) as a cohesive system. How should we organize Helm charts
-so that (a) each module is deployable standalone, (b) the full platform can be installed in one command, (c) charts are
+gears (Flight Control + system gears + application gears) as a cohesive system. How should we organize Helm charts
+so that (a) each gear is deployable standalone, (b) the full platform can be installed in one command, (c) charts are
 DRY (no duplicated templates), and (d) users with existing k8s clusters can easily adapt and extend the charts?
 
 ## Decision Drivers
 
-* **Independent deployability**: each module is a separate microservice in Profile 3 — its chart must be self-contained
+* **Independent deployability**: each gear is a separate microservice in Profile 3 — its chart must be self-contained
   and installable standalone.
-* **DRY templates**: all ModKit modules share the same structure (HTTP server on configurable port, `/healthz` +
-  `/readyz` probe endpoints provided by ModKit runtime, optional gRPC, config via env/ConfigMap). Duplicating
-  Deployment/Service/Ingress templates across 20+ modules is unmaintainable.
+* **DRY templates**: all ToolKit gears share the same structure (HTTP server on configurable port, `/healthz` +
+  `/readyz` probe endpoints provided by ToolKit runtime, optional gRPC, config via env/ConfigMap). Duplicating
+  Deployment/Service/Ingress templates across 20+ gears is unmaintainable.
 * **One-command platform install**: operators deploying the full platform should not need to install 15 charts manually.
   An umbrella chart with sensible defaults is essential.
 * **User adaptability**: users bring their own registries, ingress controllers, resource constraints, namespace
   policies. Charts must expose these as overridable `values.yaml` parameters with clear documentation.
 * **Co-location with code**: chart changes often accompany code changes (new env var, new port, new health endpoint).
-  Keeping the chart close to the module source enables atomic PRs.
+  Keeping the chart close to the gear source enables atomic PRs.
 * **CI/CD publishability**: charts must be publishable to an OCI Helm registry for distribution to users who don't have
   the monorepo.
 
 ## Considered Options
 
-* **Option A**: Co-located only — each module has `chart/` next to its source, no shared templates, no umbrella.
-* **Option B**: Centralized only — all charts in a top-level `charts/` directory, separated from module source.
-* **Option C**: Hybrid — chart source co-located with each module, shared library chart and umbrella chart in
+* **Option A**: Co-located only — each gear has `chart/` next to its source, no shared templates, no umbrella.
+* **Option B**: Centralized only — all charts in a top-level `charts/` directory, separated from gear source.
+* **Option C**: Hybrid — chart source co-located with each gear, shared library chart and umbrella chart in
   `deploy/helm/`.
 
 ## Decision Outcome
@@ -50,67 +50,67 @@ chart), while remaining publishable to OCI registries.
 
 ### Consequences
 
-* A `modkit-common` library chart must be created in `deploy/helm/modkit-common/`. It defines shared named templates for
+* A `toolkit-common` library chart must be created in `deploy/helm/toolkit-common/`. It defines shared named templates for
   Deployment, Service, ConfigMap, Ingress, HPA, PDB, NetworkPolicy, and ServiceAccount.
-* Each module's `chart/` declares a dependency on `modkit-common` and its `templates/` files consist primarily of
-  `{{ include "modkit-common.<resource>" . }}` calls, with module-specific overrides where needed.
-* A `modkit-platform` umbrella chart in `deploy/helm/modkit-platform/` aggregates all module charts as conditional
-  dependencies (`condition: <module>.enabled`), with preset values files for common deployment scenarios (minimal,
+* Each gear's `chart/` declares a dependency on `toolkit-common` and its `templates/` files consist primarily of
+  `{{ include "toolkit-common.<resource>" . }}` calls, with gear-specific overrides where needed.
+* A `toolkit-platform` umbrella chart in `deploy/helm/toolkit-platform/` aggregates all gear charts as conditional
+  dependencies (`condition: <gear>.enabled`), with preset values files for common deployment scenarios (minimal,
   production, dev).
-* CI must run `helm dependency build` for each module chart (resolving the `modkit-common` library) and for the umbrella
-  chart (resolving all module sub-charts).
-* Published charts (OCI registry) must include the resolved `modkit-common` dependency, so users can `helm install`
+* CI must run `helm dependency build` for each gear chart (resolving the `toolkit-common` library) and for the umbrella
+  chart (resolving all gear sub-charts).
+* Published charts (OCI registry) must include the resolved `toolkit-common` dependency, so users can `helm install`
   without access to the monorepo.
-* Module developers adding a new module must create a `chart/` directory following the established pattern. The library
+* Gear developers adding a new gear must create a `chart/` directory following the established pattern. The library
   chart handles 90% of the boilerplate.
 
 ### Confirmation
 
-* CI validation: `helm lint` and `helm template` pass for every module chart and the umbrella chart.
-* Integration test: `helm install modkit-platform` with `values-minimal.yaml` successfully deploys Flight Control +
+* CI validation: `helm lint` and `helm template` pass for every gear chart and the umbrella chart.
+* Integration test: `helm install toolkit-platform` with `values-minimal.yaml` successfully deploys Flight Control +
   api-gateway + authn-resolver in a test k8s cluster.
-* New module check: a newly scaffolded module's chart renders correctly with only `Chart.yaml`, `values.yaml`, and 2-3
-  template files that include `modkit-common` helpers.
+* New gear check: a newly scaffolded gear's chart renders correctly with only `Chart.yaml`, `values.yaml`, and 2-3
+  template files that include `toolkit-common` helpers.
 
 ## Pros and Cons of the Options
 
 ### Option A: Co-located Only
 
-Each module has a full `chart/` directory with complete templates. No shared library, no umbrella.
+Each gear has a full `chart/` directory with complete templates. No shared library, no umbrella.
 
 * Good, because maximum simplicity — each chart is completely self-contained, no cross-dependencies.
 * Good, because easy to understand for contributors familiar with standard Helm charts.
 * Bad, because massive template duplication — Deployment, Service, Ingress templates are nearly identical across all
-  modules.
+  gears.
 * Bad, because a platform-wide change (e.g., adding a standard annotation, changing health probe path) requires updating
-  every module's chart individually.
+  every gear's chart individually.
 * Bad, because no one-command platform install — operators must install each chart separately or write their own
   umbrella.
 * Bad, because divergence risk — charts drift apart over time as different contributors make different choices.
 
 ### Option B: Centralized Only
 
-All charts live in `charts/<module>/` at the repo root. Module source directories have no chart artifacts.
+All charts live in `charts/<gear>/` at the repo root. Gear source directories have no chart artifacts.
 
 * Good, because all charts in one place — easy to lint, publish, and maintain consistently.
 * Good, because a library chart is natural (just another directory in `charts/`).
 * Good, because an umbrella chart can reference sub-charts via relative paths.
-* Bad, because chart changes are decoupled from code changes — a PR adding a new env var to a module must also touch a
+* Bad, because chart changes are decoupled from code changes — a PR adding a new env var to a gear must also touch a
   separate directory tree, increasing review friction.
-* Bad, because discoverability suffers — a developer looking at `modules/mini-chat/` has no indication that a chart
+* Bad, because discoverability suffers — a developer looking at `gears/mini-chat/` has no indication that a chart
   exists elsewhere.
-* Bad, because violates the "module is the unit of deployment" principle — the chart is part of the deployment unit.
+* Bad, because violates the "gear is the unit of deployment" principle — the chart is part of the deployment unit.
 
 ### Option C: Hybrid (co-located + library + umbrella)
 
-Chart source lives in `modules/<name>/chart/`. Shared templates in `deploy/helm/modkit-common/` (library chart).
-Umbrella in `deploy/helm/modkit-platform/`.
+Chart source lives in `gears/<name>/chart/`. Shared templates in `deploy/helm/toolkit-common/` (library chart).
+Umbrella in `deploy/helm/toolkit-platform/`.
 
 * Good, because atomic PRs — code + chart change in one commit, one review.
 * Good, because DRY — library chart eliminates 90% of template duplication.
 * Good, because one-command install via umbrella chart with preset values files.
-* Good, because each module directory is self-describing — `chart/` is right there next to `src/`.
-* Good, because library chart enforces conventions (labels, annotations, probes) across all modules automatically.
+* Good, because each gear directory is self-describing — `chart/` is right there next to `src/`.
+* Good, because library chart enforces conventions (labels, annotations, probes) across all gears automatically.
 * Neutral, because requires `helm dependency build` step in CI (standard practice, but adds a step).
 * Bad, because the library chart path (`file://` reference) must be maintained — changing the directory structure
   requires updating all `Chart.yaml` files.
@@ -134,7 +134,7 @@ Industry references for this pattern:
 
 This decision directly addresses the following requirements or design elements:
 
-* `cpt-cf-fr-developer-transparency` — Module developers create charts using the same pattern; library chart hides
+* `cpt-cf-fr-developer-transparency` — Gear developers create charts using the same pattern; library chart hides
   platform boilerplate.
 * `cpt-cf-component-k8s-packaging` — This ADR defines the organizational strategy implemented by that component.
 * `cpt-cf-seq-oop-startup-k8s` — The K8s startup sequence relies on the chart to configure the pod correctly (ports, env

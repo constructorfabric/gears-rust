@@ -13,10 +13,10 @@ date: 2026-04-07
 
 ## Context and Problem Statement
 
-In Profile 1 (Embedded), module startup order is guaranteed by topological sort on the `deps` declared in the
-`#[modkit::module(deps = [...])]` macro. By the time module B calls `register_clients()`, its dependency A has already
-started. In Profiles 2 and 3 (OoP, K8s), modules run as independent processes/pods that start in arbitrary order. There
-is no global orchestrator that enforces topo-sort across process boundaries. How should modules handle missing
+In Profile 1 (Embedded), gear startup order is guaranteed by topological sort on the `deps` declared in the
+`#[toolkit::gear(deps = [...])]` macro. By the time gear B calls `register_clients()`, its dependency A has already
+started. In Profiles 2 and 3 (OoP, K8s), gears run as independent processes/pods that start in arbitrary order. There
+is no global orchestrator that enforces topo-sort across process boundaries. How should gears handle missing
 dependencies at startup, and who is responsible for the retry/registration logic?
 
 ## Decision Drivers
@@ -25,60 +25,60 @@ dependencies at startup, and who is responsible for the retry/registration logic
   block on other services are fragile (DNS not yet propagated, rolling update ordering, etc.) and go against k8s
   declarative model.
 * **No single point of failure**: blocking on Flight Control at startup makes it a hard dependency — if it restarts, all
-  modules that haven't registered yet are stuck.
-* **Developer transparency**: module developers should not write retry loops or health-check polling. The `deps`
+  gears that haven't registered yet are stuck.
+* **Developer transparency**: gear developers should not write retry loops or health-check polling. The `deps`
   declaration in the macro is sufficient — the runtime handles the rest.
 * **Profile compatibility**: the solution must work identically across Profile 1 (topo-sort, instant), Profile 2 (local
   processes, fast), and Profile 3 (k8s pods, eventual).
-* **Existing `deps` metadata**: the `deps` field on `ModuleEntry` already declares the dependency graph. This metadata
+* **Existing `deps` metadata**: the `deps` field on `GearEntry` already declares the dependency graph. This metadata
   should drive readiness semantics in all profiles, not just topo-sort in Profile 1.
 
 ## Considered Options
 
 * **Option A**: Init containers wait for Flight Control; topo-sort equivalent via deployment ordering (Helm hooks / Argo
   sync-waves).
-* **Option B**: Central dependency checker in Flight Control that signals "you may start" to each module.
-* **Option C**: Eventual readiness — modules start immediately, self-register with retry, readiness probe gates traffic
-  until critical deps are resolved. All retry/probe logic lives in ModKit runtime.
+* **Option B**: Central dependency checker in Flight Control that signals "you may start" to each gear.
+* **Option C**: Eventual readiness — gears start immediately, self-register with retry, readiness probe gates traffic
+  until critical deps are resolved. All retry/probe logic lives in ToolKit runtime.
 
 ## Decision Outcome
 
-Chosen option: "Eventual readiness with ModKit runtime-managed self-registration and probes", because it is
-kubernetes-native, has no single point of failure, requires zero boilerplate from module developers, and reuses the
+Chosen option: "Eventual readiness with ToolKit runtime-managed self-registration and probes", because it is
+kubernetes-native, has no single point of failure, requires zero boilerplate from gear developers, and reuses the
 existing `deps` metadata for readiness gating.
 
 ### Consequences
 
-* The ModKit OoP runtime (`modkit::bootstrap::oop`) must manage a background task that retries registration with Flight
-  Control (DirectoryService) using exponential backoff. Module code does not participate in this.
-* The ModKit OoP runtime must provide built-in HTTP endpoints for liveness (`/healthz`) and readiness (`/readyz`) probes.
-  These are framework-level, not module-level — the module does not implement them.
+* The ToolKit OoP runtime (`toolkit::bootstrap::oop`) must manage a background task that retries registration with Flight
+  Control (DirectoryService) using exponential backoff. Gear code does not participate in this.
+* The ToolKit OoP runtime must provide built-in HTTP endpoints for liveness (`/healthz`) and readiness (`/readyz`) probes.
+  These are framework-level, not gear-level — the gear does not implement them.
 * **Probe endpoints SHOULD be configurable to bind on a separate port** (e.g. `probe_bind_addr: 0.0.0.0:9090`). When set,
   `/healthz`, `/readyz`, and `/metrics` are served from that port; the main HTTP port serves only business endpoints.
   The Helm chart MUST NOT expose the probe port through the k8s `Service` — only `livenessProbe`,
   `readinessProbe`, `startupProbe`, and the Prometheus scrape config target it. Default (when `probe_bind_addr` is
   unset) is to multiplex probes on the main port — convenient for local dev, not recommended for production.
 * Liveness returns `200 OK` as soon as the HTTP server is listening (process is alive, not deadlocked).
-* **Readiness has four states** mapped to the module lifecycle:
+* **Readiness has four states** mapped to the gear lifecycle:
     - **Starting** → `503` with body `{"state":"starting","unresolved_deps":[...]}`. Returned until all `deps` are
       resolved AND every registered custom check returns `Ready`.
-    - **Ready** → `200` with body `{"state":"ready"}`. Module is fully serving traffic.
+    - **Ready** → `200` with body `{"state":"ready"}`. Gear is fully serving traffic.
     - **Degraded** → `200` with body `{"state":"degraded","reasons":[...]}`. At least one custom check returned
       `Degraded` (e.g. Redis down, but cache fallback is acceptable). Still serves traffic — operators read the body to
       decide whether to page.
     - **Draining** → `503` with body `{"state":"draining"}`. Set by the SIGTERM handler before deregistering from
       DirectoryService, so kubernetes / gateway upstream removes the instance from LB pools while in-flight requests
       complete (see DESIGN.md § Drain order).
-* Modules MAY register custom readiness checks via `ctx.runtime().register_readiness_check(name, impl ReadinessCheck)`.
+* Gears MAY register custom readiness checks via `ctx.runtime().register_readiness_check(name, impl ReadinessCheck)`.
   Checks are polled on every `/readyz` request with 1s cache; `NotReady` from any check forces `Starting` state.
-* Modules with no `deps` and no custom checks (e.g., Flight Control itself, types-registry) become ready immediately
+* Gears with no `deps` and no custom checks (e.g., Flight Control itself, types-registry) become ready immediately
   after `start()`.
-* **Use `startupProbe` for slow-bootstrapping modules.** k8s `startupProbe` runs before liveness/readiness and has its
-  own (typically longer) failure budget. A module that needs ≥30s to warm caches or fetch initial state from a remote
+* **Use `startupProbe` for slow-bootstrapping gears.** k8s `startupProbe` runs before liveness/readiness and has its
+  own (typically longer) failure budget. A gear that needs ≥30s to warm caches or fetch initial state from a remote
   source MUST declare a `startupProbe` in its Helm chart pointing at `/readyz` with `failureThreshold` sized to its
   worst-case bootstrap time. Without `startupProbe`, the liveness budget would force k8s to kill the pod mid-bootstrap.
-* The Helm chart library (`modkit-common`) configures `livenessProbe`, `readinessProbe`, and a conservative
-  `startupProbe` (failureThreshold=30, periodSeconds=5 → 150s bootstrap budget) by default; modules tune
+* The Helm chart library (`toolkit-common`) configures `livenessProbe`, `readinessProbe`, and a conservative
+  `startupProbe` (failureThreshold=30, periodSeconds=5 → 150s bootstrap budget) by default; gears tune
   `startupProbe.failureThreshold` per their `deps` count and external-resource expectations. No init containers are
   generated.
 * In Profile 1, topo-sort remains the primary mechanism. The readiness probes still exist but are trivially satisfied (
@@ -91,90 +91,90 @@ existing `deps` metadata for readiness gating.
 
 ### Confirmation
 
-* Integration test (Profile 3): start module A (depends on B) and module B simultaneously. Verify A's `/readyz` returns
+* Integration test (Profile 3): start gear A (depends on B) and gear B simultaneously. Verify A's `/readyz` returns
   503 until B is registered in DirectoryService, then 200.
 * Integration test (Profile 2): kill Flight Control while a worker is running. Verify worker continues serving existing
   requests (liveness OK) and re-registers when Flight Control restarts.
-* Code review: verify that no module source code contains retry loops for registration or dependency resolution — all
-  such logic is in `modkit::bootstrap::oop`.
+* Code review: verify that no gear source code contains retry loops for registration or dependency resolution — all
+  such logic is in `toolkit::bootstrap::oop`.
 
 ## Pros and Cons of the Options
 
 ### Option A: Init Containers + Deployment Ordering
 
 Helm charts generate init containers that poll Flight Control's `/health`. Argo CD sync-waves or Helm hooks enforce
-Flight Control → system modules → app modules ordering.
+Flight Control → system gears → app gears ordering.
 
 * Good, because familiar k8s pattern — ops engineers understand init containers.
-* Good, because guarantees Flight Control is ready before any module starts.
+* Good, because guarantees Flight Control is ready before any gear starts.
 * Bad, because fragile during rolling updates — init containers re-run, Flight Control may be mid-restart.
 * Bad, because init container images must be maintained (busybox/wget or custom).
-* Bad, because does not solve module-to-module deps (only Flight Control → module).
+* Bad, because does not solve gear-to-gear deps (only Flight Control → gear).
 * Bad, because Argo CD / Helm hook dependency — not all users use Argo CD.
 * Bad, because contradicts k8s philosophy of independent pod lifecycle.
 
 ### Option B: Central Dependency Checker in Flight Control
 
-Flight Control knows the full dependency graph. Modules connect to Flight Control on startup and block until Flight
+Flight Control knows the full dependency graph. Gears connect to Flight Control on startup and block until Flight
 Control signals "your deps are ready, proceed".
 
 * Good, because exact ordering — replicates Profile 1's topo-sort semantically.
 * Good, because centralized visibility into the full startup graph.
-* Bad, because Flight Control becomes a hard SPOF — if it's slow or restarting, all modules are blocked.
-* Bad, because requires a new protocol (modules must connect, wait for signal, then proceed).
-* Bad, because contradicts k8s declarative model — modules should not need a "start signal" from an external authority.
+* Bad, because Flight Control becomes a hard SPOF — if it's slow or restarting, all gears are blocked.
+* Bad, because requires a new protocol (gears must connect, wait for signal, then proceed).
+* Bad, because contradicts k8s declarative model — gears should not need a "start signal" from an external authority.
 * Bad, because circular dependency risk — Flight Control itself may depend on types-registry, which depends on Flight
   Control being ready to register.
-* Bad, because complicates rolling updates — restarting Flight Control blocks all modules that happen to restart
+* Bad, because complicates rolling updates — restarting Flight Control blocks all gears that happen to restart
   simultaneously.
 
 ### Option C: Eventual Readiness (chosen)
 
-Modules start immediately and unconditionally. The ModKit runtime manages self-registration (background retry) and
+Gears start immediately and unconditionally. The ToolKit runtime manages self-registration (background retry) and
 readiness probes (dep resolution check). No blocking, no central coordinator.
 
 * Good, because fully kubernetes-native — works with any k8s distribution, no special operators or ordering.
-* Good, because no SPOF — Flight Control restart does not block modules; they re-register when it's back.
+* Good, because no SPOF — Flight Control restart does not block gears; they re-register when it's back.
 * Good, because developer transparency — `deps` in the macro is all the developer writes; runtime does everything else.
 * Good, because works identically in Profile 2 and 3 — same runtime code, different transport.
 * Good, because naturally resilient to rolling updates, node failures, pod evictions.
 * Good, because readiness probe semantics map directly to k8s traffic routing — no traffic until deps ready.
-* Neutral, because there is a startup window where the module is alive but not ready — this is expected and correct k8s
+* Neutral, because there is a startup window where the gear is alive but not ready — this is expected and correct k8s
   behavior.
 * Bad, because eventual consistency means first requests may see 503 if a dep is slow to start — acceptable for
   distributed systems, but different from Profile 1's instant availability.
 
 ## More Information
 
-### ModKit Runtime Responsibilities (OoP Bootstrap)
+### ToolKit Runtime Responsibilities (OoP Bootstrap)
 
-The OoP bootstrap (`modkit::bootstrap::oop`) gains these framework-managed behaviors:
+The OoP bootstrap (`toolkit::bootstrap::oop`) gains these framework-managed behaviors:
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  ModKit OoP Runtime (framework, not module code)          │
-│                                                           │
-│  1. Start HTTP server (Axum)                              │
+│  ToolKit OoP Runtime (framework, not gear code)          │
+│                                                          │
+│  1. Start HTTP server (Axum)                             │
 │     └─ /healthz → 200 (immediate)                        │
 │     └─ /readyz  → 503 until deps resolved                │
-│     └─ /openapi.json → module's OpenAPI spec              │
-│     └─ /{module-routes} → module's OperationBuilder routes│
-│                                                           │
-│  2. Background: register_with_flight_control()            │
-│     └─ retry DirectoryService.RegisterInstance()          │
+│     └─ /openapi.json → gear's OpenAPI spec               │
+│     └─ /{gear-routes} → gear's OperationBuilder routes   │
+│                                                          │
+│  2. Background: register_with_flight_control()           │
+│     └─ retry DirectoryService.RegisterInstance()         │
 │     └─ exponential backoff: 100ms → 200ms → ... → 30s    │
-│     └─ on success: registered = true                      │
-│     └─ on Flight Control restart: re-register             │
-│                                                           │
-│  3. Background: resolve_dependencies()                    │
-│     └─ for each dep in module.deps:                       │
-│        └─ DirectoryService.ResolveRestService(dep)        │
-│        └─ on resolved: wire REST client into ClientHub    │
-│     └─ when all critical deps resolved: readyz = true     │
-│                                                           │
-│  4. Background: heartbeat (existing)                      │
-│     └─ periodic heartbeat to DirectoryService             │
-│     └─ re-register if connection lost                     │
+│     └─ on success: registered = true                     │
+│     └─ on Flight Control restart: re-register            │
+│                                                          │
+│  3. Background: resolve_dependencies()                   │
+│     └─ for each dep in gear.deps:                        │
+│        └─ DirectoryService.ResolveRestService(dep)       │
+│        └─ on resolved: wire REST client into ClientHub   │
+│     └─ when all critical deps resolved: readyz = true    │
+│                                                          │
+│  4. Background: heartbeat (existing)                     │
+│     └─ periodic heartbeat to DirectoryService            │
+│     └─ re-register if connection lost                    │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -237,10 +237,10 @@ The `deps` field semantics expand per profile:
 
 This decision directly addresses the following requirements or design elements:
 
-* `cpt-cf-fr-developer-transparency` — Module developers declare `deps` once; the runtime handles readiness in all
+* `cpt-cf-fr-developer-transparency` — Gear developers declare `deps` once; the runtime handles readiness in all
   profiles.
-* `cpt-cf-nfr-graceful-degradation` — Modules with unresolved deps return 503 via readiness probe; callers get clear
+* `cpt-cf-nfr-graceful-degradation` — Gears with unresolved deps return 503 via readiness probe; callers get clear
   ServiceUnavailable errors.
 * `cpt-cf-component-oop-bootstrap` — The OoP bootstrap component implements all retry, registration, and probe logic.
-* `cpt-cf-component-k8s-packaging` — Helm charts configure probes to `/healthz` and `/readyz` via `modkit-common`library
+* `cpt-cf-component-k8s-packaging` — Helm charts configure probes to `/healthz` and `/readyz` via `toolkit-common`library
   chart.

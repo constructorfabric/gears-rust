@@ -18,17 +18,17 @@ self-contained stack — gateway, login, auth — with no external dependencies.
 already have an API gateway (Tyk, Kong, Envoy) and an identity provider (Keycloak, Auth0, Okta) that the platform must
 integrate with rather than replace.
 
-This creates a tension: should the built-in `api-gateway` module grow to match Tyk/Kong features, or should it stay
+This creates a tension: should the built-in `api-gateway` gear grow to match Tyk/Kong features, or should it stay
 minimal? Should `authn-resolver` learn about social providers and OIDC user-login flows, or should that live elsewhere?
-And most critically: how do we ensure that internal modules see a stable `SecurityContext` regardless of which edge
+And most critically: how do we ensure that internal gears see a stable `SecurityContext` regardless of which edge
 stack is in front?
 
 ## Decision Drivers
 
 * **Self-contained on-prem**: a fresh on-premise installation must work out of the box with no external gateway or IdP.
-  The built-in modules must cover the baseline.
+  The built-in gears must cover the baseline.
 * **Enterprise integration**: customers with existing Tyk/Kong/Keycloak deployments must be able to put their stack in
-  front of the platform without forking or patching internal modules.
+  front of the platform without forking or patching internal gears.
 * **No vendor lock-in**: the internal auth model (`SecurityContext`, `authn-resolver`, `authz-resolver`) must not depend
   on Tyk-specific claims, Kong-specific headers, or any provider-specific token format.
 * **Minimal api-gateway scope**: the built-in gateway is maintained by a small team. Turning it into a full-featured API
@@ -71,10 +71,10 @@ External Client
        │ SecurityContext
        ▼
 ┌──────────────┐
-│  Modules      │  ← see only SecurityContext, never raw tokens
+│  Gears        │  ← see only SecurityContext, never raw tokens
 └──────────────┘
 
-Identity Broker / Login Service  ← separate module for login flows
+Identity Broker / Login Service  ← separate gear for login flows
   ├─ built-in social login (GitHub, Google)
   ├─ local username/password
   └─ issues platform tokens
@@ -87,8 +87,8 @@ External Client
       │
       ▼
 ┌──────────────────┐
-│  Tyk / Kong /     │  ← external gateway handles TLS, rate limiting,
-│  Envoy / Ingress  │    possibly login via its own IdP/broker
+│  Tyk / Kong /    │  ← external gateway handles TLS, rate limiting,
+│  Envoy / Ingress │    possibly login via its own IdP/broker
 └──────┬───────────┘
        │
        ├─── B1: pass-through platform token (already issued by platform)
@@ -98,25 +98,25 @@ External Client
        │
        ▼
 ┌──────────────┐
-│  api-gateway  │  ← still handles auth delegation (or bypassed entirely)
+│  api-gateway │  ← still handles auth delegation (or bypassed entirely)
 └──────┬───────┘
        │
        ▼
 ┌──────────────┐
-│authn-resolver │  ← validates platform token (same as Mode A)
+│authn-resolver│  ← validates platform token (same as Mode A)
 └──────┬───────┘     optionally: validates trusted-issuer token (configurable)
        │
        ▼
 ┌──────────────┐
-│  Modules      │  ← see only SecurityContext (identical to Mode A)
+│  Gears       │  ← see only SecurityContext (identical to Mode A)
 └──────────────┘
 ```
 
 ### The Invariant
 
-**Downstream modules always see `SecurityContext`, never provider-specific credentials.** Whether the user logged in via
+**Downstream gears always see `SecurityContext`, never provider-specific credentials.** Whether the user logged in via
 the built-in identity broker, Tyk Identity Broker, Keycloak, or Auth0 — by the time the request reaches an application
-module, it carries the same `SecurityContext` with the same `subject_id`, `tenant_id`, scopes, and bearer token format.
+gear, it carries the same `SecurityContext` with the same `subject_id`, `tenant_id`, scopes, and bearer token format.
 
 This is enforced by the **authn-resolver contract**: it validates only platform tokens and explicitly configured
 trusted-issuer tokens. It does not parse Tyk-specific claims, Kong JWT plugin headers, or provider-specific ID tokens.
@@ -125,7 +125,7 @@ trusted-issuer tokens. It does not parse Tyk-specific claims, Kong JWT plugin he
 
 * The built-in `api-gateway` must NOT grow beyond HTTP edge basics: routing, CORS, rate limiting, auth middleware
   delegation, SecurityContext propagation. This is an explicit architectural constraint.
-* A separate **Identity Broker / Login Service** subsystem must be defined (future module, P2). It handles login
+* A separate **Identity Broker / Login Service** subsystem must be defined (future gear, P2). It handles login
   orchestration, social providers, identity binding, tenant resolution, and platform token issuance. It is NOT part of
   api-gateway or authn-resolver.
 * A **token exchange endpoint** must be defined (P2) for Mode B2: external gateways/IdPs call this endpoint to convert
@@ -133,9 +133,9 @@ trusted-issuer tokens. It does not parse Tyk-specific claims, Kong JWT plugin he
 * `authn-resolver` remains a token validation service. It gains an optional "trusted issuer" configuration for Mode B1 (
   accept tokens from a configured external issuer without exchange), but does NOT learn about social providers or login
   flows.
-* The `GatewayProvider` abstraction (ADR-0005) handles route registration in both modes: `ModKitGatewayProvider` for
+* The `GatewayProvider` abstraction (ADR-0005) handles route registration in both modes: `ToolKitGatewayProvider` for
   Mode A, `KongGatewayProvider` / `TykGatewayProvider` for Mode B.
-* In Mode B, the built-in api-gateway may be bypassed entirely (external gateway routes directly to modules) or retained
+* In Mode B, the built-in api-gateway may be bypassed entirely (external gateway routes directly to gears) or retained
   as an internal routing layer. This is a deployment choice, not an architectural one.
 
 ### Confirmation
@@ -143,7 +143,7 @@ trusted-issuer tokens. It does not parse Tyk-specific claims, Kong JWT plugin he
 * Architecture review: verify that api-gateway contains no login orchestration, social provider, or token issuance code.
 * Architecture review: verify that authn-resolver does not import or reference any external gateway/IdP-specific
   libraries.
-* Integration test (Mode A): end-to-end request through built-in gateway → authn-resolver → module produces correct
+* Integration test (Mode A): end-to-end request through built-in gateway → authn-resolver → gear produces correct
   SecurityContext.
 * Design review (Mode B): token exchange endpoint contract is defined; external gateway integration documentation
   exists.
@@ -156,7 +156,7 @@ Embedded Edge for on-prem self-contained; External Edge for enterprise integrati
 
 * Good, because api-gateway stays small and maintainable — no feature creep into API management territory.
 * Good, because enterprise customers use their existing gateway/IdP stack without platform modifications.
-* Good, because internal modules are completely decoupled from the edge stack — same code in all deployments.
+* Good, because internal gears are completely decoupled from the edge stack — same code in all deployments.
 * Good, because identity broker as a separate subsystem follows the single-responsibility principle.
 * Good, because aligns with industry patterns: Kubernetes platforms (Istio, Dapr) separate ingress from application
   auth.
@@ -172,7 +172,7 @@ Add OAuth2/OIDC flows, social login, token issuance, API analytics, advanced rat
 * Bad, because enormous engineering scope — competing with Tyk/Kong/Envoy which have hundreds of person-years of
   investment.
 * Bad, because customers with existing gateways now have two full gateways — conflicts, redundancy, confusion.
-* Bad, because login orchestration mixed with HTTP routing creates a monolithic module that's hard to maintain and test.
+* Bad, because login orchestration mixed with HTTP routing creates a monolithic gear that's hard to maintain and test.
 * Bad, because every social provider addition requires a platform release — slow iteration.
 
 ### Option C: Make authn-resolver Aware of External Providers
@@ -210,7 +210,7 @@ Add Tyk/Kong/Keycloak-specific token parsing and claims mapping directly into au
   built-in gateway (Mode A) or the external gateway (Mode B).
 - **ADR-0005 (Gateway Abstraction)**: the `GatewayProvider` trait enables Mode B route registration with external
   gateways.
-- **ADR-0008 (Internal Module Auth)**: internal module auth (bootstrap token / SA tokens) is orthogonal to edge mode —
+- **ADR-0008 (Internal Gear Auth)**: internal gear auth (bootstrap token / SA tokens) is orthogonal to edge mode —
   it secures system calls regardless of which edge stack is deployed.
 
 ## Traceability

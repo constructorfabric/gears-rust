@@ -13,28 +13,28 @@ date: 2026-04-07
 
 ## Context and Problem Statement
 
-The current `api-gateway` module is an in-process Axum module that directly aggregates routes from other in-process
-modules. In Profile 2 (Host + Workers), it must also reverse-proxy to OoP modules. In Profile 3 (K8s Native), the
-built-in gateway is replaced entirely by an external gateway (Kong, Tyk, Envoy). How should modules register their
-public routes when the gateway implementation varies by deployment profile? Should modules call `api-gateway` directly,
+The current `api-gateway` gear is an in-process Axum gear that directly aggregates routes from other in-process
+gears. In Profile 2 (Host + Workers), it must also reverse-proxy to OoP gears. In Profile 3 (K8s Native), the
+built-in gateway is replaced entirely by an external gateway (Kong, Tyk, Envoy). How should gears register their
+public routes when the gateway implementation varies by deployment profile? Should gears call `api-gateway` directly,
 or should there be an abstraction?
 
 ## Decision Drivers
 
-* Profile 3 requires an external gateway: the built-in api-gateway cannot serve as the k8s ingress controller. Modules
+* Profile 3 requires an external gateway: the built-in api-gateway cannot serve as the k8s ingress controller. Gears
   must be able to register routes with Kong/Tyk.
 * Profile 1 and 2 use the built-in gateway: the existing api-gateway should continue to work without changes for
   on-premise deployments.
 * Minimal trait surface: the abstraction should be simple enough that adding a new gateway implementation requires only
   2-3 methods.
 * Vendor neutrality: the framework should not be locked to a specific external gateway. Operators should be able to swap
-  Kong for Tyk without module changes.
-* Module developer transparency: modules should not know or care which gateway is active. They call
+  Kong for Tyk without gear changes.
+* Gear developer transparency: gears should not know or care which gateway is active. They call
   `GatewayProvider::register_routes()` and the framework handles the rest.
 
 ## Considered Options
 
-* **Option A**: Abstract trait with pluggable implementations — `GatewayProvider` trait with `ModKitGatewayProvider` (
+* **Option A**: Abstract trait with pluggable implementations — `GatewayProvider` trait with `ToolKitGatewayProvider` (
   built-in) and future `KongGatewayProvider`, `TykGatewayProvider`.
 * **Option B**: CRD-only for k8s, direct api-gateway for on-premise — no abstraction; two completely separate code
   paths.
@@ -43,20 +43,20 @@ or should there be an abstraction?
 ## Decision Outcome
 
 Chosen option: "Abstract trait with pluggable implementations", because it provides a clean separation between the route
-registration intent (what modules do) and the registration mechanism (what the gateway does), while keeping the trait
+registration intent (what gears do) and the registration mechanism (what the gateway does), while keeping the trait
 surface minimal and allowing new implementations to be added without framework changes.
 
 ### Consequences
 
 * A `GatewayProvider` trait must be defined with three methods: `register_routes`, `deregister_routes`, and
   `health_check`.
-* `ModKitGatewayProvider` must be implemented as the first provider. It adds reverse-proxy routes to the built-in
-  api-gateway, using `modkit-http` to forward requests to OoP Workers.
+* `ToolKitGatewayProvider` must be implemented as the first provider. It adds reverse-proxy routes to the built-in
+  api-gateway, using `toolkit-http` to forward requests to OoP Workers.
 * The OoP bootstrap must accept a `GatewayProvider` instance (injected at startup based on config/profile) and call
   `register_routes` after the HTTP server starts.
 * In Profile 3, the operator configures a `KongGatewayProvider` (or similar) via the platform config. The framework
   provides the trait; the k8s-specific adapter is a separate crate.
-* Modules that only expose internal APIs (no public routes) skip gateway registration entirely. The `api_visibility`
+* Gears that only expose internal APIs (no public routes) skip gateway registration entirely. The `api_visibility`
   metadata on OperationBuilder routes determines this.
 * The `GatewayProvider` trait is async (network I/O is required for external gateway admin APIs), which constrains it to
   be used via `Box<dyn GatewayProvider>` or `Arc<dyn GatewayProvider>` rather than static dispatch.
@@ -65,9 +65,9 @@ surface minimal and allowing new implementations to be added without framework c
 
 * Code review: verify that `GatewayProvider` trait exists and is used in OoP bootstrap instead of direct api-gateway
   calls.
-* Integration test (Profile 2): OoP module registers routes via `ModKitGatewayProvider`; requests through api-gateway
-  reach the OoP module.
-* Architecture review: verify that no module directly imports api-gateway internals for route registration.
+* Integration test (Profile 2): OoP gear registers routes via `ToolKitGatewayProvider`; requests through api-gateway
+  reach the OoP gear.
+* Architecture review: verify that no gear directly imports api-gateway internals for route registration.
 
 ## Pros and Cons of the Options
 
@@ -75,19 +75,19 @@ surface minimal and allowing new implementations to be added without framework c
 
 `GatewayProvider` trait with `register_routes`, `deregister_routes`, `health_check`. Implementations per gateway.
 
-* Good, because clean separation of concern — modules declare intent, providers execute.
+* Good, because clean separation of concern — gears declare intent, providers execute.
 * Good, because adding a new gateway (Kong, Tyk, Envoy) requires only a new trait implementation, not framework changes.
-* Good, because module code is identical across profiles — no `#[cfg]` for gateway type.
+* Good, because gear code is identical across profiles — no `#[cfg]` for gateway type.
 * Good, because the trait surface is minimal (3 methods), keeping implementation cost low.
 * Neutral, because the trait must be async (required for network I/O to external gateways), adding some complexity.
 * Bad, because the abstraction adds a layer of indirection that may not be needed until Profile 3 is implemented.
 
 ### Option B: CRD-Only for K8s, Direct API-Gateway for On-Premise
 
-In k8s, modules create CRD resources. On-premise, modules call api-gateway directly. No shared abstraction.
+In k8s, gears create CRD resources. On-premise, gears call api-gateway directly. No shared abstraction.
 
 * Good, because no abstraction overhead — each path is optimized for its environment.
-* Bad, because modules must know their deployment profile and branch accordingly (`#[cfg]` or runtime check).
+* Bad, because gears must know their deployment profile and branch accordingly (`#[cfg]` or runtime check).
 * Bad, because two completely separate code paths means twice the maintenance and testing.
 * Bad, because adding a third gateway (e.g., Tyk) requires yet another code path.
 * Bad, because violates the deployment transparency principle.
@@ -97,7 +97,7 @@ In k8s, modules create CRD resources. On-premise, modules call api-gateway direc
 Extend the built-in api-gateway to work as a k8s ingress controller (expose it as a k8s Service, handle external TLS).
 
 * Good, because single gateway implementation across all profiles.
-* Good, because no abstraction needed — all modules talk to the same gateway.
+* Good, because no abstraction needed — all gears talk to the same gateway.
 * Bad, because building a production-grade k8s ingress controller is a massive engineering effort (TLS management, rate
   limiting, WAF, etc.).
 * Bad, because competes with mature solutions (Kong, Envoy, Traefik) that have years of production hardening.
@@ -109,20 +109,20 @@ Extend the built-in api-gateway to work as a k8s ingress controller (expose it a
 The `GatewayProvider` trait definition is specified in DESIGN.md § 3.2 (`cpt-cf-component-gateway-provider`) and § 3.3 (
 `cpt-cf-interface-gateway-trait`).
 
-The `ModKitGatewayProvider` implementation for Profile 2 works as follows:
+The `ToolKitGatewayProvider` implementation for Profile 2 works as follows:
 
-1. Receives `register_routes(module, openapi, endpoint)`.
+1. Receives `register_routes(gear, openapi, endpoint)`.
 2. Parses the OpenAPI spec to extract public route paths.
 3. Adds reverse-proxy routes to the api-gateway Axum router, where each route forwards to `endpoint + path` via
-   `modkit-http`.
-4. On `deregister_routes(module)`, removes the reverse-proxy routes.
+   `toolkit-http`.
+4. On `deregister_routes(gear)`, removes the reverse-proxy routes.
 
 Future `KongGatewayProvider` implementation for Profile 3:
 
-1. Receives `register_routes(module, openapi, endpoint)`.
-2. Creates a Kong Service pointing to the module's k8s Service URL.
+1. Receives `register_routes(gear, openapi, endpoint)`.
+2. Creates a Kong Service pointing to the gear's k8s Service URL.
 3. Creates Kong Routes for each public API path from the OpenAPI spec.
-4. On `deregister_routes(module)`, deletes the Kong Service and Routes.
+4. On `deregister_routes(gear)`, deletes the Kong Service and Routes.
 
 ## Traceability
 
