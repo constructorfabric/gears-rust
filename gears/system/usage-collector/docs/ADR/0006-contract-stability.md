@@ -31,7 +31,6 @@ The Usage Collector exposes three public surfaces — the REST API for remote ca
 ## Decision Drivers
 
 - `cpt-cf-usage-collector-nfr-plugin-contract-stability` — SDK trait, Plugin SPI, and REST API each remain stable within a major version.
-- `cpt-cf-usage-collector-nfr-developer-operator-experience` — predictable compatibility for plugin authors, in-process consumers, and remote callers.
 - PRD §1.3 ecosystem-decoupling goal (centralized metering plus operator-self-service) — release cadences of plugin authors and downstream consumers must not be coupled to the core's release train.
 - `cpt-cf-usage-collector-principle-contract-stability` — codifies major-version stability as a first-class principle.
 - `cpt-cf-usage-collector-nfr-plugin-contract-stability` (PRD §6.1) backwards-compatibility expectations — additive changes only within a major version; coexistence window across one prior major.
@@ -100,7 +99,6 @@ Related decisions: `cpt-cf-usage-collector-adr-pluggable-storage` (the Plugin SP
 This decision directly addresses the following requirements or design elements:
 
 - `cpt-cf-usage-collector-nfr-plugin-contract-stability` — major-version stability on each public surface.
-- `cpt-cf-usage-collector-nfr-developer-operator-experience` — predictable compatibility for ecosystem participants.
 - `cpt-cf-usage-collector-principle-contract-stability` — codifies the principle in §2.1.
 - `cpt-cf-usage-collector-constraint-plugin-contract-stability` — the §2.2 constraint that pairs with this ADR.
 - `cpt-cf-usage-collector-interface-rest-api`, `cpt-cf-usage-collector-interface-sdk-client`, `cpt-cf-usage-collector-interface-plugin` — the three surfaces governed by this decision.

@@ -1,185 +1,33 @@
-# Lifecycle: REFERENCE CONTRACT.
-#
-# This file is a hand-curated reference contract for the Usage Collector REST
-# surface. It is NOT the document shipped to wire consumers at runtime.
-#
-# The production OpenAPI document is emitted at runtime by `OpenApiRegistryImpl`
-# from the `OperationBuilder` calls in
-# `gears/system/usage-collector/src/api/rest/routes.rs`; that emitted document
-# is the single source of truth served to API clients and SDK generators.
-#
-# CI drift-check: a build-time job re-emits the OAS from the live
-# `OperationBuilder` calls and diffs it against this file. Any divergence in
-# paths, methods, operationIds, tags, parameters, or response schemas fails
-# the build. The intent is to keep this human-readable contract synchronised
-# with the runtime registry without making it the authoritative wire artifact.
-#
-# Anchors:
-#   - `cpt-cf-usage-collector-interface-rest-api`            — the runtime surface this file mirrors.
-#   - `cpt-cf-usage-collector-principle-canonical-errors`       — error envelope authority.
-#   - `cpt-cf-usage-collector-principle-cursor-gateway-ownership` — cursor decode/validate at gateway.
-#   - `cpt-cf-usage-collector-principle-aggregate-asymmetry`    — body-shaped aggregate vs OData raw read.
+# Reference contract for the Usage Collector REST surface. The runtime
+# OpenAPI document is emitted from `OperationBuilder` calls in
+# `gears/system/usage-collector/src/api/rest/routes.rs`; a CI drift-check
+# diffs paths, methods, operationIds, tags, parameters, and response
+# schemas against this file.
 
 openapi: 3.1.0
 info:
   title: Usage Collector API
   version: 1.1.0
   description: |
-    The Usage Collector is the platform's metering substrate. It ingests
-    attributed usage measurements from authenticated usage sources, exposes
-    raw and aggregated read surfaces to downstream consumers, and provides
-    operator-only lifecycle surfaces for Metric registration and individual
-    event deactivation.
-
-    This file is a REFERENCE CONTRACT (`cpt-cf-usage-collector-interface-rest-api`):
-    the production OpenAPI document is emitted at runtime by
-    `OpenApiRegistryImpl` from the `OperationBuilder` calls in
-    `gears/system/usage-collector/src/api/rest/routes.rs`. A CI drift-check
-    re-emits the live OAS and diffs it against this file; mismatches fail the
-    build. PRD.md, DESIGN.md, and domain-model.md describe the product surface
-    and field-level domain model; this contract restates the wire shapes and
-    wire-level enforcement (batch caps, page caps, group-by caps).
-
-    Authentication and authorization are on the synchronous critical path of
-    every operation: authentication is owned by the ToolKit gateway upstream of
-    the collector, which resolves the caller into a platform `SecurityContext`
-    and supplies it to the handler via `Extension<SecurityContext>` (the gear
-    NEVER consumes `authn-resolver`), and the platform PDP
-    (`cpt-cf-usage-collector-contract-authz-resolver`) authorizes
-    the operation against the full attribution tuple — tenant, resource,
-    optional subject, source gear, and referenced Metric. Both gates are
-    fail-closed per `cpt-cf-usage-collector-principle-fail-closed`: there is
-    no anonymous bypass, no cached PDP decision, and no synthesized identity.
-
-    Idempotency: every accepted usage record carries a caller-supplied
-    `idempotency_key`. The dedup boundary is per-(tenant_id, metric_gts_id,
-    idempotency_key) per `cpt-cf-usage-collector-fr-idempotency` and DESIGN
-    §3.7. Exact-equality retries (all caller-supplied canonical fields
-    equal) are silently absorbed as duplicates, while a same-key
-    submission whose canonical fields differ is a fail-closed
-    canonical-field-mismatch Conflict surfaced as that record's
-    per-record `rejected` outcome whose `error` is a `409` /
-    AlreadyExists `Problem` carrying
-    `context.reason="idempotency_conflict"` per
-    `cpt-cf-usage-collector-adr-mandatory-idempotency`, never a silent
-    drop and never a whole-request `409` envelope.
-
-    Versioning: breaking changes increment the major version embedded in the
-    URL path (`/usage-collector/v1/` → `/usage-collector/v2/`) per
-    `cpt-cf-usage-collector-adr-contract-stability` and
-    `cpt-cf-usage-collector-nfr-plugin-contract-stability`. Additive changes
-    within v1 (new endpoints, new optional fields) do not rev the path. At
-    most one prior major version is supported concurrently to give downstream
-    readers a migration window.
-
-    Platform liveness and readiness probes are handled by the ToolKit host
-    above the gear boundary; this gear exposes no gear-local health
-    endpoints. The former `/metrics` Prometheus scrape endpoint is REMOVED:
-    operational telemetry is pushed via OTLP from ToolKit's global
-    `SdkMeterProvider`; gear-local scrape is no longer offered (see DESIGN
-    §3.11.5/§3.11.7).
-
-    NOTE — Unified plugin-DB catalog and `gts_id` reference model per
-    `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-    (ADR-0012, which supersedes ADR-0007, ADR-0009, and ADR-0010):
-
-    - The metric catalog is unified: there is exactly one catalog,
-      persisted in the active storage plugin's database and mutated via
-      the gateway's SDK trait and REST surface. The historical
-      gateway-local-from-config catalog is removed.
-    - Usage records reference metrics by `gts_id` (string, GTS semantic
-      id). The historical `metric_type_uuid` / `uuid5`-from-type
-      derivation is removed from the wire and from the storage schema;
-      the plugin-side foreign key is
-      `usage_records.gts_id -> metric_catalog(gts_id) ON DELETE RESTRICT`.
-    - Metric specifications are flat for v1: abstract-type markers
-      (`abstract`) and ancestor-chain inheritance are NOT part of the
-      metric specification surface. Per ADR-0012's 2026-06-02
-      amendment, every metric carries a closed `metadata_fields`
-      declared-key list (`array<string>`; all values typed as
-      `String` end-to-end) and its `kind ∈ {counter, gauge}` is
-      DERIVED from the `gts_id` prefix matching one of the two
-      reserved kind base type ids (`gts.cf.core.usage.counter.v1~`,
-      `gts.cf.core.usage.gauge.v1~`); `kind` is NOT a separately
-      declared field, trait, or catalog column.
-    - REST path parameter `{type_uuid}` is replaced by `{gts_id}` on
-      `/usage-collector/v1/metric-types/{gts_id}` (GET and DELETE). The
-      ancestor-chain endpoint
-      `/usage-collector/v1/metric-types/{type_uuid}/chain`
-      (`usage_collector.read_metric_chain`) is REMOVED — chain walking
-      has no consumer in the unified catalog.
-    - Error envelopes:
-      `MetricReferenced` (409 on `usage_collector.delete_metric_type`
-      when referenced by usage rows), `MetricNotFound` (404),
-      `MetricAlreadyExists` (409). Validation failures at the metric
-      catalog and ingestion surfaces use the canonical `Problem`
-      envelope (400 / AIP-193 `InvalidArgument`) with
-      `context.reason` discriminator — notably
-      `unknown_metadata_key` (ingest-time `metadata` key not in the
-      referenced metric's `metadata_fields`) and `invalid_kind_prefix`
-      (`gts_id` whose leading `~`-separated segment matches neither
-      reserved kind base type id at registration). The
-      `Problem.context.reason` set drops
-      `metric_type_already_exists` and `declared_metric_immutable` and
-      adds `metric_already_exists`, `metric_referenced`,
-      `unknown_metadata_key`, and `invalid_kind_prefix`.
+    Attributed usage-record ingestion, raw (OData) and aggregated read
+    surfaces, individual record deactivation, and usage-type catalog
+    lifecycle. All operations require a resolved `SecurityContext`
+    supplied upstream by the platform gateway.
 
 servers:
   - url: https://api.example.com
-    description: Platform API gateway (deployment-specific). The Usage Collector gear is mounted behind the gateway; the gateway terminates TLS and enforces CORS.
+    description: Platform API gateway (deployment-specific).
 
 tags:
   - name: Ingestion
-    description: |
-      Attributed usage-record ingestion (`cpt-cf-usage-collector-fr-ingestion`,
-      `cpt-cf-usage-collector-fr-idempotency`). Served by
-      `cpt-cf-usage-collector-component-ingestion-gateway`.
+    description: Attributed usage-record ingestion.
   - name: Query
-    description: |
-      Raw and aggregated read surfaces
-      (`cpt-cf-usage-collector-fr-query-raw`,
-      `cpt-cf-usage-collector-fr-query-aggregation`). Served by
-      `cpt-cf-usage-collector-component-query-gateway`. Raw read is fully
-      OData-shaped (`$filter`, `$orderby`, `$top`, `cursor`); aggregation is
-      intentionally body-shaped (`POST .../records/aggregate`) because the
-      toolkit-odata layer does not support `$apply`
-      (`cpt-cf-usage-collector-principle-aggregate-asymmetry`). PDP-returned
-      constraints define the authorization boundary; user-supplied filters
-      intersect and can only narrow that scope.
+    description: Raw (OData) and aggregated (body-shaped) read surfaces.
   - name: Deactivation
-    description: |
-      One-way `active → inactive` lifecycle transition on individual
-      records (`cpt-cf-usage-collector-fr-event-deactivation`,
-      `cpt-cf-usage-collector-principle-monotonic-deactivation`). Served by
-      `cpt-cf-usage-collector-component-deactivation-handler`.
-  - name: Metric Catalog
-    description: |
-      Platform-global metric catalog lifecycle and read surfaces per
-      `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-      (ADR-0012). Realizes
-      `cpt-cf-usage-collector-fr-metric-registration`,
-      `cpt-cf-usage-collector-fr-metric-deletion`, and
-      `cpt-cf-usage-collector-fr-metric-existence-and-kind`. Served by
-      `cpt-cf-usage-collector-component-metric-catalog`. Catalog rows are
-      System-of-Record in the storage plugin (the unified plugin-DB
-      catalog managed via the gateway SDK trait and REST surface); the
-      gateway operates a read-through L1 catalog cache keyed by
-      `gts_id` carrying the metric's `metadata_fields` list (and the
-      derived `kind` accessor) for the ingest-time hot path.
-      Referential delete is enforced inside the plugin via an
-      `ON DELETE RESTRICT` foreign key between `usage_records.gts_id`
-      and the catalog row; an attempt to delete a referenced metric
-      returns the `MetricReferenced` envelope.
-# Default security requirement applied to every operation in this contract.
-# The Usage Collector gear itself accepts only a resolved
-# `SecurityContext` populated upstream by the ToolKit gateway via
-# `OperationBuilder::authenticated()` (the gear NEVER consumes `authn-resolver`);
-# the `bearerAuth` scheme is
-# `type=http, scheme=bearer`, which under OpenAPI 3.x cannot carry scope
-# arrays (scopes are valid only for `oauth2` / `openIdConnect` schemes).
-# Authorization mapping — which permissions are required for which operation
-# — is owned by the platform PDP policy store, not pinned in this contract
-# per `cpt-cf-usage-collector-fr-ingestion-authorization`.
+    description: One-way `active → inactive` lifecycle transition on individual records.
+  - name: UsageTypes
+    description: Platform-global usage-type catalog lifecycle and read surfaces.
+
 security:
   - bearerAuth: []
 
@@ -190,92 +38,13 @@ paths:
       tags: [Ingestion]
       summary: Ingest a batch of usage records
       description: |
-        Submit one or more usage records for persistence. Realizes
-        `cpt-cf-usage-collector-fr-ingestion` and the
-        `cpt-cf-usage-collector-seq-emit-usage` sequence (DESIGN §3.6).
-
-        Per-record processing:
-
-        - AuthN + PDP authorize the full attribution tuple (tenant, resource,
-          optional subject, source gear, Metric `gts_id`) per
-          `cpt-cf-usage-collector-fr-ingestion-authorization` before any
-          record is accepted.
-        - The Metrics Catalog validates Metric existence and Metric Kind per
-          `cpt-cf-usage-collector-fr-metric-existence-and-kind`; unknown
-          Metrics are rejected.
-        - Counter-kind records with `entry_type = usage` and `value < 0`
-          are rejected per `cpt-cf-usage-collector-fr-counter-semantics`;
-          gauge-kind records with `entry_type = usage` are stored as-is per
-          `cpt-cf-usage-collector-fr-gauge-semantics`.
-        - Unified ingestion shape: every record carries `entry_type`
-          (`usage` | `compensation`; defaults to `usage` for backward
-          compatibility) and, when `entry_type = compensation`, a
-          `corrects_id` reference to an active `entry_type = usage` row
-          sharing `(tenant_id, metric_gts_id)`. The server enforces the
-          four-cell `(MetricKind × EntryType)` value matrix at ingestion
-          per `cpt-cf-usage-collector-fr-usage-compensation` and
-          `cpt-cf-usage-collector-adr-usage-compensation`:
-          `counter+usage` requires `value >= 0`; `counter+compensation`
-          requires `value < 0`; `gauge+usage` accepts any signed value;
-          `gauge+compensation` is rejected before persistence (rejection
-          surfaces as the per-record
-          `context.reason="gauge_compensation_rejected"` outcome).
-          Compensation rides this single ingestion path — there is NO
-          dedicated `/compensate` REST endpoint, SDK method, or Plugin SPI
-          call.
-        - L1 `corrects_id` referential integrity (compensation only,
-          server-enforced at ingestion): the referenced row MUST exist
-          (`corrects_id_not_found` otherwise), MUST have
-          `entry_type = usage` (`corrects_id_wrong_entry_type` otherwise),
-          MUST share `(tenant_id, metric_gts_id)` with the incoming
-          compensation (`corrects_id_wrong_scope` otherwise), and MUST be
-          `status = active` (`corrects_id_inactive` otherwise, which also
-          realises the concurrency guard against a compensation arriving
-          mid-deactivation per
-          `cpt-cf-usage-collector-algo-event-deactivation-concurrency-guard`).
-          Each failure surfaces as the per-record `rejected` outcome whose
-          `error.context.reason` carries the snake_case wire code listed
-          above. No L2 remaining-amount tracking is performed.
-        - Same-key submissions sharing
-          `(tenant_id, metric_gts_id, idempotency_key)` resolve by
-          exact-equality of the caller-supplied canonical fields
-          (`value`, `timestamp`, `resource_ref`, `subject_ref`,
-          `source_gear`, `metadata`) per
-          `cpt-cf-usage-collector-fr-idempotency`. An exact-equality
-          retry (all canonical fields equal) is silently deduplicated
-          and the per-record acknowledgement carries
-          `outcome="duplicate"` for the absorbed retry. A same-key
-          submission whose canonical fields differ from the stored
-          record — including a metadata-only difference — is a
-          canonical-field-mismatch Conflict: it is rejected fail-closed
-          with `context.reason="idempotency_conflict"` (AlreadyExists /
-          `409`) per `cpt-cf-usage-collector-adr-mandatory-idempotency`
-          and is never silently dropped. A per-record conflict always
-          surfaces as that record's `rejected` outcome whose `error` is
-          a `409` / AlreadyExists `Problem`; the call returns
-          `207 Multi-Status` whenever at least one record is rejected
-          (whether mixed with accepted/de-duplicated records or every
-          record rejected). There is no whole-request `409` conflict
-          envelope — a same-key canonical-field mismatch is always a
-          per-record `rejected` outcome, single-record submissions
-          included.
-
-        Batch caps (wire-level enforcement of
-        `cpt-cf-usage-collector-nfr-batch-and-report-timing`): a single call
-        carries at most 100 records.
-
-        The response is a per-record acknowledgement array preserving input
-        order; a partial-failure outcome is expressed at the record level
-        (each record carries its own `outcome`) — the request returns
-        `200` only when every record was accepted or de-duplicated, and
-        `207 Multi-Status` whenever at least one record was rejected
-        (whether mixed with accepted/de-duplicated records or every record
-        rejected, including an all-`idempotency_conflict` batch). A request
-        that fails AuthN or structural validation as a whole returns a
-        single problem envelope; per-record failures (PDP denial, unknown
-        Metric, kind invariant, metadata oversize, canonical-field-mismatch
-        conflict, plugin error) are always per-record `rejected` outcomes,
-        never a whole-request envelope.
+        Submit up to 100 usage records for persistence. Every record
+        carries an `idempotency_key` and is deduplicated per
+        `(tenant_id, gts_id, idempotency_key)`. A record with
+        `corrects_id` set is a counter compensation row; otherwise it is
+        an ordinary usage row. Returns `200` if every record was accepted
+        or deduplicated, `207 Multi-Status` if at least one record was
+        rejected.
       requestBody:
         required: true
         content:
@@ -284,201 +53,47 @@ paths:
               $ref: "#/components/schemas/IngestRecordsRequest"
             examples:
               example_usage:
-                summary: Regular usage emission
-                description: |
-                  Ordinary measurement on the unified ingestion path —
-                  `entry_type` defaults to `usage`, `corrects_id` omitted,
-                  signed `value` constrained by the four-cell matrix
-                  (`counter+usage` requires `value >= 0`).
+                summary: Ordinary usage emission
                 value:
                   records:
-                    - tenant_id: tnt_01HXXXXXXXXXXXXXXXXXXXXXXX
-                      metric_gts_id: gts.cf.core.usage.metric.v1~cf.mini_chat._.tokens_consumed.v1
-                      value: 42
-                      timestamp: "2026-05-29T12:00:00Z"
+                    - uuid: "01234567-89ab-cdef-0123-456789abcdef"
+                      tenant_id: "11111111-1111-1111-1111-111111111111"
+                      gts_id: gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1
+                      value: "42"
+                      created_at: "2026-05-29T12:00:00Z"
                       idempotency_key: ik-emit-usage-0001
-                      entry_type: usage
-                      resource:
+                      resource_ref:
                         resource_id: rsc_compute_vm_001
                         resource_type: compute.vm
-                      source_gear: mod_mini_chat
               example_compensation:
-                summary: Counter compensation emission (signed-negative)
-                description: |
-                  Append-only counter value-reversal on the SAME unified
-                  ingestion path per
-                  `cpt-cf-usage-collector-adr-usage-compensation`:
-                  `entry_type = compensation`, signed-negative `value`,
-                  and `corrects_id` set to the `usage` row being corrected
-                  (which must share `(tenant_id, metric_gts_id)` and be
-                  active). No dedicated `/compensate` endpoint exists —
-                  compensation rides this same path with the same PDP
-                  attribution and the same mandatory idempotency key.
+                summary: Counter compensation (signed-negative, with corrects_id)
                 value:
                   records:
-                    - tenant_id: tnt_01HXXXXXXXXXXXXXXXXXXXXXXX
-                      metric_gts_id: gts.cf.core.usage.metric.v1~cf.mini_chat._.tokens_consumed.v1
-                      value: -10
-                      timestamp: "2026-05-29T12:05:00Z"
+                    - uuid: "fedcba98-7654-3210-fedc-ba9876543210"
+                      tenant_id: "11111111-1111-1111-1111-111111111111"
+                      gts_id: gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1
+                      value: "-10"
+                      created_at: "2026-05-29T12:05:00Z"
                       idempotency_key: ik-emit-compensation-0001
-                      entry_type: compensation
-                      corrects_id: entry_01HZZZZZZZZZZZZZZZZZZZZZZZ
-                      resource:
+                      corrects_id: "01234567-89ab-cdef-0123-456789abcdef"
+                      resource_ref:
                         resource_id: rsc_compute_vm_001
                         resource_type: compute.vm
-                      source_gear: mod_mini_chat
       responses:
         "200":
-          description: All submitted records were accepted or absorbed as duplicates.
+          description: Every record accepted or deduplicated.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/IngestRecordsResponse"
         "207":
           description: |
-            Multi-Status — at least one record was rejected. Returned
-            whether the rejected records are mixed with accepted or
-            de-duplicated records or every record was rejected (an
-            all-rejected batch, including an all-`idempotency_conflict`
-            batch and the single-record submission whose only record
-            conflicts). A same-key canonical-field mismatch surfaces here
-            as that record's `outcome="rejected"` with a per-record
-            `error: Problem` (`status=409`,
-            `context.reason="idempotency_conflict"`) — there is no
-            whole-request `409` conflict envelope. The five
-            compensation-related per-record rejection causes
-            (`gauge_compensation_rejected`, `corrects_id_not_found`,
-            `corrects_id_wrong_entry_type`, `corrects_id_wrong_scope`,
-            `corrects_id_inactive`) also surface here as that record's
-            `outcome="rejected"` with a per-record `error: Problem`
-            carrying the snake_case `context.reason` and the
-            HTTP status family documented in the dedicated 4xx response
-            schemas below (`422` for matrix and not-found, `409` for the
-            three remaining state/scope conflicts). Inspect each per-record
-            `outcome` and `error` field. (An exact-equality retry is NOT a
-            conflict — it is silently deduplicated and reported as the
-            per-record `outcome="duplicate"`.)
+            At least one record rejected. Inspect each per-record
+            `outcome` and `error` field.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/IngestRecordsResponse"
-        "404":
-          description: |
-            Per-record `corrects_id` referential failure surfaced as a
-            standalone `application/problem+json` envelope when the
-            ingestion gateway short-circuits a compensation record whose
-            `corrects_id` resolves to no record in tenant scope. The same
-            cause MAY also surface as a per-record `rejected` outcome
-            inside a `207` Multi-Status response (mixed batches); the
-            distinction is wire-format only — the cause discriminator
-            `context.reason="corrects_id_not_found"` is identical.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-              examples:
-                corrects_id_not_found:
-                  summary: Referenced corrects_id does not exist
-                  value:
-                    type: "gts://gts.cf.core.errors.err.v1~cf.core.err.precondition_failed.v1~"
-                    title: Precondition failed
-                    status: 404
-                    detail: Referenced corrects_id does not exist.
-                    context:
-                      reason: corrects_id_not_found
-                      retryable: false
-                      corrects_id: entry_01HZZZZZZZZZZZZZZZZZZZZZZZ
-        "409":
-          description: |
-            Per-record `corrects_id` state/scope conflict — the referenced
-            row exists in tenant scope but its `entry_type`, attribution
-            scope, or `status` is incompatible with the incoming
-            compensation. Three distinct `context.reason` discriminators
-            collapse under this HTTP status family per the SDK trait
-            taxonomy (`cpt-cf-usage-collector-adr-usage-compensation`):
-
-            - `corrects_id_wrong_entry_type` — referenced row is not
-              `entry_type = usage` (compensating a compensation is a
-              non-goal).
-            - `corrects_id_wrong_scope` — referenced row's
-              `(tenant_id, metric_gts_id)` does not match the incoming
-              compensation's `(tenant_id, metric_gts_id)`.
-            - `corrects_id_inactive` — referenced row's `status` is
-              `inactive` (already deactivated, including
-              mid-deactivation per the L1 "active" concurrency guard
-              `cpt-cf-usage-collector-algo-event-deactivation-concurrency-guard`).
-
-            All three are `retryable=false`. The same causes MAY also
-            surface as per-record `rejected` outcomes inside a `207`
-            Multi-Status response (mixed batches).
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-              examples:
-                corrects_id_wrong_entry_type:
-                  summary: Referenced corrects_id is not a usage entry
-                  value:
-                    type: "gts://gts.cf.core.errors.err.v1~cf.core.err.precondition_failed.v1~"
-                    title: Precondition failed
-                    status: 409
-                    detail: Referenced corrects_id is not a usage entry.
-                    context:
-                      reason: corrects_id_wrong_entry_type
-                      retryable: false
-                      corrects_id: entry_01HZZZZZZZZZZZZZZZZZZZZZZZ
-                      found_entry_type: compensation
-                corrects_id_wrong_scope:
-                  summary: Referenced corrects_id belongs to a different tenant or metric
-                  value:
-                    type: "gts://gts.cf.core.errors.err.v1~cf.core.err.precondition_failed.v1~"
-                    title: Precondition failed
-                    status: 409
-                    detail: Referenced corrects_id belongs to a different tenant or metric.
-                    context:
-                      reason: corrects_id_wrong_scope
-                      retryable: false
-                      corrects_id: entry_01HZZZZZZZZZZZZZZZZZZZZZZZ
-                corrects_id_inactive:
-                  summary: Referenced corrects_id is no longer active
-                  value:
-                    type: "gts://gts.cf.core.errors.err.v1~cf.core.err.precondition_failed.v1~"
-                    title: Precondition failed
-                    status: 409
-                    detail: Referenced corrects_id is no longer active.
-                    context:
-                      reason: corrects_id_inactive
-                      retryable: false
-                      corrects_id: entry_01HZZZZZZZZZZZZZZZZZZZZZZZ
-        "422":
-          description: |
-            Per-record value-matrix rejection surfaced as a standalone
-            `application/problem+json` envelope when the ingestion gateway
-            short-circuits on the `gauge + compensation` cell of the
-            four-cell `(MetricKind × EntryType)` matrix (compensation is
-            counter-only per
-            `cpt-cf-usage-collector-adr-usage-compensation`). The cause
-            discriminator is `context.reason="gauge_compensation_rejected"`
-            and the failure is `retryable=false` by construction (the
-            metric kind is immutable). The same cause MAY also surface as
-            a per-record `rejected` outcome inside a `207` Multi-Status
-            response (mixed batches).
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-              examples:
-                gauge_compensation_rejected:
-                  summary: Gauge metric received a compensation entry
-                  value:
-                    type: "gts://gts.cf.core.errors.err.v1~cf.core.err.kind_invariant.v1~"
-                    title: Kind invariant violation
-                    status: 422
-                    detail: Compensation entries are not permitted on gauge metrics.
-                    context:
-                      reason: gauge_compensation_rejected
-                      retryable: false
-                      metric_kind: gauge
         default:
           $ref: "#/components/responses/Problem"
 
@@ -487,82 +102,15 @@ paths:
       tags: [Query]
       summary: Query raw usage records (OData, cursor-paginated)
       description: |
-        Retrieve a cursor-paginated page of raw `UsageRecord`s using the
-        canonical OData query surface. Realizes
-        `cpt-cf-usage-collector-fr-query-raw` and the
-        `cpt-cf-usage-collector-seq-query-raw` sequence (DESIGN §3.6).
-
-        OData parameters (`cpt-cf-usage-collector-principle-cursor-gateway-ownership`):
-
-        - `metric_gts_id` (REQUIRED top-level query parameter, NOT inside
-          `$filter`) — single metric GTS id (descendant leaf of
-          `gts.cf.core.usage.metric.v1~`) being queried. Required per
-          `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-          (ADR-0012): the gateway MUST resolve the metric's declared
-          keys from the catalog `metadata_fields` list before
-          parsing / validating `$filter`. Raw query is therefore
-          single-metric; cross-metric raw query is out of scope by the
-          same rationale that makes aggregation single-metric.
-        - `$filter` — narrowing predicate over the fixed `UsageRecord`
-          read-filter set (`tenant_id`, `subject_id`, `subject_type`,
-          `resource_id`, `resource_type`, `timestamp`, `status`) PLUS the
-          per-request dynamic-dimension set resolved from
-          `metric_gts_id`: every key declared in the queried
-          metric's `metadata_fields` is an admissible `$filter` operand
-          (with `eq` / `in` comparators; all values are typed as
-          `String` per ADR-0012's closed-shape contract). The shape is
-          closed — undeclared metadata keys are rejected at ingestion
-          with `context.reason="unknown_metadata_key"` and never reach
-          the row. `metric_gts_id`
-          is NOT itself a `$filter` operand — it is supplied as the
-          top-level query parameter above. The gateway enforces tenant
-          scoping and the mandatory time-range semantic check after
-          OData parsing and before plugin dispatch.
-        - `$orderby` — MUST evaluate to a prefix of the canonical keyset
-          `(timestamp, id)`. Mismatched orderings yield a 400 problem with
-          `context.reason="order_mismatch"`.
-        - `$top` — page size; server clamps to `[1, 1000]`. Default per
-          DESIGN.md.
-        - `cursor` — opaque base64url continuation marker (internally
-          `CursorV1`). Callers MUST NOT parse or modify it. When present,
-          `$filter` and `$orderby` on the request MUST match the values
-          bound into the cursor; mismatches yield a 400 problem with
-          `context.reason="filter_mismatch"` or `"order_mismatch"`.
-          Malformed cursors yield `context.reason="cursor_decode"`.
-
-        Authorization model: PDP returns the authorized read scope as
-        `PdpConstraint` filters; the gateway composes those constraints with
-        the user-supplied `$filter` AST so user filters can only narrow the
-        authorized scope (never widen). PDP denial or empty constraints fail
-        closed with a deterministic problem envelope.
-
-        Wire-level caps per `cpt-cf-usage-collector-nfr-batch-and-report-timing`:
-
-        - The time-range bound encoded in `$filter` SHOULD be ≤ 24 hours for
-          the page-latency budget; longer ranges are accepted but may breach
-          the 1-second p95 budget.
-        - `$top` is bounded to 1,000 records per page.
-
-        An empty match inside the authorized scope returns an empty page
-        (not a problem envelope) per
-        `cpt-cf-usage-collector-seq-query-raw`.
-
-        Method note: `GET` (not `POST`) is used because the read surface is
-        fully OData-shaped, side-effect-free, and cache-friendly. The
-        asymmetric `POST .../records/aggregate` endpoint is documented at
-        `cpt-cf-usage-collector-principle-aggregate-asymmetry`.
+        Read a cursor-paginated page of raw `UsageRecord`s for a single
+        usage type. `$filter` admits the fixed read-filter set plus the
+        queried usage type's declared metadata keys. PDP-authorized scope
+        is intersected with the user-supplied filter.
       parameters:
-        - name: metric_gts_id
+        - name: gts_id
           in: query
           required: true
-          description: |
-            REQUIRED single metric GTS id (descendant leaf of
-            `gts.cf.core.usage.metric.v1~`) being queried. Required per
-            `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-            (ADR-0012): dynamic dimension resolution requires knowing
-            the metric before `$filter` is parsed/validated, so the
-            queried metric is hoisted out of `$filter` into this
-            top-level parameter.
+          description: Single UsageType GTS id being queried.
           schema:
             type: string
             minLength: 1
@@ -571,37 +119,23 @@ paths:
           in: query
           required: false
           description: |
-            OData $filter expression. Admissible operand set is the fixed
-            `UsageRecord` read-filter set (`tenant_id`, `subject_id`,
-            `subject_type`, `resource_id`, `resource_type`, `timestamp`,
-            `status`) PLUS the queried metric's declared keys
-            (the names listed on the catalog `metadata_fields`)
-            resolved per request from `metric_gts_id`. `eq` / `in`
-            comparators are permitted on declared keys (values are
-            typed as `String` per ADR-0012's closed-shape contract).
-            `metric_gts_id` itself is NOT a `$filter` operand.
-            The shape is closed — undeclared metadata keys are
-            rejected at ingestion with
-            `context.reason="unknown_metadata_key"` and never reach
-            the row. The gateway enforces tenant scoping and the
-            mandatory time-range semantic check after OData parsing and
-            before plugin dispatch.
+            OData $filter. Operands: fixed set
+            (`tenant_id`, `subject_id`, `subject_type`, `resource_id`,
+            `resource_type`, `created_at`, `status`) plus the queried
+            usage type's declared `metadata_fields` (string-valued).
           schema:
             type: string
         - name: $orderby
           in: query
           required: false
           description: |
-            OData $orderby. MUST evaluate to a prefix of the canonical
-            keyset `(timestamp, id)`. Mismatched orderings yield 400
-            with `context.reason="order_mismatch"`.
+            OData $orderby. MUST be a prefix of `(created_at, uuid)`.
           schema:
             type: string
         - name: $top
           in: query
           required: false
-          description: |
-            Page size. Server clamps to `[1, 1000]`; default per DESIGN.md.
+          description: Page size; server clamps to `[1, 1000]`.
           schema:
             type: integer
             minimum: 1
@@ -609,12 +143,7 @@ paths:
         - name: cursor
           in: query
           required: false
-          description: |
-            Opaque base64url cursor (internally `CursorV1`). When present,
-            `$filter` and `$orderby` on the request MUST match the cursor's
-            bound values; mismatches yield 400 with
-            `context.reason="filter_mismatch"` or `"order_mismatch"`.
-            Malformed cursors yield `context.reason="cursor_decode"`.
+          description: Opaque continuation marker. Callers MUST NOT parse or modify.
           schema:
             type: string
       responses:
@@ -633,58 +162,11 @@ paths:
       tags: [Query]
       summary: Query server-side aggregated usage
       description: |
-        Compute a server-side aggregation (SUM, COUNT, MIN, MAX, or AVG) of
-        usage records inside the PDP-authorized scope. Realizes
-        `cpt-cf-usage-collector-fr-query-aggregation` and the
-        `cpt-cf-usage-collector-seq-query-aggregated` sequence (DESIGN §3.6).
-
-        Aggregate asymmetry rationale
-        (`cpt-cf-usage-collector-principle-aggregate-asymmetry`): the aggregate
-        endpoint stays a body-shaped `POST` because the toolkit-odata layer
-        does not support the OData `$apply` transformation grammar used for
-        grouped/windowed aggregation in this domain; the request therefore
-        carries a structured `AggregationRequest` body (group keys,
-        aggregators, time bucket, optional filter expression). This is an
-        intentional asymmetry with the raw read at
-        `GET /usage-collector/v1/records`, which is fully OData-shaped
-        (`$filter`, `$orderby`, `$top`, `cursor`). The asymmetry is
-        documented here so consumers do not expect `$apply` and so the
-        gateway does not attempt to translate aggregation through the OData
-        parser; aggregation responses are not paginated (single result
-        envelope) and do not return a `cursor`.
-
-        Mandatory single-Metric filter (`metric_gts_id`) per the PRD: a
-        request that omits the Metric filter or supplies more than one Metric
-        value is rejected with `context.reason="kind_invariant"` /
-        `"unknown_metric"` as applicable. Restricting each aggregation to a
-        single Metric ensures the aggregated values share consistent
-        semantics and units.
-
-        Group-by dimensions are limited to at most 2 per request. Admissible
-        dimensions per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012) are the fixed set
-        `{tenant, resource, subject, source_gear, timestamp, status}`
-        plus the queried metric's declared keys (the names listed on
-        the catalog `metadata_fields`) resolved per request from
-        `metric_gts_id`. The shape is closed — undeclared metadata
-        keys are rejected at ingestion with
-        `context.reason="unknown_metadata_key"` and never reach the
-        row, so they are never group-by operands. Authorization
-        remains constrained by PDP. The supported aggregation
-        functions are `SUM`, `COUNT`, `MIN`, `MAX`, `AVG`.
-
-        Wire-level caps per `cpt-cf-usage-collector-nfr-batch-and-report-timing`:
-
-        - `time_range` width up to 90 days for the report-style budget
-          (5-second p95).
-        - Result rows bounded to 100,000; over-cap aggregations fail with
-          `context.reason="latency_budget"`.
-
-        Authorization model: identical to `usage_collector.query_raw_records`
-        — PDP constraints intersected with user-supplied filters; empty
-        result inside authorized scope returns an empty `buckets` array
-        (not a problem envelope).
+        Compute a server-side aggregation (`sum`, `count`, `min`, `max`,
+        `avg`) for a single usage type. Group-by is capped at 2
+        dimensions; result rows bounded to 100,000. Mirrors the SDK's
+        `UsageCollectorClientV1::query_aggregated_usage_records`
+        signature.
       requestBody:
         required: true
         content:
@@ -693,7 +175,7 @@ paths:
               $ref: "#/components/schemas/AggregationRequest"
       responses:
         "200":
-          description: Aggregation result for the requested Metric and grouping.
+          description: Aggregation result for the requested usage type.
           content:
             application/json:
               schema:
@@ -705,237 +187,128 @@ paths:
     parameters:
       - $ref: "#/components/parameters/RecordId"
     post:
-      operationId: usage_collector.deactivate_record
+      operationId: usage_collector.deactivate_usage_record
       tags: [Deactivation]
       summary: Deactivate an individual usage record
       description: |
-        Transition the targeted record's `status` from `active` to
-        `inactive` exactly once. Realizes
-        `cpt-cf-usage-collector-fr-event-deactivation` and the
-        `cpt-cf-usage-collector-seq-deactivate-event` sequence (DESIGN
-        §3.6).
-
-        Monotonicity: the transition is one-way; there is no reactivation
-        operation. A second deactivation request targeting an
-        already-inactive record fails with `context.reason="already_inactive"`.
-        Not-found targets fail with the canonical NotFound category.
-
-        Plugin atomicity: the plugin enforces the `active → inactive`
-        transition under a single atomic operation so two concurrent
-        deactivations cannot both observe `active` and both proceed (DESIGN
-        §3.6 description).
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/DeactivateRecordRequest"
+        Flip the targeted record's `status` from `active` to `inactive`
+        atomically. When the target is a usage row, every active
+        compensation row referencing it is flipped in the same plugin
+        transaction (depth-1 cascade). Monotonic — there is no
+        reactivation.
       responses:
-        "200":
-          description: Record transitioned from active to inactive.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DeactivateRecordResponse"
+        "204":
+          description: Record transitioned from `active` to `inactive`.
         default:
           $ref: "#/components/responses/Problem"
 
-  /usage-collector/v1/metric-types:
+  /usage-collector/v1/usage-types:
     get:
-      operationId: usage_collector.list_metric_types
-      tags: [Metric Catalog]
-      summary: List metrics from the plugin-stored catalog
-      description: |
-        List the platform-global metric catalog rows held in the storage
-        plugin per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012). Realizes
-        `cpt-cf-usage-collector-fr-metric-existence-and-kind` (read
-        side). Returns the unified plugin-DB catalog (there is exactly
-        one catalog; the historical gateway-local-from-config catalog
-        was removed by ADR-0012). PDP authorization is on the critical
-        path; readers see only metrics within their authorized scope.
-        Optional filter `kind` narrows the result by the derived
-        accumulation-semantics classifier (`counter` | `gauge`) per
-        ADR-0012's 2026-06-02 amendment; the value is derived from
-        each row's `gts_id` prefix and is not stored as a column or
-        trait.
+      operationId: listUsageTypes
+      tags: [UsageTypes]
+      summary: List usage types
+      description: Cursor-paginated list of usage-type catalog rows in the caller's authorized scope.
       parameters:
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
-        - name: kind
-          in: query
-          required: false
-          description: |
-            Filter against the derived `MetricKind` value per
-            ADR-0012's 2026-06-02 amendment: `kind` is DERIVED from
-            each catalog row's `gts_id` prefix
-            (`gts.cf.core.usage.counter.v1~` ↔ `counter`,
-            `gts.cf.core.usage.gauge.v1~` ↔ `gauge`). Permitted
-            values are `counter` and `gauge`.
-          schema:
-            $ref: "#/components/schemas/MetricKind"
       responses:
         "200":
-          description: Page of metric catalog entries.
+          description: Page of usage-type catalog entries.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/MetricTypePage"
+                $ref: "#/components/schemas/UsageTypeList"
         default:
           $ref: "#/components/responses/Problem"
     post:
-      operationId: usage_collector.register_metric_type
-      tags: [Metric Catalog]
-      summary: Register a new metric in the plugin-stored catalog
+      operationId: registerUsageType
+      tags: [UsageTypes]
+      summary: Register a new UsageType
       description: |
-        Create a new metric in the storage plugin's catalog per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012). Realizes
-        `cpt-cf-usage-collector-fr-metric-registration` and the
-        `cpt-cf-usage-collector-seq-register-metric` sequence (DESIGN
-        §3.6).
-
-        Validation:
-
-        - `gts_id` MUST end with `~` (GTS Type Schema marker). Per
-          ADR-0012's 2026-06-02 amendment the leading
-          `~`-separated base-type segment MUST match exactly one of
-          the two reserved kind base type ids
-          (`gts.cf.core.usage.counter.v1~`,
-          `gts.cf.core.usage.gauge.v1~`) — any other prefix is
-          rejected with `400`
-          (`context.reason="invalid_kind_prefix"`); malformed `gts_id`
-          values (missing trailing `~`, structurally invalid) are
-          rejected with `400`
-          (`context.reason="invalid_gts_id"`). `kind` is DERIVED from
-          this prefix and is NOT carried in the request body.
-        - `metadata_fields` MUST be an array of unique, non-empty
-          strings declaring the closed set of metadata key names
-          accepted for this metric. Values are typed as `String`
-          end-to-end. Malformed input is rejected with `400`
-          (`context.reason="validation"`).
-        - `gts_id` is deployment-unique; duplicate registration returns
-          `409` `MetricAlreadyExists`
-          (`context.reason="metric_already_exists"`).
-
-        On success the row is persisted in the plugin SoR and the
-        gateway L1 cache is refreshed synchronously so ingest-time
-        validation sees the new metric immediately.
+        Create a usage type in the catalog. `gts_id` MUST end with `~`
+        and derive from the reserved abstract base
+        `gts.cf.core.uc.usage_record.v1~`. Duplicate registration
+        returns `409`.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/MetricTypeRegisterRequest"
+              $ref: "#/components/schemas/UsageType"
       responses:
         "201":
-          description: Metric registered.
+          description: UsageType registered.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/MetricTypeRecord"
+                $ref: "#/components/schemas/UsageType"
           headers:
             Location:
               schema:
                 type: string
                 format: uri-reference
-              description: |
-                URI of the newly registered metric
-                (`/usage-collector/v1/metric-types/{gts_id}`).
+              description: URI of the newly registered usage type.
         "400":
-          description: |
-            Validation failure on register. AIP-193 `InvalidArgument`
-            envelope per
-            `cpt-cf-usage-collector-principle-canonical-errors`; the
-            `context.reason` discriminator names the specific cause:
-            `invalid_kind_prefix` (`gts_id` prefix matches neither
-            reserved kind base type id), `invalid_gts_id`
-            (malformed `gts_id`), or `validation` (malformed
-            `metadata_fields` or other structural failure).
+          description: Validation failure (e.g. `invalid_base_gts_id`, `invalid_metadata_fields`).
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "409":
-          description: |
-            `gts_id` already registered
-            (`context.reason="metric_already_exists"`).
+          description: '`gts_id` already registered.'
           content:
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/MetricAlreadyExists"
+                $ref: "#/components/schemas/Problem"
         default:
           $ref: "#/components/responses/Problem"
 
-  /usage-collector/v1/metric-types/{gts_id}:
+  /usage-collector/v1/usage-types/{gts_id}:
     parameters:
-      - $ref: "#/components/parameters/MetricTypeUuid"
+      - $ref: "#/components/parameters/UsageTypeGtsId"
     get:
-      operationId: usage_collector.read_metric_type
-      tags: [Metric Catalog]
-      summary: Read a single metric
-      description: |
-        Read the catalog entry for a single metric by its `gts_id` per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012). Returns `404` `MetricNotFound` when absent.
+      operationId: readUsageType
+      tags: [UsageTypes]
+      summary: Look up a UsageType by gts_id
+      description: Read a single catalog entry.
       responses:
         "200":
-          description: Metric catalog entry.
+          description: UsageType catalog entry.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/MetricTypeRecord"
+                $ref: "#/components/schemas/UsageType"
         "404":
-          description: Metric not found.
+          description: UsageType not found.
           content:
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/MetricNotFound"
+                $ref: "#/components/schemas/Problem"
         default:
           $ref: "#/components/responses/Problem"
     delete:
-      operationId: usage_collector.delete_metric_type
-      tags: [Metric Catalog]
-      summary: Delete a metric (referentially safe)
+      operationId: deleteUsageType
+      tags: [UsageTypes]
+      summary: Delete a UsageType (referentially safe)
       description: |
-        Remove a metric from the catalog per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012) referential-delete semantics. Realizes
-        `cpt-cf-usage-collector-fr-metric-deletion` and the
-        `cpt-cf-usage-collector-seq-delete-metric` sequence (DESIGN
-        §3.6).
-
-        Referential-delete contract: the storage plugin engine enforces
-        an `ON DELETE RESTRICT` foreign key between
-        `usage_records.gts_id` and the catalog row. If any usage row
-        (across all tenants visible to the plugin) still references the
-        targeted metric, the engine REJECTS the delete inside the same
-        transaction and the gateway surfaces the deterministic
-        `MetricReferenced` envelope
-        (`context.reason="metric_referenced"`) with the in-engine
-        reference count.
-
-        On success the gateway L1 cache invalidates the metric
-        synchronously so subsequent ingest validation sees the removal
-        immediately.
+        Delete a catalog row. The storage plugin rejects deletion if any
+        usage row still references the targeted `gts_id`
+        (`ON DELETE RESTRICT`).
       responses:
         "204":
-          description: Metric deleted.
+          description: UsageType deleted.
         "404":
-          description: Metric not found.
+          description: UsageType not found.
           content:
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/MetricNotFound"
+                $ref: "#/components/schemas/Problem"
         "409":
-          description: |
-            Metric still referenced by usage rows (referential delete
-            rejected by the plugin engine per ADR-0012).
+          description: UsageType still referenced by usage rows.
           content:
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/MetricReferenced"
+                $ref: "#/components/schemas/Problem"
         default:
           $ref: "#/components/responses/Problem"
 
@@ -946,38 +319,26 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        Platform-issued bearer JWT resolved into a `SecurityContext` by the
-        ToolKit gateway upstream of the collector via
-        `OperationBuilder::authenticated()` middleware; the resolved
-        `SecurityContext` is supplied to every handler via
-        `Extension<SecurityContext>`. The Usage Collector does not parse or
-        mint tokens, does NOT consume `authn-resolver`, and consumes only
-        the upstream-resolved `SecurityContext`. Requests without a resolved
-        `SecurityContext` fail closed per
-        `cpt-cf-usage-collector-principle-fail-closed`.
+        Platform-issued bearer JWT resolved into a `SecurityContext`
+        upstream of this gear. Requests without a resolved
+        `SecurityContext` fail closed.
 
   parameters:
     RecordId:
       name: id
       in: path
       required: true
-      description: Opaque plugin-minted `UsageRecord.id`.
+      description: Caller-supplied `UsageRecord.uuid` (RFC 4122 UUID).
       schema:
         type: string
-        minLength: 1
-        maxLength: 256
-    MetricTypeUuid:
+        format: uuid
+    UsageTypeGtsId:
       name: gts_id
       in: path
       required: true
       description: |
-        GTS semantic identifier of the metric — the same string used as
-        the catalog primary key and as the foreign key on
-        `usage_records.gts_id` per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012). MUST end with `~` and MUST be a descendant of
-        `gts.cf.core.usage.metric.v1~`. Used as the path identifier on
-        the metric catalog REST surface (URL-encoded as required).
+        GTS semantic id of the usage type. MUST end with `~` and derive
+        from `gts.cf.core.uc.usage_record.v1~`. URL-encoded as required.
       schema:
         type: string
         minLength: 1
@@ -996,346 +357,197 @@ components:
       name: cursor
       in: query
       required: false
-      description: |
-        Opaque cursor token returned by a previous page response
-        (`next_cursor`). Forward-only; callers MUST NOT parse or modify it.
+      description: Opaque cursor token. Forward-only; callers MUST NOT parse or modify.
       schema:
         type: string
 
   responses:
     Problem:
-      description: |
-        RFC 9457 `application/problem+json` envelope produced by the
-        platform canonical-errors layer (`toolkit_canonical_errors::Problem`,
-        anchored at `cpt-cf-usage-collector-principle-canonical-errors`). See
-        the `Problem` schema below for the canonical reference shape and the
-        Usage-Collector-specific `context.reason` discriminator set.
+      description: RFC 9457 `application/problem+json` envelope.
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
 
   schemas:
-    # ----- shared primitives --------------------------------------------
-
-    MetricKind:
-      type: string
-      enum: [counter, gauge]
-      description: |
-        Accumulation semantics classifier per
-        `cpt-cf-usage-collector-entity-metric-kind`. `counter` requires
-        non-negative deltas at ingestion; `gauge` stores values as-is.
-
-        NOTE: per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012, 2026-06-02 amendment) `kind` is DERIVED from the
-        catalog row's `gts_id` prefix matching one of the two reserved
-        kind base type ids (`gts.cf.core.usage.counter.v1~` ↔
-        `counter`, `gts.cf.core.usage.gauge.v1~` ↔ `gauge`); it is
-        NOT a separately declared field, trait, or catalog column.
-        This schema is retained as the wire-serialized enumeration
-        used by the value-matrix enforcement (`UsageValue`,
-        `EntryType`, the ingestion error taxonomy) and by the
-        `kind` query parameter on `usage_collector.list_metric_types`.
-
-    DeactivationStatus:
+    UsageRecordStatus:
       type: string
       enum: [active, inactive]
-      description: |
-        Monotonic record lifecycle marker per
-        `cpt-cf-usage-collector-entity-deactivation-status`. Only
-        `active → inactive` is permitted.
+      description: Monotonic record lifecycle marker. Only `active → inactive` is permitted.
 
     AggregationFunction:
       type: string
-      enum: [SUM, COUNT, MIN, MAX, AVG]
+      enum: [sum, count, min, max, avg]
       description: |
-        Supported aggregation functions per
-        `cpt-cf-usage-collector-fr-query-aggregation`.
+        Aggregation function applied to the filtered `UsageRecord.value`
+        stream. Matches the SDK's `AggregationOp` wire shape (serde
+        `rename_all = "lowercase"`). `count` counts matched rows and is
+        well-defined for any value shape; the others require a numeric
+        `value`.
 
     GroupByDimension:
-      type: string
-      minLength: 1
-      maxLength: 256
+      oneOf:
+        - type: string
+          enum: [tenant_id, resource_id, resource_type, subject_id, subject_type]
+          description: |
+            Group by a static `UsageRecord` column. `resource_id` /
+            `resource_type` flatten `resource_ref`; `subject_id` /
+            `subject_type` flatten `subject_ref` (records without a
+            subject are excluded from the grouping).
+        - type: object
+          additionalProperties: false
+          required: [metadata]
+          description: |
+            Group by the value of a single declared metadata key. The
+            key MUST be a non-empty string that is a member of the
+            queried usage type's `metadata_fields`.
+          properties:
+            metadata:
+              type: string
+              minLength: 1
+              description: Metadata key declared on the usage type.
       description: |
-        Aggregation / filter grouping dimension name per
-        `cpt-cf-usage-collector-entity-aggregation-query`. Resolved
-        dynamically per request against the queried metric's
-        `metadata_fields`:
-
-        - Fixed-field set always admissible:
-          `tenant`, `resource`, `subject`, `source_gear`, `timestamp`
-          (or `time_bucket` for server-defined bucketing — bucket width
-          is implementation-defined and reflected in each
-          `AggregationBucket.dimensions.time_bucket` value), `status`.
-        - Per-metric dynamic set: every key declared in the queried
-          metric's `metadata_fields` is also admissible.
-
-        The former static enum (`tenant`, `resource`, `subject`,
-        `source_gear`, `time_bucket`) was lifted to a plain string so
-        the contract can express both fixed-field names and
-        per-metric declared-key names without per-metric schema
-        fan-out. Undeclared metadata keys are rejected at ingestion
-        (`unknown_metadata_key`) and never reach the row, so they
-        are never admissible group-by operands.
+        Aggregation grouping dimension. Either one of the fixed static
+        columns (`tenant_id`, `resource_id`, `resource_type`,
+        `subject_id`, `subject_type`) — emitted as a JSON string — or a
+        single-field tagged object `{"metadata": "<key>"}` selecting a
+        declared metadata key. Matches the SDK's `AggregationDimension`
+        wire shape (serde `rename_all = "snake_case"` over unit and
+        single-field variants).
 
     IngestOutcome:
       type: string
       enum: [accepted, duplicate, rejected]
       description: |
-        Per-record outcome of a batched ingestion. `accepted` — record was
-        persisted. `duplicate` — record matched an existing
-        `(tenant_id, metric_gts_id, idempotency_key)` AND its
-        caller-supplied canonical fields were exactly equal to the stored
-        record (an exact-equality retry), so it was silently absorbed per
-        `cpt-cf-usage-collector-fr-idempotency`. `rejected` — record failed
-        structural validation, kind invariants, Metric existence,
-        per-record PDP authorization, OR reused an existing dedup key with
-        any differing canonical field (`value`, `timestamp`,
-        `resource_ref`, `subject_ref`, `source_gear`, `metadata`) — the
-        canonical-field-mismatch Conflict, surfaced fail-closed with
-        `context.reason="idempotency_conflict"` per
-        `cpt-cf-usage-collector-adr-mandatory-idempotency`; inspect the
-        per-record `error` field for the cause.
+        Per-record outcome. `duplicate` means an exact-equality retry
+        was silently absorbed. `rejected` means the record failed
+        validation, PDP, semantics, or a same-key canonical-field
+        mismatch (`IDEMPOTENCY_CONFLICT`); inspect the per-record
+        `error` field.
 
     Timestamp:
       type: string
       format: date-time
-      description: UTC instant (RFC 3339 / ISO 8601), e.g. `2026-05-22T11:14:03Z`.
+      description: UTC instant (RFC 3339).
 
     UsageValue:
-      type: number
-      description: |
-        Signed numeric measurement value. The permitted sign is determined
-        jointly by `MetricKind` and `EntryType` per the four-cell
-        `(MetricKind × EntryType)` validation matrix
-        (`cpt-cf-usage-collector-entity-entry-type`,
-        `cpt-cf-usage-collector-fr-counter-semantics`,
-        `cpt-cf-usage-collector-fr-gauge-semantics`,
-        `cpt-cf-usage-collector-fr-usage-compensation`):
-
-        - `counter` + `entry_type = usage` → `value >= 0` (unchanged).
-        - `counter` + `entry_type = compensation` → `value < 0` (strictly
-          negative — append-only signed-negative entry that reduces the
-          running `SUM` per `cpt-cf-usage-collector-adr-usage-compensation`).
-        - `gauge` + `entry_type = usage` → any finite signed value.
-        - `gauge` + `entry_type = compensation` → REJECTED before persistence
-          (compensation is counter-only).
-
-        The matrix is enforced server-side at ingestion; violations surface as
-        per-record `rejected` outcomes (see the ingestion operation's error
-        taxonomy: `kind_invariant` for matrix violations,
-        `gauge_compensation_rejected` for the gauge+compensation cell).
-        Not money — pricing, rating, billing, and quota decisions are
-        downstream concerns.
-
-    EntryType:
       type: string
-      enum: [usage, compensation]
-      default: usage
+      pattern: '^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$'
+      example: "42.5"
       description: |
-        Discriminator separating ordinary measurement entries from
-        counter value-reversal entries per
-        `cpt-cf-usage-collector-entity-entry-type` and
-        `cpt-cf-usage-collector-adr-usage-compensation`. `usage` is the
-        default and represents an ordinary measurement; `compensation`
-        represents an append-only signed-negative entry that reduces the
-        running `SUM` for the referenced `(tenant_id, metric_gts_id)` group
-        without retracting the original event. Counter-only —
-        `gauge + compensation` is rejected before persistence.
-        Aggregation contract per
-        `cpt-cf-usage-collector-fr-query-aggregation`: `SUM` nets across
-        both entry types treating `value` as signed; `COUNT`, `MIN`, `MAX`,
-        `AVG` operate over `entry_type = usage` rows only — compensation
-        entries adjust `SUM`; they are not events. Never mutated after
-        acceptance.
+        Signed fixed-precision numeric measurement, wire-encoded as a JSON
+        **string** (never a JSON number) so client/server number
+        representations cannot round-trip through float and silently lose
+        precision. The carrier type on every server surface is
+        `rust_decimal::Decimal` (Postgres `NUMERIC` at rest). Sign rules
+        are enforced server-side from the usage type's `kind` and the
+        presence of `corrects_id` (see `UsageRecord.corrects_id`).
 
     IdempotencyKey:
       type: string
       minLength: 1
       maxLength: 256
       description: |
-        Caller-supplied opaque dedup key per
-        `cpt-cf-usage-collector-entity-idempotency-key`. The dedup unique
-        is `(tenant_id, metric_gts_id, idempotency_key)`; the same key
-        may legitimately reappear under a different tenant or Metric.
+        Caller-supplied dedup key. Dedup unique is
+        `(tenant_id, gts_id, idempotency_key)`.
 
     RecordMetadata:
       type: object
       additionalProperties:
         type: string
       description: |
-        Caller-supplied key/value map persisted alongside the usage
-        row per `cpt-cf-usage-collector-fr-record-metadata`. Closed
-        shape per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012, 2026-06-02 amendment): every key MUST be a member
-        of the referenced metric's declared `metadata_fields` list,
-        every value is typed as `String` end-to-end, and any
-        undeclared key is rejected at the gateway before persistence
-        with a `Problem` envelope carrying
-        `context.reason="unknown_metadata_key"` (HTTP `400` /
-        AIP-193 `InvalidArgument`). There is no free-form remainder
-        and no open-extras escape hatch. Default maximum size is
-        8 KiB per record (operator-configurable); oversized metadata
-        is rejected with `context.reason="metadata_size"`. The Usage
-        Collector does NOT aggregate, classify, or interpret metadata
-        contents beyond declared-key membership validation. Source
-        gears MUST NOT place PII, payment data, regulated health
-        data, or credentials into this object per PRD §5.8 Data
-        Classification.
+        Closed key/value map. Every key MUST be a member of the
+        referenced usage type's `metadata_fields`; values are strings.
+        Default cap 8 KiB per record (operator-configurable). MUST NOT
+        contain PII, payment data, regulated health data, or
+        credentials.
 
     ResourceRef:
       type: object
       additionalProperties: false
       required: [resource_id, resource_type]
-      description: |
-        Caller-supplied resource attribution per
-        `cpt-cf-usage-collector-entity-resource-ref`. Both fields are
-        mandatory on every record; the pair can also be used as an
-        optional read-filter on queries.
+      description: Caller-supplied resource attribution; both fields are mandatory.
       properties:
         resource_id:
           type: string
           minLength: 1
           maxLength: 256
-          description: Opaque resource instance identifier inside the attributed tenant scope.
         resource_type:
           type: string
           minLength: 1
           maxLength: 256
-          description: |
-            Opaque resource type discriminator (e.g. `compute.vm`).
-            The Usage Collector does not interpret the value.
 
     SubjectRef:
       type: object
       additionalProperties: false
       required: [subject_id]
       description: |
-        Optional caller-supplied subject attribution per
-        `cpt-cf-usage-collector-entity-subject-ref`. When subject
-        attribution is supplied, `subject_id` is mandatory and
-        `subject_type` is optional. Never derived from the caller's
-        `SecurityContext`.
+        Optional subject attribution. `subject_id` is mandatory when
+        supplied; `subject_type` is optional. Never derived from the
+        caller's `SecurityContext`.
       properties:
         subject_id:
           type: string
           minLength: 1
           maxLength: 256
-          description: Opaque platform-issued subject identifier.
         subject_type:
           type: string
           minLength: 1
           maxLength: 256
-          description: |
-            Optional subject-type discriminator (e.g. `iam.user`). May be
-            omitted when the source system has no meaningful subject-type
-            taxonomy. MUST NOT be supplied without `subject_id`.
 
     UsageRecord:
       type: object
       additionalProperties: false
       required:
-        - id
+        - uuid
         - tenant_id
-        - resource
-        - source_gear
-        - metric_gts_id
+        - resource_ref
+        - gts_id
         - value
-        - timestamp
+        - created_at
         - idempotency_key
         - status
-        - entry_type
       description: |
-        One accepted measurement of resource consumption per
-        `cpt-cf-usage-collector-entity-usage-record`. Immutable after
-        acceptance except for the one-way `status` transition performed by
-        `usage_collector.deactivate_record` (which can also flip referencing
-        active compensation rows in the same atomic step — depth-1 cascade
-        per `cpt-cf-usage-collector-adr-monotonic-deactivation`). Carries an
-        `entry_type` discriminator (`usage` | `compensation`) and, on
-        compensation rows, a `corrects_id` reference to the `usage` row
-        being corrected per `cpt-cf-usage-collector-adr-usage-compensation`.
-
-        Metric reference per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012): the metric is referenced by `metric_gts_id` — the
-        same GTS semantic id that is the catalog primary key. The
-        plugin-side foreign key is
-        `usage_records.gts_id -> metric_catalog(gts_id)
-        ON DELETE RESTRICT`; the in-plugin column type and index are
-        plugin-author choice and out of wire scope. No UUID derivation
-        is performed on the wire or in the catalog. `metadata` is
-        validated at the gateway against the referenced metric's
-        `metadata_fields` list (closed shape per ADR-0012's
-        2026-06-02 amendment): every key MUST be a member of
-        `metadata_fields`; values are typed as `String` end-to-end;
-        undeclared keys are rejected at the gateway with
-        `context.reason="unknown_metadata_key"`. There is no
-        free-form remainder and no open-extras escape hatch.
+        One accepted measurement. Immutable after acceptance except for
+        the one-way `status` transition. `corrects_id` distinguishes a
+        usage row (absent) from a counter compensation row (set).
       properties:
-        id:
+        uuid:
           type: string
-          minLength: 1
-          maxLength: 256
-          description: |
-            Opaque per-record identifier minted by the active plugin on
-            acceptance. Not supplied by ingestion clients.
+          format: uuid
+          description: Caller-supplied record UUID.
         tenant_id:
           type: string
-          minLength: 1
-          maxLength: 256
-          description: Caller-supplied tenant attribution; PDP-authorized before persistence.
-        resource:
+          format: uuid
+          description: Owning tenant for this record.
+        resource_ref:
           $ref: "#/components/schemas/ResourceRef"
-        subject:
+        subject_ref:
           $ref: "#/components/schemas/SubjectRef"
-        source_gear:
-          type: string
-          minLength: 1
-          maxLength: 256
-          description: |
-            Identity of the emitting source gear, used by PDP
-            source-gear-to-Metric authorization and downstream
-            diagnostics.
-        metric_gts_id:
+        gts_id:
           type: string
           minLength: 1
           maxLength: 512
-          description: |
-            GTS semantic id of the referenced metric per
-            `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-            (ADR-0012). MUST end with `~`. This is the authoritative
-            reference and the same value the plugin-side
-            `usage_records.gts_id -> metric_catalog(gts_id)
-            ON DELETE RESTRICT` foreign key targets. Unknown / missing
-            metrics are rejected before persistence per
-            `cpt-cf-usage-collector-fr-metric-existence-and-kind`.
+          description: GTS instance id of the referenced usage type.
         value:
           $ref: "#/components/schemas/UsageValue"
-        timestamp:
+        created_at:
           $ref: "#/components/schemas/Timestamp"
         idempotency_key:
           $ref: "#/components/schemas/IdempotencyKey"
         status:
-          $ref: "#/components/schemas/DeactivationStatus"
-        entry_type:
-          $ref: "#/components/schemas/EntryType"
+          $ref: "#/components/schemas/UsageRecordStatus"
         corrects_id:
           type: string
-          minLength: 1
-          maxLength: 256
+          format: uuid
+          nullable: true
           description: |
-            Conditional reference to the `UsageRecord.id` of the `usage` row
-            being corrected, per `cpt-cf-usage-collector-entity-entry-type`
-            and `cpt-cf-usage-collector-adr-usage-compensation`. Present iff
-            `entry_type = compensation` (MUST be omitted/null on
-            `entry_type = usage` rows). On accepted compensation rows the
-            referenced row was, at the time of acceptance, an
-            `entry_type = usage` row sharing `(tenant_id, metric_gts_id)`
-            and was `status = active` (server-enforced L1 referential
-            integrity per `cpt-cf-usage-collector-fr-usage-compensation`).
+            Optional reference to a prior usage row's `uuid`. Presence
+            marks this record as a counter compensation row. The
+            referenced row MUST itself have `corrects_id` absent, share
+            the full identity tuple
+            `(tenant_id, gts_id, resource_ref, subject_ref)`,
+            and be `active`.
         metadata:
           $ref: "#/components/schemas/RecordMetadata"
 
@@ -1343,99 +555,50 @@ components:
       type: object
       additionalProperties: false
       required:
+        - uuid
         - tenant_id
-        - resource
-        - source_gear
-        - metric_gts_id
+        - resource_ref
+        - gts_id
         - value
-        - timestamp
+        - created_at
         - idempotency_key
       description: |
-        Ingestion-time projection of `UsageRecord` — same shape minus
-        `id` (server-minted) and `status` (server-defaulted to
-        `active`). Per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012) callers identify the metric by `metric_gts_id`; the
-        gateway validates `metadata` against the referenced metric's
-        `metadata_fields` list (closed shape per ADR-0012's
-        2026-06-02 amendment — undeclared keys are rejected with
-        `context.reason="unknown_metadata_key"`). No UUID derivation
-        is performed on the wire.
-
-        Unified ingestion shape (single emit path; no dedicated compensate
-        endpoint) per `cpt-cf-usage-collector-fr-usage-compensation` and
-        `cpt-cf-usage-collector-adr-usage-compensation`: the same input
-        schema carries both ordinary measurements (`entry_type = usage`)
-        and counter compensations (`entry_type = compensation`) with
-        signed `value`. The server enforces the four-cell
-        `(MetricKind × EntryType)` value matrix and the L1 `corrects_id`
-        referential integrity rule at ingestion (see the operation
-        description and the `UsageValue`, `EntryType`, and `corrects_id`
-        schema docs); the SDK and the wire schema MUST NOT pre-clamp or
-        re-validate locally.
-
-        Conditional shape constraint (logical; server-enforced):
-
-        - When `entry_type` is absent or `usage`: `corrects_id` MUST be
-          omitted; `value` follows the unsigned-counter / any-gauge rules.
-        - When `entry_type = compensation`: `corrects_id` is REQUIRED and
-          MUST reference an active `entry_type = usage` row sharing
-          `(tenant_id, metric_gts_id)`; the referenced metric kind MUST be
-          `counter` (gauge+compensation is rejected with
-          `gauge_compensation_rejected`); `value < 0` is required.
-
-        Two named request examples are exposed on the ingest operation
-        (`example_usage`, `example_compensation`) to illustrate both shapes
-        without splitting the wire schema. (`oneOf` with a
-        `discriminator: entry_type` is intentionally avoided here so the
-        request body remains a single batch shape and per-record outcomes
-        stay compatible with the per-record acknowledgement contract.)
+        Ingestion projection of `UsageRecord` — same shape minus
+        `status` (server-defaulted to `active`). The caller supplies
+        `uuid` and `created_at` on every submission. The same schema
+        carries both ordinary usage and counter compensations; the
+        server enforces the `(kind × corrects_id presence)` value
+        matrix and `corrects_id` referential integrity at ingestion.
       properties:
+        uuid:
+          type: string
+          format: uuid
         tenant_id:
           type: string
-          minLength: 1
-          maxLength: 256
-        resource:
+          format: uuid
+        resource_ref:
           $ref: "#/components/schemas/ResourceRef"
-        subject:
+        subject_ref:
           $ref: "#/components/schemas/SubjectRef"
-        source_gear:
-          type: string
-          minLength: 1
-          maxLength: 256
-        metric_gts_id:
+        gts_id:
           type: string
           minLength: 1
           maxLength: 512
         value:
           $ref: "#/components/schemas/UsageValue"
-        timestamp:
+        created_at:
           $ref: "#/components/schemas/Timestamp"
         idempotency_key:
           $ref: "#/components/schemas/IdempotencyKey"
-        entry_type:
-          $ref: "#/components/schemas/EntryType"
         corrects_id:
           type: string
-          minLength: 1
-          maxLength: 256
+          format: uuid
+          nullable: true
           description: |
-            Conditional reference to the `UsageRecord.id` of the `usage` row
-            being corrected. REQUIRED when `entry_type = compensation`; MUST
-            be omitted/null when `entry_type` is absent or `usage`. The
-            server enforces L1 referential integrity at ingestion per
-            `cpt-cf-usage-collector-fr-usage-compensation`: the referenced
-            row MUST exist, MUST have `entry_type = usage`, MUST share
-            `(tenant_id, metric_gts_id)` with the incoming compensation,
-            and MUST be `status = active`. Each failure surfaces a distinct
-            per-record `rejected` outcome — see the ingestion operation's
-            error responses (`corrects_id_not_found`,
-            `corrects_id_wrong_entry_type`, `corrects_id_wrong_scope`,
-            `corrects_id_inactive`).
+            Optional reference to a prior usage row's `uuid`. See
+            `UsageRecord.corrects_id`.
         metadata:
           $ref: "#/components/schemas/RecordMetadata"
-
-    # ----- ingestion ----------------------------------------------------
 
     IngestRecordsRequest:
       type: object
@@ -1446,11 +609,6 @@ components:
           type: array
           minItems: 1
           maxItems: 100
-          description: |
-            Batch of usage records to persist. Batch cap of 100 records per
-            call is wire-level enforcement of
-            `cpt-cf-usage-collector-nfr-batch-and-report-timing` (batched
-            ingestion p95 ≤ 500 ms over a 100-record window).
           items:
             $ref: "#/components/schemas/UsageRecordInput"
 
@@ -1458,20 +616,14 @@ components:
       type: object
       additionalProperties: false
       required: [outcome]
-      description: |
-        Per-record acknowledgement. The array preserves the input order so
-        callers can correlate by index.
+      description: Per-record acknowledgement; array preserves input order.
       properties:
         outcome:
           $ref: "#/components/schemas/IngestOutcome"
-        id:
+        uuid:
           type: string
-          minLength: 1
-          maxLength: 256
-          description: |
-            Plugin-minted record identifier; present on `accepted` and
-            `duplicate` outcomes (for `duplicate`, the identifier is that
-            of the previously-accepted record).
+          format: uuid
+          description: Record UUID; present on `accepted` and `duplicate` (echoes the caller-supplied `UsageRecord.uuid`).
         idempotency_key:
           $ref: "#/components/schemas/IdempotencyKey"
         error:
@@ -1489,231 +641,177 @@ components:
           items:
             $ref: "#/components/schemas/IngestRecordResult"
 
-    # ----- raw query ----------------------------------------------------
-
-    TimeRange:
+    TimeWindow:
       type: object
       additionalProperties: false
       required: [from, to]
-      description: |
-        Mandatory bounded UTC interval. `from` is inclusive, `to` is
-        exclusive. `to` MUST be strictly greater than `from`. Reused by the
-        aggregation surface; the raw read surface expresses time bounds via
-        OData `$filter` comparisons on the `timestamp` field.
+      description: Bounded UTC interval; `from` inclusive, `to` exclusive, `to > from`.
       properties:
         from:
           $ref: "#/components/schemas/Timestamp"
         to:
           $ref: "#/components/schemas/Timestamp"
 
-    # Canonical toolkit-odata pagination envelope (`cpt-cf-usage-collector-principle-canonical-page`).
-    # The wire shape mirrors `toolkit_odata::Page<UsageRecord>`:
-    #   { items: [UsageRecord], page_info: { next_cursor, prev_cursor, limit } }
-    # `next_cursor` / `prev_cursor` are opaque `CursorV1` envelopes minted by
-    # the toolkit gateway from the plugin-returned last-row `Keyset`. Callers
-    # MUST NOT parse, modify, or persist cursor contents.
     Page_UsageRecord:
       type: object
       additionalProperties: false
       required: [items, page_info]
-      description: |
-        Canonical toolkit-odata `Page<UsageRecord>` envelope. Records inside
-        the authorized scope intersected with the request filters; each
-        record carries its `status`; inactive records remain queryable per
-        `cpt-cf-usage-collector-fr-event-deactivation`.
+      description: Cursor-paginated page of usage records.
       properties:
         items:
           type: array
           maxItems: 1000
-          description: |
-            Records on this page, sorted by the canonical keyset
-            `(timestamp, id)` unless the request supplies a compatible
-            `$orderby`.
           items:
             $ref: "#/components/schemas/UsageRecord"
         page_info:
           $ref: "#/components/schemas/PageInfo"
 
-    # ----- aggregation --------------------------------------------------
-
-    AggregationRequest:
+    MetadataFilter:
       type: object
       additionalProperties: false
-      required: [time_range, metric_gts_id, aggregation]
+      required: [key, values]
       description: |
-        Aggregation request per
-        `cpt-cf-usage-collector-entity-aggregation-query`. `metric_gts_id`
-        is mandatory and single-valued; user-supplied filters narrow PDP
-        constraints; `group_by` is capped at 2 dimensions per request.
+        Equality-set filter applied to a single `UsageRecord.metadata`
+        key. Across a `metadata_filter` array: AND across distinct
+        filters (different keys), OR within a single filter's `values`.
+        An empty array imposes no metadata filter. Matches the SDK's
+        `MetadataFilter` 1:1.
       properties:
-        time_range:
-          $ref: "#/components/schemas/TimeRange"
-        metric_gts_id:
+        key:
           type: string
           minLength: 1
-          maxLength: 512
           description: |
-            Mandatory single Metric identifier. Requests omitting the
-            Metric filter or supplying multiple Metrics are rejected per
-            `cpt-cf-usage-collector-fr-query-aggregation`.
-        aggregation:
+            Validated metadata key (non-empty, no NUL bytes). MUST be a
+            member of the queried usage type's `metadata_fields`.
+        values:
+          type: array
+          minItems: 1
+          description: Candidate value set; at least one entry.
+          items:
+            type: string
+
+    AggregationSpec:
+      type: object
+      additionalProperties: false
+      required: [op]
+      description: |
+        Aggregation specification: the function to compute (`op`) and
+        the optional grouping (`group_by`). Matches the SDK's
+        `AggregationSpec` wire shape; `group_by` is omitted on the wire
+        when empty.
+      properties:
+        op:
           $ref: "#/components/schemas/AggregationFunction"
-        tenant_id:
-          type: string
-          minLength: 1
-          maxLength: 256
-        resource:
-          $ref: "#/components/schemas/ResourceRef"
-        subject:
-          $ref: "#/components/schemas/SubjectRef"
-        source_gear:
-          type: string
-          minLength: 1
-          maxLength: 256
-        status:
-          $ref: "#/components/schemas/DeactivationStatus"
         group_by:
           type: array
           maxItems: 2
           uniqueItems: true
           description: |
-            Up to two grouping dimensions per
-            `cpt-cf-usage-collector-nfr-batch-and-report-timing`. Result
-            row count is bounded to 100,000 across all dimension
-            combinations.
-
-            Admissible item values per
-            `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-            (ADR-0012) are the fixed-field set
-            `{tenant, resource, subject, source_gear, timestamp, status}`
-            PLUS the queried metric's declared keys (the names
-            listed on the catalog `metadata_fields`) resolved per
-            request from `metric_gts_id`. The shape is closed per
-            ADR-0012's 2026-06-02 amendment — undeclared metadata
-            keys are rejected at ingestion
-            (`context.reason="unknown_metadata_key"`) and never reach
-            the row, so they are never group-by operands. The former
-            static `GroupByDimension` enum was replaced by these
-            dynamic per-request semantics: items are typed via the
-            `GroupByDimension` named string schema so the wire schema
-            can carry both fixed-field names and per-metric
-            declared-key names without per-metric schema fan-out.
+            Ordered grouping dimensions. Omitted or empty for the
+            no-grouping case, which yields a single bucket with no
+            `key`. Capped at 2 dimensions.
           items:
             $ref: "#/components/schemas/GroupByDimension"
+
+    AggregationRequest:
+      type: object
+      additionalProperties: false
+      required: [gts_id, time_range, aggregation]
+      description: |
+        Aggregation request body. Mirrors the SDK's
+        `query_aggregated_usage_records` parameters: `gts_id`
+        + `time_range` (`TimeWindow`) + OData `filter` (parsed into
+        `ODataQuery`) + typed `metadata_filter` (sidechannel for
+        JSON-keyed values that OData cannot express) + `aggregation`
+        (`AggregationSpec`). PDP-authorized scope is intersected with
+        the supplied filter.
+      properties:
+        gts_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: GTS semantic id of the usage type to query. MUST end with `~`.
+        time_range:
+          $ref: "#/components/schemas/TimeWindow"
+        filter:
+          type: string
+          description: |
+            OData `$filter` expression over the SDK's
+            `UsageRecordQuery` field set (`tenant_id`, `resource_id`,
+            `resource_type`, `subject_id`, `subject_type`,
+            `corrects_id`, `status`). Time bounds are carried by the
+            separate `time_range` field, and `metadata_*` keys are
+            filtered through `metadata_filter` — neither flows
+            through OData.
+        metadata_filter:
+          type: array
+          description: |
+            Typed metadata filters. Each entry targets one declared
+            metadata key; entries AND together, values within a single
+            entry OR together.
+          items:
+            $ref: "#/components/schemas/MetadataFilter"
+        aggregation:
+          $ref: "#/components/schemas/AggregationSpec"
 
     AggregationBucket:
       type: object
       additionalProperties: false
-      required: [dimensions, value]
+      required: [value]
+      description: |
+        Single aggregated bucket. `key` carries the dimension values in
+        `AggregationSpec.group_by` order; omitted when `group_by` was
+        empty (the no-grouping case yields one bucket with no `key`).
+        Matches the SDK's `AggregationBucket` wire shape.
       properties:
-        dimensions:
-          type: object
-          additionalProperties:
-            type: string
+        key:
+          type: array
           description: |
-            Map of grouping-dimension name to bucket value. Keys are the
-            `GroupByDimension` values requested in the matching
-            `AggregationRequest.group_by`. Values are stringified for
-            wire transport (e.g. `time_bucket="2026-05-22T00:00:00Z"`).
+            Dimension key values in `group_by` order. Each entry is the
+            string form of the corresponding dimension's value
+            (`Uuid::to_string()` for `tenant_id`; the record's
+            identifier/type string verbatim for `resource_id`,
+            `resource_type`, `subject_id`, `subject_type`; the
+            metadata value at the declared key for
+            `{"metadata":"<key>"}`).
+          items:
+            type: string
         value:
-          type: number
-          description: Aggregated numeric value for the bucket.
+          oneOf:
+            - $ref: "#/components/schemas/UsageValue"
+            - type: "null"
+          description: |
+            Aggregated value for the bucket. `null` when no rows
+            matched (e.g. `min` over an empty set). Wire-encoded as a
+            JSON string (see `UsageValue`); `avg` may carry a
+            plugin-chosen rounding scale on non-terminating quotients.
 
     AggregationResult:
       type: object
       additionalProperties: false
-      required: [metric_gts_id, aggregation, buckets]
+      required: [buckets]
+      description: |
+        Aggregated-query result. A single bucket with no `key` (or an
+        empty `key`) represents the no-grouping case. Matches the SDK's
+        `AggregationResult` wire shape (`gts_id` and
+        `aggregation` are caller-supplied request inputs and not
+        echoed in the result).
       properties:
-        metric_gts_id:
-          type: string
-          minLength: 1
-          maxLength: 512
-        aggregation:
-          $ref: "#/components/schemas/AggregationFunction"
         buckets:
           type: array
           maxItems: 100000
-          description: |
-            Grouped buckets. Capped at 100,000 rows per
-            `cpt-cf-usage-collector-nfr-batch-and-report-timing`; an
-            ungrouped aggregation returns a single bucket with an empty
-            `dimensions` object.
+          description: Result buckets in plugin-emitted order.
           items:
             $ref: "#/components/schemas/AggregationBucket"
 
-    # ----- deactivation -------------------------------------------------
-
-    DeactivateRecordRequest:
-      type: object
-      additionalProperties: false
-
-    DeactivateRecordResponse:
-      type: object
-      additionalProperties: false
-      required: [id, status, cascaded_compensation_ids]
-      description: |
-        Outcome of a successful deactivation transition per
-        `cpt-cf-usage-collector-fr-event-deactivation` and
-        `cpt-cf-usage-collector-adr-monotonic-deactivation`. Carries the
-        explicitly-deactivated record id plus the depth-1 cascade list of
-        compensation rows that were flipped to `inactive` in the same
-        atomic plugin transition.
-      properties:
-        id:
-          type: string
-          minLength: 1
-          maxLength: 256
-          description: |
-            The explicitly-deactivated `UsageRecord.id` (any `entry_type`).
-        status:
-          $ref: "#/components/schemas/DeactivationStatus"
-          description: Always `inactive` on success.
-        cascaded_compensation_ids:
-          type: array
-          default: []
-          description: |
-            Depth-1 cascade outcome per
-            `cpt-cf-usage-collector-adr-usage-compensation` and
-            `cpt-cf-usage-collector-flow-event-deactivation-cascade`: the
-            set of `entry_type = compensation` row ids that were `active`
-            at deactivation time AND referenced `id` via `corrects_id`
-            AND shared `(tenant_id, metric_gts_id)` with the primary row,
-            and that were flipped from `active` to `inactive` as part of
-            the SAME atomic plugin transition as the primary row. The list
-            is empty by construction when the targeted row has
-            `entry_type = compensation` (no row may reference a
-            compensation — depth-1 by structural rule) or when no
-            referencing active compensations existed. Order is
-            unspecified; callers MUST NOT depend on ordering. MUST be
-            present (possibly empty) on every successful response.
-          items:
-            type: string
-            minLength: 1
-            maxLength: 256
-
-    # ----- metric catalog (ADR-0012) ------------------------------------
-
-    MetricTypeRecord:
+    UsageType:
       type: object
       additionalProperties: false
       required:
         - gts_id
+        - kind
         - metadata_fields
-        - created_at
-      description: |
-        Catalog row for a metric per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012, 2026-06-02 amendment). Returned by
-        `usage_collector.read_metric_type`,
-        `usage_collector.list_metric_types`, and
-        `usage_collector.register_metric_type` (201). Catalog rows
-        live in the storage plugin's backend database alongside
-        `usage_records`; the gateway keeps a synchronous read-through
-        L1 catalog cache keyed by `gts_id` carrying the row's
-        `metadata_fields` list (and the derived `kind` accessor) for
-        the ingest-time hot path. `kind ∈ {counter, gauge}` is DERIVED
-        from the `gts_id` prefix and is NOT carried as a separate
-        column, trait, or wire field.
+      description: Canonical UsageType catalog row.
       properties:
         gts_id:
           type: string
@@ -1721,93 +819,35 @@ components:
           maxLength: 512
           pattern: "~$"
           description: |
-            GTS semantic id; MUST end with `~`. The leading
-            `~`-separated base-type segment MUST match exactly one of
-            the two reserved kind base type ids
-            (`gts.cf.core.usage.counter.v1~`,
-            `gts.cf.core.usage.gauge.v1~`); `kind` is DERIVED from
-            this prefix. Deployment-unique. Used verbatim as the
-            catalog primary key and as the foreign-key value on
-            `usage_records.gts_id`.
+            GTS semantic id; MUST end with `~` and derive from
+            `gts.cf.core.uc.usage_record.v1~`. Deployment-unique.
+        kind:
+          type: string
+          enum: [counter, gauge]
+          description: |
+            Classification axis. `counter` accepts compensations;
+            `gauge` rejects them.
         metadata_fields:
           type: array
           items:
             type: string
           uniqueItems: true
           description: |
-            Flat list of metadata key names accepted for this metric
-            (closed shape per ADR-0012's 2026-06-02 amendment). Kind
-            is derived from the metric ID prefix and is not carried
-            as a separate field. Undeclared keys are rejected at
-            ingestion with `unknown_metadata_key`; values are typed
-            as `String` end-to-end. Every name in this list is
-            admissible as a `$filter` operand on raw query and as a
-            `group_by` operand on aggregation. Metric types are flat
-            for v1: there is no ancestor chain to inline; the row
-            carries the full declared-key list for this metric.
-        created_at:
-          type: string
-          format: date-time
-          description: |
-            UTC instant the row was first persisted in the plugin's
-            backend database (RFC 3339 / ISO 8601). Immutable.
+            Closed list of metadata key names accepted for this usage
+            type. Values are stringly-typed end-to-end. Every name here
+            is admissible as a `$filter` operand on raw query and as a
+            `group_by` operand on aggregation.
 
-    MetricTypeRegisterRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - gts_id
-        - metadata_fields
-      description: |
-        Request body for `usage_collector.register_metric_type`.
-        Realizes the register-side SDK / SPI surface per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012, 2026-06-02 amendment). The payload carries
-        `gts_id` and `metadata_fields` only — `kind` is DERIVED from
-        the `gts_id` prefix and is NOT a separately declared field,
-        trait, or catalog column.
-      properties:
-        gts_id:
-          type: string
-          minLength: 1
-          maxLength: 512
-          pattern: "~$"
-          description: |
-            GTS semantic id (MUST end with `~`). The leading
-            `~`-separated base-type segment MUST match exactly one
-            of the two reserved kind base type ids
-            (`gts.cf.core.usage.counter.v1~`,
-            `gts.cf.core.usage.gauge.v1~`); any other prefix is
-            rejected with `400`
-            (`context.reason="invalid_kind_prefix"`).
-            Deployment-unique; duplicate registration returns
-            `409` `MetricAlreadyExists`.
-        metadata_fields:
-          type: array
-          items:
-            type: string
-          uniqueItems: true
-          description: |
-            Flat list of metadata key names accepted for this metric
-            (closed shape per ADR-0012's 2026-06-02 amendment). Kind
-            is derived from the metric ID prefix and is not carried
-            as a separate field. Undeclared keys are rejected at
-            ingestion with `unknown_metadata_key`; values are typed
-            as `String` end-to-end.
-
-    MetricTypePage:
+    UsageTypeList:
       type: object
       additionalProperties: false
       required: [items, page_info]
-      description: |
-        Canonical toolkit-odata `Page<MetricTypeRecord>` envelope.
-        Returned by `usage_collector.list_metric_types`; items ordered by `created_at`
-        descending unless otherwise documented at the operation level.
+      description: Cursor-paginated list of usage-type catalog rows.
       properties:
         items:
           type: array
           items:
-            $ref: "#/components/schemas/MetricTypeRecord"
+            $ref: "#/components/schemas/UsageType"
         page_info:
           $ref: "#/components/schemas/PageInfo"
 
@@ -1815,25 +855,14 @@ components:
       type: object
       additionalProperties: false
       required: [limit]
-      description: |
-        Canonical toolkit-odata cursor-based pagination envelope. Mirrors
-        `toolkit_odata::PageInfo`. `next_cursor` / `prev_cursor` are
-        forward/backward opaque continuation markers minted by the toolkit
-        gateway from the plugin-returned last-row `Keyset` and bound to the
-        originating `$filter` / `$orderby`.
+      description: Cursor-based pagination envelope.
       properties:
         next_cursor:
           type: string
-          description: |
-            Opaque base64url `CursorV1` for the next page. Omitted on the
-            last page. Callers MUST NOT parse or modify; bound to the
-            originating filter and ordering and validated by the gateway via
-            `toolkit_odata::validate_cursor_against` before plugin dispatch.
+          description: Opaque cursor for the next page. Omitted on the last page.
         prev_cursor:
           type: string
-          description: |
-            Opaque base64url `CursorV1` for the previous page. Omitted on
-            the first page. Same bind/validate semantics as `next_cursor`.
+          description: Opaque cursor for the previous page. Omitted on the first page.
         limit:
           type: integer
           format: int64
@@ -1841,317 +870,38 @@ components:
           maximum: 1000
           description: Effective page size applied to this page.
 
-    # ----- error envelope (canonical toolkit_canonical_errors::Problem) ----
-
-    # The bespoke Problem schema previously defined in this file has been
-    # REMOVED in favor of the canonical platform shape published by the
-    # `toolkit-canonical-errors` crate (`toolkit_canonical_errors::Problem`,
-    # anchored at `cpt-cf-usage-collector-principle-canonical-errors`). The
-    # block below is a documentary mirror of that canonical shape so this
-    # reference contract remains self-contained for human readers and the
-    # CI drift-check; runtime serialization is driven by the canonical
-    # types, not by this block.
     Problem:
       type: object
       additionalProperties: true
       required: [type, title, status, detail]
       description: |
-        Documentary mirror of `toolkit_canonical_errors::Problem` — the
-        platform's RFC 9457 `application/problem+json` envelope. The cause
-        discriminator is layered:
-
-        - `type` carries the canonical-error category as a `gts://` URI
-          (stable broad-category discriminator across platform gears).
-        - `status` carries the HTTP status code.
-        - `context.reason` carries the finer Usage-Collector-specific
-          cause category drawn from the
-          `cpt-cf-usage-collector-nfr-error-experience` taxonomy and the
-          OData/cursor surface added by this revision:
-          `unknown_metric`, `invalid_metric_filter`, `invalid_gts_id`,
-          `invalid_kind_prefix`, `unknown_metadata_key`,
-          `authn`, `authz`, `kind_invariant`, `metadata_size`,
-          `plugin_readiness`, `latency_budget`, `idempotency`,
-          `idempotency_conflict`, `metric_already_exists`,
-          `metric_referenced`, `already_inactive`,
-          `cursor_decode`, `order_mismatch`, `filter_mismatch`,
-          `gauge_compensation_rejected`, `corrects_id_not_found`,
-          `corrects_id_wrong_entry_type`, `corrects_id_wrong_scope`,
-          `corrects_id_inactive`. Both `invalid_kind_prefix` (a
-          metric-catalog register-time rejection when the `gts_id`
-          prefix matches neither reserved kind base type id) and
-          `unknown_metadata_key` (an ingest-time rejection when a
-          per-record `metadata` key is not in the referenced
-          metric's `metadata_fields`) lift to AIP-193
-          `InvalidArgument` / HTTP `400` per ADR-0012's 2026-06-02
-          amendment; both are `retryable=false`. The five
-          compensation-related reasons
-          are sourced verbatim from the SDK trait taxonomy per
-          `cpt-cf-usage-collector-adr-usage-compensation`:
-          `gauge_compensation_rejected` (HTTP `422`) marks the
-          `gauge + compensation` cell of the four-cell value matrix;
-          `corrects_id_not_found` (HTTP `404`) marks L1 rule 1 violation;
-          `corrects_id_wrong_entry_type` (HTTP `409`) marks L1 rule 2
-          violation; `corrects_id_wrong_scope` (HTTP `409`) marks L1 rule
-          3 violation; `corrects_id_inactive` (HTTP `409`) marks L1 rule
-          4 violation (also realises the concurrency guard against a
-          compensation arriving mid-deactivation per
-          `cpt-cf-usage-collector-algo-event-deactivation-concurrency-guard`).
-          All five are `retryable=false` — resubmitting the same
-          divergent reference re-conflicts; the source gear must
-          reconcile the `corrects_id` or the metric kind before retrying.
-          The two idempotency reasons are distinct and MUST NOT be
-          conflated: `idempotency` is the keyless-record rejection (a
-          record submitted without the mandatory idempotency key) and
-          lifts to `InvalidArgument` / `400`, while
-          `idempotency_conflict` is the canonical-field-mismatch
-          rejection — a same-key submission whose caller-supplied
-          canonical fields (`value`, `timestamp`, `resource_ref`,
-          `subject_ref`, `source_gear`, `metadata`) differ from the
-          stored record — and lifts to `AlreadyExists` / `409`
-          (DESIGN §3.3) with `context.retryable=false`, because
-          resubmitting the same divergent content under the same key
-          re-conflicts. An exact-equality retry is NOT an error and
-          produces no `context.reason`; it is a deduplicated success.
-        - `context.retryable` (boolean) tells callers whether a retry is
-          safe under `cpt-cf-usage-collector-fr-idempotency`; retryable
-          errors are safe to resubmit with the same `idempotency_key`,
-          non-retryable errors MUST NOT advise retry. `idempotency_conflict`
-          is `retryable=false` — resubmitting the same divergent content
-          under the same key re-conflicts, so the caller must reconcile the
-          divergent fields or mint a new key rather than retry.
-
-        `Problem.context` is a GTS-typed payload whose concrete schema is
-        selected by the canonical discriminator; runtime code uses the
-        canonical types directly (see DESIGN §3.3 Error Envelopes).
-
-        The Usage-Collector-specific `context.reason` discriminator names
-        listed above are produced by the host crate's
-        `From<UsageCollectorError> for toolkit_canonical_errors::CanonicalError`
-        lift in `usage-collector/src/infra/sdk_error_mapping.rs`; they are
-        NOT variants of `toolkit_canonical_errors::Problem`. The SDK crate
-        `usage-collector-sdk` (which owns `UsageCollectorError`) does NOT
-        depend on `toolkit-canonical-errors`; the canonical envelope shape
-        and the platform discriminator vocabulary come from the platform
-        crate, while the gear-specific reason names come from the
-        gear's flat SDK error enum.
+        RFC 9457 problem+json envelope. `type` is a canonical-error
+        category URI; `status` is the HTTP status; `context.reason`
+        carries a gear-specific cause discriminator and
+        `context.retryable` is a retry-safety hint.
       properties:
         type:
           type: string
           format: uri-reference
-          description: |
-            Canonical-error category URI (e.g.
-            `gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~`).
+          description: Canonical-error category URI.
         title:
           type: string
-          description: Short human-readable summary of the category.
         status:
           type: integer
           minimum: 100
           maximum: 599
-          description: HTTP status code.
         detail:
           type: string
-          description: |
-            Human-readable detail of this specific occurrence. MUST NOT
-            include provider-internal diagnostic strings, plugin
-            internals, or sensitive identifiers — operator forensics
-            live in gear logs correlated by `trace_id`.
         instance:
           type: string
           format: uri-reference
-          description: URI reference identifying the specific occurrence.
         trace_id:
           type: string
-          description: |
-            W3C Trace Context `trace-id` for cross-signal correlation per
-            DESIGN §3.11.5. Always present on production responses.
+          description: W3C Trace Context `trace-id` for correlation.
         context:
           type: object
           additionalProperties: true
           description: |
-            Per-category structured context. Usage-Collector-relevant
-            fields:
-
-            - `reason` — the Usage Collector cause category enumerated
-              above (includes `cursor_decode`, `order_mismatch`, and
-              `filter_mismatch` for the OData raw read surface, and
-              `idempotency_conflict` for a same-key submission whose
-              canonical fields differ from the stored record).
-            - `retryable` (boolean) — retry-safety hint per
-              `cpt-cf-usage-collector-nfr-error-experience`.
-            - `retry_after_seconds` — present on retryable
-              `plugin_readiness` and `latency_budget` responses.
-            - `field_violations` — present on `kind_invariant`,
-              `metadata_size`, and structural validation failures.
-            - `resource_type`, `resource_name` — present on
-              `unknown_metric` envelope
-              (e.g. `resource_type="metric"`,
-              `resource_name="<gts_id>"`).
-
-    # ----- metric catalog error envelopes (ADR-0012) --------------------
-
-    # These envelopes specialize the canonical `Problem` shape for the
-    # metric catalog surface. They are NOT separate runtime types;
-    # the wire shape is `application/problem+json` as documented on
-    # `Problem` above, with the `type` URI and the `error` discriminator
-    # below fixing the meaning. They appear inline on the catalog
-    # operations' 4xx / 409 responses.
-
-    MetricReferenced:
-      type: object
-      additionalProperties: true
-      required: [type, title, status, detail, error, context]
-      description: |
-        Returned by `usage_collector.delete_metric_type` (409) when the
-        plugin engine rejects deletion because the targeted metric is
-        still referenced by usage rows. Per
-        `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-        (ADR-0012) the rejection is enforced inside the same transaction
-        as the delete attempt by the in-database `ON DELETE RESTRICT`
-        foreign key between `usage_records.gts_id` and the catalog row.
-        The `context.sample_ref_count` is the count the engine observed
-        at rejection time; the actual count is monotonic up to subsequent
-        deactivations / compensations but is NOT a transactional
-        snapshot for the caller's own queries. Per RFC 9457 the
-        envelope-specific fields live under the canonical
-        `Problem.context` object — they are NOT top-level Problem
-        members.
-      properties:
-        type:
-          type: string
-          format: uri-reference
-          description: |
-            Canonical-error category URI, fixed to a "conflict / failed
-            precondition" category per the platform canonical-errors
-            taxonomy.
-        title:
-          type: string
-        status:
-          type: integer
-          enum: [409]
-        detail:
-          type: string
-        error:
-          type: string
-          enum: [MetricReferenced]
-          description: |
-            Fixed discriminator literal identifying this envelope.
-        context:
-          type: object
-          additionalProperties: true
-          required: [gts_id, sample_ref_count]
-          properties:
-            gts_id:
-              type: string
-              minLength: 1
-              maxLength: 512
-              description: |
-                GTS semantic id of the metric whose deletion was
-                rejected.
-            sample_ref_count:
-              type: integer
-              minimum: 1
-              description: |
-                Count of usage rows the plugin engine observed
-                referencing `gts_id` at the moment the delete was
-                rejected.
-
-    MetricNotFound:
-      type: object
-      additionalProperties: true
-      required: [type, title, status, detail, error, context]
-      description: |
-        Returned by `usage_collector.read_metric_type` and
-        `usage_collector.delete_metric_type` (404) when the targeted
-        metric is not present in the catalog. Per RFC 9457 the
-        envelope-specific fields live under the canonical
-        `Problem.context` object — they are NOT top-level Problem
-        members.
-      properties:
-        type:
-          type: string
-          format: uri-reference
-        title:
-          type: string
-        status:
-          type: integer
-          enum: [404]
-        detail:
-          type: string
-        error:
-          type: string
-          enum: [MetricNotFound]
-        context:
-          type: object
-          additionalProperties: true
-          required: [gts_id]
-          properties:
-            gts_id:
-              type: string
-              minLength: 1
-              maxLength: 512
-              description: |
-                GTS semantic id of the missing metric.
-
-    MetricAlreadyExists:
-      type: object
-      additionalProperties: true
-      required: [type, title, status, detail, error, context]
-      description: |
-        Returned by `usage_collector.register_metric_type` (409) when
-        the supplied `gts_id` is already present in the catalog
-        (`context.reason="metric_already_exists"`). Per RFC 9457 the
-        envelope-specific fields live under the canonical
-        `Problem.context` object — they are NOT top-level Problem
-        members.
-      properties:
-        type:
-          type: string
-          format: uri-reference
-        title:
-          type: string
-        status:
-          type: integer
-          enum: [409]
-        detail:
-          type: string
-        error:
-          type: string
-          enum: [MetricAlreadyExists]
-        context:
-          type: object
-          additionalProperties: true
-          required: [gts_id]
-          properties:
-            gts_id:
-              type: string
-              minLength: 1
-              maxLength: 512
-              description: |
-                The conflicting `gts_id` already present in the
-                catalog.
-
-    # Metadata-related validation envelope (ADR-0012 2026-06-02
-    # amendment): the legacy schema-validation error type is REMOVED.
-    # Validation errors at the metric catalog and ingestion surfaces
-    # use the canonical `Problem` envelope (HTTP `400` / AIP-193
-    # `InvalidArgument`) with the `context.reason` discriminator
-    # naming the specific cause:
-    #
-    # - `invalid_kind_prefix` — registration-time rejection when the
-    #   supplied `gts_id`'s leading `~`-separated base-type segment
-    #   matches neither reserved kind base type id
-    #   (`gts.cf.core.usage.counter.v1~`,
-    #   `gts.cf.core.usage.gauge.v1~`); `context.gts_id` echoes the
-    #   rejected identifier.
-    # - `unknown_metadata_key` — ingest-time rejection when a
-    #   per-record `metadata` key is not a member of the referenced
-    #   metric's declared `metadata_fields` list; `context.gts_id`
-    #   names the metric and `context.key` names the offending key.
-    #
-    # Both lift to AIP-193 `InvalidArgument` / HTTP `400` and are
-    # `retryable=false`. `unknown_metadata_key` may surface either as
-    # a standalone 400 `application/problem+json` envelope or as a
-    # per-record `rejected` outcome's `error` field inside the
-    # standard `IngestRecordsResponse` (Multi-Status `207`), depending
-    # on whether the gateway short-circuits or batches.
+            Per-category structured context. Common fields include
+            `reason`, `retryable`, `retry_after_seconds`,
+            `field_violations`, `resource_type`, and `resource_name`.

@@ -52,14 +52,14 @@ Chosen option: "Plugin SPI binding via Plugin Host + GTS Registry", because it s
 - The core ingestion and query paths are written against Plugin SPI types only and contain no backend-specific SQL, schema, or client library code.
 - Operators select the active plugin via configuration per GTS instance; switching backends does not require a Usage Collector release.
 - Plugin authors are responsible for performance-shaping decisions (pre-aggregated materialized views, columnar indexes, partition strategies, retention tiering, durable backup, point-in-time recovery) that meet the platform NFR thresholds.
-- The core depends only on AuthN, PDP, the local Metrics catalog, and the active plugin binding for ingestion; downstream consumer availability does not enter the ingestion path.
+- The core depends only on AuthN, PDP, the local UsageType catalog, and the active plugin binding for ingestion; downstream consumer availability does not enter the ingestion path.
 - The Plugin SPI is itself bound by the contract-stability ADR (`cpt-cf-usage-collector-adr-contract-stability`); breaking changes require a coordinated multi-major release.
 
-Scope clarification (added 2026-05-30 via `cpt-cf-usage-collector-adr-catalog-plugin-referential-integrity`): the pluggable-storage scope explicitly covers the metric catalog alongside `usage_records`. The catalog physically lives on the storage plugin's backend database next to `usage_records` and is reached only through the Plugin SPI; an `ON DELETE RESTRICT` foreign key between `usage_records` and the catalog enforces referential integrity natively. The "Plugin SPI binding via Plugin Host + GTS Registry" decision and its rationale documented above are unchanged — this clarification restores the catalog to that same seam after the interim gateway-local placement under `cpt-cf-usage-collector-adr-gateway-local-metric-catalog` (now superseded).
+Scope clarification (added 2026-05-30, carried by `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`): the pluggable-storage scope explicitly covers the usage-type catalog alongside `usage_records`. The catalog physically lives on the storage plugin's backend database next to `usage_records` and is reached only through the Plugin SPI; an `ON DELETE RESTRICT` foreign key between `usage_records` and the catalog enforces referential integrity natively. The "Plugin SPI binding via Plugin Host + GTS Registry" decision and its rationale documented above apply uniformly to the catalog at the same seam.
 
 ### Confirmation
 
-Compliance is confirmed through (a) design review of §3.7 confirming that no SQL, schema, or backend-specific client code lives in the core, (b) contract conformance tests against the published Plugin SPI for every plugin shipped with the platform, and (c) NFR load tests (query latency, ingestion throughput, workload isolation) executed against each supported backend.
+Compliance is confirmed through (a) design review of the plugin-ownership boundary in DESIGN §3.7 and `plugin-spi.md` §"Cross-entity invariants honored by the Plugin SPI" confirming that no SQL, schema, or backend-specific client code lives in the core, (b) contract conformance tests against the published Plugin SPI for every plugin shipped with the platform, and (c) NFR load tests (query latency, ingestion throughput, workload isolation) executed against each supported backend.
 
 ## Pros and Cons of the Options
 
@@ -93,7 +93,7 @@ The core ships with several drivers compiled in and exposes a configuration swit
 
 ## More Information
 
-Related decisions: `cpt-cf-usage-collector-adr-contract-stability` (which governs Plugin SPI versioning). The §3.7 plugin-ownership paragraph and the Plugin SPI seam in §3.2 are the structural anchors for this decision.
+Related decisions: `cpt-cf-usage-collector-adr-contract-stability` (which governs Plugin SPI versioning). The DESIGN §3.7 stateless-gateway statement, `plugin-spi.md` §"Cross-entity invariants honored by the Plugin SPI", and the Plugin SPI seam in §3.2 are the structural anchors for this decision.
 
 ## Traceability
 
@@ -109,4 +109,4 @@ This decision directly addresses the following requirements or design elements:
 - `cpt-cf-usage-collector-principle-pluggable-storage` — codifies the principle in §2.1.
 - `cpt-cf-usage-collector-constraint-plugin-contract-stability` — pairs with this ADR to govern Plugin SPI evolution.
 - `cpt-cf-usage-collector-interface-plugin` and `cpt-cf-usage-collector-contract-storage-plugin` — the SPI interface and contract realized by this decision.
-- `cpt-cf-usage-collector-adr-catalog-plugin-referential-integrity` — re-expands this ADR's scope to include the metric catalog alongside `usage_records` and adds the FK-enforced referential delete invariant; this ADR's original "Plugin SPI binding via Plugin Host + GTS Registry" decision and rationale are unchanged.
+- `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference` — re-expands this ADR's scope to include the usage-type catalog alongside `usage_records` and adds the FK-enforced referential delete invariant; this ADR's original "Plugin SPI binding via Plugin Host + GTS Registry" decision and rationale are unchanged.

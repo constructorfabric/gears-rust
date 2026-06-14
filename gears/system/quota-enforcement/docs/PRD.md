@@ -2129,7 +2129,7 @@ subject identifiers in payloads **MUST** be rejected, mirroring the Usage Collec
   isolation enforceable at all: if callers could supply identifiers in request bodies, a misconfigured or compromised
   caller could attribute operations to other tenants and silently consume their quotas. Failing closed on PDP
   unavailability prevents an outage from degrading into a permissive bypass. The same discipline is applied by Usage
-  Collector (`cpt-cf-usage-collector-fr-tenant-attribution`, `cpt-cf-usage-collector-nfr-authorization`) for the same
+  Collector (`cpt-cf-usage-collector-fr-tenant-attribution`, `cpt-cf-usage-collector-fr-ingestion-authorization`) for the same
   reasons.
 - **Actors**: `cpt-cf-quota-enforcement-actor-authz-resolver`
 

@@ -15,7 +15,7 @@ date: 2026-05-31
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [Floor-and-ceiling split (eventual no-bound floor; plugin profile ceiling)](#floor-and-ceiling-split-eventual-no-bound-floor-plugin-profile-ceiling)
-  - [Monotonic-reads-per-`(tenant, metric)` floor](#monotonic-reads-per-tenant-metric-floor)
+  - [Monotonic-reads-per-`(tenant, usage-type)` floor](#monotonic-reads-per-tenant-usage-type-floor)
   - [Bounded-staleness floor (e.g., ≤ N ms across all backends)](#bounded-staleness-floor-eg--n-ms-across-all-backends)
   - [Read-your-writes floor (session-affinity required of every plugin)](#read-your-writes-floor-session-affinity-required-of-every-plugin)
 - [More Information](#more-information)
@@ -29,8 +29,7 @@ date: 2026-05-31
 
 Usage Collector (UC) routes ingestion and query through distinct Plugin Service
 Provider Interface (SPI) methods so each active plugin can place them on
-isolated backend pools (read replicas, separate executor pools) per
-`cpt-cf-usage-collector-nfr-workload-isolation`. That isolation is the
+isolated backend pools (read replicas, separate executor pools). That isolation is the
 structural source of queryability lag between the ingestion ack path and the
 subsequent Query SPI path, but nothing in DESIGN states the consequence as a
 contract. PRD §9 acceptance criteria informally combine ingestion-ack latency
@@ -38,15 +37,12 @@ and queryability into one "ingestion-latency-bounded freshness" phrase, which
 hides that the two are governed by different mechanisms with different bounds.
 
 Two intra-plugin invariants ARE pinned down in DESIGN and `plugin-spi.md` and
-remain in force: the `(tenant_id, metric_gts_id, idempotency_key)` dedup tuple
+remain in force: the `(tenant_id, gts_id, idempotency_key)` dedup tuple
 is permanently visible to subsequent ingestion attempts after `Acknowledged` —
 the dedup-key tuple is preserved permanently and independently of the plugin's
-record-body retention policy — per
-`cpt-cf-usage-collector-adr-mandatory-idempotency` and
-`cpt-cf-usage-collector-fr-data-lifecycle`, and a `deactivate` of
+record-body retention policy —, and a `deactivate` of
 an accepted row commits atomically with its depth-1 compensation cascade in a
-single backend transaction per `cpt-cf-usage-collector-adr-monotonic-deactivation`
-and `cpt-cf-usage-collector-adr-usage-compensation`. Neither invariant says
+single backend transaction. Neither invariant says
 anything about whether the same record is visible to a subsequent raw or
 aggregated query.
 
@@ -65,7 +61,7 @@ backend?
 - **Plugin neutrality** — the floor MUST be achievable by every plugin on the
   v1 roadmap under its default deployment posture; what a plugin can do with
   custom routing or non-default flags is a per-plugin ceiling, not a floor
-  ([§3.10.8](../DESIGN.md#3108-consistency-contract) defines the floor; each
+  ([§3.10](../DESIGN.md#310-consistency-contract) defines the floor; each
   plugin's deployment guide owns its ceiling).
 - **Caller actionability** — consumers MUST be able to derive correct
   read-after-write behaviour from the floor alone, without reading any
@@ -91,9 +87,9 @@ backend?
   to a same-tenant ingestion; per-plugin deployment guides MAY advertise a
   stronger profile (sync single-node, bounded ≤ N ms, etc.), and consumers
   that depend on the stronger bound couple themselves to that plugin.
-- **Monotonic-reads-per-`(tenant, metric)` floor** — same floor as above plus
+- **Monotonic-reads-per-`(tenant, usage-type)` floor** — same floor as above plus
   an additional guarantee that once a consumer has observed record R, no
-  subsequent read of the same `(tenant_id, metric_gts_id)` returns a state
+  subsequent read of the same `(tenant_id, gts_id)` returns a state
   that omits R.
 - **Bounded-staleness floor (e.g., ≤ N ms across all backends)** — publish a
   single numeric staleness bound the Query SPI MUST honour, and have plugins
@@ -122,11 +118,10 @@ and read-your-writes floors are rejected for the same shape of reason — they
 overpromise for backends whose default replication topology cannot meet the
 bound without custom configuration.
 
-The floor applies to both `usage_records` and the plugin-owned `metric_catalog`
-reached through the Plugin SPI per `cpt-cf-usage-collector-adr-catalog-plugin-referential-integrity`.
-The gateway L1 validator cache is an ingestion-path internal optimization, not
-a public read surface, and is out of scope. The floor is per-`(tenant_id,
-metric_gts_id)`; UC publishes no cross-tenant or cross-metric ordering claim.
+The floor applies to both `usage_records` and the plugin-owned `usage_type_catalog`
+reached through the Plugin SPI.
+The floor is per-`(tenant_id, gts_id)`; UC publishes no cross-tenant
+or cross-usage-type ordering claim.
 
 A typed `consistency_profile()` SPI method is deferred. The Plugin SPI surface
 does not change in v1; per-plugin profile advertisement lives in prose inside
@@ -136,19 +131,18 @@ switch behaviour on the profile.
 
 ### Consequences
 
-- DESIGN gains a new subsection [§3.10.8](../DESIGN.md#3108-consistency-contract)
-  carrying the floor and the consumer rules; it ties back to
+- DESIGN §3.10 (Consistency Contract) carries the floor and the consumer rules; it ties back to
   `cpt-cf-usage-collector-nfr-workload-isolation` so the contract reads as a
   consequence of an already-allocated NFR, not a fresh policy.
 - DESIGN §3.12.7 polling redirect gains concrete content — it now points at
-  [§3.10.8](../DESIGN.md#3108-consistency-contract) for the freshness the
+  [§3.10](../DESIGN.md#310-consistency-contract) for the freshness the
   polled Query SPI surface guarantees and the read-after-write constraint
   that follows.
 - `plugin-spi.md` gains a **Consistency profile** subsection that restates the
   floor as the SPI's floor and requires every plugin's deployment guide to
   publish its actual profile (sync, bounded, eventual). No SPI method is
   added.
-- Read-after-write source-gear flows (admission control, post-emit summary,
+- Read-after-write calling-gear flows (admission control, post-emit summary,
   immediate-readback dashboards) MUST NOT be designed against the Query SPI;
   they MUST use the ingestion ack for same-request outcome. Near-real-time
   observers MUST poll within `cpt-cf-usage-collector-nfr-query-latency` and
@@ -162,7 +156,7 @@ switch behaviour on the profile.
   queryability bounded by the active plugin's published profile with a no-bound
   gear-level floor; this is a PRD wording fix, not a new acceptance gate.
 - `sdk-trait.md` and the feature documents inherit the floor through a single
-  pointer back to DESIGN [§3.10.8](../DESIGN.md#3108-consistency-contract);
+  pointer back to DESIGN [§3.10](../DESIGN.md#310-consistency-contract);
   `features/usage-query.md` calls out the no-read-your-writes constraint in
   its capability summary; `features/usage-emission.md` cross-references it;
   `features/event-deactivation.md` clarifies that the documented atomicity of
@@ -176,13 +170,13 @@ switch behaviour on the profile.
 
 ### Confirmation
 
-Compliance is confirmed through (a) DESIGN [§3.10.8](../DESIGN.md#3108-consistency-contract)
+Compliance is confirmed through (a) DESIGN [§3.10](../DESIGN.md#310-consistency-contract)
 review by usage-collector maintainers covering the floor wording, the tie to
 `cpt-cf-usage-collector-nfr-workload-isolation`, and the §3.12.7 redirect
 patch; (b) `plugin-spi.md` review covering the Consistency profile subsection
 and the explicit absence of a `consistency_profile()` method in v1; (c)
 `cypilot validate` PASS for the usage-collector bundle covering this ADR and
-every artifact that back-references it (DESIGN §3.10.8 and §5 inventory,
+every artifact that back-references it (DESIGN §3.10 and §5 inventory,
 PRD §9 wording fix, `plugin-spi.md` subsection, `sdk-trait.md` pointer note,
 the three feature pointers); (d) a deployment-guide checklist item in each
 active plugin's release readiness review confirming the per-plugin profile is
@@ -218,10 +212,10 @@ advertise the actual profile.
   potential latency or UX on the table; the mitigation is the per-plugin
   ceiling advertised in the deployment guide.
 
-### Monotonic-reads-per-`(tenant, metric)` floor
+### Monotonic-reads-per-`(tenant, usage-type)` floor
 
 Same floor as above plus a "once observed, never disappears" guarantee per
-`(tenant_id, metric_gts_id)`.
+`(tenant_id, gts_id)`.
 
 - Good, because consumers do not have to defend against observed-then-disappeared
   records, which is the kind of edge case callers under-handle in practice.
@@ -284,14 +278,14 @@ ingestion ack immediately.
 - DESIGN §1.2 NFR allocation pin `cpt-cf-usage-collector-nfr-workload-isolation`
   to isolated backend pools — the structural source of the queryability lag
   the floor names.
-- DESIGN §3.10.5 Data Governance / Data quality already documents
+- `cpt-cf-usage-collector-adr-mandatory-idempotency` (ADR-0004) and
+  `cpt-cf-usage-collector-adr-monotonic-deactivation` (ADR-0005) already document
   idempotency-by-key and the depth-1 deactivate cascade as plugin-transaction
-  invariants; [§3.10.8](../DESIGN.md#3108-consistency-contract) is additive
+  invariants; [§3.10](../DESIGN.md#310-consistency-contract) is additive
   and does NOT relitigate either.
-- DESIGN §3.11.1 Performance Patterns documents the gateway L1 validator
-  cache as a non-durable read-through projection of the plugin-owned
-  `metric_catalog`; this ADR does not change that mechanism and explicitly
-  excludes the cache from the public read surface the floor governs.
+- DESIGN §3.11.1 Performance Patterns documents that the gateway dispatches
+  `get_usage_type` against the plugin SPI per call; this ADR does not change
+  that mechanism.
 - DESIGN §3.12.7 Event architecture N/A redirects near-real-time consumers
   to polling within `cpt-cf-usage-collector-nfr-query-latency`; the redirect
   text is updated in the same change set to point at the new floor.
@@ -302,7 +296,7 @@ ingestion ack immediately.
   - **ARCH** — addressed (this IS the architectural decision: floor-and-ceiling
     split between DESIGN and per-plugin deployment guides).
   - **DATA** — addressed (clarifies what queryability across `usage_records`
-    and the plugin-owned `metric_catalog` does and does not promise relative
+    and the plugin-owned `usage_type_catalog` does and does not promise relative
     to ingestion ack).
   - **PERF** — addressed indirectly (the floor reads as the cost-side of
     `cpt-cf-usage-collector-nfr-workload-isolation`; no new performance
@@ -343,8 +337,8 @@ decisions, or design elements:
   pluralism: every roadmap plugin honours the floor under default deployment
   posture, and operator-driven substitution does not break consumers coded
   against the floor.
-- `cpt-cf-usage-collector-adr-catalog-plugin-referential-integrity` — the
-  floor explicitly covers the plugin-owned `metric_catalog` reached through
+- `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference` — the
+  floor explicitly covers the plugin-owned `usage_type_catalog` reached through
   the Plugin SPI, alongside `usage_records`; this is a scope clarification,
   not a new contract on the catalog.
 - `cpt-cf-usage-collector-adr-mandatory-idempotency` — the floor cites the
@@ -363,6 +357,6 @@ decisions, or design elements:
 - `cpt-cf-usage-collector-fr-ingestion`, `cpt-cf-usage-collector-fr-query-raw`,
   `cpt-cf-usage-collector-fr-query-aggregation`,
   `cpt-cf-usage-collector-fr-event-deactivation`,
-  `cpt-cf-usage-collector-fr-metric-existence-and-kind` —
+  `cpt-cf-usage-collector-fr-usage-type-existence-and-semantics` —
   these FRs gain a uniform consistency contract that downstream consumers
   can reason about without per-plugin caveats.

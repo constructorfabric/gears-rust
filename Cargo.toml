@@ -89,6 +89,7 @@ members = [
     "gears/system/authz-resolver/plugins/tr-authz-plugin",
     "gears/system/oagw/oagw",
     "gears/system/oagw/oagw-sdk",
+    "gears/system/usage-collector/usage-collector-sdk",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
 ]
