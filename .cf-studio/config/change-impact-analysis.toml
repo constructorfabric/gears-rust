@@ -1,5 +1,5 @@
-# Constructor Studio SDLC Kit — change-impact-analysis configuration
-# Kit-owned thresholds for the cf-sdlc-change-impact-analysis workflow.
+# Constructor Studio Gears Kit - change-impact-analysis configuration
+# Kit-owned thresholds for the cf-gears-change-impact-analysis workflow.
 # This config is kit-owned and user-editable; it is NOT part of the
 # cfs-core-owned constraints.toml schema.
 

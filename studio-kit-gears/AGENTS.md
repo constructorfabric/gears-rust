@@ -1,19 +1,23 @@
 # Constructor Studio Kit: Gears (`gears`)
 
-Agent quick reference.
+Compact session context. Detailed generation, review, validation, PR, and
+traceability rules live in the matched workflow files and templates.
 
-## What it is
+## Artifact Chain
 
-Artifact-first SDLC pipeline (PRD → ADR + DESIGN → DECOMPOSITION → FEATURE → CODE) with templates, review-only checklists/examples, and embedded workflow rules for deterministic validation + traceability.
+`UPSTREAM_REQS -> PRD -> ADR + DESIGN -> DECOMPOSITION -> FEATURE -> CODE`
 
-## Artifact kinds
+Use this chain as orientation when resolving upstream/downstream context:
 
-| Kind | Semantic intent (when to use) | References |
-| --- | --- | --- |
-| PRD | Product intent: actors + problems + FR/NFR + use cases + success criteria. | `{prd_template}`, `{prd_checklist}`, `{prd_example}` |
-| ADR | Decision log: why an architecture choice was made (context/options/decision/consequences). | `{adr_template}`, `{adr_checklist}`, `{adr_example}` |
-| DESIGN | System design: architecture, components, boundaries, interfaces, drivers, principles/constraints. | `{design_template}`, `{design_checklist}`, `{design_example}` |
-| DECOMPOSITION | Executable plan: FEATURE list, ordering, dependencies, and coverage links back to PRD/DESIGN. | `{decomposition_template}`, `{decomposition_checklist}`, `{decomposition_example}` |
-| FEATURE | Precise behavior + DoD: CDSL flows/algos/states + test scenarios for implementability. | `{feature_template}`, `{feature_checklist}`, `{feature_example}` |
-| UPSTREAM_REQS | Seed artifact: requirements from existing modules toward a future module that does not exist yet. PRD must trace back to these. | `{upstream_reqs_template}`, `{upstream_reqs_checklist}` |
-| CODE | Implementation of FEATURE with optional `@cpt-*` markers and checkbox cascade/coverage validation. | `{codebase_checklist}` |
+- UPSTREAM_REQS captures requirements from existing modules toward a future module.
+- PRD turns upstream needs into product requirements.
+- ADR records significant architecture decisions.
+- DESIGN maps requirements and decisions into system structure.
+- DECOMPOSITION splits design scope into implementable FEATUREs.
+- FEATURE defines implementation-ready behavior.
+- CODE implements FEATURE scope and traceability when required.
+
+## Loading Policy
+
+Generation should enter through the matched Gears workflow. This file is only
+always-loaded kit context; do not duplicate workflow-specific rules here.
