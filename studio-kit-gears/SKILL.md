@@ -11,7 +11,9 @@ Kit `gears` skill extensions.
 
 Each Gears artifact has a thin preset workflow that delegates to a core engine
 (`cf-write-docs` for documents, `cf-coding` for code) while binding the artifact
-KIND and injecting that artifact's gears rules, template, checklist, and example.
+KIND, template, and embedded generation rules. Artifact checklists and examples
+are review-only resources; semantic review and PR review MUST load them, and
+generation MUST NOT load them.
 
 | Skill | Artifact KIND | Engine | Workflow |
 |-------|---------------|--------|----------|
@@ -38,6 +40,19 @@ When routed to a preset workflow:
 1. Read the matched workflow file and follow it.
 2. The preset binds the artifact KIND + gears references, then delegates the full
    author/coder -> deterministic-gate -> semantic-review loop to its core engine.
+
+```pdsl
+UNIT GearsKitWideRules
+PURPOSE: Apply kit-wide Gears artifact-chain and CPT identity rules without a separate rules resource.
+RULES:
+  ALWAYS follow the artifact chain PRD -> ADR + DESIGN -> DECOMPOSITION -> FEATURE -> CODE
+  ALWAYS preserve required traceability: PRD fr/nfr -> DESIGN, ADR adr -> DESIGN, DESIGN component -> DECOMPOSITION, DECOMPOSITION feature -> FEATURE, FEATURE flow/algo/state/dod -> CODE
+  ALWAYS generate Constructor Studio IDs as `cpt-{system}-{kind}-{slug}` using lowercase kebab-case characters only
+  ALWAYS wrap CPT IDs in backticks in markdown artifacts
+  ALWAYS use checkbox plus priority form when constraints require task and priority: `- [ ] `p1` - **ID**: `cpt-{system}-{kind}-{slug}``
+  ALWAYS place DECOMPOSITION status IDs and FEATURE featstatus + feature backreferences directly under the H1 title when the template requires them
+  ALWAYS start ADR files with status/date YAML frontmatter from the ADR template
+```
 
 ## Analysis Workflows
 

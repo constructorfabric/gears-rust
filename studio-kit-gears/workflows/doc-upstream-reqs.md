@@ -10,10 +10,10 @@ purpose: Thin preset that binds the UPSTREAM_REQS artifact KIND and gears kit re
 # cf-gears-doc-upstream-reqs - UPSTREAM_REQS authoring preset
 
 This workflow is a thin preset over the core `cf-write-docs` authoring engine.
-It binds the UPSTREAM_REQS artifact KIND and the gears kit resources (template,
-rules, checklist, example), injects UPSTREAM_REQS-specific authoring rules, and
-delegates the full author -> deterministic-gate -> semantic-review loop to
-`cf-write-docs`. It authors no content itself.
+It binds the UPSTREAM_REQS artifact KIND and template, injects embedded
+UPSTREAM_REQS-specific generation rules, and delegates the full author ->
+deterministic-gate -> semantic-review loop to `cf-write-docs`. It authors no
+content itself.
 
 ```pdsl
 UNIT DocUpstreamReqsPreset
@@ -23,18 +23,44 @@ STATE:
 DO:
   SET ARTIFACT_KIND = UPSTREAM_REQS
   SET artifact_template = {upstream_reqs_template}
-  SET artifact_rules = {upstream_reqs_rules}
-  SET artifact_checklist = {upstream_reqs_checklist}
-  SET artifact_example = {upstream_reqs_example}
   LOAD {cf-studio-path}/.core/workflows/write-docs.md as the controlling authoring workflow
   CONTINUE WriteDocsBootstrap
 RULES:
-  ALWAYS bind ARTIFACT_KIND = UPSTREAM_REQS and the four gears UPSTREAM_REQS references (template, rules, checklist, example) before delegating to cf-write-docs
-  ALWAYS inject {upstream_reqs_rules} as additional gears UPSTREAM_REQS authoring rules into every author dispatch
+  ALWAYS bind ARTIFACT_KIND = UPSTREAM_REQS and the gears UPSTREAM_REQS template before delegating to cf-write-docs
+  ALWAYS inject the embedded GearsUpstreamReqsGenerationRules unit below as additional gears UPSTREAM_REQS authoring rules into every author dispatch
   ALWAYS set the deterministic gate target to `cfs validate --artifact <path>` for the UPSTREAM_REQS file
-  ALWAYS pass {upstream_reqs_checklist} as the artifact checklist to cf-semantic-reviewer-artifact and {upstream_reqs_example} as the content-depth reference
+  ALWAYS keep {upstream_reqs_checklist} and {upstream_reqs_example} review-only; semantic review MUST load both before cf-semantic-reviewer-artifact dispatch, and generation MUST NOT load them
   ALWAYS carry ARTIFACT_KIND and the bound references as read-only preset data, never overriding cf-write-docs gates or verdicts
   NEVER author UPSTREAM_REQS content in this preset; delegate all authoring and review to cf-write-docs
 NOTES:
-  cf-write-docs already drives the author -> deterministic gate (cfs validate --artifact) -> semantic review (cf-semantic-reviewer-artifact) loop; this preset only supplies the gears UPSTREAM_REQS KIND binding and UPSTREAM_REQS-specific rules.
+  cf-write-docs already drives the author -> deterministic gate (cfs validate --artifact) -> semantic review loop; this preset only supplies the gears UPSTREAM_REQS KIND binding and embedded generation rules.
+```
+
+```pdsl
+UNIT GearsUpstreamReqsGenerationRules
+PURPOSE: Generate or revise upstream requirements from existing modules toward a future module.
+WHEN:
+  REQUIRE authoring or revising an UPSTREAM_REQS artifact
+DO:
+  LOAD {upstream_reqs_template}
+  RUN follow {upstream_reqs_template} structure and section order
+  RUN capture source module needs as WHAT and WHY, not implementation HOW
+  RUN generate or update the Table of Contents with `cfs toc <path>`
+  RUN validate the Table of Contents with `cfs validate-toc <path>`
+  RUN deterministic validation with `cfs validate --artifact <path>`
+  RUN fix every deterministic finding and repeat validation until zero errors
+RULES:
+  ALWAYS keep {upstream_reqs_checklist} review-only; NEVER load it during generation
+  ALWAYS keep {upstream_reqs_example} review-only; semantic review MUST load it when checking depth and example conformance
+  ALWAYS generate and maintain an accurate Table of Contents matching the final headings
+  ALWAYS generate canonical CPT IDs using `cpt-{system}-upreq-{slug}` and keep them unique within the artifact
+  ALWAYS use valid upstream requirement IDs and priority markers from the template
+  ALWAYS name the requesting module, future module boundary, and reason for every requirement
+  ALWAYS state observable acceptance signals for each upstream requirement
+  ALWAYS make every requirement traceable back to concrete requesting gear code or documentation
+  ALWAYS include a traceability section linking to future PRD and DESIGN, even when those artifacts are not created yet
+  ALWAYS preserve existing stable IDs; add new IDs only for new upstream requirements
+  ALWAYS keep downstream PRD/DESIGN/FEATURE coverage references explicit when they exist
+  NEVER include product vision, roadmap goals, implementation choices, internal algorithms, or crate-level design decisions
+  NEVER leave placeholders, TODOs, TBDs, dangling references, or unprioritized requirements
 ```

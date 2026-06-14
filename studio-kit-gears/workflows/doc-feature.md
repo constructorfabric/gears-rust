@@ -10,10 +10,10 @@ purpose: Thin preset that binds the FEATURE artifact KIND and gears kit referenc
 # cf-gears-doc-feature - FEATURE authoring preset
 
 This workflow is a thin preset over the core `cf-write-docs` authoring engine.
-It binds the FEATURE artifact KIND and the gears kit resources (template, rules,
-checklist, example), injects FEATURE-specific authoring rules, and delegates the
-full author -> deterministic-gate -> semantic-review loop to `cf-write-docs`.
-It authors no content itself.
+It binds the FEATURE artifact KIND and template, injects embedded
+FEATURE-specific generation rules, and delegates the full author ->
+deterministic-gate -> semantic-review loop to `cf-write-docs`. It authors no
+content itself.
 
 ```pdsl
 UNIT DocFeaturePreset
@@ -23,18 +23,47 @@ STATE:
 DO:
   SET ARTIFACT_KIND = FEATURE
   SET artifact_template = {feature_template}
-  SET artifact_rules = {feature_rules}
-  SET artifact_checklist = {feature_checklist}
-  SET artifact_example = {feature_example}
   LOAD {cf-studio-path}/.core/workflows/write-docs.md as the controlling authoring workflow
   CONTINUE WriteDocsBootstrap
 RULES:
-  ALWAYS bind ARTIFACT_KIND = FEATURE and the four gears FEATURE references (template, rules, checklist, example) before delegating to cf-write-docs
-  ALWAYS inject {feature_rules} as additional gears FEATURE authoring rules into every author dispatch
+  ALWAYS bind ARTIFACT_KIND = FEATURE and the gears FEATURE template before delegating to cf-write-docs
+  ALWAYS inject the embedded GearsFeatureGenerationRules unit below as additional gears FEATURE authoring rules into every author dispatch
   ALWAYS set the deterministic gate target to `cfs validate --artifact <path>` for the FEATURE file
-  ALWAYS pass {feature_checklist} as the artifact checklist to cf-semantic-reviewer-artifact and {feature_example} as the content-depth reference
+  ALWAYS keep {feature_checklist} and {feature_example} review-only; semantic review MUST load both before cf-semantic-reviewer-artifact dispatch, and generation MUST NOT load them
   ALWAYS carry ARTIFACT_KIND and the bound references as read-only preset data, never overriding cf-write-docs gates or verdicts
   NEVER author FEATURE content in this preset; delegate all authoring and review to cf-write-docs
 NOTES:
-  cf-write-docs already drives the author -> deterministic gate (cfs validate --artifact) -> semantic review (cf-semantic-reviewer-artifact) loop; this preset only supplies the gears FEATURE KIND binding and FEATURE-specific rules.
+  cf-write-docs already drives the author -> deterministic gate (cfs validate --artifact) -> semantic review loop; this preset only supplies the gears FEATURE KIND binding and embedded generation rules.
+```
+
+```pdsl
+UNIT GearsFeatureGenerationRules
+PURPOSE: Generate or revise a Gears FEATURE as an implementation-ready contract.
+WHEN:
+  REQUIRE authoring or revising a FEATURE artifact
+DO:
+  LOAD {feature_template}
+  RUN follow {feature_template} structure and section order
+  RUN define flows, algorithms, states, data contracts, and definition of done in CDSL-ready form
+  RUN generate or update the Table of Contents with `cfs toc <path>`
+  RUN validate the Table of Contents with `cfs validate-toc <path>`
+  RUN deterministic validation with `cfs validate --artifact <path>`
+  RUN fix every deterministic finding and repeat validation until zero errors
+RULES:
+  ALWAYS keep {feature_checklist} review-only; NEVER load it during generation
+  ALWAYS keep {feature_example} review-only; semantic review MUST load it when checking depth and example conformance
+  ALWAYS generate and maintain an accurate Table of Contents matching the final headings
+  ALWAYS generate canonical CPT IDs from the template patterns, including featstatus, feature, flow, algo, state, and dod IDs
+  ALWAYS use valid Gears FEATURE IDs, CDSL IDs, statuses, and priority markers from the template
+  ALWAYS include the `featstatus` checkbox and the DECOMPOSITION `feature` backreference directly under the H1 title
+  ALWAYS trace the FEATURE to DECOMPOSITION, DESIGN, PRD, ADR, or UPSTREAM_REQS IDs when those sources exist
+  ALWAYS preserve PRD coverage integrity and DESIGN principles, constraints, components, sequences, and data references
+  ALWAYS keep `featstatus` checkbox state consistent with flow, algorithm, state, and definition-of-done checkbox states
+  ALWAYS define testable acceptance criteria and deterministic completion signals
+  ALWAYS define security, reliability, data integrity, observability, rollback, and test coverage behavior when applicable; otherwise state why not applicable
+  ALWAYS include implementation constraints that code must satisfy, without prescribing incidental code structure
+  ALWAYS preserve existing stable IDs; add new IDs only for new feature/CDSL elements
+  NEVER introduce new system-level type definitions, API endpoints, architecture decisions, product requirements, sprint tasks, code snippets, test implementation, infrastructure code, or secrets
+  NEVER create CDSL steps that cannot be implemented, tested, or traced
+  NEVER leave placeholders, TODOs, TBDs, dangling references, or unprioritized CDSL elements
 ```
