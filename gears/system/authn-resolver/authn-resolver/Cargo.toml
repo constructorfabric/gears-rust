@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-authn-resolver"
-version = "0.2.17"
+version = "0.2.18"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -21,8 +21,8 @@ workspace = true
 # Trait boundaries of consumed SDKs are `CanonicalError` (ADR 0005).
 toolkit-canonical-errors = { workspace = true }
 # Local dependencies
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.17", path = "../authn-resolver-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.2.3", path = "../../types-registry/types-registry-sdk" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.18", path = "../authn-resolver-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.0", path = "../../types-registry/types-registry-sdk" }
 
 # ToolKit dependencies
 toolkit = { workspace = true }

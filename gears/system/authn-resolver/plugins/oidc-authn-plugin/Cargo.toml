@@ -21,8 +21,7 @@ authn-resolver-sdk = {
     path = "../../authn-resolver-sdk"
 }
 types-registry-sdk = {
-    package = "cf-gears-types-registry-sdk",
-    version = "0.2",
+    package = "cf-gears-types-registry-sdk", version = "0.3",
     path = "../../../types-registry/types-registry-sdk"
 }
 
