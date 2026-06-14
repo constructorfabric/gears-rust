@@ -41,6 +41,29 @@ ALWAYS open and follow `CONTRIBUTING.md` WHEN setting up development environment
 
 ALWAYS open `docs/REPO_PLAYBOOK.md` WHEN looking for a map of repository artifacts, understanding what standards/tooling exist, identifying coverage gaps, or onboarding to the project structure
 
+## Project Documentation (auto-configured)
+<!-- auto-config:docs:start -->
+ALWAYS open and follow `guidelines/README.md` WHEN starting project work or deciding which project standards apply
+ALWAYS open and follow `README.md#quick-start` WHEN onboarding, running the server, or using local example commands
+ALWAYS open and follow `CONTRIBUTING.md#2-development-workflow` WHEN contributing code, creating branches, running quality checks, signing commits, or opening PRs
+ALWAYS open and follow `docs/REPO_PLAYBOOK.md` WHEN locating repository standards, tooling, CI, testing, security, or documentation ownership
+ALWAYS open and follow `docs/ARCHITECTURE_MANIFEST.md#3-architectural-principles` WHEN changing architecture, module boundaries, or cross-cutting platform behavior
+ALWAYS open and follow `docs/toolkit_unified_system/README.md#task--document-routing` WHEN working with ToolKit or gears
+ALWAYS open and follow `docs/security/SECURITY.md` WHEN changing security controls, dependency security, FIPS behavior, credentials, or scanner expectations
+<!-- auto-config:docs:end -->
+
+## Project Rules (auto-configured)
+<!-- auto-config:rules:start -->
+ALWAYS open and follow `{cf-studio-path}/config/rules/conventions.md` WHEN writing or reviewing Rust code
+ALWAYS open and follow `{cf-studio-path}/config/rules/architecture.md` WHEN modifying architecture, gear boundaries, or runtime behavior
+ALWAYS open and follow `{cf-studio-path}/config/rules/gear-patterns.md` WHEN creating or changing gears, SDK crates, plugins, or registration
+ALWAYS open and follow `{cf-studio-path}/config/rules/api-contracts.md` WHEN adding REST endpoints, OpenAPI routes, DTOs, SDK errors, or Problem mappings
+ALWAYS open and follow `{cf-studio-path}/config/rules/testing.md` WHEN writing or running unit, integration, compile-fail, end-to-end, or fuzz tests
+ALWAYS open and follow `{cf-studio-path}/config/rules/infrastructure.md` WHEN changing build tooling, CI, linting, releases, or dependency policy
+ALWAYS open and follow `{cf-studio-path}/config/rules/security.md` WHEN writing security-sensitive code, tenant-scoped data access, credentials, or FIPS behavior
+ALWAYS open and follow `{cf-studio-path}/config/rules/anti-patterns.md` WHEN reviewing code or refactoring risky patterns
+<!-- auto-config:rules:end -->
+
 ---
 
 ## Gear Rules
