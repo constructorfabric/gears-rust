@@ -122,6 +122,22 @@ Use this analysis to inform the final verdict — if reviewers raised
 valid unresolved concerns, those should lower the confidence to
 approve. If all concerns are addressed, that supports approval.
 
+c2. **Shared Gears guardrail pass**
+Before the per-file review, identify whether the PR touches any of:
+registry/autodetect/ignore matching, artifact traceability modes, SDK/public
+contracts, canonical OperationBuilder/operation-registration behavior, REST
+operation metadata, Problem/RFC-9457 error envelopes, privileged access, Secure
+ORM, SecurityContext, tenant/identity/authz boundaries, secrets, FIPS behavior,
+or compile-time API guarantees.
+
+When any item is touched, the review MUST include an explicit guardrail finding
+or pass note covering the relevant checklist evidence. Unsafe wire errors,
+bypassed runtime privilege boundaries, ad hoc HTTP route wiring that bypasses
+canonical operation registration, or missing compile-fail tests for compile-time
+guarantees are merge-blocking. Missing rationale or review owner is
+merge-blocking when the PR introduces or relies on a shared-baseline deviation
+or changes a guarded security/registry boundary without a review record.
+
 d. **Review the changes (read-only)**
 Read `.prs/{ID}/diff.patch` to understand what changed.
 For each affected file, open the **current version in the repo** and
@@ -159,6 +175,7 @@ most attention.
 - [ ] Checklist loaded for selected review type
 - [ ] Diff parsed and scope of changes understood
 - [ ] Architecture pass completed before per-file review (step 4b)
+- [ ] Shared Gears guardrail pass completed before per-file review (step 4c2)
 - [ ] Architecture section present in review output (even if empty / "no issues")
 - [ ] Existing reviewer feedback analyzed
 - [ ] Review covers all areas from prompt and checklist

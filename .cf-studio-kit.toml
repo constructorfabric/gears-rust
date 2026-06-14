@@ -16,15 +16,6 @@ type = "file"
 user_modifiable = true
 
 [[kits.resources]]
-id = "prd_rules"
-kind = "rule"
-source = "studio-kit-gears/artifacts/PRD/rules.md"
-public = false
-install_path = "artifacts/PRD/rules.md"
-type = "file"
-user_modifiable = true
-
-[[kits.resources]]
 id = "prd_checklist"
 kind = "checklist"
 source = "docs/checklists/PRD.md"
@@ -45,15 +36,6 @@ id = "adr_template"
 kind = "template"
 source = "docs/spec-templates/gears-sdlc/ADR/template.md"
 install_path = "artifacts/ADR/template.md"
-type = "file"
-user_modifiable = true
-
-[[kits.resources]]
-id = "adr_rules"
-kind = "rule"
-source = "studio-kit-gears/artifacts/ADR/rules.md"
-public = false
-install_path = "artifacts/ADR/rules.md"
 type = "file"
 user_modifiable = true
 
@@ -82,15 +64,6 @@ type = "file"
 user_modifiable = true
 
 [[kits.resources]]
-id = "design_rules"
-kind = "rule"
-source = "studio-kit-gears/artifacts/DESIGN/rules.md"
-public = false
-install_path = "artifacts/DESIGN/rules.md"
-type = "file"
-user_modifiable = true
-
-[[kits.resources]]
 id = "design_checklist"
 kind = "checklist"
 source = "docs/checklists/DESIGN.md"
@@ -111,15 +84,6 @@ id = "decomposition_template"
 kind = "template"
 source = "docs/spec-templates/gears-sdlc/DECOMPOSITION/template.md"
 install_path = "artifacts/DECOMPOSITION/template.md"
-type = "file"
-user_modifiable = true
-
-[[kits.resources]]
-id = "decomposition_rules"
-kind = "rule"
-source = "studio-kit-gears/artifacts/DECOMPOSITION/rules.md"
-public = false
-install_path = "artifacts/DECOMPOSITION/rules.md"
 type = "file"
 user_modifiable = true
 
@@ -148,15 +112,6 @@ type = "file"
 user_modifiable = true
 
 [[kits.resources]]
-id = "feature_rules"
-kind = "rule"
-source = "studio-kit-gears/artifacts/FEATURE/rules.md"
-public = false
-install_path = "artifacts/FEATURE/rules.md"
-type = "file"
-user_modifiable = true
-
-[[kits.resources]]
 id = "feature_checklist"
 kind = "checklist"
 source = "docs/checklists/FEATURE.md"
@@ -177,15 +132,6 @@ id = "upstream_reqs_template"
 kind = "template"
 source = "docs/spec-templates/gears-sdlc/UPSTREAM_REQS/template.md"
 install_path = "artifacts/UPSTREAM_REQS/template.md"
-type = "file"
-user_modifiable = true
-
-[[kits.resources]]
-id = "upstream_reqs_rules"
-kind = "rule"
-source = "studio-kit-gears/artifacts/UPSTREAM_REQS/rules.md"
-public = false
-install_path = "artifacts/UPSTREAM_REQS/rules.md"
 type = "file"
 user_modifiable = true
 
@@ -222,15 +168,6 @@ type = "file"
 user_modifiable = true
 
 [[kits.resources]]
-id = "codebase_rules"
-kind = "rule"
-source = "studio-kit-gears/codebase/rules.md"
-public = false
-install_path = "codebase/rules.md"
-type = "file"
-user_modifiable = true
-
-[[kits.resources]]
 id = "codebase_checklist"
 kind = "checklist"
 source = "docs/checklists/CODING.md"
@@ -243,6 +180,15 @@ id = "workflow_pr_review"
 kind = "skill"
 source = "studio-kit-gears/workflows/pr-review.md"
 install_path = "workflows/pr-review.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_coding"
+kind = "skill"
+source = "studio-kit-gears/workflows/coding.md"
+install_path = "workflows/coding.md"
 type = "file"
 user_modifiable = true
 public = true
@@ -274,48 +220,33 @@ user_modifiable = true
 
 [kits.resources.artifacts.PRD]
 template = "prd_template"
-rules = "prd_rules"
 checklist = "prd_checklist"
 examples = "prd_example"
 
 [kits.resources.artifacts.ADR]
 template = "adr_template"
-rules = "adr_rules"
 checklist = "adr_checklist"
 examples = "adr_example"
 
 [kits.resources.artifacts.DESIGN]
 template = "design_template"
-rules = "design_rules"
 checklist = "design_checklist"
 examples = "design_example"
 
 [kits.resources.artifacts.DECOMPOSITION]
 template = "decomposition_template"
-rules = "decomposition_rules"
 checklist = "decomposition_checklist"
 examples = "decomposition_example"
 
 [kits.resources.artifacts.FEATURE]
 template = "feature_template"
-rules = "feature_rules"
 checklist = "feature_checklist"
 examples = "feature_example"
 
 [kits.resources.artifacts.UPSTREAM_REQS]
 template = "upstream_reqs_template"
-rules = "upstream_reqs_rules"
 checklist = "upstream_reqs_checklist"
 examples = "upstream_reqs_example"
-
-[[kits.resources]]
-id = "router"
-kind = "skill"
-source = "studio-kit-gears/SKILL.md"
-install_path = "SKILL.md"
-type = "file"
-user_modifiable = true
-public = false
 
 [[kits.resources]]
 id = "agents"
@@ -325,12 +256,3 @@ install_path = "AGENTS.md"
 type = "file"
 user_modifiable = true
 public = true
-
-[[kits.resources]]
-id = "rules"
-kind = "rule"
-source = "studio-kit-gears/rules.md"
-public = false
-install_path = "rules.md"
-type = "file"
-user_modifiable = true

@@ -15,9 +15,20 @@ Use this chain as orientation when resolving upstream/downstream context:
 - DESIGN maps requirements and decisions into system structure.
 - DECOMPOSITION splits design scope into implementable FEATUREs.
 - FEATURE defines implementation-ready behavior.
-- CODE implements FEATURE scope and traceability when required.
+- CODE implements FEATURE scope and traceability when required, or implements
+  directly from DESIGN/ADR/PRD context when no FEATURE exists.
 
 ## Loading Policy
 
 Generation should enter through the matched Gears workflow. This file is only
 always-loaded kit context; do not duplicate workflow-specific rules here.
+
+## Shared Baseline Policy
+
+Project-wide platform, security, API, testing, and architecture standards
+belong in foundational repository docs and shared kit assets. Gear-level
+PRD/DESIGN/FEATURE artifacts should document only local deviations, extensions,
+or stricter constraints.
+
+When a gear deviates from a shared baseline, document the deviation, rationale,
+and review owner in the affected artifact or review record.

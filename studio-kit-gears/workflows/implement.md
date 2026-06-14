@@ -47,6 +47,7 @@ DO:
   RUN determine traceability mode from the FEATURE or project configuration
   RUN split the FEATURE design into implementation slices from its flow, algorithm, state, and definition-of-done IDs
   RUN order slices by dependency and user-observable behavior, keeping each slice independently testable
+  RUN identify risky slices touching registry/autodetect/ignore matching, privilege boundaries, Secure ORM, SecurityContext, secrets, FIPS behavior, or security-boundary logic
   RUN implement one slice at a time with TDD: write or update the failing test first, implement the smallest passing code, then refactor
   RUN after each slice, run deterministic validation with project tests, lint/typecheck/build when available, and `cfs validate --artifact <code-path>`
   RUN fix every deterministic finding and repeat validation until zero errors before starting the next slice
@@ -65,6 +66,9 @@ RULES:
   ALWAYS update FEATURE implementation checkboxes/status only when the corresponding code and validation are complete
   ALWAYS implement every referenced flow step, algorithm requirement, state transition, and definition-of-done item that is in scope
   ALWAYS preserve PRD coverage outcomes and DESIGN principles, constraints, components, sequences, data contracts, and security requirements in code behavior
+  ALWAYS preserve SDK-first public contracts, domain/API/infrastructure separation, runtime-owned privileged access, canonical OperationBuilder/operation-registration behavior, canonical API/error behavior, and safe wire errors unless the source FEATURE or DESIGN documents an approved deviation
+  ALWAYS record explicit review evidence for slices touching registry/autodetect/ignore matching, privilege boundaries, Secure ORM, SecurityContext, secrets, FIPS behavior, or security-boundary logic in the slice plan, implementation summary, or review notes; the evidence must name the touched guardrail or deviation, rationale, owner, and validation performed
+  ALWAYS add compile-fail tests when the implementation exposes compile-time guarantees such as macro diagnostics, generated code contracts, type-state APIs, or security/type-system invariants and the repository has an available compile-fail harness; otherwise document why the gate is not applicable and run the closest available compile/typecheck validation
   ALWAYS preserve existing stable IDs and markers; move markers only with the code they describe
   NEVER introduce orphan, duplicate, stale, or speculative `@cpt-*` markers
   NEVER broaden scope beyond the source FEATURE without an explicit upstream artifact change

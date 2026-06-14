@@ -58,9 +58,11 @@ RULES:
   ALWAYS include the `featstatus` checkbox and the DECOMPOSITION `feature` backreference directly under the H1 title
   ALWAYS trace the FEATURE to DECOMPOSITION, DESIGN, PRD, ADR, or UPSTREAM_REQS IDs when those sources exist
   ALWAYS preserve PRD coverage integrity and DESIGN principles, constraints, components, sequences, and data references
+  ALWAYS document feature-local deviations from shared platform, security, API, testing, or architecture baselines with the deviation, rationale, and review owner
+  ALWAYS preserve SDK-first public contracts, domain/API/infrastructure separation, runtime-owned privileged access, and canonical API/error behavior when those apply to the FEATURE
   ALWAYS keep `featstatus` checkbox state consistent with flow, algorithm, state, and definition-of-done checkbox states
   ALWAYS define testable acceptance criteria and deterministic completion signals
-  ALWAYS define security, reliability, data integrity, observability, rollback, and test coverage behavior when applicable; otherwise state why not applicable
+  ALWAYS define security, reliability, data integrity, observability, rollback, test-layering, and compile-time-gate behavior when applicable; otherwise state why not applicable
   ALWAYS include implementation constraints that code must satisfy, without prescribing incidental code structure
   ALWAYS preserve existing stable IDs; add new IDs only for new feature/CDSL elements
   NEVER introduce new system-level type definitions, API endpoints, architecture decisions, product requirements, sprint tasks, code snippets, test implementation, infrastructure code, or secrets

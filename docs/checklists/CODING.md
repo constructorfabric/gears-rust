@@ -85,11 +85,22 @@ These checks are **Constructor Studio SDLC-specific** because they require Const
 - [ ] Validate domain model entities and invariants are respected by code
 - [ ] Confirm component responsibilities, boundaries, and dependencies match the component model
 - [ ] Validate API contracts and integration boundaries are honored
+- [ ] Confirm public contract changes preserve SDK-first boundaries when the source design requires reusable client behavior
+- [ ] Confirm domain, API, and infrastructure responsibilities remain separated or the approved design deviation is cited
+- [ ] Confirm privileged access stays behind the runtime or explicitly trusted boundary defined by the design
+- [ ] Confirm HTTP routes use the canonical OperationBuilder/operation-registration path, not ad hoc route wiring
+- [ ] Confirm HTTP-facing errors use the canonical Problem/RFC-9457 shape and do not expose stack traces, secrets, internal diagnostics, or implementation-only identifiers
+- [ ] Confirm tenant, identity, authorization, and security context boundaries are preserved for security-sensitive code paths
+- [ ] Confirm registry/autodetect/ignore, secrets, FIPS, privilege-boundary, and security-boundary changes have a review record naming the guardrail or deviation, rationale, owner, and validation performed
 - [ ] If the design relies on GTS-based modeling, ensure the code follows `guidelines/GTS.md` for identifier structure, traits usage, well-known instances, and extensibility patterns
 - [ ] Verify interactions and sequences are implemented as described
 - [ ] Ensure database schemas, constraints, and access patterns align with design
 - [ ] Confirm topology and tech stack choices are not contradicted
 - [ ] Document any deviation with a rationale and approval
+- [ ] Verify test layering: unit and integration tests cover deterministic logic, domain rules, and integration boundaries at the right layer
+- [ ] Verify E2E tests cover externally observable integration flows without replacing lower-level deterministic tests
+- [ ] Verify compile-fail tests exist when the implementation exposes compile-time guarantees such as macro diagnostics, generated code contracts, type-state APIs, or security/type-system invariants
+- [ ] Confirm coverage thresholds are taken from project-local policy, not assumed from the shared kit
 
 ---
 

@@ -13,3 +13,8 @@
 | ADR | `docs/spec-templates/ADR.md` | `docs/checklists/ADR.md` |
 | FEATURE | `docs/spec-templates/FEATURE.md` | `docs/checklists/FEATURE.md` |
 | DECOMPOSITION | `docs/spec-templates/DECOMPOSITION.md` | `docs/checklists/DECOMPOSITION.md` |
+
+## Coding workflows
+
+- `cf-gears-implement`: implement from a FEATURE artifact with traceability when required.
+- `cf-gears-coding`: implement directly from DESIGN/ADR/PRD/upstream design context without FEATURE or `@cpt-*` implementation traceability.

@@ -58,6 +58,9 @@ RULES:
   ALWAYS preserve PRD intent and scope; document any deviation as explicit approved scope change
   ALWAYS cover referenced ADR decisions and keep ADR/PRD links valid
   ALWAYS define ownership boundaries, public interfaces, lifecycle/state behavior, and error surfaces when relevant
+  ALWAYS document deviations from shared platform, security, API, testing, and architecture baselines with the deviation, rationale, and review owner
+  ALWAYS preserve SDK-first public contracts, domain/API/infrastructure separation, and runtime-owned privileged access unless an approved design deviation says otherwise
+  ALWAYS define REST contract metadata, canonical OperationBuilder/operation-registration behavior, canonical Problem/RFC-9457 error envelopes, and safe wire-error behavior when exposing HTTP APIs
   ALWAYS document security boundaries, data protection, fault tolerance, observability, testability, and compliance posture when applicable; otherwise state why not applicable
   ALWAYS call out assumptions, constraints, dependencies, and migration impacts
   ALWAYS preserve existing stable IDs; add new IDs only for new design elements
