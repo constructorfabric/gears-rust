@@ -1,8 +1,0 @@
----
-name: cypilot-ralphex
-description: "Cypilot ralphex delegation agent. Use when delegating a Cypilot plan to ralphex for autonomous execution. Manages discovery, export, delegation, and handoff lifecycle."
-tools: grep, view, edit, bash
-model: inherit
----
-
-ALWAYS open and follow `{cypilot_path}/.core/skills/cypilot/agents/cypilot-ralphex.md`

@@ -215,7 +215,11 @@ validate-gear-names:
 # |             | - Use 'make dylint-list' to see all available custom lints           |
 # +-------------+----------------------------------------------------------------------+
 
-.PHONY: clippy clippy-deep lychee kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cypilot-validate cypilot-spec-coverage
+.PHONY: clippy clippy-deep lychee kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage
+
+CFS ?= cfs
+CFS_PIPX_SPEC ?= git+https://github.com/constructorfabric/studio.git
+export PATH := $(HOME)/.local/bin:$(PATH)
 
 # Fast two-pass clippy used in PR CI (target: <5 min with sccache).
 #
@@ -246,13 +250,42 @@ clippy-deep:
 	$(call check_tool,cargo-hack)
 	cargo hack clippy --workspace --all-targets --each-feature $(CLIPPY_FLAGS)
 
-# Check cypilot spec-to-code traceability coverage
-cypilot-spec-coverage:
-	@python3 .cypilot/.core/skills/cypilot/scripts/cypilot.py spec-coverage --min-coverage 80
+# Ensure the Constructor Studio CLI is available even when generated runtime
+# files are ignored locally or absent in a clean checkout.
+cfs-ensure:
+	@if ! command -v $(CFS) >/dev/null 2>&1; then \
+		echo "cfs not found; installing $(CFS_PIPX_SPEC) via pipx"; \
+		if ! command -v pipx >/dev/null 2>&1; then \
+			echo "ERROR: pipx is required before running this target"; \
+			exit 1; \
+		else \
+			pipx install $(CFS_PIPX_SPEC); \
+		fi; \
+	fi
+	@if ! command -v $(CFS) >/dev/null 2>&1; then \
+		echo "ERROR: cfs was installed but is not on PATH"; \
+		exit 1; \
+	fi
 
-# Validate cypilot artifacts (specs, code, templates)
-cypilot-validate:
-	@python3 .cypilot/.core/skills/cypilot/scripts/cypilot.py validate && echo "OK. cypilot validation PASSED" || (echo "ERROR: cypilot validation FAILED"; exit 1)
+# Repair ignored/generated Constructor Studio runtime files before validation.
+cfs-repair: cfs-ensure
+	$(CFS) init --yes
+
+# Check Constructor Studio spec-to-code traceability coverage.
+cfs-spec-coverage: cfs-repair
+	$(CFS) spec-coverage --min-coverage 80
+
+# Validate Constructor Studio artifacts (specs, code, templates).
+cfs-validate: cfs-repair
+	$(CFS) validate && echo "OK. Constructor Studio validation PASSED" || (echo "ERROR: Constructor Studio validation FAILED"; exit 1)
+
+# Validate registered Constructor Studio kits.
+cfs-validate-kits: cfs-repair
+	$(CFS) validate-kits
+
+# Validate the local studio-kit-gears checkout as a kit directory.
+cfs-validate-kit-local: cfs-repair
+	cd studio-kit-gears && $(CFS) validate-kits .
 
 # Run markdown checks with 'lychee'
 lychee:
@@ -767,7 +800,7 @@ oop-example:
 	cargo run --bin cf-gears-example-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
-check: .setup-stamp fmt cypilot-validate clippy lychee security dylint-test dylint gts-docs test
+check: .setup-stamp fmt cfs-validate clippy lychee security dylint-test dylint gts-docs test
 
 ci_test: fmt clippy
 

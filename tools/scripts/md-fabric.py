@@ -40,14 +40,14 @@ _RECTPACK_ALGOS: tuple[Any, ...] = (
 )
 
 _CATEGORY_STYLE: dict[str, tuple[str, str, str]] = {
-    "cypilot": ("rgba(110,60,210,0.06)",  "rgba(110,60,210,0.30)",  "rgba(90,45,190,0.85)"),
+    "cf-studio": ("rgba(110,60,210,0.06)",  "rgba(110,60,210,0.30)",  "rgba(90,45,190,0.85)"),
     "toolkit":  ("rgba(200,100,10,0.06)",  "rgba(200,100,10,0.30)",  "rgba(165,80,5,0.85)"),
     "gears": ("rgba(20,145,60,0.06)",   "rgba(20,145,60,0.30)",   "rgba(10,115,40,0.85)"),
     "other":   ("rgba(100,100,100,0.04)", "rgba(100,100,100,0.20)", "rgba(60,60,60,0.75)"),
 }
 
 _NODE_COLORS: dict[str, dict[str, str]] = {
-    "cypilot": {"background": "#f4eeff", "border": "#7744cc"},
+    "cf-studio": {"background": "#f4eeff", "border": "#7744cc"},
     "toolkit":  {"background": "#fff5e6", "border": "#c07000"},
     "gears": {"background": "#edfff4", "border": "#28a060"},
     "other":   {"background": "#f4f4f4", "border": "#888888"},
@@ -208,7 +208,7 @@ def detect_template_vars(repo: Path) -> dict[str, str]:
             try:
                 data = tomllib.loads(core_toml.read_text(encoding="utf-8"))
                 if "project_root" in data:
-                    vars["cypilot_path"] = candidate.relative_to(repo).as_posix()
+                    vars["cf-studio-path"] = candidate.relative_to(repo).as_posix()
                     break
             except Exception:
                 pass
@@ -2477,7 +2477,7 @@ const options = {{
     guidelines: {{ color: {{ background: "#fff8db", border: "#c99a00" }} }},
     documents:  {{ color: {{ background: "#eaf3ff", border: "#3572b0" }} }},
     others:     {{ color: {{ background: "#eeeeee", border: "#777777" }} }},
-    cypilot:    {{ color: {{ background: "#f4eeff", border: "#7744cc" }} }},
+    cf-studio:  {{ color: {{ background: "#f4eeff", border: "#7744cc" }} }},
     toolkit:     {{ color: {{ background: "#fff5e6", border: "#c07000" }} }},
     gears:    {{ color: {{ background: "#edfff4", border: "#28a060" }} }},
     other:      {{ color: {{ background: "#f4f4f4", border: "#888888" }} }},

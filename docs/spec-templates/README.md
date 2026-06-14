@@ -1,6 +1,6 @@
 # Spec Templates
 
-Industry-standard specification templates incorporating best practices from IEEE, ISO, and modern software development methodologies. Compatible with [Cypilot-Driven Development](https://github.com/constructorfabric/Cypilot) for validation and traceability.
+Industry-standard specification templates incorporating best practices from IEEE, ISO, and modern software development methodologies. Compatible with Constructor Studio/CFS for validation and traceability.
 
 ## Purpose
 
@@ -13,9 +13,9 @@ These templates provide a structured way to document product requirements, techn
 - **ISO/IEC 15288 / 12207** — Systems and software life cycle processes
 - **MADR** — Markdown Any Decision Records
 
-Templates work standalone or can be enhanced with Cypilot annotations (`cpt-id`) for cross-document validation and traceability.
+Templates work standalone or can be enhanced with Constructor Studio annotations (`cpt-id`) for cross-document validation and traceability.
 
-**Cypilot integration is optional** — templates are useful on their own for clear, consistent documentation.
+**Constructor Studio integration is optional** — templates are useful on their own for clear, consistent documentation.
 
 ## Governance & Process
 
@@ -195,13 +195,13 @@ Both ADR and Feature files MUST use the prefix `NNNN-{cpt-id}.md`:
 - `features/0001-cpt-examples-todo-app-feature-core.md`
 - `features/0002-cpt-examples-todo-app-feature-logic.md`
 
-## Cypilot ID Convention
+## Constructor Studio ID Convention
 
-Cypilot IDs enable traceability across all specification artifacts.
+Constructor Studio IDs enable traceability across all specification artifacts.
 
-### Cypilot ID Definition
+### Constructor Studio ID Definition
 
-An Cypilot ID **defines** a unique identifier for a specification element (actor, requirement, feature, etc.). Each ID must be **globally unique** within the gear, subsystem or global project depending on where it's defined
+A Constructor Studio ID **defines** a unique identifier for a specification element (actor, requirement, feature, etc.). Each ID must be **globally unique** within the gear, subsystem or global project depending on where it's defined
 
 **Format**:
 ```
@@ -212,7 +212,7 @@ cpt-{system}-{kind}-{slug}
 
 ### ID Scope
 
-An Cypilot ID covers the **markdown section where it's defined and all its subsections**:
+A Constructor Studio ID covers the **markdown section where it's defined and all its subsections**:
 
 - ID on `#` (H1) → covers the entire document
 - ID on `##` (H2) → covers that section and all H3/H4/... within it
@@ -253,21 +253,21 @@ API responses must complete within 200ms at p95...
 
 > **Note**: Implementation status and priority are **informative only** — they don't replace your issue tracking system. Keep them simple. The value is having spec-to-implementation traceability directly in version-controlled documentation, reducing uncertainty between what's specified and what's actually built.
 
-### Cypilot ID Reference
+### Constructor Studio ID Reference
 
-An Cypilot ID **reference** links to an element defined elsewhere. References create traceability between documents — for example, a Feature can reference Actors from PRD, or an ADR can reference Requirements it addresses.
+A Constructor Studio ID **reference** links to an element defined elsewhere. References create traceability between documents — for example, a Feature can reference Actors from PRD, or an ADR can reference Requirements it addresses.
 
 **Placement**: Use backtick notation `` `cpt-...` `` when referencing an ID defined in another section or file.
 
 ### Validation
 
-Cypilot IDs must be unique. When Cypilot tooling is connected, `cypilot validate` will:
+Constructor Studio IDs must be unique. When Constructor Studio tooling is connected, `cfs validate` will:
 - Check that all referenced IDs exist
 - Detect duplicate definitions
 - Verify cross-document consistency
 ### Kind Reference
 
-These are **suggested** kind names for common artifact types. Cypilot does not enforce specific kind values — use whatever naming makes sense for your project. The important thing is consistency within your codebase.
+These are **suggested** kind names for common artifact types. Constructor Studio does not enforce specific kind values — use whatever naming makes sense for your project. The important thing is consistency within your codebase.
 
 |Kind|Description|
 |------|-------------|
@@ -291,18 +291,18 @@ These are **suggested** kind names for common artifact types. Cypilot does not e
 - `cpt-examples-todo-app-adr-local-storage` — ADR ID
 - `cpt-examples-todo-app-feature-core` — Feature ID
 
-> **Note**: You can use any slug that fits your domain. For example, `cpt-billing-usecase-checkout` or `cpt-auth-nfr-token-expiry` are equally valid if your team prefers more specific kinds. Cypilot validation only checks that referenced IDs exist — it does not validate kind names.
+> **Note**: You can use any slug that fits your domain. For example, `cpt-billing-usecase-checkout` or `cpt-auth-nfr-token-expiry` are equally valid if your team prefers more specific kinds. Constructor Studio validation only checks that referenced IDs exist — it does not validate kind names.
 
 ## Example
 
 See [examples/todo-app/](./examples/todo-app/) for a complete example using a universally understood Todo App theme.
 
-## Cypilot Compatibility
+## Constructor Studio Compatibility
 
-When full Cypilot framework is connected:
+When full Constructor Studio framework is connected:
 
-1. **Validation** — `cypilot validate` will check document structure and cross-references
+1. **Validation** — `cfs validate` will check document structure and cross-references
 2. **Traceability** — IDs will be linked across PRD → DESIGN → ADR → FEATURE → code
 3. **Deterministic gates** — CI/CD can enforce document quality before code changes
 
-For more details on Cypilot taxonomy and artifact relationships, see [`TAXONOMY.md`](https://github.com/constructorfabric/Cypilot/blob/main/guides/TAXONOMY.md).
+For more details on Constructor Studio taxonomy and artifact relationships, see Constructor Studio documentation.

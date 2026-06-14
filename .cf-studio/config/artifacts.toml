@@ -1,0 +1,358 @@
+# Updated: 2026-03-27 by Constructor Tech
+# Constructor Studio artifacts registry (migrated from v2)
+
+[[ignore]]
+reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Constructor Studio SDLC artifact."
+patterns = ["gears/system/resource-group/docs/rust-traits.md"]
+
+[[ignore]]
+reason = "Ignore 'gears/system' parent directory — not a module, only a grouping for system submodules."
+patterns = ["gears/system"]
+
+[[ignore]]
+reason = "Ignore authn-resolver root module node while allowing nested plugin docs scopes."
+patterns = ["gears/system/authn-resolver"]
+
+[[ignore]]
+reason = "Ignore 'gears/system/authz-resolver' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/authz-resolver/*"]
+
+[[ignore]]
+reason = "Ignore module 'api-gateway' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/api-gateway/*"]
+
+[[ignore]]
+reason = "Ignore module 'grpc-hub' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/grpc-hub/*"]
+
+[[ignore]]
+reason = "Ignore module 'gear-orchestrator' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/gear-orchestrator/*"]
+
+[[ignore]]
+reason = "Ignore module 'nodes-registry' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/nodes-registry/*"]
+
+[[ignore]]
+reason = "Ignore oagw codebase and features — code traceability markers reverted, pending re-add. PRD/DESIGN/ADR/DECOMPOSITION still validated via autodetect."
+patterns = [
+  "gears/system/oagw/oagw/src/*",
+  "gears/system/oagw/oagw/tests/*",
+  "gears/system/oagw/oagw-sdk/src/*",
+  "gears/system/oagw/docs/features/*",
+]
+
+[[ignore]]
+reason = "Ignore legacy (pre-CFS) ADR files in oagw/docs root — converted copies live under docs/ADR/."
+patterns = ["gears/system/oagw/docs/adr-*.md"]
+
+
+[[ignore]]
+reason = "Ignore module 'tenant-resolver' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/tenant-resolver/*"]
+
+[[ignore]]
+reason = "Ignore module 'types' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/types/*"]
+
+[[ignore]]
+reason = "Ignore module 'types-registry' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/types-registry/*"]
+
+[[ignore]]
+reason = "Ignore module 'types-sdk' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/types-sdk/*"]
+
+[[ignore]]
+reason = "Ignore module 'simple-user-settings' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/simple-user-settings/*"]
+
+[[ignore]]
+reason = "Ignore module 'types-registry' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/types-registry/*"]
+
+[[ignore]]
+reason = "Ignore serverless-runtime companion docs — supplementary to DESIGN.md, not standalone SDLC artifacts."
+patterns = [
+  "gears/serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md",
+  "gears/serverless-runtime/docs/DESIGN_RUST_TYPES.md",
+  "gears/serverless-runtime/docs/NEXT_ADR_SCOPE.md",
+]
+
+[[ignore]]
+reason = "Ignore file-storage companion docs — api.md is a reference summary supplementary to DESIGN.md, not a standalone SDLC artifact."
+patterns = [
+  "gears/file-storage/docs/api.md",
+]
+
+[[ignore]]
+reason = "Ignore module 'mini-chat' docs (temporary: PRD/DESIGN constraints failing in CI)."
+patterns = ["gears/mini-chat/*"]
+
+[[ignore]]
+reason = "Ignore module 'approval-service' (PRD/DESIGN are placeholders). Remove this ignore after PRD/DESIGN conform to template."
+patterns = ["gears/approval-service/*"]
+
+[[ignore]]
+reason = "Ignore module 'model-registry' (PRD/DESIGN headings need restructuring to match template). Remove after structural alignment."
+patterns = ["gears/model-registry/*"]
+
+[[systems]]
+name = "cf-gears"
+slug = "cf"
+kit = "gears"
+
+[[systems.autodetect]]
+kit = "gears"
+system_root = "{project_root}/gears/$system"
+artifacts_root = "{system_root}/docs"
+
+[systems.autodetect.artifacts]
+[systems.autodetect.artifacts.PRD]
+pattern = "PRD.md"
+traceability = "FULL"
+required = true
+
+[systems.autodetect.artifacts.DESIGN]
+pattern = "DESIGN.md"
+traceability = "FULL"
+required = true
+
+[systems.autodetect.artifacts.ADR]
+pattern = "ADR/*.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.UPSTREAM_REQS]
+pattern = "UPSTREAM_REQS.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.validation]
+require_kind_registered_in_kit = true
+require_md_extension = true
+fail_on_unmatched_markdown = true
+
+[[systems.autodetect.codebase]]
+name = "Gears"
+path = "{system_root}/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Tests"
+path = "{system_root}/tests"
+extensions = [".rs"]
+
+[[systems.autodetect]]
+kit = "gears"
+system_root = "{project_root}/gears/system/$system"
+artifacts_root = "{system_root}/docs"
+
+[systems.autodetect.artifacts]
+[systems.autodetect.artifacts.PRD]
+pattern = "PRD.md"
+traceability = "FULL"
+required = true
+
+[systems.autodetect.artifacts.DESIGN]
+pattern = "DESIGN.md"
+traceability = "FULL"
+required = true
+
+[systems.autodetect.artifacts.ADR]
+pattern = "ADR/*.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.UPSTREAM_REQS]
+pattern = "UPSTREAM_REQS.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.validation]
+require_kind_registered_in_kit = true
+require_md_extension = true
+# fail_on_unmatched_markdown is disabled at this scope because children autodetect rules
+# (e.g. account-management/docs/tr-plugin) do not carve their paths out of the parent's
+# unmatched-markdown walk, so tightening this would flag legitimate sub-plugin artifacts
+# as unmatched.
+#
+# Known trade-off: because this autodetect block matches every gears/system/$system
+# (oagw, resource-group, account-management, and any future sibling), setting this flag
+# to `false` here also disables unmatched-markdown detection across every other
+# gears/system/* subtree — not only account-management. Strictness is retained on each
+# child scope (see the tr-plugin child below, which keeps fail_on_unmatched_markdown = true).
+#
+# Do NOT tighten this flag without first introducing a per-path carve-out mechanism for
+# the tr-plugin-style sub-plugin case; otherwise the legitimate sub-plugin artifacts will
+# re-surface as unmatched-markdown failures for every module that ships nested artifacts.
+fail_on_unmatched_markdown = false
+
+[[systems.autodetect.codebase]]
+name = "Gears"
+path = "{system_root}/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Tests"
+path = "{system_root}/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested Gears"
+path = "{system_root}/{system}/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested Tests"
+path = "{system_root}/{system}/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested SDK"
+path = "{system_root}/{system}-sdk/src"
+extensions = [".rs"]
+
+# Nested sub-plugin scope: account-management/docs/tr-plugin/ carries its own PRD/DESIGN/ADR.
+# Declared as a child of the `gears/system/$system` autodetect rule so the sub-plugin
+# artifacts are detected as belonging to tr-plugin, not to account-management.
+[[systems.autodetect.children]]
+kit = "gears"
+system_root = "{project_root}/gears/system/account-management/docs/tr-plugin"
+artifacts_root = "{system_root}"
+
+[systems.autodetect.children.artifacts]
+[systems.autodetect.children.artifacts.PRD]
+pattern = "PRD.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.DESIGN]
+pattern = "DESIGN.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.ADR]
+pattern = "ADR/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.validation]
+require_kind_registered_in_kit = true
+require_md_extension = true
+fail_on_unmatched_markdown = true
+
+# Nested sub-plugin scope: OIDC AuthN plugin carries its own PRD/DESIGN/DECOMPOSITION
+# under gears/system/authn-resolver/plugins/oidc-authn-plugin/docs.
+[[systems.autodetect.children]]
+kit = "gears"
+system_root = "{project_root}/gears/system/authn-resolver/plugins/oidc-authn-plugin/docs"
+artifacts_root = "{system_root}"
+
+[systems.autodetect.children.artifacts]
+[systems.autodetect.children.artifacts.PRD]
+pattern = "PRD.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.DESIGN]
+pattern = "DESIGN.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.ADR]
+pattern = "ADR/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.validation]
+require_kind_registered_in_kit = true
+require_md_extension = true
+fail_on_unmatched_markdown = true
+
+[[systems]]
+name = "examples"
+slug = "examples"
+kit = "gears"
+
+[[systems.autodetect]]
+kit = "gears"
+system_root = "{project_root}/docs/spec-templates/examples/$system"
+artifacts_root = "{system_root}"
+codebase = []
+
+[systems.autodetect.artifacts]
+[systems.autodetect.artifacts.PRD]
+pattern = "PRD.md"
+traceability = "DOCS-ONLY"
+required = true
+
+[systems.autodetect.artifacts.DESIGN]
+pattern = "DESIGN.md"
+traceability = "DOCS-ONLY"
+required = true
+
+[systems.autodetect.artifacts.ADR]
+pattern = "ADR/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.artifacts.UPSTREAM_REQS]
+pattern = "UPSTREAM_REQS.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.validation]
+require_kind_registered_in_kit = true
+require_md_extension = true
+fail_on_unmatched_markdown = true

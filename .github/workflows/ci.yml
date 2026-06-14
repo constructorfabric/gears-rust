@@ -310,9 +310,9 @@ jobs:
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
 
-  cypilot:
-    name: Cypilot
-    uses: ./.github/workflows/cypilot.yml
+  cfs:
+    name: CFS
+    uses: ./.github/workflows/cfs.yml
 
   security:
     name: Security (cargo-deny & cargo-audit on Ubuntu)

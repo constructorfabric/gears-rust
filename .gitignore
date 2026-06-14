@@ -63,3 +63,61 @@ testing/e2e/logs/
 
 # Cypilot per-task working data (scratch reviews, logs, prompts; not tracked)
 .cypilot/work/
+
+# BEGIN Constructor Studio
+# Generated Constructor Studio runtime and agent integration files.
+# Files matched here are owned by Constructor Studio and may be overwritten.
+.cf-studio/.core/
+.cf-studio/.gen/
+.agents/skills/cf/
+.agents/skills/cf-*/
+.agents/skills/studio-*/
+.agents/skills/cypilot-*/
+.agents/skills/cf-constructor-*/
+.codex/agents/cf*.toml
+.codex/agents/studio-*.toml
+.codex/agents/cypilot-*.toml
+.codex/agents/cf-constructor-*.toml
+.codex/agents/storytelling-*.toml
+.codex/.cf-installed
+.codex/.constructor-studio-installed
+.claude/skills/cf/
+.claude/skills/cf-*/
+.claude/commands/cf*.md
+.claude/commands/studio-*.md
+.claude/commands/cypilot-*.md
+.claude/commands/cf-constructor-*.md
+.claude/agents/cf*.md
+.claude/agents/studio-*.md
+.claude/agents/cypilot-*.md
+.claude/agents/cf-constructor-*.md
+.claude/agents/storytelling-*.md
+.cursor/commands/cf*.md
+.cursor/commands/studio-*.md
+.cursor/commands/cypilot-*.md
+.cursor/commands/cf-constructor-*.md
+.cursor/agents/cf*.md
+.cursor/agents/studio-*.md
+.cursor/agents/cypilot-*.md
+.cursor/agents/cf-constructor-*.md
+.cursor/agents/storytelling-*.md
+.github/prompts/cf*.prompt.md
+.github/prompts/studio-*.prompt.md
+.github/prompts/cypilot-*.prompt.md
+.github/prompts/cf-constructor-*.prompt.md
+.github/agents/cf*.md
+.github/agents/studio-*.md
+.github/agents/cypilot-*.md
+.github/agents/cf-constructor-*.md
+.github/agents/storytelling-*.md
+.github/.cf-installed
+.github/.constructor-studio-installed
+.github/copilot-instructions.md
+.windsurf/workflows/cf*.md
+.windsurf/workflows/studio-*.md
+.windsurf/workflows/cypilot-*.md
+.windsurf/workflows/cf-constructor-*.md
+# END Constructor Studio
+*.backup*
+.cf-studio/config/kits/sdlc/*
+.cf-studio/.cache/explore/*

@@ -102,7 +102,7 @@ Before starting the review, confirm:
 
 ## Evidence Requirements (STRICT mode)
 
-**When Rules Mode = STRICT** (per `{cypilot_path}/.core/requirements/agent-compliance.md`):
+**When Rules Mode = STRICT** (per `{cf-studio-path}/.core/requirements/agent-compliance.md`):
 
 ### For Each Checklist Category
 
@@ -234,6 +234,8 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Data flow between components described
 - [ ] Control flow between components described
 - [ ] Component naming is consistent and meaningful
+- [ ] Public contracts are SDK-first when the system exposes reusable client behavior
+- [ ] Domain, API, and infrastructure responsibilities are separated or any deviation is explicitly justified
 
 ### ARCH-DESIGN-005: Domain Model Authority
 **Severity**: CRITICAL
@@ -262,6 +264,9 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Error handling expectations documented
 - [ ] AuthN/AuthZ entry points documented
 - [ ] Versioning strategy documented (if applicable)
+- [ ] REST routes use the framework's canonical OperationBuilder/operation-registration pattern, including explicit response and error metadata
+- [ ] Error envelopes use the canonical Problem/RFC-9457 shape when exposed over HTTP
+- [ ] Wire errors avoid stack traces, internal diagnostics, secrets, and implementation-only identifiers
 - [ ] If API discriminator fields, resource types, or extensible constants are modeled, validate that the design uses `guidelines/GTS.md` appropriately instead of closed string enums where extensibility/semantics are required
 
 ### ARCH-DESIGN-007: Interaction Sequences
@@ -447,6 +452,8 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Input validation strategy documented
 - [ ] Output encoding strategy documented
 - [ ] CORS policy documented (if applicable)
+- [ ] Tenant, identity, authorization, and security context boundaries are explicit
+- [ ] Changes to privilege boundaries, secrets, FIPS behavior, or registry matching include a review record naming the guardrail or deviation, rationale, owner, and validation performed
 
 ### SEC-DESIGN-005: Threat Modeling
 **Severity**: HIGH
@@ -546,6 +553,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Data sharding strategy documented (if applicable)
 - [ ] Hot/warm/cold data strategy documented
 - [ ] Data archival strategy documented
+- [ ] Privileged access is owned by the runtime or another explicitly trusted boundary, not by arbitrary gear code
 
 ### DATA-DESIGN-002: Data Integrity
 **Severity**: CRITICAL
@@ -722,6 +730,9 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Performance test approach documented
 - [ ] Security test approach documented
 - [ ] Contract test approach documented
+- [ ] Unit/integration tests cover deterministic logic and integration boundaries at the right layer
+- [ ] E2E tests cover externally observable integration flows without replacing lower-level deterministic tests
+- [ ] Compile-fail tests are required only when the design exposes compile-time guarantees such as macro diagnostics, generated code contracts, type-state APIs, or security/type-system invariants
 
 ---
 
