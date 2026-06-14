@@ -9,6 +9,12 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-sdk-v0.1.3...cf-gears-account-management-sdk-v0.1.4) - 2026-06-14
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-odata, cf-gears-toolkit-gts, cf-gears-toolkit-odata-macros, cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
 ## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oidc-authn-plugin-v0.1.0...cf-gears-oidc-authn-plugin-v0.1.1) - 2026-06-11
 
 ### Other
