@@ -45,13 +45,20 @@ WHEN:
 DO:
   LOAD the source FEATURE artifact
   RUN determine traceability mode from the FEATURE or project configuration
-  RUN implement only the requested FEATURE scope and preserve existing behavior outside that scope
-  RUN deterministic validation with project tests, lint/typecheck/build when available, and `cfs validate --artifact <code-path>`
-  RUN fix every deterministic finding and repeat validation until zero errors
+  RUN split the FEATURE design into implementation slices from its flow, algorithm, state, and definition-of-done IDs
+  RUN order slices by dependency and user-observable behavior, keeping each slice independently testable
+  RUN implement one slice at a time with TDD: write or update the failing test first, implement the smallest passing code, then refactor
+  RUN after each slice, run deterministic validation with project tests, lint/typecheck/build when available, and `cfs validate --artifact <code-path>`
+  RUN fix every deterministic finding and repeat validation until zero errors before starting the next slice
+  RUN after each slice is deterministic-clean, run the semantic review loop for that slice and fix findings before starting the next slice
+  RUN preserve existing behavior outside the current slice and requested FEATURE scope
 RULES:
   ALWAYS keep {codebase_checklist} review-only; NEVER load it during generation
   ALWAYS treat the source FEATURE and linked DESIGN/ADR/PRD/UPSTREAM_REQS IDs as the implementation contract
   ALWAYS resolve the source FEATURE location before implementation; if it cannot be resolved from `@cpt-*` markers or user input, stop and ask for it
+  ALWAYS create a slice plan from the FEATURE design before editing code; each slice must name the FEATURE IDs it implements
+  ALWAYS finish the current slice's TDD, deterministic validation, and semantic review before moving to the next slice
+  ALWAYS keep slice scope small enough that tests, code, CPT markers, and FEATURE checkbox/status updates can be reviewed together
   ALWAYS add `@cpt-begin` and `@cpt-end` markers for implemented CDSL IDs when traceability mode is FULL
   ALWAYS generate CPT marker IDs from existing FEATURE CDSL IDs; never invent implementation-only CPT IDs outside the source artifact contract
   ALWAYS keep CPT markers minimal, correctly nested, and attached to the code that realizes the referenced behavior
