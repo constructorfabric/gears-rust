@@ -255,19 +255,11 @@ clippy-deep:
 cfs-ensure:
 	@if ! command -v $(CFS) >/dev/null 2>&1; then \
 		echo "cfs not found; installing $(CFS_PIPX_SPEC) via pipx"; \
-		if command -v pipx >/dev/null 2>&1; then \
-			pipx ensurepath; \
-			pipx install $(CFS_PIPX_SPEC); \
-		elif python3 -m pipx --version >/dev/null 2>&1; then \
-			python3 -m pipx ensurepath; \
-			python3 -m pipx install $(CFS_PIPX_SPEC); \
-		elif [ -n "$$GITHUB_ACTIONS" ] || [ -n "$$ACT" ]; then \
-			python3 -m pip install --user pipx; \
-			python3 -m pipx ensurepath; \
-			python3 -m pipx install $(CFS_PIPX_SPEC); \
-		else \
-			echo "ERROR: pipx is required to install cfs. Install it first, for example: brew install pipx"; \
+		if ! command -v pipx >/dev/null 2>&1; then \
+			echo "ERROR: pipx is required before running this target"; \
 			exit 1; \
+		else \
+			pipx install $(CFS_PIPX_SPEC); \
 		fi; \
 	fi
 	@if ! command -v $(CFS) >/dev/null 2>&1; then \

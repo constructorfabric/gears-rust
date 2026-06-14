@@ -24,10 +24,10 @@ import sys
 
 try:
     import tomllib
-except GearNotFoundError:  # Python < 3.11
+except ModuleNotFoundError:  # Python < 3.11
     try:
         import tomli as tomllib  # type: ignore[no-redef]
-    except GearNotFoundError:
+    except ModuleNotFoundError:
         tomllib = None  # type: ignore[assignment]
 
 
@@ -969,17 +969,29 @@ def reorder(pr_number: str):
 
 
 # @cpt-begin:cpt-cfs-flow-pr-workflows-status:p1:inst-user-status
+def _print_usage(stream=sys.stderr):
+    print(
+        "Usage: pr.py {list|fetch|status|reorder} [PR_NUMBER|ALL]",
+        file=stream,
+    )
+    print("", file=stream)
+    print("Commands:", file=stream)
+    print("  list                 List open pull requests", file=stream)
+    print("  fetch <PR|ALL>       Fetch latest PR metadata, diff, and comments", file=stream)
+    print("  status <PR|ALL>      Fetch and generate PR status report(s)", file=stream)
+    print("  reorder <PR>         Reorder a generated status report by severity", file=stream)
+
+
 def main():
     if len(sys.argv) < 2:
-        print(
-            "Usage: pr.py "
-            "{list|fetch|status|reorder} "
-            "[PR_NUMBER]",
-            file=sys.stderr,
-        )
+        _print_usage()
         sys.exit(1)
 
     cmd = sys.argv[1]
+
+    if cmd in ("-h", "--help", "help"):
+        _print_usage(stream=sys.stdout)
+        sys.exit(0)
 
     if cmd == "list":
         prs = _list_open_prs()

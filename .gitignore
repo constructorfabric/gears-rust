@@ -119,3 +119,4 @@ testing/e2e/logs/
 .windsurf/workflows/cf-constructor-*.md
 # END Constructor Studio
 *.backup*
+.cf-studio/config/kits/sdlc/*

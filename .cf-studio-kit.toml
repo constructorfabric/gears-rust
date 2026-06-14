@@ -239,15 +239,6 @@ type = "file"
 user_modifiable = true
 
 [[kits.resources]]
-id = "workflow_migrate_openspec"
-kind = "skill"
-source = "studio-kit-gears/workflows/migrate-openspec.md"
-install_path = "workflows/migrate-openspec.md"
-type = "file"
-user_modifiable = true
-public = true
-
-[[kits.resources]]
 id = "workflow_pr_review"
 kind = "skill"
 source = "studio-kit-gears/workflows/pr-review.md"
