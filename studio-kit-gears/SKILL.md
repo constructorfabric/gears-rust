@@ -1,11 +1,66 @@
 ---
 name: cf-gears-router
-description: "Artifacts: ADR, CODEBASE, DECOMPOSITION, DESIGN, FEATURE, PR-CODE-REVIEW-TEMPLATE, PR-REVIEW, PR-STATUS-REPORT-TEMPLATE, PRD; Workflows: pr-review, pr-status"
+description: "Artifacts: ADR, CODEBASE, DECOMPOSITION, DESIGN, FEATURE, PR-CODE-REVIEW-TEMPLATE, PR-REVIEW, PR-STATUS-REPORT-TEMPLATE, PRD, UPSTREAM_REQS; Workflows: doc-prd, doc-upstream-reqs, doc-adr, doc-design, decompose, doc-feature, implement, change-impact-analysis, pr-review, pr-status"
 ---
 
 # Constructor Studio Skill — Kit `gears`
 
 Kit `gears` skill extensions.
+
+## Authoring & Implementation Workflows
+
+Each Gears artifact has a thin preset workflow that delegates to a core engine
+(`cf-write-docs` for documents, `cf-coding` for code) while binding the artifact
+KIND and injecting that artifact's gears rules, template, checklist, and example.
+
+| Skill | Artifact KIND | Engine | Workflow |
+|-------|---------------|--------|----------|
+| `cf-gears-doc-prd` | PRD | cf-write-docs | `{workflow_doc_prd}` |
+| `cf-gears-doc-upstream-reqs` | UPSTREAM_REQS | cf-write-docs | `{workflow_doc_upstream_reqs}` |
+| `cf-gears-doc-adr` | ADR | cf-write-docs | `{workflow_doc_adr}` |
+| `cf-gears-doc-design` | DESIGN | cf-write-docs | `{workflow_doc_design}` |
+| `cf-gears-decompose` | DECOMPOSITION | cf-write-docs | `{workflow_decompose}` |
+| `cf-gears-doc-feature` | FEATURE | cf-write-docs | `{workflow_doc_feature}` |
+| `cf-gears-implement` | CODE | cf-coding | `{workflow_implement}` |
+
+ALWAYS route to the matching preset workflow WHEN the user intent is authoring,
+revising, or implementing the corresponding Gears artifact:
+
+- `cf-gears-doc-prd` - write/revise a PRD (`generate PRD`, `write the PRD`)
+- `cf-gears-doc-upstream-reqs` - write/revise UPSTREAM_REQS (`generate upstream requirements`, `write UPSTREAM_REQS`)
+- `cf-gears-doc-adr` - write/revise an ADR (`generate ADR`, `record a decision`)
+- `cf-gears-doc-design` - write/revise a DESIGN (`generate DESIGN`, `design the gear`)
+- `cf-gears-decompose` - write/revise a DECOMPOSITION (`decompose`, `break into features`)
+- `cf-gears-doc-feature` - write/revise a FEATURE (`generate FEATURE`, `spec the feature`)
+- `cf-gears-implement` - implement a FEATURE in code (`implement`, `write the code`)
+
+When routed to a preset workflow:
+1. Read the matched workflow file and follow it.
+2. The preset binds the artifact KIND + gears references, then delegates the full
+   author/coder -> deterministic-gate -> semantic-review loop to its core engine.
+
+## Analysis Workflows
+
+| Skill | Engine | Workflow | Output |
+|-------|--------|----------|--------|
+| `cf-gears-change-impact-analysis` | cf-analyze | `{workflow_change_impact_analysis}` | `.change-impact/{id}/report.md` |
+
+ALWAYS route to `cf-gears-change-impact-analysis` WHEN the user intent is to
+analyze downstream impact of an upstream Gears artifact change (`impact of
+changing UPSTREAM_REQS`, `what breaks if I change this DESIGN`, `trace affected FEATUREs`).
+The workflow is read-only; modes are `cascade-tracking` and
+`release-readiness-estimation`; thresholds live in `{change_impact_config}`.
+
+## UPSTREAM_REQS
+
+### UPSTREAM_REQS Commands
+- `cfs validate --artifact <UPSTREAM_REQS.md>` - validate UPSTREAM_REQS structure and IDs
+- `cfs list-ids --kind upreq` - list all upstream requirements
+- `cfs where-defined --id <id>` - find where an upstream requirement ID is defined
+- `cfs where-used --id <id>` - find where an upstream requirement ID is referenced downstream
+### UPSTREAM_REQS Workflows
+- **Generate UPSTREAM_REQS**: create requirements from existing modules toward a future module with guided prompts per section
+- **Analyze UPSTREAM_REQS**: validate structure (deterministic) then semantic quality (checklist-based)
 
 ## ADR
 

@@ -150,6 +150,46 @@ path = "../docs/checklists/CODING.md"
 kind = "checklist"
 public = false
 
+[kits.gears.resources.workflow_doc_prd]
+path = "../studio-kit-gears/workflows/doc-prd.md"
+kind = "skill"
+public = true
+
+[kits.gears.resources.workflow_doc_upstream_reqs]
+path = "../studio-kit-gears/workflows/doc-upstream-reqs.md"
+kind = "skill"
+public = true
+
+[kits.gears.resources.workflow_doc_adr]
+path = "../studio-kit-gears/workflows/doc-adr.md"
+kind = "skill"
+public = true
+
+[kits.gears.resources.workflow_doc_design]
+path = "../studio-kit-gears/workflows/doc-design.md"
+kind = "skill"
+public = true
+
+[kits.gears.resources.workflow_decompose]
+path = "../studio-kit-gears/workflows/decompose.md"
+kind = "skill"
+public = true
+
+[kits.gears.resources.workflow_doc_feature]
+path = "../studio-kit-gears/workflows/doc-feature.md"
+kind = "skill"
+public = true
+
+[kits.gears.resources.workflow_implement]
+path = "../studio-kit-gears/workflows/implement.md"
+kind = "skill"
+public = true
+
+[kits.gears.resources.workflow_change_impact_analysis]
+path = "../studio-kit-gears/workflows/change-impact-analysis.md"
+kind = "skill"
+public = true
+
 [kits.gears.resources.workflow_pr_review]
 path = "../studio-kit-gears/workflows/pr-review.md"
 kind = "skill"
@@ -162,6 +202,11 @@ public = true
 
 [kits.gears.resources.scripts]
 path = "../studio-kit-gears/scripts"
+kind = "script"
+public = false
+
+[kits.gears.resources.change_impact_config]
+path = "../studio-kit-gears/scripts/change-impact-analysis.toml"
 kind = "script"
 public = false
 
