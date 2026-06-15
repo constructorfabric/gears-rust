@@ -305,13 +305,14 @@ async fn delete_message_subtree_removes_whole_tree_against_sqlite() {
 
     // Deep + wide tree under `root`:  root → {a, b};  a → gc.
     // Plus an unrelated root (`other`) that must survive the delete.
-    // Siblings under `root` need distinct variant_index (UNIQUE constraint);
-    // the two NULL-parent roots don't conflict (NULLs are distinct).
+    // Siblings under a shared parent need distinct variant_index — including
+    // the two NULL-parent roots, now that the root partial UNIQUE index
+    // enforces uniqueness for `parent_message_id IS NULL`.
     let root = db::seed_message(&harness, session_id, None, 0).await;
     let a = db::seed_message(&harness, session_id, Some(root), 0).await;
     let b = db::seed_message(&harness, session_id, Some(root), 1).await;
     let gc = db::seed_message(&harness, session_id, Some(a), 0).await;
-    let other = db::seed_message(&harness, session_id, None, 0).await;
+    let other = db::seed_message(&harness, session_id, None, 1).await;
 
     let removed = harness
         .messages

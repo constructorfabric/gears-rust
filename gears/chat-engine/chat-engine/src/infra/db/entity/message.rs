@@ -9,7 +9,7 @@ use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
-use crate::infra::db::migrations::UQ_VARIANT_INDEX;
+use crate::infra::db::migrations::{UQ_VARIANT_INDEX, UQ_VARIANT_INDEX_ROOT};
 
 /// Maximum retries when racing the `uq_messages_session_parent_variant`
 /// constraint. After exhaustion callers MUST map the returned error to
@@ -162,11 +162,12 @@ where
 /// retryable conflict into a hard failure: the structured discriminant
 /// stays put and only the narrowing message-text fallback would skew.
 ///
-/// Postgres includes the index name (`uq_messages_session_parent_variant`)
-/// in the violation message; SQLite emits the offending column list
-/// (`messages.session_id, messages.parent_message_id,
-/// messages.variant_index`). Either pattern unambiguously identifies
-/// this crate's only UNIQUE index. If neither matches, we return
+/// Postgres includes the index name (`uq_messages_session_parent_variant`
+/// or the root partial index `uq_messages_session_root_variant`) in the
+/// violation message; SQLite emits the offending column list, which always
+/// carries `messages.session_id` + `messages.variant_index` for either
+/// index. Both patterns unambiguously identify the crate's variant-index
+/// UNIQUE indexes. If neither matches, we return
 /// `false` and the caller surfaces the error without retrying — the
 /// safe default given an unrecognised UNIQUE violation might belong to
 /// a different schema constraint added later.
@@ -174,19 +175,21 @@ pub fn is_variant_unique_violation(err: &DbErr) -> bool {
     let Some(SqlErr::UniqueConstraintViolation(message)) = err.sql_err() else {
         return false;
     };
-    // Postgres path — the message embeds the index name verbatim.
-    if message.contains(UQ_VARIANT_INDEX) {
+    // Postgres path — the message embeds the index name verbatim. Both the
+    // composite index and the root-only partial index are retryable variant
+    // collisions.
+    if message.contains(UQ_VARIANT_INDEX) || message.contains(UQ_VARIANT_INDEX_ROOT) {
         return true;
     }
-    // SQLite path — no constraint name in the message; identify the
-    // UQ by the column triple it covers. Two of the three columns
-    // would already be ambiguous (the `idx_messages_session_parent`
-    // INDEX is on the first two columns but is not UNIQUE, so it does
-    // not raise this error), but matching on all three makes the
-    // classification air-tight.
-    message.contains("messages.session_id")
-        && message.contains("messages.parent_message_id")
-        && message.contains("messages.variant_index")
+    // SQLite path — no constraint name in the message; identify the UQ by the
+    // columns it covers. Both variant-uniqueness indexes
+    // (`uq_messages_session_parent_variant` over the column triple and the
+    // root partial index over `(session_id, variant_index)`) are the only
+    // UNIQUE indexes carrying `variant_index`, so `session_id` +
+    // `variant_index` together identify either unambiguously (the non-UNIQUE
+    // `idx_messages_session_parent` lacks `variant_index` and never raises
+    // this error).
+    message.contains("messages.session_id") && message.contains("messages.variant_index")
 }
 
 #[cfg(test)]
@@ -302,6 +305,75 @@ mod tests {
         assert!(
             matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))),
             "DbErr::sql_err() must surface UniqueConstraintViolation; got: {err:?}",
+        );
+    }
+
+    /// Two ROOT messages (`parent_message_id` NULL) with the same
+    /// `(session_id, variant_index)` must collide on the root partial UNIQUE
+    /// index. The composite `uq_messages_session_parent_variant` alone treats
+    /// the NULL parents as distinct and would let both through — this asserts
+    /// the partial index closes that gap and the collision is retryable.
+    #[tokio::test]
+    async fn detects_real_sqlite_root_uq_violation() {
+        use sea_orm::ConnectOptions;
+
+        let mut opts = ConnectOptions::new("sqlite::memory:".to_string());
+        opts.max_connections(1);
+        let db = Database::connect(opts).await.expect("connect");
+        crate::infra::db::Migrator::up(&db, None)
+            .await
+            .expect("migrations");
+
+        let session_id = uuid::Uuid::new_v4();
+        let session_type_id = uuid::Uuid::new_v4();
+        let now = OffsetDateTime::now_utc().to_string();
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            format!(
+                "INSERT INTO session_types (session_type_id, name, plugin_instance_id, \
+                 created_at, updated_at) VALUES ('{session_type_id}', 'test', NULL, \
+                 '{now}', '{now}')",
+            ),
+        ))
+        .await
+        .expect("seed session_type");
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            format!(
+                "INSERT INTO sessions (session_id, tenant_id, user_id, client_id, \
+                 session_type_id, enabled_capabilities, metadata, lifecycle_state, \
+                 share_token, deleted_at, scheduled_hard_delete_at, created_at, \
+                 updated_at) VALUES ('{session_id}', 't', 'u', NULL, \
+                 '{session_type_id}', NULL, NULL, 'active', NULL, NULL, NULL, '{now}', \
+                 '{now}')",
+            ),
+        ))
+        .await
+        .expect("seed session");
+
+        let insert_root = |id: uuid::Uuid| {
+            Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!(
+                    "INSERT INTO messages (message_id, session_id, parent_message_id, \
+                     role, content, file_ids, variant_index, is_active, is_complete, \
+                     is_hidden_from_user, is_hidden_from_backend, metadata, created_at) \
+                     VALUES ('{id}', '{session_id}', NULL, 'user', '{{\"text\":\"r\"}}', \
+                     NULL, 0, 1, 1, 0, 0, NULL, '{now}')",
+                ),
+            )
+        };
+        db.execute(insert_root(uuid::Uuid::new_v4()))
+            .await
+            .expect("seed first root");
+        let err = db
+            .execute(insert_root(uuid::Uuid::new_v4()))
+            .await
+            .expect_err("second root with same variant_index must violate the root UNIQUE index");
+
+        assert!(
+            is_variant_unique_violation(&err),
+            "root variant collision must classify as retryable; got: {err:?}",
         );
     }
 
