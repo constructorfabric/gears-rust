@@ -388,11 +388,26 @@ impl SessionService {
                 }
                 Err(err) => {
                     // Rollback: hard-delete the orphan session row so the
-                    // caller can safely retry.
-                    self.sessions
+                    // caller can safely retry. If the rollback itself fails
+                    // the row is orphaned — surface that as an internal error
+                    // (combining both causes) rather than masking it behind
+                    // the otherwise-retryable plugin error.
+                    if let Err(rollback_err) = self
+                        .sessions
                         .hard_delete(&identity.tenant_id, &identity.user_id, inserted_id)
                         .await
-                        .ok();
+                    {
+                        warn!(
+                            session_id = %inserted_id,
+                            plugin_error = %err,
+                            rollback_error = %rollback_err,
+                            "failed to roll back orphaned session row after plugin rejection",
+                        );
+                        return Err(ChatEngineError::internal(format!(
+                            "session rollback failed after plugin error ({err}); \
+                             session {inserted_id} may be orphaned"
+                        )));
+                    }
                     return Err(err);
                 }
             }
