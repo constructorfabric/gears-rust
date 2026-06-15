@@ -27,7 +27,7 @@
 //!    `enabled_capabilities`.
 //!
 //! Concurrency: the recreate / branch flows allocate `variant_index` via
-//! [`assign_variant_index`] (Phase 1 helper) which retries up to 3 times
+//! the Phase-1 `compute_next_variant_index` helper which retries up to 3 times
 //! on `uq_messages_session_parent_variant` collisions and surfaces an
 //! exhausted retry as
 //! [`ChatEngineError::Conflict`] mapping to HTTP 409.
@@ -118,7 +118,7 @@ pub trait VariantRepo: Send + Sync {
     ) -> Result<Vec<Message>>;
 
     /// INSERT a user message as child of `parent_message_id` with
-    /// `variant_index = MAX+1` (uses [`assign_variant_index`]) AND its
+    /// `variant_index = MAX+1` (uses `compute_next_variant_index`) AND its
     /// assistant stub (`variant_index = 0`, `is_active=true`,
     /// `is_complete=false`) inside a single SERIALIZABLE transaction.
     ///
@@ -213,51 +213,12 @@ impl VariantService {
         self
     }
 
-    // ------------------------------------------------------------------
-    //  Variant-index allocation (Phase 6 public surface)
-    // ------------------------------------------------------------------
-
-    /// Allocate the next `variant_index` for the `(session_id,
-    /// parent_message_id)` sibling group.
-    ///
-    /// The Phase 1 helper [`crate::infra::db::assign_variant_index`]
-    /// already runs a SERIALIZABLE retry loop capped at
-    /// `VARIANT_INDEX_MAX_RETRIES (=3)` over the
-    /// `uq_messages_session_parent_variant` constraint. We surface a
-    /// dedicated [`ChatEngineError::Conflict`] when the helper exhausts
-    /// retries so the REST layer can map to HTTP 409.
-    ///
-    /// Returns the allocated index. The caller is responsible for the
-    /// matching INSERT (typically inside the repository method that
-    /// owns the new row).
-    //
-    // Kept `async` (and a no-op `&self`) deliberately: this is the documented
-    // Phase-6 surface anchor that always errors when called directly, so the
-    // signature matches the eventual real implementation.
-    #[allow(clippy::unused_async, clippy::unused_self)]
-    pub async fn assign_variant_index(
-        &self,
-        _session_id: Uuid,
-        _parent_message_id: Uuid,
-    ) -> Result<i32> {
-        // Defer the actual allocation to the repository methods that
-        // *immediately* INSERT under the new index (see
-        // `MessageRepo::insert_assistant_variant_stub` and
-        // `VariantRepo::insert_user_and_assistant_stub_for_branch`).
-        // The helper is exposed as part of the Phase 6 surface so
-        // callers — and downstream phases — have a single semantic
-        // anchor; the underlying mechanism is the Phase 1
-        // `assign_variant_index` SQL helper.
-        //
-        // We return `Internal` if this method is reached directly: the
-        // canonical path is "allocate + INSERT in the same SERIALIZABLE
-        // tx". Returning Conflict here would be incorrect (we have not
-        // actually raced anything yet).
-        Err(ChatEngineError::internal(
-            "VariantService::assign_variant_index is a documentation anchor \u{2014} use \
-             insert_assistant_variant_stub / insert_user_and_assistant_stub_for_branch",
-        ))
-    }
+    // Variant-index allocation is intentionally NOT exposed as a standalone
+    // method: an index must be allocated and INSERTed within the same
+    // SERIALIZABLE transaction (see `MessageRepo::insert_assistant_variant_stub`
+    // and `VariantRepo::insert_user_and_assistant_stub_for_branch`), which run
+    // the Phase-1 `compute_next_variant_index` retry loop. A free-standing
+    // allocator would hand back an index that is immediately stale.
 
     // ------------------------------------------------------------------
     //  Variant navigation
