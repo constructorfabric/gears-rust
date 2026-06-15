@@ -214,19 +214,15 @@ impl SessionService {
             // 404 (mapped from `NotFound`) so the developer can correct it.
             let plugin = self.plugins.resolve(plugin_instance_id)?;
 
-            // Persist plugin_config (optional, plugin-defined shape).
+            // Persist plugin_config (optional, plugin-defined shape) keyed by
+            // (plugin_instance_id, session_type_id) so `create_session`'s
+            // `PluginService::load_config` observes it later. A persistence
+            // failure surfaces to the caller rather than silently dropping the
+            // config.
             if let Some(cfg) = req.plugin_config.clone() {
-                // We don't currently expose `upsert` through PluginService;
-                // the load_config path is sufficient for the on_session_*
-                // call and the actual persistence happens in Phase 15 once
-                // the admin surface is wired. Log so operators see the
-                // request was accepted without persistence yet.
-                tracing::debug!(
-                    plugin_instance_id = %plugin_instance_id,
-                    session_type_id = %session_type_id,
-                    "plugin_config received on register_session_type \u{2014} persistence wiring lands in Phase 15"
-                );
-                let _ = cfg; // suppress unused warning
+                self.plugins
+                    .save_config(plugin_instance_id, session_type_id, cfg)
+                    .await?;
             }
 
             // Build a cancellable, deadline-bounded ctx and invoke the
