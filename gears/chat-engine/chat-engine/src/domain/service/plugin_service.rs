@@ -104,6 +104,25 @@ impl PluginService {
         self.configs.find(plugin_instance_id, session_type_id).await
     }
 
+    /// Persist (insert or update) the `(plugin_instance_id, session_type_id)`
+    /// JSONB config so a later [`Self::load_config`] — e.g. from
+    /// `create_session` — observes it.
+    ///
+    /// # Errors
+    ///
+    /// - Underlying repository / database errors propagate via
+    ///   `From<sea_orm::DbErr> for ChatEngineError`.
+    pub async fn save_config(
+        &self,
+        plugin_instance_id: &str,
+        session_type_id: Uuid,
+        config: JsonValue,
+    ) -> Result<(), ChatEngineError> {
+        self.configs
+            .upsert(plugin_instance_id, session_type_id, config)
+            .await
+    }
+
     /// Probe the plugin's `health_check()` and apply the routing matrix
     /// documented at module level. Always returns `Ok(_)` once the plugin is
     /// resolved — the only error path is `resolve` failing with `NotFound`.
@@ -315,6 +334,30 @@ mod tests {
             .await
             .expect("ok")
             .expect("some");
+        assert_eq!(cfg, serde_json::json!({"k": "v"}));
+    }
+
+    #[tokio::test]
+    async fn save_config_is_readable_by_load_config() {
+        // Mirrors the register_session_type -> create_session round-trip: a
+        // config saved at registration must be observable by a later
+        // load_config (it used to be dropped on the floor).
+        let svc = make_service(vec![], StubRepo::new(None));
+        assert!(
+            svc.load_config("p", Uuid::nil())
+                .await
+                .expect("ok")
+                .is_none(),
+            "config must be absent before save",
+        );
+        svc.save_config("p", Uuid::nil(), serde_json::json!({"k": "v"}))
+            .await
+            .expect("save ok");
+        let cfg = svc
+            .load_config("p", Uuid::nil())
+            .await
+            .expect("ok")
+            .expect("some after save");
         assert_eq!(cfg, serde_json::json!({"k": "v"}));
     }
 }
