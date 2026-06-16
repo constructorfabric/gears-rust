@@ -4,6 +4,7 @@ use proc_macro::TokenStream;
 use syn::parse_macro_input;
 
 mod codegen;
+mod consumes;
 mod contract_error;
 mod grpc_contract;
 mod grpc_contract_parse;
@@ -62,6 +63,24 @@ pub fn provides(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr = parse_macro_input!(attr as provides::ProvidesAttr);
     let item = parse_macro_input!(item as syn::ItemStruct);
     match provides::generate(&attr, &item) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// `#[toolkit::consumes(contract = ..., from = "gear")]` — declare a contract
+/// dependency wired via eventual-readiness directory discovery.
+///
+/// Applied on the gear struct (alongside `#[toolkit::gear]`). Emits a
+/// `ConsumerRegistration` (behind `directory-rest-client`) that the runtime's
+/// proxy-wiring phase replays: a compile-time local impl wins, otherwise a
+/// directory-resolving REST client is registered. Does NOT inject a topo-sort
+/// dependency — see `toolkit_contract_macros::consumes` docs.
+#[proc_macro_attribute]
+pub fn consumes(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr = parse_macro_input!(attr as consumes::ConsumesAttr);
+    let item = parse_macro_input!(item as syn::ItemStruct);
+    match consumes::generate(&attr, &item) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }

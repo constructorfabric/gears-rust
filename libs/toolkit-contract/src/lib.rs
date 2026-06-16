@@ -30,7 +30,7 @@ pub use ir::{
     validate_grpc_binding, validate_http_binding,
 };
 pub use toolkit_contract_macros::{
-    ContractError, ProtoBridge, contract, grpc_contract, provides, rest_contract,
+    ContractError, ProtoBridge, consumes, contract, grpc_contract, provides, rest_contract,
 };
 pub use policy::{Policy, PolicyContext, PolicyStack, TracingPolicy};
 pub use wiring::{ClientTuning, ClientWiring, ReconnectSettings, RetrySettings};

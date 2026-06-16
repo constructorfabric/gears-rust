@@ -99,8 +99,8 @@ pub use registry::GearRegistry;
 
 // Re-export the macros from the proc-macro crate
 pub use toolkit_contract::{
-    ContractError, GrpcRepr, GrpcReprScalar, ProtoBridge, contract, grpc_contract, provides,
-    rest_contract,
+    ContractError, GrpcRepr, GrpcReprScalar, ProtoBridge, consumes, contract, grpc_contract,
+    provides, rest_contract,
 };
 pub use toolkit_macros::{ExpandVars, gear, lifecycle};
 

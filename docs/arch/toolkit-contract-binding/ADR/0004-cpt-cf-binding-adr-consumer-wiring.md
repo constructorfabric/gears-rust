@@ -281,3 +281,25 @@ Document the current pattern; require authors to configure static endpoints.
   used by the generated `wire` closure.
 * OoP bootstrap integration point: `libs/modkit/src/bootstrap/oop.rs:533–598` — the background
   wiring task is inserted here, after `DirectoryClient` is connected and before `module.run()`.
+
+## Implementation note (toolkit) — deliberate deviation: no topo-dep injection
+
+The shipped `#[toolkit::consumes(contract = X, from = "gear")]` macro
+(`libs/toolkit-contract-macros/src/consumes.rs`) **does not** inject `from` into the consuming
+gear's topo-sort `deps`, contrary to the "Init cycle detection" consequence above. Reasons:
+
+1. **Mechanically infeasible across attributes.** `deps` are baked by `#[toolkit::gear]` into a
+   `&'static [&'static str]` inside the emitted `Registrator` closure at expansion time; a separate
+   attribute macro cannot mutate them.
+2. **Wrong for eventual readiness / remote providers.** A consumed provider is frequently a *remote*
+   gear (separate OoP process) absent from the local registry. Injecting it as a hard dep would make
+   `build_topo_sorted` fail with `depends on unknown gear`, and would force the consumer to block on
+   the provider's local init — contradicting ADR-0007 non-blocking startup. The directory-resolving
+   client already tolerates a not-yet-ready or remote provider lazily (per-call resolve →
+   `ServiceUnavailable` until ready → self-heals).
+
+Therefore `#[toolkit::consumes]` emits **only** the `ConsumerRegistration` (`inventory::submit!`,
+behind `directory-rest-client`) replayed by the runtime proxy-wiring phase. If a provider is
+co-located and must initialise first (so the `try_get` short-circuit picks up its local impl), the
+author declares that ordering explicitly in `#[toolkit::gear(deps = ["provider-gear"])]`. Cycle
+detection thus remains the responsibility of explicitly-declared `deps`, not of `consumes`.
