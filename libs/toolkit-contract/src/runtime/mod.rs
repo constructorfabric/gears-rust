@@ -29,3 +29,6 @@ pub mod http;
 pub mod retry;
 #[cfg(feature = "runtime-client")]
 pub mod sse;
+
+#[cfg(feature = "directory-rest-client")]
+pub mod resolving;

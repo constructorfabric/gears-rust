@@ -754,6 +754,12 @@ pub enum RegistryError {
         #[source]
         source: anyhow::Error,
     },
+    #[error("consumer proxy-wiring failed for gear '{gear}'")]
+    ProxyWiring {
+        gear: &'static str,
+        #[source]
+        source: anyhow::Error,
+    },
     #[error(
         "REST phase requires an gateway host: gears with capability 'rest' found, but no gear with capability 'rest_host'"
     )]
