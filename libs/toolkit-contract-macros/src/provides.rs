@@ -20,9 +20,9 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{
-    Expr, Ident, ItemStruct, Path, PathArguments, PathSegment, Result as SynResult, Token,
-};
+use syn::{Expr, Ident, ItemStruct, Path, Result as SynResult, Token};
+
+use crate::support::{append_segment, parent_module};
 
 /// Parsed `#[toolkit::provides(...)]` attribute.
 pub struct ProvidesAttr {
@@ -392,33 +392,5 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
     Ok(expanded)
 }
 
-/// Take all segments of `path` except the last (the trait name itself).
-/// `foo::bar::Baz` → `foo::bar`. Single-segment paths produce an empty
-/// path so subsequent appends fall back to the call-site scope.
-fn parent_module(path: &Path) -> SynResult<Path> {
-    if path.segments.is_empty() {
-        return Err(syn::Error::new_spanned(path, "`contract` path is empty"));
-    }
-    let mut segments: Punctuated<PathSegment, Token![::]> = Punctuated::new();
-    let n = path.segments.len();
-    for (i, seg) in path.segments.iter().enumerate() {
-        if i + 1 < n {
-            segments.push(seg.clone());
-        }
-    }
-    Ok(Path {
-        leading_colon: path.leading_colon,
-        segments,
-    })
-}
-
-/// `parent` + `ident` → `parent::ident`. Empty parent yields a bare ident
-/// path resolved against the call-site scope.
-fn append_segment(parent: &Path, ident: &Ident) -> Path {
-    let mut out = parent.clone();
-    out.segments.push(PathSegment {
-        ident: ident.clone(),
-        arguments: PathArguments::None,
-    });
-    out
-}
+// `parent_module` / `append_segment` now live in `crate::support` (shared with
+// `consumes.rs`).

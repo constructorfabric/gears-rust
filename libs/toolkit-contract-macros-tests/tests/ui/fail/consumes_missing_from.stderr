@@ -1,0 +1,7 @@
+error: missing required arg `from = "provider-gear-name"`
+ --> tests/ui/fail/consumes_missing_from.rs:9:1
+  |
+9 | #[consumes(contract = FooApi)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `consumes` (in Nightly builds, run with -Z macro-backtrace for more info)

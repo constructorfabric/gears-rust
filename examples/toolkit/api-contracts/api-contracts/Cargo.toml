@@ -11,7 +11,13 @@ rust-version.workspace = true
 [features]
 default = ["rest-client", "directory-rest-client"]
 rest-client = ["api-contracts-sdk/rest-client"]
-directory-rest-client = ["rest-client", "api-contracts-sdk/directory-rest-client"]
+directory-rest-client = [
+    "rest-client",
+    "api-contracts-sdk/directory-rest-client",
+    # Enable the runtime proxy-wiring phase + discovery wiring in toolkit so the
+    # #[toolkit::consumes] ConsumerRegistration is replayed at startup.
+    "toolkit/contract-directory-rest-client",
+]
 grpc-client = [
     "api-contracts-sdk/grpc-client",
     "toolkit-contract/grpc-client",
