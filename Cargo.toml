@@ -533,7 +533,7 @@ mime = "0.3"
 
 # Document parsing libraries
 docx-rust = "0.1.11"
-kreuzberg = { version = "=4.9.7", features = ["html", "excel", "office", "pdf", "bundled-pdfium"] }
+kreuzberg = { version = "=4.9.8", features = ["html", "excel", "office", "pdf", "bundled-pdfium"] }
 
 # Additional testing utilities
 temp-env = { version = "0.3", features = ["async_closure"] }
