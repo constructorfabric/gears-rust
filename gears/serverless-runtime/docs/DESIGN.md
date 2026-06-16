@@ -140,6 +140,8 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-serverless-runtime-adr-temporal-workflow-engine` | Temporal chosen as the durable execution backend for the workflow engine plugin, interpreting the Serverless Workflow DSL atop Temporal primitives |
 | `cpt-cf-serverless-runtime-adr-thin-host` | Serverless-runtime gear boundary: host owns Registry, Tenant Policy, lightweight invocation index, REST, GTS validation, audit, and plugin dispatch; runtime plugins own invocation, scheduling, and event-trigger handling using their backend's native primitives |
 
+The Composed Runtime plugin is one such runtime plugin — a peer of the Temporal/DSL plugin and any other backend plugin under the thin-host model. Its internal architecture (the shared in-plugin environment, the choice of which executors it embeds, and how it composes them) is a plugin-level concern and is recorded in that plugin's own ADR log under [`plugins/composed-runtime-plugin/docs/ADR/`](../plugins/composed-runtime-plugin/docs/ADR/), not at this module level.
+
 ### 1.3 Architecture Layers
 
 | Layer | Responsibility | Technology |

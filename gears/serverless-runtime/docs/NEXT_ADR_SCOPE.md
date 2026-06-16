@@ -2,7 +2,11 @@
 
 **Source:** Consistency review of `DESIGN.md` against `PRD.md`
 **Date:** 2026-01-21
-**Updated:** 2026-05-14 (renumbered ADR-2–7 → ADR-3–8 after ADR-0002 JSON-RPC/MCP was written; then ADR-3–8 → ADR-5–10 after ADR-0003 Workflow DSL and ADR-0004 Temporal Workflow Engine were written; then ADR-5–10 → ADR-6–11 after ADR-0005 Thin Host Gear, Fat Runtime Plugins was written)
+**Updated:** 2026-04-22 (renumbered ADR-2–7 → ADR-3–8 after ADR-0002 JSON-RPC/MCP was written; then ADR-3–8 → ADR-5–10 after ADR-0003 Workflow DSL and ADR-0004 Temporal Workflow Engine were written)
+**Updated:** 2026-04-29 (renumbered ADR-5–10 → ADR-8–13 after ADR-0005 In-Process Runtime, ADR-0006 Starlark Executor, and ADR-0007 Native Rust Executor were written)
+**Updated:** 2026-05-12 (rebased onto upstream main: upstream's ADR-0005 Thin Host took the 0005 slot; local In-Process Runtime ADR moved into the 0006 slot — directly beneath the thin-host parent — so Starlark moved 0006 → 0007 and Native Rust moved 0007 → 0008; subsequent "Next" ADRs shifted ADR-8–13 → ADR-9–14; In-Process Runtime ADR reframed to describe the **in-process plugin** under the thin-host model, providing a shared environment — router, `ExecutionContext`, checkpointing, eventing, sync+async execution — for embedded language executors)
+**Updated:** 2026-05-14 (rebased onto upstream main, picking up the `serverless-runtime-sdk` PRD/DESIGN: ADR-0006 renamed from "In-Process Runtime" to "Composed Runtime"; ADR-0006/0007/0008 now explicitly reference `RuntimeAdapter` / `FunctionHandler` / `WorkflowHandler` / `Context` / `Environment` / `ServerlessRuntimeClient` from the SDK; no slot shifts)
+**Updated:** 2026-06-11 (relocated the Composed Runtime plugin decisions out of the gear ADR log into the plugin's own ADR log at `plugins/composed-runtime-plugin/docs/ADR/`: gear ADR-0006/0007/0008 → plugin-local ADR-0001 Composed Runtime / ADR-0002 Starlark / ADR-0003 Native Rust. Gear ADR slots 0006+ freed, so the deferred "Next" ADRs renumber 9–14 → 6–11)
 
 ---
 
@@ -70,7 +74,8 @@
 > **ADR-0003** (`0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md`) has been written and adopts the Serverless Workflow Specification as the workflow DSL.
 > **ADR-0004** (`0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md`) has been written and selects Temporal as the durable execution backend.
 > **ADR-0005** (`0005-cpt-cf-serverless-runtime-adr-thin-host.md`) has been written and commits to a thin host gear with fat runtime plugins (rejecting the PR 1279 three-tier orchestrator boundary).
-> The ADRs below are renumbered accordingly.
+> The **Composed Runtime plugin** and its embedded-executor decisions are **not** gear-level ADRs. They live in the plugin's own ADR log at `plugins/composed-runtime-plugin/docs/ADR/` — plugin-local **ADR-0001** (Composed Runtime plugin), **ADR-0002** (Starlark executor), **ADR-0003** (hot-loadable native Rust executor). Future embedded executors (CEL, additional scripting languages, etc.) plug into that plugin through its internal executor interface and inherit its checkpointing, eventing, and routing for free.
+> At the gear level the Composed Runtime plugin is simply one runtime plugin under the ADR-0005 thin-host model, so gear ADR slots 0006+ remain free. The deferred ADRs below resume at ADR-6.
 
 ### ADR-2 (Completed): JSON-RPC/MCP Protocol Surfaces
 
@@ -87,6 +92,14 @@ See [ADR-0004](ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.m
 ### ADR-5 (Completed): Thin Host Gear, Fat Runtime Plugins
 
 See [ADR-0005](ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md).
+
+### Composed Runtime plugin (Relocated): see the plugin ADR log
+
+The Composed Runtime plugin decision and its embedded-executor decisions are recorded in the plugin's own ADR log, not here:
+
+- Composed Runtime plugin — [plugins/composed-runtime-plugin/docs/ADR/0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md](../plugins/composed-runtime-plugin/docs/ADR/0001-cpt-cf-composed-runtime-plugin-adr-composed-runtime.md)
+- Starlark executor — [plugins/composed-runtime-plugin/docs/ADR/0002-cpt-cf-composed-runtime-plugin-adr-starlark-runtime.md](../plugins/composed-runtime-plugin/docs/ADR/0002-cpt-cf-composed-runtime-plugin-adr-starlark-runtime.md)
+- Hot-loadable native Rust executor — [plugins/composed-runtime-plugin/docs/ADR/0003-cpt-cf-composed-runtime-plugin-adr-native-rust-executor.md](../plugins/composed-runtime-plugin/docs/ADR/0003-cpt-cf-composed-runtime-plugin-adr-native-rust-executor.md)
 
 ### ADR-6 (Next): Security Model (P0 — Blocker)
 
