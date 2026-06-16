@@ -150,6 +150,12 @@ pub use directory::{
     ServiceInstanceInfo,
 };
 
+// Consumer-side discovery wiring for eventual readiness.
+#[cfg(feature = "contract-directory-rest-client")]
+pub mod discovery;
+#[cfg(feature = "contract-directory-rest-client")]
+pub use discovery::{ConsumerRegistration, DirectoryEndpointResolver};
+
 // GTS schema support
 pub mod gts;
 

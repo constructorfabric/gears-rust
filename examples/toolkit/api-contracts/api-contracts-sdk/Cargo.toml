@@ -19,6 +19,12 @@ rest-client = [
     "dep:async-stream",
     "dep:futures-util",
 ]
+# Directory-resolving REST transport: enables the generated
+# `<Trait>ResolvingClient` wrapper (self-healing endpoint discovery).
+directory-rest-client = [
+    "rest-client",
+    "toolkit-contract/directory-rest-client",
+]
 grpc-client = [
     "toolkit-contract/grpc-client",
     "dep:tonic",

@@ -61,6 +61,11 @@ db = ["dep:toolkit-db", "dep:sea-orm-migration"]
 # `#[grpc_contract]`).
 contract-grpc-client = ["toolkit-contract/grpc-client"]
 
+# Forward toolkit-contract's directory-rest-client feature and enable the
+# consumer-side discovery wiring (DirectoryEndpointResolver, ConsumerRegistration,
+# and the runtime proxy-wiring phase) used for eventual readiness.
+contract-directory-rest-client = ["toolkit-contract/directory-rest-client"]
+
 # OpenTelemetry support for distributed tracing
 otel = [
     "dep:opentelemetry",
