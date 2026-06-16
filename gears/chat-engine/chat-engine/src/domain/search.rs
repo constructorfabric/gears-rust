@@ -185,9 +185,11 @@ pub enum SearchError {
     /// Identity claims absent or session not owned by caller — maps to 403.
     #[error("forbidden")]
     Forbidden,
-    /// Underlying backend (DB / sea-orm) failure — maps to 500.
+    /// Underlying backend (DB / sea-orm) failure — maps to 500. Wraps the
+    /// originating [`ChatEngineError`] as a source so the chain survives the
+    /// round-trip (DE1302).
     #[error("backend error: {0}")]
-    Backend(String),
+    Backend(#[source] Box<ChatEngineError>),
 }
 
 impl From<SearchError> for ChatEngineError {
@@ -199,9 +201,9 @@ impl From<SearchError> for ChatEngineError {
             SearchError::Forbidden => {
                 ChatEngineError::forbidden("authenticated identity required to perform search")
             }
-            SearchError::Backend(reason) => ChatEngineError::Internal {
-                reason,
-                source: None,
+            SearchError::Backend(err) => ChatEngineError::Internal {
+                reason: "search backend error".to_owned(),
+                source: Some(err),
             },
         }
     }
@@ -219,7 +221,7 @@ impl From<ChatEngineError> for SearchError {
                     SearchError::QueryRequired
                 }
             }
-            other => SearchError::Backend(other.to_string()),
+            other => SearchError::Backend(Box::new(other)),
         }
     }
 }
@@ -660,7 +662,8 @@ mod tests {
         let err: ChatEngineError = SearchError::Forbidden.into();
         assert!(matches!(err, ChatEngineError::Forbidden { .. }));
 
-        let err: ChatEngineError = SearchError::Backend("boom".into()).into();
+        let err: ChatEngineError =
+            SearchError::Backend(Box::new(ChatEngineError::internal("boom"))).into();
         assert!(matches!(err, ChatEngineError::Internal { .. }));
     }
 

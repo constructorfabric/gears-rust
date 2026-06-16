@@ -251,14 +251,13 @@ pub enum StorageError {
 impl From<StorageError> for ChatEngineError {
     fn from(err: StorageError) -> Self {
         match err {
-            StorageError::Unavailable(msg) => {
-                let err = StorageError::Unavailable(msg);
-                ChatEngineError::BackendUnavailable {
-                    reason: err.to_string(),
-                    retry_after: None,
-                    source: Some(Box::new(err)),
-                }
-            }
+            StorageError::Unavailable(msg) => ChatEngineError::BackendUnavailable {
+                // Built from the message string, not the error's Display, so
+                // the typed `StorageError` survives in `source` (DE1302).
+                reason: format!("export storage unavailable: {msg}"),
+                retry_after: None,
+                source: Some(Box::new(StorageError::Unavailable(msg))),
+            },
             StorageError::NotImplemented(reason) => ChatEngineError::not_implemented(reason),
         }
     }
