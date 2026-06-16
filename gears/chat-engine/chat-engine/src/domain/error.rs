@@ -167,9 +167,11 @@ impl From<DbErr> for ChatEngineError {
                 id: msg,
             },
             other => {
-                let reason = other.to_string();
+                // The typed error is preserved in `source` (reachable via
+                // `.source()` / downcast); the reason is a category label so
+                // we don't flatten the chain into the message (DE1302).
                 Self::Internal {
-                    reason,
+                    reason: "database error".to_owned(),
                     source: Some(Box::new(other)),
                 }
             }
@@ -227,7 +229,8 @@ impl From<DbError> for ChatEngineError {
             // `RecordNotFound` keeps its 404 mapping.
             DbError::Sea(sea) => sea.into(),
             other => Self::Internal {
-                reason: other.to_string(),
+                // Source preserves the typed error / chain (DE1302).
+                reason: "database error".to_owned(),
                 source: Some(Box::new(other)),
             },
         }
