@@ -30,6 +30,11 @@ runtime-client = [
 ]
 # Used by rest_contract codegen to gate the generated client struct.
 rest-client = ["runtime-client"]
+# Directory-resolving REST transport: a self-healing wrapper that resolves the
+# provider endpoint from the service directory per call and rebuilds the
+# generated REST client when the endpoint changes. Gates the generated
+# `<Trait>ResolvingClient` struct and the `runtime::resolving` module.
+directory-rest-client = ["rest-client"]
 # Generate OpenAPI 3.1 specs from contract + binding IR.
 # Pulls in canonical-errors so the generated spec can reference the wire
 # `Problem` envelope under `components.schemas.Problem`. The OpenAPI document

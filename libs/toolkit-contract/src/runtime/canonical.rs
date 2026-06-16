@@ -37,6 +37,13 @@ impl From<TransportError> for CanonicalError {
             #[cfg(feature = "grpc-client")]
             TransportError::Grpc { code, message } => grpc_code_to_canonical(code, message),
             TransportError::Network(_msg) => CanonicalError::service_unavailable().create(),
+            // Provider not registered / no live instance: same canonical shape
+            // as a network failure — retryable service-unavailable. Keep the
+            // gear name in the detail so operators can triage which dependency
+            // failed to resolve.
+            TransportError::Unresolved { gear } => CanonicalError::service_unavailable()
+                .with_detail(format!("provider `{gear}` is not resolvable"))
+                .create(),
             TransportError::Timeout(d) => {
                 CanonicalError::internal(format!("timeout after {d:?}")).create()
             }
@@ -71,9 +78,16 @@ fn synth_problem(category: ProblemCategory, detail: &str) -> Problem {
         detail: detail.to_owned(),
         instance: None,
         trace_id: None,
+        // Carry every field any synthesizable category's context needs.
+        // serde ignores unknown fields, so categories that don't use a given
+        // key (e.g. NotFound ignores `reason`, PermissionDenied ignores the
+        // resource fields) deserialize fine. `reason` is required by
+        // `PermissionDeniedV1`; omitting it made `synth_to_canonical` panic for
+        // 403 / gRPC PermissionDenied.
         context: serde_json::json!({
             "resource_type": "unknown",
             "resource_name": "unknown",
+            "reason": detail,
         }),
         error_code: None,
         error_domain: None,

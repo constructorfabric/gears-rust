@@ -24,5 +24,8 @@ pub use rest::{PaymentApiRest, payment_api_rest_http_binding};
 #[cfg(feature = "rest-client")]
 pub use rest::PaymentApiRestClient;
 
+#[cfg(feature = "directory-rest-client")]
+pub use rest::PaymentApiRestResolvingClient;
+
 #[cfg(feature = "grpc-client")]
 pub use grpc::{PaymentApiGrpc, PaymentApiGrpcClient, payment_api_grpc_binding};

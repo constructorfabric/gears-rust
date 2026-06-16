@@ -33,6 +33,8 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
     let binding_fn = generate_binding_fn(model, &support);
     let client_struct = generate_client_struct(model, &support);
     let client_impl = generate_client_impl(model, &support);
+    let resolving_struct = generate_resolving_client_struct(model, &support);
+    let resolving_impl = generate_resolving_client_impl(model, &support);
     let projection_impl = generate_projection_impl(model);
 
     quote! {
@@ -40,6 +42,8 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
         #binding_fn
         #client_struct
         #client_impl
+        #resolving_struct
+        #resolving_impl
         #projection_impl
     }
 }
@@ -309,6 +313,147 @@ fn generate_client_impl(model: &RestContractModel, support: &TokenStream) -> Tok
             #(#methods)*
         }
     }
+}
+
+/// Generate the directory-resolving wrapper struct + its constructor.
+///
+/// The wrapper holds an `Arc<DirectoryResolvingClient<XxxRestClient>>` and
+/// delegates each base-trait method through it (see
+/// [`generate_resolving_client_impl`]). Gated behind `directory-rest-client`
+/// (which enables `rest-client`, so `XxxRestClient` exists).
+fn generate_resolving_client_struct(model: &RestContractModel, support: &TokenStream) -> TokenStream {
+    let resolving_ident = resolving_struct_ident(&model.trait_ident);
+    let client_ident = client_struct_ident(&model.trait_ident);
+    let doc = format!(
+        "Directory-resolving REST client for [`{}`].\n\nProduced by `#[toolkit::rest_contract]`. \
+         Resolves the provider endpoint from the service directory on every call and rebuilds \
+         the inner [`{client_ident}`] when the endpoint changes, so consumers tolerate eventual \
+         readiness and provider churn.",
+        model.trait_ident
+    );
+
+    quote! {
+        #[cfg(feature = "directory-rest-client")]
+        #[doc = #doc]
+        pub struct #resolving_ident {
+            __inner: ::std::sync::Arc<
+                #support::runtime::resolving::DirectoryResolvingClient<#client_ident>,
+            >,
+        }
+
+        #[cfg(feature = "directory-rest-client")]
+        impl #resolving_ident {
+            /// Build a resolving client that discovers `from_gear` via `resolver`.
+            ///
+            /// The inner REST client is (re)built from the resolved endpoint via
+            /// the generated [`new`](#client_ident::new); `tuning` applies the
+            /// per-call timeout / retry / reconnect overrides.
+            #[must_use]
+            pub fn new(
+                resolver: ::std::sync::Arc<dyn #support::runtime::resolving::EndpointResolver>,
+                from_gear: impl ::std::convert::Into<::std::string::String>,
+                tuning: #support::wiring::ClientTuning,
+            ) -> Self {
+                let __inner = #support::runtime::resolving::DirectoryResolvingClient::new(
+                    resolver,
+                    from_gear,
+                    tuning,
+                    |__cfg| {
+                        <#client_ident>::new(__cfg).map_err(|__e| {
+                            #support::runtime::transport_error::TransportError::network(__e)
+                        })
+                    },
+                );
+                Self { __inner: ::std::sync::Arc::new(__inner) }
+            }
+        }
+    }
+}
+
+/// Generate the base-trait impl for the resolving wrapper. Each method resolves
+/// the live client and delegates; unresolved providers surface as
+/// `TransportError::Unresolved` (mapped into the trait's error type).
+fn generate_resolving_client_impl(model: &RestContractModel, support: &TokenStream) -> TokenStream {
+    let resolving_ident = resolving_struct_ident(&model.trait_ident);
+    let client_ident = client_struct_ident(&model.trait_ident);
+    let trait_path = &model.base_trait;
+
+    let methods = model
+        .methods
+        .iter()
+        .map(|m| generate_resolving_method(m, &client_ident, trait_path, support));
+
+    quote! {
+        #[cfg(feature = "directory-rest-client")]
+        #[::async_trait::async_trait]
+        impl #trait_path for #resolving_ident {
+            #(#methods)*
+        }
+    }
+}
+
+/// One delegating method body for the resolving wrapper.
+fn generate_resolving_method(
+    method: &RestMethodModel,
+    client_ident: &syn::Ident,
+    trait_path: &syn::Path,
+    support: &TokenStream,
+) -> TokenStream {
+    let method_ident = &method.ident;
+    let sig = render_method_signature(method);
+    let arg_idents: Vec<&syn::Ident> = method
+        .params
+        .iter()
+        .filter(|p| p.ident != "self")
+        .map(|p| &p.ident)
+        .collect();
+
+    if method.streaming {
+        let item_ty = streaming_item_type(method);
+        let err_ty = error_type(method);
+        return quote! {
+            fn #method_ident #sig {
+                use ::futures_util::StreamExt as _;
+                let __inner = ::std::sync::Arc::clone(&self.__inner);
+                let __fut = async move {
+                    let __stream: ::std::pin::Pin<::std::boxed::Box<
+                        dyn ::futures_core::Stream<Item = ::std::result::Result<#item_ty, #err_ty>>
+                            + ::std::marker::Send + 'static,
+                    >> = match __inner.resolved().await {
+                        ::std::result::Result::Ok(__c) => {
+                            <#client_ident as #trait_path>::#method_ident(&*__c, #(#arg_idents),*)
+                        }
+                        ::std::result::Result::Err(__e) => ::std::boxed::Box::pin(
+                            ::futures_util::stream::once(async move {
+                                ::std::result::Result::Err(
+                                    <#err_ty as ::std::convert::From<
+                                        #support::runtime::transport_error::TransportError,
+                                    >>::from(__e),
+                                )
+                            }),
+                        ),
+                    };
+                    __stream
+                };
+                ::std::boxed::Box::pin(::futures_util::stream::once(__fut).flatten())
+            }
+        };
+    }
+
+    let err_ty = error_type(method);
+    let convert_err = quote! {
+        |__e| <#err_ty as ::std::convert::From<#support::runtime::transport_error::TransportError>>::from(__e)
+    };
+    quote! {
+        async fn #method_ident #sig {
+            let __c = self.__inner.resolved().await.map_err(#convert_err)?;
+            <#client_ident as #trait_path>::#method_ident(&*__c, #(#arg_idents),*).await
+        }
+    }
+}
+
+fn resolving_struct_ident(trait_ident: &syn::Ident) -> syn::Ident {
+    format_ident!("{}ResolvingClient", trait_ident)
 }
 
 fn generate_client_method(

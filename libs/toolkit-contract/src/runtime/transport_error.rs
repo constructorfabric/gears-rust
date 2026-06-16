@@ -58,6 +58,17 @@ pub enum TransportError {
     /// URL construction error (missing path parameter, invalid template).
     #[error("URL build error: {0}")]
     UrlBuild(String),
+
+    /// The providing gear could not be resolved to a live endpoint via the
+    /// service directory: it has not registered yet, or every instance was
+    /// evicted (e.g., the provider pod went away). Treated as transient — the
+    /// directory-resolving client re-resolves on the next call and recovers
+    /// once a live instance reappears.
+    #[error("provider `{gear}` is not resolvable (not ready or no live instance)")]
+    Unresolved {
+        /// Logical gear name that could not be resolved to an endpoint.
+        gear: String,
+    },
 }
 
 impl TransportError {
@@ -88,15 +99,21 @@ impl TransportError {
         Self::Sse(err.into())
     }
 
+    /// Convenience constructor for [`TransportError::Unresolved`].
+    pub fn unresolved(gear: impl Into<String>) -> Self {
+        Self::Unresolved { gear: gear.into() }
+    }
+
     /// Whether this error class is generally safe to retry without a higher-level
     /// idempotency strategy. Used by [`crate::runtime::retry`] when a method is
     /// declared `#[retryable]`.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            TransportError::Network(_) | TransportError::Timeout(_) | TransportError::Sse(_) => {
-                true
-            }
+            TransportError::Network(_)
+            | TransportError::Timeout(_)
+            | TransportError::Sse(_)
+            | TransportError::Unresolved { .. } => true,
             TransportError::HttpStatus { status, .. } => is_retryable_status(*status),
             #[cfg(feature = "canonical-errors")]
             TransportError::Problem(p) => is_retryable_status(p.status),
@@ -133,6 +150,11 @@ mod tests {
     fn serialization_is_not_transient() {
         assert!(!TransportError::serialization("bad json").is_transient());
         assert!(!TransportError::UrlBuild("missing path param".into()).is_transient());
+    }
+
+    #[test]
+    fn unresolved_is_transient() {
+        assert!(TransportError::unresolved("billing").is_transient());
     }
 
     #[cfg(feature = "grpc-client")]

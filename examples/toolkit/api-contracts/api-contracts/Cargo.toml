@@ -9,8 +9,9 @@ description = "api-contracts example module — PaymentService with local and HT
 rust-version.workspace = true
 
 [features]
-default = ["rest-client"]
+default = ["rest-client", "directory-rest-client"]
 rest-client = ["api-contracts-sdk/rest-client"]
+directory-rest-client = ["rest-client", "api-contracts-sdk/directory-rest-client"]
 grpc-client = [
     "api-contracts-sdk/grpc-client",
     "toolkit-contract/grpc-client",
