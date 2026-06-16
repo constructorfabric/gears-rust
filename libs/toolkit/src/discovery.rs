@@ -12,12 +12,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use toolkit_contract::runtime::resolving::{EndpointResolver, ResolveError};
 
 use cf_system_sdks::directory::DirectoryNotFound;
 
 use crate::DirectoryClient;
 use crate::client_hub::ClientHub;
+
+/// Re-export so the `#[toolkit::consumes]`-generated wire fn can name the
+/// resolver type as `toolkit::discovery::EndpointResolver` without the consuming
+/// gear crate needing a direct `toolkit-contract` dependency.
+pub use toolkit_contract::runtime::resolving::{EndpointResolver, ResolveError};
 
 /// Adapts the service [`DirectoryClient`] into the contract-layer
 /// [`EndpointResolver`] consumed by `DirectoryResolvingClient`.
