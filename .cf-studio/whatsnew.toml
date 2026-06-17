@@ -1,3 +1,7 @@
+[whatsnew."v1.5.2"]
+summary = "v1.5.2"
+details = "## What's Changed\r\n* Improve Pylint rules and enhance documentation by @ainetx in https://github.com/constructorfabric/studio/pull/38\r\n* Enforce active workflow state law by @ainetx in https://github.com/constructorfabric/studio/pull/42\r\n* Enhance Git Kit Source Management and Manifest Validation by @ainetx in https://github.com/constructorfabric/studio/pull/43\r\n\r\n\r\n**Full Changelog**: https://github.com/constructorfabric/studio/compare/v1.5.1...v1.5.2"
+
 [whatsnew."v1.5.1"]
 summary = "v1.5.1"
 details = "## What's Changed\r\n* Refactor bootstrap processes for various workflows by @ainetx in https://github.com/constructorfabric/studio/pull/40\r\n* Refactor workflow module loading and improve error messaging by @ainetx in https://github.com/constructorfabric/studio/pull/41\r\n\r\n\r\n**Full Changelog**: https://github.com/constructorfabric/studio/compare/v1.5.0...v1.5.1"
