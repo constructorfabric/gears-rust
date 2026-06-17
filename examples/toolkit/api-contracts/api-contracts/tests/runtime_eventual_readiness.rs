@@ -39,6 +39,7 @@ use toolkit::registry::RegistryBuilder;
 use toolkit::runtime::HostRuntime;
 use toolkit::{
     ClientHub, DbOptions, DirectoryClient, GearCtx, GearManager, LocalDirectoryClient,
+    ReadinessPhase, ReadinessState,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_contract::policy::PolicyStack;
@@ -240,6 +241,30 @@ async fn consumer_resolves_provider_through_runtime_phases() {
     assert_eq!(resp.status, PaymentStatus::Pending);
     assert!(!resp.payment_id.is_nil());
 
+    // Process readiness reflects eventual readiness: the readiness probe loop
+    // (proxy-wiring phase) flips the consumed provider to resolved once it is
+    // advertised in the directory, so ReadinessState goes Starting -> Ready.
+    let readiness = hub
+        .get::<ReadinessState>()
+        .expect("ReadinessState published in ClientHub by the runtime");
+    let rdy_deadline = Instant::now() + Duration::from_secs(15);
+    while !readiness.is_ready() {
+        assert!(
+            Instant::now() < rdy_deadline,
+            "readiness did not reach Ready; unresolved: {:?}",
+            readiness.report().unresolved_deps
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(readiness.report().phase, ReadinessPhase::Ready);
+
+    // Shutdown → the draining watcher flips readiness to Draining (so /readyz 503).
     cancel.cancel();
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    while readiness.report().phase != ReadinessPhase::Draining {
+        assert!(Instant::now() < drain_deadline, "readiness did not reach Draining");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
 }

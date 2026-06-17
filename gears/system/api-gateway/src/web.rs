@@ -1,10 +1,14 @@
+use std::sync::Arc;
+
 use axum::{
+    Extension,
     http::StatusCode,
     response::{Html, Json},
     routing::{MethodRouter, get},
 };
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
+use toolkit::ReadinessState;
 
 /// Returns a 501 Not Implemented handler for operations without implementations
 #[allow(dead_code)]
@@ -25,6 +29,16 @@ pub async fn health_check() -> Json<Value> {
         "status": "healthy",
         "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
     }))
+}
+
+/// Readiness probe (`/readyz`). Reports 200 once the process is serving traffic
+/// (all consumed dependencies resolved) and 503 while `starting` or `draining`,
+/// so a k8s readiness probe gates the pod in/out of the load balancer.
+pub async fn readyz(Extension(state): Extension<Arc<ReadinessState>>) -> (StatusCode, Json<Value>) {
+    let report = state.report();
+    let status =
+        StatusCode::from_u16(report.http_status()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    (status, Json(report.to_json()))
 }
 
 #[cfg(not(feature = "embed_elements"))]

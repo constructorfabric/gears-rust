@@ -166,6 +166,7 @@ impl ApiGateway {
         // Always mark built-in health check routes as public
         public_routes.insert((Method::GET, "/health".to_owned()));
         public_routes.insert((Method::GET, "/healthz".to_owned()));
+        public_routes.insert((Method::GET, "/readyz".to_owned()));
 
         public_routes.insert((Method::GET, "/docs".to_owned()));
         public_routes.insert((Method::GET, "/openapi.json".to_owned()));
@@ -728,18 +729,27 @@ impl toolkit::Gear for ApiGateway {
 impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
     fn rest_prepare(
         &self,
-        _ctx: &toolkit::context::GearCtx,
+        ctx: &toolkit::context::GearCtx,
         router: axum::Router,
     ) -> anyhow::Result<axum::Router> {
-        // Add health check endpoints:
-        // - /health: detailed JSON response with status and timestamp
-        // - /healthz: simple "ok" liveness probe (Kubernetes-style)
-        let router = router
+        // Add probe endpoints:
+        // - /health, /healthz: liveness (200 once serving).
+        // - /readyz: readiness (503 starting/draining, 200 ready) — gated to the
+        //   process `ReadinessState` published by the runtime.
+        let mut router = router
             .route("/health", get(web::health_check))
             .route("/healthz", get(|| async { "ok" }));
 
+        if let Ok(readiness) = ctx.client_hub().get::<toolkit::ReadinessState>() {
+            router = router
+                .route("/readyz", get(web::readyz))
+                .layer(axum::Extension(readiness));
+        } else {
+            tracing::warn!("ReadinessState not published in ClientHub; /readyz not mounted");
+        }
+
         // You may attach global middlewares here (trace, compression, cors), but do not start server.
-        tracing::debug!("REST host prepared base router with health check endpoints");
+        tracing::debug!("REST host prepared base router with health + readiness endpoints");
         Ok(router)
     }
 

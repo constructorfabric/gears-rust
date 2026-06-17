@@ -136,8 +136,11 @@ pub mod telemetry;
 pub mod backends;
 pub mod lifecycle;
 pub mod plugins;
+pub mod readiness;
 pub mod runtime;
 pub mod wiring;
+
+pub use readiness::{ReadinessPhase, ReadinessReport, ReadinessState};
 
 // Domain layer marker traits for DDD enforcement
 pub mod domain;

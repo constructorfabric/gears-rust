@@ -74,8 +74,10 @@ pub struct HostRuntime {
     instance_id: Uuid,
     gear_manager: Arc<GearManager>,
     grpc_installers: Arc<GrpcInstallerStore>,
-    #[allow(dead_code)]
     client_hub: Arc<ClientHub>,
+    /// Process-level readiness, published in `client_hub` for the `/readyz`
+    /// probe and updated by the proxy-wiring readiness loop + draining watcher.
+    readiness: Arc<crate::ReadinessState>,
     cancel: CancellationToken,
     #[allow(dead_code)]
     db_options: DbOptions,
@@ -102,6 +104,11 @@ impl HostRuntime {
         let gear_manager = Arc::new(GearManager::new());
         let grpc_installers = Arc::new(GrpcInstallerStore::new());
 
+        // Process-level readiness, published so the gateway's /readyz handler
+        // can fetch it (concrete-type key). Created before any phase runs.
+        let readiness = Arc::new(crate::ReadinessState::new());
+        client_hub.register::<crate::ReadinessState>(readiness.clone());
+
         // Build the context builder that will resolve per-gear DbHandles
         let ctx_builder =
             GearContextBuilder::new(instance_id, gears_cfg, client_hub.clone(), cancel.clone());
@@ -118,6 +125,7 @@ impl HostRuntime {
             gear_manager,
             grpc_installers,
             client_hub,
+            readiness,
             cancel,
             db_options,
             oop_options,
@@ -385,7 +393,7 @@ impl HostRuntime {
         };
         let resolver: Arc<dyn EndpointResolver> = Arc::new(DirectoryEndpointResolver(dir));
 
-        for reg in regs {
+        for reg in &regs {
             (reg.wire)(&self.client_hub, Arc::clone(&resolver)).map_err(|source| {
                 RegistryError::ProxyWiring {
                     gear: reg.owner_gear,
@@ -394,6 +402,44 @@ impl HostRuntime {
             })?;
             tracing::debug!(owner = reg.owner_gear, dep = reg.dep_gear, "wired consumer contract");
         }
+
+        // Register consumed deps as readiness gates and spawn a background probe
+        // loop that flips each to resolved once the directory can resolve it.
+        // Readiness is startup-gating + sticky (ADR-0007): /readyz reports
+        // Starting until every consumed dependency resolves, then Ready.
+        let deps: Vec<String> = regs.iter().map(|r| r.dep_gear.to_owned()).collect();
+        for dep in &deps {
+            self.readiness.register_dep(dep.clone());
+        }
+        let readiness = Arc::clone(&self.readiness);
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            const BASE: std::time::Duration = std::time::Duration::from_millis(100);
+            const MAX: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut pending = deps;
+            let mut backoff = BASE;
+            while !pending.is_empty() {
+                let mut still_pending = Vec::new();
+                for dep in pending {
+                    if matches!(resolver.resolve_endpoint(&dep).await, Ok(Some(_))) {
+                        readiness.mark_resolved(&dep);
+                        tracing::info!(dep = %dep, "readiness: dependency resolved");
+                    } else {
+                        still_pending.push(dep);
+                    }
+                }
+                pending = still_pending;
+                if pending.is_empty() {
+                    break;
+                }
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(MAX);
+            }
+        });
+
         Ok(())
     }
 
@@ -1018,6 +1064,18 @@ impl HostRuntime {
 
         // 7. Start phase
         self.run_start_phase().await?;
+
+        // Draining watcher: flip readiness to Draining the moment shutdown
+        // begins so /readyz reports 503 and the orchestrator drains the pod out
+        // of the load balancer before the stop phase tears gears down.
+        {
+            let readiness = Arc::clone(&self.readiness);
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                readiness.set_draining();
+            });
+        }
 
         // 7b. Directory-register phase: advertise in-process REST providers in
         //     the directory once the gateway has bound its listener.
