@@ -65,8 +65,9 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-fr-export-session` | Background job traverses message tree (active path or all variants), formats to JSON/Markdown/TXT, uploads to storage |
 | `cpt-cf-chat-engine-fr-share-session` | Generates unique share token stored in database, maps to session_id; recipients create branches from last message |
 | `cpt-cf-chat-engine-fr-session-summary` | Routes `session.summary` event to dedicated summarization service URL or backend plugin based on session type config |
-| `cpt-cf-chat-engine-fr-search-session` | Full-text search on messages table filtered by session_id; returns matches with context window |
-| `cpt-cf-chat-engine-fr-search-sessions` | Full-text search across messages joined with sessions; ranks by relevance, returns session metadata |
+| `cpt-cf-chat-engine-fr-search-session` | Full-text search over `message_parts` (text parts) joined to messages, filtered by session_id; returns matches with context window |
+| `cpt-cf-chat-engine-fr-search-sessions` | Full-text search over `message_parts` (text parts) joined with messages + sessions; ranks by relevance, returns session metadata |
+| `cpt-cf-chat-engine-fr-message-parts` | Messages persist an ordered list of typed `message_parts` rows (text/code/images/videos/links/statuses); the send/get APIs and plugin responses exchange `parts` arrays |
 | `cpt-cf-chat-engine-fr-delete-session` | Sends `session.deleted` event to backend plugin, then soft-deletes session and messages in database |
 | `cpt-cf-chat-engine-fr-conversation-memory` | Message history forwarded to backend plugin with configurable depth; visibility flags (`is_hidden_from_backend`) enable context management strategies |
 | `cpt-cf-chat-engine-fr-delete-message` | Hard delete individual messages with cascade reaction cleanup; ownership validation before deletion |
@@ -124,6 +125,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-adr-capability-filtering` | Capability filtering for session type matching |
 | `cpt-cf-chat-engine-adr-search-strategy` | Full-text search strategy for sessions and messages |
 | `cpt-cf-chat-engine-adr-message-reactions` | Per-message reactions for user feedback |
+| `cpt-cf-chat-engine-adr-message-parts` | Messages composed of ordered typed parts in a dedicated `message_parts` table |
 | `cpt-cf-chat-engine-adr-session-deletion-strategy` | Soft delete as default with automatic hard delete after retention period |
 | `cpt-cf-chat-engine-adr-plugin-backend-integration` | Internal plugin trait for backend integration |
 | `cpt-cf-chat-engine-adr-llm-gateway-plugin` | LLM gateway plugin with schema extensions |
@@ -141,7 +143,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-nfr-authentication` | JWT validation middleware | Bearer token validation on every request; user_id, tenant_id, client_id claim extraction |
 | `cpt-cf-chat-engine-nfr-backend-isolation` | Plugin trait abstraction | Each plugin owns its resilience (retry, circuit breaker, timeout); failures isolated per session type |
 | `cpt-cf-chat-engine-nfr-file-size` | File Storage Service delegation | File size validation delegated to external File Storage Service; Chat Engine validates URL format only |
-| `cpt-cf-chat-engine-nfr-search` | PostgreSQL tsvector/GIN indexes | Full-text search with inverted indexes on message content; cursor-based pagination |
+| `cpt-cf-chat-engine-nfr-search` | PostgreSQL tsvector/GIN indexes | Full-text search with inverted indexes on `message_parts` text content (`idx_message_parts_text_fts`); cursor-based pagination |
 | `cpt-cf-chat-engine-nfr-developer-experience` | OpenAPI spec + structured errors | RFC 9457 Problem Details; consistent API patterns; comprehensive OpenAPI 3.0.3 specification |
 | `cpt-cf-chat-engine-nfr-lifecycle-performance` | Session state machine + soft delete | Lifecycle operations (create, delete, archive, restore) via state machine; < 50ms p95 target |
 | `cpt-cf-chat-engine-nfr-message-history` | Tree traversal queries | Recursive CTE queries preserve full message history across variants and branches |
@@ -161,9 +163,9 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| PostgreSQL full-text search scalability degrades beyond ~10M rows | Search latency increases; may require dedicated search engine (e.g., Elasticsearch) | Monitor query latency on `idx_messages_content_fts`; plan migration path to external search service |
+| PostgreSQL full-text search scalability degrades beyond ~10M rows | Search latency increases; may require dedicated search engine (e.g., Elasticsearch) | Monitor query latency on `idx_message_parts_text_fts`; plan migration path to external search service |
 | NDJSON streaming through reverse proxies and CDNs may be buffered | Clients experience delayed chunks instead of real-time streaming | Ensure proxy configuration disables response buffering (`X-Accel-Buffering: no`, `proxy_buffering off`) |
-| JSONB query performance degrades with deeply nested structures | Slow queries on `content`, `metadata`, and `enabled_capabilities` columns | Limit JSONB nesting depth in GTS schemas; prefer top-level keys for indexed access |
+| JSONB query performance degrades with deeply nested structures | Slow queries on `message_parts.content`, `metadata`, and `enabled_capabilities` columns | Limit JSONB nesting depth in GTS schemas; prefer top-level keys for indexed access |
 | Single-database architecture limits horizontal write scaling | Write throughput capped by single PostgreSQL instance | Bounded by `cpt-cf-chat-engine-constraint-single-database`; vertical scaling and read replicas as interim measures; sharding by `tenant_id` as future option |
 
 ## 2. Principles & Constraints
@@ -268,11 +270,11 @@ All Chat Engine instances share a single database cluster. No local caching of s
 
 #### Message Operations (message/)
 
-- **MessageSendRequest** - Send message (session_id, content, file_ids, parent_message_id, enabled_capabilities)
+- **MessageSendRequest** - Send message (session_id, parts, file_ids, parent_message_id, enabled_capabilities) — `parts` is an ordered list of `MessagePartInput` (`{type, content}`); the legacy scalar `content` field is removed (see `cpt-cf-chat-engine-design-entity-message-part`)
 - **MessageListRequest** - List messages (session_id, parent_message_id)
-- **MessageListResponse** - Messages list (messages)
+- **MessageListResponse** - Messages list (messages, each with its ordered `parts`)
 - **MessageGetRequest** - Get message (message_id)
-- **MessageGetResponse** - Message details (message_id, role, content, file_ids, user_id, metadata, variant_info) — `user_id` is the message author (null for assistant/system); `tenant_id` is internal-only and not exposed to clients
+- **MessageGetResponse** - Message details (message_id, role, parts, file_ids, user_id, metadata, variant_info) — `parts` is the ordered list of `MessagePart` rows; `user_id` is the message author (null for assistant/system); `tenant_id` is internal-only and not exposed to clients
 - **MessageRecreateRequest** - Recreate response (message_id, enabled_capabilities)
 - **MessageGetVariantsRequest** - Get variants (message_id)
 - **MessageGetVariantsResponse** - Variants list (variants, current_index)
@@ -282,16 +284,18 @@ All Chat Engine instances share a single database cluster. No local caching of s
 **Note**: Sent via HTTP chunked response as newline-delimited JSON (NDJSON)
 
 - **StreamingStartEvent** - Begin streaming (message_id)
-- **StreamingChunkEvent** - Stream chunk (message_id, chunk: text fragment to append to the message content)
+- **StreamingChunkEvent** - Stream chunk (message_id, chunk: text fragment appended to the assistant message's active `text` part — the part materialised at `number = 0` on completion)
 - **StreamingCompleteEvent** - Streaming finished (message_id, metadata: optional plugin-defined object; omitted from the wire payload when absent)
 - **StreamingErrorEvent** - Stream error (message_id, error: human-readable description; no further events follow)
+
+> **Streaming and parts**: only the assistant's `text` part is chunk-streamed (chunks accumulate into a single `text` part). Richer parts (`code`, `images`, `videos`, `links`, `statuses`) returned by the plugin are persisted on completion and surfaced via `MessageGetResponse.parts`; per-part incremental streaming of non-text parts is an intentional exclusion for this iteration (see §5).
 
 #### Webhook Protocol (webhook/)
 
 - **SessionCreatedEvent** - Session created notification (event, session_id, session_type_id, client_id, user_id, tenant_id, timestamp)
 - **SessionCreatedResponse** - Capabilities list (enabled_capabilities)
 - **MessageNewEvent** - New message for processing (event, session_id, message_id, session_metadata, enabled_capabilities, message, history, timestamp)
-- **MessageNewResponse** - Assistant response (message_id, role, content, metadata)
+- **MessageNewResponse** - Assistant response (message_id, role, parts, metadata) — `parts` is the ordered list of `MessagePartInput` the plugin emits
 - **MessageRecreateEvent** - Recreate request (event, session_id, message_id, enabled_capabilities, history, timestamp)
 - **MessageRecreateResponse** - Recreated response (same as MessageNewResponse)
 - **MessageAbortedEvent** - Streaming cancelled (event, session_id, message_id, partial_content, timestamp)
@@ -318,9 +322,11 @@ Session entity (session_id, tenant_id, user_id, client_id?, session_type_id?, en
 
 - [x] `p1` - **ID**: `cpt-cf-chat-engine-design-entity-message`
 
-Message entity (message_id, session_id, tenant_id?, user_id?, parent_message_id?, role, content, file_ids, variant_index, is_active, is_complete, is_hidden_from_user, is_hidden_from_backend, metadata, created_at, updated_at).
+Message entity (message_id, session_id, tenant_id?, user_id?, parent_message_id?, role, parts, file_ids, variant_index, is_active, is_complete, is_hidden_from_user, is_hidden_from_backend, metadata, created_at, updated_at).
 
-Serde deserialization defaults (defined in the SDK on `chat-engine-sdk::models::Message`): `variant_index = 0`, `is_active = false`, `is_complete = true` (note: defaults to **true**, not false, so payloads that omit it represent fully-persisted messages), `is_hidden_from_user = false`, `is_hidden_from_backend = false`, `file_ids = []`, `tenant_id = None`, `user_id = None`. `parent_message_id` is `None` only for the root message of a session.
+The message body is no longer a single `content` blob. A message **owns an ordered list of `MessagePart` rows** (`parts`), each a typed fragment (`text`, `code`, `images`, `videos`, `links`, `statuses`) — see `cpt-cf-chat-engine-design-entity-message-part`. The former `content` field/column is removed; on read the SDK `Message` carries `parts: Vec<MessagePart>` ordered by `number`. This mirrors the rolos chat-engine part model and enables per-part typing, text-only full-text search, and (future) per-part citations.
+
+Serde deserialization defaults (defined in the SDK on `chat-engine-sdk::models::Message`): `variant_index = 0`, `is_active = false`, `is_complete = true` (note: defaults to **true**, not false, so payloads that omit it represent fully-persisted messages), `is_hidden_from_user = false`, `is_hidden_from_backend = false`, `file_ids = []`, `parts = []`, `tenant_id = None`, `user_id = None`. `parent_message_id` is `None` only for the root message of a session.
 
 - `tenant_id` is `Optional` (`Option<TenantId>`): the owning tenant, denormalized from the parent session so message-scoped queries (cross-session search, message-level retention, reactions) and sharding by `tenant_id` do not require a join to `sessions`. When set, it always equals the parent session's `tenant_id`. `None` only for legacy rows persisted before the column existed (not yet backfilled) — see `cpt-cf-chat-engine-nfr-authentication` for the tenant-isolation invariant.
 - `user_id` is `Optional` (`Option<UserId>`): the **author** of this specific message, not the session owner. For `user`-role messages this is the authenticated user (from the JWT `user_id` claim) who sent it; for `assistant`- and `system`-role messages it is `None` (machine-generated, no human author). This enables author attribution in multi-user and shared sessions (`cpt-cf-chat-engine-fr-share-session`), where messages on a branch may originate from a different user than the session owner.
@@ -351,15 +357,27 @@ Typical `value` shapes (plugin-defined; not enforced by Chat Engine):
 
 A concrete capability value chosen by the client for a specific call (`chat-engine-sdk::models::CapabilityValue`). Fields: `name` (must match a capability previously declared by the plugin via `Capability`) and `value` (the chosen JSON value; type and range must validate against the schema in the corresponding `Capability.value`, e.g. `"gpt-4"`, `0.9`, `false`). Passed in `PluginCallContext.enabled_capabilities` so plugins know which options were selected.
 
-##### ContentPart
+##### MessagePart
 
-Abstract content type (type, ...). Subtypes:
-- **TextContent** - Plain text content (type: "text", text)
-- **CodeContent** - Code block (type: "code", language, code)
-- **ImageContent** - Image content (type: "image", image_id: uuid, mime_type)
-- **AudioContent** - Audio content (type: "audio", audio_id: uuid, mime_type)
-- **VideoContent** - Video content (type: "video", video_id: uuid, mime_type)
-- **DocumentContent** - Document content (type: "document", document_id: uuid, mime_type)
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-design-entity-message-part`
+
+A typed, ordered fragment of a message. A message owns one or more parts; the parts in `number` order are the message body. Persisted in its own table (`cpt-cf-chat-engine-dbtable-message-parts`) with a CASCADE foreign key to `messages`.
+
+Fields: `id` (UUID PK), `message_id` (UUID FK → messages, CASCADE), `type` (`MessagePartType`), `content` (typed JSON, shape determined by `type`), `number` (ordinal within the message, 0-based).
+
+- **Ordering**: `number` is unique per message (`UNIQUE(message_id, number)`) and assigned as `MAX(number)+1` within the part-insert transaction — the same SERIALIZABLE-retry pattern used for `variant_index` (`cpt-cf-chat-engine-adr-variant-indexing`). rolos uses a dedicated per-message counter table; we reuse the existing variant-index machinery instead of adding one.
+- **Immutability**: like the message tree, persisted parts are append-mostly; the streaming text part is filled in as chunks arrive, then frozen on completion.
+- **Input vs persisted**: `MessagePartInput {type, content}` is the wire/plugin shape (no `id`/`number`); Chat Engine assigns `id` and `number` on persist and returns the full `MessagePart`.
+
+**MessagePartType** — Enum: `text`, `code`, `images`, `videos`, `links`, `statuses`. The set is extensible by plugin vendors via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`); `audio` / `document` / `table` are out of initial scope (§5).
+
+**Per-type `content` shapes** (validated structurally by Chat Engine, semantics owned by plugins):
+- **text** — `{ text: string, title?: string }`
+- **code** — `{ language: string, code: string }`
+- **images** — `{ images: [{ image_id: uuid, mime_type?: string, width?: int, height?: int, title?: string }] }` (file UUIDs reference File Storage per `cpt-cf-chat-engine-constraint-external-storage`)
+- **videos** — `{ videos: [{ video_id: uuid, mime_type?: string, format?: string, thumbnail_url?: string, width?: int, height?: int }] }`
+- **links** — `{ links: [{ url: string, title?: string, description?: string, icon?: string, source?: string }] }`
+- **statuses** — `{ statuses: [{ code: string, detail?: string }] }`
 
 ##### Supporting Types
 
@@ -397,6 +415,8 @@ HTTP Protocol:
 - SessionCreateRequest → SessionType: references via session_type_id
 - MessageSendRequest → Session: references via session_id
 - MessageSendRequest → Message: optional parent via parent_message_id
+- MessageSendRequest → MessagePartInput: ordered body fragments via parts
+- MessageGetResponse, MessageListResponse → MessagePart: contains ordered parts
 - MessageSendRequest → CapabilityValue: per-message capability settings via enabled_capabilities
 - MessageGetResponse → VariantInfo: includes variant metadata
 - SessionSearchResponse, SessionsSearchResponse → SearchResult/SessionSearchResult: contains results
@@ -407,7 +427,7 @@ Webhook Protocol:
 - MessageNewEvent, MessageRecreateEvent → Message: references
 - MessageNewEvent, MessageRecreateEvent → Session: context
 - MessageNewEvent, MessageRecreateEvent, SessionSummaryEvent → CapabilityValue: per-message capability settings via enabled_capabilities
-- MessageNewResponse, MessageRecreateResponse → ContentPart: contains array
+- MessageNewResponse, MessageRecreateResponse → MessagePartInput: contains ordered array
 - MessageNewResponse, MessageRecreateResponse → Usage: includes metadata
 - SessionSummaryEvent → SummarizationSettings: includes config
 
@@ -418,10 +438,11 @@ Common Types:
 - Message → Session: belongs to via session_id
 - Message → Message: tree structure via parent_message_id
 - Message → Role: has role enum
-- Message → ContentPart: contains content array
+- Message → MessagePart: owns an ordered list of parts (via message_id, CASCADE delete)
 - Message → Usage: optional in metadata
 - SessionType → SummarizationSettings: optional config
-- ContentPart ← TextContent, CodeContent, ImageContent, AudioContent, VideoContent, DocumentContent: polymorphic
+- MessagePart → MessagePartType: has type enum
+- MessagePart content ← text, code, images, videos, links, statuses: polymorphic by `type`
 - MessageReaction → Message: references via message_id
 - MessageReaction → ReactionType: uses type enum
 - MessageReactionEvent → MessageReaction: notifies on change
@@ -1168,7 +1189,6 @@ sequenceDiagram
 | user_id | VARCHAR NULL | Author of this message (from JWT `user_id` claim for `user`-role messages); NULL for `assistant`/`system` messages and un-backfilled legacy rows |
 | parent_message_id | UUID FK NULL | Parent in message tree (NULL for root) |
 | role | VARCHAR | `user` / `assistant` / `system` |
-| content | JSONB | Array of ContentPart objects |
 | file_ids | UUID[] | File UUID references |
 | variant_index | INT | Variant position among siblings |
 | is_active | BOOL | Whether this is the active variant in the tree |
@@ -1179,6 +1199,22 @@ sequenceDiagram
 | created_at | TIMESTAMPTZ | Creation timestamp |
 
 **Constraints**: UNIQUE (session_id, parent_message_id, variant_index)
+
+> **Migration note**: the prior `content JSONB` column is **dropped** — the message body moves wholesale to `message_parts`. The migration that created `messages` (`m20260417_000002_create_messages_table`) is amended in place rather than adding a new migration, per the project's pre-GA migration policy.
+
+#### Table: message_parts
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-dbtable-message-parts`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | UUID PK | Unique part identifier |
+| message_id | UUID FK | References messages (CASCADE DELETE) |
+| type | VARCHAR | `text` / `code` / `images` / `videos` / `links` / `statuses` |
+| content | JSONB | Typed payload; shape determined by `type` (see `cpt-cf-chat-engine-design-entity-message-part`) |
+| number | INT | 0-based ordinal of the part within the message |
+
+**Constraints**: UNIQUE (message_id, number)
 
 #### Table: message_reactions
 
@@ -1226,7 +1262,8 @@ sequenceDiagram
 | messages | idx_messages_session_parent | (session_id, parent_message_id) | btree |
 | messages | idx_messages_session_created | (session_id, created_at) | btree |
 | messages | idx_messages_tenant | (tenant_id) | btree (partial: `WHERE tenant_id IS NOT NULL`) |
-| messages | idx_messages_content_fts | content | GIN (tsvector) |
+| message_parts | idx_message_parts_message | (message_id, number) | btree (covered by UNIQUE) |
+| message_parts | idx_message_parts_text_fts | `lower(content->>'text')` | GIN (tsvector / trigram), partial: `WHERE type = 'text'` |
 | message_reactions | idx_reactions_message | (message_id) | btree |
 
 ### 3.5 Authorization Model
@@ -1264,7 +1301,7 @@ Chat Engine does not manage authentication for plugin-to-external-service commun
 | `client_id` | Pseudonymous identifier | Sessions, Messages | Session lifecycle |
 | Message `user_id` | Pseudonymous identifier | Messages table | Message lifecycle |
 | Message `tenant_id` | Tenant identifier | Sessions, Messages | Session lifecycle |
-| Message content | Potentially personal | Messages table | FR-020 retention policy |
+| Message content | Potentially personal | Message_parts table (CASCADE-deleted with the message) | FR-020 retention policy |
 | Session metadata | Potentially personal | Sessions table | Session lifecycle |
 | File UUIDs | Reference only (not content) | Messages table | Session lifecycle |
 | Reaction `user_id` | Pseudonymous identifier | Reactions table | Message lifecycle |
@@ -1447,6 +1484,8 @@ Aspects acknowledged and intentionally excluded from this DESIGN.
 | Category | Exclusion | Reason |
 |----------|-----------|--------|
 | **Content Safety** | Content moderation, toxicity filtering | Delegated to backend plugins (Principle: Zero Business Logic in Routing — `cpt-cf-chat-engine-principle-zero-business-logic`) |
+| **Per-part streaming** | Incremental streaming of non-text parts (images/videos/links/statuses) | Only the assistant `text` part is chunk-streamed; richer parts are persisted on completion and returned via `MessageGetResponse.parts`. Discrete per-part stream events are a future enhancement (`cpt-cf-chat-engine-design-entity-message-part`) |
+| **Extra part types** | `audio`, `document`, `table` part types | Out of initial scope; the `MessagePartType` set starts at text/code/images/videos/links/statuses and is extensible via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`) |
 | **Accessibility** | UI/UX accessibility requirements | Backend service; client application responsibility |
 | **Internationalization** | Multi-language UI, locale handling | Not applicable; message content is opaque to Chat Engine |
 | **Rate Limiting** | Throttling algorithms, quota management | Handled at API gateway layer upstream of Chat Engine |

@@ -91,6 +91,7 @@ The core value proposition is enabling flexible, stateful conversation managemen
 | **Backend Plugin** | A Gear plugin gear implementing `ChatEngineBackendPlugin` trait; co-located in the same Gears process and called directly via `ClientHub`. External HTTP backends are supported via the `chat-engine-webhook-adapter` plugin. See ADR-0022. |
 | **Message Tree** | A tree structure where each message references a parent message; sibling nodes with the same parent are variants |
 | **Message Variant** | An alternative response at the same position in the conversation tree — created by regeneration or branching |
+| **Message Part** | An ordered, typed fragment of a message body (`text`, `code`, `images`, `videos`, `links`, `statuses`). A message is composed of one or more parts; the parts in order form the message body. See FR-022. |
 | **Capability** | A typed feature declared by the backend plugin (`bool`, `enum`, `str`, `int`). `SessionType.available_capabilities` is the maximum set the plugin supports; `Session.enabled_capabilities` is the confirmed set for a specific session. Per-message settings are passed as `CapabilityValue` (id + value). |
 | **CapabilityValue** | A per-message capability setting: `{id, value}` where value matches the type declared in the corresponding `Capability` definition |
 | **Streaming Response** | Real-time forwarding of response chunks from the backend plugin to the client as they are generated |
@@ -191,6 +192,7 @@ No gear-specific environment constraints beyond platform defaults.
 - Session lifecycle management (create, delete, retrieve)
 - Message routing to backend plugins with real-time streaming
 - Message variant preservation (regeneration, branching)
+- Structured message bodies as ordered typed parts (text, code, images, videos, links, statuses) (see FR-022)
 - File attachment references in messages
 - Session type switching mid-conversation
 - Session export (JSON, Markdown, TXT)
@@ -234,7 +236,7 @@ The system **MUST** create a new session with a specified session type and clien
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-fr-send-message`
 
 <!-- fdd-id-content -->
-The system **MUST** forward user messages to backend plugin with full session context (session metadata, capabilities, message history) and stream responses back to client in real-time. The system persists the complete message exchange (user message and assistant response) after streaming completes. Each persisted user message is stamped with its authoring `user_id` and the owning `tenant_id`, both taken from the JWT bearer token and never accepted from the request body; assistant and system messages have no authoring user (`user_id` is unset) but carry the same `tenant_id`. These identifiers enable author attribution in multi-user and shared sessions and tenant-scoped message queries.
+The system **MUST** forward user messages to backend plugin with full session context (session metadata, capabilities, message history) and stream responses back to client in real-time. The system persists the complete message exchange (user message and assistant response) after streaming completes. Each persisted user message is stamped with its authoring `user_id` and the owning `tenant_id`, both taken from the JWT bearer token and never accepted from the request body; assistant and system messages have no authoring user (`user_id` is unset) but carry the same `tenant_id`. These identifiers enable author attribution in multi-user and shared sessions and tenant-scoped message queries. Message bodies — both the inbound user message and the streamed/persisted assistant response — are structured as an ordered list of typed parts (see FR-022), not a single content blob.
 
 **Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
 <!-- fdd-id-content -->
@@ -655,7 +657,7 @@ The system **SHOULD** provide extensible, versioned base schemas for all core do
 
 | Category | Base Schemas | Extension Point |
 |---|---|---|
-| **Message content types** | `TextContent`, `ImageContent`, `AudioContent`, `VideoContent`, `DocumentContent`, `CodeContent` | Plugins declare custom `ContentPart` subtypes |
+| **Message part types** | `text`, `code`, `images`, `videos`, `links`, `statuses` (`MessagePart`, see FR-022) | Plugins declare custom `MessagePartType` values and part `content` schemas |
 | **Event types** | `MessageNewEvent`, `SessionCreatedEvent`, `StreamingChunkEvent`, etc. | Plugins emit custom typed events via webhook response extensions |
 | **Error types** | `ErrorResponse`, `ErrorCode` | Plugins define domain-specific error codes in the `ErrorCode` enum space |
 | **Session / Message metadata** | `Session.metadata`, `Message.metadata` | Plugins store and validate typed custom metadata blobs |
@@ -678,6 +680,37 @@ The system **SHOULD** provide extensible, versioned base schemas for all core do
 - Base schema fields cannot be overridden by plugin extensions; attempts are rejected
 
 **Actors**: `cpt-cf-chat-engine-actor-backend-plugin`, `cpt-cf-chat-engine-actor-tenant-admin`
+<!-- fdd-id-content -->
+
+#### FR-022: Structured Message Parts
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-fr-message-parts`
+
+<!-- fdd-id-content -->
+The system **MUST** represent a message body as an **ordered list of typed parts** rather than a single content blob. Each part has a `type` and a typed `content` payload; the parts in order constitute the message. This lets a single assistant or user message mix prose, code, media, links, and progress statuses while preserving rendering order.
+
+**Supported part types (initial set)**:
+- **text** — plain text (`content`, optional `title`)
+- **code** — code block (`language`, `code`)
+- **images** — one or more image references (file UUIDs + optional dimensions/mime)
+- **videos** — one or more video references (file UUIDs + optional thumbnail/format)
+- **links** — link preview cards (`url`, optional `title`/`description`/`icon`/`source`)
+- **statuses** — progress/status indicators (`code`, optional `detail`)
+
+**Behavioral rules**:
+- Parts are **ordered** within a message and the order is stable across reads (persisted ordinal).
+- Media parts (`images`, `videos`) reference files by UUID via the File Storage Service (`cpt-cf-chat-engine-fr-attach-files`); Chat Engine never stores or fetches the bytes.
+- Streaming assistant responses accumulate into a single `text` part; richer parts are persisted on completion (per-part incremental streaming is out of scope for this iteration).
+- The part type set is **extensible** by plugin vendors via GTS without forking Chat Engine core (`cpt-cf-chat-engine-fr-schema-extensibility`).
+- Deleting a message deletes its parts (cascade); parts are not independently addressable for deletion.
+
+**Acceptance criteria**:
+- A message sent with multiple ordered parts is persisted and returned with the same parts in the same order.
+- A `text` part's content is full-text searchable (`cpt-cf-chat-engine-fr-search-session`, `cpt-cf-chat-engine-fr-search-sessions`); non-text parts are excluded from text search.
+- An `images`/`videos` part referencing a file UUID is forwarded to backend plugins without the engine fetching the file.
+- A message with no parts is rejected as an invalid request.
+
+**Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
 <!-- fdd-id-content -->
 
 ## 6. Non-Functional Requirements
