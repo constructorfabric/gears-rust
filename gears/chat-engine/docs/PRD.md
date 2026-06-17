@@ -1,5 +1,5 @@
 Created:  2026-03-06 by Constructor Tech
-Updated:  2026-03-06 by Constructor Tech
+Updated:  2026-06-17 by Constructor Tech
 # PRD — Chat Engine
 
 
@@ -234,7 +234,7 @@ The system **MUST** create a new session with a specified session type and clien
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-fr-send-message`
 
 <!-- fdd-id-content -->
-The system **MUST** forward user messages to backend plugin with full session context (session metadata, capabilities, message history) and stream responses back to client in real-time. The system persists the complete message exchange (user message and assistant response) after streaming completes.
+The system **MUST** forward user messages to backend plugin with full session context (session metadata, capabilities, message history) and stream responses back to client in real-time. The system persists the complete message exchange (user message and assistant response) after streaming completes. Each persisted user message is stamped with its authoring `user_id` and the owning `tenant_id`, both taken from the JWT bearer token and never accepted from the request body; assistant and system messages have no authoring user (`user_id` is unset) but carry the same `tenant_id`. These identifiers enable author attribution in multi-user and shared sessions and tenant-scoped message queries.
 
 **Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
 <!-- fdd-id-content -->
@@ -488,7 +488,7 @@ The system **SHOULD** provide guidance and capabilities to support conversation 
 - [x] `p1` - **ID**: `cpt-cf-chat-engine-fr-delete-message`
 
 <!-- fdd-id-content -->
-The system **MUST** support deletion of individual messages within a session. When a message is deleted, all associated reactions are cascade-deleted automatically to maintain referential integrity. The system validates ownership (authenticated user must own the message) before deletion and notifies the backend plugin of the deletion event.
+The system **MUST** support deletion of individual messages within a session. When a message is deleted, all associated reactions are cascade-deleted automatically to maintain referential integrity. The system validates ownership before deletion — the authenticated `user_id` must match the message's authoring `user_id` (assistant and system messages, which have no authoring user, are never user-deletable) — and notifies the backend plugin of the deletion event.
 
 **Deletion Behavior**:
 - **Hard delete only**: Messages are permanently removed (no soft delete for individual messages)

@@ -1,5 +1,5 @@
 Created:  2026-03-06 by Constructor Tech
-Updated:  2026-03-06 by Constructor Tech
+Updated:  2026-06-17 by Constructor Tech
 # Technical Design: Chat Engine
 
 
@@ -272,7 +272,7 @@ All Chat Engine instances share a single database cluster. No local caching of s
 - **MessageListRequest** - List messages (session_id, parent_message_id)
 - **MessageListResponse** - Messages list (messages)
 - **MessageGetRequest** - Get message (message_id)
-- **MessageGetResponse** - Message details (message_id, role, content, file_ids, metadata, variant_info)
+- **MessageGetResponse** - Message details (message_id, role, content, file_ids, user_id, metadata, variant_info) — `user_id` is the message author (null for assistant/system); `tenant_id` is internal-only and not exposed to clients
 - **MessageRecreateRequest** - Recreate response (message_id, enabled_capabilities)
 - **MessageGetVariantsRequest** - Get variants (message_id)
 - **MessageGetVariantsResponse** - Variants list (variants, current_index)
@@ -318,9 +318,13 @@ Session entity (session_id, tenant_id, user_id, client_id?, session_type_id?, en
 
 - [x] `p1` - **ID**: `cpt-cf-chat-engine-design-entity-message`
 
-Message entity (message_id, session_id, parent_message_id?, role, content, file_ids, variant_index, is_active, is_complete, is_hidden_from_user, is_hidden_from_backend, metadata, created_at, updated_at).
+Message entity (message_id, session_id, tenant_id?, user_id?, parent_message_id?, role, content, file_ids, variant_index, is_active, is_complete, is_hidden_from_user, is_hidden_from_backend, metadata, created_at, updated_at).
 
-Serde deserialization defaults (defined in the SDK on `chat-engine-sdk::models::Message`): `variant_index = 0`, `is_active = false`, `is_complete = true` (note: defaults to **true**, not false, so payloads that omit it represent fully-persisted messages), `is_hidden_from_user = false`, `is_hidden_from_backend = false`, `file_ids = []`. `parent_message_id` is `None` only for the root message of a session.
+Serde deserialization defaults (defined in the SDK on `chat-engine-sdk::models::Message`): `variant_index = 0`, `is_active = false`, `is_complete = true` (note: defaults to **true**, not false, so payloads that omit it represent fully-persisted messages), `is_hidden_from_user = false`, `is_hidden_from_backend = false`, `file_ids = []`, `tenant_id = None`, `user_id = None`. `parent_message_id` is `None` only for the root message of a session.
+
+- `tenant_id` is `Optional` (`Option<TenantId>`): the owning tenant, denormalized from the parent session so message-scoped queries (cross-session search, message-level retention, reactions) and sharding by `tenant_id` do not require a join to `sessions`. When set, it always equals the parent session's `tenant_id`. `None` only for legacy rows persisted before the column existed (not yet backfilled) — see `cpt-cf-chat-engine-nfr-authentication` for the tenant-isolation invariant.
+- `user_id` is `Optional` (`Option<UserId>`): the **author** of this specific message, not the session owner. For `user`-role messages this is the authenticated user (from the JWT `user_id` claim) who sent it; for `assistant`- and `system`-role messages it is `None` (machine-generated, no human author). This enables author attribution in multi-user and shared sessions (`cpt-cf-chat-engine-fr-share-session`), where messages on a branch may originate from a different user than the session owner.
+- Both reuse the SDK newtypes (`TenantId`, `UserId`) which reject the empty string at construction time; an empty value would silently scope queries to no/all rows and is treated as a latent authorization bug. Like `parent_message_id`, both are immutable once set (`cpt-cf-chat-engine-principle-immutable-tree`).
 
 ##### SessionType
 
@@ -1160,6 +1164,8 @@ sequenceDiagram
 |--------|------|-------------|
 | message_id | UUID PK | Unique message identifier |
 | session_id | UUID FK | References sessions |
+| tenant_id | VARCHAR NULL | Owning tenant, denormalized from the parent session (from JWT `tenant_id` claim); enables message-scoped queries and sharding without a join. NULL only for un-backfilled legacy rows |
+| user_id | VARCHAR NULL | Author of this message (from JWT `user_id` claim for `user`-role messages); NULL for `assistant`/`system` messages and un-backfilled legacy rows |
 | parent_message_id | UUID FK NULL | Parent in message tree (NULL for root) |
 | role | VARCHAR | `user` / `assistant` / `system` |
 | content | JSONB | Array of ContentPart objects |
@@ -1219,6 +1225,7 @@ sequenceDiagram
 | sessions | idx_sessions_tenant_user | (tenant_id, user_id) | btree |
 | messages | idx_messages_session_parent | (session_id, parent_message_id) | btree |
 | messages | idx_messages_session_created | (session_id, created_at) | btree |
+| messages | idx_messages_tenant | (tenant_id) | btree (partial: `WHERE tenant_id IS NOT NULL`) |
 | messages | idx_messages_content_fts | content | GIN (tsvector) |
 | message_reactions | idx_reactions_message | (message_id) | btree |
 
@@ -1236,8 +1243,8 @@ All client requests require a valid JWT Bearer token in the `Authorization` head
 |----------|-----------|-------------|------------|
 | Session | Create | JWT valid | `user_id` from JWT becomes session owner; `tenant_id` scopes tenant isolation |
 | Session | Read / Delete | JWT + ownership | `user_id` must match session `user_id` within same `tenant_id` |
-| Message | Send | JWT + session ownership | Session must belong to `user_id` within same `tenant_id` |
-| Message | Delete | JWT + ownership | Only message author can delete |
+| Message | Send | JWT + session ownership | Session must belong to `user_id` within same `tenant_id`; persisted message is stamped with the authoring `user_id` and the session's `tenant_id` |
+| Message | Delete | JWT + ownership | Only the message author may delete — JWT `user_id` must match the message `user_id` (assistant/system messages, which have a NULL `user_id`, are never user-deletable per `cpt-cf-chat-engine-fr-delete-message`) |
 | Message | React | JWT + session access | Session must be accessible to `user_id` within same `tenant_id` |
 | Shared session | Read | Share token | Valid non-expired share token required |
 | Session type | Configure | Admin role | Elevated admin claim in JWT |
@@ -1255,6 +1262,8 @@ Chat Engine does not manage authentication for plugin-to-external-service commun
 | Data Type | Classification | Storage Location | Retention |
 |-----------|---------------|-----------------|-----------|
 | `client_id` | Pseudonymous identifier | Sessions, Messages | Session lifecycle |
+| Message `user_id` | Pseudonymous identifier | Messages table | Message lifecycle |
+| Message `tenant_id` | Tenant identifier | Sessions, Messages | Session lifecycle |
 | Message content | Potentially personal | Messages table | FR-020 retention policy |
 | Session metadata | Potentially personal | Sessions table | Session lifecycle |
 | File UUIDs | Reference only (not content) | Messages table | Session lifecycle |
