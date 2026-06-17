@@ -421,11 +421,19 @@ impl HostRuntime {
             while !pending.is_empty() {
                 let mut still_pending = Vec::new();
                 for dep in pending {
-                    if matches!(resolver.resolve_endpoint(&dep).await, Ok(Some(_))) {
-                        readiness.mark_resolved(&dep);
-                        tracing::info!(dep = %dep, "readiness: dependency resolved");
-                    } else {
-                        still_pending.push(dep);
+                    match resolver.resolve_endpoint(&dep).await {
+                        Ok(Some(_)) => {
+                            readiness.mark_resolved(&dep);
+                            tracing::info!(dep = %dep, "readiness: dependency resolved");
+                        }
+                        // No live instance yet — expected during startup churn.
+                        Ok(None) => still_pending.push(dep),
+                        // Genuine directory-backend failure: surface it (a stuck
+                        // Starting / 503 pod otherwise has no diagnostic trail).
+                        Err(e) => {
+                            tracing::warn!(dep = %dep, error = %e, "readiness: directory lookup failed");
+                            still_pending.push(dep);
+                        }
                     }
                 }
                 pending = still_pending;
