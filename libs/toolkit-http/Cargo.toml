@@ -46,6 +46,11 @@ fips = [
 ]
 # OpenTelemetry integration for distributed tracing
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+# Axum middleware for tenant-plane SecurityContext propagation (secctx_middleware).
+# Kept optional so the bare HTTP client does not pull in axum. Also pulls the
+# canonical error stack (axum-rendered RFC 9457 problem+json) so auth rejections
+# match the platform-wide error contract.
+axum-middleware = ["dep:axum", "dep:toolkit-canonical-errors"]
 
 [dependencies]
 # Core dependencies
@@ -54,6 +59,21 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# SecurityContext propagation. `toolkit-security` is transport-agnostic and owns
+# both `SecurityContext` and the `BearerAuthenticator` trait, so it can be the
+# only auth dependency here. Do NOT add authn-resolver-sdk: it would pull the
+# whole ToolKit framework into this transport crate and invert the layering —
+# the concrete AuthNResolverClient is adapted to BearerAuthenticator at the
+# gear/bootstrap layer instead.
+toolkit-security = { workspace = true }
+secrecy = { workspace = true }
+
+# Optional Axum integration, gated behind the `axum-middleware` feature.
+axum = { workspace = true, optional = true }
+# Canonical (AIP-193 / RFC 9457) error rendering for middleware rejections.
+# `axum` feature provides `IntoResponse for CanonicalError` (problem+json).
+toolkit-canonical-errors = { workspace = true, optional = true, features = ["axum"] }
 
 # HTTP stack
 hyper = { workspace = true, features = ["client", "http1", "http2"] }
@@ -107,3 +127,4 @@ tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 flate2 = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

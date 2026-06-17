@@ -1,5 +1,6 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 pub mod access_scope;
+pub mod authenticator;
 pub mod bin_codec;
 pub mod constants;
 pub mod context;
@@ -10,6 +11,7 @@ pub use access_scope::{
     InTenantSubtreeScopeFilter, ScopeConstraint, ScopeFilter, ScopeValue, pep_properties,
     rg_tables, tenant_tables,
 };
+pub use authenticator::{AuthnError, BearerAuthenticator};
 pub use context::{SecurityContext, SecurityContextBuildError};
 
 pub use bin_codec::{

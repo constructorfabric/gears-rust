@@ -50,6 +50,8 @@ mod client;
 mod config;
 mod error;
 mod layers;
+#[cfg(feature = "axum-middleware")]
+pub mod middleware;
 pub mod otel;
 mod request;
 mod response;
@@ -72,4 +74,8 @@ pub use layers::{
 };
 pub use request::{RequestBuilder, RequestType};
 pub use response::{HttpResponse, LimitedBody, ResponseBody};
+pub use security::{SecCtxHttpError, attach_bearer_http, extract_bearer_http};
 pub use tls::TlsConfigError;
+
+#[cfg(feature = "axum-middleware")]
+pub use middleware::{PublicRoute, secctx_middleware};
