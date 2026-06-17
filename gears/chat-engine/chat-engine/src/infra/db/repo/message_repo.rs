@@ -54,6 +54,14 @@ use crate::infra::db::{
 #[derive(Debug, Clone)]
 pub struct NewUserMessage {
     pub session_id: Uuid,
+    /// Owning tenant, denormalized from the session (sourced from the JWT
+    /// `tenant_id` claim, never the request body). Stamped onto both the user
+    /// message and the assistant stub. `None` keeps the column NULL.
+    pub tenant_id: Option<String>,
+    /// Author of the user message — the authenticated user (JWT `user_id`
+    /// claim). Applied to the user message only; the assistant stub has no
+    /// human author and is always persisted with `user_id = NULL`.
+    pub user_id: Option<String>,
     /// Parent in the message tree (`None` only for the very first message in
     /// a session). When `Some`, the caller MUST have already verified the
     /// parent belongs to `session_id` via
@@ -170,8 +178,9 @@ pub trait MessageRepo: Send + Sync {
         &self,
         session_id: Uuid,
         parent_message_id: Uuid,
+        tenant_id: Option<String>,
     ) -> Result<InsertedPair, ChatEngineError> {
-        let _ = (session_id, parent_message_id);
+        let _ = (session_id, parent_message_id, tenant_id);
         Err(ChatEngineError::internal(
             "insert_assistant_variant_stub not implemented for this repository",
         ))
@@ -186,8 +195,9 @@ pub trait MessageRepo: Send + Sync {
         text: String,
         metadata: Option<JsonValue>,
         summarized_ids: Vec<Uuid>,
+        tenant_id: Option<String>,
     ) -> Result<Uuid, ChatEngineError> {
-        let _ = (session_id, text, metadata, summarized_ids);
+        let _ = (session_id, text, metadata, summarized_ids, tenant_id);
         Err(ChatEngineError::internal(
             "insert_summary_message not implemented for this repository",
         ))
@@ -296,6 +306,8 @@ impl MessageRepo for SeaMessageRepo {
             .and_then(|ids| serde_json::to_value(ids).ok());
         let content = req.content;
         let metadata = req.metadata;
+        let tenant_id = req.tenant_id;
+        let author_id = req.user_id;
 
         let mut last_err: Option<ChatEngineError> = None;
         for _attempt in 0..VARIANT_INDEX_MAX_RETRIES {
@@ -305,6 +317,10 @@ impl MessageRepo for SeaMessageRepo {
             let content_attempt = content.clone();
             let metadata_attempt = metadata.clone();
             let file_ids_attempt = file_ids_json.clone();
+            let user_tenant = tenant_id.clone();
+            let author = author_id.clone();
+            // Assistant stub inherits the owning tenant but has no author.
+            let assistant_tenant = tenant_id.clone();
 
             let outcome: Result<i32, ChatEngineError> = self
                 .db
@@ -317,6 +333,10 @@ impl MessageRepo for SeaMessageRepo {
                         let user_active = message_entity::ActiveModel {
                             message_id: Set(user_message_id),
                             session_id: Set(session_id),
+                            // Owning tenant (denormalized) + authoring user, both
+                            // sourced from the JWT identity by the service layer.
+                            tenant_id: Set(user_tenant),
+                            user_id: Set(author),
                             parent_message_id: Set(parent),
                             role: Set(message_entity::MessageRole::User),
                             content: Set(content_attempt),
@@ -332,6 +352,10 @@ impl MessageRepo for SeaMessageRepo {
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(assistant_message_id),
                             session_id: Set(session_id),
+                            // Inherits the owning tenant; assistant messages have
+                            // no human author, so `user_id` stays NULL.
+                            tenant_id: Set(assistant_tenant),
+                            user_id: Set(None),
                             parent_message_id: Set(Some(user_message_id)),
                             role: Set(message_entity::MessageRole::Assistant),
                             content: Set(empty_content()),
@@ -648,6 +672,7 @@ impl MessageRepo for SeaMessageRepo {
         text: String,
         metadata: Option<JsonValue>,
         summarized_ids: Vec<Uuid>,
+        tenant_id: Option<String>,
     ) -> Result<Uuid, ChatEngineError> {
         let summary_id = Uuid::new_v4();
         let now = OffsetDateTime::now_utc();
@@ -656,6 +681,9 @@ impl MessageRepo for SeaMessageRepo {
         let summary_active = message_entity::ActiveModel {
             message_id: Set(summary_id),
             session_id: Set(session_id),
+            // Inherits the owning tenant; system-generated, so no human author.
+            tenant_id: Set(tenant_id),
+            user_id: Set(None),
             parent_message_id: Set(None),
             role: Set(message_entity::MessageRole::System),
             content: Set(content),
@@ -780,6 +808,7 @@ impl MessageRepo for SeaMessageRepo {
         &self,
         session_id: Uuid,
         parent_message_id: Uuid,
+        tenant_id: Option<String>,
     ) -> Result<InsertedPair, ChatEngineError> {
         // Same race-free pattern as `insert_user_and_assistant_stub`:
         // the SELECT for `MAX(variant_index)+1` runs in the SAME
@@ -788,6 +817,7 @@ impl MessageRepo for SeaMessageRepo {
         for _attempt in 0..VARIANT_INDEX_MAX_RETRIES {
             let new_message_id = Uuid::new_v4();
             let now = OffsetDateTime::now_utc();
+            let variant_tenant = tenant_id.clone();
 
             let outcome: Result<i32, ChatEngineError> = self
                 .db
@@ -800,6 +830,10 @@ impl MessageRepo for SeaMessageRepo {
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(new_message_id),
                             session_id: Set(session_id),
+                            // Inherits the owning tenant; recreated assistant
+                            // variant has no human author.
+                            tenant_id: Set(variant_tenant),
+                            user_id: Set(None),
                             parent_message_id: Set(Some(parent_message_id)),
                             role: Set(message_entity::MessageRole::Assistant),
                             content: Set(empty_content()),

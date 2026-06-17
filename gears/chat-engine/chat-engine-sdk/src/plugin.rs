@@ -337,6 +337,8 @@ mod message_plugin_ctx_debug_tests {
         Message {
             message_id: Uuid::nil(),
             session_id: Uuid::nil(),
+            tenant_id: None,
+            user_id: None,
             parent_message_id: None,
             variant_index: 0,
             is_active: true,

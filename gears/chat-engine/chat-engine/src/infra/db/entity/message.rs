@@ -16,11 +16,12 @@ use crate::infra::db::migrations::{UQ_VARIANT_INDEX, UQ_VARIANT_INDEX_ROOT};
 /// HTTP `409 Conflict` (see DESIGN §3.7 "Variant Index Concurrency").
 pub const VARIANT_INDEX_MAX_RETRIES: u32 = 3;
 
-// Tenant / user scoping for messages is enforced indirectly via the
-// owning `sessions` row, which the repo joins on per request. There is
-// no per-message `tenant_id` column to wire `Scopable` against, so the
-// entity is marked unrestricted and scoping stays in the explicit
-// session join below.
+// Tenant / user scoping for messages stays enforced via the owning
+// `sessions` row, which the repo joins on per request. The denormalized
+// `tenant_id` column below is nullable (un-backfilled legacy rows hold
+// NULL) and `user_id` is the message *author*, not an ownership key, so
+// neither is a safe authority for row scoping yet — the entity stays
+// `unrestricted` and scoping remains the explicit session join.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "messages")]
 #[secure(unrestricted)]
@@ -29,6 +30,11 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub message_id: Uuid,
     pub session_id: Uuid,
+    /// Owning tenant, denormalized from the parent session. NULL only for
+    /// un-backfilled legacy rows.
+    pub tenant_id: Option<String>,
+    /// Author of this message (NULL for assistant/system and legacy rows).
+    pub user_id: Option<String>,
     pub parent_message_id: Option<Uuid>,
     pub role: MessageRole,
     #[sea_orm(column_type = "JsonBinary")]

@@ -813,6 +813,8 @@ mod tests {
         Message {
             message_id: Uuid::new_v4(),
             session_id,
+            tenant_id: None,
+            user_id: None,
             parent_message_id: None,
             variant_index: 0,
             is_active: true,

@@ -321,6 +321,18 @@ pub struct Message {
     pub message_id: Uuid,
     /// Session this message belongs to.
     pub session_id: Uuid,
+    /// Owning tenant, denormalized from the parent session so message-scoped
+    /// queries and sharding don't require a join. When set, always equals the
+    /// session's `tenant_id`. `None` only for legacy rows persisted before the
+    /// column existed (not yet backfilled).
+    #[serde(default)]
+    pub tenant_id: Option<TenantId>,
+    /// Author of this specific message (not the session owner). Set to the
+    /// authenticated user for `user`-role messages; `None` for `assistant` /
+    /// `system` messages (machine-generated, no human author) and un-backfilled
+    /// legacy rows. Enables author attribution in multi-user / shared sessions.
+    #[serde(default)]
+    pub user_id: Option<UserId>,
     /// Parent message in the tree; `None` for the first (root) message.
     pub parent_message_id: Option<Uuid>,
     /// Ordinal among siblings sharing the same `parent_message_id` within the

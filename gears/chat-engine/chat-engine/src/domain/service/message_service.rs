@@ -577,7 +577,13 @@ impl MessageService {
         // single SERIALIZABLE transaction (see
         // `MessageRepo::insert_summary_message`).
         self.messages
-            .insert_summary_message(session_id, accumulator, metadata, summarized_ids)
+            .insert_summary_message(
+                session_id,
+                accumulator,
+                metadata,
+                summarized_ids,
+                Some(tenant_id.to_owned()),
+            )
             .await?;
 
         info!(
@@ -680,9 +686,10 @@ impl MessageService {
         &self,
         session_id: Uuid,
         parent_message_id: Uuid,
+        tenant_id: Option<String>,
     ) -> Result<InsertedPair> {
         self.messages
-            .insert_assistant_variant_stub(session_id, parent_message_id)
+            .insert_assistant_variant_stub(session_id, parent_message_id, tenant_id)
             .await
     }
 
@@ -1062,14 +1069,20 @@ impl MessageService {
     /// `uq_messages_session_parent_variant` collisions — the previous
     /// `assign_variant_index` helper had its own transaction for the
     /// SELECT and left a race window before the INSERT.
-    #[instrument(skip(self, req, _identity), fields(session_id = %req.session_id))]
+    #[instrument(skip(self, req, identity), fields(session_id = %req.session_id))]
     async fn pre_persist_user_message(
         &self,
         req: &SendMessageRequest,
-        _identity: &Identity,
+        identity: &Identity,
     ) -> Result<InsertedPair> {
         let payload = NewUserMessage {
             session_id: req.session_id,
+            // Denormalized owning tenant + authoring user, sourced from the JWT
+            // identity (never the request body). The session is already proven
+            // to belong to this identity by `validate_request`, so the session's
+            // `tenant_id` and `identity.tenant_id` are equal.
+            tenant_id: Some(identity.tenant_id.clone()),
+            user_id: Some(identity.user_id.clone()),
             parent_message_id: req.parent_message_id,
             content: req.content.clone(),
             file_ids: if req.file_ids.is_empty() {
@@ -2213,6 +2226,8 @@ mod tests {
         Message {
             message_id: Uuid::new_v4(),
             session_id: Uuid::nil(),
+            tenant_id: None,
+            user_id: None,
             parent_message_id: None,
             variant_index: 0,
             is_active: true,
@@ -2233,6 +2248,8 @@ mod tests {
         Message {
             message_id: Uuid::new_v4(),
             session_id: Uuid::nil(),
+            tenant_id: None,
+            user_id: None,
             parent_message_id: None,
             variant_index: 0,
             is_active: true,
@@ -2906,6 +2923,8 @@ mod tests {
         Message {
             message_id: Uuid::new_v4(),
             session_id,
+            tenant_id: None,
+            user_id: None,
             parent_message_id: parent,
             variant_index: 0,
             is_active: true,

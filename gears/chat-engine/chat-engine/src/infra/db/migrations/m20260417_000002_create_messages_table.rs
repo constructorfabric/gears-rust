@@ -33,6 +33,12 @@ pub const UQ_VARIANT_INDEX: &str = "uq_messages_session_parent_variant";
 /// path too.
 pub const UQ_VARIANT_INDEX_ROOT: &str = "uq_messages_session_root_variant";
 
+/// Partial btree index on the denormalized `tenant_id`, supporting
+/// message-scoped queries (cross-session search, retention) and future
+/// sharding without joining `sessions`. Partial (`WHERE tenant_id IS NOT NULL`)
+/// because un-backfilled legacy rows hold NULL and need not be indexed.
+pub const IDX_MESSAGES_TENANT: &str = "idx_messages_tenant";
+
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -51,6 +57,8 @@ impl MigrationTrait for Migration {
                             .primary_key(),
                     )
                     .col(ColumnDef::new(Messages::SessionId).uuid().not_null())
+                    .col(ColumnDef::new(Messages::TenantId).string().null())
+                    .col(ColumnDef::new(Messages::UserId).string().null())
                     .col(ColumnDef::new(Messages::ParentMessageId).uuid().null())
                     .col(ColumnDef::new(Messages::Role).string().not_null())
                     .col(ColumnDef::new(Messages::Content).json_binary().not_null())
@@ -164,12 +172,32 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        // Partial index on the denormalized `tenant_id`. Raw SQL because the
+        // SeaORM index builder does not express a partial `WHERE` portably;
+        // PG + SQLite support it (ADR-0019), MySQL is a no-op.
+        match manager.get_database_backend() {
+            sea_orm::DatabaseBackend::Postgres | sea_orm::DatabaseBackend::Sqlite => {
+                manager
+                    .get_connection()
+                    .execute_unprepared(&format!(
+                        "CREATE INDEX IF NOT EXISTS {IDX_MESSAGES_TENANT} \
+                         ON messages (tenant_id) WHERE tenant_id IS NOT NULL"
+                    ))
+                    .await?;
+            }
+            sea_orm::DatabaseBackend::MySql => {}
+        }
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         match manager.get_database_backend() {
             sea_orm::DatabaseBackend::Postgres | sea_orm::DatabaseBackend::Sqlite => {
+                manager
+                    .get_connection()
+                    .execute_unprepared(&format!("DROP INDEX IF EXISTS {IDX_MESSAGES_TENANT}"))
+                    .await?;
                 manager
                     .get_connection()
                     .execute_unprepared(&format!("DROP INDEX IF EXISTS {UQ_VARIANT_INDEX_ROOT}"))
@@ -221,6 +249,8 @@ pub enum Messages {
     Table,
     MessageId,
     SessionId,
+    TenantId,
+    UserId,
     ParentMessageId,
     Role,
     Content,

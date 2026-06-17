@@ -180,6 +180,71 @@ async fn cancel_after_partial_chunks_persists_is_complete_false_against_sqlite()
 }
 
 // ===========================================================================
+// 1b. Author/tenant stamping — the persisted user message carries the JWT
+//     tenant + author; the assistant stub inherits the tenant but has no
+//     human author. Exercises the write-path threading end-to-end.
+// ===========================================================================
+
+#[tokio::test]
+async fn send_message_stamps_tenant_and_author_against_sqlite() {
+    use chat_engine::infra::db::entity::message;
+
+    let harness = db::setup_sqlite().await;
+    let plugin_id = "tenant-stamp-plugin";
+    let session_type_id = db::seed_session_type(&harness, plugin_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+
+    // A script that closes cleanly so both the user message and the
+    // finalized assistant row land on disk.
+    let plugin = FakePlugin::new(
+        plugin_id,
+        FakePluginScript::Events(vec![StreamingEvent::Chunk(StreamingChunkEvent {
+            message_id: Uuid::nil(),
+            chunk: "ok".into(),
+        })]),
+    );
+    let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+    let svc = build_service(&harness, plugin_id, plugin_dyn);
+
+    let cancel = CancellationToken::new();
+    let mut stream = svc
+        .send_message(make_request(session_id), make_identity(), cancel)
+        .await
+        .expect("send_message dispatch");
+    while stream.next().await.is_some() {}
+
+    let rows = db::list_messages(&harness.db, session_id).await;
+    let user = rows
+        .iter()
+        .find(|m| matches!(m.role, message::MessageRole::User))
+        .expect("user message persisted");
+    assert_eq!(
+        user.tenant_id.as_deref(),
+        Some(TENANT_ID),
+        "user message must inherit the JWT tenant",
+    );
+    assert_eq!(
+        user.user_id.as_deref(),
+        Some(USER_ID),
+        "user message must record its JWT author",
+    );
+
+    let assistant = rows
+        .iter()
+        .find(|m| matches!(m.role, message::MessageRole::Assistant))
+        .expect("assistant stub persisted");
+    assert_eq!(
+        assistant.tenant_id.as_deref(),
+        Some(TENANT_ID),
+        "assistant message must inherit the owning tenant",
+    );
+    assert_eq!(
+        assistant.user_id, None,
+        "assistant message has no human author",
+    );
+}
+
+// ===========================================================================
 // 2. Pre-stream timeout — the assistant stub must be finalised with
 //    finish_reason=timeout, is_complete=false, against the real DB
 // ===========================================================================

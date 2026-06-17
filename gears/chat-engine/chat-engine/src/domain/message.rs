@@ -24,7 +24,7 @@
 
 pub use chat_engine_sdk::models::{
     Message, MessageRole, StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent,
-    StreamingEvent, StreamingStartEvent, VariantInfo,
+    StreamingEvent, StreamingStartEvent, TenantId, UserId, VariantInfo,
 };
 
 use sea_orm::ActiveValue::Set;
@@ -50,6 +50,11 @@ impl From<message_entity::Model> for Message {
         Message {
             message_id: m.message_id,
             session_id: m.session_id,
+            // Empty strings can't occur via the write path (newtypes reject
+            // them) but we filter defensively rather than panic in
+            // `TenantId`/`UserId::from` at this conversion boundary.
+            tenant_id: m.tenant_id.filter(|s| !s.is_empty()).map(TenantId::from),
+            user_id: m.user_id.filter(|s| !s.is_empty()).map(UserId::from),
             parent_message_id: m.parent_message_id,
             variant_index,
             is_active: m.is_active,
@@ -81,6 +86,8 @@ impl From<Message> for message_entity::ActiveModel {
         message_entity::ActiveModel {
             message_id: Set(m.message_id),
             session_id: Set(m.session_id),
+            tenant_id: Set(m.tenant_id.map(|t| t.as_str().to_owned())),
+            user_id: Set(m.user_id.map(|u| u.as_str().to_owned())),
             parent_message_id: Set(m.parent_message_id),
             role: Set(role_to_entity(&m.role)),
             content: Set(m.content),
@@ -126,6 +133,8 @@ mod tests {
         message_entity::Model {
             message_id: Uuid::nil(),
             session_id: Uuid::nil(),
+            tenant_id: Some("tenant-1".to_string()),
+            user_id: Some("user-1".to_string()),
             parent_message_id: None,
             role: message_entity::MessageRole::Assistant,
             content: serde_json::json!({"text": "hi"}),
@@ -150,10 +159,35 @@ mod tests {
     }
 
     #[test]
+    fn tenant_and_user_round_trip_through_conversions() {
+        let msg: Message = sample_model().into();
+        assert_eq!(msg.tenant_id.as_ref().map(TenantId::as_str), Some("tenant-1"));
+        assert_eq!(msg.user_id.as_ref().map(UserId::as_str), Some("user-1"));
+
+        let am: message_entity::ActiveModel = msg.into();
+        assert!(matches!(am.tenant_id, ActiveValue::Set(Some(ref t)) if t == "tenant-1"));
+        assert!(matches!(am.user_id, ActiveValue::Set(Some(ref u)) if u == "user-1"));
+    }
+
+    #[test]
+    fn null_and_empty_string_tenant_user_decode_to_none() {
+        // NULL columns decode to None; empty strings are filtered defensively
+        // rather than panicking in TenantId/UserId::from.
+        let mut model = sample_model();
+        model.tenant_id = None;
+        model.user_id = Some(String::new());
+        let msg: Message = model.into();
+        assert!(msg.tenant_id.is_none());
+        assert!(msg.user_id.is_none());
+    }
+
+    #[test]
     fn message_to_active_model_encodes_role_and_file_ids() {
         let msg = Message {
             message_id: Uuid::nil(),
             session_id: Uuid::nil(),
+            tenant_id: Some(TenantId::from("tenant-1")),
+            user_id: Some(UserId::from("user-1")),
             parent_message_id: None,
             variant_index: 3,
             is_active: false,
@@ -183,6 +217,8 @@ mod tests {
         let msg = Message {
             message_id: Uuid::nil(),
             session_id: Uuid::nil(),
+            tenant_id: Some(TenantId::from("tenant-1")),
+            user_id: Some(UserId::from("user-1")),
             parent_message_id: None,
             variant_index: 0,
             is_active: false,

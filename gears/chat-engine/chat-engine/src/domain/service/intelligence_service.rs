@@ -487,6 +487,7 @@ impl IntelligenceService {
             cancel,
             plugin_cancel,
             deadline,
+            identity.tenant_id.clone(),
         );
         Ok(stream)
     }
@@ -758,6 +759,9 @@ impl IntelligenceService {
         cancel: CancellationToken,
         plugin_cancel: CancellationToken,
         deadline: Instant,
+        // Owning tenant (denormalized) stamped onto the persisted summary
+        // message; the summary is system-generated and has no human author.
+        tenant_id: String,
     ) -> SummaryStream {
         let (tx, rx) = mpsc::channel::<StreamingEvent>(self.summary_buffer_size);
         let messages = Arc::clone(&self.messages);
@@ -871,6 +875,7 @@ impl IntelligenceService {
                         accumulator,
                         last_metadata.clone(),
                         summarized_ids,
+                        Some(tenant_id.clone()),
                     )
                     .await
                 {
@@ -1174,14 +1179,17 @@ mod tests {
         }
     }
 
+    /// One `insert_summary_message` call recorded by the mock:
+    /// `(session_id, summary_text, tenant_id)`.
+    type RecordedSummary = (Uuid, String, Option<String>);
+
     /// `MockMessageRepo` driven by a caller-supplied vector of messages
     /// the retention-evaluator should see. Tracks `delete_message_subtree`
     /// calls so tests can assert at-most-once behaviour.
     struct MockMessageRepo {
         all: Mutex<Vec<Message>>,
         deletes: Mutex<Vec<Uuid>>,
-        /// `(session_id, summary_text)` recorded by `insert_summary_message`.
-        summaries: Mutex<Vec<(Uuid, String)>>,
+        summaries: Mutex<Vec<RecordedSummary>>,
         /// When set, `insert_summary_message` returns an error so tests can
         /// exercise the persist-failure path of the summarize driver.
         fail_summary: Mutex<bool>,
@@ -1225,11 +1233,12 @@ mod tests {
             text: String,
             _metadata: Option<serde_json::Value>,
             _summarized_ids: Vec<Uuid>,
+            tenant_id: Option<String>,
         ) -> std::result::Result<Uuid, ChatEngineError> {
             if *self.fail_summary.lock() {
                 return Err(ChatEngineError::internal("mock summary persist failure"));
             }
-            self.summaries.lock().push((session_id, text));
+            self.summaries.lock().push((session_id, text, tenant_id));
             Ok(Uuid::new_v4())
         }
         async fn fetch_active_history(
@@ -1388,6 +1397,8 @@ mod tests {
         Message {
             message_id: Uuid::new_v4(),
             session_id,
+            tenant_id: None,
+            user_id: None,
             parent_message_id: parent,
             variant_index: 0,
             is_active: true,
@@ -1994,10 +2005,18 @@ mod tests {
         assert_eq!(kinds, vec!["start", "chunk", "chunk", "complete"]);
         // `Complete` is emitted only after a successful persist, so by the
         // time the stream closes the summary row must have been recorded.
+        let summaries = msgs.summaries.lock();
         assert_eq!(
-            msgs.summaries.lock().len(),
+            summaries.len(),
             1,
             "happy path must persist the summary before emitting Complete",
+        );
+        // The summary message must be stamped with the caller's tenant
+        // (denormalized owning tenant), threaded from the JWT identity.
+        assert_eq!(
+            summaries[0].2.as_deref(),
+            Some("t"),
+            "summary must inherit the identity tenant_id",
         );
     }
 

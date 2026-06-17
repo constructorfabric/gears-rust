@@ -127,6 +127,10 @@ pub trait VariantRepo: Send + Sync {
     /// streaming pipeline never observes a user turn with no assistant
     /// child.
     ///
+    /// `tenant_id` (denormalized owning tenant) is stamped on both rows;
+    /// `user_id` (the branching author, from the JWT identity) is stamped on
+    /// the user message only — the assistant stub has no human author.
+    ///
     /// Returns `(user_message_id, user_variant_index, assistant_message_id)`.
     async fn insert_user_and_assistant_stub_for_branch(
         &self,
@@ -134,6 +138,8 @@ pub trait VariantRepo: Send + Sync {
         parent_message_id: Uuid,
         content: JsonValue,
         file_ids: Option<Vec<Uuid>>,
+        tenant_id: Option<String>,
+        user_id: Option<String>,
     ) -> Result<(Uuid, i32, Uuid)>;
 
     /// Walk the ancestor chain of `message_id` up to the root, returning
@@ -493,7 +499,11 @@ impl VariantService {
         // Phase 1 `assign_variant_index` helper.
         let inserted = self
             .message_service
-            .prepare_recreate_stub(session_id, parent_message_id)
+            .prepare_recreate_stub(
+                session_id,
+                parent_message_id,
+                Some(identity.tenant_id.clone()),
+            )
             .await
             .map_err(map_unique_violation_to_conflict)?;
         let new_message_id = inserted.assistant_message_id;
@@ -647,6 +657,8 @@ impl VariantService {
                 branch_point_message_id,
                 content,
                 file_ids,
+                Some(identity.tenant_id.clone()),
+                Some(identity.user_id.clone()),
             )
             .await
             .map_err(map_unique_violation_to_conflict)?;
@@ -1189,6 +1201,8 @@ mod tests {
             parent_message_id: Uuid,
             _content: JsonValue,
             _file_ids: Option<Vec<Uuid>>,
+            _tenant_id: Option<String>,
+            _user_id: Option<String>,
         ) -> Result<(Uuid, i32, Uuid)> {
             self.total_calls.fetch_add(1, Ordering::SeqCst);
             let mut attempts = self.attempts.lock();
@@ -1272,6 +1286,8 @@ mod tests {
                     session_id,
                     parent_message_id,
                     json!({"text": "x"}),
+                    None,
+                    None,
                     None,
                 )
                 .await

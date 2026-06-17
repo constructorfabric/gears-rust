@@ -155,6 +155,8 @@ pub async fn seed_message(
     let am = message::ActiveModel {
         message_id: Set(id),
         session_id: Set(session_id),
+        tenant_id: Set(None),
+        user_id: Set(None),
         parent_message_id: Set(parent_message_id),
         role: Set(message::MessageRole::User),
         content: Set(JsonValue::Object(serde_json::Map::new())),

@@ -75,6 +75,8 @@ impl VariantRepo for SeaVariantRepo {
         parent_message_id: Uuid,
         content: JsonValue,
         file_ids: Option<Vec<Uuid>>,
+        tenant_id: Option<String>,
+        user_id: Option<String>,
     ) -> Result<(Uuid, i32, Uuid)> {
         use crate::infra::db::entity::message as message_entity;
         use crate::infra::db::{
@@ -101,6 +103,10 @@ impl VariantRepo for SeaVariantRepo {
             let now = OffsetDateTime::now_utc();
             let content_attempt = content.clone();
             let file_ids_attempt = file_ids_json.clone();
+            let user_tenant = tenant_id.clone();
+            let author = user_id.clone();
+            // Assistant stub inherits the owning tenant but has no author.
+            let assistant_tenant = tenant_id.clone();
 
             let outcome: Result<i32> = self
                 .db
@@ -113,6 +119,10 @@ impl VariantRepo for SeaVariantRepo {
                         let user_active = message_entity::ActiveModel {
                             message_id: Set(user_message_id),
                             session_id: Set(session_id),
+                            // Owning tenant (denormalized) + branching author,
+                            // both from the JWT identity at the service layer.
+                            tenant_id: Set(user_tenant),
+                            user_id: Set(author),
                             parent_message_id: Set(Some(parent_message_id)),
                             role: Set(message_entity::MessageRole::User),
                             content: Set(content_attempt),
@@ -128,6 +138,9 @@ impl VariantRepo for SeaVariantRepo {
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(assistant_message_id),
                             session_id: Set(session_id),
+                            // Inherits the owning tenant; no human author.
+                            tenant_id: Set(assistant_tenant),
+                            user_id: Set(None),
                             parent_message_id: Set(Some(user_message_id)),
                             role: Set(message_entity::MessageRole::Assistant),
                             content: Set(json!({ "text": "" })),
