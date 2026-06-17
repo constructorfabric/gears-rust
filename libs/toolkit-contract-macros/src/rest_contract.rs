@@ -274,6 +274,11 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
             ///   traffic in dev / behind a mesh sidecar typically uses
             ///   plaintext. Callers needing TLS-only enforcement use
             ///   [`Self::with_http_client`] with a stricter `HttpClient`.
+            /// - OpenTelemetry is **enabled** (`with_otel`): outbound calls get
+            ///   a span and W3C trace-context propagation so a contract hop
+            ///   joins the distributed trace. Inert unless the build enables
+            ///   `toolkit-http/otel`; callers wanting a different observability
+            ///   stance use [`Self::with_http_client`].
             fn build_default_http_client() -> ::std::result::Result<
                 ::toolkit_http::HttpClient,
                 ::toolkit_http::HttpError,
@@ -281,6 +286,7 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
                 ::toolkit_http::HttpClient::builder()
                     .retry(::std::option::Option::None)
                     .transport(::toolkit_http::TransportSecurity::AllowInsecureHttp)
+                    .with_otel()
                     .build()
             }
 
