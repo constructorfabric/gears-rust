@@ -2540,6 +2540,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "trybuild",
  "uuid",
 ]
 
@@ -2550,6 +2551,7 @@ dependencies = [
  "anyhow",
  "cf-gears-toolkit-security",
  "rand 0.10.1",
+ "secrecy",
  "tokio",
  "tokio-stream",
  "tokio-util",

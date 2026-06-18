@@ -4,6 +4,7 @@ pub mod authenticator;
 pub mod bin_codec;
 pub mod constants;
 pub mod context;
+pub mod internal_auth;
 pub mod prelude;
 
 pub use access_scope::{
@@ -13,6 +14,10 @@ pub use access_scope::{
 };
 pub use authenticator::{AuthnError, BearerAuthenticator};
 pub use context::{SecurityContext, SecurityContextBuildError};
+pub use internal_auth::{
+    InternalAuthError, InternalAuthenticator, InternalCredential, PeerAuthenticated,
+    PlatformIdentity, PlatformSecurityContext,
+};
 
 pub use bin_codec::{
     SECCTX_BIN_VERSION, SecCtxDecodeError, SecCtxEncodeError, decode_bin, encode_bin,

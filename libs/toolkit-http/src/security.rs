@@ -3,12 +3,13 @@
 //! `SecurityContext` propagation over HTTP uses a single header,
 //! `Authorization: Bearer <jwt>`, carrying the original tenant-plane JWT. The
 //! token is forwarded as-is across hops and **re-validated at every hop** —
-//! there is no trusted-peer fast path (zero-trust; see ADR-0008). No binary
+//! there is no trusted-peer fast path (zero-trust). No binary
 //! `x-secctx-bin` encoding is used over HTTP.
 
 use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use toolkit_security::SecurityContext;
+use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 
 /// Maximum body preview size for error messages (8KB).
 ///
@@ -47,6 +48,9 @@ pub fn attach_bearer_http<B>(request: &mut http::Request<B>, secctx: &SecurityCo
     };
     // Expose the secret only here, at the transport boundary, and never log it.
     let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {}", token.expose_secret())) else {
+        tracing::warn!(
+            "bearer token contains invalid HTTP header characters; outgoing request sent without Authorization header"
+        );
         return;
     };
     value.set_sensitive(true);
@@ -62,7 +66,7 @@ pub fn attach_bearer_http<B>(request: &mut http::Request<B>, secctx: &SecurityCo
 ///
 /// Returns [`SecCtxHttpError`] when the header is absent, not a valid `Bearer`
 /// credential, or carries an empty token.
-pub fn extract_bearer_http(headers: &HeaderMap) -> Result<String, SecCtxHttpError> {
+pub fn extract_bearer_http(headers: &HeaderMap) -> Result<SecretString, SecCtxHttpError> {
     let header = headers
         .get(AUTHORIZATION)
         .ok_or(SecCtxHttpError::MissingAuthHeader)?;
@@ -83,8 +87,77 @@ pub fn extract_bearer_http(headers: &HeaderMap) -> Result<String, SecCtxHttpErro
     if token.is_empty() {
         return Err(SecCtxHttpError::EmptyToken);
     }
+    if token.contains(char::is_whitespace) {
+        return Err(SecCtxHttpError::InvalidAuthHeader);
+    }
 
-    Ok(token.to_owned())
+    Ok(SecretString::from(token))
+}
+
+/// Errors raised while extracting the platform-plane internal token from HTTP
+/// request headers.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InternalTokenHttpError {
+    /// No `X-ToolKit-Internal-Token` header was present on the request.
+    #[error("missing X-ToolKit-Internal-Token header")]
+    MissingHeader,
+    /// The header was present but its value was not valid (non-ASCII bytes).
+    #[error("invalid X-ToolKit-Internal-Token header value")]
+    InvalidHeader,
+    /// The header was present but empty after trimming surrounding whitespace.
+    #[error("empty internal token")]
+    EmptyToken,
+}
+
+/// Attach a platform-plane internal `token` to an outgoing request as the
+/// `X-ToolKit-Internal-Token` header.
+///
+/// The token is carried raw (no `Bearer` scheme) and **never** on
+/// `Authorization`, to avoid colliding with the tenant-plane user JWT.
+/// The secret is exposed only at this transport boundary
+/// and the resulting header value is marked sensitive so it is never logged. If
+/// the token cannot be represented as a header value, the request is left
+/// unchanged.
+pub fn attach_internal_token_http<B>(request: &mut http::Request<B>, token: &SecretString) {
+    // Expose the secret only here, at the transport boundary, and never log it.
+    let Ok(mut value) = HeaderValue::from_str(token.expose_secret()) else {
+        tracing::warn!(
+            "internal token contains invalid HTTP header characters; outgoing request sent without X-ToolKit-Internal-Token header"
+        );
+        return;
+    };
+    value.set_sensitive(true);
+    request.headers_mut().insert(INTERNAL_TOKEN_HEADER, value);
+}
+
+/// Extract the raw platform-plane internal token from the
+/// `X-ToolKit-Internal-Token` header.
+///
+/// Surrounding whitespace is trimmed and an empty token is rejected. The token
+/// is opaque to the transport — its shape (JWT vs. opaque) is classified, and
+/// it is validated, by the receiving `InternalAuthenticator`.
+///
+/// # Errors
+///
+/// Returns [`InternalTokenHttpError`] when the header is absent, not valid
+/// ASCII, or carries an empty token.
+pub fn extract_internal_token_http(
+    headers: &HeaderMap,
+) -> Result<SecretString, InternalTokenHttpError> {
+    let header = headers
+        .get(INTERNAL_TOKEN_HEADER)
+        .ok_or(InternalTokenHttpError::MissingHeader)?;
+    let raw = header
+        .to_str()
+        .map_err(|_| InternalTokenHttpError::InvalidHeader)?;
+
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(InternalTokenHttpError::EmptyToken);
+    }
+
+    Ok(SecretString::from(token))
 }
 
 #[cfg(test)]
@@ -108,7 +181,7 @@ mod tests {
         attach_bearer_http(&mut request, &secctx);
 
         let token = extract_bearer_http(request.headers()).expect("token extracted");
-        assert_eq!(token, "header.payload.signature");
+        assert_eq!(token.expose_secret(), "header.payload.signature");
     }
 
     #[test]
@@ -134,8 +207,8 @@ mod tests {
     fn extract_missing_header() {
         let headers = HeaderMap::new();
         assert_eq!(
-            extract_bearer_http(&headers),
-            Err(SecCtxHttpError::MissingAuthHeader)
+            extract_bearer_http(&headers).unwrap_err(),
+            SecCtxHttpError::MissingAuthHeader
         );
     }
 
@@ -143,23 +216,35 @@ mod tests {
     fn extract_case_insensitive_scheme() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("bEaReR my-token"));
-        assert_eq!(extract_bearer_http(&headers).unwrap(), "my-token");
+        assert_eq!(
+            extract_bearer_http(&headers).unwrap().expose_secret(),
+            "my-token"
+        );
     }
 
     #[test]
     fn extract_trims_surrounding_whitespace() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("  Bearer   my-token  "));
-        assert_eq!(extract_bearer_http(&headers).unwrap(), "my-token");
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("  Bearer   my-token  "),
+        );
+        assert_eq!(
+            extract_bearer_http(&headers).unwrap().expose_secret(),
+            "my-token"
+        );
     }
 
     #[test]
     fn extract_wrong_scheme() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjpwYXNz"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
         assert_eq!(
-            extract_bearer_http(&headers),
-            Err(SecCtxHttpError::InvalidAuthHeader)
+            extract_bearer_http(&headers).unwrap_err(),
+            SecCtxHttpError::InvalidAuthHeader
         );
     }
 
@@ -168,8 +253,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer"));
         assert_eq!(
-            extract_bearer_http(&headers),
-            Err(SecCtxHttpError::InvalidAuthHeader)
+            extract_bearer_http(&headers).unwrap_err(),
+            SecCtxHttpError::InvalidAuthHeader
         );
     }
 
@@ -178,8 +263,69 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer    "));
         assert_eq!(
-            extract_bearer_http(&headers),
-            Err(SecCtxHttpError::EmptyToken)
+            extract_bearer_http(&headers).unwrap_err(),
+            SecCtxHttpError::EmptyToken
+        );
+    }
+
+    #[test]
+    fn internal_token_attach_extract_round_trip() {
+        let mut request = http::Request::new(());
+        attach_internal_token_http(&mut request, &SecretString::from("sa.jwt.token"));
+
+        let token = extract_internal_token_http(request.headers()).expect("token extracted");
+        assert_eq!(token.expose_secret(), "sa.jwt.token");
+    }
+
+    #[test]
+    fn internal_token_uses_dedicated_header_not_authorization() {
+        let mut request = http::Request::new(());
+        attach_internal_token_http(&mut request, &SecretString::from("sa.jwt.token"));
+
+        assert!(request.headers().get(INTERNAL_TOKEN_HEADER).is_some());
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn internal_token_header_is_sensitive() {
+        let mut request = http::Request::new(());
+        attach_internal_token_http(&mut request, &SecretString::from("sa.jwt.token"));
+
+        let value = request
+            .headers()
+            .get(INTERNAL_TOKEN_HEADER)
+            .expect("header set");
+        assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn extract_internal_token_missing_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_internal_token_http(&headers).unwrap_err(),
+            InternalTokenHttpError::MissingHeader
+        );
+    }
+
+    #[test]
+    fn extract_internal_token_trims_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert(INTERNAL_TOKEN_HEADER, HeaderValue::from_static("  tok  "));
+        assert_eq!(
+            extract_internal_token_http(&headers)
+                .unwrap()
+                .expose_secret(),
+            "tok"
+        );
+    }
+
+    #[test]
+    fn extract_internal_token_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert(INTERNAL_TOKEN_HEADER, HeaderValue::from_static("   "));
+        assert_eq!(
+            extract_internal_token_http(&headers).unwrap_err(),
+            InternalTokenHttpError::EmptyToken
         );
     }
 }

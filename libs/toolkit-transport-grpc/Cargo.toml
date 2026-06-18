@@ -27,3 +27,4 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 rand = { workspace = true }
+secrecy = { workspace = true }
