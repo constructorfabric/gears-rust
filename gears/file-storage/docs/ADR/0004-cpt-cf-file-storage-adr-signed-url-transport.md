@@ -1,9 +1,9 @@
 ---
 status: accepted
-date: 2026-06-17
+date: 2026-06-18
 ---
 
-# ADR-0004: Signed-URL Field & Signature Transport
+# ADR-0004: Signed-URL Encoding & Transport
 
 <!-- toc -->
 
@@ -14,10 +14,10 @@ date: 2026-06-17
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [A. Discrete query parameters (chosen)](#a-discrete-query-parameters-chosen)
-  - [B. Single opaque query token](#b-single-opaque-query-token)
-  - [C. Discrete HTTP headers](#c-discrete-http-headers)
-  - [D. Single opaque HTTP-header token](#d-single-opaque-http-header-token)
+  - [A. Discrete fields in the query (chosen)](#a-discrete-fields-in-the-query-chosen)
+  - [B. Opaque token in the query (rejected)](#b-opaque-token-in-the-query-rejected)
+  - [C. Discrete fields in a header (chosen)](#c-discrete-fields-in-a-header-chosen)
+  - [D. Opaque token in a header (rejected)](#d-opaque-token-in-a-header-rejected)
 - [More Information](#more-information)
 - [Option Comparison](#option-comparison)
 - [Traceability](#traceability)
@@ -29,144 +29,167 @@ date: 2026-06-17
 ## Context and Problem Statement
 
 FileStorage authorizes every content operation with an Ed25519 **signed URL** verified by the sidecar
-(`cpt-cf-file-storage-adr-sidecar-data-plane`, `cpt-cf-file-storage-design-signed-urls`). A signed URL is a set of
-**fields** — algorithm, expiry, operation, the resource (`file_id` in the path; `content_id` / `version_id` pin),
-constraints (`ip`, token-claim predicates, upload size/hash, P2 rate/conns), baked response headers — plus the
-**signature** over their canonical form. (Backend id and a key id are deliberately not in the URL — see ADR-0003 /
-§4.5: the sidecar resolves the backend from the version row, and P1 uses a single key.)
+(`cpt-cf-file-storage-adr-sidecar-data-plane`, `cpt-cf-file-storage-design-signed-urls`). A signed request is a set of
+**fields** — operation, resource (`file_id` in the path, `content_id`/`version_id`), `exp`, constraints (`ip`,
+token-claim predicates, upload size/hash, P2 rate/conns), baked response headers — plus one **signature** over their
+canonical form.
 
-Where those fields and the signature physically live on the wire is a separate decision from *what* they contain.
-Two axes: **location** (URL query string vs HTTP headers) and **shape** (discrete named entries vs a single opaque
-token blob). This ADR fixes that transport so the canonicalization, the SDK, the sidecar verifier, and any CDN/proxy
-in front of the sidecar all agree.
+How those fields and the signature ride on the wire is **two orthogonal decisions**, which an earlier draft conflated:
+
+1. **Encoding** — discrete named fields (one signature over all of them, S3 SigV4 style) **vs.** a single **opaque token
+   blob** (e.g. PASETO) that hides the fields.
+2. **Envelope / transport** — the **URL query string** **vs.** **HTTP headers**.
+
+The earlier draft picked "discrete fields, in the query, header deferred". Review showed the two axes are independent and
+that there are **two genuinely different access intents** whose needs conflict, so a single envelope cannot be optimal
+for both.
 
 ## Decision Drivers
 
-* Works as a **bare, shareable URL** — a download link must be usable directly by a browser, an `<img>`/`<video>` tag,
-  `curl <url>`, or a media player issuing `Range` requests, with **no out-of-band headers** the embedder cannot set
-* Canonical / interoperable — reusing a battle-tested, widely-understood scheme lowers implementation and review risk
-  and matches operator/tooling expectations
-* Cache-friendliness with the CDN offload (`cpt-cf-file-storage-nfr-bandwidth`) — how the transport interacts with
-  cache keys when a URL's signature is re-issued
-* Debuggability / observability — fields visible and greppable in logs and traces vs an opaque blob
-* Verifiability without parsing ceremony — the sidecar must reconstruct the canonical string deterministically
-* Secret hygiene — the signature is a short-lived, constrained credential; where it appears (URL logs, Referer,
-  browser history) matters
+* **Bare, shareable URL** — a download link must work directly in a browser, `<img>`/`<video>`, `curl <url>`, or a media
+  player issuing `Range`, with **no headers** the embedder cannot set
+* **Programmatic / batch access** — SDK and server-to-server callers want the credential **out of the URL** (clean
+  access logs / `Referer` / history), a **stable URL** across re-issue (CDN cache), and low per-request ceremony
+* **Edge observability without cracking crypto** — CDN cache-key normalization, WAF rules, and access-log analytics
+  should be able to read fields (e.g. `exp`, scope) **without decoding a token**
+* **Fields are not secrets** — `exp`, tenant, hash, op are not capabilities; the **only** secret is the signature, which
+  is present on the wire regardless of encoding. Hiding the *other* fields buys no security
+* **One composite signature** — a single signature over the whole canonical field-set (not per-field)
+* **Low-risk, proven shape** — prefer a design pattern with a long, broad production track record
 
 ## Considered Options
 
-* **A. Discrete query parameters** — each field is its own `X-FS-*` query parameter; signature in `X-FS-Signature` (S3 SigV4 style)
-* **B. Single opaque query token** — all fields + signature packed into one base64 blob in a single query parameter
-* **C. Discrete HTTP headers** — each field is its own request header; signature in a header
-* **D. Single opaque HTTP-header token** — all fields + signature packed into one header value (bearer-token shape)
+Two axes → four concrete combinations:
+
+| | Query string | HTTP header |
+|---|---|---|
+| **Discrete fields** | **A** | **C** |
+| **Opaque token** | B | D |
 
 ## Decision Outcome
 
-Chosen option: **"A. Discrete query parameters"**. The signed URL carries each field as an `X-FS-*` query parameter and
-the signature as `X-FS-Signature`, exactly as specified in `cpt-cf-file-storage-design-signed-urls`. This is the
-**canonical AWS S3 SigV4 query-signing scheme**, in production use for ~20 years.
+**Encoding = discrete named fields** (`X-FS-*`) with one composite Ed25519 signature over the canonical string — **not**
+an opaque token. **Transport = both envelopes, chosen by access intent:**
 
-The decisive driver is the **bare-URL property**: a FileStorage download URL must be directly usable as a plain URL —
-pasted into a browser, set as `<img src>` / `<video src>`, fetched by `curl`, or seeked by a media player via `Range`
-— **without the caller attaching any headers**. Only the query-string form gives that; any header-based form
-(C/D) cannot be embedded as a bare URL and forces every consumer to attach headers, which rules it out for the primary
-use case. Discrete fields (over a token blob) keep the scheme canonical, debuggable, and verifiable without an extra
-decode step, and let a CDN reason about individual parameters when needed.
+* **Query (A)** — the default. `X-FS-*` query parameters produce a **bare, shareable URL** for embeddable/anonymous-ish
+  reads (browser, `<img>`/`<video>`, `curl`, media `Range`), where the caller cannot set headers.
+* **Header (C)** — for **programmatic / SDK / batch** callers: the *same* `X-FS-*` fields and the *same* signature are
+  carried as **request headers** instead of query parameters (analogous to S3 SigV4's `Authorization`-header form). This
+  keeps the credential **out of the URL** (clean logs, no `Referer` leak), keeps the **URL stable** across re-issue
+  (clean CDN cache key), and is tidy for batch.
 
-**Header-based discrete fields (C) are the acknowledged runner-up**, with one genuine advantage: the URL path+query is
-**stable across signature re-issue** (re-presigning only changes headers, not the URL), which keeps a CDN cache key
-clean and avoids cache fragmentation when a link is re-signed. We accept the query-form caching trade-off instead
-(mitigations below) because the bare-URL property outweighs it. C may be offered later as an **optional alternate
-transport** for header-capable, cache-sensitive callers (SDK/server-to-server), but P1 commits to A as the one
-canonical form.
+Both envelopes carry the **identical field-set and signature**; the canonical string the signature covers is the same
+regardless of where the fields ride, so the sidecar verifies a request whether the fields arrive as query params or as
+headers. The caller (or SDK) picks the envelope by intent.
 
-**Token forms (B and D) are rejected outright** — in any location they add an opaque blob that must be decoded before
-verification, destroy log/trace debuggability, and are non-standard, while providing **no benefit**: the signature
-already makes the payload tamper-evident, so opacity buys nothing.
+**Reject the opaque token (B and D)** in both envelopes. In the query it provides **no** advantage over discrete fields:
+the supposed gains attributed to it are actually gains of the **header envelope**, not of the token encoding.
+Specifically:
+
+* "one signature, not per-field" is already true for discrete fields — SigV4-style signing produces a **single
+  composite** signature over all params; discrete ≠ per-field;
+* "hide fields from logs" gives **no security** — the fields are not secrets and the signature is in the URL either way;
+  if a caller truly needs the credential out of the URL, that is the **header envelope**, not opacity;
+* an opaque blob **loses edge observability** (CDN/WAF/logs can no longer read `exp`/scope without decoding) and is a
+  non-standard format every edge component would have to learn.
+
+S3 (and the many independent vendors that implemented the same SigV4 presigned scheme over ~20 years) is cited **only as
+evidence that the discrete-fields + dual-envelope shape is sound and enterprise-sufficient** — note SigV4 itself offers
+*both* a header form and a presigned-query form, both using discrete fields, never an opaque blob. **We do not adopt the
+S3 wire format and make no claim of S3 compatibility.**
+
+This supersedes the earlier draft's "query-only, header deferred" outcome: discrete fields are kept, and the header
+envelope is promoted to a first-class peer of the query envelope.
 
 ### Consequences
 
-* `cpt-cf-file-storage-design-signed-urls` is locked to the discrete `X-FS-*` query-parameter form; the canonical
-  string remains `method + host + path + sorted(X-FS-* except X-FS-Signature)`. No header-based signing path in P1.
-* **Caching trade-off (accepted).** Re-presigning a download (new `exp`) yields a new query string and therefore a new
-  CDN cache key. Mitigations: (1) within a URL's lifetime the query is stable, so repeat reads hit cache; (2) the
-  recommended `max_url_ttl` of 7 days (`cpt-cf-file-storage-fr-signed-urls`) keeps URLs — and their cached
-  representations — long-lived; (3) deployments may configure CDN **cache-key normalization** to drop the signing
-  parameters from the key while still forwarding them to the sidecar for verification; (4) the content-only ETag lets
-  conditional revalidation succeed across re-signs.
-* **Secret-in-URL hygiene (accepted).** The signature appears in the URL and may land in access logs, `Referer`, and
-  browser history — the same exposure as S3 presigned URLs. It is mitigated by short, capped `exp`, the
-  fully-constrained (ip/token/op/size/hash) scope of each URL, and the fact that it is not a reusable bearer credential
-  beyond `exp`. Operators SHOULD avoid logging full query strings for the sidecar domain.
-* The SDK builds and parses only the query form; the sidecar verifier reads `X-FS-*` query params only.
-* Leaves the door open to add transport **C** later as an opt-in without changing field semantics (only the
-  canonicalization source would differ), should caching pressure justify it.
+* `cpt-cf-file-storage-design-signed-urls` (DESIGN §4.5), api.md, and the worked examples (§4.6/§4.7) carry the **same
+  `X-FS-*` fields in two carriers**: query params (embeddable) or request headers (programmatic). The canonical signing
+  input and verification are unchanged; only the carrier differs. The SDK chooses the header envelope by default for
+  in-process/S2S calls and emits a query URL when a bare, embeddable link is requested.
+* **Caching:** the query envelope changes the URL when re-issued (new `exp`) → CDN cache-key churn, mitigated by a long
+  `max_url_ttl` and cache-key normalization; the header envelope keeps the URL stable → clean cache key. Programmatic
+  callers that care about caching use the header envelope.
+* **Credential exposure:** the query envelope puts the (short-lived, fully-constrained, bearer) signature in the URL —
+  acceptable for embeddable links; programmatic callers use the header envelope to keep it out of URLs, logs, and
+  `Referer`.
+* **Debuggability is sanitized server-side structured logging** (log tenant/file ids and outcomes; **never** the
+  signature or raw `exp`), independent of the envelope. It is explicitly **not** derived from field visibility in the
+  URL — that earlier "pro" is removed as it contradicted the leak concern.
+* **No opaque-token format** is introduced; no new dependency (PASETO/JWT), no per-edge token-format support burden.
 
 ### Confirmation
 
-* Code review confirming the SDK emits and the sidecar verifies the `X-FS-*` **query-parameter** form, with no
-  header-based signing path.
-* Integration tests confirming a signed download URL is consumable as a **bare URL** (browser/`curl`/`<img>`) and that
-  `Range` requests against it succeed without extra headers.
-* Integration tests confirming re-presigning changes only the query (not path) and that CDN cache-key normalization (where
-  configured) serves repeat reads without re-transiting the sidecar.
+* Code review confirming the SDK emits and the sidecar verifies **discrete `X-FS-*` fields** with a single composite
+  Ed25519 signature, from **either** the query string **or** request headers, over the same canonical string.
+* Integration tests: (a) a query-envelope download URL is consumable as a **bare URL** (browser/`curl`/`<img>`) and
+  serves `Range`; (b) a header-envelope request authorizes with no signing material in the URL; (c) re-issuing a
+  header-envelope credential leaves the URL byte-identical (cache-friendly).
+* Review confirming access logs/CDN/WAF can key on discrete fields without decoding, and that logging never records the
+  signature or raw expiry.
 
 ## Pros and Cons of the Options
 
-### A. Discrete query parameters (chosen)
+### A. Discrete fields in the query (chosen)
 
-* Good, because the result is a **bare, shareable URL** — embeddable in HTML, openable in a browser, fetchable by
-  `curl`, seekable by media players, with no headers required
-* Good, because it is the **canonical S3 SigV4 scheme** — ~20 years in production, universally understood, well-tooled
-* Good, because discrete fields are **debuggable** (visible/greppable in logs) and verified without an extra decode step
-* Bad, because re-presigning changes the URL → CDN cache-key churn unless normalized
-* Bad, because the signature appears in URLs (logs/Referer/history) — accepted, same as S3
+* Good, because it is a **bare, shareable URL** — embeddable, browser-openable, `curl`-able, `Range`-seekable, no headers
+* Good, because edge components (CDN/WAF/logs) read fields **without decoding** a token
+* Good, because it is REST-native and **versionable per field** (add a constraint param later, no format migration)
+* Good, because it carries **one composite signature** (SigV4-style), not per-field
+* Bad, because re-issuing changes the URL → CDN cache-key churn (mitigated: long `max_url_ttl`, cache-key normalization)
+* Bad, because the signature appears in the URL (logs/`Referer`/history) — accepted for embeddable use; short, capped `exp`
 
-### B. Single opaque query token
+### B. Opaque token in the query (rejected)
 
-* Good, because it is compact and hides internal structure
-* Bad, because it must be base64-decoded and parsed before verification — extra ceremony, easy to get wrong
-* Bad, because it destroys log/trace debuggability and is non-standard
-* Bad, because opacity buys nothing — the signature already makes the payload tamper-evident
-* Bad, because it still carries the secret-in-URL exposure of query form without query form's interop benefits
+* Bad, because it gives **no security** over A — the fields are not secrets and the signature is in the URL regardless
+* Bad, because it **loses edge observability** (CDN/WAF/logs can't read `exp`/scope without decoding) and is non-standard
+* Bad, because it does not even solve the leak concern — the bearer token is still in the URL
+* Neutral — the "single signature" it advertises is already provided by A; no real advantage remains
 
-### C. Discrete HTTP headers
+### C. Discrete fields in a header (chosen)
 
-* Good, because the URL (path+query) is **stable across re-issue** → clean CDN cache key, no fragmentation
-* Good, because the signature stays out of the URL (not in access logs / Referer / history)
-* Bad, because it is **not a bare URL** — cannot be embedded as `<img src>` or opened in a browser; every consumer must
-  attach headers, which fails the primary download use case
-* Bad, because it diverges from the canonical query-signing mental model
-* Neutral — a reasonable **optional** transport for header-capable SDK/S2S callers; deferred
+* Good, because the credential stays **out of the URL** — clean access logs, no `Referer`/history leak
+* Good, because the **URL is stable** across re-issue → clean CDN cache key, batch-friendly
+* Good, because edge/proxies can still read the discrete header fields for observability when needed
+* Good, because it reuses the *same* fields and signature as A — no second contract, only a second carrier
+* Bad, because it is **not a bare URL** — every caller must set headers, so it is unsuitable for embedding; that is
+  exactly why A coexists
 
-### D. Single opaque HTTP-header token
+### D. Opaque token in a header (rejected)
 
-* Good, because URL is stable and the secret is out of the URL
-* Bad, because it combines the worst of B and C: opaque blob (no debuggability, decode ceremony, no benefit) **and**
-  not a bare URL (headers required)
-* Bad, because a bearer-token-in-a-header shape invites treating it as a reusable credential, which it is not
+* Good, because URL is stable and the credential is out of the URL (same as C)
+* Bad, because it adds the opaque-blob downsides (no edge observability, non-standard, decode ceremony) on top of C for
+  no gain — even S3's header form packs **discrete** fields, not an opaque blob
+* Bad, because a bearer-blob-in-a-header invites treating it as a reusable credential, which it is not
 
 ## More Information
 
-This aligns FileStorage's wire transport with the AWS S3 SigV4 **query** (`X-Amz-*`) presigning convention rather than
-the SigV4 **header** (`Authorization`) convention. S3 itself offers both for the same reasons captured here: the query
-form exists precisely to produce a self-contained, shareable URL; the header form exists for programmatic callers that
-prefer a stable URL and headers. We adopt the query form as the single P1 transport and keep the header form as a
-possible future opt-in.
+The two access intents have opposite constraints, so the design serves each with its own envelope rather than forcing
+one:
+
+* **Embeddable / browser-driven** — cannot set headers → **query** (A).
+* **Programmatic / SDK / batch** — can set headers, wants the credential out of the URL and a stable cacheable URL →
+  **header** (C).
+
+AWS S3 SigV4 demonstrates exactly this split — a header (`Authorization`) form and a presigned-**query** form, both built
+from **discrete fields** — and has done so across AWS and many independent implementations for ~20 years. We take that as
+evidence the *shape* (discrete fields, single composite signature, dual envelope) is sound and enterprise-sufficient. We
+**do not** implement the S3 wire format and make **no** S3-compatibility claim; our hosts, field names, and semantics are
+our own.
 
 ## Option Comparison
 
 ✓ = yes / good · ✗ = no / bad · ~ = partial
 
-| Aspect | A · query fields | B · query token | C · headers | D · header token |
+| Aspect | A · fields/query | B · token/query | C · fields/header | D · token/header |
 |---|---|---|---|---|
-| Bare, shareable URL (browser / `<img>` / `curl` / Range) | ✓ | ✓ | ✗ | ✗ |
-| Canonical (S3 SigV4) / well-tooled | ✓ | ✗ | ~ | ✗ |
-| Stable URL on re-sign → clean CDN cache key | ✗ | ✗ | ✓ | ✓ |
-| Discrete, debuggable fields (logs/traces) | ✓ | ✗ | ✓ | ✗ |
-| Verify without a decode step | ✓ | ✗ | ✓ | ✗ |
-| Signature kept out of URL (logs / Referer / history) | ✗ | ✗ | ✓ | ✓ |
-| **Verdict** | **Chosen** | Rejected | Deferred (opt-in) | Rejected |
+| Bare, shareable URL (no headers) | ✓ | ✓ | ✗ | ✗ |
+| Credential kept out of the URL (logs/Referer) | ✗ | ✗ | ✓ | ✓ |
+| Stable URL across re-issue → clean CDN cache | ✗ | ✗ | ✓ | ✓ |
+| Edge observability without decoding (CDN/WAF/logs) | ✓ | ✗ | ✓ | ✗ |
+| REST-native / per-field versionable | ✓ | ✗ | ✓ | ✗ |
+| One composite signature | ✓ | ✓ | ✓ | ✓ |
+| **Verdict** | **Chosen (embeddable)** | Rejected | **Chosen (programmatic)** | Rejected |
 
 ## Traceability
 
@@ -176,7 +199,7 @@ possible future opt-in.
 
 This decision directly addresses the following requirements or design elements:
 
-* `cpt-cf-file-storage-fr-signed-urls` — fixes the on-the-wire transport of the signed-URL fields and signature
-* `cpt-cf-file-storage-design-signed-urls` — locks the canonical form to discrete `X-FS-*` query parameters
-* `cpt-cf-file-storage-principle-signed-urls` — the control-minted, sidecar-verified URL is a bare, query-signed URL
-* `cpt-cf-file-storage-nfr-bandwidth` — documents the CDN cache-key interaction and its mitigations
+* `cpt-cf-file-storage-fr-signed-urls` — fixes the encoding (discrete fields) and transport (query + header) of the signed-URL fields and signature
+* `cpt-cf-file-storage-design-signed-urls` — the canonical signing input is unchanged; fields ride in the query (embeddable) or in headers (programmatic)
+* `cpt-cf-file-storage-principle-signed-urls` — control-minted, sidecar-verified discrete-field credential, one composite signature
+* `cpt-cf-file-storage-nfr-bandwidth` — the header envelope gives programmatic callers a stable, cache-friendly URL
