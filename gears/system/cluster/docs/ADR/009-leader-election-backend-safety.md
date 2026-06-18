@@ -142,6 +142,8 @@ impl CasBasedLeaderElectionBackend {
 }
 ```
 
+> **Implementation note.** The snippets in this ADR are illustrative of the *decision* — the `new` / `new_allow_weak_consistency` constructor pair (reject `EventuallyConsistent` by default; warn on explicit opt-in). The shipped code factors this shared logic into `cluster-sdk/src/defaults/guard.rs` (`reject_weak_consistency` / `warn_weak_consistency`), reused by both the leader-election and lock defaults. The diagnostic names the **backend** (via its `Self::NAME`) and reports the cache's *consistency class* — it does **not** call `std::any::type_name_of_val(&*cache)`, which on a `&dyn ClusterCacheBackend` would yield only the trait-object name, never the concrete cache type.
+
 The warning log fires on instantiation regardless of whether the backend is actually misused — the log is the audit trail. Operators monitoring logs see the warning and can confirm whether the opt-in was intentional.
 
 ### Why opt-in exists at all (evolution from the original "no bypass" stance)

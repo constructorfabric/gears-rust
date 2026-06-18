@@ -134,17 +134,17 @@ A `Closed(ConnectionLost)` on a `LeaderWatch`, `ServiceWatch`, or `CacheWatch` i
 **State-loss signals per primitive**:
 
 - `LeaderElectionV1` — when `max_missed_renewals` consecutive renewal attempts fail, or the backend confirms TTL expiry, the renewal task emits `LeaderWatchEvent::Status(Lost)`. Auto-reenroll follows per the `LeaderWatch` lifecycle (DESIGN §3.3).
-- `DistributedLockV1` — the renewal task surfaces state loss through the next `LockGuard::extend(additional_ttl).await`, which returns `Err(ClusterError::LockExpired { name })`. A subsequent `LockGuard::release(self).await` against a foreign-held lock is a benign no-op (delete-if-still-holder CAS).
+- `DistributedLockV1` — the renewal task surfaces state loss through the next `LockGuard::renew(new_ttl).await`, which returns `Err(ClusterError::LockExpired { name })`. A subsequent `LockGuard::release(self).await` against a foreign-held lock is a benign no-op (delete-if-still-holder CAS).
 - `ServiceDiscoveryV1` — when the registration's heartbeat task fails, the registered instance disappears from any `discover()` result after `TTL + epsilon`, and active `ServiceWatch` subscribers receive `ServiceWatchEvent::Change(TopologyChange::Left { instance_id })`.
 
-**Authoritative state-loss declarations**. Leadership is invalidated when the renewal task emits `Status(Lost)`, or when the shutdown sequence emits the `Status(Lost) → Closed(Shutdown)` two-step (§"Shutdown sequence"). Lock state is invalidated when `LockExpired` returns from `extend()`. Service-discovery instance state is invalidated when the instance disappears from the discovery set. These are the authoritative state-loss events.
+**Authoritative state-loss declarations**. Leadership is invalidated when the renewal task emits `Status(Lost)`, or when the shutdown sequence emits the `Status(Lost) → Closed(Shutdown)` two-step (§"Shutdown sequence"). Lock state is invalidated when `LockExpired` returns from `renew()`. Service-discovery instance state is invalidated when the instance disappears from the discovery set. These are the authoritative state-loss events.
 
 **TTL as the staleness bound**. The TTL+heartbeat model gives every primitive a deterministic upper bound on staleness, independent of any backend-managed session concept. Backends with native session semantics (e.g., a future ZooKeeper plugin using ephemeral nodes) surface session-loss earlier: the renewal task observes the native session-loss signal and emits `Status(Lost)` / `LockExpired` ahead of TTL expiry. The consumer-facing surface is identical across all backends.
 
 **Consumer recovery pattern under partition**:
 
 1. On `Closed(err)` from the watch — subscription is lost; existing claims remain valid until the renewal task speaks.
-2. On the authoritative state-loss signal (`Status(Lost)` for leader claims, `Err(LockExpired)` from the next `extend()` for lock claims) — the claim is invalid; cease state-dependent work.
+2. On the authoritative state-loss signal (`Status(Lost)` for leader claims, `Err(LockExpired)` from the next `renew()` for lock claims) — the claim is invalid; cease state-dependent work.
 3. After watch reconnect (`Reset`), restart the primitive (`elect()` / `try_lock()` / `register()`).
 
 ### Lightweight notifications: events carry no value payload
