@@ -1,5 +1,5 @@
 Created:  2026-03-06 by Constructor Tech
-Updated:  2026-06-17 by Constructor Tech
+Updated:  2026-06-18 by Constructor Tech
 # PRD — Chat Engine
 
 
@@ -92,6 +92,8 @@ The core value proposition is enabling flexible, stateful conversation managemen
 | **Message Tree** | A tree structure where each message references a parent message; sibling nodes with the same parent are variants |
 | **Message Variant** | An alternative response at the same position in the conversation tree — created by regeneration or branching |
 | **Message Part** | An ordered, typed fragment of a message body (`text`, `code`, `images`, `videos`, `links`, `statuses`). A message is composed of one or more parts; the parts in order form the message body. See FR-022. |
+| **Citation** | A plugin-supplied attribution attached to a `text` message part, anchoring a `[N]` marker in the text to a source: a retrieved document (file citation) or a web page (link citation). Carries quote, source location, and the text offsets of the marker. See FR-023. |
+| **Reference** | A lightweight URL badge attached to a `text` message part (URL + position, no quote/anchor). See FR-023. |
 | **Capability** | A typed feature declared by the backend plugin (`bool`, `enum`, `str`, `int`). `SessionType.available_capabilities` is the maximum set the plugin supports; `Session.enabled_capabilities` is the confirmed set for a specific session. Per-message settings are passed as `CapabilityValue` (id + value). |
 | **CapabilityValue** | A per-message capability setting: `{id, value}` where value matches the type declared in the corresponding `Capability` definition |
 | **Streaming Response** | Real-time forwarding of response chunks from the backend plugin to the client as they are generated |
@@ -193,6 +195,7 @@ No gear-specific environment constraints beyond platform defaults.
 - Message routing to backend plugins with real-time streaming
 - Message variant preservation (regeneration, branching)
 - Structured message bodies as ordered typed parts (text, code, images, videos, links, statuses) (see FR-022)
+- Per-part citations and references (file/link citations, URL badges) anchoring text to sources (see FR-023)
 - File attachment references in messages
 - Session type switching mid-conversation
 - Session export (JSON, Markdown, TXT)
@@ -709,6 +712,33 @@ The system **MUST** represent a message body as an **ordered list of typed parts
 - A `text` part's content is full-text searchable (`cpt-cf-chat-engine-fr-search-session`, `cpt-cf-chat-engine-fr-search-sessions`); non-text parts are excluded from text search.
 - An `images`/`videos` part referencing a file UUID is forwarded to backend plugins without the engine fetching the file.
 - A message with no parts is rejected as an invalid request.
+
+**Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
+<!-- fdd-id-content -->
+
+#### FR-023: Per-Part Citations & References
+
+- [ ] `p2` - **ID**: `cpt-cf-chat-engine-fr-citations`
+
+<!-- fdd-id-content -->
+The system **SHOULD** persist and serve **citations and references attached to a `text` message part**, allowing a backend plugin to attribute spans of an answer to their sources. Citations attach to a specific text part (not the whole message), so a multi-part answer can cite per text block.
+
+**Kinds**:
+- **File citation** — a citation into a retrieved document (document id/name/title, quote, page/timestamp, chunk preview, source-offset anchors).
+- **Link citation** — a citation into a web page (url, title, quote, preview, favicon).
+- **Reference** — a lightweight URL badge (url + position, no quote/anchor).
+
+**Behavioral rules**:
+- Citations and references are **supplied by the backend plugin** on its response; Chat Engine stores and serves them but does **not** generate or interpret them (`cpt-cf-chat-engine-principle-zero-business-logic`).
+- A citation's `index` corresponds to a `[N]` marker in the part's text (1-indexed); **file and link citations share one `[N]` numbering** within a part.
+- The plugin provides the marker offsets in the text (`text_positions`) and per-marker source anchors **verbatim**; the system **MUST NOT** scan message text to compute positions.
+- Citations/references are persisted together with the assistant's text part on completion (not streamed incrementally) and are **cascade-deleted** with their part (and message).
+- On read, each `text` part exposes its file citations, link citations, and references.
+
+**Acceptance criteria**:
+- A plugin response carrying file/link citations and references is persisted and returned, attached to the correct text part, with `index`/`text_positions` preserved verbatim.
+- Deleting a message (or its part) removes all attached citations and references.
+- Citations referencing files/documents do not cause the engine to fetch any content (attribution metadata only).
 
 **Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
 <!-- fdd-id-content -->

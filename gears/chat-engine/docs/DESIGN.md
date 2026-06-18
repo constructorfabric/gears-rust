@@ -1,5 +1,5 @@
 Created:  2026-03-06 by Constructor Tech
-Updated:  2026-06-17 by Constructor Tech
+Updated:  2026-06-18 by Constructor Tech
 # Technical Design: Chat Engine
 
 
@@ -68,6 +68,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-fr-search-session` | Full-text search over `message_parts` (text parts) joined to messages, filtered by session_id; returns matches with context window |
 | `cpt-cf-chat-engine-fr-search-sessions` | Full-text search over `message_parts` (text parts) joined with messages + sessions; ranks by relevance, returns session metadata |
 | `cpt-cf-chat-engine-fr-message-parts` | Messages persist an ordered list of typed `message_parts` rows (text/code/images/videos/links/statuses); the send/get APIs and plugin responses exchange `parts` arrays |
+| `cpt-cf-chat-engine-fr-citations` | Plugin-supplied file/link citations and URL references attach to a `text` part (child tables, CASCADE); engine forwards `text_positions`/anchors verbatim and surfaces them on read |
 | `cpt-cf-chat-engine-fr-delete-session` | Sends `session.deleted` event to backend plugin, then soft-deletes session and messages in database |
 | `cpt-cf-chat-engine-fr-conversation-memory` | Message history forwarded to backend plugin with configurable depth; visibility flags (`is_hidden_from_backend`) enable context management strategies |
 | `cpt-cf-chat-engine-fr-delete-message` | Hard delete individual messages with cascade reaction cleanup; ownership validation before deletion |
@@ -126,6 +127,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-adr-search-strategy` | Full-text search strategy for sessions and messages |
 | `cpt-cf-chat-engine-adr-message-reactions` | Per-message reactions for user feedback |
 | `cpt-cf-chat-engine-adr-message-parts` | Messages composed of ordered typed parts in a dedicated `message_parts` table |
+| `cpt-cf-chat-engine-adr-citations` | Citations/references as child tables of `message_parts`; positions forwarded verbatim from the plugin |
 | `cpt-cf-chat-engine-adr-session-deletion-strategy` | Soft delete as default with automatic hard delete after retention period |
 | `cpt-cf-chat-engine-adr-plugin-backend-integration` | Internal plugin trait for backend integration |
 | `cpt-cf-chat-engine-adr-llm-gateway-plugin` | LLM gateway plugin with schema extensions |
@@ -274,7 +276,7 @@ All Chat Engine instances share a single database cluster. No local caching of s
 - **MessageListRequest** - List messages (session_id, parent_message_id)
 - **MessageListResponse** - Messages list (messages, each with its ordered `parts`)
 - **MessageGetRequest** - Get message (message_id)
-- **MessageGetResponse** - Message details (message_id, role, parts, file_ids, user_id, metadata, variant_info) — `parts` is the ordered list of `MessagePart` rows; `user_id` is the message author (null for assistant/system); `tenant_id` is internal-only and not exposed to clients
+- **MessageGetResponse** - Message details (message_id, role, parts, file_ids, user_id, metadata, variant_info) — `parts` is the ordered list of `MessagePart` rows; each `text` part also carries its `file_citations`, `link_citations`, and `references` (see `cpt-cf-chat-engine-design-entity-citations`); `user_id` is the message author (null for assistant/system); `tenant_id` is internal-only and not exposed to clients
 - **MessageRecreateRequest** - Recreate response (message_id, enabled_capabilities)
 - **MessageGetVariantsRequest** - Get variants (message_id)
 - **MessageGetVariantsResponse** - Variants list (variants, current_index)
@@ -289,6 +291,8 @@ All Chat Engine instances share a single database cluster. No local caching of s
 - **StreamingErrorEvent** - Stream error (message_id, error: human-readable description; no further events follow)
 
 > **Streaming and parts**: only the assistant's `text` part is chunk-streamed (chunks accumulate into a single `text` part). Richer parts (`code`, `images`, `videos`, `links`, `statuses`) returned by the plugin are persisted on completion and surfaced via `MessageGetResponse.parts`; per-part incremental streaming of non-text parts is an intentional exclusion for this iteration (see §5).
+>
+> **Streaming and citations**: citations and references (`cpt-cf-chat-engine-design-entity-citations`) ride on the plugin's terminal `text` part and are persisted with it at finalize — they are not streamed incrementally. The `StreamingCompleteEvent.metadata` MAY carry them for the client; the authoritative copy is read back via `MessageGetResponse.parts[].{file_citations,link_citations,references}`.
 
 #### Webhook Protocol (webhook/)
 
@@ -379,6 +383,30 @@ Fields: `id` (UUID PK), `message_id` (UUID FK → messages, CASCADE), `type` (`M
 - **links** — `{ links: [{ url: string, title?: string, description?: string, icon?: string, source?: string }] }`
 - **statuses** — `{ statuses: [{ code: string, detail?: string }] }`
 
+A `text` part may additionally own **citations and references** (`cpt-cf-chat-engine-design-entity-file-citation`, `-link-citation`, `-link-reference`) anchoring spans of its text to sources. They are carried on the part's wire shape as optional `file_citations`, `link_citations`, `references` arrays and persisted into their own child tables.
+
+##### Citations & References
+
+- [ ] `p2` - **ID**: `cpt-cf-chat-engine-design-entity-citations`
+
+Citations and references attach to a single `text` [`MessagePart`](#messagepart), not to the message — so a multi-part answer cites per text block. Three sibling kinds, each a row with a CASCADE foreign key to `message_parts(id)`:
+
+- **FileCitation** (`cpt-cf-chat-engine-design-entity-file-citation`, `cpt-cf-chat-engine-dbtable-file-citations`) — a citation into a retrieved document. Fields: `id`, `message_part_id`, `citation_id?`, `index?`, `document_id`, `document_name`, `document_title?`, `source?`, `quote`, `char_start?`, `char_end?`, `chunk_id?`, `chunk_preview?`, `chunk_content?`, `chunk_type` (`text`/`image`), `page?`, `timestamp?`, `highlights` (JSON), `reference_type?` (`direct_quote`/`paraphrase`/`data_reference`/`methodology_reference`), `text_positions` (int array), `text_position_anchors` (JSON array of `TextPositionAnchor`), `meta` (JSON), `number` (0-based ordinal within the part).
+- **LinkCitation** (`cpt-cf-chat-engine-design-entity-link-citation`, `cpt-cf-chat-engine-dbtable-link-citations`) — a citation into a web page. Fields: `id`, `message_part_id`, `citation_id?`, `index?`, `url`, `title`, `preview_text?`, `favicon_url?`, `quote?`, `char_start?`, `char_end?`, `reference_type?`, `text_positions` (int array), `number`.
+- **LinkReference** (`cpt-cf-chat-engine-design-entity-link-reference`, `cpt-cf-chat-engine-dbtable-link-references`) — a lightweight URL badge (no quote/anchor). Fields: `id`, `message_part_id`, `title`, `url`, `preview_text`, `position` (int array), `preview_highlights` (JSON), `ref_type` (`url`/`document`/`internal`), `ref_meta` (JSON), `idx` (per-part ordinal so positional `[N]` → `refs[N-1]` is stable). UNIQUE `(message_part_id, url)`.
+
+**TextPositionAnchor** (supporting type, stored verbatim inside `file_citations.text_position_anchors`): `{ char_start?, char_end?, quote, chunk_id?, chunk_preview? }` — per-marker source-location anchor parallel to one entry in `text_positions`.
+
+**Anchoring model** (matches rolos):
+- `index` matches the `[N]` token in the part's `text` content (1-indexed). **FileCitation and LinkCitation share one `[N]` namespace** within a part.
+- `text_positions[i]` is the character offset in the part text where the `[index]` marker appears; `text_position_anchors[i]` is the *source* location for that occurrence (parallel arrays).
+- **Chat Engine forwards `text_positions` / anchors verbatim from the plugin — it does NOT scan the text or compute offsets** (`cpt-cf-chat-engine-principle-zero-business-logic`). The plugin is the sole authority for citation positions.
+
+**Lifecycle**:
+- Citations/references are **provided by the backend plugin** on its terminal response (the `text` part it emits) and persisted by Chat Engine **when the assistant's text part is finalized** — not streamed incrementally (see §5).
+- They CASCADE-delete with their `message_part` (and therefore with the message). Like parts, they are immutable once written.
+- On read, each `MessagePart` of type `text` surfaces its `file_citations`, `link_citations`, and `references` arrays in `MessageGetResponse.parts[]`.
+
 ##### Supporting Types
 
 - **Usage** - Backend processing metrics (input_units, output_units)
@@ -443,6 +471,8 @@ Common Types:
 - SessionType → SummarizationSettings: optional config
 - MessagePart → MessagePartType: has type enum
 - MessagePart content ← text, code, images, videos, links, statuses: polymorphic by `type`
+- MessagePart → FileCitation / LinkCitation / LinkReference: a `text` part owns zero or more of each (via message_part_id, CASCADE delete)
+- FileCitation → TextPositionAnchor: contains a parallel array of anchors
 - MessageReaction → Message: references via message_id
 - MessageReaction → ReactionType: uses type enum
 - MessageReactionEvent → MessageReaction: notifies on change
@@ -1216,6 +1246,82 @@ sequenceDiagram
 
 **Constraints**: UNIQUE (message_id, number)
 
+#### Table: file_citations
+
+- [ ] `p2` - **ID**: `cpt-cf-chat-engine-dbtable-file-citations`
+
+Document citations attached to a `text` `message_part` (see `cpt-cf-chat-engine-design-entity-file-citation`).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | UUID PK | Unique citation identifier |
+| message_part_id | UUID FK | References message_parts (CASCADE DELETE) |
+| citation_id | VARCHAR NULL | Plugin-assigned id, unique per message |
+| index | INT NULL | Matches the `[N]` token in the part text (1-indexed) |
+| document_id | VARCHAR | Source document id |
+| document_name | VARCHAR | Source document name |
+| document_title | VARCHAR NULL | Human-readable title |
+| source | VARCHAR NULL | Document source / venue |
+| quote | TEXT | Quoted text |
+| char_start | INT NULL | Start offset into source plain text |
+| char_end | INT NULL | Exclusive end offset into source plain text |
+| chunk_id | VARCHAR NULL | Source chunk id |
+| chunk_preview | TEXT NULL | First ~200 chars of the chunk |
+| chunk_content | TEXT NULL | Full chunk body (text) or image URL |
+| chunk_type | VARCHAR | `text` / `image` |
+| page | INT NULL | Source page (1-indexed) |
+| timestamp | DOUBLE NULL | Video timestamp (seconds) |
+| highlights | JSONB | Highlighted spans within the chunk |
+| reference_type | VARCHAR NULL | `direct_quote` / `paraphrase` / `data_reference` / `methodology_reference` |
+| text_positions | INT[] | Offsets in the part text where `[index]` appears (plugin-provided) |
+| text_position_anchors | JSONB | Parallel array of `TextPositionAnchor` (plugin-provided) |
+| meta | JSONB | Opaque plugin metadata |
+| number | INT | 0-based ordinal within the part |
+
+#### Table: link_citations
+
+- [ ] `p2` - **ID**: `cpt-cf-chat-engine-dbtable-link-citations`
+
+Web-page citations attached to a `text` `message_part` (see `cpt-cf-chat-engine-design-entity-link-citation`). Shares the `[index]` namespace with `file_citations`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | UUID PK | Unique citation identifier |
+| message_part_id | UUID FK | References message_parts (CASCADE DELETE) |
+| citation_id | VARCHAR NULL | Plugin-assigned id |
+| index | INT NULL | Matches the `[N]` token in the part text (1-indexed) |
+| url | VARCHAR | Cited page URL |
+| title | VARCHAR | Cited page title |
+| preview_text | TEXT NULL | Snippet/preview |
+| favicon_url | VARCHAR NULL | Favicon URL |
+| quote | TEXT NULL | Cited text |
+| char_start | INT NULL | Start offset into source plain text |
+| char_end | INT NULL | Exclusive end offset |
+| reference_type | VARCHAR NULL | Citation kind label |
+| text_positions | INT[] | Offsets in the part text where `[index]` appears (plugin-provided) |
+| number | INT | 0-based ordinal within the part |
+
+#### Table: link_references
+
+- [ ] `p2` - **ID**: `cpt-cf-chat-engine-dbtable-link-references`
+
+Lightweight URL badges attached to a `text` `message_part` (see `cpt-cf-chat-engine-design-entity-link-reference`).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | UUID PK | Unique reference identifier |
+| message_part_id | UUID FK | References message_parts (CASCADE DELETE) |
+| title | VARCHAR | Reference title |
+| url | VARCHAR | Reference URL |
+| preview_text | TEXT | Preview text |
+| position | INT[] | Offsets in the part text where the badge appears (plugin-provided) |
+| preview_highlights | JSONB | Highlight spans for the preview |
+| ref_type | VARCHAR | `url` / `document` / `internal` |
+| ref_meta | JSONB | Additional metadata (e.g. entity_id) |
+| idx | INT | Per-part ordinal so positional `[N]` → `refs[N-1]` is stable |
+
+**Constraints**: UNIQUE (message_part_id, url)
+
 #### Table: message_reactions
 
 - [x] `p2` - **ID**: `cpt-cf-chat-engine-dbtable-reactions`
@@ -1264,6 +1370,9 @@ sequenceDiagram
 | messages | idx_messages_tenant | (tenant_id) | btree (partial: `WHERE tenant_id IS NOT NULL`) |
 | message_parts | idx_message_parts_message | (message_id, number) | btree (covered by UNIQUE) |
 | message_parts | idx_message_parts_text_fts | `lower(content->>'text')` | GIN (tsvector / trigram), partial: `WHERE type = 'text'` |
+| file_citations | idx_file_citations_part | (message_part_id) | btree |
+| link_citations | idx_link_citations_part | (message_part_id) | btree |
+| link_references | idx_link_references_part | (message_part_id) | btree |
 | message_reactions | idx_reactions_message | (message_id) | btree |
 
 ### 3.5 Authorization Model
@@ -1302,6 +1411,7 @@ Chat Engine does not manage authentication for plugin-to-external-service commun
 | Message `user_id` | Pseudonymous identifier | Messages table | Message lifecycle |
 | Message `tenant_id` | Tenant identifier | Sessions, Messages | Session lifecycle |
 | Message content | Potentially personal | Message_parts table (CASCADE-deleted with the message) | FR-020 retention policy |
+| Citation quotes / chunk content | Potentially personal | file_citations / link_citations / link_references (CASCADE-deleted with the part) | FR-020 retention policy |
 | Session metadata | Potentially personal | Sessions table | Session lifecycle |
 | File UUIDs | Reference only (not content) | Messages table | Session lifecycle |
 | Reaction `user_id` | Pseudonymous identifier | Reactions table | Message lifecycle |
@@ -1484,7 +1594,8 @@ Aspects acknowledged and intentionally excluded from this DESIGN.
 | Category | Exclusion | Reason |
 |----------|-----------|--------|
 | **Content Safety** | Content moderation, toxicity filtering | Delegated to backend plugins (Principle: Zero Business Logic in Routing — `cpt-cf-chat-engine-principle-zero-business-logic`) |
-| **Per-part streaming** | Incremental streaming of non-text parts (images/videos/links/statuses) | Only the assistant `text` part is chunk-streamed; richer parts are persisted on completion and returned via `MessageGetResponse.parts`. Discrete per-part stream events are a future enhancement (`cpt-cf-chat-engine-design-entity-message-part`) |
+| **Per-part streaming** | Incremental streaming of non-text parts (images/videos/links/statuses) and of citations/references | Only the assistant `text` part is chunk-streamed; richer parts and all citations/references are persisted on completion and returned via `MessageGetResponse.parts`. Discrete per-part / per-citation stream events are a future enhancement (`cpt-cf-chat-engine-design-entity-message-part`, `cpt-cf-chat-engine-design-entity-citations`) |
+| **Citation position computation** | Engine-side scanning of part text to compute `[N]` marker offsets | `text_positions` / anchors are forwarded verbatim from the plugin (`cpt-cf-chat-engine-principle-zero-business-logic`); the engine never parses message text to derive citation positions |
 | **Extra part types** | `audio`, `document`, `table` part types | Out of initial scope; the `MessagePartType` set starts at text/code/images/videos/links/statuses and is extensible via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`) |
 | **Accessibility** | UI/UX accessibility requirements | Backend service; client application responsibility |
 | **Internationalization** | Multi-language UI, locale handling | Not applicable; message content is opaque to Chat Engine |
