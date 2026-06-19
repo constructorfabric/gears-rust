@@ -35,19 +35,16 @@ deferred piece — see [Improving the story](#improving-the-story)).
 
 ## Prerequisites
 
-1. **A kitsoki checkout, as a sibling of this repo.** The story's default
-   `workdir` is `../gears-rust`, so kitsoki expects this repo one level up
-   from itself:
+1. **The `kitsoki` binary on your `PATH`.** kitsoki ships its base story
+   library (`dev-story` and its sub-stories) **embedded in the binary**, so
+   this repo's instance — which imports the base via
+   `source: "@kitsoki/dev-story"` — runs with **only the binary present**: no
+   kitsoki checkout, no sibling clone. Install a release, or build once from a
+   kitsoki checkout (`make build && install ./kitsoki /usr/local/bin/`) and
+   then discard it.
 
-   ```
-   code/
-   ├── Kitsoki/        # the kitsoki checkout (clone it here)
-   └── gears-rust/     # this repo
-   ```
-
-2. **Go toolchain** (to build the `kitsoki` binary) and **Python 3** (the
-   publish glue). Node/pnpm only if you want the web UI's bundled assets
-   rebuilt.
+2. **Python 3** for the publish glue. No Node/pnpm needed — the web UI assets
+   and the demo-video renderer (`kitsoki tour`) are baked into the binary too.
 
 3. **An LLM, or a recorded cassette.** A live run dispatches `claude` agents
    to author the docs (cost + latency). The no-LLM flows and the demo run
@@ -55,27 +52,22 @@ deferred piece — see [Improving the story](#improving-the-story)).
 
 ## Run it
 
-All commands run **from the kitsoki checkout** (`cd ../Kitsoki`).
-
-Build once:
-
-```bash
-make build && cp ./kitsoki bin/kitsoki
-```
+All commands run **from this repo's root**, with `kitsoki` on your `PATH`.
 
 ### Web UI (recommended)
 
 ```bash
-# one line — a newline after --stories-dir splits the command and fails
-./kitsoki web --stories-dir stories/gears-rust --addr 127.0.0.1:7780
+kitsoki web
 ```
 
-Open `http://127.0.0.1:7780`, then drive the walk in the chat box.
+Discovery is zero-config: `kitsoki web` walks the default `./stories` dir and
+finds `stories/gears-rust/`. Open the printed URL, pick **gears-rust**, and
+drive the walk in the chat box.
 
 ### Terminal UI
 
 ```bash
-./kitsoki run stories/gears-rust/app.yaml
+kitsoki run stories/gears-rust/app.yaml
 ```
 
 ### The walk
@@ -105,7 +97,7 @@ The target gear and checkout path are configuration, overridable per run via a
 *warp scenario* without editing the story:
 
 ```bash
-./kitsoki run stories/gears-rust/app.yaml --warp stories/gears-rust/scenarios/gears-rust.yaml
+kitsoki run stories/gears-rust/app.yaml --warp stories/gears-rust/scenarios/gears-rust.yaml
 ```
 
 Edit that scenario (or the `world:` defaults in
@@ -113,7 +105,7 @@ Edit that scenario (or the `world:` defaults in
 
 | Key | Default | Meaning |
 |---|---|---|
-| `workdir` / `repo_root` | `../gears-rust` | this repo's checkout path |
+| `workdir` / `repo_root` | `.` | this repo's checkout (the default) |
 | `publish_durable_path` | `gears/notes-service/docs` | PRD home (relative to `workdir`) |
 | `design_durable_path` | `gears/notes-service/docs` | DESIGN home |
 | `prd_doc_filename` / `design_doc_filename` | `PRD` / `DESIGN` | fixed output filenames |
@@ -129,15 +121,20 @@ The full walk is pinned by deterministic fixtures (recorded agent outputs, no
 LLM call, no cost):
 
 ```bash
-cd ../Kitsoki
-./kitsoki test flows stories/gears-rust/app.yaml
+kitsoki test flows stories/gears-rust/app.yaml
 ```
 
 These assert the resolved publish paths (`gears/notes-service/docs/PRD.md`,
-`…/DESIGN.md`) and that no ticket is filed. There is also a tour-narrated demo
-video driven through the chat UI against the same fixtures — see
-[`stories/gears-rust/README.md`](https://github.com/constructorfabric/kitsoki/blob/main/stories/gears-rust/README.md)
-in the kitsoki checkout.
+`…/DESIGN.md`) and that no ticket is filed. A tour-narrated demo video of the
+same walk renders **from the binary** — no Node/pnpm/Playwright:
+
+```bash
+kitsoki tour --feature gears-prd-design
+# → .artifacts/gears-prd-design/gears-prd-design.mp4 (+ chapters + per-step PNGs)
+```
+
+See [`stories/gears-rust/README.md`](../stories/gears-rust/README.md) for the
+instance end to end.
 
 ## How the retargeting works
 
@@ -200,25 +197,28 @@ priority order:
    drafts need less editing.
 
 To make a *second* external target (another GitHub repo), copy
-`stories/gears-rust/` in the kitsoki checkout, repoint the world keys, vendor
-that target's templates, and adjust the two flows — no kitsoki code change.
-The procedure is in `stories/gears-rust/README.md` → "Copy this dir for a NEW
+`stories/gears-rust/` into that repo, repoint the world keys, vendor that
+target's templates, and adjust the two flows — no kitsoki code change. The
+procedure is in `stories/gears-rust/README.md` → "Copy this dir for a NEW
 external target".
 
 ## Troubleshooting
 
-- **`flag needs an argument: --stories-dir` / `permission denied: stories/…`**
-  — your shell split the command across a newline. Keep `--stories-dir
-  <dir>` on one line (or end the line with `\`).
+- **`kitsoki: command not found`.** The binary isn't on your `PATH` — install a
+  release or build it once from a kitsoki checkout (see Prerequisites). No
+  kitsoki checkout needs to be present once the binary is installed; the base
+  stories are embedded.
+
+- **`gears-rust` isn't listed by `kitsoki web`.** Discovery walks `./stories`
+  from the directory you launched in — run `kitsoki web` from this repo's root
+  so `stories/gears-rust/` is found (or pass `--stories-dir stories`).
 
 - **The spec talks about *kitsoki* instead of this repo.** The authoring agent
-  must run with this repo as its working directory and the gears-sdlc
-  templates as its template dir. Both are set by the profile; if you see
-  kitsoki content, confirm you launched with `--stories-dir stories/gears-rust`
-  (not the bare `kitsoki-dev` instance) and that `../gears-rust` resolves to
-  this checkout. This requires a recent kitsoki build — earlier builds had a
-  boot-time projection bug where the profile keys did not reach the hub.
+  must run with this repo as its working directory and the gears-sdlc templates
+  as its template dir — both are set by the profile. Confirm you picked the
+  `gears-rust` instance (not the bare `kitsoki-dev` one) and that `workdir` /
+  `repo_root` resolve to this checkout (default `.`).
 
-- **Docs land in kitsoki's own `docs/proposals/` instead of here.** Same cause
-  — the profile keys aren't resolving; check `workdir` / `*_durable_path` in
-  `stories/gears-rust/app.yaml` and rebuild the binary.
+- **Docs land in kitsoki's own `docs/proposals/` instead of here.** The profile
+  keys aren't resolving; check `workdir` / `*_durable_path` in
+  `stories/gears-rust/app.yaml`.
