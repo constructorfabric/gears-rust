@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use chat_engine_sdk::{
-    Capability, ChatEngineBackendPlugin, HealthStatus, LifecycleState, MemoryStrategy,
+    ChatEngineBackendPlugin, HealthStatus, LifecycleState, MemoryStrategy,
     MessagePluginCtx, PluginCallContext, PluginError, PluginStream, RetentionPolicy,
     SessionPluginCtx, StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent,
     StreamingEvent, StreamingStartEvent, TenantId, UserId, empty_stream, stream_from_events,
@@ -659,9 +659,10 @@ async fn it_fake_plugin_on_session_created_returns_no_capabilities() {
         session_id: Some(Uuid::nil()),
         call_ctx: make_call_ctx(None, cancel),
     };
-    let caps: Vec<Capability> = plugin_dyn
+    let resp = plugin_dyn
         .on_session_created(ctx)
         .await
         .expect("session created");
-    assert!(caps.is_empty());
+    assert!(resp.capabilities.is_empty());
+    assert!(resp.metadata.is_none());
 }

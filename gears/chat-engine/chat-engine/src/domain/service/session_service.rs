@@ -253,7 +253,9 @@ impl SessionService {
                 .invoke_with_deadline(plugin.on_session_type_configured(session_ctx), &cancel)
                 .await
             {
-                Ok(_caps) => {
+                // `on_session_type_configured` has no session, so any returned
+                // metadata is ignored; only the call's success/failure matters.
+                Ok(_result) => {
                     info!(
                         plugin_instance_id = %plugin_instance_id,
                         session_type_id = %session_type_id,
@@ -352,6 +354,7 @@ impl SessionService {
         // map to 502 and roll back the session row to avoid orphaning a
         // session against a plugin that refused to accept it.
         let mut enabled_capabilities: Option<JsonValue> = None;
+        let mut plugin_metadata: Option<JsonValue> = None;
         if let Some(ref st) = session_type
             && let Some(plugin_instance_id) = st.plugin_instance_id.clone()
         {
@@ -383,8 +386,9 @@ impl SessionService {
                 .invoke_with_deadline(plugin.on_session_created(session_ctx), &cancel)
                 .await
             {
-                Ok(caps) => {
-                    enabled_capabilities = Some(capabilities_to_json(caps));
+                Ok(result) => {
+                    enabled_capabilities = Some(capabilities_to_json(result.capabilities));
+                    plugin_metadata = result.metadata;
                 }
                 Err(err) => {
                     // Rollback: hard-delete the orphan session row so the
@@ -413,7 +417,7 @@ impl SessionService {
             }
         }
 
-        let persisted = if let Some(caps) = enabled_capabilities {
+        let mut persisted = if let Some(caps) = enabled_capabilities {
             self.sessions
                 .update_capabilities(
                     &identity.tenant_id,
@@ -425,6 +429,21 @@ impl SessionService {
         } else {
             inserted
         };
+
+        // Plugin-supplied metadata is merged into the session metadata
+        // (object merge; engine-reserved keys are stripped).
+        if let Some(plugin_meta) = plugin_metadata {
+            let merged = merge_plugin_metadata(persisted.metadata.clone(), plugin_meta);
+            persisted = self
+                .sessions
+                .update_metadata(
+                    &identity.tenant_id,
+                    &identity.user_id,
+                    inserted_id,
+                    Some(merged),
+                )
+                .await?;
+        }
 
         let session: Session = persisted.into();
 
@@ -525,6 +544,7 @@ impl SessionService {
         };
 
         let mut new_caps_json = capability_values_to_json(&caps);
+        let mut plugin_metadata: Option<JsonValue> = None;
 
         if let Some(ref plugin_instance_id) = plugin_instance_id {
             let plugin = self.plugins.resolve(plugin_instance_id)?;
@@ -551,13 +571,14 @@ impl SessionService {
             };
             // Plugin failure on update → 502 (mapped via the standard
             // PluginError → ChatEngineError conversion).
-            let returned_caps = self
+            let returned = self
                 .invoke_with_deadline(plugin.on_session_updated(session_ctx), &cancel)
                 .await?;
-            new_caps_json = capabilities_to_json(returned_caps);
+            new_caps_json = capabilities_to_json(returned.capabilities);
+            plugin_metadata = returned.metadata;
         }
 
-        let updated = self
+        let mut updated = self
             .sessions
             .update_capabilities(
                 &identity.tenant_id,
@@ -566,6 +587,20 @@ impl SessionService {
                 Some(new_caps_json),
             )
             .await?;
+
+        // Merge plugin-supplied metadata into the session metadata.
+        if let Some(plugin_meta) = plugin_metadata {
+            let merged = merge_plugin_metadata(updated.metadata.clone(), plugin_meta);
+            updated = self
+                .sessions
+                .update_metadata(
+                    &identity.tenant_id,
+                    &identity.user_id,
+                    session_id,
+                    Some(merged),
+                )
+                .await?;
+        }
         Ok(redact_session(updated.into()))
     }
 
@@ -764,6 +799,34 @@ fn capability_values_to_json(caps: &[CapabilityValue]) -> JsonValue {
     serde_json::to_value(caps).unwrap_or(JsonValue::Array(Vec::new()))
 }
 
+/// Merge plugin-supplied `overlay` metadata into the session's existing `base`
+/// metadata (FR session-hook metadata). Object-level merge: overlay keys
+/// override same-name base keys. Engine-reserved keys
+/// (`memory_strategy` / `retention_policy` / `share_expires_at`) are stripped
+/// from the overlay so a plugin can't clobber engine-managed session state.
+/// A non-object overlay is ignored when the base is an object (to avoid
+/// dropping client metadata); otherwise the overlay wins.
+fn merge_plugin_metadata(base: Option<JsonValue>, overlay: JsonValue) -> JsonValue {
+    let overlay = match overlay {
+        JsonValue::Object(mut map) => {
+            map.retain(|k, _| !RESERVED_METADATA_KEYS.contains(&k.as_str()));
+            JsonValue::Object(map)
+        }
+        other => other,
+    };
+    match base {
+        Some(JsonValue::Object(mut base_map)) => {
+            if let JsonValue::Object(over_map) = overlay {
+                for (k, v) in over_map {
+                    base_map.insert(k, v);
+                }
+            }
+            JsonValue::Object(base_map)
+        }
+        _ => overlay,
+    }
+}
+
 /// Strip reserved metadata keys and clear the `share_token` (which is a
 /// bearer secret) before returning a session to the caller. Phase 14 DTO
 /// mapping must call this helper before serialization.
@@ -810,6 +873,42 @@ mod tests {
         let metadata = serde_json::json!({"memory_strategy": {"type": "full"}});
         let err = reject_reserved_metadata(Some(&metadata)).unwrap_err();
         assert!(matches!(err, ChatEngineError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn merge_plugin_metadata_object_merge_overlay_wins() {
+        let base = Some(serde_json::json!({"a": 1, "b": 2}));
+        let overlay = serde_json::json!({"b": 99, "c": 3});
+        let merged = merge_plugin_metadata(base, overlay);
+        assert_eq!(merged, serde_json::json!({"a": 1, "b": 99, "c": 3}));
+    }
+
+    #[test]
+    fn merge_plugin_metadata_strips_reserved_keys_from_overlay() {
+        let base = Some(serde_json::json!({"a": 1}));
+        // Plugin tries to set engine-reserved keys — they must be dropped.
+        let overlay = serde_json::json!({
+            "memory_strategy": {"type": "full"},
+            "retention_policy": {"x": 1},
+            "share_expires_at": "2026-01-01",
+            "model": "gpt-4",
+        });
+        let merged = merge_plugin_metadata(base, overlay);
+        assert_eq!(merged, serde_json::json!({"a": 1, "model": "gpt-4"}));
+    }
+
+    #[test]
+    fn merge_plugin_metadata_uses_overlay_when_base_absent() {
+        let merged = merge_plugin_metadata(None, serde_json::json!({"k": "v"}));
+        assert_eq!(merged, serde_json::json!({"k": "v"}));
+    }
+
+    #[test]
+    fn merge_plugin_metadata_keeps_base_when_overlay_not_object() {
+        // A non-object overlay must not clobber existing client metadata.
+        let base = Some(serde_json::json!({"a": 1}));
+        let merged = merge_plugin_metadata(base, serde_json::json!("oops"));
+        assert_eq!(merged, serde_json::json!({"a": 1}));
     }
 
     #[test]

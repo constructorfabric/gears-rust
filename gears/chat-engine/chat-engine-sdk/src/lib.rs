@@ -23,6 +23,6 @@ pub use models::{
     VariantInfo,
 };
 pub use plugin::{
-    ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream, SessionPluginCtx,
-    empty_stream, stream_from_events,
+    ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream,
+    SessionPluginCtx, SessionPluginResponse, empty_stream, stream_from_events,
 };

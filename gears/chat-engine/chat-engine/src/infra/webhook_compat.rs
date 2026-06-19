@@ -81,7 +81,7 @@ use chat_engine_sdk::error::PluginError;
 use chat_engine_sdk::models::{Capability, HealthStatus, StreamingEvent};
 use chat_engine_sdk::plugin::{
     ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream, SessionPluginCtx,
-    empty_stream, stream_from_events,
+    SessionPluginResponse, empty_stream, stream_from_events,
 };
 
 const CONFIG_KEY_ENDPOINT: &str = "endpoint";
@@ -193,7 +193,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
     async fn on_session_type_configured(
         &self,
         ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
+    ) -> Result<SessionPluginResponse, PluginError> {
         let body = serde_json::json!({
             "event": "session_type_configured",
             "session_type_id": ctx.session_type_id,
@@ -208,13 +208,13 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
             "session_type_configured",
         )
         .await?;
-        parse_capabilities(resp).await
+        parse_session_response(resp).await
     }
 
     async fn on_session_created(
         &self,
         ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
+    ) -> Result<SessionPluginResponse, PluginError> {
         let body = serde_json::json!({
             "event": "session_created",
             "session_type_id": ctx.session_type_id,
@@ -222,13 +222,13 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         });
         let cfg = Self::extract_config(&ctx.call_ctx)?;
         let resp = post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_created").await?;
-        parse_capabilities(resp).await
+        parse_session_response(resp).await
     }
 
     async fn on_session_updated(
         &self,
         ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
+    ) -> Result<SessionPluginResponse, PluginError> {
         let body = serde_json::json!({
             "event": "session_updated",
             "session_type_id": ctx.session_type_id,
@@ -236,7 +236,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         });
         let cfg = Self::extract_config(&ctx.call_ctx)?;
         let resp = post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_updated").await?;
-        parse_capabilities(resp).await
+        parse_session_response(resp).await
     }
 
     async fn on_message(&self, ctx: MessagePluginCtx) -> Result<PluginStream, PluginError> {
@@ -602,16 +602,44 @@ fn trim_newline(line: &[u8]) -> &[u8] {
     &line[..end]
 }
 
-async fn parse_capabilities(resp: Response) -> Result<Vec<Capability>, PluginError> {
+/// Parse a session-hook HTTP response into a [`SessionPluginResponse`].
+///
+/// Accepts two shapes for backward compatibility:
+/// - a bare capability array `[ {..}, .. ]` → capabilities only, no metadata;
+/// - an object `{ "capabilities": [..], "metadata": {..} }` → both, where
+///   `metadata` is forwarded verbatim to be merged into the session.
+async fn parse_session_response(resp: Response) -> Result<SessionPluginResponse, PluginError> {
     let bytes = resp
         .bytes()
         .await
         .map_err(|e| PluginError::transient_with("failed to read response body", e))?;
     if bytes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SessionPluginResponse::default());
     }
-    serde_json::from_slice::<Vec<Capability>>(&bytes)
-        .map_err(|e| PluginError::internal_with("malformed capability payload", e))
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| PluginError::internal_with("malformed session response", e))?;
+    match value {
+        serde_json::Value::Array(_) => {
+            let capabilities = serde_json::from_value::<Vec<Capability>>(value)
+                .map_err(|e| PluginError::internal_with("malformed capability payload", e))?;
+            Ok(SessionPluginResponse::from(capabilities))
+        }
+        serde_json::Value::Object(mut map) => {
+            let capabilities = match map.remove("capabilities") {
+                Some(c) => serde_json::from_value::<Vec<Capability>>(c)
+                    .map_err(|e| PluginError::internal_with("malformed capability payload", e))?,
+                None => Vec::new(),
+            };
+            let metadata = map.remove("metadata").filter(|v| !v.is_null());
+            Ok(SessionPluginResponse {
+                capabilities,
+                metadata,
+            })
+        }
+        _ => Err(PluginError::internal(
+            "session response must be a capability array or an object",
+        )),
+    }
 }
 
 /// Map an HTTP status (4xx/5xx) to a [`PluginError`] using the canonical

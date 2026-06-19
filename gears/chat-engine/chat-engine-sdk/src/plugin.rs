@@ -428,27 +428,57 @@ mod message_plugin_ctx_debug_tests {
     }
 }
 
+/// What a session lifecycle hook returns: the capability set plus optional
+/// metadata the plugin wants persisted onto the session.
+///
+/// Returned by [`ChatEngineBackendPlugin::on_session_created`],
+/// [`on_session_updated`](ChatEngineBackendPlugin::on_session_updated), and
+/// [`on_session_type_configured`](ChatEngineBackendPlugin::on_session_type_configured).
+/// For the session-bound hooks (`on_session_created` / `on_session_updated`)
+/// Chat Engine merges `metadata` into `Session.metadata`. For
+/// `on_session_type_configured` there is no session, so `metadata` is ignored.
+#[derive(Debug, Clone, Default)]
+pub struct SessionPluginResponse {
+    /// Capabilities to expose — stored as `Session.enabled_capabilities`
+    /// (session hooks) or `SessionType.available_capabilities` (type hook).
+    pub capabilities: Vec<Capability>,
+    /// Optional metadata merged into the owning session's `metadata` (object
+    /// merge; plugin keys override existing same-name keys). `None` leaves the
+    /// session metadata untouched.
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl From<Vec<Capability>> for SessionPluginResponse {
+    /// Ergonomic conversion for plugins that only resolve capabilities.
+    fn from(capabilities: Vec<Capability>) -> Self {
+        Self {
+            capabilities,
+            metadata: None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ChatEngineBackendPlugin: Send + Sync {
     async fn on_session_type_configured(
         &self,
         _ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
-        Ok(vec![])
+    ) -> Result<SessionPluginResponse, PluginError> {
+        Ok(SessionPluginResponse::default())
     }
 
     async fn on_session_created(
         &self,
         _ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
-        Ok(vec![])
+    ) -> Result<SessionPluginResponse, PluginError> {
+        Ok(SessionPluginResponse::default())
     }
 
     async fn on_session_updated(
         &self,
         _ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
-        Ok(vec![])
+    ) -> Result<SessionPluginResponse, PluginError> {
+        Ok(SessionPluginResponse::default())
     }
 
     /// Process a new user message and stream response events back.

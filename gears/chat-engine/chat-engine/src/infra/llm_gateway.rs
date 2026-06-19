@@ -62,7 +62,7 @@ use chat_engine_sdk::models::{
 };
 use chat_engine_sdk::plugin::{
     ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream, SessionPluginCtx,
-    stream_from_events,
+    SessionPluginResponse, stream_from_events,
 };
 
 use crate::domain::llm_config::{
@@ -410,7 +410,7 @@ impl ChatEngineBackendPlugin for LlmGatewayPlugin {
     async fn on_session_type_configured(
         &self,
         ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
+    ) -> Result<SessionPluginResponse, PluginError> {
         // Validate the plugin config and return an empty capability set —
         // resolution is deferred to `on_session_created` per ADR-0023
         // lifecycle step 2.
@@ -422,13 +422,13 @@ impl ChatEngineBackendPlugin for LlmGatewayPlugin {
             retry_count = cfg.effective_retry_count(),
             "llm gateway plugin config validated",
         );
-        Ok(Vec::new())
+        Ok(SessionPluginResponse::default())
     }
 
     async fn on_session_created(
         &self,
         ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
+    ) -> Result<SessionPluginResponse, PluginError> {
         let cfg = Self::config_from_ctx(&ctx.call_ctx)?;
         let start = Instant::now();
         let result = self.resolve_capabilities(&cfg).await;
@@ -440,13 +440,15 @@ impl ChatEngineBackendPlugin for LlmGatewayPlugin {
             ok = result.is_ok(),
             "llm gateway: capabilities resolved",
         );
-        result
+        // The LLM gateway plugin resolves capabilities only; no session
+        // metadata to attach.
+        result.map(SessionPluginResponse::from)
     }
 
     async fn on_session_updated(
         &self,
         ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
+    ) -> Result<SessionPluginResponse, PluginError> {
         let cfg = Self::config_from_ctx(&ctx.call_ctx)?;
         let start = Instant::now();
         let result = self
@@ -460,7 +462,7 @@ impl ChatEngineBackendPlugin for LlmGatewayPlugin {
             ok = result.is_ok(),
             "llm gateway: capabilities refreshed",
         );
-        result
+        result.map(SessionPluginResponse::from)
     }
 
     async fn on_message(&self, ctx: MessagePluginCtx) -> Result<PluginStream, PluginError> {
@@ -942,7 +944,7 @@ mod tests {
             call_ctx: make_call_ctx(valid_config()),
         };
         let caps = plugin.on_session_type_configured(ctx).await.unwrap();
-        assert!(caps.is_empty());
+        assert!(caps.capabilities.is_empty());
     }
 
     #[tokio::test]
@@ -969,7 +971,7 @@ mod tests {
             call_ctx: make_call_ctx(valid_config()),
         };
         let caps = plugin.on_session_created(ctx).await.unwrap();
-        let names: Vec<&str> = caps.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<&str> = caps.capabilities.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&CAPABILITY_MODEL));
         assert!(names.contains(&CAPABILITY_TEMPERATURE));
         assert!(names.contains(&CAPABILITY_STREAM));

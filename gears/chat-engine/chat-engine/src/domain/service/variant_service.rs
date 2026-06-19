@@ -806,7 +806,7 @@ impl VariantService {
 
         // Capability superset check: every currently-enabled capability
         // name must be in the freshly-declared list.
-        let available =
+        let response =
             tokio::time::timeout(self.plugin_timeout, plugin.on_session_updated(session_ctx))
                 .await
                 .map_err(|_| {
@@ -818,6 +818,11 @@ impl VariantService {
                     }
                 })?
                 .map_err(ChatEngineError::from)?;
+        // This is a validation-only call to learn the target type's declared
+        // capabilities for the superset check; any returned metadata is not
+        // persisted on the type-switch path (capability updates go through
+        // `SessionService::update_capabilities`, which does merge it).
+        let available = response.capabilities;
 
         let current_names: Vec<String> = enabled_capability_names(&session);
         let available_names: std::collections::HashSet<&str> =

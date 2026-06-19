@@ -1,5 +1,5 @@
 Created:  2026-03-06 by Constructor Tech
-Updated:  2026-06-18 by Constructor Tech
+Updated:  2026-06-19 by Constructor Tech
 # Technical Design: Chat Engine
 
 
@@ -191,7 +191,7 @@ Once a message is created with a parent_message_id, that relationship is immutab
 <!-- fdd-id-content -->
 **ADRs**: `cpt-cf-chat-engine-adr-capability-model`, `cpt-cf-chat-engine-adr-plugin-backend-integration`, `cpt-cf-chat-engine-adr-llm-gateway-plugin`
 
-Backend plugins are code modules inside Chat Engine implementing the `ChatEngineBackendPlugin` trait. A session type references its plugin via `plugin_instance_id`. Plugin configuration is stored separately in `plugin_configs` (keyed by `plugin_instance_id` + `session_type_id`) and forwarded to the plugin in every call context. On `on_session_created`, the plugin resolves capabilities (e.g., by querying external services) and returns `Vec<Capability>` stored as `Session.enabled_capabilities`. On each message operation, Chat Engine calls the corresponding trait method and receives a `ResponseStream`. Plugins own all outbound communication — for example, the LLM gateway plugin makes HTTP requests to the Model Registry and LLM gateway service. Chat Engine does not interpret capability semantics, transport details, or external service protocols. Plugins may extend `PluginConfig.config` and `Message.metadata` with typed fields by registering GTS derived schemas — see `cpt-cf-chat-engine-adr-llm-gateway-plugin`.
+Backend plugins are code modules inside Chat Engine implementing the `ChatEngineBackendPlugin` trait. A session type references its plugin via `plugin_instance_id`. Plugin configuration is stored separately in `plugin_configs` (keyed by `plugin_instance_id` + `session_type_id`) and forwarded to the plugin in every call context. On `on_session_created`, the plugin resolves capabilities (e.g., by querying external services) and returns a `SessionPluginResponse { capabilities, metadata }`: `capabilities` is stored as `Session.enabled_capabilities` and the optional `metadata` is merged into `Session.metadata` (engine-reserved keys stripped). On each message operation, Chat Engine calls the corresponding trait method and receives a `ResponseStream`. Plugins own all outbound communication — for example, the LLM gateway plugin makes HTTP requests to the Model Registry and LLM gateway service. Chat Engine does not interpret capability semantics, transport details, or external service protocols. Plugins may extend `PluginConfig.config` and `Message.metadata` with typed fields by registering GTS derived schemas — see `cpt-cf-chat-engine-adr-llm-gateway-plugin`.
 <!-- fdd-id-content -->
 
 #### Principle: Stream Everything
@@ -346,7 +346,7 @@ Binding of a plugin reference and session type identity (session_type_id, name, 
 
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-design-entity-capability`
 
-Schema declaration of a capability supported by a backend plugin (`chat-engine-sdk::models::Capability`). Returned from `on_session_type_configured` / `on_session_created` / `on_session_updated` to tell Chat Engine what is tunable for the session. Fields: `name` (capability identifier, e.g. `"model"`, `"temperature"`, `"stream"`) and `value` (a plugin-defined JSON descriptor of allowed values). Chat Engine stores the returned `Vec<Capability>` in `Session.enabled_capabilities` and exposes the menu to clients; it does **not** interpret capability semantics.
+Schema declaration of a capability supported by a backend plugin (`chat-engine-sdk::models::Capability`). Returned (inside `SessionPluginResponse.capabilities`) from `on_session_type_configured` / `on_session_created` / `on_session_updated` to tell Chat Engine what is tunable for the session. Fields: `name` (capability identifier, e.g. `"model"`, `"temperature"`, `"stream"`) and `value` (a plugin-defined JSON descriptor of allowed values). Chat Engine stores the returned `Vec<Capability>` in `Session.enabled_capabilities` and exposes the menu to clients; it does **not** interpret capability semantics.
 
 Typical `value` shapes (plugin-defined; not enforced by Chat Engine):
 
@@ -545,7 +545,7 @@ Chat Engine orchestrates message creation, persistence, and tree management. It 
 <!-- fdd-id-content -->
 **ADRs**: `cpt-cf-chat-engine-adr-routing-layer` (zero business logic), `cpt-cf-chat-engine-adr-plugin-backend-integration` (plugin system)
 
-Chat Engine's plugin invocation layer. Resolves `dyn ChatEngineBackendPlugin` by `plugin_instance_id`, constructs call context, and invokes plugin methods (`on_session_type_configured`, `on_session_created`, `on_session_updated`, `on_message`, `on_message_recreate`, `on_session_summary`). On `on_session_created` and `on_session_updated`, the plugin returns `Vec<Capability>` stored as `Session.enabled_capabilities`. Auth, retry, circuit breaker, and timeouts are the plugin's responsibility.
+Chat Engine's plugin invocation layer. Resolves `dyn ChatEngineBackendPlugin` by `plugin_instance_id`, constructs call context, and invokes plugin methods (`on_session_type_configured`, `on_session_created`, `on_session_updated`, `on_message`, `on_message_recreate`, `on_session_summary`). On `on_session_created` and `on_session_updated`, the plugin returns a `SessionPluginResponse` whose `capabilities` are stored as `Session.enabled_capabilities` and whose optional `metadata` is merged into `Session.metadata`. Auth, retry, circuit breaker, and timeouts are the plugin's responsibility.
 
 **N:1 session type → plugin relationship**: Multiple differently-configured session types can share the same `plugin_instance_id`. Plugin configuration is stored separately in the `plugin_configs` table (keyed by `plugin_instance_id` + `session_type_id`). The call context always includes `session_type_id` and `plugin_config` (the `config` JSONB from the `plugin_configs` table), allowing a single plugin instance to serve multiple session types with different behaviour (e.g., different configuration, different capability set, different processing strategy).
 <!-- fdd-id-content -->
@@ -695,10 +695,10 @@ For complete endpoint definitions, request/response schemas, and examples, see t
 
 **Discovery**: Plugin implementations are internal code gears registered in Chat Engine's plugin registry at startup by `plugin_instance_id`.
 
-**Plugin methods**:
-- `on_session_type_configured(ctx)` → `Vec<Capability>` — optional static capabilities stored as `SessionType.available_capabilities`; plugins may return empty and defer resolution to session creation
-- `on_session_created(ctx)` → `Vec<Capability>` — capabilities resolved at session creation time, stored as `Session.enabled_capabilities`
-- `on_session_updated(ctx)` → `Vec<Capability>` — called when user updates session capabilities; plugin re-resolves capabilities (e.g., model change triggers capability refresh from Model Registry), result overwrites `Session.enabled_capabilities`
+**Plugin methods** (the three session hooks return `SessionPluginResponse { capabilities: Vec<Capability>, metadata: Option<JSON> }`):
+- `on_session_type_configured(ctx)` → `SessionPluginResponse` — optional static capabilities stored as `SessionType.available_capabilities`; plugins may return empty and defer resolution to session creation. `metadata` is ignored (there is no session yet).
+- `on_session_created(ctx)` → `SessionPluginResponse` — capabilities resolved at session creation time, stored as `Session.enabled_capabilities`; `metadata` is merged into `Session.metadata` (object merge, engine-reserved keys stripped).
+- `on_session_updated(ctx)` → `SessionPluginResponse` — called when user updates session capabilities; plugin re-resolves capabilities (e.g., model change triggers capability refresh from Model Registry), result overwrites `Session.enabled_capabilities` and `metadata` is merged into `Session.metadata`. (The session-type-switch path calls this hook for a capability-superset check only and does not persist returned metadata.)
 - `on_message(ctx, stream)` → streams response chunks
 - `on_message_recreate(ctx, stream)` → streams regenerated response
 - `on_session_summary(ctx, stream)` → streams session summary
@@ -775,7 +775,7 @@ sequenceDiagram
     Model Registry-->>Backend Plugin: Models list
     Backend Plugin->>Model Registry: Get capabilities for default model
     Model Registry-->>Backend Plugin: Model capabilities
-    Backend Plugin-->>Chat Engine: Vec<Capability>
+    Backend Plugin-->>Chat Engine: SessionPluginResponse (capabilities + metadata)
 
     Chat Engine->>Chat Engine: Store Session Capabilities
     Chat Engine-->>Client: Session Created (enabled_capabilities)
