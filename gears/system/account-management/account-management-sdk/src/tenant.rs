@@ -218,6 +218,13 @@ pub struct TenantInfoQuery {
     /// path for exact-id reads.
     #[odata(filter(kind = "Uuid"))]
     pub id: Uuid,
+    /// `tenants.name` — the human label returned in every list item.
+    /// Filterable (`$filter=name eq '...'`) and orderable
+    /// (`$orderby=name`) so operator UIs can search and sort children by
+    /// name. `name` is in the response projection, so it must be in the
+    /// filter/order allow-list too (projection-vs-filter parity).
+    #[odata(filter(kind = "String"))]
+    pub name: String,
     /// `tenants.status` projected as the public [`TenantStatus`]
     /// lifecycle string: `"active"`, `"suspended"`, or `"deleted"`
     /// (the serde rename on the SDK enum). The `OData` parser only
@@ -227,14 +234,24 @@ pub struct TenantInfoQuery {
     #[odata(filter(kind = "String"))]
     pub status: String,
     /// Deterministic `UUIDv5` of the registered tenant-type schema id.
-    /// Filtering on the UUID rather than the chained `gts.*` string
-    /// keeps the wire path simple — callers building a UI dropdown
-    /// over tenant types already hold the UUID (the resolver registry
-    /// returns it on type lookups), and the SDK does not need a
-    /// server-side `derive_schema_uuid` rewrite step. Exact-type
-    /// listings go through `$filter=tenant_type_uuid eq <uuid>`.
+    /// The raw-UUID filter remains for callers that already hold the
+    /// UUID (the resolver registry returns it on type lookups):
+    /// `$filter=tenant_type_uuid eq <uuid>`. Most callers should prefer
+    /// the chained-string [`tenant_type`](Self::tenant_type) filter
+    /// below, which matches the value returned in the projection.
     #[odata(filter(kind = "Uuid"))]
     pub tenant_type_uuid: Uuid,
+    /// Chained `gts.*` tenant-type string, exactly as returned in the
+    /// projection (`TenantDto.tenant_type`). Filterable
+    /// (`$filter=tenant_type eq 'gts.cf.core.am.tenant_type.v1~…~'`,
+    /// plus `ne` / `in`) so operator UIs can filter by the value they
+    /// already display — projection-vs-filter parity. The
+    /// string is mapped server-side to its deterministic `UUIDv5` and
+    /// compared against `tenant_type_uuid`; ordered operators and
+    /// `$orderby` are rejected (sorting by a derived UUID is
+    /// meaningless), mirroring `status`.
+    #[odata(filter(kind = "String"))]
+    pub tenant_type: String,
     /// `tenants.self_managed` flag. Useful to surface "boundary"
     /// child tenants vs ordinary ones in operator UIs.
     #[odata(filter(kind = "Bool"))]

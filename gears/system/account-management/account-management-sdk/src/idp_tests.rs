@@ -107,6 +107,28 @@ async fn list_users_default_impl_returns_unsupported_operation() {
 }
 
 #[test]
+fn parent_context_defaults_none_and_builder_sets_it() {
+    let tt = gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
+    let req = IdpProvisionTenantRequest::new(Uuid::nil(), Uuid::nil(), "t", tt.clone());
+    assert!(
+        req.parent_context.is_none(),
+        "new() must default parent_context to None"
+    );
+
+    let pctx = IdpTenantContext::new(
+        Uuid::nil(),
+        "parent",
+        tt,
+        Some(serde_json::json!({"k":"v"})),
+    );
+    let req2 = req.with_parent_context(pctx);
+    assert!(
+        req2.parent_context.is_some(),
+        "with_parent_context must set the field"
+    );
+}
+
+#[test]
 fn provision_failure_metric_labels_are_stable() {
     assert_eq!(
         IdpProvisionFailure::CleanFailure {

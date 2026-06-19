@@ -5719,7 +5719,7 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- id: eq|ne|in\n- status: eq|ne|contains|startswith|endswith|in\n- tenant_type_uuid: eq|ne|in\n- self_managed: eq|ne\n- created_at: eq|ne|gt|ge|lt|le|in\n- updated_at: eq|ne|gt|ge|lt|le|in",
+            "description": "OData v4 filter expression\n- id: eq|ne|in\n- name: eq|ne|contains|startswith|endswith|in\n- status: eq|ne|contains|startswith|endswith|in\n- tenant_type_uuid: eq|ne|in\n- tenant_type: eq|ne|contains|startswith|endswith|in\n- self_managed: eq|ne\n- created_at: eq|ne|gt|ge|lt|le|in\n- updated_at: eq|ne|gt|ge|lt|le|in",
             "in": "query",
             "name": "$filter",
             "required": false,
@@ -5728,7 +5728,7 @@
             }
           },
           {
-            "description": "OData v4 orderby expression\n- id asc\n- id desc\n- status asc\n- status desc\n- tenant_type_uuid asc\n- tenant_type_uuid desc\n- self_managed asc\n- self_managed desc\n- created_at asc\n- created_at desc\n- updated_at asc\n- updated_at desc",
+            "description": "OData v4 orderby expression\n- id asc\n- id desc\n- name asc\n- name desc\n- status asc\n- status desc\n- tenant_type_uuid asc\n- tenant_type_uuid desc\n- tenant_type asc\n- tenant_type desc\n- self_managed asc\n- self_managed desc\n- created_at asc\n- created_at desc\n- updated_at asc\n- updated_at desc",
             "in": "query",
             "name": "$orderby",
             "required": false,
@@ -5854,11 +5854,27 @@
               "ne",
               "in"
             ],
+            "name": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
             "self_managed": [
               "eq",
               "ne"
             ],
             "status": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "tenant_type": [
               "eq",
               "ne",
               "contains",
@@ -5886,10 +5902,14 @@
           "allowedFields": [
             "id asc",
             "id desc",
+            "name asc",
+            "name desc",
             "status asc",
             "status desc",
             "tenant_type_uuid asc",
             "tenant_type_uuid desc",
+            "tenant_type asc",
+            "tenant_type desc",
             "self_managed asc",
             "self_managed desc",
             "created_at asc",

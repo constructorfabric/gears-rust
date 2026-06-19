@@ -802,12 +802,14 @@ impl<R: TenantRepo> TenantService<R> {
 
         // Saga step 2 — invoke IdP provider outside any TX.
         // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-idp-tenant-provision:p1:inst-dod-idp-provision-call
+        let parent_ctx = self.load_tenant_context(parent.id).await?;
         let mut req = IdpProvisionTenantRequest::new(
             provisioning_row.id,
             parent.id,
             input.name.clone(),
             input.tenant_type.clone(),
-        );
+        )
+        .with_parent_context((&parent_ctx).into());
         if let Some(meta) = input.provisioning_metadata.clone() {
             req = req.with_metadata(meta);
         }

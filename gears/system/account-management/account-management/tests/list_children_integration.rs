@@ -97,6 +97,41 @@ async fn seed_root(h: &Harness, root_id: Uuid) {
         .expect("root self-row");
 }
 
+/// Seed an active, non-barrier child with an explicit `name` so the
+/// name-filter / name-orderby tests can assert on a controlled label
+/// (the generic `seed_tenant_at` derives `name` from the id, which is
+/// not lexicographically controllable).
+async fn seed_tenant_named(
+    h: &Harness,
+    id: Uuid,
+    parent_id: Uuid,
+    name: &str,
+    tenant_type_uuid: Uuid,
+    created_at: OffsetDateTime,
+) {
+    use toolkit_db::secure::secure_insert;
+    let conn = h.provider.conn().expect("conn");
+    let am = tenants::ActiveModel {
+        id: ActiveValue::Set(id),
+        parent_id: ActiveValue::Set(Some(parent_id)),
+        name: ActiveValue::Set(name.to_owned()),
+        status: ActiveValue::Set(ACTIVE),
+        self_managed: ActiveValue::Set(false),
+        tenant_type_uuid: ActiveValue::Set(tenant_type_uuid),
+        depth: ActiveValue::Set(1),
+        created_at: ActiveValue::Set(created_at),
+        updated_at: ActiveValue::Set(created_at),
+        deleted_at: ActiveValue::Set(None),
+        retention_window_secs: ActiveValue::Set(None),
+        claimed_by: ActiveValue::Set(None),
+        claimed_at: ActiveValue::Set(None),
+        terminal_failure_at: ActiveValue::Set(None),
+    };
+    secure_insert::<tenants::Entity>(am, &allow_all(), &conn)
+        .await
+        .expect("seed named child");
+}
+
 /// Build `$filter=<field> eq <i16>` for a numeric column. Used by
 /// non-status numeric columns in these tests (none currently — kept
 /// as scaffold for future numeric filters).
@@ -156,8 +191,10 @@ fn tenant_filter_fields_are_stable() {
         names,
         vec![
             "id",
+            "name",
             "status",
             "tenant_type_uuid",
+            "tenant_type",
             "self_managed",
             "created_at",
             "updated_at",
@@ -383,6 +420,68 @@ async fn list_children_filter_self_managed_isolates_barrier_children() {
         ids_of(&page.items),
         vec![boundary],
         "`$filter=self_managed eq true` MUST return only the barrier child"
+    );
+}
+
+// ---- name filter / orderby ------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_children_filter_by_name_returns_only_match() {
+    let h = setup_sqlite().await.expect("harness");
+    let root = Uuid::from_u128(ROOT_ID);
+    seed_root(&h, root).await;
+
+    let type_a = Uuid::from_u128(0xAA);
+    let alpha = Uuid::from_u128(0x501);
+    let beta = Uuid::from_u128(0x502);
+    seed_tenant_named(&h, alpha, root, "alpha", type_a, ts_at(1)).await;
+    seed_tenant_named(&h, beta, root, "beta", type_a, ts_at(2)).await;
+
+    let query = ODataQuery::default().with_filter(filter_field_eq_string("name", "alpha"));
+    let page = h
+        .repo
+        .list_children(&allow_all(), root, &query)
+        .await
+        .expect("list");
+
+    assert_eq!(
+        ids_of(&page.items),
+        vec![alpha],
+        "`$filter=name eq 'alpha'` MUST return only the exactly-named child"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_children_orderby_name_sorts_lexicographically() {
+    let h = setup_sqlite().await.expect("harness");
+    let root = Uuid::from_u128(ROOT_ID);
+    seed_root(&h, root).await;
+
+    let type_a = Uuid::from_u128(0xAA);
+    let charlie = Uuid::from_u128(0x601);
+    let alpha = Uuid::from_u128(0x602);
+    let bravo = Uuid::from_u128(0x603);
+    // Insertion (created_at) order is charlie, alpha, bravo — deliberately
+    // NOT the lexicographic name order, so a passing assertion proves the
+    // sort honoured `name`, not the default `created_at`.
+    seed_tenant_named(&h, charlie, root, "charlie", type_a, ts_at(1)).await;
+    seed_tenant_named(&h, alpha, root, "alpha", type_a, ts_at(2)).await;
+    seed_tenant_named(&h, bravo, root, "bravo", type_a, ts_at(3)).await;
+
+    let query = ODataQuery::default().with_order(ODataOrderBy(vec![OrderKey {
+        field: "name".to_owned(),
+        dir: SortDir::Asc,
+    }]));
+    let page = h
+        .repo
+        .list_children(&allow_all(), root, &query)
+        .await
+        .expect("list");
+
+    assert_eq!(
+        ids_of(&page.items),
+        vec![alpha, bravo, charlie],
+        "`$orderby=name asc` MUST sort children lexicographically by name"
     );
 }
 

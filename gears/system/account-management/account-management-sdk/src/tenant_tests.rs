@@ -46,8 +46,10 @@ fn tenant_filter_fields_are_pinned() {
         names,
         vec![
             "id",
+            "name",
             "status",
             "tenant_type_uuid",
+            "tenant_type",
             "self_managed",
             "created_at",
             "updated_at",

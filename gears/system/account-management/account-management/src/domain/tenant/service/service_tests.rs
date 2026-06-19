@@ -368,6 +368,40 @@ async fn create_tenant_happy_path_writes_self_row_and_one_ancestor_row() {
 }
 
 #[tokio::test]
+async fn create_child_forwards_parent_context() {
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x200);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let idp = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
+    let svc = TenantService::new(
+        repo.clone(),
+        idp.clone(),
+        Arc::new(InertResourceOwnershipChecker),
+        crate::domain::tenant_type::inert_tenant_type_checker(),
+        mock_enforcer(),
+        AccountManagementConfig::default(),
+    )
+    .with_types_registry(::std::sync::Arc::new(ConstantTypesRegistry));
+
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
+        .await
+        .expect("create ok");
+
+    // The saga MUST replay the parent's resolved snapshot so the plugin
+    // can derive the effective realm from the parent's opaque metadata.
+    let req = idp
+        .last_provision_request()
+        .expect("provision_tenant was called");
+    let parent_ctx = req
+        .parent_context
+        .expect("child provision must carry parent_context");
+    assert_eq!(
+        parent_ctx.tenant_id, root,
+        "parent_context must snapshot the parent tenant"
+    );
+}
+
+#[tokio::test]
 async fn create_tenant_clean_failure_compensates_and_writes_no_closure_rows() {
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x201);
@@ -3721,7 +3755,8 @@ async fn get_tenant_outside_caller_subtree_returns_not_found() {
         crate::domain::tenant_type::inert_tenant_type_checker(),
         mock_enforcer(),
         AccountManagementConfig::default(),
-    );
+    )
+    .with_types_registry(Arc::new(ConstantTypesRegistry));
     setup_svc
         .create_tenant(&ctx_for(root), child_input(child, root))
         .await
@@ -3763,7 +3798,8 @@ async fn make_cross_subtree_svc(
         crate::domain::tenant_type::inert_tenant_type_checker(),
         mock_enforcer(),
         AccountManagementConfig::default(),
-    );
+    )
+    .with_types_registry(Arc::new(ConstantTypesRegistry));
     setup_svc
         .create_tenant(&ctx_for(root), child_input(child, root))
         .await

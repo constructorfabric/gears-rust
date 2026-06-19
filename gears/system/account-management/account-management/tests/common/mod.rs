@@ -946,16 +946,6 @@ pub fn inert_resource_checker()
     Arc::new(InertResourceOwnershipChecker)
 }
 
-/// Empty `MockTypesRegistryClient` from the SDK's `test-util` feature.
-/// Every `get_*` returns `gts_type_schema_not_found`; reads that
-/// expect a populated registry (e.g. the `tenant_type` lift in
-/// `TenantDto::from_sdk_tenant`) collapse to `None` rather than
-/// failing the whole HTTP call.
-#[must_use]
-pub fn inert_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
-    Arc::new(types_registry_sdk::testing::MockTypesRegistryClient::new())
-}
-
 /// Canonical chained `tenant_type` id used by every E2E tenant fixture.
 /// Mirrors the in-source `domain::user::service_tests::TEST_TENANT_TYPE_ID`
 /// so the harness lines up byte-for-byte with the canonical AM unit-test
@@ -1073,14 +1063,17 @@ pub fn build_services(harness: &Harness) -> TestServices {
 /// Same as [`build_services`] but parameterised on the `IdP` plugin
 /// and the metadata-schema registry — used by tests that need a
 /// pre-seeded schema or a non-default IdP behaviour. Uses
-/// [`inert_types_registry`] for the types-registry side.
+/// [`types_registry_for_users`] so the types-registry resolves the
+/// harness tenant-type chain: `create_tenant` now loads the parent's
+/// context (`load_tenant_context`), which reverse-resolves the
+/// parent's `tenant_type_uuid` — an inert registry would 503 it.
 #[must_use]
 pub fn build_services_with(
     harness: &Harness,
     idp: Arc<dyn IdpPluginClient>,
     metadata_registry: Arc<dyn MetadataSchemaRegistry>,
 ) -> TestServices {
-    build_services_full(harness, idp, metadata_registry, inert_types_registry())
+    build_services_full(harness, idp, metadata_registry, types_registry_for_users())
 }
 
 /// Full variant of [`build_services_with`] that also takes the

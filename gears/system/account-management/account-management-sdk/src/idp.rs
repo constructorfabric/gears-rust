@@ -139,6 +139,11 @@ pub struct IdpProvisionTenantRequest {
     pub tenant_type: GtsTypeId,
     /// Opaque provider-specific metadata from `TenantCreateRequest.provisioning_metadata`.
     pub metadata: Option<Value>,
+    /// The parent tenant's resolved snapshot, replayed so the plugin can
+    /// derive the effective realm from the parent's opaque `metadata`.
+    /// `None` for the root-bootstrap path. AM remains the sole echo-proxy;
+    /// the plugin remains the sole interpreter of the blob.
+    pub parent_context: Option<IdpTenantContext>,
 }
 
 impl IdpProvisionTenantRequest {
@@ -153,6 +158,7 @@ impl IdpProvisionTenantRequest {
             name: name.into(),
             tenant_type,
             metadata: None,
+            parent_context: None,
         }
     }
 
@@ -173,6 +179,7 @@ impl IdpProvisionTenantRequest {
             name: name.into(),
             tenant_type,
             metadata: None,
+            parent_context: None,
         }
     }
 
@@ -180,6 +187,13 @@ impl IdpProvisionTenantRequest {
     #[must_use]
     pub fn with_metadata(mut self, metadata: Value) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    /// Builder-style setter for [`Self::parent_context`].
+    #[must_use]
+    pub fn with_parent_context(mut self, ctx: IdpTenantContext) -> Self {
+        self.parent_context = Some(ctx);
         self
     }
 }

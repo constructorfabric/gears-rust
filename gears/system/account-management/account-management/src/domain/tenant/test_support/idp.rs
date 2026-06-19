@@ -71,6 +71,11 @@ pub struct FakeIdpProvisioner {
     /// [`account_management_sdk::IdpTenantContext::metadata`].
     pub metadata: Mutex<Option<Value>>,
     pub calls: Mutex<Vec<Uuid>>,
+    /// Last [`IdpProvisionTenantRequest`] observed by `provision_tenant`,
+    /// captured verbatim so tests can assert request-shaping the saga
+    /// performs (e.g. `parent_context` replay) rather than only the
+    /// `tenant_id`.
+    pub last_provision_request: Mutex<Option<IdpProvisionTenantRequest>>,
     pub deprovision_calls: Mutex<Vec<Uuid>>,
     /// Notified once `provision_tenant` is entered (BEFORE the
     /// per-outcome dispatch). Tests using `FakeOutcome::Hang` await
@@ -87,6 +92,7 @@ impl FakeIdpProvisioner {
             deprovision_outcome: Mutex::new(FakeDeprovisionOutcome::Ok),
             metadata: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
+            last_provision_request: Mutex::new(None),
             deprovision_calls: Mutex::new(Vec::new()),
             provision_entered: Arc::new(Notify::new()),
         }
@@ -117,6 +123,12 @@ impl FakeIdpProvisioner {
     pub fn provision_call_count(&self) -> usize {
         self.calls.lock().expect("lock").len()
     }
+
+    /// The last provision request the fake captured, cloned out for
+    /// assertions. `None` until `provision_tenant` has been called.
+    pub fn last_provision_request(&self) -> Option<IdpProvisionTenantRequest> {
+        self.last_provision_request.lock().expect("lock").clone()
+    }
 }
 
 #[async_trait]
@@ -127,6 +139,7 @@ impl IdpPluginClient for FakeIdpProvisioner {
         req: &IdpProvisionTenantRequest,
     ) -> Result<IdpProvisionResult, IdpProvisionFailure> {
         self.calls.lock().expect("lock").push(req.tenant_id);
+        *self.last_provision_request.lock().expect("lock") = Some(req.clone());
         // Signal that the saga has reached `provision_tenant`
         // BEFORE the per-outcome dispatch so a test using
         // `FakeOutcome::Hang` can synchronize against entry rather
