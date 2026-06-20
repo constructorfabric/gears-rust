@@ -63,3 +63,8 @@ testing/e2e/logs/
 
 # Cypilot per-task working data (scratch reviews, logs, prompts; not tracked)
 .cypilot/work/
+
+# kitsoki working data (the bug-fix pipeline's isolated git worktrees + the
+# tour/demo render output — both scratch, not tracked). See docs/KITSOKI.md.
+.worktrees/
+.artifacts/
