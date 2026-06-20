@@ -91,6 +91,51 @@ Each authoring step runs an agent **with this repo as its working directory**,
 so it reads the real gear code, `docs/`, and `guidelines/` to ground the spec
 — and writes the result through the vendored gears-sdlc template.
 
+### VS Code extension
+
+The same PRD → Design walk runs **inside VS Code**, where it stops being a chat
+in a box and becomes editor-native: the conversation lives in a Kitsoki panel,
+but every document it authors — the brief, the PRD, the DESIGN — is mirrored
+into a **real editor tab** you can read, search, and hand-edit, and a refine
+opens a **native side-by-side diff** with an in-editor **Accept / Reject** whose
+verdict flows back into the walk.
+
+**Setup.**
+
+1. Install the **Kitsoki VS Code extension** (built from `tools/vscode-kitsoki`
+   in the kitsoki repo). It drives the same `kitsoki` binary on your `PATH`.
+2. Open **this repo** as the VS Code workspace, so the authoring agents run with
+   it as their working directory — the same grounding the Web/TUI runs get.
+3. Run **`Kitsoki: Open Chat`** from the Command Palette. The extension spawns
+   `kitsoki web` as a child process and connects to it as an IDE bridge
+   automatically (no port wrangling), then pop the chat out to the editor so the
+   conversation sits beside the documents it opens.
+
+**Drive the walk.** Pick **gears-rust** in the chat, then drive exactly the
+[same intents](#the-walk) (`prd` → `prd__start` → … → `prd__accept` →
+`continue` → …). What's new is what happens in the editor at each beat:
+
+| Beat | In the editor |
+|---|---|
+| **Clarify → submit** | The **brief** opens as an editor tab and **grows** as you answer each round of clarifying questions — you watch it accrete on disk, not in a chat bubble. |
+| **Drafting** | The **PRD** opens as a real tab (`gears/<gear>/docs/PRD.md`) showing the full gears-sdlc document — headings, requirements, open questions — editable and searchable like any file. |
+| **Refine** | Typing a refinement opens a **native diff** (the current PRD ↔ the proposed revision). The turn **blocks on your verdict**: **Accept** (the editor title-bar action or the CodeLens at the top of the diff) applies the change — it writes the file and the walk continues — or **Reject** discards it and re-drafts. Multiple refine rounds work the same way. |
+| **Design half** | The DESIGN authoring mirrors identically: drafted into a tab, refined through the diff/verdict gate, published to `gears/<gear>/docs/DESIGN.md`. |
+
+Because the docs are real on-disk files, your normal VS Code muscle memory
+applies — Explorer, search, save/undo, stock diff navigation (next/previous
+change, inline vs side-by-side). Nothing hijacks it.
+
+**How the editor link works.** The extension is a Claude-Code-style **IDE MCP
+server**; the spawned `kitsoki web` auto-connects to it (via
+`CLAUDE_CODE_SSE_PORT`), and the story's editor actions — `host.ide.open_file`
+for the brief/PRD, `host.ide.open_diff` for a refine — dispatch over that link.
+`open_diff` **blocks the turn** until you Accept/Reject, so the verdict is a real
+gate, not fire-and-forget. With no IDE attached (a plain `kitsoki web` in a
+browser, or the no-LLM flows) those verbs report *not connected* and the walk
+degrades gracefully to the in-chat path — the same story, no VS-Code-specific
+branches.
+
 ## Targeting a different gear or checkout
 
 The target gear and checkout path are configuration, overridable per run via a
