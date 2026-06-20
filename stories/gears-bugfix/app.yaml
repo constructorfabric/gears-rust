@@ -1,0 +1,115 @@
+# gears-bugfix — fix a bug in THIS repo with kitsoki's bug-fix pipeline.
+#
+# The companion to stories/gears-rust/ (PRD → Design): where that instance drives
+# the spec chain, this one drives the **autonomous bug-fix pipeline** against this
+# gears-rust checkout. It is the gears team's own story, living in this repo, that
+# imports the kitsoki base via `source: "@kitsoki/bugfix"` (resolved from the
+# kitsoki binary's embedded story library — no kitsoki checkout needed) and binds
+# it to this repo + a real ticket.
+#
+# What the pipeline does, on YOUR gear code:
+#   reproduce → propose → implement → test → review → validate → done
+# The agent reads + edits real gear code in an isolated git worktree, CI runs the
+# project's real `cargo test`, and the fix lands on a feature branch — ready for a
+# PR against gears-rust. No kitsoki engine or bugfix-room change is needed to point
+# it at this repo; the seam is config (the world keys below), exactly like the
+# gears-rust PRD → Design instance.
+#
+# This instance is pre-bound to gears-rust issue #4115 (gear config can't be
+# overridden via env vars in Kubernetes — a dashed gear name vs the k8s
+# C_IDENTIFIER rule) so the tour (features/gears-bugfix.yaml) opens with the bug
+# context already loaded. To fix a DIFFERENT bug, change ticket_id / ticket_title
+# / ticket_url below (or override them via a warp scenario).
+#
+# Quickstart (from this story dir, kitsoki binary on PATH):
+#   $ cd stories/gears-bugfix && kitsoki run app.yaml      # drive it in the TUI
+#   $ kitsoki tour --feature gears-bugfix                  # render the no-LLM demo
+#
+# The tour is a deterministic, no-LLM replay of a REAL run (see flows/ + cassettes/);
+# a live run dispatches `claude` agents to do the actual fixing.
+
+app:
+  id: gears-bugfix
+  version: 0.1.0
+  title: "gears-bugfix — fix a bug in this repo with kitsoki's bug-fix pipeline"
+  author: "Constructor Fabric"
+  license: "Apache-2.0"
+
+hosts:
+  - host.local_files.ticket
+  - host.git
+  - host.local
+  - host.git_worktree
+  - host.append_to_file
+  - host.inbox.add
+  - host.oracle.ask
+  - host.oracle.decide
+  - host.oracle.task
+  - host.diff.open
+
+imports:
+  bf:
+    source: "@kitsoki/bugfix"
+    entry: idle
+    hosts: declared
+    host_bindings:
+      ticket:    host.local_files.ticket
+      vcs:       host.git
+      ci:        host.local
+      workspace: host.git_worktree
+      transport: host.append_to_file
+    # Project this repo's profile into bugfix's private world.
+    world_in:
+      ticket_id:       "{{ world.ticket_id }}"
+      ticket_title:    "{{ world.ticket_title }}"
+      ticket_url:      "{{ world.ticket_url }}"
+      thread:          "{{ world.thread }}"
+      workspace_id:    "{{ world.workspace_id }}"
+      workdir:         "{{ world.workdir }}"
+      base_branch:     "{{ world.base_branch }}"
+      feature_branch:  "{{ world.feature_branch }}"
+      bugfix_mode:     "{{ world.bugfix_mode }}"
+      judge_mode:      "{{ world.judge_mode }}"
+      # CI commands for this repo's Rust workspace (the bugfix story forwards
+      # test_cmd / build_cmd to host.local in place of the Go defaults).
+      test_cmd:        "{{ world.test_cmd }}"
+      build_cmd:       "{{ world.build_cmd }}"
+      # Pre-pinned true so bf.idle.on_enter skips its auto-derive + auto-start
+      # chain: workdir is already set (below), and the tour drives `start`.
+      bf_autostart_attempted: "{{ world.bf_autostart_attempted }}"
+    # bf's exits land in the instance's terminal close-out (PR-ready).
+    exits:
+      done:        { to: shipped }
+      abandoned:   { to: shipped }
+      pick_ticket: { to: shipped }
+
+# Instance world — the gears-rust profile (target checkout + the seeded ticket).
+world:
+  ticket_id:       { type: string, default: "gh-4115" }
+  ticket_title:    { type: string, default: "Gear/plugin config can't be overridden via env vars in Kubernetes (dash in gear name vs C_IDENTIFIER)" }
+  ticket_url:      { type: string, default: "https://github.com/constructorfabric/gears-rust/issues/4115" }
+  thread:          { type: string, default: "gh-4115" }
+  workspace_id:    { type: string, default: "bf-gh-4115" }
+  # The isolated git worktree the agent edits — under this checkout's .worktrees/.
+  workdir:         { type: string, default: ".worktrees/bf-gh-4115" }
+  base_branch:     { type: string, default: "main" }
+  feature_branch:  { type: string, default: "fix/gh-4115" }
+  bugfix_mode:     { type: string, default: "full" }
+  judge_mode:      { type: string, default: "human" }
+  # This repo's Rust toolkit tests are behind the `bootstrap` cargo feature.
+  test_cmd:        { type: string, default: "cargo test -p cf-gears-toolkit --features bootstrap --lib bootstrap::config" }
+  build_cmd:       { type: string, default: "cargo build -p cf-gears-toolkit --features bootstrap" }
+  bf_autostart_attempted: { type: bool, default: true }
+
+states:
+  shipped:
+    description: "Fix landed on the feature branch — PR-ready, ticket resolved."
+    view:
+      - banner:
+          text:     "PR-READY"
+          subtitle: "bug fixed — the feature branch is ready to open a pull request against gears-rust"
+          color:    "#22C55E"
+      - prose: "kitsoki's bug-fix pipeline reproduced, proposed, implemented, tested, reviewed and validated the fix against this gears-rust checkout. The branch is ready for a PR; the ticket is resolved."
+    relevant_world: [ticket_id, ticket_title, feature_branch]
+
+root: bf

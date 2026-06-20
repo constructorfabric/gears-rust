@@ -1,0 +1,24 @@
+# Deterministic (no-LLM) replay of the real gh-4115 gears bug-fix, happy-path walk,
+# through the gears-bugfix instance. Oracle artifacts, fix diff, and the 316/0
+# cargo log are replayed verbatim from the recorded real run via the cassette.
+test_kind: flow
+app: ../app.yaml
+host_cassette: ../cassettes/tour.cassette.yaml
+initial_state: bf.idle
+initial_world:
+  workdir: ".worktrees/bf-gh-4115"
+  workspace_id: "bf-gh-4115"
+  feature_branch: "fix/gh-4115"
+  ticket_id: "gh-4115"
+  bf_autostart_attempted: true
+turns:
+  - intent: { name: bf__start,  slots: {} }   # bf.idle -> bf.reproducing
+  - intent: { name: bf__accept, slots: {} }   # -> bf.proposing
+  - intent: { name: bf__accept, slots: {} }   # -> bf.implementing
+  - intent: { name: bf__accept, slots: {} }   # -> bf.testing
+  - intent: { name: bf__accept, slots: {} }   # -> bf.reviewing
+  - intent: { name: bf__accept, slots: {} }   # -> bf.validating
+  - intent: { name: bf__accept, slots: {} }   # -> bf.done
+  - intent: { name: bf__accept, slots: {} }   # -> shipped (exit:done close-out)
+    then:
+      - expect_state: shipped

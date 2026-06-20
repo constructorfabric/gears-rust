@@ -17,6 +17,14 @@ is specific to gears-rust.
 > and DESIGN.md you review and edit — it never touches `src/`, `Cargo.toml`,
 > or any gear implementation.
 
+> **Also: fixing bugs.** A companion story —
+> [`stories/gears-bugfix/`](../stories/gears-bugfix/README.md) — points kitsoki's
+> **autonomous bug-fix pipeline** at this repo (reproduce → propose → implement →
+> test → review → validate → PR-ready). Unlike the spec-authoring story above,
+> that one *does* edit gear code (in an isolated worktree) and runs the project's
+> real `cargo test`. Watch the no-LLM demo:
+> `cd stories/gears-bugfix && kitsoki tour --feature gears-bugfix`.
+
 ## What it produces
 
 A full walk lands two fixed-name docs in the target gear, in the gears-sdlc

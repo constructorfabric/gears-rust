@@ -1,0 +1,188 @@
+# yaml-language-server: $schema=feature.schema.json
+id: gears-bugfix
+kind: story-demo
+title: Fix a gears-rust bug with kitsoki, end to end
+tagline: Point kitsoki's autonomous bug-fix pipeline at this repo — reproduce, fix, test and validate a real gears-rust bug, ready for a PR.
+summary: "A guided walk through kitsoki's bug-fix pipeline running against THIS gears-rust checkout, fixing issue #4115 (gear config can't be overridden via env vars in Kubernetes — dashes in gear names vs the C_IDENTIFIER rule). Every room is a deterministic state-machine beat: reproduce the bug, propose a root-cause fix, implement it in an isolated git worktree, run the project's real cargo test suite, self-review the diff, validate end to end, and close out — the feature branch ready to open a PR. The content is replayed verbatim from a real LLM run; this render is no-LLM and deterministic, so it costs nothing and looks the same every time."
+narrative: "kitsoki ships embedded in the gears tooling (no kitsoki checkout needed). This tour is for gears developers: it shows what happens when you hand a gears-rust bug to kitsoki's bug-fix pipeline. The agent reads and edits real gear code in an isolated worktree, CI runs `cargo test`, and the fix lands on a feature branch — PR-ready. It is the bug-fix companion to the gears-rust PRD → Design story: same idea (kitsoki as a dependency, pointed at this repo via config), different stage of the SDLC. The walk you see is a genuine run against gh-4115, replayed deterministically."
+docs:
+  - stories/gears-bugfix/README.md
+  - docs/KITSOKI.md
+related:
+  - gears-prd-design
+demo:
+  spec: tests/playwright/gears-bugfix.spec.ts
+  artifactDir: gears-bugfix
+  videoBase: gears-bugfix
+  posterStep: gb-intro-home
+  story: .
+  flow: flows/tour.yaml
+  hostCassette: cassettes/tour.cassette.yaml
+tour:
+  export: GEARS_BUGFIX_TOUR_STEPS
+  steps:
+    - id: gb-intro-home
+      route: home
+      title: Fix a gears-rust bug with kitsoki
+      body: "kitsoki ships with this repo's tooling. Hand it a gears-rust bug and its pipeline fixes it end to end: reproduce → propose → implement → test → review → validate → done — every room a deterministic state-machine step. We'll fix issue #4115 on this checkout. This whole walk is replayed from a real run; no LLM in the loop now."
+      placement: center
+      kind: explain
+      advance: next
+      waitForTarget: home-view
+      dwellMs: 6000
+      drive: []
+    - id: gb-intro-story
+      route: home
+      target: story-card
+      title: The bug-fix pipeline, pointed at this repo
+      body: "This is the bug-fix companion to the gears-rust PRD → Design story: the same kitsoki-as-a-dependency idea, here driving the autonomous fix loop against THIS gears-rust checkout. The agent reads and edits real gear code in an isolated git worktree, and CI runs the project's real cargo tests. Let's run it."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: story-card
+      dwellMs: 5500
+      drive: []
+    - id: gb-intro-start
+      route: home
+      target: new-session-btn
+      title: Spin up a run
+      body: Click New session to create a fresh, independently-traced run of the bug-fix pipeline against gears-rust issue #4115.
+      placement: right
+      kind: action
+      advance: route-match
+      advanceRoute: interactive
+      waitForTarget: new-session-btn
+      dwellMs: 3500
+      drive: []
+    - id: gb-intro-observe
+      route: interactive
+      target: observe-link
+      title: Drive here, observe there
+      body: "We're on the drive view: each accept advances the pipeline exactly one room, and the state badge tracks where we are. The ticket — gears-rust #4115, gear config can't be overridden via env vars in Kubernetes — is already loaded. Let's reproduce it."
+      placement: bottom
+      kind: explain
+      advance: next
+      waitForTarget: observe-link
+      dwellMs: 5500
+      drive: []
+    - id: gb-reproduce
+      route: any
+      target: chat-transcript
+      title: Reproduce the bug
+      body: "bf.reproducing — the agent confirms the bug is real before touching code. It traces figment's `Env::prefixed(\"APP__\").split(\"__\")` layer in `libs/toolkit`: it lowercases and splits on `__`, but never maps `_`→`-`, so `APP__GEARS__STATIC_AUTHZ_PLUGIN__…` resolves to a `static_authz_plugin` key that misses the dashed `static-authz-plugin` gear. Override silently dropped. Accept to move on."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 8000
+      drive:
+        - { type: wait-state, state: bf.idle }
+        - { type: click-intent, intent: bf__start }
+        - { type: wait-state, state: bf.reproducing }
+        - { type: reveal-turn }
+    - id: gb-propose
+      route: any
+      target: chat-transcript
+      title: Propose a root-cause fix
+      body: "bf.proposing — root cause confirmed. The fix: a post-extraction normalization pass in `AppConfig::load_layered` that deep-merges the underscore-keyed env override into the dashed YAML gear entry, reusing the existing `merge_json_objects` pattern from `oop.rs`. Accept the proposal."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 7000
+      drive:
+        - { type: click-intent, intent: bf__accept }
+        - { type: wait-state, state: bf.proposing }
+        - { type: reveal-turn }
+    - id: gb-implement
+      route: any
+      target: chat-transcript
+      title: Implement the fix
+      body: "bf.implementing — the agent edits `libs/toolkit/src/bootstrap/config/mod.rs` in an isolated worktree: the normalization pass, a `merge_gear_env_override` helper, and regression tests. The change is committed to the fix/gh-4115 branch. Accept to run the tests."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 7000
+      drive:
+        - { type: click-intent, intent: bf__accept }
+        - { type: wait-state, state: bf.implementing }
+        - { type: reveal-turn }
+    - id: gb-test
+      route: any
+      target: chat-transcript
+      title: Run this repo's real cargo tests
+      body: "bf.testing — CI runs the project's real suite: `cargo test -p cf-gears-toolkit --features bootstrap`. The new regression tests prove the dashed-gear env override now applies, and the full module is green — 316 passed, 0 failed. The fix is proven, not just plausible. Accept to self-review."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 7500
+      drive:
+        - { type: click-intent, intent: bf__accept }
+        - { type: wait-state, state: bf.testing }
+        - { type: reveal-turn }
+    - id: gb-review
+      route: any
+      target: chat-transcript
+      title: Self-review the diff
+      body: "bf.reviewing — the agent reviews its own diff against the worktree before anyone else sees it: scope is contained to one file, the normalization is guarded to gears whose name has both a dash and an underscore form, and unrelated config keys are untouched. Accept to validate end to end."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 7000
+      drive:
+        - { type: click-intent, intent: bf__accept }
+        - { type: wait-state, state: bf.reviewing }
+        - { type: reveal-turn }
+    - id: gb-validate
+      route: any
+      target: chat-transcript
+      title: Validate end to end
+      body: "bf.validating — a full check: the crate builds with `cargo build --features bootstrap`, the whole suite passes under parallel execution (316/316), and the originally-reported symptom is gone — a dashed gear's config is now overridable by a Kubernetes-legal env var. Outcome: pass. Accept to close out."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 7500
+      drive:
+        - { type: click-intent, intent: bf__accept }
+        - { type: wait-state, state: bf.validating }
+        - { type: reveal-turn }
+    - id: gb-done
+      route: any
+      target: chat-transcript
+      title: Close out the fix
+      body: "bf.done — the pipeline has reproduced, proposed, implemented, tested, reviewed and validated the fix. The close-out artifact captures the lessons and the metrics. The branch fix/gh-4115 is ready to open a pull request against gears-rust. One more accept resolves the ticket."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 7500
+      drive:
+        - { type: click-intent, intent: bf__accept }
+        - { type: wait-state, state: bf.done }
+        - { type: reveal-turn }
+    - id: gb-resolved
+      route: any
+      target: state-badge
+      title: Ticket resolved, PR-ready
+      body: "The fix is committed to fix/gh-4115, the ticket transitions to resolved, and the run reaches its PR-ready close-out. To fix your own bug: point this story at a different ticket (ticket_id / ticket_title in app.yaml) and run it — a live run dispatches agents to do the real work; this tour is its deterministic, no-LLM replay."
+      placement: left
+      kind: explain
+      advance: next
+      waitForTarget: state-badge
+      dwellMs: 7000
+      drive:
+        - { type: click-intent, intent: bf__accept }
+        - { type: wait-state, state: shipped }
+        - { type: dwell-ms, ms: 1500 }
+    - id: gb-outro
+      route: any
+      title: That's your bug, fixed
+      body: "You watched kitsoki's bug-fix pipeline take a real gears-rust bug from a symptom to a tested, validated, PR-ready fix — every room a deterministic, replayable state-machine step, the content drawn from a genuine run against this repo. See stories/gears-bugfix/README.md to run it on your own bug."
+      placement: center
+      kind: explain
+      advance: next
+      dwellMs: 6000
