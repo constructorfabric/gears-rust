@@ -16,7 +16,7 @@ Gears span three broad categories:
 
 See also:
 - [WHY_GEARS](docs/WHY_GEARS.md) explaining why to chose Rust/Gears for your XaaS project.
-- [OVERVIEW](docs/slides/1_OVERVIEW.md) HTML slides explaining the key Constructor Fabric Gears concepts.
+- [OVERVIEW](docs/slides/1_OVERVIEW.html) Slidey deck explaining the key Constructor Fabric Gears concepts.
 - [GEARS](docs/GEARS.md) for gears overview.
 
 **Five defining Gears characteristics:**
