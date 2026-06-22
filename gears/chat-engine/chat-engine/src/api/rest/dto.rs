@@ -206,15 +206,34 @@ pub struct MessagePartInputDto {
 
 impl From<MessagePartInputDto> for SdkMessagePartInput {
     fn from(d: MessagePartInputDto) -> Self {
+        let part_type = part_type_from_wire(&d.part_type);
         Self {
-            part_type: part_type_from_wire(&d.part_type),
-            content: d.content,
+            content: normalize_part_content(part_type, d.content),
+            part_type,
             // Citations/references are plugin-produced (assistant side); the
             // inbound user-message wire shape does not carry them.
             file_citations: Vec::new(),
             link_citations: Vec::new(),
             references: Vec::new(),
         }
+    }
+}
+
+/// Canonicalize inbound part content to the persisted/streamed wire shape so
+/// user and assistant parts of the same type serialize identically.
+///
+/// A `text` part's canonical content is the object `{ "text": "<body>" }`
+/// (see [`MessagePart::text`](chat_engine_sdk::models::MessagePart::text) and
+/// the streamed assistant form). Clients commonly send a bare JSON string for
+/// convenience; wrap it so it matches the assistant side. Already-canonical
+/// objects and every other part type pass through untouched — per-type shape
+/// validation stays in the service/plugin layer.
+fn normalize_part_content(part_type: MessagePartType, content: JsonValue) -> JsonValue {
+    match (part_type, content) {
+        (MessagePartType::Text, JsonValue::String(text)) => {
+            serde_json::json!({ "text": text })
+        }
+        (_, content) => content,
     }
 }
 
@@ -675,6 +694,39 @@ mod rfc3339_opt {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn text_part_input_string_is_canonicalized_to_object() {
+        // A bare-string text part is wrapped so it matches the persisted /
+        // streamed assistant shape `{ "text": ... }`.
+        let dto = MessagePartInputDto {
+            part_type: "text".into(),
+            content: json!("hello"),
+        };
+        let sdk = SdkMessagePartInput::from(dto);
+        assert_eq!(sdk.part_type, MessagePartType::Text);
+        assert_eq!(sdk.content, json!({ "text": "hello" }));
+    }
+
+    #[test]
+    fn text_part_input_object_passes_through() {
+        let dto = MessagePartInputDto {
+            part_type: "text".into(),
+            content: json!({ "text": "hi" }),
+        };
+        assert_eq!(SdkMessagePartInput::from(dto).content, json!({ "text": "hi" }));
+    }
+
+    #[test]
+    fn non_text_part_content_is_untouched() {
+        let dto = MessagePartInputDto {
+            part_type: "links".into(),
+            content: json!({ "links": [{ "url": "https://e.com" }] }),
+        };
+        let sdk = SdkMessagePartInput::from(dto);
+        assert_eq!(sdk.part_type, MessagePartType::Links);
+        assert_eq!(sdk.content, json!({ "links": [{ "url": "https://e.com" }] }));
+    }
 
     #[test]
     fn streaming_event_dto_serializes_as_tagged_union() {
