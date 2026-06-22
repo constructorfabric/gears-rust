@@ -806,7 +806,7 @@ fn capability_values_to_json(caps: &[CapabilityValue]) -> JsonValue {
 /// from the overlay so a plugin can't clobber engine-managed session state.
 /// A non-object overlay is ignored when the base is an object (to avoid
 /// dropping client metadata); otherwise the overlay wins.
-fn merge_plugin_metadata(base: Option<JsonValue>, overlay: JsonValue) -> JsonValue {
+pub(crate) fn merge_plugin_metadata(base: Option<JsonValue>, overlay: JsonValue) -> JsonValue {
     let overlay = match overlay {
         JsonValue::Object(mut map) => {
             map.retain(|k, _| !RESERVED_METADATA_KEYS.contains(&k.as_str()));

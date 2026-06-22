@@ -65,7 +65,7 @@ use crate::domain::service::message_service::{
     MessageEventKind, MessageService, SendMessageStream,
 };
 use crate::domain::service::plugin_service::PluginService;
-use crate::domain::service::session_service::Identity;
+use crate::domain::service::session_service::{Identity, merge_plugin_metadata};
 use crate::domain::session::Session;
 use crate::infra::db::entity::session_type as session_type_entity;
 use crate::infra::db::repo::message_repo::MessageRepo;
@@ -753,7 +753,12 @@ impl VariantService {
         identity: &Identity,
         session_id: Uuid,
         target_session_type_id: Uuid,
-    ) -> Result<(session_type_entity::Model, String, Vec<Capability>)> {
+    ) -> Result<(
+        session_type_entity::Model,
+        String,
+        Vec<Capability>,
+        Option<JsonValue>,
+    )> {
         let session = self.load_session(identity, session_id).await?;
         self.gate_lifecycle_mutation(&session)?;
 
@@ -818,10 +823,9 @@ impl VariantService {
                     }
                 })?
                 .map_err(ChatEngineError::from)?;
-        // This is a validation-only call to learn the target type's declared
-        // capabilities for the superset check; any returned metadata is not
-        // persisted on the type-switch path (capability updates go through
-        // `SessionService::update_capabilities`, which does merge it).
+        // Capabilities drive the superset check below; metadata is returned so
+        // the caller can merge it into the session on a successful switch.
+        let returned_metadata = response.metadata;
         let available = response.capabilities;
 
         let current_names: Vec<String> = enabled_capability_names(&session);
@@ -836,7 +840,7 @@ impl VariantService {
             }
         }
 
-        Ok((target, plugin_instance_id, available))
+        Ok((target, plugin_instance_id, available, returned_metadata))
     }
 
     /// `PATCH /sessions/{session_id}/type` (canonical) /
@@ -857,13 +861,13 @@ impl VariantService {
     ) -> Result<Session> {
         let started = OffsetDateTime::now_utc();
 
-        let (_target_type, _plugin_instance_id, capabilities) = self
+        let (_target_type, _plugin_instance_id, capabilities, plugin_metadata) = self
             .validate_session_type_switch(identity, session_id, target_session_type_id)
             .await?;
 
         let caps_json = serde_json::to_value(&capabilities).unwrap_or(JsonValue::Array(Vec::new()));
 
-        let updated = self
+        let mut updated = self
             .variants
             .update_session_type(
                 &identity.tenant_id,
@@ -873,6 +877,21 @@ impl VariantService {
                 caps_json,
             )
             .await?;
+
+        // Merge any plugin-supplied metadata from `on_session_updated` into the
+        // session metadata (same semantics as the capability-update path).
+        if let Some(plugin_meta) = plugin_metadata {
+            let merged = merge_plugin_metadata(updated.metadata.clone(), plugin_meta);
+            updated = self
+                .sessions
+                .update_metadata(
+                    &identity.tenant_id,
+                    &identity.user_id,
+                    session_id,
+                    Some(merged),
+                )
+                .await?;
+        }
 
         log_op_finished(started, "switch_type", session_id, session_id, None);
         increment_variant_creation_total("switch_type");
