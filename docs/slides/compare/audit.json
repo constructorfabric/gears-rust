@@ -1,0 +1,557 @@
+{
+  "spec": "/Users/brad/code/gears-rust-slidey/docs/slides/1_OVERVIEW.compare.slidey.json",
+  "resolution": {
+    "width": 1920,
+    "height": 1080
+  },
+  "summary": {
+    "frames": 60,
+    "frames_with_findings": 0,
+    "findings": 0,
+    "errors": 0,
+    "warnings": 0,
+    "info": 0
+  },
+  "frames": [
+    {
+      "frame": "00-01.png",
+      "scene": 0,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 01: Constructor Fabric Gears (Rust)",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "01-01.png",
+      "scene": 1,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 02: Agenda",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "02-01.png",
+      "scene": 2,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 03: Part 1 — What & Why",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "03-01.png",
+      "scene": 3,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 04: What is Constructor Gear?",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "04-01.png",
+      "scene": 4,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 05: For whom?",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "05-01.png",
+      "scene": 5,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 06: Non-goals",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "06-01.png",
+      "scene": 6,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 07: Key defining characteristics",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "07-01.png",
+      "scene": 7,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 08: Part 2 — Architecture Principles & Philosophy",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "08-01.png",
+      "scene": 8,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 09: Principle 1 — Secure by default (defense-in-depth)",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "09-01.png",
+      "scene": 9,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 10: Principle 2 — Architecture enforced at compile time",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "10-01.png",
+      "scene": 10,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 11: Dylint — compile-time architecture validation",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "11-01.png",
+      "scene": 11,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 12: Principle 3 — Three-tier gears hierarchy",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "12-01.png",
+      "scene": 12,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 13: Principle 4 — Composable libraries, vendor-controlled deployment",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "13-01.png",
+      "scene": 13,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 14: Principle 5 — Local-first shift-left development",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "14-01.png",
+      "scene": 14,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 15: Principle 6 — Pre-integrated XaaS backbone",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "15-01.png",
+      "scene": 15,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 16: Principle 7 — Extensible domain model via GTS",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "16-01.png",
+      "scene": 16,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 17: Engineering principles (how we work)",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "17-01.png",
+      "scene": 17,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 18: Part 3 — Foundations",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "18-01.png",
+      "scene": 18,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 19: Why Rust?",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "19-01.png",
+      "scene": 19,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 20: Why a monorepo?",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "20-01.png",
+      "scene": 20,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 21: Deployment shapes (FUTURE)",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "21-01.png",
+      "scene": 21,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 22: Repository structure",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "22-01.png",
+      "scene": 22,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 23: Part 4 — What is a Gear in a nutshell?",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "23-01.png",
+      "scene": 23,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 24: Gear = independent capability domain",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "24-01.png",
+      "scene": 24,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 25: Gear architecture (the big picture)",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "25-01.png",
+      "scene": 25,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 26: Planned Gears map",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "26-01.png",
+      "scene": 26,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 27: Gear anatomy — DDD-light layers",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "27-01.png",
+      "scene": 27,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 28: Gear execution model",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "28-01.png",
+      "scene": 28,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 29: Gear composition — compiled-in vs selectable",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "29-01.png",
+      "scene": 29,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 30: Gear lifecycle (platform-owned)",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "30-01.png",
+      "scene": 30,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 31: Gear categories",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "31-01.png",
+      "scene": 31,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 32: Plugins & extensibility",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "32-01.png",
+      "scene": 32,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 33: Part 5 — Gears Toolkit",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "33-01.png",
+      "scene": 33,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 34: Gears Toolkit — mission",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "34-01.png",
+      "scene": 34,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 35: Tookit — features",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "35-01.png",
+      "scene": 35,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 36: Consistent API dialect",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "36-01.png",
+      "scene": 36,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 37: API handler registration example",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "37-01.png",
+      "scene": 37,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 38: Part 6 — Cross-cutting Concerns",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "38-01.png",
+      "scene": 38,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 39: Request lifecycle",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "39-01.png",
+      "scene": 39,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 40: Request lifecycle — who owns what",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "40-01.png",
+      "scene": 40,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 41: Security — PDP/PEP authorization",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "41-01.png",
+      "scene": 41,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 42: Security — Secure ORM & tenancy",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "42-01.png",
+      "scene": 42,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 43: Security — defense across the lifecycle",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "43-01.png",
+      "scene": 43,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 44: Security — FIPS 140-3",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "44-01.png",
+      "scene": 44,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 45: Global Type System (GTS)",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "45-01.png",
+      "scene": 45,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 46: Errors — canonical taxonomy",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "46-01.png",
+      "scene": 46,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 47: Observability & operations",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "47-01.png",
+      "scene": 47,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 48: Part 7 — Engineering & Developer Experience",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "48-01.png",
+      "scene": 48,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 49: Developer experience",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "49-01.png",
+      "scene": 49,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 50: Spec-Driven Development (SDD)",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "50-01.png",
+      "scene": 50,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 51: Testing architecture",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "51-01.png",
+      "scene": 51,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 52: Part 8 — Getting Started",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "52-01.png",
+      "scene": 52,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 53: Prerequisites",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "53-01.png",
+      "scene": 53,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 54: How to build & run",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "54-01.png",
+      "scene": 54,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 55: Configuration",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "55-01.png",
+      "scene": 55,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 56: How to run tests",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "56-01.png",
+      "scene": 56,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 57: How to contribute",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "57-01.png",
+      "scene": 57,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 58: Documentation map",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "58-01.png",
+      "scene": 58,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 59: Why Constructor Gears is a good choice for your project",
+      "state": "reveal_all",
+      "findings": []
+    },
+    {
+      "frame": "59-01.png",
+      "scene": 59,
+      "step": 1,
+      "type": "image-compare",
+      "title": "Slide 60: Thank you",
+      "state": "reveal_all",
+      "findings": []
+    }
+  ]
+}

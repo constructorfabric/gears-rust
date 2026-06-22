@@ -61,6 +61,15 @@ testing/e2e/.venv/
 testing/e2e/logs/
 .docker-stage
 
+# Generated Slidey comparison review assets. Rebuild with:
+#   docs/slides/rebuild-comparison-assets.sh
+/docs/slides/1_OVERVIEW.compare.html
+/docs/slides/compare/new/
+/docs/slides/compare/old/
+/docs/slides/compare/old.[0-9]*
+/docs/slides/compare/img/
+/docs/slides/diagrams/themed-svg/*.svg
+
 # Cypilot per-task working data (scratch reviews, logs, prompts; not tracked)
 .cypilot/work/
 

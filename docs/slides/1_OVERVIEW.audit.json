@@ -1,0 +1,2456 @@
+{
+  "spec": "/Users/brad/code/gears-rust-slidey/docs/slides/1_OVERVIEW.slidey.json",
+  "resolution": {
+    "width": 1920,
+    "height": 1080
+  },
+  "summary": {
+    "frames": 271,
+    "frames_with_findings": 0,
+    "findings": 0,
+    "errors": 0,
+    "warnings": 0,
+    "info": 0
+  },
+  "frames": [
+    {
+      "frame": "00-01.png",
+      "scene": 0,
+      "step": 1,
+      "type": "title",
+      "title": "Constructor Fabric Gears (Rust)",
+      "state": null,
+      "findings": []
+    },
+    {
+      "frame": "01-01.png",
+      "scene": 1,
+      "step": 1,
+      "type": "cards",
+      "title": "Agenda",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "01-02.png",
+      "scene": 1,
+      "step": 2,
+      "type": "cards",
+      "title": "Agenda",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "01-03.png",
+      "scene": 1,
+      "step": 3,
+      "type": "cards",
+      "title": "Agenda",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "01-04.png",
+      "scene": 1,
+      "step": 4,
+      "type": "cards",
+      "title": "Agenda",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "01-05.png",
+      "scene": 1,
+      "step": 5,
+      "type": "cards",
+      "title": "Agenda",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "01-06.png",
+      "scene": 1,
+      "step": 6,
+      "type": "cards",
+      "title": "Agenda",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "01-07.png",
+      "scene": 1,
+      "step": 7,
+      "type": "cards",
+      "title": "Agenda",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "01-08.png",
+      "scene": 1,
+      "step": 8,
+      "type": "cards",
+      "title": "Agenda",
+      "state": "cards_item_6",
+      "findings": []
+    },
+    {
+      "frame": "01-09.png",
+      "scene": 1,
+      "step": 9,
+      "type": "cards",
+      "title": "Agenda",
+      "state": "cards_item_7",
+      "findings": []
+    },
+    {
+      "frame": "02-01.png",
+      "scene": 2,
+      "step": 1,
+      "type": "title",
+      "title": "Part 1 — What & Why",
+      "state": null,
+      "findings": []
+    },
+    {
+      "frame": "03-01.png",
+      "scene": 3,
+      "step": 1,
+      "type": "cards",
+      "title": "What is Constructor Gear?",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "03-02.png",
+      "scene": 3,
+      "step": 2,
+      "type": "cards",
+      "title": "What is Constructor Gear?",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "03-03.png",
+      "scene": 3,
+      "step": 3,
+      "type": "cards",
+      "title": "What is Constructor Gear?",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "03-04.png",
+      "scene": 3,
+      "step": 4,
+      "type": "cards",
+      "title": "What is Constructor Gear?",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "04-01.png",
+      "scene": 4,
+      "step": 1,
+      "type": "cards",
+      "title": "For whom?",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "04-02.png",
+      "scene": 4,
+      "step": 2,
+      "type": "cards",
+      "title": "For whom?",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "04-03.png",
+      "scene": 4,
+      "step": 3,
+      "type": "cards",
+      "title": "For whom?",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "04-04.png",
+      "scene": 4,
+      "step": 4,
+      "type": "cards",
+      "title": "For whom?",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "04-05.png",
+      "scene": 4,
+      "step": 5,
+      "type": "cards",
+      "title": "For whom?",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "04-06.png",
+      "scene": 4,
+      "step": 6,
+      "type": "cards",
+      "title": "For whom?",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "05-01.png",
+      "scene": 5,
+      "step": 1,
+      "type": "cards",
+      "title": "Non-goals",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "05-02.png",
+      "scene": 5,
+      "step": 2,
+      "type": "cards",
+      "title": "Non-goals",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "05-03.png",
+      "scene": 5,
+      "step": 3,
+      "type": "cards",
+      "title": "Non-goals",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "05-04.png",
+      "scene": 5,
+      "step": 4,
+      "type": "cards",
+      "title": "Non-goals",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "06-01.png",
+      "scene": 6,
+      "step": 1,
+      "type": "cards",
+      "title": "Key defining characteristics",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "06-02.png",
+      "scene": 6,
+      "step": 2,
+      "type": "cards",
+      "title": "Key defining characteristics",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "06-03.png",
+      "scene": 6,
+      "step": 3,
+      "type": "cards",
+      "title": "Key defining characteristics",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "06-04.png",
+      "scene": 6,
+      "step": 4,
+      "type": "cards",
+      "title": "Key defining characteristics",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "06-05.png",
+      "scene": 6,
+      "step": 5,
+      "type": "cards",
+      "title": "Key defining characteristics",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "06-06.png",
+      "scene": 6,
+      "step": 6,
+      "type": "cards",
+      "title": "Key defining characteristics",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "06-07.png",
+      "scene": 6,
+      "step": 7,
+      "type": "cards",
+      "title": "Key defining characteristics",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "06-08.png",
+      "scene": 6,
+      "step": 8,
+      "type": "cards",
+      "title": "Key defining characteristics",
+      "state": "cards_item_6",
+      "findings": []
+    },
+    {
+      "frame": "07-01.png",
+      "scene": 7,
+      "step": 1,
+      "type": "title",
+      "title": "Part 2 — Architecture Principles & Philosophy",
+      "state": null,
+      "findings": []
+    },
+    {
+      "frame": "08-01.png",
+      "scene": 8,
+      "step": 1,
+      "type": "cards",
+      "title": "Principle 1 — Secure by default (defense-in-depth)",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "08-02.png",
+      "scene": 8,
+      "step": 2,
+      "type": "cards",
+      "title": "Principle 1 — Secure by default (defense-in-depth)",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "08-03.png",
+      "scene": 8,
+      "step": 3,
+      "type": "cards",
+      "title": "Principle 1 — Secure by default (defense-in-depth)",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "08-04.png",
+      "scene": 8,
+      "step": 4,
+      "type": "cards",
+      "title": "Principle 1 — Secure by default (defense-in-depth)",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "08-05.png",
+      "scene": 8,
+      "step": 5,
+      "type": "cards",
+      "title": "Principle 1 — Secure by default (defense-in-depth)",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "08-06.png",
+      "scene": 8,
+      "step": 6,
+      "type": "cards",
+      "title": "Principle 1 — Secure by default (defense-in-depth)",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "09-01.png",
+      "scene": 9,
+      "step": 1,
+      "type": "cards",
+      "title": "Principle 2 — Architecture enforced at compile time",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "09-02.png",
+      "scene": 9,
+      "step": 2,
+      "type": "cards",
+      "title": "Principle 2 — Architecture enforced at compile time",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "09-03.png",
+      "scene": 9,
+      "step": 3,
+      "type": "cards",
+      "title": "Principle 2 — Architecture enforced at compile time",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "10-01.png",
+      "scene": 10,
+      "step": 1,
+      "type": "cards",
+      "title": "Dylint — compile-time architecture validation",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "10-02.png",
+      "scene": 10,
+      "step": 2,
+      "type": "cards",
+      "title": "Dylint — compile-time architecture validation",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "10-03.png",
+      "scene": 10,
+      "step": 3,
+      "type": "cards",
+      "title": "Dylint — compile-time architecture validation",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "10-04.png",
+      "scene": 10,
+      "step": 4,
+      "type": "cards",
+      "title": "Dylint — compile-time architecture validation",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "10-05.png",
+      "scene": 10,
+      "step": 5,
+      "type": "cards",
+      "title": "Dylint — compile-time architecture validation",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "10-06.png",
+      "scene": 10,
+      "step": 6,
+      "type": "cards",
+      "title": "Dylint — compile-time architecture validation",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "10-07.png",
+      "scene": 10,
+      "step": 7,
+      "type": "cards",
+      "title": "Dylint — compile-time architecture validation",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "10-08.png",
+      "scene": 10,
+      "step": 8,
+      "type": "cards",
+      "title": "Dylint — compile-time architecture validation",
+      "state": "cards_item_6",
+      "findings": []
+    },
+    {
+      "frame": "10-09.png",
+      "scene": 10,
+      "step": 9,
+      "type": "cards",
+      "title": "Dylint — compile-time architecture validation",
+      "state": "cards_item_7",
+      "findings": []
+    },
+    {
+      "frame": "11-01.png",
+      "scene": 11,
+      "step": 1,
+      "type": "table",
+      "title": "Principle 3 — Three-tier gears hierarchy",
+      "state": "table_title",
+      "findings": []
+    },
+    {
+      "frame": "11-02.png",
+      "scene": 11,
+      "step": 2,
+      "type": "table",
+      "title": "Principle 3 — Three-tier gears hierarchy",
+      "state": "table_header",
+      "findings": []
+    },
+    {
+      "frame": "11-03.png",
+      "scene": 11,
+      "step": 3,
+      "type": "table",
+      "title": "Principle 3 — Three-tier gears hierarchy",
+      "state": "table_row_0",
+      "findings": []
+    },
+    {
+      "frame": "11-04.png",
+      "scene": 11,
+      "step": 4,
+      "type": "table",
+      "title": "Principle 3 — Three-tier gears hierarchy",
+      "state": "table_row_1",
+      "findings": []
+    },
+    {
+      "frame": "11-05.png",
+      "scene": 11,
+      "step": 5,
+      "type": "table",
+      "title": "Principle 3 — Three-tier gears hierarchy",
+      "state": "table_row_2",
+      "findings": []
+    },
+    {
+      "frame": "11-06.png",
+      "scene": 11,
+      "step": 6,
+      "type": "table",
+      "title": "Principle 3 — Three-tier gears hierarchy",
+      "state": "table_caption",
+      "findings": []
+    },
+    {
+      "frame": "12-01.png",
+      "scene": 12,
+      "step": 1,
+      "type": "cards",
+      "title": "Principle 4 — Composable libraries, vendor-controlled deployment",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "12-02.png",
+      "scene": 12,
+      "step": 2,
+      "type": "cards",
+      "title": "Principle 4 — Composable libraries, vendor-controlled deployment",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "12-03.png",
+      "scene": 12,
+      "step": 3,
+      "type": "cards",
+      "title": "Principle 4 — Composable libraries, vendor-controlled deployment",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "12-04.png",
+      "scene": 12,
+      "step": 4,
+      "type": "cards",
+      "title": "Principle 4 — Composable libraries, vendor-controlled deployment",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "12-05.png",
+      "scene": 12,
+      "step": 5,
+      "type": "cards",
+      "title": "Principle 4 — Composable libraries, vendor-controlled deployment",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "13-01.png",
+      "scene": 13,
+      "step": 1,
+      "type": "cards",
+      "title": "Principle 5 — Local-first shift-left development",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "13-02.png",
+      "scene": 13,
+      "step": 2,
+      "type": "cards",
+      "title": "Principle 5 — Local-first shift-left development",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "13-03.png",
+      "scene": 13,
+      "step": 3,
+      "type": "cards",
+      "title": "Principle 5 — Local-first shift-left development",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "13-04.png",
+      "scene": 13,
+      "step": 4,
+      "type": "cards",
+      "title": "Principle 5 — Local-first shift-left development",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "13-05.png",
+      "scene": 13,
+      "step": 5,
+      "type": "cards",
+      "title": "Principle 5 — Local-first shift-left development",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "14-01.png",
+      "scene": 14,
+      "step": 1,
+      "type": "cards",
+      "title": "Principle 6 — Pre-integrated XaaS backbone",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "14-02.png",
+      "scene": 14,
+      "step": 2,
+      "type": "cards",
+      "title": "Principle 6 — Pre-integrated XaaS backbone",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "14-03.png",
+      "scene": 14,
+      "step": 3,
+      "type": "cards",
+      "title": "Principle 6 — Pre-integrated XaaS backbone",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "14-04.png",
+      "scene": 14,
+      "step": 4,
+      "type": "cards",
+      "title": "Principle 6 — Pre-integrated XaaS backbone",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "15-01.png",
+      "scene": 15,
+      "step": 1,
+      "type": "cards",
+      "title": "Principle 7 — Extensible domain model via GTS",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "15-02.png",
+      "scene": 15,
+      "step": 2,
+      "type": "cards",
+      "title": "Principle 7 — Extensible domain model via GTS",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "15-03.png",
+      "scene": 15,
+      "step": 3,
+      "type": "cards",
+      "title": "Principle 7 — Extensible domain model via GTS",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "15-04.png",
+      "scene": 15,
+      "step": 4,
+      "type": "cards",
+      "title": "Principle 7 — Extensible domain model via GTS",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "15-05.png",
+      "scene": 15,
+      "step": 5,
+      "type": "cards",
+      "title": "Principle 7 — Extensible domain model via GTS",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "15-06.png",
+      "scene": 15,
+      "step": 6,
+      "type": "cards",
+      "title": "Principle 7 — Extensible domain model via GTS",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "16-01.png",
+      "scene": 16,
+      "step": 1,
+      "type": "cards",
+      "title": "Engineering principles (how we work)",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "16-02.png",
+      "scene": 16,
+      "step": 2,
+      "type": "cards",
+      "title": "Engineering principles (how we work)",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "16-03.png",
+      "scene": 16,
+      "step": 3,
+      "type": "cards",
+      "title": "Engineering principles (how we work)",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "16-04.png",
+      "scene": 16,
+      "step": 4,
+      "type": "cards",
+      "title": "Engineering principles (how we work)",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "16-05.png",
+      "scene": 16,
+      "step": 5,
+      "type": "cards",
+      "title": "Engineering principles (how we work)",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "16-06.png",
+      "scene": 16,
+      "step": 6,
+      "type": "cards",
+      "title": "Engineering principles (how we work)",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "17-01.png",
+      "scene": 17,
+      "step": 1,
+      "type": "title",
+      "title": "Part 3 — Foundations",
+      "state": null,
+      "findings": []
+    },
+    {
+      "frame": "18-01.png",
+      "scene": 18,
+      "step": 1,
+      "type": "cards",
+      "title": "Why Rust?",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "18-02.png",
+      "scene": 18,
+      "step": 2,
+      "type": "cards",
+      "title": "Why Rust?",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "18-03.png",
+      "scene": 18,
+      "step": 3,
+      "type": "cards",
+      "title": "Why Rust?",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "18-04.png",
+      "scene": 18,
+      "step": 4,
+      "type": "cards",
+      "title": "Why Rust?",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "18-05.png",
+      "scene": 18,
+      "step": 5,
+      "type": "cards",
+      "title": "Why Rust?",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "18-06.png",
+      "scene": 18,
+      "step": 6,
+      "type": "cards",
+      "title": "Why Rust?",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "18-07.png",
+      "scene": 18,
+      "step": 7,
+      "type": "cards",
+      "title": "Why Rust?",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "19-01.png",
+      "scene": 19,
+      "step": 1,
+      "type": "cards",
+      "title": "Why a monorepo?",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "19-02.png",
+      "scene": 19,
+      "step": 2,
+      "type": "cards",
+      "title": "Why a monorepo?",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "19-03.png",
+      "scene": 19,
+      "step": 3,
+      "type": "cards",
+      "title": "Why a monorepo?",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "19-04.png",
+      "scene": 19,
+      "step": 4,
+      "type": "cards",
+      "title": "Why a monorepo?",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "19-05.png",
+      "scene": 19,
+      "step": 5,
+      "type": "cards",
+      "title": "Why a monorepo?",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "19-06.png",
+      "scene": 19,
+      "step": 6,
+      "type": "cards",
+      "title": "Why a monorepo?",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "20-01.png",
+      "scene": 20,
+      "step": 1,
+      "type": "cards",
+      "title": "Deployment shapes (FUTURE)",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "20-02.png",
+      "scene": 20,
+      "step": 2,
+      "type": "cards",
+      "title": "Deployment shapes (FUTURE)",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "20-03.png",
+      "scene": 20,
+      "step": 3,
+      "type": "cards",
+      "title": "Deployment shapes (FUTURE)",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "20-04.png",
+      "scene": 20,
+      "step": 4,
+      "type": "cards",
+      "title": "Deployment shapes (FUTURE)",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "21-01.png",
+      "scene": 21,
+      "step": 1,
+      "type": "code",
+      "title": "Repository structure",
+      "state": "code_header",
+      "findings": []
+    },
+    {
+      "frame": "21-02.png",
+      "scene": 21,
+      "step": 2,
+      "type": "code",
+      "title": "Repository structure",
+      "state": "code_body",
+      "findings": []
+    },
+    {
+      "frame": "22-01.png",
+      "scene": 22,
+      "step": 1,
+      "type": "title",
+      "title": "Part 4 — What is a Gear in a nutshell?",
+      "state": null,
+      "findings": []
+    },
+    {
+      "frame": "23-01.png",
+      "scene": 23,
+      "step": 1,
+      "type": "cards",
+      "title": "Gear = independent capability domain",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "23-02.png",
+      "scene": 23,
+      "step": 2,
+      "type": "cards",
+      "title": "Gear = independent capability domain",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "23-03.png",
+      "scene": 23,
+      "step": 3,
+      "type": "cards",
+      "title": "Gear = independent capability domain",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "23-04.png",
+      "scene": 23,
+      "step": 4,
+      "type": "cards",
+      "title": "Gear = independent capability domain",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "23-05.png",
+      "scene": 23,
+      "step": 5,
+      "type": "cards",
+      "title": "Gear = independent capability domain",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "23-06.png",
+      "scene": 23,
+      "step": 6,
+      "type": "cards",
+      "title": "Gear = independent capability domain",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "23-07.png",
+      "scene": 23,
+      "step": 7,
+      "type": "cards",
+      "title": "Gear = independent capability domain",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "24-01.png",
+      "scene": 24,
+      "step": 1,
+      "type": "image",
+      "title": "Gear architecture (the big picture)",
+      "state": "image_title",
+      "findings": []
+    },
+    {
+      "frame": "24-02.png",
+      "scene": 24,
+      "step": 2,
+      "type": "image",
+      "title": "Gear architecture (the big picture)",
+      "state": "image_frame",
+      "findings": []
+    },
+    {
+      "frame": "25-01.png",
+      "scene": 25,
+      "step": 1,
+      "type": "image",
+      "title": "Planned Gears map",
+      "state": "image_title",
+      "findings": []
+    },
+    {
+      "frame": "25-02.png",
+      "scene": 25,
+      "step": 2,
+      "type": "image",
+      "title": "Planned Gears map",
+      "state": "image_frame",
+      "findings": []
+    },
+    {
+      "frame": "26-01.png",
+      "scene": 26,
+      "step": 1,
+      "type": "table",
+      "title": "Gear anatomy — DDD-light layers",
+      "state": "table_title",
+      "findings": []
+    },
+    {
+      "frame": "26-02.png",
+      "scene": 26,
+      "step": 2,
+      "type": "table",
+      "title": "Gear anatomy — DDD-light layers",
+      "state": "table_header",
+      "findings": []
+    },
+    {
+      "frame": "26-03.png",
+      "scene": 26,
+      "step": 3,
+      "type": "table",
+      "title": "Gear anatomy — DDD-light layers",
+      "state": "table_row_0",
+      "findings": []
+    },
+    {
+      "frame": "26-04.png",
+      "scene": 26,
+      "step": 4,
+      "type": "table",
+      "title": "Gear anatomy — DDD-light layers",
+      "state": "table_row_1",
+      "findings": []
+    },
+    {
+      "frame": "26-05.png",
+      "scene": 26,
+      "step": 5,
+      "type": "table",
+      "title": "Gear anatomy — DDD-light layers",
+      "state": "table_row_2",
+      "findings": []
+    },
+    {
+      "frame": "26-06.png",
+      "scene": 26,
+      "step": 6,
+      "type": "table",
+      "title": "Gear anatomy — DDD-light layers",
+      "state": "table_caption",
+      "findings": []
+    },
+    {
+      "frame": "27-01.png",
+      "scene": 27,
+      "step": 1,
+      "type": "cards",
+      "title": "Gear execution model",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "27-02.png",
+      "scene": 27,
+      "step": 2,
+      "type": "cards",
+      "title": "Gear execution model",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "27-03.png",
+      "scene": 27,
+      "step": 3,
+      "type": "cards",
+      "title": "Gear execution model",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "28-01.png",
+      "scene": 28,
+      "step": 1,
+      "type": "cards",
+      "title": "Gear composition — compiled-in vs selectable",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "28-02.png",
+      "scene": 28,
+      "step": 2,
+      "type": "cards",
+      "title": "Gear composition — compiled-in vs selectable",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "28-03.png",
+      "scene": 28,
+      "step": 3,
+      "type": "cards",
+      "title": "Gear composition — compiled-in vs selectable",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "28-04.png",
+      "scene": 28,
+      "step": 4,
+      "type": "cards",
+      "title": "Gear composition — compiled-in vs selectable",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "28-05.png",
+      "scene": 28,
+      "step": 5,
+      "type": "cards",
+      "title": "Gear composition — compiled-in vs selectable",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "28-06.png",
+      "scene": 28,
+      "step": 6,
+      "type": "cards",
+      "title": "Gear composition — compiled-in vs selectable",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "29-01.png",
+      "scene": 29,
+      "step": 1,
+      "type": "code",
+      "title": "Gear lifecycle (platform-owned)",
+      "state": "code_header",
+      "findings": []
+    },
+    {
+      "frame": "29-02.png",
+      "scene": 29,
+      "step": 2,
+      "type": "code",
+      "title": "Gear lifecycle (platform-owned)",
+      "state": "code_body",
+      "findings": []
+    },
+    {
+      "frame": "30-01.png",
+      "scene": 30,
+      "step": 1,
+      "type": "image",
+      "title": "Gear categories",
+      "state": "image_title",
+      "findings": []
+    },
+    {
+      "frame": "30-02.png",
+      "scene": 30,
+      "step": 2,
+      "type": "image",
+      "title": "Gear categories",
+      "state": "image_frame",
+      "findings": []
+    },
+    {
+      "frame": "31-01.png",
+      "scene": 31,
+      "step": 1,
+      "type": "cards",
+      "title": "Plugins & extensibility",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "31-02.png",
+      "scene": 31,
+      "step": 2,
+      "type": "cards",
+      "title": "Plugins & extensibility",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "31-03.png",
+      "scene": 31,
+      "step": 3,
+      "type": "cards",
+      "title": "Plugins & extensibility",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "31-04.png",
+      "scene": 31,
+      "step": 4,
+      "type": "cards",
+      "title": "Plugins & extensibility",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "31-05.png",
+      "scene": 31,
+      "step": 5,
+      "type": "cards",
+      "title": "Plugins & extensibility",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "31-06.png",
+      "scene": 31,
+      "step": 6,
+      "type": "cards",
+      "title": "Plugins & extensibility",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "32-01.png",
+      "scene": 32,
+      "step": 1,
+      "type": "title",
+      "title": "Part 5 — Gears Toolkit",
+      "state": null,
+      "findings": []
+    },
+    {
+      "frame": "33-01.png",
+      "scene": 33,
+      "step": 1,
+      "type": "cards",
+      "title": "Gears Toolkit — mission",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "33-02.png",
+      "scene": 33,
+      "step": 2,
+      "type": "cards",
+      "title": "Gears Toolkit — mission",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "33-03.png",
+      "scene": 33,
+      "step": 3,
+      "type": "cards",
+      "title": "Gears Toolkit — mission",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "33-04.png",
+      "scene": 33,
+      "step": 4,
+      "type": "cards",
+      "title": "Gears Toolkit — mission",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "34-01.png",
+      "scene": 34,
+      "step": 1,
+      "type": "cards",
+      "title": "Tookit — features",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "34-02.png",
+      "scene": 34,
+      "step": 2,
+      "type": "cards",
+      "title": "Tookit — features",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "34-03.png",
+      "scene": 34,
+      "step": 3,
+      "type": "cards",
+      "title": "Tookit — features",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "34-04.png",
+      "scene": 34,
+      "step": 4,
+      "type": "cards",
+      "title": "Tookit — features",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "34-05.png",
+      "scene": 34,
+      "step": 5,
+      "type": "cards",
+      "title": "Tookit — features",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "34-06.png",
+      "scene": 34,
+      "step": 6,
+      "type": "cards",
+      "title": "Tookit — features",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "34-07.png",
+      "scene": 34,
+      "step": 7,
+      "type": "cards",
+      "title": "Tookit — features",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "34-08.png",
+      "scene": 34,
+      "step": 8,
+      "type": "cards",
+      "title": "Tookit — features",
+      "state": "cards_item_6",
+      "findings": []
+    },
+    {
+      "frame": "34-09.png",
+      "scene": 34,
+      "step": 9,
+      "type": "cards",
+      "title": "Tookit — features",
+      "state": "cards_item_7",
+      "findings": []
+    },
+    {
+      "frame": "35-01.png",
+      "scene": 35,
+      "step": 1,
+      "type": "cards",
+      "title": "Consistent API dialect",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "35-02.png",
+      "scene": 35,
+      "step": 2,
+      "type": "cards",
+      "title": "Consistent API dialect",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "35-03.png",
+      "scene": 35,
+      "step": 3,
+      "type": "cards",
+      "title": "Consistent API dialect",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "35-04.png",
+      "scene": 35,
+      "step": 4,
+      "type": "cards",
+      "title": "Consistent API dialect",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "35-05.png",
+      "scene": 35,
+      "step": 5,
+      "type": "cards",
+      "title": "Consistent API dialect",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "35-06.png",
+      "scene": 35,
+      "step": 6,
+      "type": "cards",
+      "title": "Consistent API dialect",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "35-07.png",
+      "scene": 35,
+      "step": 7,
+      "type": "cards",
+      "title": "Consistent API dialect",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "36-01.png",
+      "scene": 36,
+      "step": 1,
+      "type": "code",
+      "title": "API handler registration example",
+      "state": "code_header",
+      "findings": []
+    },
+    {
+      "frame": "36-02.png",
+      "scene": 36,
+      "step": 2,
+      "type": "code",
+      "title": "API handler registration example",
+      "state": "code_body",
+      "findings": []
+    },
+    {
+      "frame": "37-01.png",
+      "scene": 37,
+      "step": 1,
+      "type": "title",
+      "title": "Part 6 — Cross-cutting Concerns",
+      "state": null,
+      "findings": []
+    },
+    {
+      "frame": "38-01.png",
+      "scene": 38,
+      "step": 1,
+      "type": "mermaid",
+      "title": "Request lifecycle",
+      "state": "mermaid_title",
+      "findings": []
+    },
+    {
+      "frame": "38-02.png",
+      "scene": 38,
+      "step": 2,
+      "type": "mermaid",
+      "title": "Request lifecycle",
+      "state": "mermaid_frame",
+      "findings": []
+    },
+    {
+      "frame": "39-01.png",
+      "scene": 39,
+      "step": 1,
+      "type": "cards",
+      "title": "Request lifecycle — who owns what",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "39-02.png",
+      "scene": 39,
+      "step": 2,
+      "type": "cards",
+      "title": "Request lifecycle — who owns what",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "39-03.png",
+      "scene": 39,
+      "step": 3,
+      "type": "cards",
+      "title": "Request lifecycle — who owns what",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "39-04.png",
+      "scene": 39,
+      "step": 4,
+      "type": "cards",
+      "title": "Request lifecycle — who owns what",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "39-05.png",
+      "scene": 39,
+      "step": 5,
+      "type": "cards",
+      "title": "Request lifecycle — who owns what",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "39-06.png",
+      "scene": 39,
+      "step": 6,
+      "type": "cards",
+      "title": "Request lifecycle — who owns what",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "40-01.png",
+      "scene": 40,
+      "step": 1,
+      "type": "cards",
+      "title": "Security — PDP/PEP authorization",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "40-02.png",
+      "scene": 40,
+      "step": 2,
+      "type": "cards",
+      "title": "Security — PDP/PEP authorization",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "40-03.png",
+      "scene": 40,
+      "step": 3,
+      "type": "cards",
+      "title": "Security — PDP/PEP authorization",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "40-04.png",
+      "scene": 40,
+      "step": 4,
+      "type": "cards",
+      "title": "Security — PDP/PEP authorization",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "40-05.png",
+      "scene": 40,
+      "step": 5,
+      "type": "cards",
+      "title": "Security — PDP/PEP authorization",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "41-01.png",
+      "scene": 41,
+      "step": 1,
+      "type": "cards",
+      "title": "Security — Secure ORM & tenancy",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "41-02.png",
+      "scene": 41,
+      "step": 2,
+      "type": "cards",
+      "title": "Security — Secure ORM & tenancy",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "41-03.png",
+      "scene": 41,
+      "step": 3,
+      "type": "cards",
+      "title": "Security — Secure ORM & tenancy",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "41-04.png",
+      "scene": 41,
+      "step": 4,
+      "type": "cards",
+      "title": "Security — Secure ORM & tenancy",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "41-05.png",
+      "scene": 41,
+      "step": 5,
+      "type": "cards",
+      "title": "Security — Secure ORM & tenancy",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "41-06.png",
+      "scene": 41,
+      "step": 6,
+      "type": "cards",
+      "title": "Security — Secure ORM & tenancy",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "41-07.png",
+      "scene": 41,
+      "step": 7,
+      "type": "cards",
+      "title": "Security — Secure ORM & tenancy",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "42-01.png",
+      "scene": 42,
+      "step": 1,
+      "type": "cards",
+      "title": "Security — defense across the lifecycle",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "42-02.png",
+      "scene": 42,
+      "step": 2,
+      "type": "cards",
+      "title": "Security — defense across the lifecycle",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "42-03.png",
+      "scene": 42,
+      "step": 3,
+      "type": "cards",
+      "title": "Security — defense across the lifecycle",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "42-04.png",
+      "scene": 42,
+      "step": 4,
+      "type": "cards",
+      "title": "Security — defense across the lifecycle",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "42-05.png",
+      "scene": 42,
+      "step": 5,
+      "type": "cards",
+      "title": "Security — defense across the lifecycle",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "42-06.png",
+      "scene": 42,
+      "step": 6,
+      "type": "cards",
+      "title": "Security — defense across the lifecycle",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "42-07.png",
+      "scene": 42,
+      "step": 7,
+      "type": "cards",
+      "title": "Security — defense across the lifecycle",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "43-01.png",
+      "scene": 43,
+      "step": 1,
+      "type": "table",
+      "title": "Security — FIPS 140-3",
+      "state": "table_title",
+      "findings": []
+    },
+    {
+      "frame": "43-02.png",
+      "scene": 43,
+      "step": 2,
+      "type": "table",
+      "title": "Security — FIPS 140-3",
+      "state": "table_header",
+      "findings": []
+    },
+    {
+      "frame": "43-03.png",
+      "scene": 43,
+      "step": 3,
+      "type": "table",
+      "title": "Security — FIPS 140-3",
+      "state": "table_row_0",
+      "findings": []
+    },
+    {
+      "frame": "43-04.png",
+      "scene": 43,
+      "step": 4,
+      "type": "table",
+      "title": "Security — FIPS 140-3",
+      "state": "table_row_1",
+      "findings": []
+    },
+    {
+      "frame": "43-05.png",
+      "scene": 43,
+      "step": 5,
+      "type": "table",
+      "title": "Security — FIPS 140-3",
+      "state": "table_row_2",
+      "findings": []
+    },
+    {
+      "frame": "43-06.png",
+      "scene": 43,
+      "step": 6,
+      "type": "table",
+      "title": "Security — FIPS 140-3",
+      "state": "table_caption",
+      "findings": []
+    },
+    {
+      "frame": "44-01.png",
+      "scene": 44,
+      "step": 1,
+      "type": "cards",
+      "title": "Global Type System (GTS)",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "44-02.png",
+      "scene": 44,
+      "step": 2,
+      "type": "cards",
+      "title": "Global Type System (GTS)",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "44-03.png",
+      "scene": 44,
+      "step": 3,
+      "type": "cards",
+      "title": "Global Type System (GTS)",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "44-04.png",
+      "scene": 44,
+      "step": 4,
+      "type": "cards",
+      "title": "Global Type System (GTS)",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "44-05.png",
+      "scene": 44,
+      "step": 5,
+      "type": "cards",
+      "title": "Global Type System (GTS)",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "44-06.png",
+      "scene": 44,
+      "step": 6,
+      "type": "cards",
+      "title": "Global Type System (GTS)",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "45-01.png",
+      "scene": 45,
+      "step": 1,
+      "type": "cards",
+      "title": "Errors — canonical taxonomy",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "45-02.png",
+      "scene": 45,
+      "step": 2,
+      "type": "cards",
+      "title": "Errors — canonical taxonomy",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "45-03.png",
+      "scene": 45,
+      "step": 3,
+      "type": "cards",
+      "title": "Errors — canonical taxonomy",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "45-04.png",
+      "scene": 45,
+      "step": 4,
+      "type": "cards",
+      "title": "Errors — canonical taxonomy",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "45-05.png",
+      "scene": 45,
+      "step": 5,
+      "type": "cards",
+      "title": "Errors — canonical taxonomy",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "46-01.png",
+      "scene": 46,
+      "step": 1,
+      "type": "cards",
+      "title": "Observability & operations",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "46-02.png",
+      "scene": 46,
+      "step": 2,
+      "type": "cards",
+      "title": "Observability & operations",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "46-03.png",
+      "scene": 46,
+      "step": 3,
+      "type": "cards",
+      "title": "Observability & operations",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "46-04.png",
+      "scene": 46,
+      "step": 4,
+      "type": "cards",
+      "title": "Observability & operations",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "46-05.png",
+      "scene": 46,
+      "step": 5,
+      "type": "cards",
+      "title": "Observability & operations",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "46-06.png",
+      "scene": 46,
+      "step": 6,
+      "type": "cards",
+      "title": "Observability & operations",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "47-01.png",
+      "scene": 47,
+      "step": 1,
+      "type": "title",
+      "title": "Part 7 — Engineering & Developer Experience",
+      "state": null,
+      "findings": []
+    },
+    {
+      "frame": "48-01.png",
+      "scene": 48,
+      "step": 1,
+      "type": "cards",
+      "title": "Developer experience",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "48-02.png",
+      "scene": 48,
+      "step": 2,
+      "type": "cards",
+      "title": "Developer experience",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "48-03.png",
+      "scene": 48,
+      "step": 3,
+      "type": "cards",
+      "title": "Developer experience",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "48-04.png",
+      "scene": 48,
+      "step": 4,
+      "type": "cards",
+      "title": "Developer experience",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "48-05.png",
+      "scene": 48,
+      "step": 5,
+      "type": "cards",
+      "title": "Developer experience",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "48-06.png",
+      "scene": 48,
+      "step": 6,
+      "type": "cards",
+      "title": "Developer experience",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "48-07.png",
+      "scene": 48,
+      "step": 7,
+      "type": "cards",
+      "title": "Developer experience",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "49-01.png",
+      "scene": 49,
+      "step": 1,
+      "type": "cards",
+      "title": "Spec-Driven Development (SDD)",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "49-02.png",
+      "scene": 49,
+      "step": 2,
+      "type": "cards",
+      "title": "Spec-Driven Development (SDD)",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "49-03.png",
+      "scene": 49,
+      "step": 3,
+      "type": "cards",
+      "title": "Spec-Driven Development (SDD)",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "49-04.png",
+      "scene": 49,
+      "step": 4,
+      "type": "cards",
+      "title": "Spec-Driven Development (SDD)",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "49-05.png",
+      "scene": 49,
+      "step": 5,
+      "type": "cards",
+      "title": "Spec-Driven Development (SDD)",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "49-06.png",
+      "scene": 49,
+      "step": 6,
+      "type": "cards",
+      "title": "Spec-Driven Development (SDD)",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "50-01.png",
+      "scene": 50,
+      "step": 1,
+      "type": "cards",
+      "title": "Testing architecture",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "50-02.png",
+      "scene": 50,
+      "step": 2,
+      "type": "cards",
+      "title": "Testing architecture",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "50-03.png",
+      "scene": 50,
+      "step": 3,
+      "type": "cards",
+      "title": "Testing architecture",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "51-01.png",
+      "scene": 51,
+      "step": 1,
+      "type": "title",
+      "title": "Part 8 — Getting Started",
+      "state": null,
+      "findings": []
+    },
+    {
+      "frame": "52-01.png",
+      "scene": 52,
+      "step": 1,
+      "type": "cards",
+      "title": "Prerequisites",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "52-02.png",
+      "scene": 52,
+      "step": 2,
+      "type": "cards",
+      "title": "Prerequisites",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "52-03.png",
+      "scene": 52,
+      "step": 3,
+      "type": "cards",
+      "title": "Prerequisites",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "52-04.png",
+      "scene": 52,
+      "step": 4,
+      "type": "cards",
+      "title": "Prerequisites",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "52-05.png",
+      "scene": 52,
+      "step": 5,
+      "type": "cards",
+      "title": "Prerequisites",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "53-01.png",
+      "scene": 53,
+      "step": 1,
+      "type": "code",
+      "title": "How to build & run",
+      "state": "code_header",
+      "findings": []
+    },
+    {
+      "frame": "53-02.png",
+      "scene": 53,
+      "step": 2,
+      "type": "code",
+      "title": "How to build & run",
+      "state": "code_body",
+      "findings": []
+    },
+    {
+      "frame": "54-01.png",
+      "scene": 54,
+      "step": 1,
+      "type": "code",
+      "title": "Configuration",
+      "state": "code_header",
+      "findings": []
+    },
+    {
+      "frame": "54-02.png",
+      "scene": 54,
+      "step": 2,
+      "type": "code",
+      "title": "Configuration",
+      "state": "code_body",
+      "findings": []
+    },
+    {
+      "frame": "55-01.png",
+      "scene": 55,
+      "step": 1,
+      "type": "code",
+      "title": "How to run tests",
+      "state": "code_header",
+      "findings": []
+    },
+    {
+      "frame": "55-02.png",
+      "scene": 55,
+      "step": 2,
+      "type": "code",
+      "title": "How to run tests",
+      "state": "code_body",
+      "findings": []
+    },
+    {
+      "frame": "56-01.png",
+      "scene": 56,
+      "step": 1,
+      "type": "cards",
+      "title": "How to contribute",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "56-02.png",
+      "scene": 56,
+      "step": 2,
+      "type": "cards",
+      "title": "How to contribute",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "56-03.png",
+      "scene": 56,
+      "step": 3,
+      "type": "cards",
+      "title": "How to contribute",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "56-04.png",
+      "scene": 56,
+      "step": 4,
+      "type": "cards",
+      "title": "How to contribute",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "56-05.png",
+      "scene": 56,
+      "step": 5,
+      "type": "cards",
+      "title": "How to contribute",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "56-06.png",
+      "scene": 56,
+      "step": 6,
+      "type": "cards",
+      "title": "How to contribute",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "56-07.png",
+      "scene": 56,
+      "step": 7,
+      "type": "cards",
+      "title": "How to contribute",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "56-08.png",
+      "scene": 56,
+      "step": 8,
+      "type": "cards",
+      "title": "How to contribute",
+      "state": "cards_item_6",
+      "findings": []
+    },
+    {
+      "frame": "56-09.png",
+      "scene": 56,
+      "step": 9,
+      "type": "cards",
+      "title": "How to contribute",
+      "state": "cards_item_7",
+      "findings": []
+    },
+    {
+      "frame": "57-01.png",
+      "scene": 57,
+      "step": 1,
+      "type": "cards",
+      "title": "Documentation map",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "57-02.png",
+      "scene": 57,
+      "step": 2,
+      "type": "cards",
+      "title": "Documentation map",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "57-03.png",
+      "scene": 57,
+      "step": 3,
+      "type": "cards",
+      "title": "Documentation map",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "57-04.png",
+      "scene": 57,
+      "step": 4,
+      "type": "cards",
+      "title": "Documentation map",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "57-05.png",
+      "scene": 57,
+      "step": 5,
+      "type": "cards",
+      "title": "Documentation map",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "57-06.png",
+      "scene": 57,
+      "step": 6,
+      "type": "cards",
+      "title": "Documentation map",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "57-07.png",
+      "scene": 57,
+      "step": 7,
+      "type": "cards",
+      "title": "Documentation map",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "57-08.png",
+      "scene": 57,
+      "step": 8,
+      "type": "cards",
+      "title": "Documentation map",
+      "state": "cards_item_6",
+      "findings": []
+    },
+    {
+      "frame": "57-09.png",
+      "scene": 57,
+      "step": 9,
+      "type": "cards",
+      "title": "Documentation map",
+      "state": "cards_item_7",
+      "findings": []
+    },
+    {
+      "frame": "58-01.png",
+      "scene": 58,
+      "step": 1,
+      "type": "cards",
+      "title": "Why Constructor Gears is a good choice for your project",
+      "state": "cards_title",
+      "findings": []
+    },
+    {
+      "frame": "58-02.png",
+      "scene": 58,
+      "step": 2,
+      "type": "cards",
+      "title": "Why Constructor Gears is a good choice for your project",
+      "state": "cards_item_0",
+      "findings": []
+    },
+    {
+      "frame": "58-03.png",
+      "scene": 58,
+      "step": 3,
+      "type": "cards",
+      "title": "Why Constructor Gears is a good choice for your project",
+      "state": "cards_item_1",
+      "findings": []
+    },
+    {
+      "frame": "58-04.png",
+      "scene": 58,
+      "step": 4,
+      "type": "cards",
+      "title": "Why Constructor Gears is a good choice for your project",
+      "state": "cards_item_2",
+      "findings": []
+    },
+    {
+      "frame": "58-05.png",
+      "scene": 58,
+      "step": 5,
+      "type": "cards",
+      "title": "Why Constructor Gears is a good choice for your project",
+      "state": "cards_item_3",
+      "findings": []
+    },
+    {
+      "frame": "58-06.png",
+      "scene": 58,
+      "step": 6,
+      "type": "cards",
+      "title": "Why Constructor Gears is a good choice for your project",
+      "state": "cards_item_4",
+      "findings": []
+    },
+    {
+      "frame": "58-07.png",
+      "scene": 58,
+      "step": 7,
+      "type": "cards",
+      "title": "Why Constructor Gears is a good choice for your project",
+      "state": "cards_item_5",
+      "findings": []
+    },
+    {
+      "frame": "58-08.png",
+      "scene": 58,
+      "step": 8,
+      "type": "cards",
+      "title": "Why Constructor Gears is a good choice for your project",
+      "state": "cards_item_6",
+      "findings": []
+    },
+    {
+      "frame": "59-01.png",
+      "scene": 59,
+      "step": 1,
+      "type": "title",
+      "title": "Thank you",
+      "state": null,
+      "findings": []
+    }
+  ]
+}

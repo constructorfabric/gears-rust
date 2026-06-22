@@ -1,0 +1,63 @@
+%% Reconstructed from docs/img/gears_categories.drawio.png for the Slidey overview deck.
+block-beta
+  columns 8
+  title1["Gears w/o Plugins"]:4 title2["Gear with Plugins"]:4
+  g1Api["Gear #1 public API"] g1Rest["REST API handlers
+api/"] g2Api["Gear #2 public API"] g2Rest["REST API handlers
+api/"] g3Api["Gear #3 public API"] g3Rest["REST API handlers
+api/"] p3Api["gRPC/REST handlers
+api/"] p3Title["Gear #3 plugin"]
+  space g1Svc["Service logic
+domain/"] space g2Svc["Service logic
+domain/"] space g3Svc["Service logic
+domain/"] p3Svc["Service logic
+domain/"] space
+  space g1Client["External clients
+clients/"] space space space g3Client["External clients
+clients/"] space space
+  space g1Repo["Storage layer
+repository/"] space g2Repo["Storage layer
+repository/"] space g3Repo["Storage layer
+repository/"] p3Repo["Storage layer
+repository/"] space
+  space g1Db[("Gear #1 DB
+Storage")] space g2Db[("Gear #2 DB
+Storage")] space g3Db[("Gear #3 DB
+Storage")] p3Db[("Gear #3 plugin DB
+Storage")] space
+  note["Gear Architecture
+Each gear encapsulates a well-defined piece of business logic and exposes versioned contracts to consumers via Rust-native interfaces, REST, or gRPC APIs. Plugin interfaces allow pluggable implementations for processing and storage."]:8
+  gateway["API gateway"]:8
+  space llm["LLM gateway
+(inference, embedding, MCP)"]:2 space mcp["MCP gateway"]:2 space
+  space openai["OpenAI"] ollama["Ollama"] more1["..."] integrated["Integrated
+functions"] http["HTTP
+functions"] more2["..."] space
+
+  g1Api --> g1Rest
+  g1Rest --> g1Svc
+  g1Svc --> g1Client
+  g1Client --> g1Repo
+  g1Repo --> g1Db
+  g2Api --> g2Rest
+  g2Rest --> g2Svc
+  g2Svc --> g2Repo
+  g2Repo --> g2Db
+  g1Client --> g2Rest
+  g3Api --> g3Rest
+  g3Rest --> g3Svc
+  g3Svc --> g3Client
+  g3Client --> g3Repo
+  g3Repo --> g3Db
+  g3Client --> p3Api
+  p3Api --> p3Svc
+  p3Svc --> p3Repo
+  p3Repo --> p3Db
+  gateway --> llm
+  gateway --> mcp
+  llm --> openai
+  llm --> ollama
+  llm --> more1
+  mcp --> integrated
+  mcp --> http
+  mcp --> more2

@@ -1,0 +1,52 @@
+%% Reconstructed from docs/img/gear_architecture.drawio.png for the Slidey overview deck.
+block-beta
+  columns 7
+  sdk["Gear X Rust SDK
+for external Gears"] grpcClients["External gRPC
+clients"] restClients["External REST
+API clients"] space libsTitle["Toolkit libraries"] sdksTitle["SDKs for other Gears"] space
+  local["Local"] remote["Remote"] grpcIf(("gRPC interface")) restEp(("REST API endpoints")) errors["errors"] authn["authz/authn resolver"] space
+  space space grpcHandler["Toolkit gRPC handler
+(...)"] restHandler["Toolkit REST API handler
+(API odata parser,
+operation builder)"] security["security"] tenant["tenant resolver"] space
+  space space api["API
+(api/)"]:2 gts["gts (types)"] types["Types registry"] space
+  space domain["Domain - main Gear X business logic
+(domain/)"]:3 http["http client"] events["Events"] space
+  externalSdk["Gear X external
+plugin Y SDK"] builtinSdk["Gear X built-in
+plugin Z SDK"] infra["Infrastructure
+(infra/)"] space cluster["cluster primitives"] oagw["Outbound API gw"] space
+  pluginApi["Plugin API handler
+(REST for now)"] pluginZLogic["Built-in plugin Z
+business logic crate"] gearOrm["Toolkit SeaORM
+(incl DB odata)"] space outbox["outbox"] flight["Flight control"] cred["Cred store"]
+  pluginLogic["External plugin Y
+business logic"] pluginZOrm["Toolkit SeaORM"] gearDb[("Gear X DB")] space space space space
+  pluginOrm["Toolkit SeaORM"] pluginZDb[("Plugin Z DB")] space space space space space
+  pluginYDb[("Plugin Y DB")] space space space space space space
+
+  sdk --> local
+  sdk --> remote
+  remote --> grpcIf
+  grpcClients --> grpcIf
+  restClients --> restEp
+  grpcIf --> grpcHandler
+  restEp --> restHandler
+  grpcHandler --> api
+  restHandler --> api
+  local --> domain
+  api --> domain
+  domain --> externalSdk
+  domain --> builtinSdk
+  domain --> infra
+  externalSdk --> pluginApi
+  pluginApi --> pluginLogic
+  pluginLogic --> pluginOrm
+  pluginOrm --> pluginYDb
+  builtinSdk --> pluginZLogic
+  pluginZLogic --> pluginZOrm
+  pluginZOrm --> pluginZDb
+  infra --> gearOrm
+  gearOrm --> gearDb

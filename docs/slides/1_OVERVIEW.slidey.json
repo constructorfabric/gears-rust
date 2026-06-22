@@ -4,223 +4,293 @@
     "mode": "pitch",
     "source": {
       "kind": "marp"
-    }
+    },
+    "theme": "rose-pine-moon"
   },
   "scenes": [
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Constructor Fabric Gears (Rust)",
-      "subtitle": "A secure, modular XaaS development framework & middleware"
+      "subtitle": "A secure, modular XaaS development framework & middleware\nBy the Cyber Fabric Foundation · Apache-2.0\nComposable building blocks · Defense-in-depth · Multi-tenancy · GenAI-ready",
+      "subtitleHtml": "A secure, modular XaaS development framework &amp; middleware<br>By the <strong>Cyber Fabric Foundation</strong> · Apache-2.0<br><em>Composable building blocks · Defense-in-depth · Multi-tenancy · GenAI-ready</em>"
     },
     {
       "type": "cards",
-      "variant": "agenda",
+      "variant": "markdown",
       "title": "Agenda",
       "cards": [
         {
-          "label": "What & Why — what Constructor Gears is, for whom, non-goals"
+          "label": "What & Why — what Constructor Gears is, for whom, non-goals",
+          "labelHtml": "<strong>What &amp; Why</strong> — what Constructor Gears is, for whom, non-goals"
         },
         {
-          "label": "Principles & Philosophy — defense-in-depth, XaaS backbone, composability"
+          "label": "Principles & Philosophy — defense-in-depth, XaaS backbone, composability",
+          "labelHtml": "<strong>Principles &amp; Philosophy</strong> — defense-in-depth, XaaS backbone, composability"
         },
         {
-          "label": "Foundations — why Rust, why monorepo, deployment shapes"
+          "label": "Foundations — why Rust, why monorepo, deployment shapes",
+          "labelHtml": "<strong>Foundations</strong> — why Rust, why monorepo, deployment shapes"
         },
         {
-          "label": "Gears — architecture overview, anatomy, execution"
+          "label": "Gears — architecture overview, anatomy, execution",
+          "labelHtml": "<strong>Gears</strong> — architecture overview, anatomy, execution"
         },
         {
-          "label": "Gears Toolkit — the runtime substrate & features"
+          "label": "Gears Toolkit — the runtime substrate & features",
+          "labelHtml": "<strong>Gears Toolkit</strong> — the runtime substrate &amp; features"
         },
         {
-          "label": "Cross-cutting — request lifecycle, security, GTS, errors, observability"
+          "label": "Cross-cutting — request lifecycle, security, GTS, errors, observability",
+          "labelHtml": "<strong>Cross-cutting</strong> — request lifecycle, security, GTS, errors, observability"
         },
         {
-          "label": "Engineering — dev experience, spec-driven dev, testing"
+          "label": "Engineering — dev experience, spec-driven dev, testing",
+          "labelHtml": "<strong>Engineering</strong> — dev experience, spec-driven dev, testing"
         },
         {
-          "label": "Getting started — build, run, test, contribute"
+          "label": "Getting started — build, run, test, contribute",
+          "labelHtml": "<strong>Getting started</strong> — build, run, test, contribute"
         }
       ]
     },
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Part 1 — What & Why",
-      "subtitle": ""
+      "subtitle": "",
+      "subtitleHtml": ""
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "What is Constructor Gear?",
       "cards": [
         {
-          "label": "Toolkit libraries for reusable platform building blocks — OData, canonical"
+          "label": "Toolkit libraries for reusable platform building blocks — OData, canonical errors, secure DB ORM, API middleware, security, and more",
+          "labelHtml": "<strong>Toolkit libraries</strong> for reusable platform building blocks — OData, canonical errors, secure DB ORM, API middleware, security, and more"
         },
         {
-          "label": "System gears for platform and control-plane capabilities — events, API"
+          "label": "System gears for platform and control-plane capabilities — events, API gateway, auth, tenant resolution, registries, and outbound integration",
+          "labelHtml": "<strong>System gears</strong> for platform and control-plane capabilities — events, API gateway, auth, tenant resolution, registries, and outbound integration"
         },
         {
-          "label": "Domain gears for business capabilities — GenAI, OSS, and BSS services with"
+          "label": "Domain gears for business capabilities — GenAI, OSS, and BSS services with ready-to-use public APIs",
+          "labelHtml": "<strong>Domain gears</strong> for business capabilities — GenAI, OSS, and BSS services with ready-to-use public APIs"
         }
-      ]
+      ],
+      "intro": "A Gear is the unit of composition in Constructor Gears.\nConstructor Gears is a secure, modular XaaS development framework and middleware that helps you build XaaS products by composing gears:\nEvery layer has built-in Defense-in-depth - multi-tenancy, granular access control",
+      "introHtml": "A <strong>Gear</strong> is the unit of composition in Constructor Gears.<br>Constructor Gears is a <strong>secure, modular XaaS development framework and middleware</strong> that helps you build XaaS products by composing gears:<br>Every layer has built-in <strong>Defense-in-depth</strong> - multi-tenancy, granular access control",
+      "outro": "It is not a ready-to-use service — it is a set of well-integrated libraries that XaaS vendors compose into their own services and products.",
+      "outroHtml": "It is <strong>not</strong> a ready-to-use service — it is a set of well-integrated libraries that XaaS vendors <strong>compose into their own services and products</strong>."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "For whom?",
       "cards": [
         {
-          "label": "XaaS / SaaS vendors building products on a governed, multi-tenant backbone"
+          "label": "XaaS / SaaS vendors building products on a governed, multi-tenant backbone",
+          "labelHtml": "<strong>XaaS / SaaS vendors</strong> building products on a governed, multi-tenant backbone"
         },
         {
-          "label": "Platform & product teams who want security and tenancy for free"
+          "label": "Platform & product teams who want security and tenancy for free",
+          "labelHtml": "<strong>Platform &amp; product teams</strong> who want security and tenancy <em>for free</em>"
         },
         {
-          "label": "GenAI builders needing chat, RAG, model management, agents, tools"
+          "label": "GenAI builders needing chat, RAG, model management, agents, tools",
+          "labelHtml": "<strong>GenAI builders</strong> needing chat, RAG, model management, agents, tools"
         },
         {
-          "label": "On-prem / edge vendors shipping single-binary appliances"
+          "label": "On-prem / edge vendors shipping single-binary appliances",
+          "labelHtml": "<strong>On-prem / edge vendors</strong> shipping single-binary appliances"
         },
         {
-          "label": "Enterprises embedding Gears into an existing platform via plugins"
+          "label": "Enterprises embedding Gears into an existing platform via plugins",
+          "labelHtml": "<strong>Enterprises</strong> embedding Gears into an existing platform via plugins"
         }
-      ]
+      ],
+      "intro": "Vendors who use Gears decide which gears to include, how to combine them,\nand where to run them — from edge devices to Kubernetes clusters.",
+      "introHtml": "Vendors who use Gears decide <strong>which gears to include</strong>, <strong>how to combine them</strong>,<br>and <strong>where to run them</strong> — from edge devices to Kubernetes clusters."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Non-goals",
       "cards": [
         {
-          "label": "Optimize for minimalism / lowest barrier to entry"
+          "label": "Optimize for minimalism / lowest barrier to entry",
+          "labelHtml": "<strong>Optimize for minimalism / lowest barrier to entry</strong>",
+          "lines": [
+            "Prioritizes explicit structure, security, governance, and evolvability."
+          ]
         },
         {
-          "label": "Prioritizes explicit structure, security, governance, and evolvability."
+          "label": "Ship a rich catalog of end-user services",
+          "labelHtml": "<strong>Ship a rich catalog of end-user services</strong>",
+          "lines": [
+            "It is the foundation on which vendors build complete SaaS offerings."
+          ],
+          "linesHtml": [
+            "It is the <em>foundation</em> on which vendors build complete SaaS offerings."
+          ]
         },
         {
-          "label": "Ship a rich catalog of end-user services"
-        },
-        {
-          "label": "It is the foundation on which vendors build complete SaaS offerings."
-        },
-        {
-          "label": "Replace cloud infrastructure or PaaS"
-        },
-        {
-          "label": "Gears are libraries and building blocks, not a ready PaaS"
+          "label": "Replace cloud infrastructure or PaaS",
+          "labelHtml": "<strong>Replace cloud infrastructure or PaaS</strong>",
+          "lines": [
+            "Gears are libraries and building blocks, not a ready PaaS"
+          ]
         }
-      ]
+      ],
+      "intro": "Constructor Gears deliberately does not:",
+      "introHtml": "Constructor Gears deliberately does <strong>not</strong>:"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Key defining characteristics",
       "cards": [
         {
-          "label": "Secure by default (defense-in-depth) — security is structural, not opt-in, validated at build time."
+          "label": "Secure by default (defense-in-depth) — security is structural, not opt-in, validated at build time.",
+          "labelHtml": "<strong>Secure by default (defense-in-depth)</strong> — security is structural, not opt-in, validated at build time."
         },
         {
-          "label": "Architecture enforced at compile time - use custom lint rules via dylint"
+          "label": "Architecture enforced at compile time - use custom lint rules via dylint",
+          "labelHtml": "<strong>Architecture enforced at compile time</strong> - use custom lint rules via <code>dylint</code>"
         },
         {
-          "label": "Three-tier gears hierarchy — toolkit, System gears, Service gears."
+          "label": "Three-tier gears hierarchy — toolkit, System gears, Service gears.",
+          "labelHtml": "<strong>Three-tier gears hierarchy</strong> — toolkit, System gears, Service gears."
         },
         {
-          "label": "Composable libraries, vendor-controlled deployment — own API + DB, SDK facades local vs. remote."
+          "label": "Composable libraries, vendor-controlled deployment — own API + DB, SDK facades local vs. remote.",
+          "labelHtml": "<strong>Composable libraries, vendor-controlled deployment</strong> — own API + DB, SDK facades local vs. remote."
         },
         {
-          "label": "Local-first shift-left development - run and test everything locally, LLM-friendly"
+          "label": "Local-first shift-left development - run and test everything locally, LLM-friendly",
+          "labelHtml": "<strong>Local-first shift-left development</strong> - run and test everything locally, LLM-friendly"
         },
         {
-          "label": "Pre-integrated XaaS backbone — tenancy, licensing, quota, usage, events — all replaceable via plugins."
+          "label": "Pre-integrated XaaS backbone — tenancy, licensing, quota, usage, events — all replaceable via plugins.",
+          "labelHtml": "<strong>Pre-integrated XaaS backbone</strong> — tenancy, licensing, quota, usage, events — all replaceable via plugins."
         },
         {
-          "label": "Extensible domain model and API data types via the Global Type System (GTS)."
+          "label": "Extensible domain model and API data types via the Global Type System (GTS).",
+          "labelHtml": "<strong>Extensible domain model and API data types</strong> via the Global Type System (GTS)."
         }
       ]
     },
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Part 2 — Architecture Principles & Philosophy",
-      "subtitle": ""
+      "subtitle": "",
+      "subtitleHtml": ""
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Principle 1 — Secure by default (defense-in-depth)",
       "cards": [
         {
-          "label": "Static checks — lints + CI catch violations at build time"
+          "label": "Static checks — lints + CI catch violations at build time",
+          "labelHtml": "<strong>Static checks</strong> — lints + CI catch violations at build time"
         },
         {
-          "label": "Authentication — gateway validates tokens → injects SecurityContext"
+          "label": "Authentication — gateway validates tokens → injects SecurityContext",
+          "labelHtml": "<strong>Authentication</strong> — gateway validates tokens → injects <code>SecurityContext</code>"
         },
         {
-          "label": "Authorization — PolicyEnforcer → PDP → decision + constraints → AccessScope"
+          "label": "Authorization — PolicyEnforcer → PDP → decision + constraints → AccessScope",
+          "labelHtml": "<strong>Authorization</strong> — <code>PolicyEnforcer<code> → PDP → decision + constraints → </code> AccessScope</code>"
         },
         {
-          "label": "DB scoping — SecureConn applies AccessScope as automatic WHERE clauses"
+          "label": "DB scoping — SecureConn applies AccessScope as automatic WHERE clauses",
+          "labelHtml": "<strong>DB scoping</strong> — <code>SecureConn<code> applies </code> AccessScope<code> as automatic </code> WHERE</code> clauses"
         },
         {
-          "label": "Credentials — credstore; Outbound — oagw egress policy"
+          "label": "Credentials — credstore; Outbound — oagw egress policy",
+          "labelHtml": "<strong>Credentials</strong> — <code>credstore<code>; <strong>Outbound</strong> — </code> oagw</code> egress policy"
         }
-      ]
+      ],
+      "intro": "The architecture makes the insecure path harder than the secure one.\nThe platform owns a linear security data-path:",
+      "introHtml": "The architecture makes the <strong>insecure path harder than the secure one</strong>.<br>The platform owns a <strong>linear security data-path</strong>:",
+      "outro": "There is no \"unscoped\" shortcut to accidentally use.",
+      "outroHtml": "There is no &quot;unscoped&quot; shortcut to accidentally use."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Principle 2 — Architecture enforced at compile time",
       "cards": [
         {
-          "label": "tools/dylint_lints/ — a dedicated Dylint suite that checks:"
+          "label": "tools/dylint_lints/ — a dedicated Dylint suite that checks:",
+          "labelHtml": "<code>tools/dylint_lints/</code> — a dedicated Dylint suite that checks:",
+          "lines": [
+            "contract-layer purity, DTO placement & schema derives",
+            "domain-layer isolation, direct-SQL restrictions",
+            "versioned REST paths, mandatory OperationBuilder metadata",
+            "OData extension usage, GTS* identifier correctness"
+          ],
+          "linesHtml": [
+            "contract-layer purity, DTO placement &amp; schema derives",
+            "domain-layer isolation, direct-SQL restrictions",
+            "versioned REST paths, mandatory <code>OperationBuilder</code> metadata",
+            "OData extension usage, GTS* identifier correctness"
+          ]
         },
         {
-          "label": "contract-layer purity, DTO placement & schema derives"
-        },
-        {
-          "label": "domain-layer isolation, direct-SQL restrictions"
-        },
-        {
-          "label": "versioned REST paths, mandatory OperationBuilder metadata"
-        },
-        {
-          "label": "OData extension usage, GTS* identifier correctness"
-        },
-        {
-          "label": "Runs alongside Clippy + CI → violations fail fast, before review or runtime"
+          "label": "Runs alongside Clippy + CI → violations fail fast, before review or runtime",
+          "labelHtml": "Runs alongside Clippy + CI → <strong>violations fail fast, before review or runtime</strong>"
         }
-      ]
+      ],
+      "intro": "Custom static analysis is a core architectural mechanism, not a coding aid.",
+      "introHtml": "Custom static analysis is a <strong>core architectural mechanism</strong>, not a coding aid.",
+      "outro": "\"Shift-left\": architecture that lives in markdown decays; Dylint makes it executable. GTS* = Global Type System identifers like gts.cf.core.events.v1~a.b.c.d.v1~",
+      "outroHtml": "&quot;Shift-left&quot;: architecture that lives in markdown decays; Dylint makes it executable. GTS* = Global Type System identifers like <code>gts.cf.core.events.v1~a.b.c.d.v1~</code>"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Dylint — compile-time architecture validation",
       "cards": [
         {
-          "label": "Domain-layer isolation — no infra imports (sqlx, sea_orm, ...) in domain/"
+          "label": "Domain-layer isolation — no infra imports (sqlx, sea_orm, ...) in domain/",
+          "labelHtml": "<strong>Domain-layer isolation</strong> — no infra imports (<code>sqlx<code>, </code> sea_orm<code>, ...) in </code> domain/</code>"
         },
         {
-          "label": "Direct-SQL restriction — raw SQL only in migration infrastructure"
+          "label": "Direct-SQL restriction — raw SQL only in migration infrastructure",
+          "labelHtml": "<strong>Direct-SQL restriction</strong> — raw SQL only in migration infrastructure"
         },
         {
-          "label": "Versioned REST paths — endpoints must be //v1/..."
+          "label": "Versioned REST paths — endpoints must be /<gear>/v1/...",
+          "labelHtml": "<strong>Versioned REST paths</strong> — endpoints must be <code>/&lt;gear&gt;/v1/...</code>"
         },
         {
-          "label": "Contract-layer purity — SDK/contract crates stay transport-agnostic"
+          "label": "Contract-layer purity — SDK/contract crates stay transport-agnostic",
+          "labelHtml": "<strong>Contract-layer purity</strong> — SDK/contract crates stay transport-agnostic"
         },
         {
-          "label": "Mandatory OperationBuilder metadata — auth posture, error responses, schemas declared"
+          "label": "Mandatory OperationBuilder metadata — auth posture, error responses, schemas declared",
+          "labelHtml": "<strong>Mandatory <code>OperationBuilder</code> metadata</strong> — auth posture, error responses, schemas declared"
         },
         {
-          "label": "OData extension usage — standardized $filter / $orderby / $select helpers"
+          "label": "OData extension usage — standardized $filter / $orderby / $select helpers",
+          "labelHtml": "<strong>OData extension usage</strong> — standardized <code>$filter</code> / <code>$orderby</code> / <code>$select</code> helpers"
         },
         {
-          "label": "GTS identifier correctness — valid IDs; no schema_for! on GTS structs"
+          "label": "GTS identifier correctness — valid IDs; no schema_for! on GTS structs",
+          "labelHtml": "<strong>GTS identifier correctness</strong> — valid IDs; no <code>schema_for!</code> on GTS structs"
         },
         {
           "label": "..."
         }
-      ]
+      ],
+      "intro": "Repository-specific lints in tools/dylint_lints/ make the design executable — not just documented - code won't compile in case of violation:",
+      "introHtml": "Repository-specific lints in <code>tools/dylint_lints/</code> make the design <strong>executable</strong> — not just documented - code won&#39;t compile in case of violation:",
+      "outro": "Runs Dylint in CI → architecture violations fail the build before review or runtime.",
+      "outroHtml": "Runs Dylint in CI → architecture violations <strong>fail the build</strong> before review or runtime."
     },
     {
       "type": "table",
@@ -253,30 +323,37 @@
             "Business/domain: serverless runtime, GenAI subsystems, chat, file parser"
           ]
         }
-      ]
+      ],
+      "caption": "All tiers follow the same Toolkit patterns, SDK conventions, and security model."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Principle 4 — Composable libraries, vendor-controlled deployment",
       "cards": [
         {
-          "label": "Constructor Gears ships libraries, not services"
+          "label": "Constructor Gears ships libraries, not services",
+          "labelHtml": "Constructor Gears <strong>ships libraries, not services</strong>"
         },
         {
-          "label": "Each gear is infrastructure-, DB- and deployment-agnostic"
+          "label": "Each gear is infrastructure-, DB- and deployment-agnostic",
+          "labelHtml": "Each gear is <strong>infrastructure-, DB- and deployment-agnostic</strong>"
         },
         {
-          "label": "Gears talk via a Rust-native SDK that facades local vs. remote calls"
+          "label": "Gears talk via a Rust-native SDK that facades local vs. remote calls",
+          "labelHtml": "Gears talk via a <strong>Rust-native SDK</strong> that facades local vs. remote calls"
         },
         {
-          "label": "DB-agnostic persistence (SeaORM SecureConn) + infra-agnostic cluster primitives"
+          "label": "DB-agnostic persistence (SeaORM SecureConn) + infra-agnostic cluster primitives",
+          "labelHtml": "DB-agnostic persistence (SeaORM <code>SecureConn</code>) + infra-agnostic cluster primitives"
         }
-      ]
+      ],
+      "outro": "Refactor internals freely — as long as the SDK contract stays compatible.",
+      "outroHtml": "Refactor internals freely — as long as the <strong>SDK contract</strong> stays compatible."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Principle 5 — Local-first shift-left development",
       "cards": [
         {
@@ -286,140 +363,180 @@
           "label": "AI-assisted tooling can inspect the diff and suggest which tests should run"
         },
         {
-          "label": "Coverage is easy to collect, and diff coverage makes it clear whether tests"
+          "label": "Coverage is easy to collect, and diff coverage makes it clear whether tests actually touched changed code"
         },
         {
           "label": "Fast feedback keeps regressions visible before CI and before any deployment"
         }
-      ]
+      ],
+      "intro": "Composable libraries make it possible to run the full business logic locally on a\ndeveloper machine.",
+      "introHtml": "Composable libraries make it possible to run the full business logic locally on a<br>developer machine.",
+      "outro": "If it runs locally, it fails locally — long before a pipeline or release stage."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Principle 6 — Pre-integrated XaaS backbone",
       "cards": [
         {
-          "label": "Multi-tenancy · permissions & roles· licensing & quota · usage collection"
+          "label": "Multi-tenancy · permissions & roles· licensing & quota · usage collection",
+          "labelHtml": "Multi-tenancy · permissions &amp; roles· licensing &amp; quota · usage collection"
         },
         {
-          "label": "Swap Constructor Gears' authn-resolver, tenant-resolver, etc. for vendor systems"
+          "label": "Swap Constructor Gears' authn-resolver, tenant-resolver, etc. for vendor systems",
+          "labelHtml": "Swap Constructor Gears&#39; <code>authn-resolver<code>, </code> tenant-resolver</code>, etc. for <strong>vendor systems</strong>"
         },
         {
-          "label": "Integrate an existing product catalog / provisioning / license engine via plugins"
+          "label": "Integrate an existing product catalog / provisioning / license engine via plugins",
+          "labelHtml": "Integrate an existing product catalog / provisioning / license engine via <strong>plugins</strong>"
         }
-      ]
+      ],
+      "intro": "Deep, built-in integration with the typical XaaS backbone:\nEvery backbone concern is a regular, replaceable gear with its own SDK:",
+      "introHtml": "Deep, <em>built-in</em> integration with the typical XaaS backbone:<br>Every backbone concern is a <strong>regular, replaceable gear</strong> with its own SDK:"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Principle 7 — Extensible domain model via GTS",
       "cards": [
         {
-          "label": "Most gears expose an extensible domain model"
+          "label": "Most gears expose an extensible domain model",
+          "labelHtml": "Most gears expose an <strong>extensible domain model</strong>"
         },
         {
-          "label": "The Global Type System provides"
+          "label": "The Global Type System provides versioned, schema-validated type definitions"
         },
         {
-          "label": "Add new event types, settings, model attributes, permissions, license types —"
+          "label": "Add new event types, settings, model attributes, permissions, license types — without modifying existing gears",
+          "labelHtml": "Add new <strong>event types, settings, model attributes, permissions, license types</strong> — <em>without modifying existing gears</em>"
         },
         {
-          "label": "Open-closed via plugins: host defines a plugin interface in its SDK; plugins"
+          "label": "Open-closed via plugins: host defines a plugin interface in its SDK; plugins register as scoped ClientHub clients keyed by GTS instance ID",
+          "labelHtml": "<strong>Open-closed via plugins</strong>: host defines a plugin interface in its SDK; plugins register as scoped <code>ClientHub</code> clients keyed by GTS instance ID"
         },
         {
-          "label": "CRUD handlers customizable via hooks/callbacks as serverless functions/workflows"
+          "label": "CRUD handlers customizable via hooks/callbacks as serverless functions/workflows",
+          "labelHtml": "CRUD handlers customizable via <strong>hooks/callbacks</strong> as serverless functions/workflows"
         }
       ]
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Engineering principles (how we work)",
       "cards": [
         {
-          "label": "Spec-Driven Development — PRD → Design & ADR → Feature before code"
+          "label": "Spec-Driven Development — PRD → Design & ADR → Feature before code",
+          "labelHtml": "<strong>Spec-Driven Development</strong> — PRD → Design &amp; ADR → Feature <em>before</em> code"
         },
         {
-          "label": "Code validation — custom Dylints + Clippy + tests + fuzzing + audits in CI"
+          "label": "Code validation — custom Dylints + Clippy + tests + fuzzing + audits in CI",
+          "labelHtml": "<strong>Code validation</strong> — custom Dylints + Clippy + tests + fuzzing + audits in CI"
         },
         {
-          "label": "Quality First — 90%+ coverage target across unit / integration / E2E / perf / security"
+          "label": "Quality First — 90%+ coverage target across unit / integration / E2E / perf / security",
+          "labelHtml": "<strong>Quality First</strong> — 90%+ coverage target across unit / integration / E2E / perf / security"
         },
         {
-          "label": "Core in Rust — compile-time safety + deep static analysis"
+          "label": "Core in Rust — compile-time safety + deep static analysis",
+          "labelHtml": "<strong>Core in Rust</strong> — compile-time safety + deep static analysis"
         },
         {
-          "label": "Monorepo — atomic refactors, consistent tooling, realistic local E2E"
+          "label": "Monorepo — atomic refactors, consistent tooling, realistic local E2E",
+          "labelHtml": "<strong>Monorepo</strong> — atomic refactors, consistent tooling, realistic local E2E"
         }
       ]
     },
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Part 3 — Foundations",
-      "subtitle": ""
+      "subtitle": "",
+      "subtitleHtml": ""
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Why Rust?",
       "cards": [
         {
-          "label": "Compile-time safety — eliminates broad classes of memory & concurrency bugs"
+          "label": "Compile-time safety — eliminates broad classes of memory & concurrency bugs",
+          "labelHtml": "<strong>Compile-time safety</strong> — eliminates broad classes of memory &amp; concurrency bugs"
         },
         {
-          "label": "Great fit for reusable platform code — predictable perf, explicit interfaces"
+          "label": "Great fit for reusable platform code — predictable perf, explicit interfaces",
+          "labelHtml": "<strong>Great fit for reusable platform code</strong> — predictable perf, explicit interfaces"
         },
         {
-          "label": "Static analysis as architecture — Clippy + custom Dylints enforce rules at build"
+          "label": "Static analysis as architecture — Clippy + custom Dylints enforce rules at build",
+          "labelHtml": "<strong>Static analysis as architecture</strong> — Clippy + custom Dylints enforce rules at build"
         },
         {
-          "label": "Operational efficiency — low footprint → realistic local/edge runs & E2E"
+          "label": "Operational efficiency — low footprint → realistic local/edge runs & E2E",
+          "labelHtml": "<strong>Operational efficiency</strong> — low footprint → realistic local/edge runs &amp; E2E"
         },
         {
-          "label": "AI-friendly - great compiler and linters assistant to catch problems early"
+          "label": "AI-friendly - great compiler and linters assistant to catch problems early",
+          "labelHtml": "<strong>AI-friendly</strong> - great compiler and linters assistant to catch problems early"
         },
         {
-          "label": "Universal language — cloud/on-prem/edge, kernel + even frontend, mobile"
+          "label": "Universal language — cloud/on-prem/edge, kernel + even frontend, mobile",
+          "labelHtml": "<strong>Universal language</strong> — cloud/on-prem/edge, kernel + even frontend, mobile"
         }
-      ]
+      ],
+      "intro": "Building a platform layer for long-lived XaaS systems — concurrency,\ncorrectness, and maintainability matter more than raw implementation speed.",
+      "introHtml": "Building a <strong>platform layer for long-lived XaaS systems</strong> — concurrency,<br>correctness, and maintainability matter more than raw implementation speed."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Why a monorepo?",
       "cards": [
         {
-          "label": "Atomic contract evolution — core contracts + all consumers updated together"
+          "label": "Atomic contract evolution — core contracts + all consumers updated together",
+          "labelHtml": "<strong>Atomic contract evolution</strong> — core contracts + all consumers updated together"
         },
         {
-          "label": "Shared quality gates — one set of lints, CI, tests, security scanning"
+          "label": "Shared quality gates — one set of lints, CI, tests, security scanning",
+          "labelHtml": "<strong>Shared quality gates</strong> — one set of lints, CI, tests, security scanning"
         },
         {
-          "label": "Integrated architecture validation — reqs, design, code and tests in one place"
+          "label": "Integrated architecture validation — reqs, design, code and tests in one place",
+          "labelHtml": "<strong>Integrated architecture validation</strong> — reqs, design, code and tests in one place"
         },
         {
-          "label": "AI-friendly development — single context improves the feedback loop"
+          "label": "AI-friendly development — single context improves the feedback loop",
+          "labelHtml": "<strong>AI-friendly development</strong> — single context improves the feedback loop"
         },
         {
-          "label": "Full traceability and index - suitable for autonomous & LLM-assisted development"
+          "label": "Full traceability and index - suitable for autonomous & LLM-assisted development",
+          "labelHtml": "<strong>Full traceability and index</strong> - suitable for autonomous &amp; LLM-assisted development"
         }
-      ]
+      ],
+      "intro": "Constructor Gears is a co-evolving platform, not a loose collection of packages.",
+      "introHtml": "Constructor Gears is a <strong>co-evolving platform</strong>, not a loose collection of packages."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Deployment shapes (FUTURE)",
       "cards": [
         {
-          "label": "Single-node — all gears in one process → edge, on-prem appliances, dev/test"
+          "label": "Single-node — all gears in one process → edge, on-prem appliances, dev/test",
+          "labelHtml": "<strong>Single-node</strong> — all gears in one process → edge, on-prem appliances, dev/test"
         },
         {
-          "label": "Multi-node — gears across processes/machines over REST/gRPC, no orchestration → bare-metal on-prem"
+          "label": "Multi-node — gears across processes/machines over REST/gRPC, no orchestration → bare-metal on-prem",
+          "labelHtml": "<strong>Multi-node</strong> — gears across processes/machines over REST/gRPC, no orchestration → bare-metal on-prem"
         },
         {
-          "label": "Kubernetes — containerized services, full orchestration, cloud-native ops"
+          "label": "Kubernetes — containerized services, full orchestration, cloud-native ops",
+          "labelHtml": "<strong>Kubernetes</strong> — containerized services, full orchestration, cloud-native ops"
         }
-      ]
+      ],
+      "intro": "Same gear code & API — three physical shapes via runtime.type: local | oop:",
+      "introHtml": "Same gear code &amp; API — three physical shapes via <code>runtime.type: local | oop</code>:",
+      "outro": "Develop locally single-node → deploy bare-metal → scale to K8s, no rewrites."
     },
     {
       "type": "code",
@@ -430,49 +547,64 @@
     },
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Part 4 — What is a Gear in a nutshell?",
-      "subtitle": ""
+      "subtitle": "",
+      "subtitleHtml": ""
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Gear = independent capability domain",
       "cards": [
         {
-          "label": "Owns its public API via an SDK crate (-sdk) — traits, models, errors"
+          "label": "Owns its public API via an SDK crate (<name>-sdk) — traits, models, errors",
+          "labelHtml": "<strong>Owns its public API</strong> via an SDK crate (<code>&lt;name&gt;-sdk</code>) — traits, models, errors"
         },
         {
-          "label": "Owns its data behind SecureConn + AccessScope (no raw DB access)"
+          "label": "Owns its data behind SecureConn + AccessScope (no raw DB access)",
+          "labelHtml": "<strong>Owns its data</strong> behind <code>SecureConn<code> + </code> AccessScope</code> (no raw DB access)"
         },
         {
-          "label": "Is discovered at link time via inventory, initialized in dependency order"
+          "label": "Is discovered at link time via inventory, initialized in dependency order",
+          "labelHtml": "<strong>Is discovered at link time</strong> via <code>inventory</code>, initialized in dependency order"
         },
         {
-          "label": "Composes through the typed ClientHub (in-proc) or gRPC SDKs (remote)"
+          "label": "Composes through the typed ClientHub (in-proc) or gRPC SDKs (remote)",
+          "labelHtml": "<strong>Composes</strong> through the typed <code>ClientHub</code> (in-proc) or gRPC SDKs (remote)"
         },
         {
-          "label": "Is extensible via built-in or external plugins"
+          "label": "Is extensible via built-in or external plugins",
+          "labelHtml": "<strong>Is extensible</strong> via built-in or external plugins"
         },
         {
-          "label": "Published at crates.io independently with it's own version"
+          "label": "Published at crates.io independently with it's own version",
+          "labelHtml": "<strong>Published at crates.io</strong> independently with it&#39;s own version"
         }
-      ]
+      ],
+      "intro": "A Gear:",
+      "outro": "A Gear is a self-contained, composable unit of business capability that plugs into the platform. Directory is still gears/<name>/.",
+      "outroHtml": "A <strong>Gear</strong> is a self-contained, composable unit of business capability that plugs into the platform. Directory is still <code>gears/&lt;name&gt;/</code>."
     },
     {
       "type": "image",
       "title": "Gear architecture (the big picture)",
-      "src": "../img/gear_architecture.drawio.png",
-      "alt": "",
-      "caption": "",
-      "fit": "contain"
+      "src": "diagrams/themed-svg/gear_architecture.svg",
+      "alt": "Gear architecture (the big picture)",
+      "fit": "contain",
+      "mediaBackground": "transparent",
+      "mediaPadding": "0",
+      "frameHeight": "820px"
     },
     {
       "type": "image",
       "title": "Planned Gears map",
-      "src": "../img/architecture.drawio.png",
-      "alt": "",
-      "caption": "",
-      "fit": "contain"
+      "src": "diagrams/themed-svg/planned_gears_map.svg",
+      "alt": "Planned Gears map",
+      "fit": "contain",
+      "mediaBackground": "transparent",
+      "mediaPadding": "0",
+      "frameHeight": "820px"
     },
     {
       "type": "table",
@@ -505,165 +637,214 @@
             "SeaORM entities, repositories, migrations, adapters"
           ]
         }
-      ]
+      ],
+      "caption": "SDK-first: implementation depends on the SDK, never the reverse #[domain_model] macro rejects infra types (sqlx, axum, reqwest...) in domain"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Gear execution model",
       "cards": [
         {
-          "label": "In-process (default) — gears share one runtime; communicate via typed ClientHub clients; wired by Tookit"
+          "label": "In-process (default) — gears share one runtime; communicate via typed ClientHub clients; wired by Tookit",
+          "labelHtml": "<strong>In-process (default)</strong> — gears share one runtime; communicate via typed <code>ClientHub</code> clients; wired by Tookit"
         },
         {
-          "label": "Out-of-process — gears as separate processes over gRPC"
-        },
-        {
-          "label": "HostRuntime OoP orchestration hooks"
-        },
-        {
-          "label": "toolkit-transport-grpc transport library"
-        },
-        {
-          "label": "examples/oop-gears/ demonstrates the pattern"
+          "label": "Out-of-process — gears as separate processes over gRPC",
+          "labelHtml": "<strong>Out-of-process</strong> — gears as separate processes over <strong>gRPC</strong>",
+          "lines": [
+            "HostRuntime OoP orchestration hooks",
+            "toolkit-transport-grpc transport library",
+            "examples/oop-gears/ demonstrates the pattern"
+          ],
+          "linesHtml": [
+            "<code>HostRuntime</code> OoP orchestration hooks",
+            "<code>toolkit-transport-grpc</code> transport library",
+            "<code>examples/oop-gears/</code> demonstrates the pattern"
+          ]
         }
-      ]
+      ],
+      "intro": "The logical model stays identical regardless of the physical boundary.",
+      "introHtml": "The <strong>logical model stays identical</strong> regardless of the physical boundary.",
+      "outro": "Switch modes with a YAML field (runtime.type) — no code changes.",
+      "outroHtml": "Switch modes with a YAML field (<code>runtime.type</code>) — <strong>no code changes</strong>."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Gear composition — compiled-in vs selectable",
       "cards": [
         {
-          "label": "Core system gears are linked into the host binary and discovered via inventory"
+          "label": "Core system gears are linked into the host binary and discovered via inventory",
+          "labelHtml": "<strong>Core system gears</strong> are linked into the host binary and discovered via <code>inventory</code>"
         },
         {
-          "label": "Optional gears/plugins are included by Cargo feature flags such as"
+          "label": "Optional gears/plugins are included by Cargo feature flags such as mini-chat, static-authn, static-authz, static-credstore",
+          "labelHtml": "<strong>Optional gears/plugins</strong> are included by Cargo feature flags such as <code>mini-chat<code>, </code> static-authn<code>, </code> static-authz<code>, </code> static-credstore</code>"
         },
         {
-          "label": "Feature flags decide what code is present; runtime config decides which vendor,"
+          "label": "Feature flags decide what code is present; runtime config decides which vendor, plugin instance, or capability is used",
+          "labelHtml": "<strong>Feature flags decide what code is present</strong>; runtime config decides which vendor, plugin instance, or capability is used"
         },
         {
-          "label": "Built-in plugins run in-process and register scoped ClientHub clients"
+          "label": "Built-in plugins run in-process and register scoped ClientHub clients",
+          "labelHtml": "<strong>Built-in plugins</strong> run in-process and register scoped <code>ClientHub</code> clients"
         },
         {
-          "label": "External plugins/gears keep the same SDK contract but can run out-of-process over gRPC"
+          "label": "External plugins/gears keep the same SDK contract but can run out-of-process over gRPC",
+          "labelHtml": "<strong>External plugins/gears</strong> keep the same SDK contract but can run out-of-process over gRPC"
         }
-      ]
+      ],
+      "intro": "Constructor Gears favors explicit, reproducible composition over opaque runtime magic.",
+      "introHtml": "Constructor Gears favors <strong>explicit, reproducible composition</strong> over opaque runtime magic.",
+      "outro": "Result: small vendor-specific binaries, deterministic SBOMs, and the same extension model locally or remotely."
     },
     {
       "type": "code",
       "variant": "source",
       "title": "Gear lifecycle (platform-owned)",
       "lang": "text",
-      "code": "pre_init → DB migration → init → post_init(barrier)\n        → REST wiring → gRPC wiring → start → ... → stop"
+      "code": "pre_init → DB migration → init → post_init(barrier)\n        → REST wiring → gRPC wiring → start → ... → stop",
+      "caption": "HostRuntime runs a shared, ordered phase sequence: System gears run first where required post_init begins only after all init hooks complete Shutdown runs in reverse dependency order with a graceful-stop deadline Cancellation tokens propagate so background work cooperates with shutdown"
     },
     {
       "type": "image",
       "title": "Gear categories",
-      "src": "../img/gears_categories.drawio.png",
-      "alt": "",
-      "caption": "API Ingress · Business Logic · GenAI · Serverless · Core Functionality · Core Platform Integration · Core Platform Services. See docs/GEARS.md.",
-      "fit": "contain"
+      "src": "diagrams/themed-svg/gear_categories.svg",
+      "alt": "Gear categories",
+      "fit": "contain",
+      "mediaBackground": "transparent",
+      "mediaPadding": "0",
+      "frameHeight": "820px"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Plugins & extensibility",
       "cards": [
         {
-          "label": "Gateway Gear defines a plugin interface in its SDK + registers the plugin schema in the Types Registry"
+          "label": "Gateway Gear defines a plugin interface in its SDK + registers the plugin schema in the Types Registry",
+          "labelHtml": "<strong>Gateway Gear</strong> defines a plugin interface in its SDK + registers the plugin schema in the Types Registry"
         },
         {
-          "label": "Plugin Gears implement the interface, register as scoped ClientHub clients keyed by GTS instance ID"
+          "label": "Plugin Gears implement the interface, register as scoped ClientHub clients keyed by GTS instance ID",
+          "labelHtml": "<strong>Plugin Gears</strong> implement the interface, register as <strong>scoped <code>ClientHub</code> clients</strong> keyed by GTS instance ID"
         },
         {
-          "label": "Host discovers plugins at runtime, routes to the selected one via a vendor config field"
+          "label": "Host discovers plugins at runtime, routes to the selected one via a vendor config field",
+          "labelHtml": "Host discovers plugins at runtime, routes to the selected one via a <code>vendor</code> config field"
         },
         {
-          "label": "Built-in plugin — compiled in, own business-logic crate + optional dedicated DB"
+          "label": "Built-in plugin — compiled in, own business-logic crate + optional dedicated DB",
+          "labelHtml": "<strong>Built-in plugin</strong> — compiled in, own business-logic crate + optional dedicated DB"
         },
         {
-          "label": "External plugin — separate deployable, own API handler + business logic + DB"
+          "label": "External plugin — separate deployable, own API handler + business logic + DB",
+          "labelHtml": "<strong>External plugin</strong> — separate deployable, own API handler + business logic + DB"
         }
-      ]
+      ],
+      "outro": "Add a new backend (e.g. a custom auth provider) = write a plugin. Host stays unchanged."
     },
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Part 5 — Gears Toolkit",
-      "subtitle": ""
+      "subtitle": "",
+      "subtitleHtml": ""
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Gears Toolkit — mission",
       "cards": [
         {
-          "label": "Defines how gears are declared, discovered, wired, and operated"
+          "label": "Defines how gears are declared, discovered, wired, and operated",
+          "labelHtml": "Defines <strong>how gears are declared, discovered, wired, and operated</strong>"
         },
         {
-          "label": "Provides the secure-by-default substrate every Gear builds on"
+          "label": "Provides the secure-by-default substrate every Gear builds on",
+          "labelHtml": "Provides the <strong>secure-by-default</strong> substrate every Gear builds on"
         },
         {
-          "label": "Makes route metadata, schemas, and contracts part of the architecture, not afterthoughts"
+          "label": "Makes route metadata, schemas, and contracts part of the architecture, not afterthoughts",
+          "labelHtml": "Makes route metadata, schemas, and contracts <strong>part of the architecture</strong>, not afterthoughts"
         }
-      ]
+      ],
+      "intro": "Gears Toolkit is the central framework that turns the gear architecture into a reusable runtime discipline.",
+      "introHtml": "Gears Toolkit is the <strong>central framework</strong> that turns the gear architecture into a <strong>reusable runtime discipline</strong>.",
+      "outro": "One predictable operational model for every gear across every deployment shape."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Tookit — features",
       "cards": [
         {
-          "label": "Inventory-based gear discovery → dependency-ordered registry"
+          "label": "Inventory-based gear discovery → dependency-ordered registry",
+          "labelHtml": "<strong>Inventory-based gear discovery</strong> → dependency-ordered registry"
         },
         {
-          "label": "Lifecycle orchestration (HostRuntime phases)"
+          "label": "Lifecycle orchestration (HostRuntime phases)",
+          "labelHtml": "<strong>Lifecycle orchestration</strong> (<code>HostRuntime</code> phases)"
         },
         {
-          "label": "Type-safe in-process communication (ClientHub)"
+          "label": "Type-safe in-process communication (ClientHub)",
+          "labelHtml": "<strong>Type-safe in-process communication</strong> (<code>ClientHub</code>)"
         },
         {
-          "label": "REST + OpenAPI composition (OperationBuilder, OpenApiRegistry)"
+          "label": "REST + OpenAPI composition (OperationBuilder, OpenApiRegistry)",
+          "labelHtml": "<strong>REST + OpenAPI composition</strong> (<code>OperationBuilder<code>, </code> OpenApiRegistry</code>)"
         },
         {
-          "label": "Gear-owned migrations, runtime-executed"
+          "label": "Gear-owned migrations, runtime-executed",
+          "labelHtml": "<strong>Gear-owned migrations</strong>, runtime-executed"
         },
         {
-          "label": "Security primitives (SecurityContext, AccessScope, secure ORM)"
+          "label": "Security primitives (SecurityContext, AccessScope, secure ORM)",
+          "labelHtml": "<strong>Security primitives</strong> (<code>SecurityContext<code>, </code> AccessScope</code>, secure ORM)"
         },
         {
-          "label": "SSE streaming (SseBroadcaster, sse_json())"
+          "label": "SSE streaming (SseBroadcaster<T>, sse_json<T>())",
+          "labelHtml": "<strong>SSE streaming</strong> (<code>SseBroadcaster&lt;T&gt;<code>, </code> sse_json&lt;T&gt;()</code>)"
         },
         {
-          "label": "Transactional outbox (exactly-once / leased, multi-DB)"
+          "label": "Transactional outbox (exactly-once / leased, multi-DB)",
+          "labelHtml": "<strong>Transactional outbox</strong> (exactly-once / leased, multi-DB)"
         }
-      ]
+      ],
+      "outro": "Additional: Observability (tracing, OTel, request IDs, health) · Typed config (ExpandVars)",
+      "outroHtml": "Additional: <strong>Observability</strong> (tracing, OTel, request IDs, health) · <strong>Typed config</strong> (<code>ExpandVars</code>)"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Consistent API dialect",
       "cards": [
         {
-          "label": "HTTP method + versioned path (/resource-group/v1/groups)"
+          "label": "HTTP method + versioned path (/resource-group/v1/groups)",
+          "labelHtml": "HTTP method + <strong>versioned path</strong> (<code>/resource-group/v1/groups</code>)"
         },
         {
-          "label": "Auth posture (.authenticated() / .public()) + license posture"
+          "label": "Auth posture (.authenticated() / .public()) + license posture",
+          "labelHtml": "<strong>Auth posture</strong> (<code>.authenticated()</code> / <code>.public()</code>) + <strong>license posture</strong>"
         },
         {
           "label": "Request/response schemas, tags, summary, registered error responses"
         },
         {
-          "label": "Uniform OpenAPI publication through the gateway"
+          "label": "Uniform OpenAPI publication through the gateway",
+          "labelHtml": "Uniform <strong>OpenAPI</strong> publication through the gateway"
         },
         {
-          "label": "Same pagination / filter / order (OData $filter, $select, $orderby)"
+          "label": "Same pagination / filter / order (OData $filter, $select, $orderby)",
+          "labelHtml": "Same pagination / filter / order (<strong>OData</strong> <code>$filter</code>, <code>$select</code>, <code>$orderby</code>)"
         },
         {
           "label": "Consistent auth, rate-limit, timeout, and observability behavior"
         }
-      ]
+      ],
+      "intro": "OperationBuilder is the authoritative route-registration mechanism — one place declares:\nResult:",
+      "introHtml": "<code>OperationBuilder</code> is the authoritative route-registration mechanism — one place declares:<br>Result:"
     },
     {
       "type": "code",
@@ -674,105 +855,133 @@
     },
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Part 6 — Cross-cutting Concerns",
-      "subtitle": ""
+      "subtitle": "",
+      "subtitleHtml": ""
     },
     {
-      "type": "image",
+      "type": "mermaid",
       "title": "Request lifecycle",
-      "src": "../img/request_sequence.png",
-      "alt": "",
       "caption": "",
-      "fit": "contain"
+      "source": "%% Reconstructed from docs/img/request_sequence.png for the Slidey overview deck.\nsequenceDiagram\n  autonumber\n  actor Client\n  participant Gateway as API Gateway<br/>(middleware stack)\n  participant AuthN as AuthN Resolver<br/>(+ vendor plugin → IdP)\n  participant Handler as Gear Handler<br/>(api/rest, PEP entry)\n  participant Domain as Domain Service\n  participant PEP as PolicyEnforcer (PEP)\n  participant PDP as AuthZ Resolver (PDP)<br/>(+ vendor plugin)\n  participant Repo as Repository + SecureConn\n  participant DB as Gear DB\n\n  Client->>Gateway: HTTP request + Bearer token\n  Note over Gateway: SetRequestId / Trace / Timeout /<br/>BodyLimit / CORS / MIME / RateLimit\n\n  rect rgb(54, 66, 92)\n    Note over Gateway,AuthN: Authentication (AuthN middleware)\n    Gateway->>Gateway: resolve route auth requirement\n    alt route is .authenticated()\n      Gateway->>AuthN: authenticate(bearer_token)\n      AuthN->>AuthN: vendor plugin validates / introspects token (IdP)\n      AuthN-->>Gateway: AuthenticationResult { SecurityContext }\n      Gateway->>Gateway: inject Extension SecurityContext\n    else missing token\n      Gateway-->>Client: 401 Unauthorized (MISSING_BEARER)\n    end\n    Gateway->>Gateway: ScopeEnforcement (token scopes) + License check\n  end\n\n  Gateway->>Handler: dispatch to Axum handler + SecurityContext\n  Handler->>Handler: deserialize DTO / extract Path and OData query\n  Handler->>Domain: service.method(&ctx, args)\n\n  rect rgb(45, 78, 58)\n    Note over Domain,PDP: Authorization (PEP → PDP)\n    Domain->>PEP: access_scope(ctx, ResourceType, action, resource_id)\n    PEP->>PDP: EvaluationRequest(subject, action, resource, context, token_scopes)\n    PDP->>PDP: vendor plugin evaluates policies<br/>(+ tenant/RG hierarchy)\n    PDP-->>PEP: decision + constraints\n    alt decision = false or constraints missing\n      PEP-->>Domain: EnforcerError::Denied → 403 Forbidden (fail-closed)\n    else allowed\n      PEP->>PEP: compile constraints → AccessScope\n      PEP-->>Domain: AccessScope\n    end\n\n    Domain->>Repo: repo.op(&conn, &scope, ...)\n    Repo->>Repo: secure().scope_with(&scope)<br/>SQL WHERE (tenant + constraints)\n    Repo->>DB: scoped query / insert / update\n    DB-->>Repo: rows (0 rows on point op → 404)\n    Repo-->>Domain: domain model(s)\n  end\n\n  Domain-->>Handler: domain result or DomainError\n  Handler-->>Gateway: ApiResult T -> JSON / RFC-9457 Problem\n  Gateway->>Gateway: ErrorMapping (canonical errors), Trace span close\n  Gateway-->>Client: HTTP response\n",
+      "sourceFile": "diagrams/request_lifecycle.mmd"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Request lifecycle — who owns what",
       "cards": [
         {
-          "label": "API Gateway owns authentication (token → SecurityContext) and fast license validation"
+          "label": "API Gateway owns authentication (token → SecurityContext) and fast license validation",
+          "labelHtml": "<strong>API Gateway</strong> owns <strong>authentication</strong> (token → <code>SecurityContext</code>) and fast <strong>license</strong> validation"
         },
         {
-          "label": "Gear domain services own licensing and authorization — call PolicyEnforcer (PEP)"
+          "label": "Gear domain services own licensing and authorization — call PolicyEnforcer (PEP)",
+          "labelHtml": "<strong>Gear domain services</strong> own <strong>licensing</strong> and <strong>authorization</strong> — call <code>PolicyEnforcer</code> (PEP)"
         },
         {
-          "label": "AuthZ Resolver (PDP) returns a decision + row-level constraints"
+          "label": "AuthZ Resolver (PDP) returns a decision + row-level constraints",
+          "labelHtml": "<strong>AuthZ Resolver</strong> (PDP) returns a decision + <strong>row-level constraints</strong>"
         },
         {
-          "label": "Constraints compile to an AccessScope → SecureConn applies SQL WHERE"
+          "label": "Constraints compile to an AccessScope → SecureConn applies SQL WHERE",
+          "labelHtml": "Constraints compile to an <strong><code>AccessScope<code></strong> → </code> SecureConn<code> applies SQL </code> WHERE</code>"
         },
         {
-          "label": "Gear code never parses tokens or resolves tenancy directly"
+          "label": "Gear code never parses tokens or resolves tenancy directly",
+          "labelHtml": "Gear code <strong>never</strong> parses tokens or resolves tenancy directly"
         }
-      ]
+      ],
+      "intro": "Gateway middleware order:\nSetRequestId → Trace → Timeout → BodyLimit → CORS → MIME → RateLimit → ErrorMapping → Auth → ScopeEnforcement → License → Router",
+      "introHtml": "Gateway middleware order:<br><code>SetRequestId → Trace → Timeout → BodyLimit → CORS → MIME → RateLimit → ErrorMapping → Auth → ScopeEnforcement → License → Router</code>"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Security — PDP/PEP authorization",
       "cards": [
         {
-          "label": "PDP (AuthZ Resolver plugin) — evaluates policies (RBAC/ABAC/ReBAC, vendor's choice)"
+          "label": "PDP (AuthZ Resolver plugin) — evaluates policies (RBAC/ABAC/ReBAC, vendor's choice)",
+          "labelHtml": "<strong>PDP</strong> (AuthZ Resolver plugin) — evaluates policies (RBAC/ABAC/ReBAC, vendor&#39;s choice)"
         },
         {
-          "label": "PEP (domain gear) — compiles constraints into SQL WHERE clauses"
+          "label": "PEP (domain gear) — compiles constraints into SQL WHERE clauses",
+          "labelHtml": "<strong>PEP</strong> (domain gear) — compiles constraints into SQL <code>WHERE</code> clauses"
         },
         {
-          "label": "Returns predicates, not resource IDs → O(1) authz overhead, correct pagination, accurate counts"
+          "label": "Returns predicates, not resource IDs → O(1) authz overhead, correct pagination, accurate counts",
+          "labelHtml": "Returns <strong>predicates</strong>, not resource IDs → O(1) authz overhead, correct pagination, accurate counts"
         },
         {
-          "label": "Fail-closed: denied / unreachable PDP / missing constraints → 403"
+          "label": "Fail-closed: denied / unreachable PDP / missing constraints → 403",
+          "labelHtml": "<strong>Fail-closed</strong>: denied / unreachable PDP / missing constraints → <strong>403</strong>"
         }
-      ]
+      ],
+      "intro": "PDP — the Policy Decision Point that evaluates authorization policies.\nPEP — the Policy Enforcement Point that applies the decision in the gear.\nNIST SP 800-162 PDP/PEP model, built on OpenID AuthZEN + query-level constraints.",
+      "introHtml": "<strong>PDP</strong> — the Policy Decision Point that evaluates authorization policies.<br><strong>PEP</strong> — the Policy Enforcement Point that applies the decision in the gear.<br><strong>NIST SP 800-162 PDP/PEP</strong> model, built on OpenID <strong>AuthZEN</strong> + query-level constraints.",
+      "outro": "effective_access = min(token_scopes, user_permissions)",
+      "outroHtml": "<code>effective_access = min(token_scopes, user_permissions)</code>"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Security — Secure ORM & tenancy",
       "cards": [
         {
-          "label": "Entities derive Scopable with #[secure(tenant_col, resource_col, owner_col, type_col)]"
+          "label": "Entities derive Scopable with #[secure(tenant_col, resource_col, owner_col, type_col)]",
+          "labelHtml": "Entities derive <strong><code>Scopable</code></strong> with <code>#[secure(tenant_col, resource_col, owner_col, type_col)]</code>"
         },
         {
-          "label": "AccessScope carries four dimensions: tenant, resource, owner, type"
+          "label": "AccessScope carries four dimensions: tenant, resource, owner, type",
+          "labelHtml": "<code>AccessScope</code> carries four dimensions: <strong>tenant, resource, owner, type</strong>"
         },
         {
-          "label": "SecureConn auto-maps PEP properties → columns → WHERE clauses"
+          "label": "SecureConn auto-maps PEP properties → columns → WHERE clauses",
+          "labelHtml": "<code>SecureConn<code> auto-maps PEP properties → columns → </code> WHERE</code> clauses"
         },
         {
-          "label": "Tenant topology: single-root hierarchy; every resource has owner_tenant_id"
+          "label": "Tenant topology: single-root hierarchy; every resource has owner_tenant_id",
+          "labelHtml": "<strong>Tenant topology</strong>: single-root hierarchy; every resource has <code>owner_tenant_id</code>"
         },
         {
-          "label": "Barriers (e.g. self_managed) restrict parent visibility into subtrees"
+          "label": "Barriers (e.g. self_managed) restrict parent visibility into subtrees",
+          "labelHtml": "<strong>Barriers</strong> (e.g. <code>self_managed</code>) restrict parent visibility into subtrees"
         },
         {
-          "label": "Resource groups add optional access-control grouping within tenants"
+          "label": "Resource groups add optional access-control grouping within tenants",
+          "labelHtml": "<strong>Resource groups</strong> add optional access-control grouping within tenants"
         }
       ]
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Security — defense across the lifecycle",
       "cards": [
         {
-          "label": "Rust safety baseline — memory safety, strict lints"
+          "label": "Rust safety baseline — memory safety, strict lints",
+          "labelHtml": "<strong>Rust safety baseline</strong> — memory safety, strict lints"
         },
         {
-          "label": "Split AuthN / AuthZ as separate system services"
+          "label": "Split AuthN / AuthZ as separate system services",
+          "labelHtml": "<strong>Split AuthN / AuthZ</strong> as separate system services"
         },
         {
-          "label": "SecurityContext propagation — explicit data, no thread-local magic"
+          "label": "SecurityContext propagation — explicit data, no thread-local magic",
+          "labelHtml": "<strong><code>SecurityContext</code> propagation</strong> — explicit data, no thread-local magic"
         },
         {
-          "label": "Outbound boundary — oagw centralizes egress policy + credential injection"
+          "label": "Outbound boundary — oagw centralizes egress policy + credential injection",
+          "labelHtml": "<strong>Outbound boundary</strong> — <code>oagw</code> centralizes egress policy + credential injection"
         },
         {
-          "label": "Credential handling — credstore + secrecy-aware types"
+          "label": "Credential handling — credstore + secrecy-aware types",
+          "labelHtml": "<strong>Credential handling</strong> — <code>credstore<code> + </code> secrecy</code>-aware types"
         },
         {
-          "label": "Static & CI gates — Clippy, Dylints, cargo-deny, CodeQL, fuzzing, Scorecard/Snyk/Aikido"
+          "label": "Static & CI gates — Clippy, Dylints, cargo-deny, CodeQL, fuzzing, Scorecard/Snyk/Aikido",
+          "labelHtml": "<strong>Static &amp; CI gates</strong> — Clippy, Dylints, <code>cargo-deny</code>, CodeQL, fuzzing, Scorecard/Snyk/Aikido"
         }
       ]
     },
@@ -803,65 +1012,84 @@
             "AWS-LC FIPS Provider"
           ]
         }
-      ]
+      ],
+      "caption": "Build with --features fips to route TLS crypto through a FIPS 140-3 validated module: One rustls 0.23 state machine, pluggable CryptoProvider per OS Offers only FIPS-approved suites (AES-GCM, P-256/384, SHA-256/384) Fails closed on Windows when OS FIPS mode is off"
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Global Type System (GTS)",
       "cards": [
         {
-          "label": "Globally unique, human-readable, versioned identifiers for types & instances"
+          "label": "Globally unique, human-readable, versioned identifiers for types & instances",
+          "labelHtml": "Globally unique, human-readable, <strong>versioned</strong> identifiers for types &amp; instances"
         },
         {
-          "label": "gts.cf.core.events.event.v1~ style IDs as a platform contract surface"
+          "label": "gts.cf.core.events.event.v1~ style IDs as a platform contract surface",
+          "labelHtml": "<code>gts.cf.core.events.event.v1~</code> style IDs as a <strong>platform contract surface</strong>"
         },
         {
-          "label": "GTS JSON Schemas generated directly from Rust types → registered in Types Registry"
+          "label": "GTS JSON Schemas generated directly from Rust types → registered in Types Registry",
+          "labelHtml": "GTS <strong>JSON Schemas generated directly from Rust types</strong> → registered in Types Registry"
         },
         {
-          "label": "The non-HTTP counterpart to OpenAPI: describes plugin specs, events, permissions"
+          "label": "The non-HTTP counterpart to OpenAPI: describes plugin specs, events, permissions",
+          "labelHtml": "The non-HTTP counterpart to OpenAPI: describes <strong>plugin specs, events, permissions</strong>"
         },
         {
-          "label": "GTS-specific Dylints validate identifier correctness"
+          "label": "GTS-specific Dylints validate identifier correctness",
+          "labelHtml": "GTS-specific <strong>Dylints</strong> validate identifier correctness"
         }
-      ]
+      ],
+      "intro": "A powerful extension-point architecture — virtually every API can be extended\nwithout modifying core code.",
+      "introHtml": "A powerful <strong>extension-point architecture</strong> — virtually every API can be extended<br>without modifying core code."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Errors — canonical taxonomy",
       "cards": [
         {
-          "label": "NotFound, AlreadyExists, PermissionDenied, InvalidArgument, Unauthenticated, ... (16 total)"
+          "label": "NotFound, AlreadyExists, PermissionDenied, InvalidArgument, Unauthenticated, ... (16 total)",
+          "labelHtml": "<code>NotFound</code>, <code>AlreadyExists</code>, <code>PermissionDenied</code>, <code>InvalidArgument</code>, <code>Unauthenticated</code>, ... (16 total)"
         },
         {
-          "label": "Each category: typed context + HTTP mapping + stable GTS type identifier"
+          "label": "Each category: typed context + HTTP mapping + stable GTS type identifier",
+          "labelHtml": "Each category: typed context + HTTP mapping + <strong>stable GTS type identifier</strong>"
         },
         {
-          "label": "Rendered as RFC-9457 Problem documents over HTTP"
+          "label": "Rendered as RFC-9457 Problem documents over HTTP",
+          "labelHtml": "Rendered as <strong>RFC-9457 <code>Problem</code></strong> documents over HTTP"
         },
         {
           "label": "Aligns REST · SDK boundaries · future gRPC · retry classification"
         }
-      ]
+      ],
+      "intro": "One platform-wide error vocabulary, aligned with the 16 gRPC categories:",
+      "introHtml": "One platform-wide error vocabulary, aligned with the <strong>16 gRPC categories</strong>:",
+      "outro": "Foundation implemented (libs/toolkit-canonical-errors); repo-wide migration in progress.",
+      "outroHtml": "Foundation implemented (<code>libs/toolkit-canonical-errors</code>); repo-wide migration in progress."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Observability & operations",
       "cards": [
         {
-          "label": "OpenTelemetry tracing (libs/toolkit/src/telemetry/)"
+          "label": "OpenTelemetry tracing (libs/toolkit/src/telemetry/)",
+          "labelHtml": "<strong>OpenTelemetry</strong> tracing (<code>libs/toolkit/src/telemetry/</code>)"
         },
         {
-          "label": "API Gateway: request IDs, tracing, timeout layers, body limits, structured access logs"
+          "label": "API Gateway: request IDs, tracing, timeout layers, body limits, structured access logs",
+          "labelHtml": "<strong>API Gateway</strong>: request IDs, tracing, timeout layers, body limits, structured access logs"
         },
         {
-          "label": "Health endpoints: /health (detailed JSON) and /healthz (liveness)"
+          "label": "Health endpoints: /health (detailed JSON) and /healthz (liveness)",
+          "labelHtml": "<strong>Health endpoints</strong>: <code>/health</code> (detailed JSON) and <code>/healthz</code> (liveness)"
         },
         {
-          "label": "Governor-based rate limiting with policy headers + inflight semaphores"
+          "label": "Governor-based rate limiting with policy headers + inflight semaphores",
+          "labelHtml": "<strong>Governor-based rate limiting</strong> with policy headers + inflight semaphores"
         },
         {
           "label": "CI workflows + test infrastructure aligned with operational quality"
@@ -870,99 +1098,132 @@
     },
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Part 7 — Engineering & Developer Experience",
-      "subtitle": ""
+      "subtitle": "",
+      "subtitleHtml": ""
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Developer experience",
       "cards": [
         {
-          "label": "Golden path templates for new Gears (SDK + gear crate scaffolding)"
+          "label": "Golden path templates for new Gears (SDK + gear crate scaffolding)",
+          "labelHtml": "<strong>Golden path</strong> templates for new Gears (SDK + gear crate scaffolding)"
         },
         {
-          "label": "Type-safe REST — OperationBuilder prevents half-wired routes at compile time"
+          "label": "Type-safe REST — OperationBuilder prevents half-wired routes at compile time",
+          "labelHtml": "<strong>Type-safe REST</strong> — <code>OperationBuilder</code> prevents half-wired routes at compile time"
         },
         {
-          "label": "OpenAPI auto-generated from the same route declarations that run the service"
+          "label": "OpenAPI auto-generated from the same route declarations that run the service",
+          "labelHtml": "<strong>OpenAPI auto-generated</strong> from the same route declarations that run the service"
         },
         {
-          "label": "GET /cw/docs live Swagger UI on the example server"
+          "label": "GET /cw/docs live Swagger UI on the example server",
+          "labelHtml": "<strong><code>GET /cw/docs</code></strong> live Swagger UI on the example server"
         },
         {
-          "label": "Architectural Dylints enforce design rules and patterns at build time"
+          "label": "Architectural Dylints enforce design rules and patterns at build time",
+          "labelHtml": "<strong>Architectural Dylints</strong> enforce design rules and patterns at build time"
         },
         {
-          "label": "Rich docs: docs/toolkit_unified_system/ (13 topic files) + per-gear specs"
+          "label": "Rich docs: docs/toolkit_unified_system/ (13 topic files) + per-gear specs",
+          "labelHtml": "<strong>Rich docs</strong>: <code>docs/toolkit_unified_system/</code> (13 topic files) + per-gear specs"
         }
       ]
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Spec-Driven Development (SDD)",
       "cards": [
         {
-          "label": "PRD — vision, actors, capabilities, use cases, FR/NFR"
+          "label": "PRD — vision, actors, capabilities, use cases, FR/NFR",
+          "labelHtml": "<strong>PRD</strong> — vision, actors, capabilities, use cases, FR/NFR"
         },
         {
-          "label": "DESIGN — architecture, principles, constraints, domain model, API contracts"
+          "label": "DESIGN — architecture, principles, constraints, domain model, API contracts",
+          "labelHtml": "<strong>DESIGN</strong> — architecture, principles, constraints, domain model, API contracts"
         },
         {
-          "label": "ADR — decisions, options, trade-offs, consequences"
+          "label": "ADR — decisions, options, trade-offs, consequences",
+          "labelHtml": "<strong>ADR</strong> — decisions, options, trade-offs, consequences"
         },
         {
-          "label": "FEATURE — flows, algorithms, states, requirements"
+          "label": "FEATURE — flows, algorithms, states, requirements",
+          "labelHtml": "<strong>FEATURE</strong> — flows, algorithms, states, requirements"
         },
         {
-          "label": "UPSTREAM_REQS — incoming technical requirements from other gears"
+          "label": "UPSTREAM_REQS — incoming technical requirements from other gears",
+          "labelHtml": "<strong>UPSTREAM_REQS</strong> — incoming technical requirements from other gears"
         }
-      ]
+      ],
+      "intro": "Large features start with specs that live alongside the code:",
+      "introHtml": "Large features start with <strong>specs that live alongside the code</strong>:",
+      "outro": "Templates in docs/spec-templates/. Every gear is well documented.",
+      "outroHtml": "Templates in <code>docs/spec-templates/</code>. Every gear is well documented."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Testing architecture",
       "cards": [
         {
-          "label": "Unit & integration — in-process, SQLite :memory:, mocked AuthZ"
+          "label": "Unit & integration — in-process, SQLite :memory:, mocked AuthZ",
+          "labelHtml": "<strong>Unit &amp; integration</strong> — in-process, SQLite <code>:memory:</code>, <strong>mocked AuthZ</strong>",
+          "lines": [
+            "domain invariants, validation, error chains, DTO conversions, seeding — no HTTP, no real DB"
+          ],
+          "linesHtml": [
+            "domain invariants, validation, error chains, DTO conversions, seeding — <em>no HTTP, no real DB</em>"
+          ]
         },
         {
-          "label": "domain invariants, validation, error chains, DTO conversions, seeding — no HTTP, no real DB"
-        },
-        {
-          "label": "End-to-end — pytest vs. a running cyberware-server with a real DB"
-        },
-        {
-          "label": "JSON wire format, real AuthZ wiring, DB-specific SQL, cross-gear SDK boundaries"
+          "label": "End-to-end — pytest vs. a running cyberware-server with a real DB",
+          "labelHtml": "<strong>End-to-end</strong> — pytest vs. a running <code>cyberware-server</code> with a <strong>real DB</strong>",
+          "lines": [
+            "JSON wire format, real AuthZ wiring, DB-specific SQL, cross-gear SDK boundaries"
+          ]
         }
-      ]
+      ],
+      "intro": "A dual-layer strategy with an explicit zero-overlap rule:\nUnit-test gate: (1) deterministic domain logic? (2) atomic & fast? (3) removing it lowers confidence?",
+      "introHtml": "A <strong>dual-layer</strong> strategy with an explicit <strong>zero-overlap</strong> rule:<br>Unit-test gate: (1) deterministic domain logic? (2) atomic &amp; fast? (3) removing it lowers confidence?"
     },
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Part 8 — Getting Started",
-      "subtitle": ""
+      "subtitle": "",
+      "subtitleHtml": ""
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Prerequisites",
       "cards": [
         {
-          "label": "Rust stable with Cargo (Edition 2024, MSRV 1.95.0)"
+          "label": "Rust stable with Cargo (Edition 2024, MSRV 1.95.0)",
+          "labelHtml": "<strong>Rust stable</strong> with Cargo (Edition 2024, MSRV 1.95.0)"
         },
         {
-          "label": "protoc (Protocol Buffers compiler)"
+          "label": "protoc (Protocol Buffers compiler)",
+          "labelHtml": "<strong><code>protoc</code></strong> (Protocol Buffers compiler)",
+          "lines": [
+            "macOS: brew install protobuf · Linux: apt-get install protobuf-compiler"
+          ],
+          "linesHtml": [
+            "macOS: <code>brew install protobuf<code> · Linux: </code> apt-get install protobuf-compiler</code>"
+          ]
         },
         {
-          "label": "macOS: brew install protobuf · Linux: apt-get install protobuf-compiler"
+          "label": "MariaDB / PostgreSQL / SQLite or in-memory database",
+          "labelHtml": "<strong>MariaDB / PostgreSQL / SQLite</strong> or in-memory database"
         },
         {
-          "label": "MariaDB / PostgreSQL / SQLite or in-memory database"
-        },
-        {
-          "label": "Agentic IDE: VS Code with rust-analyzer or similar"
+          "label": "Agentic IDE: VS Code with rust-analyzer or similar",
+          "labelHtml": "<strong>Agentic IDE</strong>: VS Code with <strong>rust-analyzer</strong> or similar"
         }
       ]
     },
@@ -971,116 +1232,144 @@
       "variant": "source",
       "title": "How to build & run",
       "lang": "bash",
-      "code": "git clone --recurse-submodules <repository-url>\ncd cyberware-rust\n\nmake build      # build libs + example server\nmake example    # run the example server\n# → API docs at http://127.0.0.1:8087/cw/docs\n\n# Health checks\ncurl http://127.0.0.1:8087/cw/health   # detailed JSON\ncurl http://127.0.0.1:8087/healthz      # liveness \"ok\""
+      "code": "git clone --recurse-submodules <repository-url>\ncd cyberware-rust\n\nmake build      # build libs + example server\nmake example    # run the example server\n# → API docs at http://127.0.0.1:8087/cw/docs\n\n# Health checks\ncurl http://127.0.0.1:8087/cw/health   # detailed JSON\ncurl http://127.0.0.1:8087/healthz      # liveness \"ok\"",
+      "caption": "Run modes: SQLite (config/quickstart.yaml), no-DB ( config/no-db.yaml), or --mock."
     },
     {
       "type": "code",
       "variant": "source",
       "title": "Configuration",
       "lang": "yaml",
-      "code": "server:   { home_dir: \"~/.cyberware\" }\ndatabase: { url: \"sqlite://database/database.db\", max_conns: 10 }\ngears:\n  api_gateway:\n    config: { bind_addr: \"127.0.0.1:8087\", enable_docs: true }\n  users_info:\n    database: { server: \"sqlite_users\", file: \"users_info.db\" }\n    config:   { default_page_size: 5, max_page_size: 100 }"
+      "code": "server:   { home_dir: \"~/.cyberware\" }\ndatabase: { url: \"sqlite://database/database.db\", max_conns: 10 }\ngears:\n  api_gateway:\n    config: { bind_addr: \"127.0.0.1:8087\", enable_docs: true }\n  users_info:\n    database: { server: \"sqlite_users\", file: \"users_info.db\" }\n    config:   { default_page_size: 5, max_page_size: 100 }",
+      "caption": "Env overrides with CYBERFABRIC_ prefix, e.g. CYBERFABRIC_DATABASE_URL=postgres://..."
     },
     {
       "type": "code",
       "variant": "source",
       "title": "How to run tests",
       "lang": "bash",
-      "code": "make check           # full quality gate: fmt + clippy + test + security\nmake test            # unit tests (workspace)\nmake test-sqlite     # integration tests (SQLite, no external DB)\nmake e2e-local       # E2E — builds + starts server automatically\nmake coverage-unit   # unit-test coverage\nmake fuzz            # fuzz smoke tests (30s/target)"
+      "code": "make check           # full quality gate: fmt + clippy + test + security\nmake test            # unit tests (workspace)\nmake test-sqlite     # integration tests (SQLite, no external DB)\nmake e2e-local       # E2E — builds + starts server automatically\nmake coverage-unit   # unit-test coverage\nmake fuzz            # fuzz smoke tests (30s/target)",
+      "caption": "On Windows (no make): python tools/scripts/ci.py check Full strategy & CI details: docs/TESTING.md."
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "How to contribute",
       "cards": [
         {
-          "label": "Branch / fork — feature/, fix/, docs/"
+          "label": "Branch / fork — feature/<name>, fix/<name>, docs/<name>",
+          "labelHtml": "<strong>Branch / fork</strong> — <code>feature/&lt;name&gt;<code>, </code> fix/&lt;name&gt;<code>, </code> docs/&lt;name&gt;</code>"
         },
         {
-          "label": "Spec-first for large features (PRD/DESIGN/ADR/FEATURE templates)"
+          "label": "Spec-first for large features (PRD/DESIGN/ADR/FEATURE templates)",
+          "labelHtml": "<strong>Spec-first</strong> for large features (PRD/DESIGN/ADR/FEATURE templates)"
         },
         {
-          "label": "Code to guidelines (guidelines/DNA/...), kebab-case gear dirs, add tests"
+          "label": "Code to guidelines (guidelines/DNA/...), kebab-case gear dirs, add tests",
+          "labelHtml": "<strong>Code</strong> to guidelines (<code>guidelines/DNA/...</code>), kebab-case gear dirs, add tests"
         },
         {
-          "label": "Quality gate — make check (or ci.py check); aim high on coverage"
+          "label": "Quality gate — make check (or ci.py check); aim high on coverage",
+          "labelHtml": "<strong>Quality gate</strong> — <code>make check<code> (or </code> ci.py check</code>); aim high on coverage"
         },
         {
-          "label": "DCO sign-off — git commit -s"
+          "label": "DCO sign-off — git commit -s",
+          "labelHtml": "<strong>DCO sign-off</strong> — <code>git commit -s</code>"
         },
         {
-          "label": "Conventional commits — feat(auth): ..., fix(ui): ..."
+          "label": "Conventional commits — feat(auth): ..., fix(ui): ...",
+          "labelHtml": "<strong>Conventional commits</strong> — <code>feat(auth): ...<code>, </code> fix(ui): ...</code>"
         },
         {
-          "label": "Open PR → CI green + 1 maintainer approval + conversations resolved"
+          "label": "Open PR → CI green + 1 maintainer approval + conversations resolved",
+          "labelHtml": "<strong>Open PR</strong> → CI green + 1 maintainer approval + conversations resolved"
         },
         {
-          "label": "Local AI review — cypilot review PR"
+          "label": "Local AI review — cypilot review PR <number>",
+          "labelHtml": "<strong>Local AI review</strong> — <code>cypilot review PR &lt;number&gt;</code>"
         }
       ]
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Documentation map",
       "cards": [
         {
-          "label": "Architecture Manifest — docs/ARCHITECTURE_MANIFEST.mddefining characteristics"
+          "label": "Architecture Manifest — docs/ARCHITECTURE_MANIFEST.md defining characteristics",
+          "labelHtml": "<strong>Architecture Manifest</strong> — <code>docs/ARCHITECTURE_MANIFEST.md</code> defining characteristics"
         },
         {
-          "label": "Gears inventory — docs/GEARS.md"
+          "label": "Gears inventory — docs/GEARS.md",
+          "labelHtml": "<strong>Gears inventory</strong> — <code>docs/GEARS.md</code>"
         },
         {
-          "label": "Toolkit guide (13 topics) — docs/toolkit_unified_system/README.md"
+          "label": "Toolkit guide (13 topics) — docs/toolkit_unified_system/README.md",
+          "labelHtml": "<strong>Toolkit guide (13 topics)</strong> — <code>docs/toolkit_unified_system/README.md</code>"
         },
         {
-          "label": "Gear overview — docs/toolkit_unified_system/00_gear_overview.md"
+          "label": "Gear overview — docs/toolkit_unified_system/00_gear_overview.md",
+          "labelHtml": "<strong>Gear overview</strong> — <code>docs/toolkit_unified_system/00_gear_overview.md</code>"
         },
         {
-          "label": "Authorization design — docs/arch/authorization/DESIGN.md"
+          "label": "Authorization design — docs/arch/authorization/DESIGN.md",
+          "labelHtml": "<strong>Authorization design</strong> — <code>docs/arch/authorization/DESIGN.md</code>"
         },
         {
-          "label": "Security overview — docs/security/SECURITY.md"
+          "label": "Security overview — docs/security/SECURITY.md",
+          "labelHtml": "<strong>Security overview</strong> — <code>docs/security/SECURITY.md</code>"
         },
         {
-          "label": "Testing — docs/TESTING.md · Contributing — CONTRIBUTING.md"
+          "label": "Testing — docs/TESTING.md · Contributing — CONTRIBUTING.md",
+          "labelHtml": "<strong>Testing</strong> — <code>docs/TESTING.md<code> · <strong>Contributing</strong> — </code> CONTRIBUTING.md</code>"
         },
         {
-          "label": "Repo playbook — docs/REPO_PLAYBOOK.md"
+          "label": "Repo playbook — docs/REPO_PLAYBOOK.md",
+          "labelHtml": "<strong>Repo playbook</strong> — <code>docs/REPO_PLAYBOOK.md</code>"
         }
       ]
     },
     {
       "type": "cards",
-      "variant": "list",
+      "variant": "markdown",
       "title": "Why Constructor Gears is a good choice for your project",
       "cards": [
         {
-          "label": "XaaS-friendly - built-in multi-tenancy, licensing, usage, etc"
+          "label": "XaaS-friendly - built-in multi-tenancy, licensing, usage, etc",
+          "labelHtml": "<strong>XaaS-friendly</strong> - built-in multi-tenancy, licensing, usage, etc"
         },
         {
-          "label": "Security by architecture — AuthN/AuthZ, tenancy, scoped DB access, FIPS 140-3"
+          "label": "Security by architecture — AuthN/AuthZ, tenancy, scoped DB access, FIPS 140-3",
+          "labelHtml": "<strong>Security by architecture</strong> — AuthN/AuthZ, tenancy, scoped DB access, FIPS 140-3"
         },
         {
-          "label": "Compile-time governance — linters and Dylints detect violations before runtime"
+          "label": "Compile-time governance — linters and Dylints detect violations before runtime",
+          "labelHtml": "<strong>Compile-time governance</strong> — linters and Dylints detect violations before runtime"
         },
         {
-          "label": "Composable gear model — single code - multiple builds and deployments"
+          "label": "Composable gear model — single code - multiple builds and deployments",
+          "labelHtml": "<strong>Composable gear model</strong> — single code - multiple builds and deployments"
         },
         {
-          "label": "Shift-left productivity — all-in-one gears process for local build and test"
+          "label": "Shift-left productivity — all-in-one gears process for local build and test",
+          "labelHtml": "<strong>Shift-left productivity</strong> — all-in-one gears process for local build and test"
         },
         {
-          "label": "Extensible by design — custom API data types, plugins, serverless gears"
+          "label": "Extensible by design — custom API data types, plugins, serverless gears",
+          "labelHtml": "<strong>Extensible by design</strong> — custom API data types, plugins, serverless gears"
         },
         {
-          "label": "Operations friendly — OpenAPI, OData, canonical errors, observability, migrations, and lifecycle are standard"
+          "label": "Operations friendly — OpenAPI, OData, canonical errors, observability, migrations, and lifecycle are standard",
+          "labelHtml": "<strong>Operations friendly</strong> — OpenAPI, OData, canonical errors, observability, migrations, and lifecycle are standard"
         }
       ]
     },
     {
       "type": "title",
+      "theme": "markdown",
       "title": "Thank you",
-      "subtitle": "Constructor Gears (Rust)"
+      "subtitle": "Constructor Gears (Rust)\nSecure · Modular · Composable · GenAI-ready\nStart: make example → http://127.0.0.1:8087/cw/docs\nApache-2.0 · Cyber Fabric Foundation",
+      "subtitleHtml": "Constructor Gears (Rust)<br><em>Secure · Modular · Composable · GenAI-ready</em><br>Start: <code>make example</code> → http://127.0.0.1:8087/cw/docs<br>Apache-2.0 · Cyber Fabric Foundation"
     }
   ]
 }

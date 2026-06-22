@@ -1,0 +1,58 @@
+%% Reconstructed from docs/img/request_sequence.png for the Slidey overview deck.
+sequenceDiagram
+  autonumber
+  actor Client
+  participant Gateway as API Gateway<br/>(middleware stack)
+  participant AuthN as AuthN Resolver<br/>(+ vendor plugin → IdP)
+  participant Handler as Gear Handler<br/>(api/rest, PEP entry)
+  participant Domain as Domain Service
+  participant PEP as PolicyEnforcer (PEP)
+  participant PDP as AuthZ Resolver (PDP)<br/>(+ vendor plugin)
+  participant Repo as Repository + SecureConn
+  participant DB as Gear DB
+
+  Client->>Gateway: HTTP request + Bearer token
+  Note over Gateway: SetRequestId / Trace / Timeout /<br/>BodyLimit / CORS / MIME / RateLimit
+
+  rect rgb(54, 66, 92)
+    Note over Gateway,AuthN: Authentication (AuthN middleware)
+    Gateway->>Gateway: resolve route auth requirement
+    alt route is .authenticated()
+      Gateway->>AuthN: authenticate(bearer_token)
+      AuthN->>AuthN: vendor plugin validates / introspects token (IdP)
+      AuthN-->>Gateway: AuthenticationResult { SecurityContext }
+      Gateway->>Gateway: inject Extension SecurityContext
+    else missing token
+      Gateway-->>Client: 401 Unauthorized (MISSING_BEARER)
+    end
+    Gateway->>Gateway: ScopeEnforcement (token scopes) + License check
+  end
+
+  Gateway->>Handler: dispatch to Axum handler + SecurityContext
+  Handler->>Handler: deserialize DTO / extract Path and OData query
+  Handler->>Domain: service.method(&ctx, args)
+
+  rect rgb(45, 78, 58)
+    Note over Domain,PDP: Authorization (PEP → PDP)
+    Domain->>PEP: access_scope(ctx, ResourceType, action, resource_id)
+    PEP->>PDP: EvaluationRequest(subject, action, resource, context, token_scopes)
+    PDP->>PDP: vendor plugin evaluates policies<br/>(+ tenant/RG hierarchy)
+    PDP-->>PEP: decision + constraints
+    alt decision = false or constraints missing
+      PEP-->>Domain: EnforcerError::Denied → 403 Forbidden (fail-closed)
+    else allowed
+      PEP->>PEP: compile constraints → AccessScope
+      PEP-->>Domain: AccessScope
+    end
+
+    Domain->>Repo: repo.op(&conn, &scope, ...)
+    Repo->>Repo: secure().scope_with(&scope)<br/>SQL WHERE (tenant + constraints)
+    Repo->>DB: scoped query / insert / update
+    DB-->>Repo: rows (0 rows on point op → 404)
+    Repo-->>Domain: domain model(s)
+  end
+
+  Domain-->>Handler: domain result or DomainError
+  Handler-->>Gateway: ApiResult T -> JSON / RFC-9457 Problem
+  Gateway->>Gateway: ErrorMapping (canonical errors), Trace span close
+  Gateway-->>Client: HTTP response

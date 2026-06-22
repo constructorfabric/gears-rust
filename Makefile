@@ -410,6 +410,7 @@ md-fabric:
 ## Build the slides with Slidey
 slides:
 	@command -v slidey >/dev/null || (echo "slidey is required to build slides. Install/link the slidey CLI first." && exit 1)
+	node docs/slides/diagrams/render-themed-drawio-svg.mjs
 	slidey bundle docs/slides/1_OVERVIEW.slidey.json docs/slides/1_OVERVIEW.html
 
 # -------- Development and auto fix --------

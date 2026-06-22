@@ -1,0 +1,182 @@
+/* @theme rose-pine-moon */
+/*
+Rosé Pine theme create by RAINBOWFLESH
+> www.rosepinetheme.com
+
+palette in :root
+*/
+
+@import "default";
+@import "schema";
+@import "structure";
+
+:root {
+    --base: #232136;
+    --surface: #2a273f;
+    --overlay: #393552;
+    --muted: #6e6a86;
+    --subtle: #908caa;
+    --text: #e0def4;
+    --love: #eb6f92;
+    --gold: #f6c177;
+    --rose: #ea9a97;
+    --pine: #3e8fb0;
+    --foam: #9ccfd8;
+    --iris: #c4a7e7;
+    --highlight-low: #2a283e;
+    --highlight-muted: #44415a;
+    --highlight-high: #56526e;
+
+    font-family: Pier Sans, ui-sans-serif, system-ui, -apple-system,
+        BlinkMacSystemFont, Segoe UI, Roboto, Helvetica Neue, Arial, Noto Sans,
+        sans-serif, "Apple Color Emoji", "Segoe UI Emoji", Segoe UI Symbol,
+        "Noto Color Emoji";
+    font-weight: initial;
+
+    background-color: var(--base);
+}
+/* Common style */
+section {
+    padding: 40px 75px;
+}
+
+h1 {
+    color: var(--rose);
+    margin-top: 0.45em;
+    padding-top: 0.45em;
+    padding-bottom: 2mm;
+    margin-bottom: 12mm;
+}
+h2 {
+    color: var(--rose);
+}
+h3 {
+    color: var(--rose);
+}
+h4 {
+    color: var(--rose);
+}
+h5 {
+    color: var(--rose);
+}
+h6 {
+    color: var(--rose);
+}
+a {
+    color: var(--iris);
+}
+p {
+    font-family: inherit;
+    font-weight: 400;
+    line-height: 1.35;
+    color: var(--subtle);
+}
+code {
+    color: var(--text);
+    background-color: var(--highlight-muted);
+}
+text {
+    color: var(--text);
+}
+ul {
+    color: var(--subtle);
+}
+li {
+    font-family: inherit;
+    font-weight: 400;
+    color: var(--subtle);
+    line-height: 1.35;
+}
+img {
+    background-color: #ffffff;
+}
+img[src$=".png"] {
+    padding: 10px;
+    background-color: #ffffff;
+}
+strong {
+    color: var(--text);
+    font-weight: inherit;
+    font-weight: 800;
+}
+mjx-container {
+    color: var(--text);
+}
+marp-pre {
+    background-color: var(--overlay);
+    border-color: var(--highlight-high);
+}
+
+/* Code blok */
+.hljs-comment {
+    color: var(--muted);
+}
+.hljs-attr {
+    color: var(--foam);
+}
+.hljs-punctuation {
+    color: var(--subtle);
+}
+.hljs-string {
+    color: var(--gold);
+}
+.hljs-title {
+    color: var(--foam);
+}
+.hljs-keyword {
+    color: var(--pine);
+}
+.hljs-variable {
+    color: var(--text);
+}
+.hljs-literal {
+    color: var(--rose);
+}
+.hljs-type {
+    color: var(--love);
+}
+.hljs-number {
+    color: var(--gold);
+}
+.hljs-built_in {
+    color: var(--love);
+}
+.hljs-params {
+    color: var(--iris);
+}
+.hljs-symbol {
+    color: var(--foam);
+}
+.hljs-meta {
+    color: var(--subtle);
+}
+
+/* Table overrides for Rose Pine Moon */
+section table {
+  background: #232136;
+  color: #e0def4;
+  border-collapse: collapse;
+}
+
+section table th {
+  background: #393552;
+  color: #e0def4;
+  border-color: #56526e;
+}
+
+section table td {
+  background: #2a273f;
+  color: #e0def4;
+  border-color: #56526e;
+}
+
+section table tr:nth-child(even) td {
+  background: #232136;
+}
+
+section table code {
+  background: #393552;
+  color: #ea9a97;
+  border-radius: 4px;
+  padding: 0.08em 0.35em;
+}

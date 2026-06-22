@@ -1,0 +1,38 @@
+%% Reconstructed from docs/img/architecture.drawio.png for the Slidey overview deck.
+block-beta
+  columns 6
+  api["API gateway"]:5 apiNote["API Ingress"]
+  bgA["Business Gear A"] bgB["Business Gear B"] bgC["Business Gear C"] bgD["Business Gear D"] bgE["Business Gear E"] businessNote["Business Logic gears
+Primary user-facing SaaS application logic"]
+  chat["Chat engine"] models["Models Registry"] agents["AI Agents Registry"] search["Web Search Gateway"] mcp["MCP Registry"] genAiNote["Gen AI modules
+Generic foundation for generative AI"]
+  llm["LLM gateway
+(inference, embedding)"] provider["Model Provider Controller"] memory["Agent Memory"] crawler["URL Crawler"] scheduler["Model Scheduler"] genAiNote2[" "]
+  serverlessGw["Serverless Gateway"] runtime["Serverless Runtimes"] settings["Settings Service"] durable["Durable Objects"] cluster["Cluster Plane"] serverlessNote["Serverless
+FaaS, workflows, storage"]
+  email["Emails Storage"] notifications["Notifications Service"] approvals["Approvals"] jobs["Jobs Manager"] parser["File Parser"] coreNote["Core functionality
+General purpose functionality"]
+  analytics["Analytics"] nodes["Nodes Registry"] usage["Usage Collector"] events["Events Broker"] fileStorage["File Storage"] coreNote2[" "]
+  rg["Resource Groups"] types["Types Registry"] quota["Quota Enforcer"] audit["Audit"] downloader["File Downloader"] integrationNote["Core Platform Integration
+Compiled-in adapters to core platform"]
+  tenant["Tenant Resolver
+Adapter"] authn["Auth Resolver
+Adapter"] license["License Resolver
+Adapter"] credentials["Credentials Store
+Adapter"] outbound["Outbound API interface
+Adapter"] integrationNote2[" "]
+  account["Account Manager"] policy["Policy Manager"] licenseMgr["License Manager"] credStore["Credentials Store"] oagw["Outbound API gateway"] platformNote["Core Platform Services
+External platform or standalone services"]
+  toolkit["Toolkit Libraries"]:5 toolkitNote["Shared Toolkit Libraries
+auth, odata, secure orm, errors, grpc, data types"]
+
+  rg --> tenant
+  types --> authn
+  quota --> license
+  audit --> credentials
+  downloader --> outbound
+  tenant --> account
+  authn --> policy
+  license --> licenseMgr
+  credentials --> credStore
+  outbound --> oagw

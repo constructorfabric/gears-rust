@@ -1,0 +1,914 @@
+{
+  "title": "Gears overview migration QA",
+  "resolution": {
+    "width": 1920,
+    "height": 1080
+  },
+  "scenes": [
+    {
+      "type": "image-compare",
+      "title": "Slide 01: Constructor Fabric Gears (Rust)",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.001.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/00-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 02: Agenda",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.002.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/01-09.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 03: Part 1 — What & Why",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.003.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/02-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 04: What is Constructor Gear?",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.004.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/03-04.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 05: For whom?",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.005.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/04-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 06: Non-goals",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.006.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/05-04.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 07: Key defining characteristics",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.007.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/06-08.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 08: Part 2 — Architecture Principles & Philosophy",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.008.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/07-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 09: Principle 1 — Secure by default (defense-in-depth)",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.009.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/08-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 10: Principle 2 — Architecture enforced at compile time",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.010.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/09-03.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 11: Dylint — compile-time architecture validation",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.011.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/10-09.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 12: Principle 3 — Three-tier gears hierarchy",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.012.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/11-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 13: Principle 4 — Composable libraries, vendor-controlled deployment",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.013.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/12-05.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 14: Principle 5 — Local-first shift-left development",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.014.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/13-05.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 15: Principle 6 — Pre-integrated XaaS backbone",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.015.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/14-04.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 16: Principle 7 — Extensible domain model via GTS",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.016.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/15-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 17: Engineering principles (how we work)",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.017.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/16-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 18: Part 3 — Foundations",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.018.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/17-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 19: Why Rust?",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.019.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/18-07.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 20: Why a monorepo?",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.020.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/19-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 21: Deployment shapes (FUTURE)",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.021.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/20-04.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 22: Repository structure",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.022.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/21-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 23: Part 4 — What is a Gear in a nutshell?",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.023.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/22-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 24: Gear = independent capability domain",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.024.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/23-07.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 25: Gear architecture (the big picture)",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.025.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/24-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 26: Planned Gears map",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.026.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/25-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 27: Gear anatomy — DDD-light layers",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.027.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/26-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 28: Gear execution model",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.028.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/27-03.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 29: Gear composition — compiled-in vs selectable",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.029.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/28-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 30: Gear lifecycle (platform-owned)",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.030.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/29-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 31: Gear categories",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.031.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/30-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 32: Plugins & extensibility",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.032.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/31-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 33: Part 5 — Gears Toolkit",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.033.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/32-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 34: Gears Toolkit — mission",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.034.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/33-04.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 35: Tookit — features",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.035.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/34-09.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 36: Consistent API dialect",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.036.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/35-07.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 37: API handler registration example",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.037.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/36-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 38: Part 6 — Cross-cutting Concerns",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.038.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/37-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 39: Request lifecycle",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.039.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/38-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 40: Request lifecycle — who owns what",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.040.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/39-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 41: Security — PDP/PEP authorization",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.041.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/40-05.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 42: Security — Secure ORM & tenancy",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.042.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/41-07.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 43: Security — defense across the lifecycle",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.043.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/42-07.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 44: Security — FIPS 140-3",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.044.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/43-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 45: Global Type System (GTS)",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.045.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/44-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 46: Errors — canonical taxonomy",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.046.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/45-05.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 47: Observability & operations",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.047.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/46-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 48: Part 7 — Engineering & Developer Experience",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.048.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/47-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 49: Developer experience",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.049.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/48-07.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 50: Spec-Driven Development (SDD)",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.050.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/49-06.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 51: Testing architecture",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.051.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/50-03.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 52: Part 8 — Getting Started",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.052.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/51-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 53: Prerequisites",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.053.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/52-05.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 54: How to build & run",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.054.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/53-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 55: Configuration",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.055.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/54-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 56: How to run tests",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.056.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/55-02.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 57: How to contribute",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.057.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/56-09.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 58: Documentation map",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.058.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/57-09.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 59: Why Constructor Gears is a good choice for your project",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.059.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/58-08.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    },
+    {
+      "type": "image-compare",
+      "title": "Slide 60: Thank you",
+      "left": {
+        "label": "Marp original",
+        "src": "compare/old/slide.060.png"
+      },
+      "right": {
+        "label": "Slidey themed migration",
+        "src": "compare/new/59-01.png"
+      },
+      "fit": "contain",
+      "variant": "qa",
+      "caption": "Marp original vs current Slidey final reveal"
+    }
+  ],
+  "meta": {
+    "title": "Gears overview comparison",
+    "mode": "pitch",
+    "theme": "rose-pine-moon"
+  }
+}
