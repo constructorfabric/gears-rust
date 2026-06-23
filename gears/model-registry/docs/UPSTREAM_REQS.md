@@ -58,7 +58,7 @@ The gear **MUST** return the provider's API endpoint and GTS type for credential
 
 #### Return Provider Health Metrics
 
-- [ ] `p2` - **ID**: `cpt-cf-model-registry-upreq-provider-health`
+- [ ] `p3` - **ID**: `cpt-cf-model-registry-upreq-provider-health`
 
 The gear **MUST** return provider health status (healthy, degraded, unhealthy) and optionally latency and error rate metrics for proactive provider selection.
 
@@ -97,7 +97,7 @@ The gear **MUST** return distinct errors for: model not found in catalog, model 
 | Priority | Requirements |
 |----------|-------------|
 | p1 (critical) | `cpt-cf-model-registry-upreq-get-tenant-model`, `cpt-cf-model-registry-upreq-model-capabilities`, `cpt-cf-model-registry-upreq-provider-info`, `cpt-cf-model-registry-upreq-tenant-hierarchy`, `cpt-cf-model-registry-upreq-low-latency`, `cpt-cf-model-registry-upreq-error-responses` |
-| p2 (important) | `cpt-cf-model-registry-upreq-provider-health` |
+| p3 (deferred) | `cpt-cf-model-registry-upreq-provider-health` — depends on Model Registry `fr-health-monitoring` which is scheduled for MR phase 3 |
 
 ## 4. Traceability
 

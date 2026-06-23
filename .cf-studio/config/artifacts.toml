@@ -94,10 +94,6 @@ patterns = ["gears/mini-chat/*"]
 reason = "Ignore module 'approval-service' (PRD/DESIGN are placeholders). Remove this ignore after PRD/DESIGN conform to template."
 patterns = ["gears/approval-service/*"]
 
-[[ignore]]
-reason = "Ignore module 'model-registry' (PRD/DESIGN headings need restructuring to match template). Remove after structural alignment."
-patterns = ["gears/model-registry/*"]
-
 [[systems]]
 name = "cf-gears"
 slug = "cf"
