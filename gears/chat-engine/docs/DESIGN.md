@@ -1,5 +1,5 @@
 Created:  2026-03-06 by Constructor Tech
-Updated:  2026-06-19 by Constructor Tech
+Updated:  2026-06-23 by Constructor Tech
 # Technical Design: Chat Engine
 
 
@@ -56,6 +56,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 |--------|----------------------|
 | `cpt-cf-chat-engine-fr-create-session` | RESTful API endpoint creates session record, invokes backend plugin with `session.created` event, stores returned `enabled_capabilities` (typed `Capability[]`) |
 | `cpt-cf-chat-engine-fr-send-message` | HTTP streaming endpoint forwards message to backend plugin, pipes streamed response back to client, persists complete exchange after streaming |
+| `cpt-cf-chat-engine-fr-delta-streaming` | SSE delta protocol (`start`/`delta`/`complete`/`error`) projects plugin output into `(op, path, value)` mutations; per-message `seq` + `Last-Event-ID` resume against a short-TTL event buffer (`cpt-cf-chat-engine-design-stream-resume`) |
 | `cpt-cf-chat-engine-fr-attach-files` | Messages support file URL array field; client uploads to external storage first, includes URLs in message payload |
 | `cpt-cf-chat-engine-fr-switch-session-type` | Session stores current session_type_id; switching updates this field and routes next message to new backend plugin |
 | `cpt-cf-chat-engine-fr-recreate-response` | Creates new message with same parent_message_id as original, sends `message.recreate` event to backend plugin |
@@ -90,7 +91,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-nfr-availability` | Stateless instances behind load balancer; health check endpoints; database read replicas for failover |
 | `cpt-cf-chat-engine-nfr-scalability` | Horizontal scaling; database sharding by tenant_id; connection pool per instance |
 | `cpt-cf-chat-engine-nfr-data-persistence` | Database transactions wrap message writes; acknowledge client only after commit confirmation |
-| `cpt-cf-chat-engine-nfr-streaming` | HTTP chunked transfer encoding; buffering disabled; direct pipe from plugin to client |
+| `cpt-cf-chat-engine-nfr-streaming` | SSE delta stream; buffering disabled; per-message `seq` for ordering/resume; plugin events projected to the client with minimal latency |
 | `cpt-cf-chat-engine-nfr-authentication` | JWT-based authentication; client_id, user_id, tenant_id claim extraction; session ownership validated by user_id; tenant isolation enforced by tenant_id on every request |
 | `cpt-cf-chat-engine-nfr-data-integrity` | Database foreign key constraints on parent_message_id; unique constraint on (session_id, parent_message_id, variant_index) |
 | `cpt-cf-chat-engine-nfr-backend-isolation` | Error isolation per backend plugin; plugins own their own resilience (retry, circuit breaker, timeout); Chat Engine isolates plugin failures from other sessions |
@@ -108,10 +109,12 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 |--------|----------|
 | `cpt-cf-chat-engine-adr-message-tree-structure` | Immutable tree with parent_message_id for conversation branching |
 | `cpt-cf-chat-engine-adr-capability-model` | Plugin-driven capability model for session type configuration |
-| `cpt-cf-chat-engine-adr-streaming-architecture` | HTTP chunked transfer for streaming responses |
+| `cpt-cf-chat-engine-adr-streaming-architecture` | Streaming responses (SSE delta protocol) for time-to-first-byte |
+| `cpt-cf-chat-engine-adr-sse-delta-streaming` | Server-Sent Events carrying `(op, path, value)` deltas (supersedes NDJSON); client maintains the message document |
+| `cpt-cf-chat-engine-adr-stream-resumability` | `seq` + `Last-Event-ID` resume backed by a short-TTL event buffer (DB table default, optional Redis) |
 | `cpt-cf-chat-engine-adr-routing-layer` | Zero business logic routing layer |
 | `cpt-cf-chat-engine-adr-file-handling` | URL-based file references with external storage |
-| `cpt-cf-chat-engine-adr-http-client-protocol` | HTTP streaming with NDJSON for client communication (WebSocket rejected) |
+| `cpt-cf-chat-engine-adr-http-client-protocol` | HTTP streaming for client communication, WebSocket rejected (NDJSON superseded by SSE — see `cpt-cf-chat-engine-adr-sse-delta-streaming`) |
 | `cpt-cf-chat-engine-adr-webhook-event-types` | Typed event categories for plugin notifications |
 | `cpt-cf-chat-engine-adr-streaming-cancellation` | Client-initiated streaming cancellation with partial save |
 | `cpt-cf-chat-engine-adr-stateless-scaling` | Stateless instances for horizontal scaling |
@@ -139,7 +142,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-nfr-response-time` | Stateless routing, async I/O | Direct plugin invocation without intermediate queuing; streaming starts immediately |
 | `cpt-cf-chat-engine-nfr-availability` | Stateless scaling | Horizontal scaling with no shared in-memory state; database is single point of persistence |
 | `cpt-cf-chat-engine-nfr-scalability` | Stateless architecture | Any instance can handle any session; load balancer distributes evenly |
-| `cpt-cf-chat-engine-nfr-streaming` | HTTP chunked transfer | NDJSON streaming with backpressure; chunks forwarded as received from plugin |
+| `cpt-cf-chat-engine-nfr-streaming` | SSE delta protocol | `start`/`delta`/`complete`/`error` events over `text/event-stream` with backpressure; resume via `Last-Event-ID` |
 | `cpt-cf-chat-engine-nfr-data-integrity` | ACID transactions | All state mutations wrapped in database transactions; message tree immutability enforced |
 | `cpt-cf-chat-engine-nfr-data-persistence` | PostgreSQL with WAL | Write-ahead logging ensures durability; client acknowledged only after commit confirmation |
 | `cpt-cf-chat-engine-nfr-authentication` | JWT validation middleware | Bearer token validation on every request; user_id, tenant_id, client_id claim extraction |
@@ -156,7 +159,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
-| **API Layer** | HTTP request handling, streaming response coordination, authentication, chunked transfer encoding | HTTP server with async I/O |
+| **API Layer** | HTTP request handling, SSE delta-stream coordination, authentication | HTTP server with async I/O |
 | **Application Layer** | Use case orchestration, plugin invocation, streaming coordination | Service classes with dependency injection |
 | **Domain Layer** | Business logic, message tree operations, validation rules | Domain entities and value objects |
 | **Infrastructure Layer** | Database access, plugin trait dispatch, file storage client | PostgreSQL, HTTP client library (used by plugins), S3 SDK |
@@ -166,7 +169,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | PostgreSQL full-text search scalability degrades beyond ~10M rows | Search latency increases; may require dedicated search engine (e.g., Elasticsearch) | Monitor query latency on `idx_message_parts_text_fts`; plan migration path to external search service |
-| NDJSON streaming through reverse proxies and CDNs may be buffered | Clients experience delayed chunks instead of real-time streaming | Ensure proxy configuration disables response buffering (`X-Accel-Buffering: no`, `proxy_buffering off`) |
+| SSE streaming through reverse proxies and CDNs may be buffered | Clients experience delayed deltas instead of real-time streaming | Ensure proxy configuration disables response buffering (`X-Accel-Buffering: no`, `proxy_buffering off`); SSE keep-alive comments hold the connection open |
 | JSONB query performance degrades with deeply nested structures | Slow queries on `message_parts.content`, `metadata`, and `enabled_capabilities` columns | Limit JSONB nesting depth in GTS schemas; prefer top-level keys for indexed access |
 | Single-database architecture limits horizontal write scaling | Write throughput capped by single PostgreSQL instance | Bounded by `cpt-cf-chat-engine-constraint-single-database`; vertical scaling and read replicas as interim measures; sharding by `tenant_id` as future option |
 
@@ -201,7 +204,7 @@ Backend plugins are code modules inside Chat Engine implementing the `ChatEngine
 <!-- fdd-id-content -->
 **ADRs**: `cpt-cf-chat-engine-adr-streaming-architecture`
 
-All plugin responses are streamed by default to minimize time-to-first-byte. Plugins write chunks to a `ResponseStream` handle; Chat Engine pipes them directly to the client via HTTP chunked transfer with minimal buffering.
+All plugin responses are streamed by default to minimize time-to-first-byte. Plugins write chunks/parts to a `ResponseStream` handle; Chat Engine projects them into a Server-Sent Events **delta** stream (`start` → `delta*` → `complete`/`error`) and emits them to the client with minimal buffering. Each event carries a per-message `seq` so a dropped connection resumes via `Last-Event-ID` (`cpt-cf-chat-engine-design-stream-resume`).
 <!-- fdd-id-content -->
 
 #### Principle: Zero Business Logic in Routing
@@ -283,16 +286,62 @@ All Chat Engine instances share a single database cluster. No local caching of s
 
 #### Streaming Events (streaming/)
 
-**Note**: Sent via HTTP chunked response as newline-delimited JSON (NDJSON)
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-design-streaming-protocol`
 
-- **StreamingStartEvent** - Begin streaming (message_id)
-- **StreamingChunkEvent** - Stream chunk (message_id, chunk: text fragment appended to the assistant message's active `text` part — the part materialised at `number = 0` on completion)
-- **StreamingCompleteEvent** - Streaming finished (message_id, metadata: optional plugin-defined object; omitted from the wire payload when absent)
-- **StreamingErrorEvent** - Stream error (message_id, error: human-readable description; no further events follow)
+**Transport**: Server-Sent Events (`text/event-stream`). Each SSE frame carries `id: <seq>`, `event: <type>`, `data: <JSON of the event>` (`cpt-cf-chat-engine-adr-sse-delta-streaming`, supersedes the NDJSON shape of `cpt-cf-chat-engine-adr-http-client-protocol`).
 
-> **Streaming and parts**: only the assistant's `text` part is chunk-streamed (chunks accumulate into a single `text` part). Richer parts (`code`, `images`, `videos`, `links`, `statuses`) returned by the plugin are persisted on completion and surfaced via `MessageGetResponse.parts`; per-part incremental streaming of non-text parts is an intentional exclusion for this iteration (see §5).
->
-> **Streaming and citations**: citations and references (`cpt-cf-chat-engine-design-entity-citations`) ride on the plugin's terminal `text` part and are persisted with it at finalize — they are not streamed incrementally. The `StreamingCompleteEvent.metadata` MAY carry them for the client; the authoritative copy is read back via `MessageGetResponse.parts[].{file_citations,link_citations,references}`.
+The stream is a **delta protocol**: `start` establishes the (empty) assistant message document, `delta` events mutate it by `(op, path, value)`, and `complete` / `error` terminate it. The client maintains the message document locally and applies each delta — there is no separate `chunk` event (text arrives as `append` deltas on a `text` part). Every event carries a per-message monotonically-increasing `seq`, mirrored in the SSE `id:` line for ordering, de-duplication, and resume (`cpt-cf-chat-engine-design-stream-resume`).
+
+- **StreamingStartEvent** - Begin streaming (`event: "start"`; fields: `message_id`, `seq`). Marks the assistant message as open; the document starts with no parts.
+- **StreamingDeltaEvent** - Mutate the message document (`event: "delta"`; fields: `message_id`, `seq`, `op`, `path`, `value`).
+- **StreamingCompleteEvent** - Streaming finished (`event: "complete"`; fields: `message_id`, `seq`, `metadata?`). No further events follow.
+- **StreamingErrorEvent** - Stream error (`event: "error"`; fields: `message_id`, `seq`, `error`: human-readable description). Terminal.
+
+**Delta operations** (`StreamingDeltaEvent.op`):
+
+| op | meaning |
+|----|---------|
+| `add` | Set the value at `path` (create a part, set a field). |
+| `append` | Append `value` to the existing value at `path` (text fragment onto `parts/N/content/text`; element onto an array like `parts/N/file_citations`). |
+| `patch` | Replace a scalar/field at `path` (e.g. a part `title`, message `metadata`). |
+| `remove` | Remove the value at `path` (rarely used; e.g. retract a speculative part). |
+
+**Delta paths** (`StreamingDeltaEvent.path`) address the message document, mirroring `MessageGetResponse`:
+- `parts/{n}` — a whole `MessagePart` (used with `add` when a new part opens)
+- `parts/{n}/content/text` — text body of a `text` part (used with `append` for token streaming)
+- `parts/{n}/content` — typed content of a non-text part (used with `add`/`patch`)
+- `parts/{n}/file_citations` · `parts/{n}/link_citations` · `parts/{n}/references` — citation/reference arrays (used with `append`)
+- `metadata` — message metadata (used with `patch`)
+
+Example stream (text part with a streamed token, then a links part, then a citation):
+
+```
+id: 0\nevent: start\ndata: {"message_id":"…","seq":0}
+id: 1\nevent: delta\ndata: {"message_id":"…","seq":1,"op":"add","path":"parts/0","value":{"type":"text","content":{"text":""},"number":0}}
+id: 2\nevent: delta\ndata: {"message_id":"…","seq":2,"op":"append","path":"parts/0/content/text","value":"Hel"}
+id: 3\nevent: delta\ndata: {"message_id":"…","seq":3,"op":"append","path":"parts/0/content/text","value":"lo"}
+id: 4\nevent: delta\ndata: {"message_id":"…","seq":4,"op":"append","path":"parts/0/file_citations","value":[{"document_id":"doc-1","index":1}]}
+id: 5\nevent: complete\ndata: {"message_id":"…","seq":5,"metadata":{"finish_reason":"stop"}}
+```
+
+This delta model makes **all parts and citations stream incrementally** (superseding the earlier per-part-streaming exclusion). Server-side, the engine still accumulates the parts to persist the final message on completion (the deltas are the wire projection of that build).
+
+##### Stream resume
+
+- [ ] `p2` - **ID**: `cpt-cf-chat-engine-design-stream-resume`
+
+A dropped connection (network blip, client reload) MUST be resumable without re-running the plugin. Resume rides the standard SSE mechanism (`cpt-cf-chat-engine-adr-stream-resumability`):
+
+- On reconnect the client sends `Last-Event-ID: <seq>` (the SSE `id:` of the last applied event). The server **replays buffered events with `seq > last`** then continues live; the client applies them on top of its existing document, so the result is identical to an uninterrupted stream.
+- If the buffer for that message is gone (TTL expired) or the stream already terminated, the server closes with no replay and the client falls back to a one-shot `GET /messages/{id}` to fetch the final document.
+- `seq` is a per-message monotonic counter assigned by the engine as it emits events (it is **not** the part `number`). Clients de-duplicate on `seq`.
+
+**Event buffer (`StreamEventBuffer` port).** Events are appended to a per-message append-only buffer keyed by `message_id`, each `(seq, event)`, with a short TTL (live-stream window, minutes — not durable history). The buffer is a port with two backends:
+
+- **DB-table** (`cpt-cf-chat-engine-dbtable-stream-events`) — default; keeps the gear within `cpt-cf-chat-engine-constraint-single-database` (no new infra). A periodic sweep deletes rows past TTL.
+- **Redis Streams** — optional, mirrors rolos; lower-latency fan-out and native `XADD`/`XREAD` cursors, but **relaxes** `cpt-cf-chat-engine-constraint-single-database` (adds a Redis dependency). Selected by config; off by default.
+
+> The buffer is **not** durable conversation history — it only bridges reconnects within the live window. The durable record is the persisted message (parts + citations), read via `GET /messages/{id}`.
 
 #### Webhook Protocol (webhook/)
 
@@ -439,7 +488,8 @@ Cryptographic share token (share_token, session_id, created_at, expires_at)
 **Relationships**:
 
 HTTP Protocol:
-- StreamingStartEvent, StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent → message_id: linked sequence
+- StreamingStartEvent, StreamingDeltaEvent, StreamingCompleteEvent, StreamingErrorEvent → message_id + seq: ordered, resumable sequence
+- StreamingDeltaEvent → MessagePart / citations: mutates the message document by `(op, path, value)`
 - SessionCreateRequest → SessionType: references via session_type_id
 - MessageSendRequest → Session: references via session_id
 - MessageSendRequest → Message: optional parent via parent_message_id
@@ -522,7 +572,7 @@ flowchart TB
 
 **System Architecture**:
 
-Chat Engine handles all chat-related operations. It is deployed as a unified monolithic service, not as separate microservices. Each instance includes an HTTP server with chunked streaming support for client connections and provides the following core functionality through internal gears.
+Chat Engine handles all chat-related operations. It is deployed as a unified monolithic service, not as separate microservices. Each instance includes an HTTP server with Server-Sent Events delta streaming for client connections and provides the following core functionality through internal gears.
 
 **Core Functionality**:
 
@@ -555,7 +605,7 @@ Chat Engine's plugin invocation layer. Resolves `dyn ChatEngineBackendPlugin` by
 <!-- fdd-id-content -->
 **ADRs**: `cpt-cf-chat-engine-adr-streaming-architecture` (streaming architecture), `cpt-cf-chat-engine-adr-streaming-cancellation` (cancellation), `cpt-cf-chat-engine-adr-backpressure-handling` (backpressure)
 
-Chat Engine manages HTTP chunked streaming functionality. It pipes data from backend plugin to client via HTTP streaming responses. This handles stateless request processing, partial response saving on connection close, and backpressure control. Each stream is identified by unique message_id.
+Chat Engine manages the SSE delta-stream functionality. It projects backend-plugin output into `start`/`delta`/`complete`/`error` events and emits them to the client over `text/event-stream`. This handles request processing, partial response saving on connection close, backpressure, per-message `seq` assignment, and resume via `Last-Event-ID` against the short-TTL event buffer (`cpt-cf-chat-engine-design-stream-resume`). Each stream is identified by a unique message_id.
 <!-- fdd-id-content -->
 
 #### Conversation Export
@@ -592,7 +642,7 @@ Chat Engine allows users to react to messages with simple like/dislike feedback.
 **Key Interactions**:
 - Client → Chat Engine: Session and message operations via HTTP REST API
 - Chat Engine → Backend Plugin: internal trait call with context (in-process)
-- Chat Engine → Client: HTTP chunked streaming with NDJSON messages
+- Chat Engine → Client: Server-Sent Events delta stream (`start`/`delta`/`complete`/`error`)
 - Chat Engine → File Storage: File upload with signed URL generation for exports
 - Chat Engine → Database: All persistence operations for sessions, messages, and metadata
 - Chat Engine → Summarization Service: Context summarization requests
@@ -645,7 +695,7 @@ Plugin registry and trait dispatch: resolves `dyn ChatEngineBackendPlugin` by `p
 
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-component-response-streaming`
 
-HTTP chunked streaming: plugin-to-client pipe, backpressure control, connection cancellation, partial response saving. **ADRs**: `cpt-cf-chat-engine-adr-streaming-architecture`, `cpt-cf-chat-engine-adr-streaming-cancellation`, `cpt-cf-chat-engine-adr-backpressure-handling`.
+SSE delta streaming: plugin-to-client projection (`start`/`delta`/`complete`/`error`), `seq` assignment, resume buffer, backpressure control, connection cancellation, partial response saving. **ADRs**: `cpt-cf-chat-engine-adr-streaming-architecture`, `cpt-cf-chat-engine-adr-sse-delta-streaming`, `cpt-cf-chat-engine-adr-stream-resumability`, `cpt-cf-chat-engine-adr-streaming-cancellation`, `cpt-cf-chat-engine-adr-backpressure-handling`.
 
 #### Conversation Export Gear
 
@@ -681,11 +731,12 @@ See [`api/README.md`](api/README.md) for comprehensive protocol documentation.
 - **Session Management (10)**: Create, get, delete, switch type, export, share, access shared, search, summarize (streaming)
 - **Message Operations (5)**: Send (streaming), recreate (streaming), list, get, variants, reaction
 
-**HTTP Streaming**:
-- Content-Type: `application/x-ndjson` (newline-delimited JSON)
-- Transfer-Encoding: chunked
-- Cancellation: Close HTTP connection
-- Events: start, chunk, complete, error
+**HTTP Streaming** (`cpt-cf-chat-engine-design-streaming-protocol`):
+- Content-Type: `text/event-stream` (Server-Sent Events)
+- Frame: `id: <seq>` · `event: <type>` · `data: <JSON>`
+- Events: `start`, `delta` (`{op, path, value}`), `complete`, `error`
+- Cancellation: close the HTTP connection
+- Resume: reconnect with `Last-Event-ID: <seq>` (`cpt-cf-chat-engine-design-stream-resume`)
 
 For complete endpoint definitions, request/response schemas, and examples, see the OpenAPI specification file.
 
@@ -704,7 +755,7 @@ For complete endpoint definitions, request/response schemas, and examples, see t
 - `on_session_summary(ctx, stream)` → streams session summary
 - `health_check()` → HealthStatus (optional)
 
-**Streaming**: Plugin writes chunks to `ResponseStream`; Chat Engine pipes to client via HTTP chunked transfer (NDJSON)
+**Streaming**: Plugin writes chunks/parts to `ResponseStream`; Chat Engine projects them into `start`/`delta`/`complete`/`error` events and emits them to the client over SSE (`cpt-cf-chat-engine-design-streaming-protocol`)
 
 
 ### 3.3.1 Internal Dependencies
@@ -786,7 +837,7 @@ sequenceDiagram
 
     loop Streaming Response
         Backend Plugin-->>Chat Engine: Stream chunk
-        Chat Engine-->>Client: Stream chunk
+        Chat Engine-->>Client: Stream delta (SSE)
     end
 
     Backend Plugin-->>Chat Engine: Stream complete
@@ -820,7 +871,7 @@ sequenceDiagram
 
     loop Streaming Response
         Backend Plugin-->>Chat Engine: Stream chunk
-        Chat Engine-->>Client: Stream chunk
+        Chat Engine-->>Client: Stream delta (SSE)
     end
 
     Backend Plugin-->>Chat Engine: Stream complete
@@ -850,7 +901,7 @@ sequenceDiagram
 
     loop Streaming Response
         Backend Plugin B-->>Chat Engine: Stream chunk
-        Chat Engine-->>Client: Stream chunk
+        Chat Engine-->>Client: Stream delta (SSE)
     end
 
     Backend Plugin B-->>Chat Engine: Stream complete
@@ -878,7 +929,7 @@ sequenceDiagram
 
     loop Streaming New Response
         Backend Plugin-->>Chat Engine: Stream chunk
-        Chat Engine-->>Client: Stream chunk
+        Chat Engine-->>Client: Stream delta (SSE)
     end
 
     Backend Plugin-->>Chat Engine: Stream complete
@@ -908,7 +959,7 @@ sequenceDiagram
 
     loop Streaming Response
         Backend Plugin-->>Chat Engine: Stream chunk
-        Chat Engine-->>Client: Stream chunk
+        Chat Engine-->>Client: Stream delta (SSE)
     end
 
     Backend Plugin-->>Chat Engine: Stream complete
@@ -991,7 +1042,7 @@ sequenceDiagram
 
     loop Streaming Response
         Backend Plugin-->>Chat Engine: Stream chunk
-        Chat Engine-->>User B: Stream chunk
+        Chat Engine-->>User B: Stream delta (SSE)
     end
 
     Backend Plugin-->>Chat Engine: Stream complete
@@ -1021,7 +1072,7 @@ sequenceDiagram
 
     loop Streaming Response
         Backend Plugin-->>Chat Engine: Stream chunk
-        Chat Engine-->>Client: Stream chunk
+        Chat Engine-->>Client: Stream delta (SSE)
     end
 
     Note over Client: User cancels streaming
@@ -1101,7 +1152,7 @@ sequenceDiagram
 
             loop Streaming Summary
                 Summarization Service-->>Chat Engine: Stream chunk
-                Chat Engine-->>Client: Stream chunk
+                Chat Engine-->>Client: Stream delta (SSE)
             end
 
             Summarization Service-->>Chat Engine: Stream complete
@@ -1111,7 +1162,7 @@ sequenceDiagram
 
             loop Streaming Summary
                 Backend Plugin-->>Chat Engine: Stream chunk
-                Chat Engine-->>Client: Stream chunk
+                Chat Engine-->>Client: Stream delta (SSE)
             end
 
             Backend Plugin-->>Chat Engine: Stream complete
@@ -1327,6 +1378,22 @@ Lightweight URL badges attached to a `text` `message_part` (see `cpt-cf-chat-eng
 | created_at | TIMESTAMPTZ | Creation timestamp |
 | updated_at | TIMESTAMPTZ | Last modification timestamp |
 
+#### Table: stream_events
+
+- [ ] `p2` - **ID**: `cpt-cf-chat-engine-dbtable-stream-events`
+
+Short-TTL resume buffer for the SSE delta stream (default backend of the `StreamEventBuffer` port — see `cpt-cf-chat-engine-design-stream-resume`). Append-only; swept after `expires_at`. **Not** durable history.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| message_id | UUID | Assistant message whose stream this event belongs to (composite PK) |
+| seq | BIGINT | Per-message monotonic event ordinal mirrored in the SSE `id:` line (composite PK) |
+| event | JSONB | Serialized streaming event (`start` / `delta` / `complete` / `error`) replayed verbatim on resume |
+| created_at | TIMESTAMPTZ | Emission timestamp |
+| expires_at | TIMESTAMPTZ | TTL deadline; a periodic sweep deletes rows past this |
+
+**PK**: (message_id, seq). When the Redis backend is configured instead, this table is unused.
+
 #### Indexes
 
 | Table | Index | Columns | Type |
@@ -1341,6 +1408,7 @@ Lightweight URL badges attached to a `text` `message_part` (see `cpt-cf-chat-eng
 | link_citations | idx_link_citations_part | (message_part_id) | btree |
 | link_references | idx_link_references_part | (message_part_id) | btree |
 | message_reactions | idx_reactions_message | (message_id) | btree |
+| stream_events | idx_stream_events_expiry | (expires_at) | btree (TTL sweep) |
 
 ### 3.5 Authorization Model
 
@@ -1561,7 +1629,8 @@ Aspects acknowledged and intentionally excluded from this DESIGN.
 | Category | Exclusion | Reason |
 |----------|-----------|--------|
 | **Content Safety** | Content moderation, toxicity filtering | Delegated to backend plugins (Principle: Zero Business Logic in Routing — `cpt-cf-chat-engine-principle-zero-business-logic`) |
-| **Per-part streaming** | Incremental streaming of non-text parts (images/videos/links/statuses) and of citations/references | Only the assistant `text` part is chunk-streamed; richer parts and all citations/references are persisted on completion and returned via `MessageGetResponse.parts`. Discrete per-part / per-citation stream events are a future enhancement (`cpt-cf-chat-engine-design-entity-message-part`, `cpt-cf-chat-engine-design-entity-citations`) |
+| **Redis stream buffer** | Redis-backed resume buffer (rolos-style `XADD`/`XREAD`) | The default resume buffer is the DB table (`cpt-cf-chat-engine-dbtable-stream-events`), keeping the gear within `cpt-cf-chat-engine-constraint-single-database`. Redis Streams is an optional, config-gated backend that relaxes that constraint; not enabled by default |
+| **Durable stream replay** | Long-term replay of historical streams | The event buffer is short-TTL (live-reconnect window only); historical reads use the persisted message (`GET /messages/{id}`), not the stream |
 | **Citation position computation** | Engine-side scanning of part text to compute `[N]` marker offsets | `text_positions` / anchors are forwarded verbatim from the plugin (`cpt-cf-chat-engine-principle-zero-business-logic`); the engine never parses message text to derive citation positions |
 | **Extra part types** | `audio`, `document`, `table` part types | Out of initial scope; the `MessagePartType` set starts at text/code/images/videos/links/statuses and is extensible via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`) |
 | **Accessibility** | UI/UX accessibility requirements | Backend service; client application responsibility |
