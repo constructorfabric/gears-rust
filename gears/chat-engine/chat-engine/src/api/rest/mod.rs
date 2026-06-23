@@ -152,26 +152,27 @@ where
 /// is the load-bearing detail.
 pub(crate) fn sse_delta_stream_response(
     stream: crate::domain::service::message_service::SendMessageStream,
-    cancel: tokio_util::sync::CancellationToken,
 ) -> Response {
     use crate::domain::stream_delta::DeltaProjector;
     use futures::stream;
 
-    let guard = cancel.drop_guard();
-    // Project the plugin event stream into wire delta events, threading the
-    // projector state through `scan`, then flatten the per-input batches.
+    // True live-tail (FR-024): a client disconnect does NOT cancel the driver.
+    // The driver runs to completion, buffering every event, so a reconnect via
+    // `Last-Event-ID` resumes seamlessly. Hence no `drop_guard` here — dropping
+    // this response body just stops *delivery*, not *generation*.
+    //
+    // The projector below is independent of the driver's buffer projector but
+    // sees the identical `StreamingEvent` sequence, so the `seq` it stamps on
+    // the wire matches the buffer — the client's `Last-Event-ID` lines up on
+    // reconnect.
     let wire = stream
         .scan(DeltaProjector::new(), |proj, evt| {
             std::future::ready(Some(stream::iter(proj.project(evt))))
         })
         .flatten();
 
-    let body_stream = wire.map(move |w| {
-        // Owns `guard` for the body's lifetime; dropped (→ cancels the driver
-        // token) when the body completes or the client disconnects.
-        let _keep = &guard;
-        std::result::Result::<_, Infallible>::Ok(sse_frame(&w))
-    });
+    let body_stream =
+        wire.map(|w| std::result::Result::<_, Infallible>::Ok(sse_frame(&w)));
 
     Response::builder()
         .status(StatusCode::OK)

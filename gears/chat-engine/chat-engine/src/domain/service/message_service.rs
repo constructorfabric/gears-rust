@@ -103,19 +103,34 @@ pub const RESUME_BUFFER_TTL: time::Duration = time::Duration::minutes(10);
 /// `seq`-stamped wire events (FR-024). A single [`DeltaProjector`] instance is
 /// kept so `seq` is monotonic across the whole stream. Buffer writes are
 /// best-effort: a failed append is logged and never blocks the live stream.
+///
+/// True live-tail (FR-024): a dropped channel receiver is **not** fatal. The
+/// driver keeps running to completion, buffering every event, so a
+/// `Last-Event-ID` reconnect resumes seamlessly. Once the client is gone we
+/// stop attempting channel sends that can no longer succeed.
+///
+/// The buffer projector here and the wire projector in
+/// `api::rest::sse_delta_stream_response` are two independent
+/// [`DeltaProjector`]s fed the *same* `StreamingEvent` sequence, so they assign
+/// identical `seq`s. That invariant is what lets a client reconnect with the
+/// `Last-Event-ID` it saw on the wire and have the buffer replay exactly the
+/// undelivered tail.
 struct Emitter {
     tx: mpsc::Sender<StreamingEvent>,
     projector: DeltaProjector,
     buffer: Option<Arc<dyn StreamEventBuffer>>,
     message_id: Uuid,
     expires_at: OffsetDateTime,
+    /// Set once the channel receiver is gone (client disconnected). The driver
+    /// runs on regardless; this just suppresses further doomed channel sends.
+    client_gone: bool,
 }
 
 impl Emitter {
-    /// Forward `event` to the client channel and tee its projected wire events
-    /// into the resume buffer. Returns `Err(())` when the channel receiver is
-    /// gone (client disconnected) so the caller can react as before.
-    async fn emit(&mut self, event: StreamingEvent) -> std::result::Result<(), ()> {
+    /// Tee `event` into the resume buffer (best-effort) and, while the client
+    /// is still connected, forward it to the live channel. A dropped receiver
+    /// is non-fatal — the driver runs to completion either way (FR-024).
+    async fn emit(&mut self, event: StreamingEvent) {
         if let Some(buffer) = &self.buffer {
             for wire in self.projector.project(event.clone()) {
                 let value = serde_json::to_value(&wire).unwrap_or(JsonValue::Null);
@@ -128,7 +143,11 @@ impl Emitter {
                 }
             }
         }
-        self.tx.send(event).await.map_err(|_| ())
+        if !self.client_gone && self.tx.send(event).await.is_err() {
+            debug!(message_id = %self.message_id,
+                "client disconnected; driver continues to completion (resume via Last-Event-ID)");
+            self.client_gone = true;
+        }
     }
 }
 
@@ -1253,30 +1272,20 @@ impl MessageService {
                 buffer: stream_buffer,
                 message_id: assistant_id,
                 expires_at: buffer_expires_at,
+                client_gone: false,
             };
-            // 1) Emit Start.
+            // 1) Emit Start. A disconnected client (failed send) does not abort
+            // the driver — it runs to completion so a reconnect can resume.
             let start = StreamingEvent::Start(StreamingStartEvent {
                 message_id: assistant_id,
             });
-            if emitter.emit(start).await.is_err() {
-                // Receiver dropped before we even started. Treat as
-                // cancellation.
-                cancel.cancel();
-                messages
-                    .finalize_assistant(
-                        session_id,
-                        assistant_id,
-                        FinalizeOutcome::Cancelled {
-                            text: String::new(),
-                        },
-                    )
-                    .await
-                    .ok();
-                return;
-            }
+            emitter.emit(start).await;
 
             let mut accumulator = String::new();
             let mut last_metadata: Option<JsonValue> = None;
+            // Outcome the driver settles on if the parent token is cancelled
+            // (explicit stop) before the plugin terminates. A client *drop* no
+            // longer reaches here — only an explicit `cancel.cancel()` does.
             let mut outcome = DriverOutcome::CancelledByClient;
             // Phase 7: flips to `true` when the plugin emits
             // `StreamingErrorEvent { error: "context_overflow: ..." }`. The
@@ -1323,12 +1332,10 @@ impl MessageService {
                                     message_id: assistant_id,
                                     chunk: c.chunk,
                                 });
-                                if emitter.emit(evt).await.is_err() {
-                                    // Sink dropped → client gone.
-                                    plugin_cancel.cancel();
-                                    outcome = DriverOutcome::CancelledByClient;
-                                    break;
-                                }
+                                // A dropped client connection is non-fatal: the
+                                // driver keeps consuming + buffering so a
+                                // reconnect resumes the full response.
+                                emitter.emit(evt).await;
                             }
                             Ok(StreamingEvent::Complete(c)) => {
                                 last_metadata = c.metadata.clone();
@@ -1347,7 +1354,7 @@ impl MessageService {
                                     link_citations: c.link_citations,
                                     references: c.references,
                                 });
-                                emitter.emit(evt).await.ok();
+                                emitter.emit(evt).await;
                                 outcome = DriverOutcome::Completed {
                                     metadata: last_metadata.clone(),
                                     citations,
@@ -1374,7 +1381,7 @@ impl MessageService {
                                     message_id: assistant_id,
                                     error: e.error.clone(),
                                 });
-                                emitter.emit(evt).await.ok();
+                                emitter.emit(evt).await;
                                 outcome = DriverOutcome::Errored {
                                     error: e.error,
                                     finish_reason: "error",
@@ -1388,7 +1395,7 @@ impl MessageService {
                                     message_id: assistant_id,
                                     error: error_str.clone(),
                                 });
-                                emitter.emit(evt).await.ok();
+                                emitter.emit(evt).await;
                                 outcome = DriverOutcome::Errored {
                                     error: error_str,
                                     finish_reason,

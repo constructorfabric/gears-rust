@@ -593,6 +593,64 @@ async fn cross_tenant_send_returns_not_found_against_sqlite() {
 }
 
 // ===========================================================================
+// 3b. True live-tail (FR-024, 3b-3): dropping the client stream mid-flight
+// must NOT abort generation. The detached driver runs to completion so a
+// reconnect can resume — the persisted row ends up COMPLETE, not cancelled.
+// ===========================================================================
+
+#[tokio::test]
+async fn dropped_client_stream_still_completes_generation_against_sqlite() {
+    let harness = db::setup_sqlite().await;
+    let plugin_id = "live-tail-plugin";
+    let session_type_id = db::seed_session_type(&harness, plugin_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+
+    let placeholder = Uuid::nil();
+    let plugin = FakePlugin::new(
+        plugin_id,
+        FakePluginScript::Events(vec![
+            StreamingEvent::Chunk(StreamingChunkEvent {
+                message_id: placeholder,
+                chunk: "Hel".into(),
+            }),
+            StreamingEvent::Chunk(StreamingChunkEvent {
+                message_id: placeholder,
+                chunk: "lo".into(),
+            }),
+            StreamingEvent::Complete(StreamingCompleteEvent {
+                message_id: placeholder,
+                metadata: None,
+                file_citations: vec![],
+                link_citations: vec![],
+                references: vec![],
+            }),
+        ]),
+    );
+    let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+    let svc = build_service(&harness, plugin_id, plugin_dyn);
+
+    let cancel = CancellationToken::new();
+    let stream = svc
+        .send_message(make_request(session_id), make_identity(), cancel)
+        .await
+        .expect("send_message dispatch");
+    // Simulate a client that disconnects immediately: drop the response stream
+    // without consuming a single event. The driver must press on regardless.
+    drop(stream);
+
+    let row = db::wait_for_finalize(&harness.db, session_id, Duration::from_secs(2)).await;
+    assert!(
+        row.is_complete,
+        "client disconnect must NOT cancel generation under live-tail; row = {row:?}",
+    );
+    assert_eq!(
+        db::message_text(&harness.db, row.message_id).await,
+        "Hello",
+        "full plugin output must persist even though the client left",
+    );
+}
+
+// ===========================================================================
 // 4. Resume buffer is populated while the stream runs (FR-024, 3b-2)
 //
 // The detached driver tees every projected wire event into the

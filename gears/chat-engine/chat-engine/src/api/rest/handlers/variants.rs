@@ -181,11 +181,11 @@ pub async fn recreate_variant(
             session_id,
             message_id,
             body.enabled_capabilities,
-            cancel.clone(),
+            cancel,
         )
         .await?;
 
-    stream_to_ndjson_response(stream, cancel)
+    stream_to_sse_response(stream)
 }
 
 /// `POST /sessions/{session_id}/messages/{message_id}/branch`.
@@ -214,11 +214,11 @@ pub async fn branch_message(
             body.parts,
             body.file_ids,
             body.enabled_capabilities,
-            cancel.clone(),
+            cancel,
         )
         .await?;
 
-    stream_to_ndjson_response(stream, cancel)
+    stream_to_sse_response(stream)
 }
 
 /// `GET /sessions/{session_id}/messages/{message_id}/variants`.
@@ -328,15 +328,15 @@ pub async fn switch_session_type_compat(
 //  Shared NDJSON response builder
 // ============================================================================
 
-fn stream_to_ndjson_response(
+fn stream_to_sse_response(
     stream: crate::domain::service::message_service::SendMessageStream,
-    cancel: CancellationToken,
 ) -> Result<Response> {
     // Delegates to the shared SSE delta-stream builder (FR-024): the plugin
     // event stream is projected into `start`/`delta`/`complete`/`error` SSE
-    // frames, and the cancel token is tied to the body's lifetime (cancels the
-    // driver on client disconnect).
-    Ok(crate::api::rest::sse_delta_stream_response(stream, cancel))
+    // frames. Per true live-tail, a client disconnect no longer cancels the
+    // driver — it runs to completion and the client may resume via
+    // `Last-Event-ID`.
+    Ok(crate::api::rest::sse_delta_stream_response(stream))
 }
 
 // ============================================================================

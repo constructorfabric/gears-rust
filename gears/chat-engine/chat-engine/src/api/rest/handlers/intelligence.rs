@@ -77,22 +77,18 @@ pub async fn summarize_session(
 ) -> Result<Response> {
     let identity = identity_from_ctx(&ctx)?;
 
-    // Cancellation pipeline: the handler-owned token is wired into the
-    // service so connection close (axum's body drop) cancels the plugin
-    // call. Phase 14 may centralise this via tower middleware.
+    // Cancellation token threaded into the summary driver. The summary stream
+    // is not part of the resumable message buffer, but it shares the SSE delta
+    // builder; a client disconnect no longer force-cancels here, so an
+    // on-demand summary still completes and persists.
     let cancel = CancellationToken::new();
 
     let event_stream = svc
-        .summarize_session(&identity, session_id, cancel.clone())
+        .summarize_session(&identity, session_id, cancel)
         .await?;
 
-    // Project the summary stream into the shared SSE delta protocol (FR-024);
-    // the helper ties `cancel` to the body lifetime (client-disconnect → driver
-    // cancel).
-    Ok(crate::api::rest::sse_delta_stream_response(
-        event_stream,
-        cancel,
-    ))
+    // Project the summary stream into the shared SSE delta protocol (FR-024).
+    Ok(crate::api::rest::sse_delta_stream_response(event_stream))
 }
 
 /// `GET /sessions/{id}/retention-policy` — returns the effective

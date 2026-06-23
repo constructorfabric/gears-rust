@@ -89,11 +89,10 @@ pub async fn send_message(
 
     tracing::Span::current().record("session_id", tracing::field::display(body.session_id));
 
-    // Build the cancellation token that the rest of the pipeline observes.
-    // Phase 5 wires the connection-close bridge inline; Phase 14 may
-    // promote this to a tower middleware that tracks all in-flight
-    // streams centrally so the explicit `DELETE /streaming` handler
-    // (Phase 12) can look up the token by message id.
+    // Cancellation token threaded into the driver. Under true live-tail it is
+    // NOT cancelled by connection close — generation runs to completion so a
+    // reconnect can resume. It remains the hook a future explicit "stop
+    // generation" endpoint would cancel to abort the driver.
     let cancel = CancellationToken::new();
 
     let req = SendMessageRequest {
@@ -104,15 +103,13 @@ pub async fn send_message(
         capabilities: body.capabilities,
     };
 
-    let event_stream = svc.send_message(req, identity, cancel.clone()).await?;
+    let event_stream = svc.send_message(req, identity, cancel).await?;
 
     // Project the plugin event stream into the client-facing SSE delta
-    // protocol (FR-024). The shared helper ties `cancel` to the response
-    // body's lifetime, so a client disconnect cancels the driver task.
-    Ok(crate::api::rest::sse_delta_stream_response(
-        event_stream,
-        cancel,
-    ))
+    // protocol (FR-024). Per true live-tail, a client disconnect no longer
+    // cancels the driver — it runs to completion and the client may resume the
+    // stream via `Last-Event-ID`.
+    Ok(crate::api::rest::sse_delta_stream_response(event_stream))
 }
 
 /// Wire response for `DELETE /sessions/{session_id}/messages/{message_id}`.

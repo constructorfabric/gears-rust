@@ -69,8 +69,8 @@ pub async fn send_message_in_session(
         capabilities: capabilities_into_sdk(body.capabilities),
     };
     let cancel = CancellationToken::new();
-    let stream = svc.send_message(req, identity, cancel.clone()).await?;
-    Ok(sse_delta_stream_response(stream, cancel))
+    let stream = svc.send_message(req, identity, cancel).await?;
+    Ok(sse_delta_stream_response(stream))
 }
 
 /// `GET /chat-engine/v1/sessions/{id}/messages` — list the active path.
@@ -124,10 +124,10 @@ pub async fn recreate_message(
             session_id,
             message_id,
             capabilities_into_sdk(body.enabled_capabilities),
-            cancel.clone(),
+            cancel,
         )
         .await?;
-    Ok(sse_delta_stream_response(stream, cancel))
+    Ok(sse_delta_stream_response(stream))
 }
 
 /// `GET /chat-engine/v1/messages/{id}/variants` — list sibling variants.
@@ -209,9 +209,9 @@ pub async fn summarize_session(
     let identity = identity_from_ctx(&ctx)?;
     let cancel = CancellationToken::new();
     let stream = svc
-        .summarize_session(&identity, session_id, cancel.clone())
+        .summarize_session(&identity, session_id, cancel)
         .await?;
-    Ok(sse_delta_stream_response(stream, cancel))
+    Ok(sse_delta_stream_response(stream))
 }
 
 /// `POST /chat-engine/v1/sessions/{id}/search` — JSON-body variant that
