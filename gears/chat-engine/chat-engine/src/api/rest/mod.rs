@@ -8,15 +8,16 @@
 //! - [`error`] — RFC-9457 mapping (`From<ChatEngineError> for CanonicalError`).
 //! - [`handlers`] — thin axum handlers (Phases 4-12).
 //! - [`routes`] — `register_routes` and the per-endpoint `OperationBuilder` chains.
-//! - [`mod@self`] — NDJSON streaming helper + `WebhookEmitter` trait.
+//! - [`mod@self`] — SSE delta streaming helper + `WebhookEmitter` trait.
 //!
-//! ## NDJSON streaming
+//! ## SSE delta streaming
 //!
 //! The streaming endpoints (`POST messages`, `POST messages/recreate`,
-//! `POST sessions/{id}/summarize`) all flush events as one
-//! [`StreamingEventDto`](dto::StreamingEventDto) per line over
-//! `application/x-ndjson`. See [`ndjson_response`] for the canonical
-//! response builder.
+//! `POST sessions/{id}/summarize`, `GET messages/{id}/stream`) emit the
+//! `start`/`delta`/`complete`/`error` delta protocol (FR-024) over
+//! `text/event-stream`. See [`sse_delta_stream_response`] (live projection)
+//! and [`stream_reader::sse_buffer_reader_response`] (resume reader) for the
+//! response builders.
 //!
 //! ## Webhook emitter
 //!
@@ -49,8 +50,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
-use futures::stream::{Stream, StreamExt};
-use serde_json::json;
+use futures::stream::StreamExt;
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
@@ -58,77 +58,10 @@ use crate::domain::service::webhook::{
     NoopWebhookEmitter as DomainNoopWebhookEmitter, WebhookEmitter as DomainWebhookEmitter,
     WebhookEvent,
 };
-use dto::StreamingEventDto;
 
 // ===========================================================================
-// NDJSON streaming helper
+// SSE delta streaming helper
 // ===========================================================================
-
-/// Wrap a fallible streaming-event source into an `application/x-ndjson`
-/// chunked HTTP response.
-///
-/// - `Content-Type: application/x-ndjson`
-/// - `Cache-Control: no-cache`
-/// - `X-Accel-Buffering: no` (defeats nginx buffering so chunks actually
-///   flush over the wire)
-///
-/// Each successful item is serialized as one JSON object followed by `\n`.
-/// If the stream yields `Err(ChatEngineError)`, the helper emits a single
-/// terminal `StreamingErrorDto` line carrying the error text and ends the
-/// stream — no further events are produced. This mirrors the SDK contract
-/// that `StreamingErrorEvent` is terminal.
-///
-/// Serialization failures degrade gracefully to a best-effort error line so
-/// the connection still closes cleanly rather than hanging on a broken
-/// sink.
-pub fn ndjson_response<S>(stream: S) -> Response
-where
-    S: Stream<Item = Result<StreamingEventDto, ChatEngineError>> + Send + 'static,
-{
-    let body_stream = stream.map(|item| {
-        let mut bytes = match item {
-            Ok(evt) => serialize_event_or_fallback(&evt),
-            Err(err) => {
-                tracing::warn!(error = %err, "ndjson stream terminated with error event");
-                serialize_error_line(&err)
-            }
-        };
-        if !bytes.ends_with(b"\n") {
-            bytes.push(b'\n');
-        }
-        std::result::Result::<_, Infallible>::Ok(bytes)
-    });
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        )
-        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
-        .header("x-accel-buffering", HeaderValue::from_static("no"))
-        .body(Body::from_stream(body_stream))
-        .unwrap_or_else(|err| {
-            tracing::error!(error = %err, "failed to build ndjson response");
-            // The header values are static; this branch should never fire,
-            // but degrade to a JSON 500 to keep the response shape sane.
-            let fallback_body = json!({"type": "internal", "detail": err.to_string()}).to_string();
-            // Static status + header, so the build cannot realistically fail;
-            // if it ever did, return a bare 500 rather than panicking.
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                )
-                .body(Body::from(fallback_body))
-                .unwrap_or_else(|_| {
-                    let mut resp = Response::new(Body::empty());
-                    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                    resp
-                })
-        })
-}
 
 /// Build a `text/event-stream` (Server-Sent Events) **delta** response from an
 /// infallible `StreamingEvent` stream — the shape returned by the message /
@@ -140,16 +73,10 @@ where
 /// `data:` = JSON). Mid-stream errors travel as an `error` event, never a
 /// `Result::Err`.
 ///
-/// The supplied `cancel` token fires when axum drops the response **body**
-/// (client disconnect / connection close), so the plugin-driver task tears
-/// down promptly rather than streaming into the void.
-///
-/// The cancel-on-drop [`DropGuard`](tokio_util::sync::CancellationToken)
-/// is owned by the body stream — **not** the response extensions. axum
-/// drops response extensions as soon as it has the response head, well
-/// before the body finishes streaming; parking the guard there would cancel
-/// the driver after the very first event. Tying it to the body's lifetime
-/// is the load-bearing detail.
+/// Under true live-tail (FR-024) this response does **not** own a
+/// cancellation guard: dropping the body (client disconnect) stops delivery
+/// but the detached driver keeps generating and buffering, so a reconnect via
+/// `Last-Event-ID` resumes the stream.
 pub(crate) fn sse_delta_stream_response(
     stream: crate::domain::service::message_service::SendMessageStream,
 ) -> Response {
@@ -199,22 +126,6 @@ fn sse_frame(evt: &crate::domain::stream_delta::WireStreamEvent) -> Vec<u8> {
         r#"{"type":"error","error":"internal serialization failure"}"#.to_string()
     });
     format!("id: {}\nevent: {}\ndata: {}\n\n", evt.seq(), evt.event_name(), data).into_bytes()
-}
-
-fn serialize_event_or_fallback(evt: &StreamingEventDto) -> Vec<u8> {
-    serde_json::to_vec(evt).unwrap_or_else(|err| {
-        tracing::error!(error = %err, "failed to serialize StreamingEventDto");
-        br#"{"type":"error","error":"internal serialization failure"}"#.to_vec()
-    })
-}
-
-fn serialize_error_line(err: &ChatEngineError) -> Vec<u8> {
-    let line = json!({
-        "type": "error",
-        "message_id": Uuid::nil(),
-        "error": err.to_string(),
-    });
-    serde_json::to_vec(&line).unwrap_or_else(|_| br#"{"type":"error","error":"unknown"}"#.to_vec())
 }
 
 // ===========================================================================
@@ -526,70 +437,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::rest::dto::{StreamingChunkDto, StreamingEventDto, StreamingStartDto};
-    use axum::body::to_bytes;
-    use futures::stream;
-
-    #[tokio::test]
-    async fn ndjson_response_emits_application_x_ndjson() {
-        let stream = stream::iter(vec![Ok::<_, ChatEngineError>(StreamingEventDto::Start(
-            StreamingStartDto {
-                message_id: Uuid::nil(),
-            },
-        ))]);
-
-        let resp = ndjson_response(stream);
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/x-ndjson"
-        );
-        assert_eq!(
-            resp.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-cache"
-        );
-        assert_eq!(resp.headers().get("x-accel-buffering").unwrap(), "no");
-    }
-
-    #[tokio::test]
-    async fn ndjson_response_writes_one_event_per_line() {
-        let evts = vec![
-            Ok::<_, ChatEngineError>(StreamingEventDto::Start(StreamingStartDto {
-                message_id: Uuid::nil(),
-            })),
-            Ok::<_, ChatEngineError>(StreamingEventDto::Chunk(StreamingChunkDto {
-                message_id: Uuid::nil(),
-                chunk: "hello".into(),
-            })),
-        ];
-
-        let resp = ndjson_response(stream::iter(evts));
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-
-        let lines: Vec<&str> = text.split_terminator('\n').collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("\"type\":\"start\""));
-        assert!(lines[1].contains("\"type\":\"chunk\""));
-        assert!(lines[1].contains("\"chunk\":\"hello\""));
-    }
-
-    #[tokio::test]
-    async fn ndjson_response_terminates_on_first_error() {
-        let evts = vec![
-            Ok::<_, ChatEngineError>(StreamingEventDto::Start(StreamingStartDto {
-                message_id: Uuid::nil(),
-            })),
-            Err::<StreamingEventDto, _>(ChatEngineError::bad_request("oops")),
-        ];
-
-        let resp = ndjson_response(stream::iter(evts));
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        let lines: Vec<&str> = text.split_terminator('\n').collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[1].contains("\"type\":\"error\""));
-    }
 
     #[tokio::test]
     async fn noop_webhook_emitter_satisfies_rest_trait() {
