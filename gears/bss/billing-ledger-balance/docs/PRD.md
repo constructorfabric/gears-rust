@@ -15,7 +15,6 @@ refs:
 
 # PRD — Billing Ledger & Balances
 
-
 <!-- toc -->
 
 - [1. Overview](#1-overview)
@@ -187,35 +186,35 @@ Industry alignment: an append-only journal with compensating entries matches aud
 
 #### CFO / Finance Controller
 
-**ID**: `cpt-vhp-bss-actor-cfo`
+**ID**: `cpt-cf-bss-ledger-actor-cfo`
 
 **Role**: Owns financial integrity of billing; requires auditable, ASC-ready AR, revenue, and exports.
 **Needs**: Double-entry guarantees, disclosure-grade revenue recognition, GL reconciliation.
 
 #### Revenue Assurance Analyst
 
-**ID**: `cpt-vhp-bss-actor-revenue-assurance`
+**ID**: `cpt-cf-bss-ledger-actor-revenue-assurance`
 
 **Role**: Investigates reconciliation variances and invariant alarms; owns close-blocking decisions.
 **Needs**: Variance reports, exception queues, alarm routing.
 
 #### Finance Operations
 
-**ID**: `cpt-vhp-bss-actor-finance-ops`
+**ID**: `cpt-cf-bss-ledger-actor-finance-ops`
 
 **Role**: Resolves suspense, unallocated cash, mapping gaps, and failed exports.
 **Needs**: Exception queues, inquiry/audit pack, manual adjustment workflows.
 
 #### Finance Approver
 
-**ID**: `cpt-vhp-bss-actor-finance-approver`
+**ID**: `cpt-cf-bss-ledger-actor-finance-approver`
 
 **Role**: Approves manual journals, exceptions, and dual-control actions (refunds above threshold, backdating).
 **Needs**: Segregation of duties, reason codes, audit trail.
 
 #### Auditor
 
-**ID**: `cpt-vhp-bss-actor-auditor`
+**ID**: `cpt-cf-bss-ledger-actor-auditor`
 
 **Role**: Internal/external auditor requesting tamper-evident posting history and lineage.
 **Needs**: Tenant-scoped audit retrieval with full source-document linkage.
@@ -224,43 +223,43 @@ Industry alignment: an append-only journal with compensating entries matches aud
 
 #### Rating / Subscriptions
 
-**ID**: `cpt-vhp-bss-actor-rating-subscriptions`
+**ID**: `cpt-cf-bss-ledger-actor-rating-subscriptions`
 
 **Role**: Produces `BillableItem` upstream of invoice post; ledger consumes posted aggregates.
 
 #### Billing Orchestration
 
-**ID**: `cpt-vhp-bss-actor-billing-orchestration`
+**ID**: `cpt-cf-bss-ledger-actor-billing-orchestration`
 
 **Role**: Drafts invoice, calls tax, issues and posts invoices; drives per-invoice atomic posting.
 
 #### Payments / PSP
 
-**ID**: `cpt-vhp-bss-actor-payments-psp`
+**ID**: `cpt-cf-bss-ledger-actor-payments-psp`
 
 **Role**: Settles funds and emits `PaymentSettled` / allocation / refund / dispute events; ledger records outcomes.
 
 #### Tax Engine
 
-**ID**: `cpt-vhp-bss-actor-tax-engine`
+**ID**: `cpt-cf-bss-ledger-actor-tax-engine`
 
 **Role**: Provides authoritative `TaxBreakdown`; ledger posts, never recomputes, tax.
 
 #### Catalog & Contracts
 
-**ID**: `cpt-vhp-bss-actor-catalog-contracts`
+**ID**: `cpt-cf-bss-ledger-actor-catalog-contracts`
 
 **Role**: Supply `glCode` snapshots, SKU/plan defaults, PO/SSP, and deferral/recognition precedence inputs.
 
 #### ERP / GL
 
-**ID**: `cpt-vhp-bss-actor-erp-gl`
+**ID**: `cpt-cf-bss-ledger-actor-erp-gl`
 
 **Role**: Consumes idempotent, replay-safe exports; may be GL of record (Mode A) or downstream mirror (Mode B).
 
 #### Recognition Run
 
-**ID**: `cpt-vhp-bss-actor-recognition-run`
+**ID**: `cpt-cf-bss-ledger-actor-recognition-run`
 
 **Role**: Scheduled/event-driven job releasing contract liability to revenue per active schedules.
 
@@ -330,46 +329,46 @@ Industry alignment: an append-only journal with compensating entries matches aud
 
 #### Balanced journal entries
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-balanced-journal-entries`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-balanced-journal-entries`
 
 The system **MUST** post every journal entry such that total debits equal total credits in the entry currency (within the rounding-unit rule), and the zero-sum invariant **MUST** hold per tenant per entry, not only globally.
 
 **Rationale**: Balance per tenant is the foundational integrity invariant for an auditable subledger.
 
-**Actors**: `cpt-vhp-bss-actor-billing-orchestration`
+**Actors**: `cpt-cf-bss-ledger-actor-billing-orchestration`
 
 <!-- migration-note: legacy "Journal entry (normative)" requirements folded into this FR. -->
 Each entry MUST carry unambiguous identity; posted-at timestamp in UTC; legal-entity and currency scope; linkage to the originating business document/event; system-generated vs user-initiated marker.
 
 #### Posting immutability
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-posting-immutability`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-posting-immutability`
 
 Posted financial facts on lines (amounts, posted account/classification, source linkage) **MUST NOT** change in place; corrections **MUST** be new compensating or reversal entries. Non-financial metadata MAY change only under controlled policy with full audit, or via append-only supplemental records.
 
 **Rationale**: Immutability is required for SOX/ASC-grade audit and tamper evidence.
 
-**Actors**: `cpt-vhp-bss-actor-cfo`
+**Actors**: `cpt-cf-bss-ledger-actor-cfo`
 
 #### Reversal canonical pattern
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-reversal-canonical-pattern`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-reversal-canonical-pattern`
 
 Reversals **MUST** use **strict line-negation**: mirror the original entry's accounts and sides with negated amounts, carry explicit `reverses=<originalEntryId>` linkage, and post at current effective time. Storno and gross-replace **MUST NOT** be the BSS ledger shape (ERP-side mapping permitted as presentation only).
 
 **Rationale**: One canonical reversal shape keeps exports consistent and auditable.
 
-**Actors**: `cpt-vhp-bss-actor-finance-ops`
+**Actors**: `cpt-cf-bss-ledger-actor-finance-ops`
 
 #### Account classes (posting reference)
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-account-classes`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-account-classes`
 
 Posted lines **MUST** classify against the following business account classes; concrete GL numbers are tenant/ERP configured, BSS stores **class** + `glCode` snapshot from Catalog §4.1.
 
 **Rationale**: A fixed class taxonomy is required so posting rules and reconciliation are unambiguous.
 
-**Actors**: `cpt-vhp-bss-actor-catalog-contracts`
+**Actors**: `cpt-cf-bss-ledger-actor-catalog-contracts`
 
 <!-- migration-note: legacy "Accounts (account classes)" + "Books (logical)" tables preserved verbatim. -->
 
@@ -392,13 +391,13 @@ Logical books: **AR (subledger)**, **Revenue / contract liability**, **Tax**, **
 
 #### S1 — Invoice post (direct split)
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-invoice-post-direct-split`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-invoice-post-direct-split`
 
 On invoice post, the ledger **MUST** use the **direct split** pattern: debit **AR** for the full invoice (incl. tax), credit **Revenue** for the recognized-at-post portion and **Contract liability** for the deferred portion (ex-tax) per PO/policy, credit **Tax payable** per `TaxBreakdown`. The system **MUST NOT** use gross-Revenue-then-same-invoice-reclassification as the default. When nothing is deferred, Contract liability lines **MUST** be absent (zero-amount placeholders rejected at post-time validation).
 
 **Rationale**: A single deferral pattern guarantees balance and ASC 606 substance without ERP-specific reclass.
 
-**Actors**: `cpt-vhp-bss-actor-billing-orchestration`
+**Actors**: `cpt-cf-bss-ledger-actor-billing-orchestration`
 
 | **Line** | **Debit** | **Credit** |
 |----------|-----------|------------|
@@ -411,13 +410,13 @@ Rules: amounts MUST match sum(InvoiceItem) + TaxBreakdown with rounding evidence
 
 #### S2 — Payment: settlement vs allocation
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-payment-settlement-vs-allocation`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-payment-settlement-vs-allocation`
 
 Settlement (funds confirmed) and allocation (which posted invoices a payment satisfies) **MUST** be representable as distinct patterns whenever unallocated balances can exist. **AR MUST** decrease only when allocations are applied, not from receipt alone — except a narrow atomic settle-and-apply shortcut with no residual unallocated balance.
 
 **Rationale**: Prepayments, partial pay, multi-invoice application, and overpayments require separating cash location from AR application.
 
-**Actors**: `cpt-vhp-bss-actor-payments-psp`
+**Actors**: `cpt-cf-bss-ledger-actor-payments-psp`
 
 | **Step** | **Debit** | **Credit** |
 |----------|-----------|------------|
@@ -428,13 +427,13 @@ Rules: partial multi-invoice allocation reduces open AR per invoice by allocated
 
 #### S3 — Credit note (adjustment)
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-credit-note-adjustment`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-credit-note-adjustment`
 
 Credit notes reducing recognized revenue **MUST** debit **Contra-revenue** (not Revenue directly); the unreleased deferred portion **MUST** debit **Contract liability**, split from the targeted posted invoice item, PO/allocation group, and recognition-schedule state. A credit note **MUST NOT** reduce AR while leaving related unreleased contract liability unchanged. If the recognized-vs-unreleased split cannot be determined unambiguously, the post **MUST** block and route to the exception queue. AR-only goodwill credits debit a non-revenue class (not bad-debt/write-off).
 
 **Rationale**: Keeps Revenue gross, supports disclosure-grade exports, and preserves ASC deferral lineage.
 
-**Actors**: `cpt-vhp-bss-actor-finance-ops`
+**Actors**: `cpt-cf-bss-ledger-actor-finance-ops`
 
 | **Line** | **Debit** | **Credit** |
 |----------|-----------|------------|
@@ -445,23 +444,23 @@ Credit notes reducing recognized revenue **MUST** debit **Contra-revenue** (not 
 
 #### S4 — Debit note (additional charge post-fact)
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-fr-debit-note-charge`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-debit-note-charge`
 
 A debit note for additional post-invoice charges **MUST** credit **Tax payable** per posted `TaxBreakdown` and follow the same direct split as S1 (Revenue recognized portion, Contract liability deferred portion ex-tax). It **MUST NOT** change posted invoice line rows (compensating entry only) and **MUST** be a balanced entry that rolls back fully on failure.
 
 **Rationale**: Post-fact charges must reflect full customer balance impact including tax, consistently with invoice post.
 
-**Actors**: `cpt-vhp-bss-actor-billing-orchestration`
+**Actors**: `cpt-cf-bss-ledger-actor-billing-orchestration`
 
 #### S5 — Refund (balance-first)
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-refund-balance-first`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-refund-balance-first`
 
 Refund posting **MUST** follow which balance is returned: **Unallocated cash** / **Reusable customer credit** (Pattern A — no P&L impact) or **AR** restoration (Pattern B). Refund JEs **MUST NOT** debit Revenue or Contra-revenue; recognized revenue and material tax reversals follow S3/S4 (S3+S5 pairing in jurisdiction-expected order). Where initiation and PSP settlement are not atomic, refunds **MUST** post two stages against **Refund clearing**; single-step is permitted only when atomic with no clearing residual.
 
 **Rationale**: Prevents revenue distortion from cash mechanics and makes never-confirmed refunds visible as clearing balances.
 
-**Actors**: `cpt-vhp-bss-actor-payments-psp`
+**Actors**: `cpt-cf-bss-ledger-actor-payments-psp`
 
 | **Situation** | **Debit** | **Credit** |
 |---------------|-----------|------------|
@@ -472,279 +471,279 @@ Rules: aggregate cap Σ(refunds) ≤ settled amount; per-invoice (Pattern B) cap
 
 #### S3/S5 credit-note cumulative cap
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-credit-note-cumulative-cap`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-credit-note-cumulative-cap`
 
 For each posted invoice, a new credit note (incl. tax) **MUST NOT** exceed available headroom = `original posted total + Σ(prior S4 debit notes) − Σ(prior credit notes)` (all incl. tax). Over-cap adjustments **MUST** route via non-revenue debit or be out of scope under bad-debt workflows — never silently allowed via S3.
 
 **Rationale**: Prevents over-crediting an invoice beyond its real exposure.
 
-**Actors**: `cpt-vhp-bss-actor-finance-approver`
+**Actors**: `cpt-cf-bss-ledger-actor-finance-approver`
 
 #### Allocation precedence (multi-invoice payment)
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-fr-allocation-precedence`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-allocation-precedence`
 
 Multi-invoice allocation order **MUST** be deterministic: default oldest posting date first, ties broken by smallest invoice id; tenant overrides allowed; statutory jurisdiction rules (e.g. UK Consumer Credit Act) **MUST** take precedence over both tenant overrides and the platform default.
 
 **Rationale**: Deterministic, statute-compliant allocation is required for correct AR and disputes.
 
-**Actors**: `cpt-vhp-bss-actor-payments-psp`
+**Actors**: `cpt-cf-bss-ledger-actor-payments-psp`
 
 ### 6.3 ASC 606 Revenue Recognition
 
 #### S6 — Recognition schedule controls
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-recognition-schedule-controls`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-recognition-schedule-controls`
 
 Recognition runs **MUST** release amounts per a documented schedule (DR Contract liability / CR Revenue), **MUST NOT** double-recognize the same deferred slice for the same period/segment (idempotent, at-most-once per segment per period), and schedule changes **MUST** be controlled (approval, audit trail, new version or compensating entries) — never silent rewrites of past releases.
 
 **Rationale**: Controlled, idempotent recognition is the core ASC 606 integrity guarantee.
 
-**Actors**: `cpt-vhp-bss-actor-recognition-run`
+**Actors**: `cpt-cf-bss-ledger-actor-recognition-run`
 
 #### ASC 606 PO identification & transaction-price
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-asc606-po-identification`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-asc606-po-identification`
 
 Posted invoice items **MUST** carry PO or allocation-group identifiers when the line has deferral/recognition, is marked multi-PO/ASC-tracked/SSP, or has variable consideration; otherwise a Catalog default allocation group for traceability. Outside the narrow immaterial-one-shot exemption, missing PO/allocation group **MUST** block post. SSP snapshots are required for multi-PO allocation; deferral and recognition timing **MUST** be derivable from Contract → Catalog → PO type → billing model precedence.
 
 **Rationale**: PO-level economics and SSP allocation are mandatory for ASC 606 audit.
 
-**Actors**: `cpt-vhp-bss-actor-catalog-contracts`
+**Actors**: `cpt-cf-bss-ledger-actor-catalog-contracts`
 
 #### Revenue-stream disaggregation
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-revenue-stream-disaggregation`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-revenue-stream-disaggregation`
 
 Every revenue-affecting journal line (and originating posted invoice item where applicable) **MUST** carry a mandatory revenue-stream classification (usage / recurring / one-time, or Design-equivalent), preserved via distinct natural accounts, sub-accounts, or reporting dimensions — not free text alone. Mixed invoices **MUST** split amounts by stream.
 
 **Rationale**: Disclosure-grade reporting requires disaggregated, machine-sliceable revenue.
 
-**Actors**: `cpt-vhp-bss-actor-cfo`
+**Actors**: `cpt-cf-bss-ledger-actor-cfo`
 
 #### Recognition audit linkage
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-recognition-audit-linkage`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-recognition-audit-linkage`
 
 Every recognition journal entry **MUST** carry minimum linkage: recognition period/segment; PO or allocation group; deferral origin resolving to posted invoice item(s); subscription/entitlement context when schedule-scoped. Period alone is insufficient; non-invoice deferral sources are out of MVP scope and **MUST** block.
 
 **Rationale**: Auditable lineage from recognition back to invoiced deferral is mandatory.
 
-**Actors**: `cpt-vhp-bss-actor-auditor`
+**Actors**: `cpt-cf-bss-ledger-actor-auditor`
 
 ### 6.4 Immutability, Audit & Compliance
 
 #### Immutable audit logs & tamper evidence
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-immutable-audit-logs`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-immutable-audit-logs`
 
 The production authoritative posted-journal store **MUST** be tamper-evident (hash chain, WORM, signed append log, or equivalent per Design). Financially binding fields **MUST NOT** be updated/deleted in place; retention **MUST** meet legal/contractual minimums (manifest §4.4, typically ≥ 7 years). Operational surfaces **MUST NOT** carry direct PII; the secured audit store holds investigation-grade records.
 
 **Rationale**: Tamper evidence and PII minimization are compliance show-stoppers.
 
-**Actors**: `cpt-vhp-bss-actor-auditor`
+**Actors**: `cpt-cf-bss-ledger-actor-auditor`
 
 #### Audit retrieval (tenant-scoped)
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-audit-retrieval`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-audit-retrieval`
 
 For a posted journal entry, the system **MUST** make who/when/source-document linkage/correlation retrievable, and responses **MUST** be tenant-scoped; cross-tenant access requires elevated context recorded with actor, reason, and scope.
 
 **Rationale**: Auditors and support need lineage without cross-tenant leakage.
 
-**Actors**: `cpt-vhp-bss-actor-auditor`
+**Actors**: `cpt-cf-bss-ledger-actor-auditor`
 
 #### Right-to-erasure vs retention
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-fr-right-to-erasure`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-right-to-erasure`
 
 Posted journal lines reference an immutable internal payer id, never raw PII. After erasure, journal lines remain intact and queryable; reverse-lookup to human PII **MUST** yield a tombstone marker without breaking ledger integrity or tamper-evidence chains.
 
 **Rationale**: Reconciles GDPR Art. 17 with financial retention and immutability.
 
-**Actors**: `cpt-vhp-bss-actor-cfo`
+**Actors**: `cpt-cf-bss-ledger-actor-cfo`
 
 ### 6.5 Multi-Tenant & Multi-Axis Posting
 
 #### Tenant isolation in posting
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-tenant-isolation-posting`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-tenant-isolation-posting`
 
 A single posted journal entry **MUST NOT** mix lines from more than one payer tenant (legal-entity mixing equally forbidden); tenant chart-of-accounts **MUST NOT** leak across tenants; balances, reconciliation, export, audit, and inquiry are tenant-scoped by default.
 
 **Rationale**: Tenant isolation is a hard multi-tenant financial boundary.
 
-**Actors**: `cpt-vhp-bss-actor-billing-orchestration`
+**Actors**: `cpt-cf-bss-ledger-actor-billing-orchestration`
 
 #### Multi-axis attribution
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-fr-multi-axis-attribution`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-multi-axis-attribution`
 
 Every posted line **MUST** carry the applicable tenant axes: payer tenant (AR), seller tenant (channel/reseller lines), resource tenant (showback). Seller is line-level metadata, not a tenant-scope split; inter-tenant/reseller settlement is out of scope here.
 
 **Rationale**: Multi-axis attribution enables showback and channel splits without breaking isolation.
 
-**Actors**: `cpt-vhp-bss-actor-rating-subscriptions`
+**Actors**: `cpt-cf-bss-ledger-actor-rating-subscriptions`
 
 ### 6.6 Idempotency & Replay
 
 #### Idempotency per business flow
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-idempotency-per-flow`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-idempotency-per-flow`
 
 Each flow **MUST** be idempotent per its business key: invoice post (per posted invoice), settlement (per PSP event id), allocation (per allocation id), credit/debit note (per note id), refund (per `(tenant, PSP refund id, phase)`), recognition (per segment × period), chargeback (per `(tenant, payment/dispute id, outcome phase)`), ERP export (per export key).
 
 **Rationale**: At-most-once ledger effect under at-least-once delivery is mandatory.
 
-**Actors**: `cpt-vhp-bss-actor-payments-psp`
+**Actors**: `cpt-cf-bss-ledger-actor-payments-psp`
 
 #### Idempotent-replay response contract
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-idempotent-replay-contract`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-idempotent-replay-contract`
 
 Replay with same key + same payload **MUST** return the prior posting reference (entry id, posted-at, status); replay with same key + different payload **MUST** hard-error with a specific code and capture the conflicting payload in the secured audit store. Business identifiers **MUST** dedupe for the financial retention period.
 
 **Rationale**: Callers need deterministic replay semantics, not generic acks.
 
-**Actors**: `cpt-vhp-bss-actor-rating-subscriptions`
+**Actors**: `cpt-cf-bss-ledger-actor-rating-subscriptions`
 
 ### 6.7 Reconciliation & Period Close
 
 #### AR tie-out
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-ar-tie-out`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-ar-tie-out`
 
 AR ledger balance per payer **MUST** tie (within tolerance) to the derived AR projection from all AR-affecting posted facts: invoice posts, debit notes, payment allocations, credit notes, applied-payment refunds, chargeback Won/Lost/Partial outcomes, CreditApplication wallet-to-AR settlements, and reversals. "Dispute opened" sub-class moves are AR-class-neutral and **MUST NOT** enter the roll-up.
 
 **Rationale**: AR truth must be derivable from posted facts, not an independent mutable view.
 
-**Actors**: `cpt-vhp-bss-actor-revenue-assurance`
+**Actors**: `cpt-cf-bss-ledger-actor-revenue-assurance`
 
 #### ERP / GL export idempotency
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-erp-export-idempotency`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-erp-export-idempotency`
 
 Export **MUST** be idempotent and replay-safe: a successful replay is indistinguishable (same business amounts to GL) from the first success. BSS owns re-drive with the same key; failed exports are queued, never dropped; ERP "already posted" is treated as idempotent success; mismatched payload for the same key **MUST** alarm and block.
 
 **Rationale**: Idempotent export is a manifest §4.4 invariant and reconciliation precondition.
 
-**Actors**: `cpt-vhp-bss-actor-erp-gl`
+**Actors**: `cpt-cf-bss-ledger-actor-erp-gl`
 
 #### Accounting periods and close
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-accounting-periods-close`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-accounting-periods-close`
 
 Closed periods **MUST NOT** accept new routine postings except reversals or authorized corrections (dual-control). Period close **MUST** block while reconciliation variance exceeds tolerance or required exception queues remain open. Material backdating requires exception approval with audit trail; backdating thresholds outside [1, 30] business days **MUST** be rejected at config time.
 
 **Rationale**: Period integrity and controlled close are core finance controls.
 
-**Actors**: `cpt-vhp-bss-actor-finance-approver`
+**Actors**: `cpt-cf-bss-ledger-actor-finance-approver`
 
 #### Exceptions, suspense & reconciliation handling
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-fr-exception-suspense-handling`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-exception-suspense-handling`
 
 Unmatched settled payments **MUST** remain in unallocated (aged with alerts); missing account mapping **MUST** block post or route to suspense (no silent wrong-revenue mapping); export failures **MUST** retry with no silent drop; reconciliation mismatch **MUST** produce a variance report + ticket and block close above tolerance.
 
 **Rationale**: No financial fact may be silently dropped or mis-mapped.
 
-**Actors**: `cpt-vhp-bss-actor-finance-ops`
+**Actors**: `cpt-cf-bss-ledger-actor-finance-ops`
 
 ### 6.8 Money, Rounding & Foreign Exchange
 
 #### Money type, rounding & decimal scale
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-money-rounding-scale`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-money-rounding-scale`
 
 Posted amounts **MUST** use a fixed-precision decimal at the currency's ISO 4217 minor-unit scale with **banker's rounding (half-to-even)** as platform default, applied identically across S1–S6 and exports. Internal compute may carry up to 4 extra decimals but **MUST NOT** leak into posted truth; tenant rounding override only with recorded, audited evidence; over-range **MUST** hard-error.
 
 **Rationale**: Deterministic money arithmetic is auditor-verifiable and prevents drift.
 
-**Actors**: `cpt-vhp-bss-actor-cfo`
+**Actors**: `cpt-cf-bss-ledger-actor-cfo`
 
 #### Negative-balance invariants & alarms
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-negative-balance-invariants`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-negative-balance-invariants`
 
 The ledger **MUST** emit production alarms (not just logs) on sign violations per the class table: Cash/clearing, Unallocated cash, Reusable customer credit, AR (per `(payer, invoice)` and payer-aggregate), and Contract liability **MUST NOT** go negative; Tax payable may go negative during reversal windows evaluated per `(jurisdiction, filing-period)`. Single-bucket designs **MUST** alarm on per-event-type sub-balances.
 
 **Rationale**: Sign violations indicate posting defects with direct financial-integrity impact.
 
-**Actors**: `cpt-vhp-bss-actor-revenue-assurance`
+**Actors**: `cpt-cf-bss-ledger-actor-revenue-assurance`
 
 #### Multi-currency & FX
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-multi-currency-fx`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-multi-currency-fx`
 
 Rate locks **MUST** follow the normative lock points: S1 at post, S2 on settle and (if different) on alloc, S6 does not re-lock the revenue line. Realized FX **MUST** post on receipt/settlement/allocation/refund/chargeback when document ≠ functional currency; unrealized revaluation is optional and, if on, must be dedicated, idempotent, and reversible (no silent S1 recompute).
 
 **Rationale**: Explicit FX lock points and realized/unrealized treatment are required for correct multi-currency AR.
 
-**Actors**: `cpt-vhp-bss-actor-cfo`
+**Actors**: `cpt-cf-bss-ledger-actor-cfo`
 
 #### FX rate-source failure & staleness
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-fr-fx-rate-source-failure`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-fx-rate-source-failure`
 
 When the rate provider is unreachable or the latest rate is stale, the post **MUST** block by default, or proceed only with a `stale=true` snapshot where tenant policy explicitly allows; silent fallback to a last-good rate without the marker **MUST NOT** happen. Snapshots are immutable; later provider revisions post as new compensating entries.
 
 **Rationale**: Prevents silent posting on missing/stale rates and protects historical immutability.
 
-**Actors**: `cpt-vhp-bss-actor-finance-ops`
+**Actors**: `cpt-cf-bss-ledger-actor-finance-ops`
 
 ### 6.9 Chargebacks & Disputes
 
 #### Chargeback and dispute outcomes
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-chargeback-dispute-posting`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-chargeback-dispute-posting`
 
 For PSP disputes/chargebacks, postings **MUST** match the normative outcomes (opened/hold, won, lost, partial-or-split) without editing original payment JEs; "Dispute opened" reclassification **MUST NOT** zero/negate `(payer, invoice)` AR or change payer-aggregate AR sign. Replay of the same `(tenant, payment/dispute id, outcome phase)` key **MUST** be a no-op. P&L (if any) routes via S3, not bad-debt workflows.
 
 **Rationale**: Disputes must reconcile to PSP outcomes without double-posting or AR distortion.
 
-**Actors**: `cpt-vhp-bss-actor-payments-psp`
+**Actors**: `cpt-cf-bss-ledger-actor-payments-psp`
 
 ### 6.10 Lifecycle, Ordering & Governance
 
 #### Account lifecycle posting
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-fr-account-lifecycle-posting`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-account-lifecycle-posting`
 
 Collections suspension **MUST NOT** freeze recognition or allocation; cancelled subscription recognition is driven by the upstream schedule decision (ledger consumes, not decides); closed payer accounts with open AR permit compensating posts only and block new invoice posts (closing with non-zero balance requires approval + audit marker).
 
 **Rationale**: Distinct lifecycle states must not be conflated in posting behavior.
 
-**Actors**: `cpt-vhp-bss-actor-finance-ops`
+**Actors**: `cpt-cf-bss-ledger-actor-finance-ops`
 
 #### Out-of-order event handling
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-fr-out-of-order-event-handling`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-out-of-order-event-handling`
 
 Allocation before settlement **MUST** queue (not reject) and apply on settlement; refund before original payment **MUST** quarantine; recognition for period N before N−1 **MUST** order by `(schedule, period)`; out-of-order chargeback phases **MUST** queue rather than post partial outcomes. Source clock skew beyond ±15 min warns, ±24 h alerts and quarantines.
 
 **Rationale**: Ordering guarantees prevent incorrect or partial financial state.
 
-**Actors**: `cpt-vhp-bss-actor-payments-psp`
+**Actors**: `cpt-cf-bss-ledger-actor-payments-psp`
 
 #### Manual journals & adjustment governance
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-fr-manual-adjustment-governance`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-manual-adjustment-governance`
 
 Normal JEs are system-generated from S1–S6 and dispute/FX runs; free-form GL vouchers are out of scope for MVP. Governed adjustments (suspense, rounding) **MUST** enforce segregation of duties (preparer vs approver), amount/entity thresholds with dual-control, and mandatory reason code + actor + before/after audit.
 
 **Rationale**: Controls prevent ad-hoc re-keying of settled economic facts.
 
-**Actors**: `cpt-vhp-bss-actor-finance-approver`
+**Actors**: `cpt-cf-bss-ledger-actor-finance-approver`
 
 #### Policy versioning & historical immutability
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-fr-policy-versioning-immutability`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-policy-versioning-immutability`
 
 Posted lines and idempotent export keys for completed periods **MUST** remain immutable when future-effective changes alter contract, catalog, tax, or revenue rules; new documents use the policy/snapshot versions in effect at their own posting; corrections to past amounts use only new compensating entries — no hidden recompute of closed history.
 
 **Rationale**: Historical immutability under policy change is required for audit and ASC 606.
 
-**Actors**: `cpt-vhp-bss-actor-cfo`
+**Actors**: `cpt-cf-bss-ledger-actor-cfo`
 
 ## 7. Non-Functional Requirements
 
@@ -754,7 +753,7 @@ Posted lines and idempotent export keys for completed periods **MUST** remain im
 
 #### Availability of the posting path
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-nfr-availability`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-nfr-availability`
 
 The billing posting path **MUST** sustain ≥ 99.9% availability.
 
@@ -764,7 +763,7 @@ The billing posting path **MUST** sustain ≥ 99.9% availability.
 
 #### Disaster recovery (RTO / RPO)
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-nfr-rto-rpo`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-nfr-rto-rpo`
 
 The ledger **MUST** meet RTO ≤ 60 minutes and RPO ≤ 5 minutes per region.
 
@@ -774,7 +773,7 @@ The ledger **MUST** meet RTO ≤ 60 minutes and RPO ≤ 5 minutes per region.
 
 #### Data residency & geo-redundancy
 
-- [ ] `p1` - **ID**: `cpt-vhp-bss-nfr-data-residency`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-nfr-data-residency`
 
 Posted journal lines for a residency-pinned tenant **MUST NOT** cross the residency boundary in primary, replica, or DR storage; minimum multi-AZ, with cross-region warm/active per tenant policy.
 
@@ -784,7 +783,7 @@ Posted journal lines for a residency-pinned tenant **MUST NOT** cross the reside
 
 #### Posting & read performance
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-nfr-posting-performance`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-nfr-posting-performance`
 
 Interactive posting and AR reads **MUST** meet committed latency targets; bill-run throughput **MUST** sustain manifest baselines.
 
@@ -794,7 +793,7 @@ Interactive posting and AR reads **MUST** meet committed latency targets; bill-r
 
 #### Tamper-evidence verification cadence
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-nfr-tamper-evidence-cadence`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-nfr-tamper-evidence-cadence`
 
 The ledger **MUST** run periodic chain-integrity verification and alert on the first inconsistency.
 
@@ -834,7 +833,7 @@ Explicit dispositions for checklist domains not otherwise addressed (no silent o
 
 #### Ledger inquiry & audit-pack interface
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-interface-ledger-inquiry`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-interface-ledger-inquiry`
 
 **Type**: REST / query API (shape in Design)
 
@@ -846,7 +845,7 @@ Explicit dispositions for checklist domains not otherwise addressed (no silent o
 
 #### Posting intake interface
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-interface-posting-intake`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-interface-posting-intake`
 
 **Type**: event/command intake (shape in Design)
 
@@ -860,7 +859,7 @@ Explicit dispositions for checklist domains not otherwise addressed (no silent o
 
 #### ERP / GL export contract
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-contract-erp-export`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-contract-erp-export`
 
 **Direction**: provided by ledger to ERP/GL
 
@@ -870,7 +869,7 @@ Explicit dispositions for checklist domains not otherwise addressed (no silent o
 
 #### Payments / PSP event contract
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-contract-payments-events`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-contract-payments-events`
 
 **Direction**: required from Payments
 
@@ -880,7 +879,7 @@ Explicit dispositions for checklist domains not otherwise addressed (no silent o
 
 #### Tax / Catalog / Contracts input contract
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-contract-tax-catalog-contracts`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-contract-tax-catalog-contracts`
 
 **Direction**: required from Tax Engine, Catalog, Contracts
 
@@ -892,9 +891,9 @@ Explicit dispositions for checklist domains not otherwise addressed (no silent o
 
 #### Ledger inquiry and audit-pack export
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-usecase-ledger-inquiry`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-usecase-ledger-inquiry`
 
-**Actor**: `cpt-vhp-bss-actor-auditor`
+**Actor**: `cpt-cf-bss-ledger-actor-auditor`
 
 **Preconditions**:
 - Posted journal entries exist for the tenant and period.
@@ -912,9 +911,9 @@ Explicit dispositions for checklist domains not otherwise addressed (no silent o
 
 #### Reconciliation review and close decision
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-usecase-reconciliation-review`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-usecase-reconciliation-review`
 
-**Actor**: `cpt-vhp-bss-actor-revenue-assurance`
+**Actor**: `cpt-cf-bss-ledger-actor-revenue-assurance`
 
 **Preconditions**:
 - Reconciliation job has run for the period scope (AR, PSP, ERP).
@@ -932,9 +931,9 @@ Explicit dispositions for checklist domains not otherwise addressed (no silent o
 
 #### Exception queue resolution
 
-- [ ] `p2` - **ID**: `cpt-vhp-bss-usecase-exception-resolution`
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-usecase-exception-resolution`
 
-**Actor**: `cpt-vhp-bss-actor-finance-ops`
+**Actor**: `cpt-cf-bss-ledger-actor-finance-ops`
 
 **Preconditions**:
 - Unallocated cash, suspense lines, failed exports, or mapping gaps exist.

@@ -7,6 +7,10 @@ reason = "Ignore 'gears/system' parent directory — not a module, only a groupi
 patterns = ["gears/system"]
 
 [[ignore]]
+reason = "Ignore 'gears/bss' parent directory — not a module, only a grouping for BSS submodules."
+patterns = ["gears/bss"]
+
+[[ignore]]
 reason = "Ignore authn-resolver root module node while allowing nested plugin docs scopes."
 patterns = ["gears/system/authn-resolver"]
 
@@ -306,6 +310,74 @@ required = false
 require_kind_registered_in_kit = true
 require_md_extension = true
 fail_on_unmatched_markdown = true
+
+
+[[systems.autodetect]]
+kit = "gears"
+slug = "cf-bss"
+system_root = "{project_root}/gears/bss/$system"
+artifacts_root = "{system_root}/docs"
+
+[systems.autodetect.artifacts]
+[systems.autodetect.artifacts.PRD]
+pattern = "PRD.md"
+traceability = "FULL"
+required = true
+
+[systems.autodetect.artifacts.DESIGN]
+pattern = "DESIGN.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.ADR]
+pattern = "ADR/*.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "FULL"
+required = false
+
+[systems.autodetect.artifacts.UPSTREAM_REQS]
+pattern = "UPSTREAM_REQS.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.validation]
+require_kind_registered_in_kit = true
+require_md_extension = true
+fail_on_unmatched_markdown = false
+
+[[systems.autodetect.codebase]]
+name = "Gears"
+path = "{system_root}/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Tests"
+path = "{system_root}/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested Gears"
+path = "{system_root}/{system}/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested Tests"
+path = "{system_root}/{system}/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested SDK"
+path = "{system_root}/{system}-sdk/src"
+extensions = [".rs"]
 
 [[systems]]
 name = "examples"
