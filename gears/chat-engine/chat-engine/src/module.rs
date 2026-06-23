@@ -91,6 +91,11 @@ struct RuntimeState {
     leader: Arc<dyn LeaderElector>,
 }
 
+/// How often the resume-buffer TTL sweep runs (FR-024). The buffer's TTL is
+/// `RESUME_BUFFER_TTL` (minutes), so a few-minute cadence keeps expired rows
+/// from accumulating without competing with the hours-scale retention loop.
+const STREAM_BUFFER_SWEEP_PERIOD: Duration = Duration::from_mins(5);
+
 /// Chat Engine module entrypoint.
 ///
 /// Construction is two-phased so the macro-generated registrator can
@@ -158,6 +163,7 @@ impl ChatEngineModule {
         let interval_hours = runtime.config.retention_cleanup_interval_hours;
         let period = Duration::from_secs(interval_hours.saturating_mul(3600));
         let intelligence = Arc::clone(&runtime.intelligence);
+        let stream_buffer = Arc::clone(&runtime.stream_buffer);
         let leader = Arc::clone(&runtime.leader);
 
         ready.notify();
@@ -172,6 +178,7 @@ impl ChatEngineModule {
                 cancel,
                 work_fn(move |cancel| {
                     let intelligence = Arc::clone(&intelligence);
+                    let stream_buffer = Arc::clone(&stream_buffer);
                     async move {
                         let mut interval = tokio::time::interval(period);
                         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -179,6 +186,15 @@ impl ChatEngineModule {
                         // fires synchronously — the first cleanup runs one
                         // period after acquiring leadership, not instantly.
                         interval.tick().await;
+
+                        // Resume-buffer TTL sweep (FR-024) on its own short
+                        // cadence: the buffer's TTL is minutes, so it is swept
+                        // far more often than the hours-scale retention loop.
+                        // Shares the leader gate — the buffer is one shared DB
+                        // table, so a single sweeper suffices.
+                        let mut sweep = tokio::time::interval(STREAM_BUFFER_SWEEP_PERIOD);
+                        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        sweep.tick().await;
 
                         loop {
                             tokio::select! {
@@ -198,6 +214,9 @@ impl ChatEngineModule {
                                             "chat-engine retention-cleanup tick failed; continuing",
                                         );
                                     }
+                                }
+                                _ = sweep.tick() => {
+                                    run_stream_buffer_sweep_tick(stream_buffer.as_ref()).await;
                                 }
                             }
                         }
@@ -224,6 +243,24 @@ async fn run_retention_cleanup_tick(intelligence: &IntelligenceService) -> anyho
         "chat-engine retention-cleanup tick completed"
     );
     Ok(())
+}
+
+/// Single resume-buffer TTL sweep tick (FR-024): delete every event past its
+/// `expires_at`. Best-effort — a failed sweep is logged and the loop continues;
+/// expired rows are simply collected on the next tick. The buffer is short-TTL
+/// reconnect scratch, never durable history, so a missed sweep is harmless.
+async fn run_stream_buffer_sweep_tick(
+    buffer: &dyn crate::infra::db::repo::stream_event_repo::StreamEventBuffer,
+) {
+    match buffer.delete_expired(time::OffsetDateTime::now_utc()).await {
+        Ok(removed) if removed > 0 => {
+            info!(removed, "chat-engine stream-buffer TTL sweep removed expired events");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            warn!(error = %err, "chat-engine stream-buffer TTL sweep failed; continuing");
+        }
+    }
 }
 
 /// Construct the leader elector that gates the retention-cleanup loop.
