@@ -276,10 +276,59 @@ impl MigrationTrait for Migration {
                 .await?;
         }
 
+        // Resume buffer for the SSE delta stream (FR-024). Append-only,
+        // short-TTL; no FK to `messages` (ephemeral infra, reclaimed by TTL).
+        // See `cpt-cf-chat-engine-dbtable-stream-events`.
+        manager
+            .create_table(
+                Table::create()
+                    .table(StreamEvents::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(StreamEvents::MessageId).uuid().not_null())
+                    .col(ColumnDef::new(StreamEvents::Seq).big_integer().not_null())
+                    .col(ColumnDef::new(StreamEvents::Event).json_binary().not_null())
+                    .col(
+                        ColumnDef::new(StreamEvents::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(StreamEvents::ExpiresAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(StreamEvents::MessageId)
+                            .col(StreamEvents::Seq),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_stream_events_expiry")
+                    .table(StreamEvents::Table)
+                    .col(StreamEvents::ExpiresAt)
+                    .to_owned(),
+            )
+            .await?;
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(StreamEvents::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+
         // Drop citation children before their parent `message_parts`.
         for table in CITATION_TABLES {
             manager
@@ -375,4 +424,14 @@ pub enum MessageParts {
     Type,
     Content,
     Number,
+}
+
+#[derive(DeriveIden)]
+pub enum StreamEvents {
+    Table,
+    MessageId,
+    Seq,
+    Event,
+    CreatedAt,
+    ExpiresAt,
 }
