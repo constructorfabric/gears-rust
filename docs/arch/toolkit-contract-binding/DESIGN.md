@@ -568,13 +568,93 @@ Generated `error_code` values: `NOTIFICATION_NOT_FOUND`, `DELIVERY_UNAVAILABLE`,
 
 **Enforcement**: Currently by convention. Future work may add a Dylint lint that rejects traits with incorrect suffixes or transport projections on Extension/Embedded types.
 
+### D7: Server-Side Route Registration via OperationBuilder
+
+- [ ] `p1` - **ID**: `cpt-cf-binding-decision-server-codegen`
+
+**Decision**: The `#[toolkit::rest_contract]` macro additionally generates a server-side registration function `register_<trait>_routes(router, openapi, svc)` that uses `OperationBuilder` internally. This function is the drop-in replacement for hand-written `routes.rs` files. The same IR that drives REST client generation drives server route registration — single source of truth.
+
+**Rationale**: Eliminates manual duplication of path templates, HTTP verbs, and request/response schemas between the projection trait and server-side handler code. The HTTP binding IR (`HttpBindingIr`) generated for the client is now also used by the macro to emit `OperationBuilder` calls that register routes, collect OpenAPI specs, and attach Axum handlers.
+
+**What the developer writes:**
+
+```rust
+// SDK crate — projection trait with HTTP annotations (unchanged)
+#[toolkit::rest_contract(base_path = "/api/billing/v1")]
+pub trait BillingApiRest: BillingApi {
+    #[post("/payments/charge")]
+    async fn charge(&self, ctx: SecurityContext, req: ChargeRequest) 
+        -> Result<ChargeResponse, BillingError>;
+}
+```
+
+**What the macro emits (new):**
+
+```rust
+/// Register all `BillingApi` REST routes on the given router.
+pub fn register_billing_api_rest_routes(
+    router: axum::Router,
+    openapi: &dyn toolkit::api::OpenApiRegistry,
+    svc: std::sync::Arc<dyn BillingApi>,
+) -> axum::Router {
+    let router = OperationBuilder::post("/api/billing/v1/payments/charge")
+        .operation_id("billing.charge")
+        .summary("Charge a payment")
+        .authenticated()
+        .no_license_required()
+        .json_request::<ChargeRequest>(openapi, "")
+        .handler({
+            let svc = Arc::clone(&svc);
+            move |Extension(ctx): Extension<SecurityContext>, 
+                  Json(req): Json<ChargeRequest>| {
+                let svc = Arc::clone(&svc);
+                async move {
+                    svc.charge(ctx, req).await
+                        .map(Json)
+                        .map_err(Into::into)
+                }
+            }
+        })
+        .json_response_with_schema::<ChargeResponse>(openapi, StatusCode::OK, "")
+        .standard_errors(openapi)
+        .register(router, openapi);
+    router
+}
+```
+
+**Server-side usage (replaces `routes.rs`):**
+
+```rust
+impl RestApiCapability for MyGear {
+    fn register_rest(&self, ctx: &GearCtx, router: Router, openapi: &dyn OpenApiRegistry) 
+        -> anyhow::Result<Router> {
+        let svc = ctx.client_hub().get::<dyn BillingApi>()?;
+        Ok(api_contracts_sdk::rest::register_billing_api_rest_routes(router, openapi, svc))
+    }
+}
+```
+
+**Consequences:**
+
+- The projection trait becomes the **sole source of REST API specification** — paths, HTTP methods, response schemas, authentication all derive from it.
+- Manual `routes.rs` files are deleted; server routes are auto-generated from the trait.
+- OpenAPI spec is assembled via a single `OpenApiRegistry` (utoipa) as routes are registered.
+- Handler generation is synchronized with the IR — parameter binding order, error mapping, streaming support all follow from the binding metadata.
+- Current scope (PoC): basic HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[delete]`) + streaming (`#[streaming]`). Path/query parameters and complex authentication (license, OData) are follow-up work.
+
+**Trade-offs:**
+
+- The macro's responsibility grows — now generating both client and server paths. Debugging becomes more complex.
+- Server route generation is synchronous; async patterns in routes require manual composition with the generated function.
+- For routes that cannot be expressed by the macro (complex authentication, custom response shapes, multipart uploads), manual `OperationBuilder` calls can be composed alongside the generated function.
+
 ## 4. Crate Structure
 
 | Crate | Type | Responsibility |
 |-------|------|----------------|
-| `cf-toolkit-contract-macros` | proc-macro | `#[toolkit_rest_contract]` -- generates REST client struct, OpenAPI spec function, SSE streaming, retryable methods. `#[derive(ContractError)]` -- generates Problem Details conversion with `error_code` + `error_domain`. Method annotations: `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `#[patch]`. Parameter annotations: `#[path]`, `#[query]`, `#[header]`, `#[streaming]`, `#[retryable]`. |
+| `cf-toolkit-contract-macros` | proc-macro | `#[toolkit_rest_contract]` -- generates REST client struct, server route registration function (`register_<name>_routes()`), HTTP binding IR, OpenAPI spec function, SSE streaming, retryable methods. `#[derive(ContractError)]` -- generates Problem Details conversion with `error_code` + `error_domain`. Method annotations: `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `#[patch]`, `#[streaming]`, `#[retryable]`. |
 | `cf-toolkit-contract-runtime` | lib | `ProblemDetails` struct (RFC 9457 with extension fields). SSE stream parser (byte stream to typed events). `ClientConfig` (base URL, timeout, retry policy). `RetryConfig` and `with_retry()` helper for exponential backoff. |
-| Gear SDK crates (e.g., `notification-sdk`) | lib | Base traits (zero annotations, no macro dependency). Transport projection traits (behind `rest-client` feature). Feature-gated: `rest-client` enables `reqwest`, `schemars`, and the generated REST client. Without the feature, only the base trait is available. |
+| Gear SDK crates (e.g., `notification-sdk`) | lib | Base traits (zero annotations, no macro dependency). Transport projection traits (behind `rest-client` feature). Feature-gated: `rest-client` enables `reqwest`, `schemars`, and the generated REST client. `rest-server` feature enables server route registration function (`register_<name>_routes()`) and `OperationBuilder`, `axum`, `utoipa` dependencies. Without features, only the base trait is available. |
 | `cf-toolkit` (modified) | lib | ClientHub: fallback resolution (compile-time first, then REST proxy from directory). Gear lifecycle: new proxy wiring phase after plugin discovery, before post-init. |
 | `cf-toolkit-macros` (modified) | proc-macro | Alignment with ADR-0004 (PR #1380) gear/plugin declaration macros. |
 
@@ -592,6 +672,7 @@ notification-sdk/
   Cargo.toml
     [features]
     rest-client = ["reqwest", "schemars", "cf-toolkit-contract-macros", "cf-toolkit-contract-runtime"]
+    rest-server = ["toolkit", "axum", "utoipa", "cf-toolkit-contract-macros"]
 ```
 
 ## 5. Contract Enforcement

@@ -30,6 +30,9 @@ runtime-client = [
 ]
 # Used by rest_contract codegen to gate the generated client struct.
 rest-client = ["runtime-client"]
+# Server-side REST route registration: gates the generated `register_<trait>_routes()` function
+# and server-side OperationBuilder integration. Requires Axum and OpenAPI registry.
+rest-server = ["openapi", "dep:axum"]
 # Directory-resolving REST transport: a self-healing wrapper that resolves the
 # provider endpoint from the service directory per call and rebuilds the
 # generated REST client when the endpoint changes. Gates the generated

@@ -36,6 +36,7 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
     let resolving_struct = generate_resolving_client_struct(model, &support);
     let resolving_impl = generate_resolving_client_impl(model, &support);
     let projection_impl = generate_projection_impl(model);
+    let server_registration = generate_server_registration(model, &support);
 
     quote! {
         #cleaned_trait
@@ -45,6 +46,7 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
         #resolving_struct
         #resolving_impl
         #projection_impl
+        #server_registration
     }
 }
 
@@ -796,6 +798,167 @@ fn capture_body_param(method: &RestMethodModel) -> Option<syn::Ident> {
             !path_params.iter().any(|pp| p.ident == pp)
         })
         .map(|p| p.ident.clone())
+}
+
+fn generate_server_registration(model: &RestContractModel, _support: &TokenStream) -> TokenStream {
+    let fn_name = format_ident!("register_{}_routes", to_snake_case(&model.trait_ident.to_string()));
+    let base_trait = &model.base_trait;
+    let doc = format!("Register all REST routes for [`{}`] on the given router.", model.trait_ident);
+
+    let method_routes = model.methods.iter().map(|method| {
+        generate_method_route(method, model, _support)
+    });
+
+    quote! {
+        #[cfg(feature = "rest-server")]
+        #[doc = #doc]
+        pub fn #fn_name(
+            mut router: ::axum::Router,
+            openapi: &dyn ::toolkit::api::OpenApiRegistry,
+            svc: ::std::sync::Arc<dyn #base_trait>,
+        ) -> ::axum::Router {
+            #(#method_routes)*
+            router
+        }
+    }
+}
+
+fn generate_method_route(
+    method: &RestMethodModel,
+    model: &RestContractModel,
+    _support: &TokenStream,
+) -> TokenStream {
+    let base_path = &model.base_path;
+    let method_name = &method.ident;
+    let path = &method.path_template;
+    let full_path = format!("{}{}", base_path, path);
+    let operation_id = format!("{}_{}", to_snake_case(&model.trait_ident.to_string()), method_name);
+
+    let http_verb_method = match method.http_method {
+        HttpVerb::Get => quote! { get },
+        HttpVerb::Post => quote! { post },
+        HttpVerb::Put => quote! { put },
+        HttpVerb::Delete => quote! { delete },
+    };
+
+    let path_param_names = extract_path_param_names(&method.path_template);
+
+    let handler = if method.streaming {
+        generate_streaming_handler(method, &path_param_names)
+    } else {
+        generate_unary_handler(method, &path_param_names)
+    };
+
+    let response_registration = if method.streaming {
+        // For streaming, use sse_json with the item type from the stream
+        quote! {
+            .sse_json::<()>(openapi, "SSE response")
+        }
+    } else if let Some((ok_ty, _)) = &method.result_types {
+        // For unary methods, use json_response_with_schema with the response type
+        quote! {
+            .json_response_with_schema::<#ok_ty>(openapi, ::axum::http::StatusCode::OK, "OK")
+        }
+    } else {
+        // Fallback if we can't determine the type
+        quote! {
+            .json_response(::axum::http::StatusCode::OK, "OK")
+        }
+    };
+
+    quote! {
+        router = ::toolkit::api::OperationBuilder::#http_verb_method(#full_path)
+            .operation_id(#operation_id)
+            .authenticated()
+            .no_license_required()
+            .handler(#handler)
+            #response_registration
+            .standard_errors(openapi)
+            .register(router, openapi);
+    }
+}
+
+fn generate_unary_handler(
+    method: &RestMethodModel,
+    path_param_names: &[String],
+) -> TokenStream {
+    let method_ident = &method.ident;
+
+    // Build parameter extractors
+    let mut extractors = Vec::new();
+    let mut call_args = vec![quote! { ctx }];
+
+    // SecurityContext is always first (extracted via Extension)
+    extractors.push(quote! {
+        ::axum::extract::Extension(ctx): ::axum::extract::Extension<::toolkit_security::SecurityContext>
+    });
+
+    // Process remaining parameters
+    for param in &method.params {
+        let param_name = &param.ident;
+        if param_name == "self" || type_path_ends_with(&param.ty, "SecurityContext") {
+            continue;
+        }
+
+        let param_ty = &param.ty;
+
+        if path_param_names.contains(&param_name.to_string()) {
+            // Path parameter
+            extractors.push(quote! {
+                ::axum::extract::Path(#param_name): ::axum::extract::Path<#param_ty>
+            });
+            call_args.push(quote! { #param_name });
+        } else if method.http_method.allows_body() && call_args.len() == 1 {
+            // Body parameter (first non-SecurityContext param for POST/PUT)
+            extractors.push(quote! {
+                ::axum::Json(#param_name): ::axum::Json<#param_ty>
+            });
+            call_args.push(quote! { #param_name });
+        } else {
+            // Query parameter
+            extractors.push(quote! {
+                ::axum::extract::Query(#param_name): ::axum::extract::Query<#param_ty>
+            });
+            call_args.push(quote! { #param_name });
+        }
+    }
+
+    let extractor_list = quote! { #(#extractors),* };
+
+    quote! {
+        {
+            let svc = ::std::sync::Arc::clone(&svc);
+            |#extractor_list| {
+                let svc = ::std::sync::Arc::clone(&svc);
+                async move {
+                    svc.#method_ident(#(#call_args),*).await
+                        .map(::axum::Json)
+                        .map_err(|e| {
+                            let _problem: ::toolkit_canonical_errors::Problem = e.into();
+                            // TODO: proper error response conversion
+                            (::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error")
+                        })
+                }
+            }
+        }
+    }
+}
+
+fn generate_streaming_handler(
+    _method: &RestMethodModel,
+    _path_param_names: &[String],
+) -> TokenStream {
+    // Placeholder: generates a dummy streaming handler for now
+    quote! {
+        {
+            let _svc = ::std::sync::Arc::clone(&svc);
+            |::axum::extract::Extension(_ctx): ::axum::extract::Extension<::toolkit_security::SecurityContext>| async move {
+                // TODO: implement streaming handler
+                #[allow(unreachable_code)]
+                Err::<::axum::response::Sse<futures_util::stream::BoxStream<'static, Result<::axum::response::sse::Event, ::std::convert::Infallible>>>, _>(())
+            }
+        }
+    }
 }
 
 fn to_snake_case(s: &str) -> String {
