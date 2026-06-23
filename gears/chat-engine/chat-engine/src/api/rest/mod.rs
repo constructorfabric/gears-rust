@@ -39,6 +39,7 @@ pub mod dto;
 pub mod error;
 pub mod handlers;
 pub mod routes;
+pub(crate) mod stream_reader;
 
 pub use routes::register_routes;
 
