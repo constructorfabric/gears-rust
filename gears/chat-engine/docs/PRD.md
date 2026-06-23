@@ -310,7 +310,9 @@ Webhook backends receive message history with file_ids (UUIDs). Backends must im
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-fr-stop-streaming`
 
 <!-- fdd-id-content -->
-The system **MUST** allow canceling streaming responses mid-generation. When cancellation occurs, the system stops forwarding data from backend plugin, closes the connection, and saves the partial response as an incomplete message with appropriate metadata.
+The system **MUST** allow canceling a streaming response mid-generation via an **explicit** stop action. On an explicit stop the system stops forwarding data from the backend plugin and saves the partial response as an incomplete message with appropriate metadata.
+
+Merely **closing the HTTP connection does NOT cancel generation** — under true live-tail streaming (`cpt-cf-chat-engine-design-stream-resume`) the response is resumable: the system keeps generating and buffering events so the client can reconnect with `Last-Event-ID` and continue. A disconnected stream therefore finalizes as a **complete** message (not a cancelled partial) unless an explicit stop, the plugin deadline, or a plugin error intervenes.
 
 **Actors**: `cpt-cf-chat-engine-actor-client`
 <!-- fdd-id-content -->
@@ -768,7 +770,7 @@ The system **MUST** stream assistant responses to the client as a **delta protoc
 - A dropped connection is resumable: the client reconnects with `Last-Event-ID: <seq>` and the system replays buffered events with `seq` greater than the last, then continues live — **without re-running the backend plugin**.
 - Resume is best-effort within a short live-stream window. If the buffer has expired or the stream already terminated, the client falls back to fetching the final message (`GET /messages/{id}`). The buffer is **not** durable conversation history.
 
-**Cancellation**: closing the connection cancels the stream and saves the partial response (see `cpt-cf-chat-engine-fr-stop-streaming`).
+**Cancellation**: closing the connection does **not** cancel generation — the response is resumable (see "Ordering & resume" above). Cancellation is an explicit action that stops generation and saves the partial response (see `cpt-cf-chat-engine-fr-stop-streaming`).
 
 **Acceptance criteria**:
 - A streamed assistant response applied delta-by-delta on the client yields a document identical to the persisted message read via `GET /messages/{id}`.
@@ -1124,7 +1126,8 @@ Backend Plugin integration is defined through the `ChatEngineBackendPlugin` trai
 **Postconditions**: User and assistant messages persisted; client receives complete streaming response
 
 **Alternative Flows**:
-- **Client cancels mid-stream**: System stops forwarding, saves partial response with incomplete status (see `cpt-cf-chat-engine-fr-stop-streaming`)
+- **Client disconnects mid-stream**: Generation continues to completion and events keep buffering; the client may reconnect with `Last-Event-ID` to resume (see `cpt-cf-chat-engine-design-stream-resume`). The message finalizes as complete.
+- **Client explicitly cancels mid-stream**: System stops forwarding, saves partial response with incomplete status (see `cpt-cf-chat-engine-fr-stop-streaming`)
 - **Webhook backend timeout**: System closes stream, saves error message with timeout metadata, returns appropriate timeout error to client
 - **Webhook backend returns error**: System saves error message, propagates structured error to client
 <!-- fdd-id-content -->

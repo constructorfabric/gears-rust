@@ -62,7 +62,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-fr-recreate-response` | Creates new message with same parent_message_id as original, sends `message.recreate` event to backend plugin |
 | `cpt-cf-chat-engine-fr-branch-message` | Client specifies parent_message_id; Chat Engine loads context up to parent, creates new branch in message tree |
 | `cpt-cf-chat-engine-fr-navigate-variants` | Query API returns all messages with same parent_message_id; includes variant position metadata (e.g., "2 of 3") |
-| `cpt-cf-chat-engine-fr-stop-streaming` | Client closes HTTP connection; Chat Engine cancels plugin request, saves partial response with incomplete flag |
+| `cpt-cf-chat-engine-fr-stop-streaming` | An **explicit** stop cancels the plugin request and saves the partial response with an incomplete flag. Closing the HTTP connection does NOT cancel — generation continues and is resumable via `Last-Event-ID` (`cpt-cf-chat-engine-design-stream-resume`) |
 | `cpt-cf-chat-engine-fr-export-session` | Background job traverses message tree (active path or all variants), formats to JSON/Markdown/TXT, uploads to storage |
 | `cpt-cf-chat-engine-fr-share-session` | Generates unique share token stored in database, maps to session_id; recipients create branches from last message |
 | `cpt-cf-chat-engine-fr-session-summary` | Routes `session.summary` event to dedicated summarization service URL or backend plugin based on session type config |
@@ -330,9 +330,9 @@ This delta model makes **all parts and citations stream incrementally** (superse
 
 - [ ] `p2` - **ID**: `cpt-cf-chat-engine-design-stream-resume`
 
-A dropped connection (network blip, client reload) MUST be resumable without re-running the plugin. Resume rides the standard SSE mechanism (`cpt-cf-chat-engine-adr-stream-resumability`):
+A dropped connection (network blip, client reload) MUST be resumable without re-running the plugin. This rests on a **detached driver**: generation is independent of the client connection, so a disconnect never truncates the response — the driver runs to completion and keeps appending events to the resume buffer. Resume rides the standard SSE mechanism (`cpt-cf-chat-engine-adr-stream-resumability`):
 
-- On reconnect the client sends `Last-Event-ID: <seq>` (the SSE `id:` of the last applied event). The server **replays buffered events with `seq > last`** then continues live; the client applies them on top of its existing document, so the result is identical to an uninterrupted stream.
+- The client reconnects with `GET /chat-engine/v1/messages/{id}/stream` carrying `Last-Event-ID: <seq>` (the SSE `id:` of the last applied event). The server **replays buffered events with `seq > last`** then live-tails the buffer until a terminal event; the client applies them on top of its existing document, so the result is identical to an uninterrupted stream. A missing/malformed `Last-Event-ID` replays the whole buffered stream from the start.
 - If the buffer for that message is gone (TTL expired) or the stream already terminated, the server closes with no replay and the client falls back to a one-shot `GET /messages/{id}` to fetch the final document.
 - `seq` is a per-message monotonic counter assigned by the engine as it emits events (it is **not** the part `number`). Clients de-duplicate on `seq`.
 
@@ -605,7 +605,7 @@ Chat Engine's plugin invocation layer. Resolves `dyn ChatEngineBackendPlugin` by
 <!-- fdd-id-content -->
 **ADRs**: `cpt-cf-chat-engine-adr-streaming-architecture` (streaming architecture), `cpt-cf-chat-engine-adr-streaming-cancellation` (cancellation), `cpt-cf-chat-engine-adr-backpressure-handling` (backpressure)
 
-Chat Engine manages the SSE delta-stream functionality. It projects backend-plugin output into `start`/`delta`/`complete`/`error` events and emits them to the client over `text/event-stream`. This handles request processing, partial response saving on connection close, backpressure, per-message `seq` assignment, and resume via `Last-Event-ID` against the short-TTL event buffer (`cpt-cf-chat-engine-design-stream-resume`). Each stream is identified by a unique message_id.
+Chat Engine manages the SSE delta-stream functionality. It projects backend-plugin output into `start`/`delta`/`complete`/`error` events and emits them to the client over `text/event-stream`. The streaming driver is **detached from the client connection** (true live-tail): it runs to completion regardless of whether the client is still connected, buffering every event so a reconnect can resume. This handles request processing, backpressure, per-message `seq` assignment, partial response saving on **explicit** cancellation (or plugin error/deadline), and resume via `Last-Event-ID` against the short-TTL event buffer (`cpt-cf-chat-engine-design-stream-resume`). Each stream is identified by a unique message_id.
 <!-- fdd-id-content -->
 
 #### Conversation Export
@@ -1057,7 +1057,7 @@ sequenceDiagram
 **Use Case**: `cpt-cf-chat-engine-fr-stop-streaming`
 **Actors**: `cpt-cf-chat-engine-actor-client`
 
-**Note**: With HTTP streaming, cancellation is achieved by closing the connection, not by sending a separate API call.
+**Note**: Closing the HTTP connection does **not** cancel generation — under true live-tail the driver detaches from the connection, runs to completion, and buffers events for resume. Cancellation is an **explicit** action (a future stop endpoint) that aborts the backend request and saves the partial response.
 
 ```mermaid
 sequenceDiagram
@@ -1068,22 +1068,26 @@ sequenceDiagram
     Note over Client,Chat Engine: Session already exists
 
     Client->>Chat Engine: Send Message
-    Chat Engine->>Backend Plugin: Process Message
+    Chat Engine->>Backend Plugin: Process Message (detached driver)
 
     loop Streaming Response
         Backend Plugin-->>Chat Engine: Stream chunk
+        Chat Engine->>Chat Engine: Append event to resume buffer (seq)
         Chat Engine-->>Client: Stream delta (SSE)
     end
 
-    Note over Client: User cancels streaming
+    Note over Client: Connection drops (blip / reload)
     Client->>Client: Close Connection
+    Note over Chat Engine: Driver keeps generating + buffering (NOT cancelled)
 
-    Note over Chat Engine: Connection close detected
-    Chat Engine->>Chat Engine: Cancel Request
-    Chat Engine->>Chat Engine: Save Partial Response
-    Chat Engine->>Backend Plugin: Close Connection
+    Client->>Chat Engine: GET /messages/{id}/stream (Last-Event-ID: seq)
+    Chat Engine-->>Client: Replay events with seq > last, then live-tail
+    Note over Chat Engine: Message finalizes complete
 
-    Note over Chat Engine: Message marked incomplete
+    Note over Client,Chat Engine: Explicit stop (alternative)
+    Client->>Chat Engine: Explicit cancel
+    Chat Engine->>Backend Plugin: Cancel request
+    Chat Engine->>Chat Engine: Save partial response (incomplete)
 ```
 
 #### S11: Search Session History
@@ -1560,7 +1564,7 @@ Per ADR-0022, resilience patterns (circuit breaker, retry, timeout) are the resp
 <!-- fdd-id-content -->
 **ADRs**: `cpt-cf-chat-engine-adr-backpressure-handling`
 
-Streaming implementation uses bidirectional data streams with backpressure handling. If client is slow, Chat Engine buffers chunks in memory up to a configured limit. If the buffer fills, the webhook request is paused via flow control mechanisms. Client disconnect cancels the webhook request immediately.
+Streaming implementation uses bidirectional data streams with backpressure handling. If the client is slow, Chat Engine buffers chunks up to a configured limit and applies flow control to the bounded driver→client channel. A client disconnect does **not** cancel the backend request: under true live-tail the driver detaches from the connection and runs to completion, teeing every event into the short-TTL resume buffer so a reconnect via `Last-Event-ID` continues seamlessly (`cpt-cf-chat-engine-design-stream-resume`). The backend request is cancelled only on an explicit stop or the plugin deadline.
 <!-- fdd-id-content -->
 
 #### Context: Search Performance
