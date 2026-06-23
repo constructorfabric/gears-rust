@@ -344,6 +344,13 @@ impl Gear for ChatEngineModule {
             .with_plugin_timeout(plugin_deadline),
         );
 
+        // Resume buffer (FR-024): the driver tees wire events here so dropped
+        // connections can resume via `Last-Event-ID`.
+        let stream_buffer: Arc<dyn crate::infra::db::repo::stream_event_repo::StreamEventBuffer> =
+            Arc::new(crate::infra::db::repo::stream_event_repo::SeaStreamEventBuffer::new(
+                Arc::clone(&db),
+            ));
+
         let messages = Arc::new(
             MessageService::new(
                 sessions_repo.clone(),
@@ -353,7 +360,8 @@ impl Gear for ChatEngineModule {
             )
             .with_webhook_emitter(webhooks_domain.clone())
             .with_streaming_buffer_size(config.ndjson_buffer_size)
-            .with_plugin_deadline(plugin_deadline),
+            .with_plugin_deadline(plugin_deadline)
+            .with_stream_buffer(Arc::clone(&stream_buffer)),
         );
 
         let variants = Arc::new(

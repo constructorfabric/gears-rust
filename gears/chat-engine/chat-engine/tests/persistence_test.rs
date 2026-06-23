@@ -27,6 +27,7 @@ use std::time::Duration;
 use chat_engine::domain::service::message_service::{MessageService, SendMessageRequest};
 use chat_engine::domain::service::plugin_service::PluginService;
 use chat_engine::domain::service::session_service::Identity;
+use chat_engine::infra::db::repo::stream_event_repo::{SeaStreamEventBuffer, StreamEventBuffer};
 use chat_engine_sdk::models::{FileCitation, MessagePartInput, MessagePartType};
 use chat_engine_sdk::{
     ChatEngineBackendPlugin, PluginError, StreamingChunkEvent, StreamingCompleteEvent,
@@ -589,4 +590,100 @@ async fn cross_tenant_send_returns_not_found_against_sqlite() {
         rows.is_empty(),
         "cross-tenant rejected send must not insert any messages; got {rows:?}",
     );
+}
+
+// ===========================================================================
+// 4. Resume buffer is populated while the stream runs (FR-024, 3b-2)
+//
+// The detached driver tees every projected wire event into the
+// `StreamEventBuffer` as it pumps the live channel. Drive a full
+// Chunk+Chunk+Complete send and assert the buffer holds the projected
+// start / delta(s) / complete frames with a contiguous per-message seq —
+// the substrate a `Last-Event-ID` reconnect will later replay.
+// ===========================================================================
+
+#[tokio::test]
+async fn streamed_events_are_buffered_for_resume_against_sqlite() {
+    let harness = db::setup_sqlite().await;
+    let plugin_id = "resume-buffer-plugin";
+    let session_type_id = db::seed_session_type(&harness, plugin_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+
+    let buffer: Arc<dyn StreamEventBuffer> =
+        Arc::new(SeaStreamEventBuffer::new(Arc::clone(&harness.db)));
+
+    // The SDK placeholder id; the driver re-stamps each event with the real
+    // assistant id before projecting, so the buffered events key off that.
+    let placeholder = Uuid::nil();
+    let plugin = FakePlugin::new(
+        plugin_id,
+        FakePluginScript::Events(vec![
+            StreamingEvent::Chunk(StreamingChunkEvent {
+                message_id: placeholder,
+                chunk: "Hel".into(),
+            }),
+            StreamingEvent::Chunk(StreamingChunkEvent {
+                message_id: placeholder,
+                chunk: "lo".into(),
+            }),
+            StreamingEvent::Complete(StreamingCompleteEvent {
+                message_id: placeholder,
+                metadata: None,
+                file_citations: vec![],
+                link_citations: vec![],
+                references: vec![],
+            }),
+        ]),
+    );
+    let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+
+    // Mirror `build_service` plus the resume-buffer collaborator.
+    let hub = Arc::new(ClientHub::new());
+    hub.register_scoped::<dyn ChatEngineBackendPlugin>(ClientScope::gts_id(plugin_id), plugin_dyn);
+    let plugins = PluginService::new(hub, Arc::clone(&harness.plugin_configs));
+    let svc = MessageService::new(
+        Arc::clone(&harness.sessions),
+        Arc::clone(&harness.session_types),
+        Arc::clone(&harness.messages),
+        plugins,
+    )
+    .with_stream_buffer(Arc::clone(&buffer));
+
+    let cancel = CancellationToken::new();
+    let mut stream = svc
+        .send_message(make_request(session_id), make_identity(), cancel)
+        .await
+        .expect("send_message dispatch");
+    while stream.next().await.is_some() {}
+
+    // The finalize UPDATE runs in the detached driver after the channel
+    // closes; wait for it so the assistant row (and its buffered tail) is
+    // settled before we read the buffer.
+    let row = db::wait_for_finalize(&harness.db, session_id, Duration::from_secs(2)).await;
+    assert!(row.is_complete, "completed send must finalize is_complete=true");
+
+    let events = buffer
+        .read_since(row.message_id, None)
+        .await
+        .expect("read resume buffer");
+    assert!(
+        events.len() >= 3,
+        "expected start + delta(s) + complete; got {events:?}",
+    );
+
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e.event["type"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(types.first(), Some(&"start"), "first buffered event is start");
+    assert_eq!(types.last(), Some(&"complete"), "last buffered event is complete");
+    assert!(
+        types.contains(&"delta"),
+        "text chunks must project to delta events; got {types:?}",
+    );
+
+    // seq is a contiguous per-message counter starting at 0 — the SSE `id:`.
+    for (i, e) in events.iter().enumerate() {
+        assert_eq!(e.seq, i as u64, "buffered seq must be contiguous; got {events:?}");
+    }
 }

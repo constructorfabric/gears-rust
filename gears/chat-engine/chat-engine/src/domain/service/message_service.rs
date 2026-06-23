@@ -74,8 +74,10 @@ use crate::domain::session::Session;
 use crate::infra::db::repo::message_repo::{
     FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage, PartCitations,
 };
+use crate::domain::stream_delta::DeltaProjector;
 use crate::infra::db::repo::session_repo::SessionRepo;
 use crate::infra::db::repo::session_type_repo::SessionTypeRepo;
+use crate::infra::db::repo::stream_event_repo::StreamEventBuffer;
 
 /// Default maximum number of pending events in the bounded backpressure
 /// channel between the plugin driver task and the NDJSON sink. Per
@@ -89,6 +91,46 @@ pub const DEFAULT_STREAMING_BUFFER_SIZE: usize = 64;
 /// hooks' 10s budget because plugins legitimately take time to emit a
 /// full response — but bounded so a hung plugin still releases resources.
 pub const DEFAULT_PLUGIN_DEADLINE: Duration = Duration::from_mins(2);
+
+/// How long a resume-buffer event lives (FR-024). Bounds the reconnect window:
+/// a client may resume within this window; afterwards it reconciles via
+/// `GET /messages/{id}`. Long enough to cover a generous stream + a brief
+/// reconnect gap, short enough that the buffer stays small.
+pub const RESUME_BUFFER_TTL: time::Duration = time::Duration::minutes(10);
+
+/// Tees a driver's outgoing `StreamingEvent`s to the bounded client channel
+/// **and** (when a resume buffer is configured) into the buffer as projected,
+/// `seq`-stamped wire events (FR-024). A single [`DeltaProjector`] instance is
+/// kept so `seq` is monotonic across the whole stream. Buffer writes are
+/// best-effort: a failed append is logged and never blocks the live stream.
+struct Emitter {
+    tx: mpsc::Sender<StreamingEvent>,
+    projector: DeltaProjector,
+    buffer: Option<Arc<dyn StreamEventBuffer>>,
+    message_id: Uuid,
+    expires_at: OffsetDateTime,
+}
+
+impl Emitter {
+    /// Forward `event` to the client channel and tee its projected wire events
+    /// into the resume buffer. Returns `Err(())` when the channel receiver is
+    /// gone (client disconnected) so the caller can react as before.
+    async fn emit(&mut self, event: StreamingEvent) -> std::result::Result<(), ()> {
+        if let Some(buffer) = &self.buffer {
+            for wire in self.projector.project(event.clone()) {
+                let value = serde_json::to_value(&wire).unwrap_or(JsonValue::Null);
+                if let Err(err) = buffer
+                    .append(self.message_id, wire.seq(), value, self.expires_at)
+                    .await
+                {
+                    warn!(error = %err, message_id = %self.message_id,
+                        "resume-buffer append failed (stream continues)");
+                }
+            }
+        }
+        self.tx.send(event).await.map_err(|_| ())
+    }
+}
 
 /// Validated, owned request for `send_message`. Constructed by the handler
 /// from the wire body + the JWT-derived [`Identity`].
@@ -155,6 +197,10 @@ pub struct MessageService {
     /// production emitter; by default the service uses [`NoopWebhookEmitter`]
     /// so existing constructors stay source-compatible.
     webhooks: Arc<dyn WebhookEmitter>,
+    /// Resume buffer (FR-024): when set, the driver tees every wire event into
+    /// it (with `seq`) so a dropped connection can resume via `Last-Event-ID`.
+    /// `None` disables buffering (the stream still works; just not resumable).
+    stream_buffer: Option<Arc<dyn StreamEventBuffer>>,
 }
 
 impl MessageService {
@@ -173,7 +219,16 @@ impl MessageService {
             streaming_buffer_size: DEFAULT_STREAMING_BUFFER_SIZE,
             plugin_deadline: DEFAULT_PLUGIN_DEADLINE,
             webhooks: Arc::new(NoopWebhookEmitter),
+            stream_buffer: None,
         }
+    }
+
+    /// Inject the resume buffer (FR-024). Defaults to `None` (no buffering) so
+    /// existing constructors stay source-compatible.
+    #[must_use]
+    pub fn with_stream_buffer(mut self, buffer: Arc<dyn StreamEventBuffer>) -> Self {
+        self.stream_buffer = Some(buffer);
+        self
     }
 
     /// Inject the webhook emitter used by Phase 12's
@@ -1187,12 +1242,23 @@ impl MessageService {
         });
 
         let tx_for_driver = tx.clone();
+        // Resume-buffer tee (FR-024): every event the driver emits is also
+        // projected + appended to the buffer with a monotonic `seq`.
+        let stream_buffer = self.stream_buffer.clone();
+        let buffer_expires_at = OffsetDateTime::now_utc() + RESUME_BUFFER_TTL;
         tokio::spawn(async move {
+            let mut emitter = Emitter {
+                tx: tx_for_driver,
+                projector: DeltaProjector::new(),
+                buffer: stream_buffer,
+                message_id: assistant_id,
+                expires_at: buffer_expires_at,
+            };
             // 1) Emit Start.
             let start = StreamingEvent::Start(StreamingStartEvent {
                 message_id: assistant_id,
             });
-            if tx_for_driver.send(start).await.is_err() {
+            if emitter.emit(start).await.is_err() {
                 // Receiver dropped before we even started. Treat as
                 // cancellation.
                 cancel.cancel();
@@ -1257,7 +1323,7 @@ impl MessageService {
                                     message_id: assistant_id,
                                     chunk: c.chunk,
                                 });
-                                if tx_for_driver.send(evt).await.is_err() {
+                                if emitter.emit(evt).await.is_err() {
                                     // Sink dropped → client gone.
                                     plugin_cancel.cancel();
                                     outcome = DriverOutcome::CancelledByClient;
@@ -1281,7 +1347,7 @@ impl MessageService {
                                     link_citations: c.link_citations,
                                     references: c.references,
                                 });
-                                tx_for_driver.send(evt).await.ok();
+                                emitter.emit(evt).await.ok();
                                 outcome = DriverOutcome::Completed {
                                     metadata: last_metadata.clone(),
                                     citations,
@@ -1308,7 +1374,7 @@ impl MessageService {
                                     message_id: assistant_id,
                                     error: e.error.clone(),
                                 });
-                                tx_for_driver.send(evt).await.ok();
+                                emitter.emit(evt).await.ok();
                                 outcome = DriverOutcome::Errored {
                                     error: e.error,
                                     finish_reason: "error",
@@ -1322,7 +1388,7 @@ impl MessageService {
                                     message_id: assistant_id,
                                     error: error_str.clone(),
                                 });
-                                tx_for_driver.send(evt).await.ok();
+                                emitter.emit(evt).await.ok();
                                 outcome = DriverOutcome::Errored {
                                     error: error_str,
                                     finish_reason,
