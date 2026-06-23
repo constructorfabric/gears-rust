@@ -11,6 +11,7 @@ pub mod plugin_config_repo;
 pub mod reaction_repo;
 pub mod session_repo;
 pub mod session_type_repo;
+pub mod stream_event_repo;
 pub mod variant_repo;
 
 /// Crate-wide `DBProvider` alias parameterised over the chat-engine
