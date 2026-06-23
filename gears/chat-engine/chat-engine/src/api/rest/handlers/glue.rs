@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query};
+use axum::http::{HeaderMap, HeaderName};
 use axum::response::Response;
 use axum::{Extension, Json};
 use chat_engine_sdk::models::CapabilityValue;
@@ -29,7 +30,9 @@ use crate::api::rest::dto::{
 };
 use crate::api::rest::handlers::sessions::identity_from_ctx;
 use crate::api::rest::sse_delta_stream_response;
+use crate::api::rest::stream_reader::sse_buffer_reader_response;
 use crate::domain::error::{ChatEngineError, Result};
+use crate::infra::db::repo::stream_event_repo::StreamEventBuffer;
 use crate::domain::reaction::ReactionType;
 use crate::domain::search::SearchQuery;
 use crate::domain::service::message_service::SendMessageRequest;
@@ -100,6 +103,52 @@ pub async fn get_message(
     let identity = identity_from_ctx(&ctx)?;
     let message = svc.resolve_owned_message(&identity, message_id).await?;
     Ok(Json(MessageDto::from(message)))
+}
+
+/// `GET /chat-engine/v1/messages/{id}/stream` — (re)attach to an assistant
+/// message's SSE delta stream (FR-024, true live-tail resume).
+///
+/// On reconnect the client sends `Last-Event-ID: <seq>` (the SSE `id:` of the
+/// last event it applied); the server replays buffered events with
+/// `seq > last` then live-tails the resume buffer until a terminal
+/// (`complete`/`error`) event. Without the header the full buffered stream is
+/// replayed from the start. The durable record remains `GET /messages/{id}`;
+/// this only bridges the live-reconnect window
+/// (`cpt-cf-chat-engine-design-stream-resume`).
+///
+/// Ownership is resolved first (cross-tenant/missing → 404) so no buffered
+/// event is exposed without an access check.
+#[tracing::instrument(skip(svc, buffer, ctx, headers), fields(message_id = %message_id))]
+pub async fn resume_message_stream(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<MessageService>>,
+    Extension(buffer): Extension<Arc<dyn StreamEventBuffer>>,
+    Path(message_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let identity = identity_from_ctx(&ctx)?;
+    svc.resolve_owned_message(&identity, message_id).await?;
+
+    let from_seq = parse_last_event_id(&headers);
+    // Reader-only token: cancelling it stops polling on disconnect; the driver
+    // keeps writing so a later reconnect resumes.
+    let cancel = CancellationToken::new();
+    Ok(sse_buffer_reader_response(
+        buffer,
+        message_id,
+        from_seq,
+        cancel,
+    ))
+}
+
+/// Parse the SSE `Last-Event-ID` reconnect header into a `seq`. A missing or
+/// malformed value resolves to `None` (replay from the start) rather than an
+/// error — a client that lost its cursor still gets a coherent stream.
+fn parse_last_event_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(HeaderName::from_static("last-event-id"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
 /// `POST /chat-engine/v1/messages/{id}/recreate` — regenerate an assistant

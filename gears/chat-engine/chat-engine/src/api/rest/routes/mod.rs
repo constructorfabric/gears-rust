@@ -36,6 +36,7 @@ use crate::domain::service::{
     ExportService, IntelligenceService, MessageService, ReactionService, SearchService,
     SessionService, VariantService,
 };
+use crate::infra::db::repo::stream_event_repo::StreamEventBuffer;
 
 /// API tag used by every Chat Engine endpoint in the generated OpenAPI
 /// document.
@@ -86,6 +87,7 @@ pub fn register_routes(
     openapi: &dyn OpenApiRegistry,
     services: ChatEngineServices,
     webhooks: Arc<dyn WebhookEmitter>,
+    stream_buffer: Arc<dyn StreamEventBuffer>,
     enable_search: bool,
 ) -> Router {
     let mut router = router;
@@ -385,6 +387,22 @@ pub fn register_routes(
         .standard_errors(openapi)
         .register(router, openapi);
 
+    router = OperationBuilder::get("/chat-engine/v1/messages/{id}/stream")
+        .operation_id("chat_engine.message.stream")
+        .summary("Resume an assistant message's SSE delta stream (Last-Event-ID)")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features([&ChatEngineLicense])
+        .path_param("id", "Message UUID")
+        .handler(handlers::glue::resume_message_stream)
+        .json_response_with_schema::<StreamingEventDto>(
+            openapi,
+            StatusCode::OK,
+            "SSE delta stream replayed from Last-Event-ID then live-tailed (text/event-stream)",
+        )
+        .standard_errors(openapi)
+        .register(router, openapi);
+
     router = OperationBuilder::delete("/chat-engine/v1/messages/{id}")
         .operation_id("chat_engine.message.delete")
         .summary("Delete a message and its descendants (cascade)")
@@ -456,4 +474,5 @@ pub fn register_routes(
         .layer(Extension(services.intelligence))
         .layer(Extension(services.export))
         .layer(Extension(webhooks))
+        .layer(Extension(stream_buffer))
 }

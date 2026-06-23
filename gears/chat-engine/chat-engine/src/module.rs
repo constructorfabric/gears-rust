@@ -79,6 +79,10 @@ struct RuntimeState {
     services: ChatEngineServices,
     webhooks: Arc<dyn WebhookEmitter>,
     intelligence: Arc<IntelligenceService>,
+    /// Resume buffer (FR-024) shared between the streaming driver (writer) and
+    /// the `Last-Event-ID` reconnect handler (reader); also swept by the TTL
+    /// cleanup loop.
+    stream_buffer: Arc<dyn crate::infra::db::repo::stream_event_repo::StreamEventBuffer>,
     config: Arc<ChatEngineConfig>,
     /// Leader elector gating the retention-cleanup loop so only one replica
     /// sweeps at a time under horizontal scaling
@@ -442,6 +446,7 @@ impl Gear for ChatEngineModule {
             services,
             webhooks: webhooks_rest,
             intelligence,
+            stream_buffer,
             config,
             leader,
         };
@@ -481,6 +486,7 @@ impl RestApiCapability for ChatEngineModule {
             openapi,
             runtime.services.clone(),
             Arc::clone(&runtime.webhooks),
+            Arc::clone(&runtime.stream_buffer),
             runtime.config.enable_search,
         );
         Ok(router)

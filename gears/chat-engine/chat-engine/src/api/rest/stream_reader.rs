@@ -10,10 +10,6 @@
 // @cpt-cf-chat-engine-design-stream-resume:p2
 // @cpt-cf-chat-engine-adr-stream-resumability:p2
 
-// Foundational reader landed ahead of its wiring; the initial + reconnect
-// handlers consume it in phase 3b-2/3b-3. Unit-tested in isolation here.
-#![allow(dead_code)]
-
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,8 +126,14 @@ pub fn sse_buffer_reader_response(
     from_seq: Option<u64>,
     cancel: CancellationToken,
 ) -> Response {
-    let body = buffer_reader_stream(buffer, message_id, from_seq, cancel)
-        .map(Ok::<Vec<u8>, Infallible>);
+    // A reader is just a *view* of the buffer — when the client disconnects we
+    // stop polling (cancel the reader) but the driver keeps writing, so a later
+    // reconnect resumes. This cancels reading only, never generation.
+    let guard = cancel.clone().drop_guard();
+    let body = buffer_reader_stream(buffer, message_id, from_seq, cancel).map(move |b| {
+        let _keep = &guard;
+        Ok::<Vec<u8>, Infallible>(b)
+    });
 
     Response::builder()
         .status(StatusCode::OK)
