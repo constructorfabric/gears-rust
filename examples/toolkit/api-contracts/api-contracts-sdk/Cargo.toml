@@ -35,6 +35,13 @@ grpc-client = [
     "dep:futures-util",
     "dep:secrecy",
 ]
+# Server-side route registration: enables the generated
+# `register_<trait>_routes()` function and OperationBuilder integration.
+rest-server = [
+    "toolkit-contract/rest-server",
+    "dep:axum",
+    "dep:http",
+]
 
 [lints]
 workspace = true
@@ -64,6 +71,10 @@ futures-util = { workspace = true, optional = true }
 tonic = { workspace = true, features = ["transport"], optional = true }
 tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
+
+# Direct deps required when the macro emits server route registration.
+axum = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true, optional = true }
