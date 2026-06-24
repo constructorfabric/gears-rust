@@ -131,13 +131,18 @@ pub enum FinalizeOutcome {
     /// Plugin streamed `Complete` and the response body is ready.
     Complete {
         /// Accumulated assistant text (concatenation of all `Chunk.chunk`
-        /// payloads). Stored under `content.text` per the SDK convention.
+        /// payloads). Stored under `content.text` per the SDK convention as
+        /// the primary text part (`number = 0`).
         text: String,
         /// Plugin-defined metadata (model, finish_reason, usage). When
         /// `Some` it overrides whatever the stub carried.
         metadata: Option<JsonValue>,
         /// Citations/references attached to the completed text part (FR-023).
         citations: PartCitations,
+        /// Additional typed parts streamed via `StreamingEvent::Part`
+        /// (images/videos/links/code). Persisted in arrival order after the
+        /// text part; each carries its own citations (FR-024 Phase B).
+        extra_parts: Vec<MessagePartInput>,
     },
     /// Client disconnected (or deadline elapsed) mid-stream. Persist the
     /// partial response with `cancelled=true, partial=true` markers.
@@ -574,17 +579,18 @@ impl MessageRepo for SeaMessageRepo {
         assistant_message_id: Uuid,
         outcome: FinalizeOutcome,
     ) -> Result<(), ChatEngineError> {
-        let (text, metadata, is_complete, citations) = match outcome {
+        let (text, metadata, is_complete, citations, extra_parts) = match outcome {
             FinalizeOutcome::Complete {
                 text,
                 metadata,
                 citations,
-            } => (text, metadata, true, citations),
+                extra_parts,
+            } => (text, metadata, true, citations, extra_parts),
             FinalizeOutcome::Cancelled { text } => {
                 let mut meta = serde_json::Map::new();
                 meta.insert("cancelled".into(), JsonValue::Bool(true));
                 meta.insert("partial".into(), JsonValue::Bool(true));
-                (text, Some(JsonValue::Object(meta)), false, PartCitations::default())
+                (text, Some(JsonValue::Object(meta)), false, PartCitations::default(), Vec::new())
             }
             FinalizeOutcome::Errored {
                 text,
@@ -598,7 +604,7 @@ impl MessageRepo for SeaMessageRepo {
                 );
                 meta.insert("error".into(), JsonValue::String(error));
                 meta.insert("partial".into(), JsonValue::Bool(true));
-                (text, Some(JsonValue::Object(meta)), false, PartCitations::default())
+                (text, Some(JsonValue::Object(meta)), false, PartCitations::default(), Vec::new())
             }
         };
 
@@ -635,6 +641,21 @@ impl MessageRepo for SeaMessageRepo {
                         // Attach the plugin's citations/references to the text
                         // part in the same transaction (FR-023).
                         insert_part_citations(tx, &scope, part_id, &citations).await?;
+                        // Append any parts streamed via `StreamingEvent::Part`
+                        // (FR-024 Phase B), each with its own citations.
+                        for part in &extra_parts {
+                            let extra_id =
+                                append_part(tx, &scope, assistant_message_id, part).await?;
+                            let part_citations = PartCitations {
+                                file_citations: part.file_citations.clone(),
+                                link_citations: part.link_citations.clone(),
+                                references: part.references.clone(),
+                            };
+                            if !part_citations.is_empty() {
+                                insert_part_citations(tx, &scope, extra_id, &part_citations)
+                                    .await?;
+                            }
+                        }
                     }
                     Ok::<u64, ChatEngineError>(result.rows_affected)
                 })
@@ -1171,6 +1192,36 @@ where
         message_id: Set(message_id),
         r#type: Set(message_part_entity::MessagePartType::Text),
         content: Set(text_part_content(text)),
+        number: Set(number),
+    };
+    MessagePartEntity::insert(am)
+        .secure()
+        .scope_unchecked(scope)?
+        .exec(runner)
+        .await?;
+    Ok(part_id)
+}
+
+/// Append a single typed part (image/video/link/code/…) to `message_id`
+/// (number = `MAX(number)+1`) inside the caller's transaction and return its new
+/// id. Used by finalize to persist parts streamed via `StreamingEvent::Part`
+/// (FR-024 Phase B). Citations are inserted separately by the caller.
+async fn append_part<R>(
+    runner: &R,
+    scope: &AccessScope,
+    message_id: Uuid,
+    part: &MessagePartInput,
+) -> Result<Uuid, ChatEngineError>
+where
+    R: DBRunner,
+{
+    let number = compute_next_part_number(runner, message_id).await?;
+    let part_id = Uuid::new_v4();
+    let am = message_part_entity::ActiveModel {
+        id: Set(part_id),
+        message_id: Set(message_id),
+        r#type: Set(part_type_to_entity(&part.part_type)),
+        content: Set(part.content.clone()),
         number: Set(number),
     };
     MessagePartEntity::insert(am)

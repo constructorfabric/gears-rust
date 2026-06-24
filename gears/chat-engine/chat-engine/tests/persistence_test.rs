@@ -31,7 +31,7 @@ use chat_engine::infra::db::repo::stream_event_repo::{SeaStreamEventBuffer, Stre
 use chat_engine_sdk::models::{FileCitation, MessagePartInput, MessagePartType};
 use chat_engine_sdk::{
     ChatEngineBackendPlugin, PluginError, StreamingChunkEvent, StreamingCompleteEvent,
-    StreamingEvent,
+    StreamingEvent, StreamingPartEvent, StreamingStateEvent, StreamingToolEvent,
 };
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -649,6 +649,83 @@ async fn dropped_client_stream_still_completes_generation_against_sqlite() {
         "Hello",
         "full plugin output must persist even though the client left",
     );
+}
+
+// ===========================================================================
+// 3c. Vocabulary persistence (FR-024 Phase B): a streamed Part persists as an
+// extra message part; State/Tool events fold into the message metadata.
+// ===========================================================================
+
+#[tokio::test]
+async fn streamed_parts_and_metadata_persist_against_sqlite() {
+    let harness = db::setup_sqlite().await;
+    let plugin_id = "vocab-plugin";
+    let session_type_id = db::seed_session_type(&harness, plugin_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+
+    let placeholder = Uuid::nil();
+    let plugin = FakePlugin::new(
+        plugin_id,
+        FakePluginScript::Events(vec![
+            StreamingEvent::Chunk(StreamingChunkEvent {
+                message_id: placeholder,
+                chunk: "Answer".into(),
+            }),
+            StreamingEvent::Part(StreamingPartEvent {
+                message_id: placeholder,
+                part: MessagePartInput {
+                    part_type: MessagePartType::Links,
+                    content: serde_json::json!({ "links": [{ "url": "https://example.com" }] }),
+                    file_citations: vec![],
+                    link_citations: vec![],
+                    references: vec![],
+                },
+            }),
+            StreamingEvent::State(StreamingStateEvent {
+                message_id: placeholder,
+                state: serde_json::json!({ "phase": "final" }),
+            }),
+            StreamingEvent::Tool(StreamingToolEvent {
+                message_id: placeholder,
+                tool: "file_search".into(),
+                payload: serde_json::json!({ "q": "x" }),
+            }),
+            StreamingEvent::Complete(StreamingCompleteEvent {
+                message_id: placeholder,
+                metadata: Some(serde_json::json!({ "finish_reason": "stop" })),
+                file_citations: vec![],
+                link_citations: vec![],
+                references: vec![],
+            }),
+        ]),
+    );
+    let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+    let svc = build_service(&harness, plugin_id, plugin_dyn);
+
+    let cancel = CancellationToken::new();
+    let mut stream = svc
+        .send_message(make_request(session_id), make_identity(), cancel)
+        .await
+        .expect("send_message dispatch");
+    while stream.next().await.is_some() {}
+
+    let row = db::wait_for_finalize(&harness.db, session_id, Duration::from_secs(2)).await;
+    assert!(row.is_complete, "completed send must finalize is_complete=true");
+
+    // Parts: primary text (number 0) + the streamed links part (number 1).
+    let parts = db::message_parts_ordered(&harness.db, session_id, "assistant").await;
+    assert_eq!(parts.len(), 2, "expected text + links parts; got {parts:?}");
+    assert_eq!((parts[0].0.as_str(), parts[0].1), ("text", 0));
+    assert_eq!((parts[1].0.as_str(), parts[1].1), ("links", 1));
+
+    // State + Tool fold into the persisted message metadata.
+    let meta = row.metadata.expect("metadata present");
+    assert_eq!(meta["state"]["phase"], "final", "State event must persist under metadata.state");
+    assert_eq!(
+        meta["tools"][0]["tool"], "file_search",
+        "Tool event must persist under metadata.tools",
+    );
+    assert_eq!(meta["finish_reason"], "stop", "plugin metadata must be preserved");
 }
 
 // ===========================================================================

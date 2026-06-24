@@ -1287,6 +1287,26 @@ impl MessageService {
 
             let mut accumulator = String::new();
             let mut last_metadata: Option<JsonValue> = None;
+            // FR-024 Phase B accumulators for the richer event vocabulary:
+            // parts streamed via `Part`, mid-stream citations folded onto the
+            // primary text part, the last `State` patch, tool traces, and the
+            // merged `SessionMeta` patch (applied to the session at finalize).
+            let mut extra_parts: Vec<MessagePartInput> = Vec::new();
+            let mut text_citations = PartCitations::default();
+            let mut state_patch: Option<JsonValue> = None;
+            let mut tool_traces: Vec<JsonValue> = Vec::new();
+            let mut session_patch = serde_json::Map::new();
+            // Session-persist handles (sessions repo + identity) for applying a
+            // streamed `SessionMeta` patch. Cloned from the overflow ctx so its
+            // own hook can still consume `overflow_ctx` later.
+            let session_persist = overflow_ctx.as_ref().map(|c| {
+                (
+                    Arc::clone(&c.sessions),
+                    c.tenant_id.clone(),
+                    c.user_id.clone(),
+                    c.session_id,
+                )
+            });
             // Outcome the driver settles on if the parent token is cancelled
             // (explicit stop) before the plugin terminates. A client *drop* no
             // longer reaches here — only an explicit `cancel.cancel()` does.
@@ -1341,30 +1361,51 @@ impl MessageService {
                                 // reconnect resumes the full response.
                                 emitter.emit(evt).await;
                             }
-                            Ok(
-                                ev @ (StreamingEvent::Status(_)
-                                | StreamingEvent::Part(_)
-                                | StreamingEvent::Citation(_)
-                                | StreamingEvent::State(_)
-                                | StreamingEvent::SessionMeta(_)
-                                | StreamingEvent::Tool(_)),
-                            ) => {
-                                // Vocabulary events (FR-024): projected to typed
-                                // wire events, streamed + buffered for resume.
-                                // Persisting parts / message metadata / session
-                                // metadata from these lands in Phase B.
-                                emitter.emit(ev).await;
+                            // FR-024 vocabulary events: accumulate for
+                            // persistence, then stream + buffer for resume.
+                            Ok(StreamingEvent::Status(s)) => {
+                                // Transient progress — streamed, never persisted.
+                                emitter.emit(StreamingEvent::Status(s)).await;
+                            }
+                            Ok(StreamingEvent::Part(p)) => {
+                                extra_parts.push(p.part.clone());
+                                emitter.emit(StreamingEvent::Part(p)).await;
+                            }
+                            Ok(StreamingEvent::Citation(c)) => {
+                                // Mid-stream citations fold onto the primary text
+                                // part (part 0); parts streamed via `Part` carry
+                                // their own citations.
+                                text_citations.file_citations.extend(c.file_citations.clone());
+                                text_citations.link_citations.extend(c.link_citations.clone());
+                                text_citations.references.extend(c.references.clone());
+                                emitter.emit(StreamingEvent::Citation(c)).await;
+                            }
+                            Ok(StreamingEvent::State(s)) => {
+                                state_patch = Some(s.state.clone());
+                                emitter.emit(StreamingEvent::State(s)).await;
+                            }
+                            Ok(StreamingEvent::SessionMeta(s)) => {
+                                if let Some(obj) = s.patch.as_object() {
+                                    for (k, v) in obj {
+                                        session_patch.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                emitter.emit(StreamingEvent::SessionMeta(s)).await;
+                            }
+                            Ok(StreamingEvent::Tool(t)) => {
+                                tool_traces.push(serde_json::json!({
+                                    "tool": t.tool, "payload": t.payload,
+                                }));
+                                emitter.emit(StreamingEvent::Tool(t)).await;
                             }
                             Ok(StreamingEvent::Complete(c)) => {
                                 last_metadata = c.metadata.clone();
-                                // Citations/references the plugin attached to its
-                                // text part — forwarded to the client and captured
-                                // for persistence at finalize (FR-023).
-                                let citations = PartCitations {
-                                    file_citations: c.file_citations.clone(),
-                                    link_citations: c.link_citations.clone(),
-                                    references: c.references.clone(),
-                                };
+                                // Merge the plugin's complete-time citations onto
+                                // any accumulated mid-stream citations for the
+                                // primary text part (FR-023 + FR-024 Phase B).
+                                text_citations.file_citations.extend(c.file_citations.clone());
+                                text_citations.link_citations.extend(c.link_citations.clone());
+                                text_citations.references.extend(c.references.clone());
                                 let evt = StreamingEvent::Complete(StreamingCompleteEvent {
                                     message_id: assistant_id,
                                     metadata: c.metadata,
@@ -1375,7 +1416,7 @@ impl MessageService {
                                 emitter.emit(evt).await;
                                 outcome = DriverOutcome::Completed {
                                     metadata: last_metadata.clone(),
-                                    citations,
+                                    citations: std::mem::take(&mut text_citations),
                                 };
                                 break;
                             }
@@ -1433,6 +1474,9 @@ impl MessageService {
                     metadata,
                     citations,
                 } => {
+                    // Fold accumulated `State`/`Tool` events into the message
+                    // metadata under `state` / `tools` (FR-024 Phase B).
+                    let metadata = merge_stream_metadata(metadata, state_patch, tool_traces);
                     messages
                         .finalize_assistant(
                             session_id,
@@ -1441,6 +1485,7 @@ impl MessageService {
                                 text: accumulator,
                                 metadata,
                                 citations,
+                                extra_parts,
                             },
                         )
                         .await
@@ -1478,6 +1523,16 @@ impl MessageService {
                     error = %err,
                     "failed to finalize assistant message after stream end"
                 );
+            }
+
+            // FR-024 Phase B: apply the merged `SessionMeta` patch to the owning
+            // session (shallow read-modify-write). Best-effort — a failure is
+            // logged and never blocks the (already closed) stream.
+            if !session_patch.is_empty()
+                && let Some((sessions, tenant, user, sid)) = session_persist
+            {
+                apply_session_meta_patch(sessions.as_ref(), &tenant, &user, sid, session_patch)
+                    .await;
             }
 
             // Phase 7: dispatch the overflow hook AFTER the stream has been
@@ -1571,6 +1626,72 @@ struct OverflowDispatchCtx {
     tenant_id: String,
     /// JWT-derived user id of the calling identity.
     user_id: String,
+}
+
+/// Fold accumulated `State` / `Tool` stream events into the message metadata
+/// under `state` / `tools` (FR-024 Phase B), preserving the plugin's existing
+/// metadata keys.
+fn merge_stream_metadata(
+    base: Option<JsonValue>,
+    state: Option<JsonValue>,
+    tools: Vec<JsonValue>,
+) -> Option<JsonValue> {
+    if state.is_none() && tools.is_empty() {
+        return base;
+    }
+    let mut map = match base {
+        Some(JsonValue::Object(m)) => m,
+        Some(other) => {
+            // Preserve non-object metadata under `_meta` so state/tools can sit
+            // at the top level.
+            let mut m = serde_json::Map::new();
+            m.insert("_meta".to_owned(), other);
+            m
+        }
+        None => serde_json::Map::new(),
+    };
+    if let Some(s) = state {
+        map.insert("state".to_owned(), s);
+    }
+    if !tools.is_empty() {
+        map.insert("tools".to_owned(), JsonValue::Array(tools));
+    }
+    Some(JsonValue::Object(map))
+}
+
+/// Shallow read-modify-write of a session's `metadata` with `patch` (FR-024
+/// Phase B). Best-effort: logs and returns on any failure so a streamed
+/// `SessionMeta` event never blocks the (already closed) message stream.
+async fn apply_session_meta_patch(
+    sessions: &dyn SessionRepo,
+    tenant_id: &str,
+    user_id: &str,
+    session_id: Uuid,
+    patch: serde_json::Map<String, JsonValue>,
+) {
+    let current = match sessions.find_by_id(tenant_id, user_id, session_id).await {
+        Ok(Some(row)) => row.metadata,
+        Ok(None) => return,
+        Err(err) => {
+            warn!(session_id = %session_id, error = %err,
+                "session.meta patch: failed to load session; skipping");
+            return;
+        }
+    };
+    let mut map = match current {
+        Some(JsonValue::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    for (k, v) in patch {
+        map.insert(k, v);
+    }
+    if let Err(err) = sessions
+        .update_metadata(tenant_id, user_id, session_id, Some(JsonValue::Object(map)))
+        .await
+    {
+        warn!(session_id = %session_id, error = %err,
+            "session.meta patch: update_metadata failed");
+    }
 }
 
 /// Internal state machine result of the driver loop. Bridges the
