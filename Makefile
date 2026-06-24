@@ -407,10 +407,11 @@ openapi:
 md-fabric:
 	$(PYTHON) ./tools/scripts/md-fabric.py --out docs/md-fabric/md-fabric.html
 
-## Build the slides with Marp
+## Build the slides with Slidey
 slides:
-	@command -v npx >/dev/null || (echo "npx is required to build slides. Install Node.js or run 'npm install' from the repo root." && exit 1)
-	npx marp docs/slides/1_OVERVIEW.md --theme-set docs/slides/css/slides.css --allow-local-files -o docs/slides/1_OVERVIEW.html
+	@command -v slidey >/dev/null || (echo "slidey is required to build slides. Install/link the slidey CLI first." && exit 1)
+	node docs/slides/diagrams/render-themed-drawio-svg.mjs
+	slidey bundle docs/slides/1_OVERVIEW.slidey.json docs/slides/1_OVERVIEW.html
 
 # -------- Development and auto fix --------
 
