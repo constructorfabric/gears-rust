@@ -1,0 +1,5 @@
+error: ProtoBridge enum variants must be unit (no payload)
+  --> tests/ui/fail/proto_bridge_enum_with_payload.rs:17:5
+   |
+17 |     Completed(i64),
+   |     ^^^^^^^^^

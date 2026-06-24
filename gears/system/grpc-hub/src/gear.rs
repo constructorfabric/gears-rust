@@ -515,25 +515,19 @@ impl GrpcHub {
 
         {
             for gear_data in gears {
-                let service_names: Vec<String> = gear_data
-                    .installers
-                    .iter()
-                    .map(|i| i.service_name.to_owned())
-                    .collect();
-
                 let info = cf_system_sdks::directory::RegisterInstanceInfo {
                     gear: gear_data.gear_name.clone(),
                     instance_id: instance_id.clone(),
-                    grpc_services: service_names
+                    grpc_services: gear_data
+                        .installers
                         .iter()
-                        .map(|n| {
-                            (
-                                n.clone(),
-                                cf_system_sdks::directory::ServiceEndpoint::new(endpoint),
-                            )
+                        .map(|installer| cf_system_sdks::directory::GrpcServiceInfo {
+                            service_name: installer.service_name.to_owned(),
+                            endpoint: cf_system_sdks::directory::ServiceEndpoint::new(endpoint),
                         })
                         .collect(),
                     version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                    rest_endpoint: None,
                 };
 
                 directory.register_instance(info).await?;
@@ -1132,6 +1126,12 @@ mod tests {
                 _service_name: &str,
             ) -> anyhow::Result<ServiceEndpoint> {
                 Ok(ServiceEndpoint::new("mock://endpoint"))
+            }
+            async fn resolve_rest_service(
+                &self,
+                _module_name: &str,
+            ) -> anyhow::Result<ServiceEndpoint> {
+                Ok(ServiceEndpoint::new("mock://rest-endpoint"))
             }
             async fn list_instances(
                 &self,

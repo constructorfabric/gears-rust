@@ -74,8 +74,10 @@ pub struct HostRuntime {
     instance_id: Uuid,
     gear_manager: Arc<GearManager>,
     grpc_installers: Arc<GrpcInstallerStore>,
-    #[allow(dead_code)]
     client_hub: Arc<ClientHub>,
+    /// Process-level readiness, published in `client_hub` for the `/readyz`
+    /// probe and updated by the proxy-wiring readiness loop + draining watcher.
+    readiness: Arc<crate::ReadinessState>,
     cancel: CancellationToken,
     #[allow(dead_code)]
     db_options: DbOptions,
@@ -102,6 +104,11 @@ impl HostRuntime {
         let gear_manager = Arc::new(GearManager::new());
         let grpc_installers = Arc::new(GrpcInstallerStore::new());
 
+        // Process-level readiness, published so the gateway's /readyz handler
+        // can fetch it (concrete-type key). Created before any phase runs.
+        let readiness = Arc::new(crate::ReadinessState::new());
+        client_hub.register::<crate::ReadinessState>(readiness.clone());
+
         // Build the context builder that will resolve per-gear DbHandles
         let ctx_builder =
             GearContextBuilder::new(instance_id, gears_cfg, client_hub.clone(), cancel.clone());
@@ -118,6 +125,7 @@ impl HostRuntime {
             gear_manager,
             grpc_installers,
             client_hub,
+            readiness,
             cancel,
             db_options,
             oop_options,
@@ -352,6 +360,97 @@ impl HostRuntime {
 
     /// `POST_INIT` phase: optional hook after ALL gears completed `init()`.
     ///
+    /// Consumer proxy-wiring phase (eventual readiness).
+    ///
+    /// Runs after init (compile-time / local registrations) and before
+    /// post-init. Replays each `ConsumerRegistration` emitted by
+    /// `#[toolkit::consumes]`: if a compile-time impl is already in the
+    /// `ClientHub` it wins (the wiring closure short-circuits); otherwise a
+    /// directory-resolving REST client is registered under the contract trait.
+    ///
+    /// Non-blocking: endpoint discovery is lazy/per-call inside the resolving
+    /// client, so this phase never waits on provider availability (ADR-0007).
+    /// A no-op when no consumer is registered, preserving the phase-order
+    /// invariants relied on by existing tests.
+    #[cfg(feature = "contract-directory-rest-client")]
+    async fn run_proxy_wiring_phase(&self) -> Result<(), RegistryError> {
+        use crate::discovery::{ConsumerRegistration, DirectoryEndpointResolver};
+        use toolkit_contract::runtime::resolving::EndpointResolver;
+
+        let regs: Vec<&ConsumerRegistration> =
+            inventory::iter::<ConsumerRegistration>.into_iter().collect();
+        if regs.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(count = regs.len(), "Phase: proxy-wiring (consumer discovery)");
+
+        let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() else {
+            tracing::warn!(
+                consumers = regs.len(),
+                "proxy-wiring: no DirectoryClient in ClientHub; skipping consumer discovery wiring"
+            );
+            return Ok(());
+        };
+        let resolver: Arc<dyn EndpointResolver> = Arc::new(DirectoryEndpointResolver(dir));
+
+        for reg in &regs {
+            (reg.wire)(&self.client_hub, Arc::clone(&resolver)).map_err(|source| {
+                RegistryError::ProxyWiring {
+                    gear: reg.owner_gear,
+                    source,
+                }
+            })?;
+            tracing::debug!(owner = reg.owner_gear, dep = reg.dep_gear, "wired consumer contract");
+        }
+
+        // Register consumed deps as readiness gates and spawn a background probe
+        // loop that flips each to resolved once the directory can resolve it.
+        // Readiness is startup-gating + sticky (ADR-0007): /readyz reports
+        // Starting until every consumed dependency resolves, then Ready.
+        let deps: Vec<String> = regs.iter().map(|r| r.dep_gear.to_owned()).collect();
+        for dep in &deps {
+            self.readiness.register_dep(dep.clone());
+        }
+        let readiness = Arc::clone(&self.readiness);
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            const BASE: std::time::Duration = std::time::Duration::from_millis(100);
+            const MAX: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut pending = deps;
+            let mut backoff = BASE;
+            while !pending.is_empty() {
+                let mut still_pending = Vec::new();
+                for dep in pending {
+                    match resolver.resolve_endpoint(&dep).await {
+                        Ok(Some(_)) => {
+                            readiness.mark_resolved(&dep);
+                            tracing::info!(dep = %dep, "readiness: dependency resolved");
+                        }
+                        // No live instance yet — expected during startup churn.
+                        Ok(None) => still_pending.push(dep),
+                        // Genuine directory-backend failure: surface it (a stuck
+                        // Starting / 503 pod otherwise has no diagnostic trail).
+                        Err(e) => {
+                            tracing::warn!(dep = %dep, error = %e, "readiness: directory lookup failed");
+                            still_pending.push(dep);
+                        }
+                    }
+                }
+                pending = still_pending;
+                if pending.is_empty() {
+                    break;
+                }
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(MAX);
+            }
+        });
+
+        Ok(())
+    }
+
     /// This provides a global barrier between initialization-time registration
     /// and subsequent phases that may rely on a fully-populated runtime registry.
     ///
@@ -611,6 +710,10 @@ impl HostRuntime {
     async fn run_stop_phase(&self) -> Result<(), RegistryError> {
         tracing::info!("Phase: stop");
 
+        // Drop our REST providers from the directory first, so consumers stop
+        // resolving an endpoint that is about to disappear.
+        self.deregister_rest_providers().await;
+
         let deadline = self.shutdown_deadline;
 
         // Stop all gears in reverse order, each with its own independent deadline
@@ -743,6 +846,137 @@ impl HostRuntime {
         }
     }
 
+    /// Wait for the REST host gateway to publish its bound endpoint.
+    ///
+    /// The gateway binds its listener asynchronously in the start phase, so the
+    /// bound endpoint may not be set the instant the start phase returns; poll
+    /// with a short interval until available or timeout.
+    async fn wait_for_rest_endpoint(
+        &self,
+        host: &Arc<dyn crate::contracts::ApiGatewayCapability>,
+    ) -> Option<String> {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(endpoint) = host.bound_endpoint() {
+                return Some(endpoint);
+            }
+            if start.elapsed() > MAX_WAIT {
+                tracing::warn!("Timed out waiting for REST host to bind");
+                return None;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Directory-register phase (eventual readiness, provider side).
+    ///
+    /// After the REST server has bound, advertise every in-process REST provider
+    /// gear in the service directory under its own gear name, pointing at the
+    /// shared gateway endpoint. Consumers resolving a provider gear name then
+    /// receive this endpoint and the gateway routes to the provider's handlers.
+    ///
+    /// No-op when there is no REST host or no REST provider gears, so non-REST
+    /// deployments and existing tests are unaffected. Registers through the
+    /// `DirectoryClient` in the `ClientHub`, which uniformly targets the
+    /// in-process directory (`LocalDirectoryClient`) or the central directory
+    /// (`DirectoryGrpcClient` for OoP) depending on what the host wired.
+    async fn run_directory_register_phase(&self) -> Result<(), RegistryError> {
+        let rest_gears = self.rest_provider_gears();
+        if rest_gears.is_empty() {
+            return Ok(());
+        }
+
+        let Some(host) = self
+            .registry
+            .gears()
+            .iter()
+            .find_map(|e| e.caps.query::<ApiGatewayCap>())
+        else {
+            return Ok(()); // no REST host serving the routes
+        };
+
+        let Some(endpoint) = self.wait_for_rest_endpoint(&host).await else {
+            tracing::warn!(
+                "directory-register: REST host endpoint unavailable; skipping REST provider registration"
+            );
+            return Ok(());
+        };
+
+        let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() else {
+            tracing::debug!(
+                "directory-register: no DirectoryClient in ClientHub; skipping REST provider registration"
+            );
+            return Ok(());
+        };
+
+        let instance_id = self.instance_id.to_string();
+        for gear in rest_gears {
+            // The directory keys instances by (gear, instance_id) and replaces
+            // wholesale. grpc-hub may have already registered this same
+            // (gear, instance_id) with gRPC services during the start phase, so
+            // carry those forward instead of clobbering them to empty — adding
+            // the REST endpoint must augment, not replace, the entry.
+            let (grpc_services, version) = match dir.list_instances(gear).await {
+                Ok(insts) => insts
+                    .into_iter()
+                    .find(|i| i.instance_id == instance_id)
+                    .map(|i| (i.grpc_services, i.version))
+                    .unwrap_or_default(),
+                Err(_) => (Vec::new(), None),
+            };
+            let info = crate::RegisterInstanceInfo {
+                gear: gear.to_owned(),
+                instance_id: instance_id.clone(),
+                grpc_services,
+                version,
+                rest_endpoint: Some(crate::ServiceEndpoint::new(endpoint.clone())),
+            };
+            match dir.register_instance(info).await {
+                Ok(()) => {
+                    tracing::info!(gear, endpoint = %endpoint, "registered REST provider in directory");
+                }
+                Err(e) => {
+                    tracing::warn!(gear, error = %e, "directory-register: failed to register REST provider");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Names of all gears that provide a REST API (have `RestApiCap`), excluding
+    /// the REST host gateway itself (`ApiGatewayCap`) — the gateway is the
+    /// transport, not a contract provider, so it must not be advertised in the
+    /// directory under its own gear name.
+    fn rest_provider_gears(&self) -> Vec<&'static str> {
+        self.registry
+            .gears()
+            .iter()
+            .filter(|e| e.caps.has::<RestApiCap>() && !e.caps.has::<ApiGatewayCap>())
+            .map(|e| e.name)
+            .collect()
+    }
+
+    /// Deregister this process's REST providers from the directory on shutdown,
+    /// so consumers stop resolving an endpoint that is going away. Best-effort.
+    async fn deregister_rest_providers(&self) {
+        let rest_gears = self.rest_provider_gears();
+        if rest_gears.is_empty() {
+            return;
+        }
+        let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() else {
+            return;
+        };
+        let instance_id = self.instance_id.to_string();
+        for gear in rest_gears {
+            if let Err(e) = dir.deregister_instance(gear, &instance_id).await {
+                tracing::warn!(gear, error = %e, "directory-deregister: failed to deregister REST provider");
+            }
+        }
+    }
+
     /// Run the full gear lifecycle (all phases).
     ///
     /// This is the standard entry point for normal application execution.
@@ -823,6 +1057,10 @@ impl HostRuntime {
         // 3. Init phase (system gears first)
         self.run_init_phase().await?;
 
+        // 3b. Proxy-wiring phase (consumer discovery; after init, before post-init)
+        #[cfg(feature = "contract-directory-rest-client")]
+        self.run_proxy_wiring_phase().await?;
+
         // 4. Post-init phase (barrier after ALL init; system gears only)
         self.run_post_init_phase().await?;
 
@@ -834,6 +1072,22 @@ impl HostRuntime {
 
         // 7. Start phase
         self.run_start_phase().await?;
+
+        // Draining watcher: flip readiness to Draining the moment shutdown
+        // begins so /readyz reports 503 and the orchestrator drains the pod out
+        // of the load balancer before the stop phase tears gears down.
+        {
+            let readiness = Arc::clone(&self.readiness);
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                readiness.set_draining();
+            });
+        }
+
+        // 7b. Directory-register phase: advertise in-process REST providers in
+        //     the directory once the gateway has bound its listener.
+        self.run_directory_register_phase().await?;
 
         // 8. OoP spawn phase (after grpc_hub is running)
         self.run_oop_spawn_phase().await?;

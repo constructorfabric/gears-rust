@@ -1,0 +1,23 @@
+[package]
+name = "cf-gears-toolkit-contract-macros"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Proc macros for ToolKit contracts"
+rust-version.workspace = true
+
+[lib]
+proc-macro = true
+name = "toolkit_contract_macros"
+
+[lints]
+workspace = true
+
+[dependencies]
+syn = { workspace = true, features = ["full", "parsing", "printing", "extra-traits"] }
+quote.workspace = true
+proc-macro2.workspace = true
+heck.workspace = true
+proc-macro-crate.workspace = true
