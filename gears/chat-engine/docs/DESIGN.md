@@ -290,14 +290,20 @@ All Chat Engine instances share a single database cluster. No local caching of s
 
 **Transport**: Server-Sent Events (`text/event-stream`). Each SSE frame carries `id: <seq>`, `event: <type>`, `data: <JSON of the event>` (`cpt-cf-chat-engine-adr-sse-delta-streaming`, supersedes the NDJSON shape of `cpt-cf-chat-engine-adr-http-client-protocol`).
 
-The stream is a **delta protocol**: `start` establishes the (empty) assistant message document, `delta` events mutate it by `(op, path, value)`, and `complete` / `error` terminate it. The client maintains the message document locally and applies each delta — there is no separate `chunk` event (text arrives as `append` deltas on a `text` part). Every event carries a per-message monotonically-increasing `seq`, mirrored in the SSE `id:` line for ordering, de-duplication, and resume (`cpt-cf-chat-engine-design-stream-resume`).
+The stream is a **typed delta protocol**: each event has a specific `type` (mirrored in the SSE `event:` line) naming the mutation, and the delta-family events still carry `(op, path, value)` patch fields so the client applies each to the message document by `path`. `message.start` opens the (empty) document; `message.complete` / `message.error` terminate it. There is no separate `chunk` event — text arrives as `message.text.delta` (`append`) events on a `text` part. Every event carries a per-message monotonically-increasing `seq`, mirrored in the SSE `id:` line for ordering, de-duplication, and resume (`cpt-cf-chat-engine-design-stream-resume`).
 
-- **StreamingStartEvent** - Begin streaming (`event: "start"`; fields: `message_id`, `seq`). Marks the assistant message as open; the document starts with no parts.
-- **StreamingDeltaEvent** - Mutate the message document (`event: "delta"`; fields: `message_id`, `seq`, `op`, `path`, `value`).
-- **StreamingCompleteEvent** - Streaming finished (`event: "complete"`; fields: `message_id`, `seq`, `metadata?`). No further events follow.
-- **StreamingErrorEvent** - Stream error (`event: "error"`; fields: `message_id`, `seq`, `error`: human-readable description). Terminal.
+| event `type` | fields | meaning |
+|--------------|--------|---------|
+| `message.start` | `message_id`, `seq` | Opens the assistant message document (no parts yet). |
+| `message.part.add` | + `op`, `path`, `value` | Opens a new part (`op: add`, `path: parts/{n}`). |
+| `message.text.delta` | + `op`, `path`, `value` | Appends a text fragment (`op: append`, `path: parts/{n}/content/text`). |
+| `message.file_citation.add` | + `op`, `path`, `value` | Appends file citations (`path: parts/{n}/file_citations`). |
+| `message.link_citation.add` | + `op`, `path`, `value` | Appends link citations (`path: parts/{n}/link_citations`). |
+| `message.reference.add` | + `op`, `path`, `value` | Appends URL references (`path: parts/{n}/references`). |
+| `message.complete` | `message_id`, `seq`, `metadata?` | Successful end; terminal. |
+| `message.error` | `message_id`, `seq`, `error` | Terminal error (human-readable description). |
 
-**Delta operations** (`StreamingDeltaEvent.op`):
+**Patch fields** (`op` / `path` / `value`) carried by the delta-family events:
 
 | op | meaning |
 |----|---------|
@@ -306,25 +312,20 @@ The stream is a **delta protocol**: `start` establishes the (empty) assistant me
 | `patch` | Replace a scalar/field at `path` (e.g. a part `title`, message `metadata`). |
 | `remove` | Remove the value at `path` (rarely used; e.g. retract a speculative part). |
 
-**Delta paths** (`StreamingDeltaEvent.path`) address the message document, mirroring `MessageGetResponse`:
-- `parts/{n}` — a whole `MessagePart` (used with `add` when a new part opens)
-- `parts/{n}/content/text` — text body of a `text` part (used with `append` for token streaming)
-- `parts/{n}/content` — typed content of a non-text part (used with `add`/`patch`)
-- `parts/{n}/file_citations` · `parts/{n}/link_citations` · `parts/{n}/references` — citation/reference arrays (used with `append`)
-- `metadata` — message metadata (used with `patch`)
+`path` addresses the message document, mirroring `MessageGetResponse`: `parts/{n}` (a whole `MessagePart`, with `add`), `parts/{n}/content/text` (text body, with `append`), `parts/{n}/content` (typed content of a non-text part), `parts/{n}/file_citations` · `parts/{n}/link_citations` · `parts/{n}/references` (arrays, with `append`), `metadata` (message metadata, with `patch`).
 
-Example stream (text part with a streamed token, then a links part, then a citation):
+Example stream (text part with a streamed token, then a citation):
 
 ```
-id: 0\nevent: start\ndata: {"message_id":"…","seq":0}
-id: 1\nevent: delta\ndata: {"message_id":"…","seq":1,"op":"add","path":"parts/0","value":{"type":"text","content":{"text":""},"number":0}}
-id: 2\nevent: delta\ndata: {"message_id":"…","seq":2,"op":"append","path":"parts/0/content/text","value":"Hel"}
-id: 3\nevent: delta\ndata: {"message_id":"…","seq":3,"op":"append","path":"parts/0/content/text","value":"lo"}
-id: 4\nevent: delta\ndata: {"message_id":"…","seq":4,"op":"append","path":"parts/0/file_citations","value":[{"document_id":"doc-1","index":1}]}
-id: 5\nevent: complete\ndata: {"message_id":"…","seq":5,"metadata":{"finish_reason":"stop"}}
+id: 0\nevent: message.start\ndata: {"type":"message.start","message_id":"…","seq":0}
+id: 1\nevent: message.part.add\ndata: {"type":"message.part.add","message_id":"…","seq":1,"op":"add","path":"parts/0","value":{"type":"text","content":{"text":""},"number":0}}
+id: 2\nevent: message.text.delta\ndata: {"type":"message.text.delta","message_id":"…","seq":2,"op":"append","path":"parts/0/content/text","value":"Hel"}
+id: 3\nevent: message.text.delta\ndata: {"type":"message.text.delta","message_id":"…","seq":3,"op":"append","path":"parts/0/content/text","value":"lo"}
+id: 4\nevent: message.file_citation.add\ndata: {"type":"message.file_citation.add","message_id":"…","seq":4,"op":"append","path":"parts/0/file_citations","value":[{"document_id":"doc-1","index":1}]}
+id: 5\nevent: message.complete\ndata: {"type":"message.complete","message_id":"…","seq":5,"metadata":{"finish_reason":"stop"}}
 ```
 
-This delta model makes **all parts and citations stream incrementally** (superseding the earlier per-part-streaming exclusion). Server-side, the engine still accumulates the parts to persist the final message on completion (the deltas are the wire projection of that build).
+This typed-delta model makes **all parts and citations stream incrementally** (superseding the earlier per-part-streaming exclusion). Server-side, the engine still accumulates the parts to persist the final message on completion (the events are the wire projection of that build).
 
 ##### Stream resume
 
@@ -339,7 +340,7 @@ A dropped connection (network blip, client reload) MUST be resumable without re-
 **Event buffer (`StreamEventBuffer` port).** Events are appended to a per-message append-only buffer keyed by `message_id`, each `(seq, event)`, with a short TTL (live-stream window, minutes — not durable history). The buffer is a port with two backends:
 
 - **DB-table** (`cpt-cf-chat-engine-dbtable-stream-events`) — default; keeps the gear within `cpt-cf-chat-engine-constraint-single-database` (no new infra). A periodic sweep deletes rows past TTL.
-- **Redis Streams** — optional, mirrors rolos; lower-latency fan-out and native `XADD`/`XREAD` cursors, but **relaxes** `cpt-cf-chat-engine-constraint-single-database` (adds a Redis dependency). Selected by config; off by default.
+- **Redis Streams** — optional; lower-latency fan-out and native `XADD`/`XREAD` cursors, but **relaxes** `cpt-cf-chat-engine-constraint-single-database` (adds a Redis dependency). Selected by config; off by default.
 
 > The buffer is **not** durable conversation history — it only bridges reconnects within the live window. The durable record is the persisted message (parts + citations), read via `GET /messages/{id}`.
 
@@ -377,7 +378,7 @@ Session entity (session_id, tenant_id, user_id, client_id?, session_type_id?, en
 
 Message entity (message_id, session_id, tenant_id?, user_id?, parent_message_id?, role, parts, file_ids, variant_index, is_active, is_complete, is_hidden_from_user, is_hidden_from_backend, metadata, created_at, updated_at).
 
-The message body is no longer a single `content` blob. A message **owns an ordered list of `MessagePart` rows** (`parts`), each a typed fragment (`text`, `code`, `images`, `videos`, `links`, `statuses`) — see `cpt-cf-chat-engine-design-entity-message-part`. The former `content` field/column is removed; on read the SDK `Message` carries `parts: Vec<MessagePart>` ordered by `number`. This mirrors the rolos chat-engine part model and enables per-part typing, text-only full-text search, and (future) per-part citations.
+The message body is no longer a single `content` blob. A message **owns an ordered list of `MessagePart` rows** (`parts`), each a typed fragment (`text`, `code`, `images`, `videos`, `links`, `statuses`) — see `cpt-cf-chat-engine-design-entity-message-part`. The former `content` field/column is removed; on read the SDK `Message` carries `parts: Vec<MessagePart>` ordered by `number`. This follows a parts-based message model and enables per-part typing, text-only full-text search, and (future) per-part citations.
 
 Serde deserialization defaults (defined in the SDK on `chat-engine-sdk::models::Message`): `variant_index = 0`, `is_active = false`, `is_complete = true` (note: defaults to **true**, not false, so payloads that omit it represent fully-persisted messages), `is_hidden_from_user = false`, `is_hidden_from_backend = false`, `file_ids = []`, `parts = []`, `tenant_id = None`, `user_id = None`. `parent_message_id` is `None` only for the root message of a session.
 
@@ -418,7 +419,7 @@ A typed, ordered fragment of a message. A message owns one or more parts; the pa
 
 Fields: `id` (UUID PK), `message_id` (UUID FK → messages, CASCADE), `type` (`MessagePartType`), `content` (typed JSON, shape determined by `type`), `number` (ordinal within the message, 0-based).
 
-- **Ordering**: `number` is unique per message (`UNIQUE(message_id, number)`) and assigned as `MAX(number)+1` within the part-insert transaction — the same SERIALIZABLE-retry pattern used for `variant_index` (`cpt-cf-chat-engine-adr-variant-indexing`). rolos uses a dedicated per-message counter table; we reuse the existing variant-index machinery instead of adding one.
+- **Ordering**: `number` is unique per message (`UNIQUE(message_id, number)`) and assigned as `MAX(number)+1` within the part-insert transaction — the same SERIALIZABLE-retry pattern used for `variant_index` (`cpt-cf-chat-engine-adr-variant-indexing`). An alternative design uses a dedicated per-message counter table; we reuse the existing variant-index machinery instead of adding one.
 - **Immutability**: like the message tree, persisted parts are append-mostly; the streaming text part is filled in as chunks arrive, then frozen on completion.
 - **Input vs persisted**: `MessagePartInput {type, content}` is the wire/plugin shape (no `id`/`number`); Chat Engine assigns `id` and `number` on persist and returns the full `MessagePart`.
 
@@ -446,7 +447,7 @@ Citations and references attach to a single `text` [`MessagePart`](#messagepart)
 
 **TextPositionAnchor** (supporting type, stored verbatim inside `file_citations.text_position_anchors`): `{ char_start?, char_end?, quote, chunk_id?, chunk_preview? }` — per-marker source-location anchor parallel to one entry in `text_positions`.
 
-**Anchoring model** (matches rolos):
+**Anchoring model**:
 - `index` matches the `[N]` token in the part's `text` content (1-indexed). **FileCitation and LinkCitation share one `[N]` namespace** within a part.
 - `text_positions[i]` is the character offset in the part text where the `[index]` marker appears; `text_position_anchors[i]` is the *source* location for that occurrence (parallel arrays).
 - **Chat Engine forwards `text_positions` / anchors verbatim from the plugin — it does NOT scan the text or compute offsets** (`cpt-cf-chat-engine-principle-zero-business-logic`). The plugin is the sole authority for citation positions.
@@ -1342,7 +1343,7 @@ Lightweight URL badges attached to a `text` `message_part` (see `cpt-cf-chat-eng
 | content | JSONB | Full `LinkReference` payload (title, url, preview_text, position, preview_highlights, ref_type, ref_meta, idx) |
 | number | INT | 0-based ordinal within the part (insertion order; the `idx` inside `content` carries the positional `[N]` mapping) |
 
-> De-duplication of references by URL (rolos's `UNIQUE(message_part_id, url)`) is not enforced at the DB layer because `url` lives inside the JSONB payload; the plugin owns reference uniqueness.
+> De-duplication of references by URL (a strict `UNIQUE(message_part_id, url)` constraint) is not enforced at the DB layer because `url` lives inside the JSONB payload; the plugin owns reference uniqueness.
 
 #### Table: message_reactions
 
@@ -1633,7 +1634,7 @@ Aspects acknowledged and intentionally excluded from this DESIGN.
 | Category | Exclusion | Reason |
 |----------|-----------|--------|
 | **Content Safety** | Content moderation, toxicity filtering | Delegated to backend plugins (Principle: Zero Business Logic in Routing — `cpt-cf-chat-engine-principle-zero-business-logic`) |
-| **Redis stream buffer** | Redis-backed resume buffer (rolos-style `XADD`/`XREAD`) | The default resume buffer is the DB table (`cpt-cf-chat-engine-dbtable-stream-events`), keeping the gear within `cpt-cf-chat-engine-constraint-single-database`. Redis Streams is an optional, config-gated backend that relaxes that constraint; not enabled by default |
+| **Redis stream buffer** | Redis-backed resume buffer (`XADD`/`XREAD`) | The default resume buffer is the DB table (`cpt-cf-chat-engine-dbtable-stream-events`), keeping the gear within `cpt-cf-chat-engine-constraint-single-database`. Redis Streams is an optional, config-gated backend that relaxes that constraint; not enabled by default |
 | **Durable stream replay** | Long-term replay of historical streams | The event buffer is short-TTL (live-reconnect window only); historical reads use the persisted message (`GET /messages/{id}`), not the stream |
 | **Citation position computation** | Engine-side scanning of part text to compute `[N]` marker offsets | `text_positions` / anchors are forwarded verbatim from the plugin (`cpt-cf-chat-engine-principle-zero-business-logic`); the engine never parses message text to derive citation positions |
 | **Extra part types** | `audio`, `document`, `table` part types | Out of initial scope; the `MessagePartType` set starts at text/code/images/videos/links/statuses and is extensible via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`) |

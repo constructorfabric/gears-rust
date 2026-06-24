@@ -35,7 +35,7 @@ const MAX_IDLE_POLLS: u32 = 1200; // ~60s
 fn is_terminal(event: &JsonValue) -> bool {
     matches!(
         event.get("type").and_then(JsonValue::as_str),
-        Some("complete") | Some("error")
+        Some("message.complete") | Some("message.error")
     )
 }
 
@@ -45,7 +45,7 @@ fn sse_frame(seq: u64, event: &JsonValue) -> Vec<u8> {
     let name = event
         .get("type")
         .and_then(JsonValue::as_str)
-        .unwrap_or("delta");
+        .unwrap_or("message.delta");
     let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
     format!("id: {seq}\nevent: {name}\ndata: {data}\n\n").into_bytes()
 }
@@ -207,18 +207,18 @@ mod tests {
         let mid = Uuid::new_v4();
         let buf = Arc::new(FakeBuffer::default());
         let ttl = OffsetDateTime::now_utc();
-        buf.append(mid, 0, json!({"type": "start", "message_id": mid, "seq": 0}), ttl)
+        buf.append(mid, 0, json!({"type": "message.start", "message_id": mid, "seq": 0}), ttl)
             .await
             .unwrap();
         buf.append(
             mid,
             1,
-            json!({"type": "delta", "seq": 1, "op": "append", "path": "parts/0/content/text", "value": "hi"}),
+            json!({"type": "message.text.delta", "seq": 1, "op": "append", "path": "parts/0/content/text", "value": "hi"}),
             ttl,
         )
         .await
         .unwrap();
-        buf.append(mid, 2, json!({"type": "complete", "seq": 2}), ttl)
+        buf.append(mid, 2, json!({"type": "message.complete", "seq": 2}), ttl)
             .await
             .unwrap();
 
@@ -231,9 +231,9 @@ mod tests {
             .into_iter()
             .map(|b| String::from_utf8(b).unwrap())
             .collect();
-        assert!(text.contains("event: start"));
-        assert!(text.contains("event: delta"));
-        assert!(text.contains("event: complete"));
+        assert!(text.contains("event: message.start"));
+        assert!(text.contains("event: message.text.delta"));
+        assert!(text.contains("event: message.complete"));
         assert!(text.contains("id: 2"));
     }
 
@@ -243,7 +243,7 @@ mod tests {
         let buf = Arc::new(FakeBuffer::default());
         let ttl = OffsetDateTime::now_utc();
         for seq in 0..3u64 {
-            let ty = if seq == 2 { "complete" } else { "delta" };
+            let ty = if seq == 2 { "message.complete" } else { "message.text.delta" };
             buf.append(mid, seq, json!({"type": ty, "seq": seq}), ttl)
                 .await
                 .unwrap();

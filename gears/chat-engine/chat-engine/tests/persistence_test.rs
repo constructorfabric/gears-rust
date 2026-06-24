@@ -733,11 +733,19 @@ async fn streamed_events_are_buffered_for_resume_against_sqlite() {
         .iter()
         .map(|e| e.event["type"].as_str().unwrap_or(""))
         .collect();
-    assert_eq!(types.first(), Some(&"start"), "first buffered event is start");
-    assert_eq!(types.last(), Some(&"complete"), "last buffered event is complete");
+    assert_eq!(
+        types.first(),
+        Some(&"message.start"),
+        "first buffered event is message.start",
+    );
+    assert_eq!(
+        types.last(),
+        Some(&"message.complete"),
+        "last buffered event is message.complete",
+    );
     assert!(
-        types.contains(&"delta"),
-        "text chunks must project to delta events; got {types:?}",
+        types.contains(&"message.text.delta"),
+        "text chunks must project to message.text.delta events; got {types:?}",
     );
 
     // seq is a contiguous per-message counter starting at 0 — the SSE `id:`.

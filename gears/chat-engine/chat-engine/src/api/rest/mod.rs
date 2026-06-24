@@ -123,7 +123,7 @@ pub(crate) fn sse_delta_stream_response(
 fn sse_frame(evt: &crate::domain::stream_delta::WireStreamEvent) -> Vec<u8> {
     let data = serde_json::to_string(evt).unwrap_or_else(|err| {
         tracing::error!(error = %err, "failed to serialize wire delta event");
-        r#"{"type":"error","error":"internal serialization failure"}"#.to_string()
+        r#"{"type":"message.error","error":"internal serialization failure"}"#.to_string()
     });
     format!("id: {}\nevent: {}\ndata: {}\n\n", evt.seq(), evt.event_name(), data).into_bytes()
 }

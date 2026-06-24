@@ -35,19 +35,60 @@ pub enum DeltaOp {
     Remove,
 }
 
-/// One event of the client-facing delta stream. Serialized with a `"type"`
-/// discriminator (`start` / `delta` / `complete` / `error`); `seq` mirrors the
-/// SSE `id:` line.
+/// One event of the client-facing **typed** delta stream. Each variant
+/// serializes with a specific `"type"` discriminator — `message.start`,
+/// `message.part.add`, `message.text.delta`, `message.file_citation.add`,
+/// `message.link_citation.add`, `message.reference.add`, `message.complete`,
+/// `message.error` — mirrored in the SSE `event:` line. The delta-family
+/// events keep the `(op, path, value)` patch fields so the client applies each
+/// to the message document by `path`. `seq` mirrors the SSE `id:` line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type")]
 pub enum WireStreamEvent {
     /// Opens the assistant message document (empty; no parts yet).
-    Start {
+    #[serde(rename = "message.start")]
+    Start { message_id: Uuid, seq: u64 },
+    /// Opens a new message part (`op: add`, `path: parts/{n}`).
+    #[serde(rename = "message.part.add")]
+    PartAdd {
         message_id: Uuid,
         seq: u64,
+        op: DeltaOp,
+        path: String,
+        value: JsonValue,
     },
-    /// Mutates the message document by `(op, path, value)`.
-    Delta {
+    /// Appends a text fragment to a part body
+    /// (`op: append`, `path: parts/{n}/content/text`).
+    #[serde(rename = "message.text.delta")]
+    TextDelta {
+        message_id: Uuid,
+        seq: u64,
+        op: DeltaOp,
+        path: String,
+        value: JsonValue,
+    },
+    /// Appends file citations to a part
+    /// (`op: append`, `path: parts/{n}/file_citations`).
+    #[serde(rename = "message.file_citation.add")]
+    FileCitationAdd {
+        message_id: Uuid,
+        seq: u64,
+        op: DeltaOp,
+        path: String,
+        value: JsonValue,
+    },
+    /// Appends link citations to a part.
+    #[serde(rename = "message.link_citation.add")]
+    LinkCitationAdd {
+        message_id: Uuid,
+        seq: u64,
+        op: DeltaOp,
+        path: String,
+        value: JsonValue,
+    },
+    /// Appends URL references to a part.
+    #[serde(rename = "message.reference.add")]
+    ReferenceAdd {
         message_id: Uuid,
         seq: u64,
         op: DeltaOp,
@@ -55,6 +96,7 @@ pub enum WireStreamEvent {
         value: JsonValue,
     },
     /// Successful end; carries optional plugin metadata. Terminal.
+    #[serde(rename = "message.complete")]
     Complete {
         message_id: Uuid,
         seq: u64,
@@ -62,6 +104,7 @@ pub enum WireStreamEvent {
         metadata: Option<JsonValue>,
     },
     /// Terminal error.
+    #[serde(rename = "message.error")]
     Error {
         message_id: Uuid,
         seq: u64,
@@ -75,21 +118,39 @@ impl WireStreamEvent {
     pub fn seq(&self) -> u64 {
         match self {
             WireStreamEvent::Start { seq, .. }
-            | WireStreamEvent::Delta { seq, .. }
+            | WireStreamEvent::PartAdd { seq, .. }
+            | WireStreamEvent::TextDelta { seq, .. }
+            | WireStreamEvent::FileCitationAdd { seq, .. }
+            | WireStreamEvent::LinkCitationAdd { seq, .. }
+            | WireStreamEvent::ReferenceAdd { seq, .. }
             | WireStreamEvent::Complete { seq, .. }
             | WireStreamEvent::Error { seq, .. } => *seq,
         }
     }
 
-    /// The SSE `event:` name for this event.
+    /// The SSE `event:` name for this event (identical to the serialized
+    /// `"type"`).
     #[must_use]
     pub fn event_name(&self) -> &'static str {
         match self {
-            WireStreamEvent::Start { .. } => "start",
-            WireStreamEvent::Delta { .. } => "delta",
-            WireStreamEvent::Complete { .. } => "complete",
-            WireStreamEvent::Error { .. } => "error",
+            WireStreamEvent::Start { .. } => "message.start",
+            WireStreamEvent::PartAdd { .. } => "message.part.add",
+            WireStreamEvent::TextDelta { .. } => "message.text.delta",
+            WireStreamEvent::FileCitationAdd { .. } => "message.file_citation.add",
+            WireStreamEvent::LinkCitationAdd { .. } => "message.link_citation.add",
+            WireStreamEvent::ReferenceAdd { .. } => "message.reference.add",
+            WireStreamEvent::Complete { .. } => "message.complete",
+            WireStreamEvent::Error { .. } => "message.error",
         }
+    }
+
+    /// `true` for the terminal events that end a stream (`complete` / `error`).
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            WireStreamEvent::Complete { .. } | WireStreamEvent::Error { .. }
+        )
     }
 }
 
@@ -136,17 +197,7 @@ impl DeltaProjector {
         s
     }
 
-    fn delta(&mut self, op: DeltaOp, path: impl Into<String>, value: JsonValue) -> WireStreamEvent {
-        WireStreamEvent::Delta {
-            message_id: self.message_id,
-            seq: self.take_seq(),
-            op,
-            path: path.into(),
-            value,
-        }
-    }
-
-    /// Project one plugin event into zero or more wire events.
+    /// Project one plugin event into zero or more typed wire events.
     pub fn project(&mut self, event: StreamingEvent) -> Vec<WireStreamEvent> {
         match event {
             StreamingEvent::Start(s) => {
@@ -162,28 +213,54 @@ impl DeltaProjector {
                 let mut out = Vec::new();
                 if !self.text_opened {
                     self.text_opened = true;
-                    out.push(self.delta(
-                        DeltaOp::Add,
-                        TEXT_PART_PATH,
-                        json!({ "type": "text", "content": { "text": "" }, "number": 0 }),
-                    ));
+                    out.push(WireStreamEvent::PartAdd {
+                        message_id: self.message_id,
+                        seq: self.take_seq(),
+                        op: DeltaOp::Add,
+                        path: TEXT_PART_PATH.to_owned(),
+                        value: json!({ "type": "text", "content": { "text": "" }, "number": 0 }),
+                    });
                 }
-                out.push(self.delta(DeltaOp::Append, TEXT_BODY_PATH, JsonValue::String(c.chunk)));
+                out.push(WireStreamEvent::TextDelta {
+                    message_id: self.message_id,
+                    seq: self.take_seq(),
+                    op: DeltaOp::Append,
+                    path: TEXT_BODY_PATH.to_owned(),
+                    value: JsonValue::String(c.chunk),
+                });
                 out
             }
             StreamingEvent::Complete(c) => {
                 let mut out = Vec::new();
                 if !c.file_citations.is_empty() {
-                    let v = serde_json::to_value(&c.file_citations).unwrap_or(JsonValue::Null);
-                    out.push(self.delta(DeltaOp::Append, "parts/0/file_citations", v));
+                    let value = serde_json::to_value(&c.file_citations).unwrap_or(JsonValue::Null);
+                    out.push(WireStreamEvent::FileCitationAdd {
+                        message_id: self.message_id,
+                        seq: self.take_seq(),
+                        op: DeltaOp::Append,
+                        path: "parts/0/file_citations".to_owned(),
+                        value,
+                    });
                 }
                 if !c.link_citations.is_empty() {
-                    let v = serde_json::to_value(&c.link_citations).unwrap_or(JsonValue::Null);
-                    out.push(self.delta(DeltaOp::Append, "parts/0/link_citations", v));
+                    let value = serde_json::to_value(&c.link_citations).unwrap_or(JsonValue::Null);
+                    out.push(WireStreamEvent::LinkCitationAdd {
+                        message_id: self.message_id,
+                        seq: self.take_seq(),
+                        op: DeltaOp::Append,
+                        path: "parts/0/link_citations".to_owned(),
+                        value,
+                    });
                 }
                 if !c.references.is_empty() {
-                    let v = serde_json::to_value(&c.references).unwrap_or(JsonValue::Null);
-                    out.push(self.delta(DeltaOp::Append, "parts/0/references", v));
+                    let value = serde_json::to_value(&c.references).unwrap_or(JsonValue::Null);
+                    out.push(WireStreamEvent::ReferenceAdd {
+                        message_id: self.message_id,
+                        seq: self.take_seq(),
+                        op: DeltaOp::Append,
+                        path: "parts/0/references".to_owned(),
+                        value,
+                    });
                 }
                 out.push(WireStreamEvent::Complete {
                     message_id: self.message_id,
@@ -241,29 +318,29 @@ mod tests {
         })));
         events.extend(p.project(complete(vec![])));
 
-        // start, (add parts/0 + append), append, complete = 5 events
+        // start, (part.add parts/0 + text.delta), text.delta, complete = 5 events
         assert_eq!(events.len(), 5);
         // seq is contiguous from 0 and every event carries our message_id.
         for (i, e) in events.iter().enumerate() {
             assert_eq!(e.seq(), i as u64);
         }
-        assert_eq!(events[0].event_name(), "start");
+        assert_eq!(events[0].event_name(), "message.start");
         // First chunk opens the text part then appends.
         assert!(matches!(
             &events[1],
-            WireStreamEvent::Delta { op: DeltaOp::Add, path, .. } if path == "parts/0"
+            WireStreamEvent::PartAdd { op: DeltaOp::Add, path, .. } if path == "parts/0"
         ));
         assert!(matches!(
             &events[2],
-            WireStreamEvent::Delta { op: DeltaOp::Append, path, value: JsonValue::String(s), .. }
+            WireStreamEvent::TextDelta { op: DeltaOp::Append, path, value: JsonValue::String(s), .. }
                 if path == "parts/0/content/text" && s == "Hel"
         ));
         // Second chunk only appends (part already open).
         assert!(matches!(
             &events[3],
-            WireStreamEvent::Delta { op: DeltaOp::Append, path, .. } if path == "parts/0/content/text"
+            WireStreamEvent::TextDelta { op: DeltaOp::Append, path, .. } if path == "parts/0/content/text"
         ));
-        assert_eq!(events[4].event_name(), "complete");
+        assert_eq!(events[4].event_name(), "message.complete");
     }
 
     #[test]
@@ -281,13 +358,13 @@ mod tests {
             chunk: "x".into(),
         }));
         let tail = p.project(complete(vec![cite]));
-        // append parts/0/file_citations, then complete
+        // file_citation.add parts/0/file_citations, then complete
         assert_eq!(tail.len(), 2);
         assert!(matches!(
             &tail[0],
-            WireStreamEvent::Delta { op: DeltaOp::Append, path, .. } if path == "parts/0/file_citations"
+            WireStreamEvent::FileCitationAdd { op: DeltaOp::Append, path, .. } if path == "parts/0/file_citations"
         ));
-        assert_eq!(tail[1].event_name(), "complete");
+        assert_eq!(tail[1].event_name(), "message.complete");
     }
 
     #[test]
@@ -302,8 +379,8 @@ mod tests {
     }
 
     #[test]
-    fn wire_event_serializes_with_type_and_seq() {
-        let ev = WireStreamEvent::Delta {
+    fn wire_event_serializes_with_typed_discriminator_and_patch_fields() {
+        let ev = WireStreamEvent::TextDelta {
             message_id: mid(),
             seq: 7,
             op: DeltaOp::Append,
@@ -311,10 +388,23 @@ mod tests {
             value: json!("hi"),
         };
         let v = serde_json::to_value(&ev).unwrap();
-        assert_eq!(v["type"], "delta");
+        assert_eq!(v["type"], "message.text.delta");
         assert_eq!(v["seq"], 7);
         assert_eq!(v["op"], "append");
         assert_eq!(v["path"], "parts/0/content/text");
         assert_eq!(v["value"], "hi");
+        // The SSE event: name matches the serialized type.
+        assert_eq!(ev.event_name(), "message.text.delta");
+    }
+
+    #[test]
+    fn terminal_events_are_flagged() {
+        assert!(
+            WireStreamEvent::Complete { message_id: mid(), seq: 1, metadata: None }.is_terminal()
+        );
+        assert!(
+            WireStreamEvent::Error { message_id: mid(), seq: 1, error: "x".into() }.is_terminal()
+        );
+        assert!(!WireStreamEvent::Start { message_id: mid(), seq: 0 }.is_terminal());
     }
 }
