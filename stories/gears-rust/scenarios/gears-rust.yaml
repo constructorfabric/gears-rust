@@ -1,0 +1,40 @@
+# Warp scenario — point the gears-rust instance at a checkout ELSEWHERE.
+#
+# The app.yaml default publishes into THIS checkout (workdir/repo_root = `.`).
+# Use this warp when the gears-rust checkout lives at an absolute path, or to
+# author for a different gear than the default (notes-service). EDIT the paths
+# below to your checkout + target gear.
+#
+# Usage (from the gears repo root):
+#
+#   kitsoki run stories/gears-rust/app.yaml --warp stories/gears-rust/scenarios/gears-rust.yaml
+#   # Lands in core.main; type `prd` to start the PRD → Design walk. The PRD
+#   # and DESIGN publish into <workdir>/gears/<gear>/docs/{PRD,DESIGN}.md.
+#
+# Everything here is the doc PROFILE — no code changes retarget the hub.
+
+name:        "gears-rust — PRD → Design against an absolute checkout"
+description: "Point dev-story at a gears-rust checkout (absolute path) and author a gear's PRD → DESIGN."
+
+state: core.main
+
+world:
+  # ── Target checkout (EDIT to your path) ───────────────────────────
+  core__workdir:   "/Users/brad/code/gears-rust"
+  core__repo_root: "/Users/brad/code/gears-rust"
+
+  # ── Doc profile: which gear, gears-sdlc shape, per-gear placement ──
+  # Change `notes-service` to the gear you are authoring for. Both the PRD
+  # and the DESIGN land under <workdir>/gears/<gear>/docs/ with the fixed
+  # gears-sdlc filenames.
+  core__publish_durable_path: "gears/notes-service/docs"   # PRD home
+  core__prd_doc_filename:     "PRD"
+  core__design_durable_path:  "gears/notes-service/docs"   # DESIGN home
+  core__design_doc_filename:  "DESIGN"
+  core__design_template_dir:  "stories/gears-rust/templates"
+  core__design_ticket_dir:    ""                            # external target: no kitsoki feature ticket
+
+  # Supervised (human checkpoints). Flip to llm_then_human for an
+  # unattended walk (needs an LLM oracle configured).
+  judge_mode:                 "human"
+  judge_confidence_threshold: 0.8
