@@ -1590,6 +1590,7 @@ name = "cf-gears-cluster"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cf-gears-cluster-conformance",
  "cf-gears-cluster-sdk",
  "cf-gears-toolkit",
  "rand 0.10.1",
@@ -1598,6 +1599,17 @@ dependencies = [
  "tracing",
  "tracing-test",
  "uuid",
+]
+
+[[package]]
+name = "cf-gears-cluster-conformance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-cluster-sdk",
+ "parking_lot",
+ "proptest",
+ "tokio",
 ]
 
 [[package]]

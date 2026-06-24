@@ -29,3 +29,6 @@ rand = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-test = { workspace = true }
 toolkit = { workspace = true }
+# The shared backend-agnostic conformance suite, run against this gear's real
+# cache-derived default backends in `tests/conformance.rs`.
+cf-gears-cluster-conformance = { workspace = true }

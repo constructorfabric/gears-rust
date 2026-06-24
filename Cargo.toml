@@ -61,6 +61,7 @@ members = [
     "gears/system/api-gateway",
     "gears/system/cluster/cluster-sdk",
     "gears/system/cluster/cluster",
+    "gears/system/cluster/cluster-conformance",
     "gears/system/grpc-hub",
     "gears/system/nodes-registry/nodes-registry",
     "gears/system/nodes-registry/nodes-registry-sdk",
@@ -279,6 +280,7 @@ cf-gears-system-sdk-directory = { version = "0.1.37", path = "libs/system-sdks/s
 types-registry = { package = "cf-gears-types-registry", version = "0.1.23", path = "gears/system/types-registry/types-registry" }
 
 cf-gears-cluster-sdk = { version = "0.1.0", path = "gears/system/cluster/cluster-sdk" }
+cf-gears-cluster-conformance = { version = "0.1.0", path = "gears/system/cluster/cluster-conformance" }
 
 # System gears SDKs
 account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.2.0", path = "gears/system/account-management/account-management-sdk" }
@@ -288,6 +290,7 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.9
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.0", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.3", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.1.0", path = "gears/system/usage-collector/usage-collector-sdk" }
+cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.1.0", path = "gears/system/cluster/cluster-sdk" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk" }
@@ -402,6 +405,9 @@ rand = "0.10"
 
 # Synchronous locks for better performance
 parking_lot = "0.12"
+
+# Property / model-based testing (cluster conformance suite reference model)
+proptest = "1"
 
 # CLI support
 clap = { version = "4.5", features = ["derive"] }

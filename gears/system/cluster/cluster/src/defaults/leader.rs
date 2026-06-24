@@ -453,7 +453,20 @@ impl ElectionTask {
                     true
                 }
             }
-            None => self.claim().await,
+            None => {
+                if self.am_leader {
+                    // Our own claim vanished (a TTL lapse observed via the watch)
+                    // while we still believed we were leader. Surface the loss
+                    // before reclaiming, mirroring the renewal timer's
+                    // `Ok(None) => lose_then_reclaim()` path — otherwise
+                    // `claim()`'s re-win would flow through `ensure_leader()`,
+                    // whose `am_leader` short-circuit would silently swallow the
+                    // lost-then-reacquired transition.
+                    self.lose_then_reclaim().await
+                } else {
+                    self.claim().await
+                }
+            }
         }
     }
 

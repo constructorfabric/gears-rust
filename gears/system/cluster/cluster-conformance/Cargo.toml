@@ -1,0 +1,40 @@
+[package]
+name = "cf-gears-cluster-conformance"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Parametrized backend conformance suites for the cluster gear: one shared test body run against every backend to operationalize cross-backend behavioral stability (cpt-cf-clst-nfr-cross-backend-stability)"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "cluster_conformance"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The contract under test: every suite is generic over the SDK backend traits.
+cluster-sdk = { workspace = true }
+async-trait = { workspace = true }
+# `Instant`-based TTL + the background sweeper in the in-memory `MemCache`
+# fixture. The suites themselves are runtime-agnostic plain `async fn`s
+# (see §11 open question) so a caller can drive them under `turmoil`/`madsim`.
+tokio = { workspace = true, features = ["test-util"] }
+# The `MemCache` fixture's interior is guarded by a synchronous mutex whose
+# critical sections never span an `.await`, so `parking_lot` is preferred over
+# `std::sync::Mutex` per the project dependency guideline.
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+# `test-util` enables `tokio::time::pause`/`advance` so TTL/renewal scenarios
+# run deterministically without real sleeps when self-testing the fixture.
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+# Model-based / property variants: random op sequences compared against a
+# trivial reference model (§4 "Model-based / property variants", `model.rs`).
+proptest = { workspace = true }
