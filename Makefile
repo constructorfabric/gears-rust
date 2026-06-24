@@ -410,7 +410,7 @@ md-fabric:
 ## Build the slides with Marp
 slides:
 	@command -v npx >/dev/null || (echo "npx is required to build slides. Install Node.js or run 'npm install' from the repo root." && exit 1)
-	npx marp docs/slides/1_OVERVIEW.md --theme-set docs/slides/css/slides.css --allow-local-files -o docs/slides/1_OVERVIEW.html
+	npx marp docs/slides/[0-9]*.md --theme-set docs/slides/css/slides.css --allow-local-files
 
 # -------- Development and auto fix --------
 
