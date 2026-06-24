@@ -300,8 +300,14 @@ The stream is a **typed delta protocol**: each event has a specific `type` (mirr
 | `message.file_citation.add` | + `op`, `path`, `value` | Appends file citations (`path: parts/{n}/file_citations`). |
 | `message.link_citation.add` | + `op`, `path`, `value` | Appends link citations (`path: parts/{n}/link_citations`). |
 | `message.reference.add` | + `op`, `path`, `value` | Appends URL references (`path: parts/{n}/references`). |
+| `message.status.changed` | `message_id`, `seq`, `code`, `detail?` | Transient progress (e.g. `thinking`); **not** a document mutation and **not** persisted. |
+| `message.state.changed` | `message_id`, `seq`, `state` | Opaque assistant-message state; persisted into message `metadata.state`. |
+| `session.meta.updated` | `message_id`, `seq`, `patch` | Session-scoped metadata patch; shallow-merged into the owning session's `metadata`. |
+| `message.tool` | `message_id`, `seq`, `tool`, `payload` | Tool-invocation trace; appended to message `metadata.tools`. |
 | `message.complete` | `message_id`, `seq`, `metadata?` | Successful end; terminal. |
 | `message.error` | `message_id`, `seq`, `error` | Terminal error (human-readable description). |
+
+The doc-mutating events (`part.add` / `text.delta` / `*_citation.add` / `reference.add`) carry the `(op, path, value)` patch fields; the out-of-band events (`status.changed` / `state.changed` / `session.meta.updated` / `tool`) carry bespoke fields since they do not patch the document by path. The engine projects these from the plugin's `StreamingEvent` vocabulary (`Start` / `Chunk` / `Status` / `Part` / `Citation` / `State` / `SessionMeta` / `Tool` / `Complete` / `Error`); part indices are gap-free in arrival order. Persistence: `Part` → message parts, mid-stream `Citation` → the text part's citations, `State`/`Tool` → message metadata, `SessionMeta` → session metadata, `Status` is transient.
 
 **Patch fields** (`op` / `path` / `value`) carried by the delta-family events:
 

@@ -764,6 +764,7 @@ The system **MUST** stream assistant responses to the client as a **delta protoc
 - `op` ∈ `add` (set value at path), `append` (append text fragment / array element), `patch` (replace a field), `remove` (retract).
 - `path` addresses the message document: a part (`parts/N`), a text body (`parts/N/content/text`), a citation array (`parts/N/file_citations` …), or message `metadata`.
 - All parts and citations stream incrementally (text token-by-token; richer parts and citations as the plugin emits them).
+- Events are **typed**: `message.start`, `message.part.add`, `message.text.delta`, `message.{file,link}_citation.add`, `message.reference.add`, `message.status.changed` (transient progress), `message.state.changed`, `session.meta.updated`, `message.tool`, `message.complete`, `message.error`. The engine projects these from the plugin's event vocabulary and persists the durable ones: streamed parts → message parts, citations → the relevant part, state/tool → message metadata, session-meta → session metadata; status events are transient.
 
 **Ordering & resume**:
 - Every event carries a per-message monotonically-increasing `seq`, mirrored in the SSE `id:` field; clients order and de-duplicate by `seq`.
