@@ -248,6 +248,101 @@ impl MeDto {
     }
 }
 
+/// Startup admin context for the admin panel.
+///
+/// Richer sibling of [`MeDto`]: in addition to the authenticated subject
+/// and home tenant, it projects the admin **mode** and a coarse
+/// **capabilities** hint that the frontend uses for capability-driven
+/// navigation. The backend remains the final authority on every action;
+/// these capabilities are UI hints only.
+///
+/// v0 derives mode and capabilities from the `subject_type` role marker
+/// set by the **non-production** static auth stub (`platform_admin` /
+/// `tenant_admin`). `non_production_auth` is `true` whenever that stub
+/// marker is present so the UI can surface a demo banner. When a real
+/// authorization model replaces the stub, this projection is re-backed by
+/// it without changing the wire contract. Enabled gears are intentionally
+/// not included here — the frontend reads them from the gear orchestrator.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+#[allow(clippy::struct_field_names)]
+pub struct AdminContextDto {
+    pub subject_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_type: Option<String>,
+    pub subject_tenant_id: Uuid,
+    /// `"platform"` or `"tenant"`.
+    pub admin_mode: String,
+    /// Coarse capability hints for UI gating (e.g. `tenants:write`).
+    pub capabilities: Vec<String>,
+    /// `true` when the non-production static role stub is in effect.
+    pub non_production_auth: bool,
+}
+
+/// `admin_mode` value for the platform/operator admin.
+const ADMIN_MODE_PLATFORM: &str = "platform";
+/// `admin_mode` value for the tenant admin.
+const ADMIN_MODE_TENANT: &str = "tenant";
+/// `subject_type` marker for the platform admin (static stub).
+const ROLE_PLATFORM_ADMIN: &str = "platform_admin";
+/// `subject_type` marker for the tenant admin (static stub).
+const ROLE_TENANT_ADMIN: &str = "tenant_admin";
+
+/// Capability hints for the platform/operator admin.
+const PLATFORM_CAPABILITIES: &[&str] = &[
+    "tenants:read",
+    "tenants:write",
+    "tenants:suspend",
+    "tenant-metadata:read",
+    "tenant-metadata:write",
+    "conversions:read",
+    "conversions:write",
+    "resource-groups:read",
+    "resource-groups:write",
+    "types:read",
+    "types:write",
+    "gears:read",
+];
+
+/// Capability hints for the tenant admin (own-tenant scope).
+const TENANT_CAPABILITIES: &[&str] = &[
+    "tenants:read",
+    "tenant-metadata:read",
+    "tenant-metadata:write",
+    "conversions:read",
+    "resource-groups:read",
+    "types:read",
+];
+
+impl AdminContextDto {
+    /// Project the request's [`SecurityContext`] into the admin context.
+    ///
+    /// Mode and capabilities derive from the `subject_type` role marker.
+    /// An unknown or absent marker is treated as the least-privileged
+    /// tenant admin; the backend still authorizes every action.
+    #[must_use]
+    pub(crate) fn from_security_context(ctx: &SecurityContext) -> Self {
+        let subject_type = ctx.subject_type();
+        let is_platform = subject_type == Some(ROLE_PLATFORM_ADMIN);
+        let is_stub_role = matches!(subject_type, Some(ROLE_PLATFORM_ADMIN | ROLE_TENANT_ADMIN));
+
+        let (admin_mode, capabilities) = if is_platform {
+            (ADMIN_MODE_PLATFORM, PLATFORM_CAPABILITIES)
+        } else {
+            (ADMIN_MODE_TENANT, TENANT_CAPABILITIES)
+        };
+
+        Self {
+            subject_id: ctx.subject_id(),
+            subject_type: subject_type.map(str::to_owned),
+            subject_tenant_id: ctx.subject_tenant_id(),
+            admin_mode: admin_mode.to_owned(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            non_production_auth: is_stub_role,
+        }
+    }
+}
+
 // ---- Tenant hierarchy DTOs --------------------------------------
 
 /// Wire-shape enum for `Tenant.status` on the REST surface.
