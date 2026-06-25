@@ -1,5 +1,5 @@
 story_dirs:
-  - ./stories
+  - ./.kitsoki/stories
 
-default_story: stories/gears-rust-dev/app.yaml
+default_story: .kitsoki/stories/gears-rust-dev/app.yaml
 project_profile: .kitsoki/project-profile.yaml

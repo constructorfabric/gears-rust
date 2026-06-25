@@ -5,7 +5,7 @@ Kitsoki dev-story instance for the Gears Rust checkout.
 Run from the Gears Rust repo root:
 
 ```sh
-kitsoki run stories/gears-rust-dev/app.yaml
+kitsoki run .kitsoki/stories/gears-rust-dev/app.yaml
 ```
 
 Or start the browser UI:

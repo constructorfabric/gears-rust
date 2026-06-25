@@ -55,7 +55,7 @@ kitsoki:
   story: dev-story
   instance:
     id: gears-rust-dev
-    path: stories/gears-rust-dev/app.yaml
+    path: .kitsoki/stories/gears-rust-dev/app.yaml
     bindings:
       ticket: host.local_files.ticket
       vcs: host.git

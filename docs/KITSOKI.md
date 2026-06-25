@@ -22,12 +22,12 @@ From the gears-rust repo root:
 kitsoki web
 ```
 
-`.kitsoki.yaml` points discovery at `./stories` and sets
-`stories/gears-rust-dev/app.yaml` as the default story. The terminal equivalent
+`.kitsoki.yaml` points discovery at `./.kitsoki/stories` and sets
+`.kitsoki/stories/gears-rust-dev/app.yaml` as the default story. The terminal equivalent
 is:
 
 ```sh
-kitsoki run stories/gears-rust-dev/app.yaml
+kitsoki run .kitsoki/stories/gears-rust-dev/app.yaml
 ```
 
 ## Project Commands
@@ -41,7 +41,7 @@ make build
 make check
 ```
 
-`stories/gears-rust-dev/app.yaml` projects `build_cmd` and `test_cmd` into the
+`.kitsoki/stories/gears-rust-dev/app.yaml` projects `build_cmd` and `test_cmd` into the
 imported dev-story/bugfix pipeline, so validation uses the Rust workspace's
 own Make/Cargo gates instead of Kitsoki's Go defaults.
 
@@ -64,7 +64,7 @@ gears-rust extends that imported hub through world defaults:
 - Feature-ticket minting is disabled for the design publish step.
 - Bugfix build/test gates use `make build` and `make test`.
 
-Change those values in `stories/gears-rust-dev/app.yaml` when targeting a
+Change those values in `.kitsoki/stories/gears-rust-dev/app.yaml` when targeting a
 different gear or when the repo's command conventions change.
 
 ## Local Tooling
@@ -86,5 +86,5 @@ Generated runtime data stays local and ignored:
 
 The shared dev-story fixtures live in the Kitsoki repo and are no-LLM. A
 project-local flow fixture is not generated for this instance yet; add one under
-`stories/gears-rust-dev/flows/` when gears-rust needs assertions beyond the
+`.kitsoki/stories/gears-rust-dev/flows/` when gears-rust needs assertions beyond the
 general imported hub behavior.
