@@ -9,8 +9,11 @@ description = "api-contracts example module — PaymentService with local and HT
 rust-version.workspace = true
 
 [features]
-default = ["rest-client", "directory-rest-client"]
+default = ["rest-client", "directory-rest-client", "rest-server"]
 rest-client = ["api-contracts-sdk/rest-client"]
+# Server-side route generation: pulls the macro-emitted
+# `register_payment_api_rest_routes()` from the SDK.
+rest-server = ["api-contracts-sdk/rest-server"]
 directory-rest-client = [
     "rest-client",
     "api-contracts-sdk/directory-rest-client",

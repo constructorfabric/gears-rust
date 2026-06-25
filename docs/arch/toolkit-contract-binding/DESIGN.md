@@ -609,9 +609,9 @@ pub fn register_billing_api_rest_routes(
                   Json(req): Json<ChargeRequest>| {
                 let svc = Arc::clone(&svc);
                 async move {
-                    svc.charge(ctx, req).await
-                        .map(Json)
-                        .map_err(Into::into)
+                    // `CanonicalError: IntoResponse` renders the RFC 9457
+                    // Problem at the framework boundary — no explicit map_err.
+                    svc.charge(ctx, req).await.map(Json)
                 }
             }
         })
@@ -636,17 +636,18 @@ impl RestApiCapability for MyGear {
 
 **Consequences:**
 
-- The projection trait becomes the **sole source of REST API specification** — paths, HTTP methods, response schemas, authentication all derive from it.
-- Manual `routes.rs` files are deleted; server routes are auto-generated from the trait.
-- OpenAPI spec is assembled via a single `OpenApiRegistry` (utoipa) as routes are registered.
-- Handler generation is synchronized with the IR — parameter binding order, error mapping, streaming support all follow from the binding metadata.
-- Current scope (PoC): basic HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[delete]`) + streaming (`#[streaming]`). Path/query parameters and complex authentication (license, OData) are follow-up work.
+- The projection trait becomes the **primary source of REST API specification** — paths, HTTP methods, response schemas, authentication derive from it for every method the macro covers.
+- Generation is **additive, not a replacement**. The generated `register_<trait>_routes()` and a hand-written `OperationBuilder::verb(..).register(router, openapi)` chain share the identical `axum::Router -> axum::Router` shape and compose on one router. The manual `OperationBuilder` path (used across `file-parser`, `mini-chat`, etc.) remains **first-class** and is not removed.
+- **Per-method opt-out**: a projection method marked `#[server_manual]` is skipped by the generator (but stays in the client + IR). The author registers it by hand and chains it onto the generated router. This is the escape hatch for routes the macro cannot (yet) express.
+- OpenAPI spec is assembled via a single `OpenApiRegistry` (utoipa) as routes are registered — generated and manual routes contribute to the same registry.
+- Handler generation is synchronized with the IR — parameter binding order (`SecurityContext` → path → body → query) and error mapping (`CanonicalError: IntoResponse` → RFC 9457 `Problem`) follow from the binding metadata.
+- Current scope (PoC): unary HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[delete]`) with path/query/body parameters and default `authenticated()` auth. **Streaming (`#[streaming]`) server generation is deferred** — such methods must be marked `#[server_manual]` and registered by hand (a non-opted-out streaming method raises a `compile_error!`). Complex authentication (license, OData, multipart) and base↔projection parity enforcement are follow-up work.
 
 **Trade-offs:**
 
 - The macro's responsibility grows — now generating both client and server paths. Debugging becomes more complex.
 - Server route generation is synchronous; async patterns in routes require manual composition with the generated function.
-- For routes that cannot be expressed by the macro (complex authentication, custom response shapes, multipart uploads), manual `OperationBuilder` calls can be composed alongside the generated function.
+- For routes that cannot be expressed by the macro (streaming/SSE in the PoC, complex authentication, custom response shapes, multipart uploads), `#[server_manual]` + manual `OperationBuilder` calls compose alongside the generated function on the same router.
 
 ## 4. Crate Structure
 

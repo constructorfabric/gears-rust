@@ -33,8 +33,14 @@ pub trait PaymentApiRest: PaymentApi {
         invoice_id: String,
     ) -> Result<Invoice, CanonicalError>;
 
+    // `#[server_manual]`: the SSE/streaming server route is registered by hand
+    // via `OperationBuilder` in the server crate (see `register_manual_routes`).
+    // The generated client + IR still cover this method; only the server-side
+    // route generation skips it. Demonstrates that the manual OperationBuilder
+    // path remains first-class and composes with the generated routes.
     #[get("/payments")]
     #[streaming]
+    #[server_manual]
     fn list_payments(
         &self,
         ctx: SecurityContext,

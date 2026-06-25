@@ -147,15 +147,14 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
     // `PaymentApi` is `PaymentApiRest`, whose resolving client is
     // `PaymentApiRestResolvingClient`). The SDK re-exports it at the same level
     // as the base contract trait.
-    let resolving_client_path = match &attr.resolving_client {
-        Some(p) => p.clone(),
-        None => {
-            let parent = parent_module(contract_path)?;
-            append_segment(
-                &parent,
-                &format_ident!("{}RestResolvingClient", contract_ident),
-            )
-        }
+    let resolving_client_path = if let Some(p) = &attr.resolving_client {
+        p.clone()
+    } else {
+        let parent = parent_module(contract_path)?;
+        append_segment(
+            &parent,
+            &format_ident!("{}RestResolvingClient", contract_ident),
+        )
     };
 
     let wire_fn = format_ident!(
