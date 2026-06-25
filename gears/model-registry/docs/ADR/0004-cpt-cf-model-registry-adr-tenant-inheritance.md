@@ -5,6 +5,24 @@ date: 2026-02-18
 
 # Additive Tenant Inheritance with Provider Shadowing
 
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Additive Inheritance with Shadowing](#additive-inheritance-with-shadowing)
+  - [Strict Inheritance (No Override)](#strict-inheritance-no-override)
+  - [Explicit Copy (No Inheritance)](#explicit-copy-no-inheritance)
+- [More Information](#more-information)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
 **ID**: `cpt-cf-model-registry-adr-tenant-inheritance`
 
 ## Context and Problem Statement

@@ -5,6 +5,24 @@ date: 2026-02-18
 
 # Delegate Approval Workflow to Generic Approval Service
 
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Delegate to Generic Approval Service](#delegate-to-generic-approval-service)
+  - [Build Approval Workflow into Model Registry](#build-approval-workflow-into-model-registry)
+  - [Event Sourcing for Approval States](#event-sourcing-for-approval-states)
+- [More Information](#more-information)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
 **ID**: `cpt-cf-model-registry-adr-approval-delegation`
 
 ## Context and Problem Statement
