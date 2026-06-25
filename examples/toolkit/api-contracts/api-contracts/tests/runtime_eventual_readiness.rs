@@ -114,11 +114,21 @@ impl Gear for MockGateway {
 }
 
 impl ApiGatewayCapability for MockGateway {
-    fn rest_prepare(&self, _ctx: &GearCtx, router: Router) -> anyhow::Result<Router> {
+    fn rest_prepare(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        _hc_registry: std::sync::Arc<toolkit::RestHealthcheckRegistry>,
+    ) -> anyhow::Result<Router> {
         Ok(router)
     }
 
-    fn rest_finalize(&self, _ctx: &GearCtx, router: Router) -> anyhow::Result<Router> {
+    fn rest_finalize(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        _hc_registry: std::sync::Arc<toolkit::RestHealthcheckRegistry>,
+    ) -> anyhow::Result<Router> {
         *self.final_router.lock() = Some(router.clone());
         Ok(router)
     }

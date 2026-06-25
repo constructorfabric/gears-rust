@@ -1,3 +1,7 @@
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the `Result` return is consumed by `?` under the `grpc-client` feature; in other feature configs the body reduces to `Ok(())`, but the signature must stay uniform across configs"
+)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "grpc-client")]
     {

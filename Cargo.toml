@@ -112,6 +112,7 @@ members = [
     "gears/mini-chat/mini-chat",
     "examples/toolkit/api-contracts/api-contracts-sdk",
     "examples/toolkit/api-contracts/api-contracts",
+    "examples/toolkit/api-contracts/api-contracts-consumer",
     "gears/chat-engine/chat-engine-sdk",
     "gears/chat-engine/chat-engine",
     "gears/model-registry/model-registry-sdk",

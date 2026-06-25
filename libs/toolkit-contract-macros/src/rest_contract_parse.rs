@@ -24,6 +24,10 @@ pub struct RestContractModel {
     pub methods: Vec<RestMethodModel>,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "these are independent per-method projection flags (retryable / streaming / optional / server_manual) parsed from distinct attributes; a bitflags enum would obscure rather than clarify the 1:1 attribute mapping"
+)]
 pub struct RestMethodModel {
     pub ident: Ident,
     pub http_method: HttpVerb,
@@ -37,6 +41,11 @@ pub struct RestMethodModel {
     /// `true` when the projection method declares a default body — peers
     /// MAY omit this endpoint (mirrored into `HttpMethodBindingIr.optional`).
     pub optional: bool,
+    /// `true` when the method is marked `#[server_manual]` — the server-side
+    /// route generator (`register_<trait>_routes()`) SKIPS this method so the
+    /// author can register it by hand via `OperationBuilder`. The method stays
+    /// in the generated client and the binding IR.
+    pub server_manual: bool,
 }
 
 pub struct RestParam {
@@ -181,6 +190,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
     let mut http: Option<(HttpVerb, String, Span)> = None;
     let mut retryable = false;
     let mut streaming = false;
+    let mut server_manual = false;
 
     for attr in &method.attrs {
         let path = attr.path();
@@ -196,6 +206,8 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
             retryable = true;
         } else if path.is_ident("streaming") {
             streaming = true;
+        } else if path.is_ident("server_manual") {
+            server_manual = true;
         }
     }
 
@@ -226,6 +238,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
         params,
         result_types,
         optional,
+        server_manual,
     })
 }
 

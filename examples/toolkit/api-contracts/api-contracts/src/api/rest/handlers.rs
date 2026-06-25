@@ -1,54 +1,28 @@
-//! Axum REST handlers for `PaymentApi`.
+//! Axum REST handler for the **manual** `PaymentApi` route.
 //!
-//! Handlers receive an `Extension<SecurityContext>` populated upstream by
-//! the gateway middleware (or by a test scaffold). They never parse the
-//! `Authorization` header themselves — that would re-implement gateway
-//! responsibilities inside the module and would diverge per-handler.
+//! Only `list_payments` (SSE) is hand-written here — it opts out of macro
+//! generation via `#[server_manual]` on the projection trait. The unary
+//! `charge` / `get_invoice` handlers are macro-generated inside
+//! `register_payment_api_rest_routes()` and no longer live in this crate.
 //!
-//! Returns `ApiResult<JsonBody<T>>` (`canonical_prelude` shape, where the
-//! error variant is `CanonicalError`). `OperationBuilder` maps the
-//! `CanonicalError` into an RFC 9457 `Problem` envelope at the framework
-//! boundary.
+//! The handler receives an `Extension<SecurityContext>` populated upstream by
+//! the gateway middleware (or by a test scaffold). It never parses the
+//! `Authorization` header itself — that would re-implement gateway
+//! responsibilities inside the module.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 use api_contracts_sdk::contract::PaymentApi;
-use api_contracts_sdk::models::{ChargeRequest, ChargeResponse, Invoice, ListPaymentsFilter};
+use api_contracts_sdk::models::ListPaymentsFilter;
 use axum::Extension;
-use axum::extract::{Path, Query};
+use axum::extract::Query;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::stream::{self, StreamExt as _};
-use toolkit::api::canonical_prelude::{ApiResult, JsonBody, Problem};
+use toolkit::api::canonical_prelude::Problem;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
-
-/// `POST /api/api-contracts/v1/payments/charge`
-///
-/// # Errors
-/// Returns a canonical error when the underlying `PaymentApi::charge` call fails.
-pub async fn charge_handler(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<dyn PaymentApi>>,
-    axum::Json(req): axum::Json<ChargeRequest>,
-) -> ApiResult<JsonBody<ChargeResponse>> {
-    let resp = svc.charge(ctx, req).await?;
-    Ok(axum::Json(resp))
-}
-
-/// `GET /api/api-contracts/v1/invoices/{invoice_id}`
-///
-/// # Errors
-/// Returns a canonical error when the underlying `PaymentApi::get_invoice` call fails.
-pub async fn get_invoice_handler(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<dyn PaymentApi>>,
-    Path(invoice_id): Path<String>,
-) -> ApiResult<JsonBody<Invoice>> {
-    let invoice = svc.get_invoice(ctx, invoice_id).await?;
-    Ok(axum::Json(invoice))
-}
 
 /// `GET /api/api-contracts/v1/payments` — SSE stream of `PaymentSummary`.
 ///

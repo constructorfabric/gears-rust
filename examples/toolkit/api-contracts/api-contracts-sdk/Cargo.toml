@@ -19,6 +19,9 @@ rest-client = [
     "dep:async-stream",
     "dep:futures-util",
 ]
+# OpenTelemetry in the generated clients: real W3C `traceparent` propagation +
+# RED client metrics. Forwards `toolkit-contract/otel` (→ `toolkit-http/otel`).
+otel = ["rest-client", "toolkit-contract/otel"]
 # Directory-resolving REST transport: enables the generated
 # `<Trait>ResolvingClient` wrapper (self-healing endpoint discovery).
 directory-rest-client = [

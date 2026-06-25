@@ -170,6 +170,11 @@ impl DirectoryClient for DirectoryGrpcClient {
                     Some(proto_inst.version)
                 },
                 rest_endpoint: proto_inst.rest_endpoint_uri.map(ServiceEndpoint::new),
+                // The list-instances proto response does not break the instance
+                // down per gRPC service, so nothing to carry back over the OoP
+                // directory transport. The in-process `LocalDirectoryClient`
+                // populates this from the live `GearInstance`.
+                grpc_services: Vec::new(),
             })
             .collect();
 

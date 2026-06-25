@@ -1,0 +1,51 @@
+[package]
+name = "cf-api-contracts-consumer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "api-contracts example — consumer gear that resolves PaymentApi from another gear via ClientHub"
+rust-version.workspace = true
+
+[features]
+default = ["rest-client", "directory-rest-client"]
+# Enables the generated `PaymentApiRestClient` in the SDK (the resolving client
+# builds on it).
+rest-client = ["api-contracts-sdk/rest-client"]
+# Turns on `#[toolkit::consumes]` wiring: forwards `api-contracts-sdk/`
+# `directory-rest-client` (so `PaymentApiRestResolvingClient` exists) and
+# `toolkit/contract-directory-rest-client` (so `toolkit::discovery` + the runtime
+# proxy-wiring phase exist). MUST be named exactly `directory-rest-client` — the
+# `#[toolkit::consumes]`-generated code is gated on this feature name.
+directory-rest-client = [
+    "rest-client",
+    "api-contracts-sdk/directory-rest-client",
+    "toolkit/contract-directory-rest-client",
+]
+# OpenTelemetry in the resolved REST client: W3C traceparent propagation + RED
+# metrics (forwards `api-contracts-sdk/otel`).
+otel = ["rest-client", "api-contracts-sdk/otel"]
+
+[lints]
+workspace = true
+
+[dependencies]
+api-contracts-sdk.workspace = true
+toolkit.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-security.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The real provider gear, booted alongside this consumer in the composition test.
+cf-api-contracts = { path = "../api-contracts" }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+uuid.workspace = true
+parking_lot.workspace = true
+toolkit-http.workspace = true
+serde_json.workspace = true

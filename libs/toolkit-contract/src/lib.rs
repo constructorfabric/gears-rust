@@ -35,6 +35,15 @@ pub use toolkit_contract_macros::{
 pub use policy::{Policy, PolicyContext, PolicyStack, TracingPolicy};
 pub use wiring::{ClientTuning, ClientWiring, ReconnectSettings, RetrySettings};
 
+/// Re-export of `tracing` for macro-generated client code.
+///
+/// Generated REST/gRPC clients emit per-method spans through this path
+/// (`#support::__tracing::…`) so SDK crates that only depend on
+/// `toolkit-contract` do not need a direct `tracing` dependency. Not part of
+/// the stable public API.
+#[doc(hidden)]
+pub use tracing as __tracing;
+
 // Wire envelope: re-export `Problem` from the canonical-errors leaf so all
 // downstream crates have a single import path to the RFC 9457 envelope.
 #[cfg(feature = "canonical-errors")]

@@ -63,6 +63,48 @@ where
     }
 }
 
+/// Build the default `toolkit-http` client used by macro-generated REST clients.
+///
+/// Transport-layer retry is **disabled** — the SDK runs its own retry loop in
+/// [`retry_with_backoff`](crate::runtime::retry::retry_with_backoff); plaintext
+/// `http://` is allowed for in-mesh service-to-service traffic.
+///
+/// Observability is **feature-gated on `otel`** (which forwards
+/// `toolkit-http/otel`): with the feature on, outbound calls get W3C
+/// `traceparent` propagation *and* RED client metrics
+/// (`http.client.request.duration`, labeled by `client_type`); with it off,
+/// neither the propagation nor `with_metrics` is compiled in. Either way the
+/// generated method still opens its per-method `tracing` span.
+///
+/// # Errors
+/// Propagates [`toolkit_http::HttpError`] from the underlying builder (e.g. a
+/// TLS backend that cannot be constructed under FIPS).
+#[cfg(feature = "otel")]
+pub fn build_default_http_client(
+    client_type: &str,
+) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
+    toolkit_http::HttpClient::builder()
+        .retry(None)
+        .transport(toolkit_http::TransportSecurity::AllowInsecureHttp)
+        .with_otel()
+        .with_metrics(client_type)
+        .build()
+}
+
+/// Non-`otel` build of [`build_default_http_client`]: no `traceparent`
+/// propagation and no `with_metrics` (that builder method only exists under
+/// `toolkit-http/otel`). `client_type` is unused in this configuration.
+#[cfg(not(feature = "otel"))]
+pub fn build_default_http_client(
+    _client_type: &str,
+) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
+    toolkit_http::HttpClient::builder()
+        .retry(None)
+        .transport(toolkit_http::TransportSecurity::AllowInsecureHttp)
+        .with_otel()
+        .build()
+}
+
 /// Add a JSON body to a request builder. Wraps `toolkit_http`'s fallible
 /// `.json()` (which can fail to serialize) in our [`TransportError`] surface
 /// so the macro emit path can `?` uniformly.

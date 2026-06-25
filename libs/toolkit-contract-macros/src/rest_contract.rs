@@ -17,7 +17,15 @@ use crate::projection::{
 use crate::rest_contract_parse::{HttpVerb, RestContractModel, RestMethodModel, RestParam};
 use crate::support::contract_support_path;
 
-const HTTP_ATTRS: &[&str] = &["get", "post", "put", "delete", "retryable", "streaming"];
+const HTTP_ATTRS: &[&str] = &[
+    "get",
+    "post",
+    "put",
+    "delete",
+    "retryable",
+    "streaming",
+    "server_manual",
+];
 
 fn streaming_idents(method: &RestMethodModel) -> Option<(Type, Type)> {
     if method.streaming {
@@ -36,7 +44,7 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
     let resolving_struct = generate_resolving_client_struct(model, &support);
     let resolving_impl = generate_resolving_client_impl(model, &support);
     let projection_impl = generate_projection_impl(model);
-    let server_registration = generate_server_registration(model, &support);
+    let server_registration = generate_server_registration(model);
 
     quote! {
         #cleaned_trait
@@ -237,6 +245,8 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
         "Generated REST client for [`{}`].\n\nProduced by `#[toolkit::rest_contract]`.",
         model.trait_ident
     );
+    // `client_type` label for the (otel-gated) `toolkit-http` client metrics.
+    let metrics_label = model.trait_ident.to_string();
 
     quote! {
         #[cfg(feature = "rest-client")]
@@ -248,48 +258,26 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
 
         #[cfg(feature = "rest-client")]
         impl #client_ident {
-            /// Build a new client with a default `toolkit-http` HTTP client.
+            /// Build a new client with the default `toolkit-http` HTTP client.
+            ///
+            /// The transport is built by
+            /// [`build_default_http_client`](#support::runtime::client::build_default_http_client):
+            /// transport-layer retry disabled (the SDK retries itself), plaintext
+            /// `http://` allowed, and — when the `otel` feature is enabled — W3C
+            /// `traceparent` propagation plus RED client metrics labeled with this
+            /// projection trait name. For caller-controlled HTTP client
+            /// construction use [`Self::with_http_client`].
             ///
             /// Fallible because the underlying `toolkit-http` builder can fail
             /// under non-default cryptographic backends (FIPS, custom TLS).
-            /// The previous infallible `new` panicked in those configurations;
-            /// callers must now `?` the error or pass it up. For
-            /// caller-controlled HTTP client construction, use
-            /// [`Self::with_http_client`].
             ///
             /// # Errors
             /// Returns whatever `toolkit_http::HttpClient::builder().build()` returned.
             pub fn new(
                 config: #support::runtime::config::ClientConfig,
             ) -> ::std::result::Result<Self, ::toolkit_http::HttpError> {
-                let http = Self::build_default_http_client()?;
+                let http = #support::runtime::client::build_default_http_client(#metrics_label)?;
                 Ok(Self { http, config })
-            }
-
-            /// Build the default `toolkit-http` HttpClient used by `new`/`try_new`.
-            ///
-            /// - Retry is **disabled** at the transport layer: this SDK
-            ///   consults [`ClientConfig::retry`] and runs its own retry loop
-            ///   in `runtime::retry`; double-retry would amplify request rate
-            ///   under failure.
-            /// - Plain `http://` is **allowed**: internal service-to-service
-            ///   traffic in dev / behind a mesh sidecar typically uses
-            ///   plaintext. Callers needing TLS-only enforcement use
-            ///   [`Self::with_http_client`] with a stricter `HttpClient`.
-            /// - OpenTelemetry is **enabled** (`with_otel`): outbound calls get
-            ///   a span and W3C trace-context propagation so a contract hop
-            ///   joins the distributed trace. Inert unless the build enables
-            ///   `toolkit-http/otel`; callers wanting a different observability
-            ///   stance use [`Self::with_http_client`].
-            fn build_default_http_client() -> ::std::result::Result<
-                ::toolkit_http::HttpClient,
-                ::toolkit_http::HttpError,
-            > {
-                ::toolkit_http::HttpClient::builder()
-                    .retry(::std::option::Option::None)
-                    .transport(::toolkit_http::TransportSecurity::AllowInsecureHttp)
-                    .with_otel()
-                    .build()
             }
 
             /// Build a new client with a caller-supplied `toolkit-http`
@@ -464,6 +452,37 @@ fn resolving_struct_ident(trait_ident: &syn::Ident) -> syn::Ident {
     format_ident!("{}ResolvingClient", trait_ident)
 }
 
+/// Build the `info_span!(...)` expression emitted inside every generated
+/// client method. The span name and all attribute values are baked as string
+/// literals at macro-expansion time. `otel.kind = "client"` makes this the
+/// parent of the `toolkit-http` `outgoing_http` span, so W3C `traceparent`
+/// (`trace_id` / `span_id`) propagates downstream with no manual threading.
+///
+/// Routed through `#support::__tracing` (a `toolkit-contract` re-export) so SDK
+/// crates need no direct `tracing` dependency.
+fn client_span_ctor(
+    service: &str,
+    method_name: &str,
+    method: &RestMethodModel,
+    support: &TokenStream,
+) -> TokenStream {
+    let span_name = format!("{service}.{method_name}");
+    let http_method_str = method.http_method.ir_variant().to_uppercase();
+    let route_str = method.path_template.clone();
+    quote! {
+        #support::__tracing::info_span!(
+            #span_name,
+            otel.kind = "client",
+            rpc.system = "rest",
+            rpc.service = #service,
+            rpc.method = #method_name,
+            http.method = #http_method_str,
+            http.route = #route_str,
+            error = #support::__tracing::field::Empty,
+        )
+    }
+}
+
 fn generate_client_method(
     method: &RestMethodModel,
     trait_ident: &syn::Ident,
@@ -479,6 +498,9 @@ fn generate_client_method(
     let bearer_capture = capture_bearer_token(method);
     let body_capture = capture_body_param(method);
 
+    // Per-method client span (baked-in telemetry) — see `client_span_ctor`.
+    let span_ctor = client_span_ctor(&trait_ident.to_string(), &method_name_str, method, support);
+
     if method.streaming {
         return generate_streaming_method_body(
             method,
@@ -487,6 +509,7 @@ fn generate_client_method(
             &method_name_str,
             &fields_init,
             &bearer_capture,
+            &span_ctor,
             support,
         );
     }
@@ -522,48 +545,58 @@ fn generate_client_method(
 
     quote! {
         async fn #method_ident #sig {
-            let __binding = #binding_fn();
-            let __m = __binding
-                .find_method(#method_name_str)
-                .expect(concat!("missing HTTP binding for method '", #method_name_str, "'"));
+            let __span = #span_ctor;
+            // Enter the span across the awaited dispatch so `toolkit-http`'s
+            // OtelLayer sees it as `Context::current()` and injects this span's
+            // W3C `traceparent` on the outbound request.
+            #support::__tracing::Instrument::instrument(async move {
+                let __binding = #binding_fn();
+                let __m = __binding
+                    .find_method(#method_name_str)
+                    .expect(concat!("missing HTTP binding for method '", #method_name_str, "'"));
 
-            #fields_init
-            let __fields = __fields_result.map_err(#convert_err)?;
-            let __url = #support::runtime::http::build_request_url(
-                &self.config.base_url,
-                &__binding.base_path,
-                __m,
-                &__fields,
-            )
-            .map_err(#convert_err)?;
+                #fields_init
+                let __fields = __fields_result.map_err(#convert_err)?;
+                let __url = #support::runtime::http::build_request_url(
+                    &self.config.base_url,
+                    &__binding.base_path,
+                    __m,
+                    &__fields,
+                )
+                .map_err(#convert_err)?;
 
-            #bearer_capture
+                #bearer_capture
 
-            let __attempt = || async {
-                // `toolkit-http` has no `.bearer_auth()` helper — use the
-                // `authorization` header directly.
-                let mut __builder = self.http.#verb_call(&__url);
-                if let Some(ref __t) = __bearer {
-                    __builder = __builder.header(
-                        "authorization",
-                        &::std::format!("Bearer {}", __t),
-                    );
+                let __attempt = || async {
+                    // `toolkit-http` has no `.bearer_auth()` helper — use the
+                    // `authorization` header directly.
+                    let mut __builder = self.http.#verb_call(&__url);
+                    if let Some(ref __t) = __bearer {
+                        __builder = __builder.header(
+                            "authorization",
+                            &::std::format!("Bearer {}", __t),
+                        );
+                    }
+                    #body_apply
+                    let __build_result: ::std::result::Result<
+                        ::toolkit_http::RequestBuilder,
+                        #support::runtime::transport_error::TransportError,
+                    > = ::std::result::Result::Ok(__builder);
+                    #support::runtime::client::send_unary::<_, #response_ty>(|| __build_result).await
+                };
+
+                let __result: ::std::result::Result<#response_ty, #support::runtime::transport_error::TransportError> =
+                    #retry_call;
+                if __result.is_err() {
+                    #support::__tracing::Span::current().record("error", true);
                 }
-                #body_apply
-                let __build_result: ::std::result::Result<
-                    ::toolkit_http::RequestBuilder,
-                    #support::runtime::transport_error::TransportError,
-                > = ::std::result::Result::Ok(__builder);
-                #support::runtime::client::send_unary::<_, #response_ty>(|| __build_result).await
-            };
-
-            let __result: ::std::result::Result<#response_ty, #support::runtime::transport_error::TransportError> =
-                #retry_call;
-            __result.map_err(#convert_err)
+                __result.map_err(#convert_err)
+            }, __span).await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_streaming_method_body(
     method: &RestMethodModel,
     sig: &TokenStream,
@@ -571,6 +604,7 @@ fn generate_streaming_method_body(
     method_name: &str,
     fields_init: &TokenStream,
     bearer_capture: &TokenStream,
+    span_ctor: &TokenStream,
     support: &TokenStream,
 ) -> TokenStream {
     let method_ident = &method.ident;
@@ -584,6 +618,11 @@ fn generate_streaming_method_body(
     quote! {
         fn #method_ident #sig {
             use ::futures_util::StreamExt as _;
+
+            // Per-method client span (baked-in telemetry). Entered per yielded
+            // item so SSE event processing runs under the contract span; the
+            // per-attempt HTTP send is traced by `toolkit-http`'s OtelLayer.
+            let __span = #span_ctor;
 
             let __binding = #binding_fn();
             let __m = __binding
@@ -653,7 +692,12 @@ fn generate_streaming_method_body(
             let __stream = #support::runtime::client::send_streaming::<_, #item_ty>(
                 __factory, __reconnect, __timeout,
             );
-            ::std::boxed::Box::pin(__stream.map(move |r| r.map_err(|e| __convert(e))))
+            ::std::boxed::Box::pin(__stream.map(move |r| {
+                let __enter = __span.enter();
+                let __mapped = r.map_err(|e| __convert(e));
+                ::std::mem::drop(__enter);
+                __mapped
+            }))
         }
     }
 }
@@ -800,14 +844,25 @@ fn capture_body_param(method: &RestMethodModel) -> Option<syn::Ident> {
         .map(|p| p.ident.clone())
 }
 
-fn generate_server_registration(model: &RestContractModel, _support: &TokenStream) -> TokenStream {
+fn generate_server_registration(model: &RestContractModel) -> TokenStream {
     let fn_name = format_ident!("register_{}_routes", to_snake_case(&model.trait_ident.to_string()));
     let base_trait = &model.base_trait;
-    let doc = format!("Register all REST routes for [`{}`] on the given router.", model.trait_ident);
+    let doc = format!(
+        "Register the macro-generated REST routes for [`{}`] on the given router.\n\n\
+         Methods marked `#[server_manual]` are SKIPPED — register them by hand via \
+         `OperationBuilder` on the returned router. This function is additive and \
+         composable: the returned router can be chained into further manual \
+         `OperationBuilder::verb(..).register(router, openapi)` calls.",
+        model.trait_ident
+    );
 
-    let method_routes = model.methods.iter().map(|method| {
-        generate_method_route(method, model, _support)
-    });
+    // Methods marked `#[server_manual]` are excluded from generation so the
+    // author can register them by hand. They remain in the client + IR.
+    let method_routes = model
+        .methods
+        .iter()
+        .filter(|method| !method.server_manual)
+        .map(|method| generate_method_route(method, model));
 
     quote! {
         #[cfg(feature = "rest-server")]
@@ -823,16 +878,28 @@ fn generate_server_registration(model: &RestContractModel, _support: &TokenStrea
     }
 }
 
-fn generate_method_route(
-    method: &RestMethodModel,
-    model: &RestContractModel,
-    _support: &TokenStream,
-) -> TokenStream {
+fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) -> TokenStream {
+    // Streaming server-side codegen (SSE) is not yet implemented. Such methods
+    // must opt out with `#[server_manual]` and be registered by hand via
+    // `OperationBuilder`. (server_manual methods are filtered out before
+    // reaching this function, so a streaming method here is an un-opted-out one.)
+    if method.streaming {
+        let ident = &method.ident;
+        let msg = format!(
+            "rest_contract: streaming method `{ident}` cannot be auto-registered on the server yet. \
+             Mark it `#[server_manual]` and register it by hand via OperationBuilder."
+        );
+        return quote! { ::std::compile_error!(#msg); };
+    }
+
     let base_path = &model.base_path;
     let method_name = &method.ident;
     let path = &method.path_template;
-    let full_path = format!("{}{}", base_path, path);
-    let operation_id = format!("{}_{}", to_snake_case(&model.trait_ident.to_string()), method_name);
+    let full_path = format!("{base_path}{path}");
+    let operation_id = format!(
+        "{}_{method_name}",
+        to_snake_case(&model.trait_ident.to_string()),
+    );
 
     let http_verb_method = match method.http_method {
         HttpVerb::Get => quote! { get },
@@ -843,26 +910,23 @@ fn generate_method_route(
 
     let path_param_names = extract_path_param_names(&method.path_template);
 
-    let handler = if method.streaming {
-        generate_streaming_handler(method, &path_param_names)
-    } else {
-        generate_unary_handler(method, &path_param_names)
+    // Detect the request-body parameter type (for OpenAPI request schema).
+    let body_ty = body_param_type(method, &path_param_names);
+    let request_registration = match body_ty {
+        Some(ty) => quote! { .json_request::<#ty>(openapi, "") },
+        None => quote! {},
     };
 
-    let response_registration = if method.streaming {
-        // For streaming, use sse_json with the item type from the stream
+    let handler = generate_unary_handler(method, &path_param_names);
+
+    // Response schema: derive from the `Ok` type of `Result<Ok, Err>`.
+    let response_registration = if let Some((ok_ty, _)) = &method.result_types {
         quote! {
-            .sse_json::<()>(openapi, "SSE response")
-        }
-    } else if let Some((ok_ty, _)) = &method.result_types {
-        // For unary methods, use json_response_with_schema with the response type
-        quote! {
-            .json_response_with_schema::<#ok_ty>(openapi, ::axum::http::StatusCode::OK, "OK")
+            .json_response_with_schema::<#ok_ty>(openapi, ::axum::http::StatusCode::OK, "")
         }
     } else {
-        // Fallback if we can't determine the type
         quote! {
-            .json_response(::axum::http::StatusCode::OK, "OK")
+            .json_response(::axum::http::StatusCode::OK, "")
         }
     };
 
@@ -871,6 +935,7 @@ fn generate_method_route(
             .operation_id(#operation_id)
             .authenticated()
             .no_license_required()
+            #request_registration
             .handler(#handler)
             #response_registration
             .standard_errors(openapi)
@@ -878,84 +943,76 @@ fn generate_method_route(
     }
 }
 
-fn generate_unary_handler(
-    method: &RestMethodModel,
-    path_param_names: &[String],
-) -> TokenStream {
+/// Returns the type of the request-body parameter for body-carrying verbs
+/// (POST/PUT): the first parameter that is not `self`, not `SecurityContext`,
+/// and not a path parameter. `None` for GET/DELETE or bodyless methods.
+fn body_param_type(method: &RestMethodModel, path_param_names: &[String]) -> Option<Type> {
+    if !method.http_method.allows_body() {
+        return None;
+    }
+    for param in &method.params {
+        let name = param.ident.to_string();
+        if name == "self" || type_path_ends_with(&param.ty, "SecurityContext") {
+            continue;
+        }
+        if path_param_names.contains(&name) {
+            continue;
+        }
+        return Some(param.ty.clone());
+    }
+    None
+}
+
+fn generate_unary_handler(method: &RestMethodModel, path_param_names: &[String]) -> TokenStream {
     let method_ident = &method.ident;
 
-    // Build parameter extractors
-    let mut extractors = Vec::new();
+    // Build parameter extractors and the corresponding service-call arguments.
+    // SecurityContext is always first (populated by gateway auth middleware
+    // into Axum extensions), then path params, then body, then query params.
+    let mut extractors = vec![quote! {
+        ::axum::Extension(ctx): ::axum::Extension<::toolkit_security::SecurityContext>
+    }];
     let mut call_args = vec![quote! { ctx }];
+    let mut body_taken = false;
 
-    // SecurityContext is always first (extracted via Extension)
-    extractors.push(quote! {
-        ::axum::extract::Extension(ctx): ::axum::extract::Extension<::toolkit_security::SecurityContext>
-    });
-
-    // Process remaining parameters
     for param in &method.params {
         let param_name = &param.ident;
         if param_name == "self" || type_path_ends_with(&param.ty, "SecurityContext") {
             continue;
         }
-
         let param_ty = &param.ty;
 
         if path_param_names.contains(&param_name.to_string()) {
-            // Path parameter
             extractors.push(quote! {
                 ::axum::extract::Path(#param_name): ::axum::extract::Path<#param_ty>
             });
-            call_args.push(quote! { #param_name });
-        } else if method.http_method.allows_body() && call_args.len() == 1 {
-            // Body parameter (first non-SecurityContext param for POST/PUT)
+        } else if method.http_method.allows_body() && !body_taken {
             extractors.push(quote! {
                 ::axum::Json(#param_name): ::axum::Json<#param_ty>
             });
-            call_args.push(quote! { #param_name });
+            body_taken = true;
         } else {
-            // Query parameter
             extractors.push(quote! {
                 ::axum::extract::Query(#param_name): ::axum::extract::Query<#param_ty>
             });
-            call_args.push(quote! { #param_name });
         }
+        call_args.push(quote! { #param_name });
     }
 
     let extractor_list = quote! { #(#extractors),* };
 
+    // The handler mirrors the hand-written pattern: call the domain method and
+    // wrap the `Ok` value in `Json`. The error type (`CanonicalError` in the
+    // common case) implements `IntoResponse`, so `?`/`map`-style propagation
+    // renders the RFC 9457 `Problem` envelope at the framework boundary.
     quote! {
         {
             let svc = ::std::sync::Arc::clone(&svc);
-            |#extractor_list| {
+            move |#extractor_list| {
                 let svc = ::std::sync::Arc::clone(&svc);
                 async move {
-                    svc.#method_ident(#(#call_args),*).await
-                        .map(::axum::Json)
-                        .map_err(|e| {
-                            let _problem: ::toolkit_canonical_errors::Problem = e.into();
-                            // TODO: proper error response conversion
-                            (::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error")
-                        })
+                    svc.#method_ident(#(#call_args),*).await.map(::axum::Json)
                 }
-            }
-        }
-    }
-}
-
-fn generate_streaming_handler(
-    _method: &RestMethodModel,
-    _path_param_names: &[String],
-) -> TokenStream {
-    // Placeholder: generates a dummy streaming handler for now
-    quote! {
-        {
-            let _svc = ::std::sync::Arc::clone(&svc);
-            |::axum::extract::Extension(_ctx): ::axum::extract::Extension<::toolkit_security::SecurityContext>| async move {
-                // TODO: implement streaming handler
-                #[allow(unreachable_code)]
-                Err::<::axum::response::Sse<futures_util::stream::BoxStream<'static, Result<::axum::response::sse::Event, ::std::convert::Infallible>>>, _>(())
             }
         }
     }

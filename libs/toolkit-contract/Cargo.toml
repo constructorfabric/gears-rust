@@ -30,6 +30,13 @@ runtime-client = [
 ]
 # Used by rest_contract codegen to gate the generated client struct.
 rest-client = ["runtime-client"]
+# OpenTelemetry in generated clients. Activates `toolkit-http/otel`, which makes
+# the transport actually inject W3C `traceparent` (real distributed-trace
+# propagation) AND enables RED client metrics (`http.client.request.duration`)
+# via the builder's `with_metrics`. Without this feature the generated client
+# still opens per-method `tracing` spans, but emits no wire propagation or
+# metrics. Enable it through an SDK's own `otel` feature (which forwards here).
+otel = ["runtime-client", "toolkit-http/otel"]
 # Server-side REST route registration: gates the generated `register_<trait>_routes()` function
 # and server-side OperationBuilder integration. Requires Axum and OpenAPI registry.
 rest-server = ["openapi", "dep:axum"]

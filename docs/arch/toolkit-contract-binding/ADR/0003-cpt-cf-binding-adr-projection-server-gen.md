@@ -214,13 +214,71 @@ pub trait BillingApiGrpc: BillingApi {
 * `require_full_coverage` is opt-in to allow incremental adoption; new SDK crates are expected to
   use it by default.
 * The method-level annotation vocabulary grows by `#[path]`, `#[query]` (scalar / flat-struct),
-  and `#[rest(status, tag, license, server_manual)]`. These were already anticipated in ADR-0002
-  § Phase 2. The base trait annotation vocabulary is unchanged.
-* `#[rest(server_manual)]` on a projection method excludes that method from
-  `register_<name>_routes()` while keeping it in the client. The author writes a manual
-  `OperationBuilder` call and composes it with the generated function.
+  the bare marker `#[server_manual]`, and the value-carrying group `#[rest(status, tag, license)]`.
+  These were already anticipated in ADR-0002 § Phase 2. The base trait annotation vocabulary is
+  unchanged.
+* `#[server_manual]` on a projection method excludes that method from `register_<name>_routes()`
+  while keeping it in the client and the binding IR. The author writes a manual `OperationBuilder`
+  call and composes it with the generated function.
 * ADR-0002 scope is preserved: union bodies, multipart, response headers, and per-status schemas
   still require a manual `impl Base for MyClient`; the macro does not gain new coverage.
+
+#### Attribute shape: bare marker vs. `#[rest(...)]` group
+
+A method annotation is **bare** (`#[streaming]`, `#[retryable]`, `#[server_manual]`) or lives inside
+the value-carrying **`#[rest(...)]`** group (`#[rest(status = 201, tag = "Payments", license = "…")]`).
+The rule for choosing:
+
+* **Bare attribute** — a boolean, argument-less per-method *marker*: presence alone carries the full
+  meaning, there is no value to attach. New boolean flags join `#[streaming]` / `#[retryable]` as bare
+  attributes for consistency. `#[server_manual]` is one of these.
+* **`#[rest(key = value, …)]`** — REST-projection *configuration that carries a value* (a status code,
+  a tag string, a license scope). Grouping these under one attribute keeps the method signature quiet
+  when several are set and namespaces them as projection config rather than contract semantics. A bare
+  flag gains nothing from the group, so it stays out of it.
+
+Rationale: the existing `#[get("…")]` / `#[streaming]` / `#[retryable]` vocabulary already splits this
+way (value-carrying verb vs. bare markers); the rule just makes the split explicit and forward-looking.
+The attribute *name* is part of the SDK's public surface — moving a flag between bare and grouped form
+later is a breaking change across every SDK crate — so the shape is fixed by this rule at introduction
+time, not deferred. (An earlier draft of this ADR mis-filed `server_manual` inside the `#[rest(...)]`
+group; the implemented form is the bare `#[server_manual]`, per this rule.)
+
+### Implementation status (PoC)
+
+A first PoC of the server-side generation has landed on `feature/toolkit_contracts`. What it
+actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[toolkit::rest_contract]`):
+
+* **Generated symbol**: `register_<trait_snake>_routes(router, openapi, svc)` —
+  e.g. `register_payment_api_rest_routes`. Signature
+  `fn(axum::Router, &dyn toolkit::api::OpenApiRegistry, Arc<dyn Base>) -> axum::Router`,
+  gated behind the SDK `rest-server` feature. Implemented in
+  `libs/toolkit-contract-macros/src/rest_contract.rs::generate_server_registration`.
+* **Per-method opt-out is a bare `#[server_manual]`** marker attribute, per the *Attribute shape*
+  rule above (boolean markers are bare; the `#[rest(...)]` group is reserved for value-carrying
+  config and is itself deferred). A method marked `#[server_manual]` is skipped by the generator but
+  stays in the client and the binding IR. Parsed in `rest_contract_parse.rs` alongside `#[retryable]`
+  / `#[streaming]`.
+* **Manual `OperationBuilder` remains first-class and additive.** The generated function and a
+  hand-written `OperationBuilder::verb(..).register(router, openapi)` chain share the identical
+  `Router -> Router` shape and compose on one router with no global state. This is the explicit
+  guarantee that the prior manual path (used across `file-parser`, `mini-chat`, etc.) is preserved,
+  not replaced.
+* **Unary handlers** are generated: `SecurityContext` via `Extension`, path params via `Path`, body
+  via `Json` (first non-ctx/non-path param on POST/PUT), remaining params via `Query`. The handler
+  calls `svc.method(ctx, ..).await.map(Json)`; the error type (`CanonicalError`) renders the RFC 9457
+  `Problem` via its existing `IntoResponse`.
+* **Streaming (SSE) generation is deferred.** A `#[streaming]` method that is *not*
+  `#[server_manual]` raises a `compile_error!` directing the author to opt out and register it by
+  hand. The `api-contracts` PoC marks `list_payments` `#[server_manual]` and keeps the existing
+  hand-written SSE route.
+* **PoC migration is hybrid**: `api-contracts` registers `charge` + `get_invoice` via the generated
+  function and `list_payments` via a manual `register_manual_routes()` chained on the same router,
+  composed by `register_routes()`.
+* **Not yet implemented** (follow-up): compile-time base↔projection parity check,
+  `require_full_coverage`, doc-comment → `summary`/`description` extraction, `#[rest(...)]` grouped
+  attributes (`status`, `tag`, `license`), and streaming-handler generation. `operation_id`/`tag`
+  currently use a generated default (`<trait_snake>_<method>`) rather than `<module>.<method>`.
 
 ### Confirmation
 

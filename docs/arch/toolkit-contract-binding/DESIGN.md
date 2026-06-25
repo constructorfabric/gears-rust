@@ -609,9 +609,9 @@ pub fn register_billing_api_rest_routes(
                   Json(req): Json<ChargeRequest>| {
                 let svc = Arc::clone(&svc);
                 async move {
-                    svc.charge(ctx, req).await
-                        .map(Json)
-                        .map_err(Into::into)
+                    // `CanonicalError: IntoResponse` renders the RFC 9457
+                    // Problem at the framework boundary — no explicit map_err.
+                    svc.charge(ctx, req).await.map(Json)
                 }
             }
         })
@@ -636,17 +636,18 @@ impl RestApiCapability for MyGear {
 
 **Consequences:**
 
-- The projection trait becomes the **sole source of REST API specification** — paths, HTTP methods, response schemas, authentication all derive from it.
-- Manual `routes.rs` files are deleted; server routes are auto-generated from the trait.
-- OpenAPI spec is assembled via a single `OpenApiRegistry` (utoipa) as routes are registered.
-- Handler generation is synchronized with the IR — parameter binding order, error mapping, streaming support all follow from the binding metadata.
-- Current scope (PoC): basic HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[delete]`) + streaming (`#[streaming]`). Path/query parameters and complex authentication (license, OData) are follow-up work.
+- The projection trait becomes the **primary source of REST API specification** — paths, HTTP methods, response schemas, authentication derive from it for every method the macro covers.
+- Generation is **additive, not a replacement**. The generated `register_<trait>_routes()` and a hand-written `OperationBuilder::verb(..).register(router, openapi)` chain share the identical `axum::Router -> axum::Router` shape and compose on one router. The manual `OperationBuilder` path (used across `file-parser`, `mini-chat`, etc.) remains **first-class** and is not removed.
+- **Per-method opt-out**: a projection method marked `#[server_manual]` is skipped by the generator (but stays in the client + IR). The author registers it by hand and chains it onto the generated router. This is the escape hatch for routes the macro cannot (yet) express.
+- OpenAPI spec is assembled via a single `OpenApiRegistry` (utoipa) as routes are registered — generated and manual routes contribute to the same registry.
+- Handler generation is synchronized with the IR — parameter binding order (`SecurityContext` → path → body → query) and error mapping (`CanonicalError: IntoResponse` → RFC 9457 `Problem`) follow from the binding metadata.
+- Current scope (PoC): unary HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[delete]`) with path/query/body parameters and default `authenticated()` auth. **Streaming (`#[streaming]`) server generation is deferred** — such methods must be marked `#[server_manual]` and registered by hand (a non-opted-out streaming method raises a `compile_error!`). Complex authentication (license, OData, multipart) and base↔projection parity enforcement are follow-up work.
 
 **Trade-offs:**
 
 - The macro's responsibility grows — now generating both client and server paths. Debugging becomes more complex.
 - Server route generation is synchronous; async patterns in routes require manual composition with the generated function.
-- For routes that cannot be expressed by the macro (complex authentication, custom response shapes, multipart uploads), manual `OperationBuilder` calls can be composed alongside the generated function.
+- For routes that cannot be expressed by the macro (streaming/SSE in the PoC, complex authentication, custom response shapes, multipart uploads), `#[server_manual]` + manual `OperationBuilder` calls compose alongside the generated function on the same router.
 
 ## 4. Crate Structure
 
@@ -729,70 +730,86 @@ Only REST transport projections are supported. gRPC follows the same pattern but
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-constraint-observability`
 
-The generated REST client carries retry, timeout, and error mapping. Without traces, metrics, and logs it is unusable in production. Bolting observability on later is an API break because the hook points live on `ClientConfig`. Observability is therefore wired in from day one.
+The generated REST client carries retry, timeout, and error mapping. Without traces it is
+unusable in production. Observability is therefore baked into the generated client from day one —
+but through the platform's existing `tracing` / OpenTelemetry stack, **not** a bespoke
+`ContractObservability` trait or new `ClientConfig` fields. See
+[ADR-0006](./ADR/0006-cpt-cf-binding-adr-client-observability.md) for the decision and its rationale.
 
-**Tracing (spans).** Every generated method call opens a span that carries the method name (e.g., `NotificationBackendRest::deliver`), target URL, HTTP method, status code, retry attempt number, request duration, and a correlation ID propagated outbound via the `traceparent` header.
+**Tracing (spans).** The `#[toolkit_rest_contract]` macro emits a per-method `tracing` span inside
+every generated client method. Its name (`{Trait}.{method}`, e.g. `NotificationBackendRest.deliver`)
+and its OTel-semantic fields (`otel.kind = "client"`, `rpc.system = "rest"`, `rpc.service`,
+`rpc.method`, `http.method`, `http.route`, `error`) are baked as string literals at macro-expansion
+time. The span is entered across the awaited dispatch, so it becomes the parent of `toolkit-http`'s
+`outgoing_http` span (`libs/toolkit-http/src/layers/otel.rs`), which injects W3C `traceparent`
+(`trace_id` + `span_id`) on the outbound request. Downstream propagation of `request_id`/`span_id`
+therefore happens automatically via `Context::current()` — no manual threading, and no new field on
+`ClientConfig`.
 
-**Metrics.** The generated client emits: request count (labeled by method, status), request duration histogram, retry count, error count (labeled by `error_code`, `error_domain`), and an in-flight requests gauge.
+The span code is routed through a `#[doc(hidden)] pub use tracing as __tracing;` re-export in
+`toolkit-contract`, so SDK crates need no direct `tracing` dependency.
 
-**Structured logs.** Request initiated at `debug`, retry attempts at `warn`, errors with full Problem Details context at `error`.
+**`request_id`.** By convention `request_id == trace_id` (the W3C `traceparent` 32-hex trace-id). The
+server-side error envelope already derives it via the fallback chain
+`traceparent → x-trace-id → x-request-id → span-id` (`libs/toolkit/src/api/canonical_error_layer.rs`).
+No separate request-context type is introduced.
 
-**Where the hooks live.** `ClientConfig` gains an optional parent `tracing::Span` and an optional `MetricsRegistry` handle. A new `ContractObservability` trait abstracts all three channels so platforms on OpenTelemetry, Prometheus, or a bespoke stack can supply their own wiring. A default implementation backed by the `tracing` and `metrics` crates ships with the runtime.
+**Metrics.** RED metrics (`http.client.request.duration`, labeled by `client_type` = the projection
+trait name) are **feature-gated on `otel`**. The `toolkit-contract` `otel` feature forwards
+`toolkit-http/otel`; the client builder (`runtime::client::build_default_http_client`) has two
+cfg variants, so with `otel` on it calls `.with_metrics(client_type)` (that builder method is itself
+`#[cfg(feature = "otel")]` on `toolkit-http`) and with `otel` off it does not — no `opentelemetry`
+dependency is forced onto SDKs that opt out. The rule is: **`otel` on ⇒ generated clients propagate
+W3C `traceparent` *and* emit RED metrics; `otel` off ⇒ neither** (the per-method `tracing` span is
+always present regardless). SDKs opt in through their own `otel` feature, which forwards
+`toolkit-contract/otel`.
 
-```rust
-// Runtime crate: cf-toolkit-contract-runtime
-pub struct ClientConfig {
-    pub base_url: String,
-    pub timeout: Duration,
-    pub retry: RetryConfig,
-    pub parent_span: Option<tracing::Span>,
-    pub metrics: Option<MetricsRegistry>,
-    pub observability: Option<Arc<dyn ContractObservability>>, // None = default impl
-}
+**Logs.** Errors are recorded on the span (`error = true`); request-level debug/warn logging composes
+through the same span. No custom log-channel abstraction.
 
-pub trait ContractObservability: Send + Sync {
-    fn on_request_start(&self, method: &'static str, url: &str) -> RequestScope;
-    fn on_retry(&self, scope: &RequestScope, attempt: u32, reason: &dyn std::fmt::Display);
-    fn on_response(&self, scope: RequestScope, status: u16, duration: Duration);
-    fn on_error(&self, scope: RequestScope, err: &ProblemDetails, duration: Duration);
-}
-```
-
-The macro expands each method into a span-wrapped dispatch:
+**What the macro emits (per unary method):**
 
 ```rust
 impl NotificationBackend for NotificationBackendRestClient {
-    async fn deliver(&self, ctx: &SecurityContext, req: &DeliverRequest)
+    async fn deliver(&self, ctx: SecurityContext, req: DeliverRequest)
         -> Result<DeliverResponse, NotificationError>
     {
-        let obs = self.config.observability();
-        let scope = obs.on_request_start("NotificationBackendRest::deliver", &url);
-        let span = tracing::info_span!(
-            parent: self.config.parent_span.as_ref(),
-            "NotificationBackendRest::deliver",
-            http.method = "POST", http.url = %url,
-            http.status_code = tracing::field::Empty,
-            retry.attempt = tracing::field::Empty,
+        let __span = toolkit_contract::__tracing::info_span!(
+            "NotificationBackendRest.deliver",
+            otel.kind = "client",
+            rpc.system = "rest",
+            rpc.service = "NotificationBackendRest",
+            rpc.method = "deliver",
+            http.method = "POST",
+            http.route = "/v1/deliver",
+            error = toolkit_contract::__tracing::field::Empty,
         );
-        async move {
-            tracing::debug!(?req, "request initiated");
-            let started = Instant::now();
-            match self.dispatch_with_retry(ctx, req, &scope, &span).await {
-                Ok(resp) => { obs.on_response(scope, 200, started.elapsed()); Ok(resp) }
-                Err(e)   => {
-                    tracing::error!(error_code = %e.error_code(), error_domain = %e.error_domain(), "request failed");
-                    obs.on_error(scope, &e.to_problem_details(), started.elapsed());
-                    Err(e)
-                }
+        toolkit_contract::__tracing::Instrument::instrument(async move {
+            // ... build url, attach bearer, send_unary / retry_with_backoff ...
+            let __result = /* dispatch */;
+            if __result.is_err() {
+                toolkit_contract::__tracing::Span::current().record("error", true);
             }
-        }.instrument(span).await
+            __result.map_err(/* TransportError -> CanonicalError */)
+        }, __span).await
     }
 }
 ```
 
-**Design decision.** Observability is not optional. The generated client always emits at least tracing spans. Metrics and structured logs can be silenced by supplying a no-op `ContractObservability`, but the hook points exist from day one. Adding them later would change `ClientConfig`'s public surface -- an API break for every consumer.
+**Design decision.** Observability is not optional: the generated client always emits a `tracing`
+span, whatever subscriber (if any) the binary installs. W3C context propagation activates when the
+build enables `toolkit-http/otel` (opt-in by convention, consistent with the rest of the platform).
+There is **no** `ContractObservability` trait and **no** `parent_span`/`metrics`/`observability`
+fields on `ClientConfig` — so the client's public surface does not change and there is nothing new
+for consumers to implement.
 
-**Consumer transparency.** Consumers never interact with observability directly. `backend.deliver(&ctx, &req).await` automatically produces spans and metrics. Whether telemetry is enabled, disabled, or routed to a custom backend is a construction-time concern for `ClientConfig`; call-site code is unchanged.
+**gRPC.** The gRPC projection currently propagates no trace context; a `TraceContextInterceptor` in
+`toolkit-transport-grpc` plus per-method spans in the gRPC codegen are a follow-up that mirrors this
+REST design (see ADR-0006).
+
+**Consumer transparency.** Consumers never interact with observability directly.
+`backend.deliver(ctx, req).await` automatically produces a span; whether telemetry is exported is a
+binary-level concern (subscriber + `toolkit-http/otel`), not a call-site or `ClientConfig` concern.
 
 ## 7. Open Questions
 
@@ -848,5 +865,6 @@ Path variables (`#[path]`), query parameters (`#[query]`), header injection (`#[
 - **ADR-0002** — OpenAPI spec limits: [`./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md`](./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md)
 - **ADR-0003** — projection server generation: [`./ADR/0003-cpt-cf-binding-adr-projection-server-gen.md`](./ADR/0003-cpt-cf-binding-adr-projection-server-gen.md)
 - **ADR-0004** — consumer wiring: [`./ADR/0004-cpt-cf-binding-adr-consumer-wiring.md`](./ADR/0004-cpt-cf-binding-adr-consumer-wiring.md)
+- **ADR-0006** — client observability (tracing/OTEL): [`./ADR/0006-cpt-cf-binding-adr-client-observability.md`](./ADR/0006-cpt-cf-binding-adr-client-observability.md)
 - **PoC**: [striped-zebra-dev/toolkit-binding-poc](https://github.com/striped-zebra-dev/toolkit-binding-poc)
 - **Gear/plugin declaration and resolution**: [PR #1380](https://github.com/constructorfabric/gears-rust/pull/1380)

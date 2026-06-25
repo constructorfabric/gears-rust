@@ -67,6 +67,12 @@ impl RestApiCapability for ApiContracts {
         openapi: &dyn OpenApiRegistry,
     ) -> anyhow::Result<axum::Router> {
         let service = ctx.client_hub().get::<dyn PaymentApi>()?;
+
+        // `register_routes` composes the macro-generated routes (`charge`,
+        // `get_invoice`) with the manual SSE route (`list_payments`,
+        // `#[server_manual]`) on one router — proving the generated
+        // registration is additive and interoperates with hand-written
+        // `OperationBuilder` calls.
         Ok(routes::register_routes(router, openapi, service))
     }
 }

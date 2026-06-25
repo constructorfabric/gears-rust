@@ -373,6 +373,10 @@ impl HostRuntime {
     /// A no-op when no consumer is registered, preserving the phase-order
     /// invariants relied on by existing tests.
     #[cfg(feature = "contract-directory-rest-client")]
+    #[allow(
+        clippy::unused_async,
+        reason = "kept async for symmetry with the other `run_*_phase` steps awaited in sequence by `run_gear_phases`; the awaited work runs in a spawned readiness-probe task"
+    )]
     async fn run_proxy_wiring_phase(&self) -> Result<(), RegistryError> {
         use crate::discovery::{ConsumerRegistration, DirectoryEndpointResolver};
         use toolkit_contract::runtime::resolving::EndpointResolver;
@@ -936,7 +940,7 @@ impl HostRuntime {
     /// deployments and existing tests are unaffected. Registers through the
     /// `DirectoryClient` in the `ClientHub`, which uniformly targets the
     /// in-process directory (`LocalDirectoryClient`) or the central directory
-    /// (`DirectoryGrpcClient` for OoP) depending on what the host wired.
+    /// (`DirectoryGrpcClient` for `OoP`) depending on what the host wired.
     async fn run_directory_register_phase(&self) -> Result<(), RegistryError> {
         let rest_gears = self.rest_provider_gears();
         if rest_gears.is_empty() {
@@ -987,6 +991,9 @@ impl HostRuntime {
                 grpc_services,
                 version,
                 rest_endpoint: Some(crate::ServiceEndpoint::new(endpoint.clone())),
+                // OpenAPI spec is published separately (grpc-hub start phase);
+                // the REST-augmentation registration does not carry it.
+                openapi_spec: None,
             };
             match dir.register_instance(info).await {
                 Ok(()) => {
