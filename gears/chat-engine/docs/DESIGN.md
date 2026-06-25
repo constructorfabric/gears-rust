@@ -290,45 +290,46 @@ All Chat Engine instances share a single database cluster. No local caching of s
 
 **Transport**: Server-Sent Events (`text/event-stream`). Each SSE frame carries `id: <seq>`, `event: <type>`, `data: <JSON of the event>` (`cpt-cf-chat-engine-adr-sse-delta-streaming`, supersedes the NDJSON shape of `cpt-cf-chat-engine-adr-http-client-protocol`).
 
-The stream is a **typed delta protocol**: each event has a specific `type` (mirrored in the SSE `event:` line) naming the mutation, and the delta-family events still carry `(op, path, value)` patch fields so the client applies each to the message document by `path`. `message.start` opens the (empty) document; `message.complete` / `message.error` terminate it. There is no separate `chunk` event — text arrives as `message.text.delta` (`append`) events on a `text` part. Every event carries a per-message monotonically-increasing `seq`, mirrored in the SSE `id:` line for ordering, de-duplication, and resume (`cpt-cf-chat-engine-design-stream-resume`).
+The stream is a **typed delta protocol**: each event has a specific `type` (mirrored in the SSE `event:` line) naming the mutation, and the delta-family events carry terse `(o, p, v)` patch fields — operation / path / value — so the client applies each to the message document by `p`. `message.start` opens the (empty) document; `message.complete` (carrying `o: stop`) / `message.error` terminate it. There is no separate `chunk` event — text arrives as `message.text.delta` (`o: append`) events on a `text` part. Every event carries a per-message monotonically-increasing `seq`, mirrored in the SSE `id:` line for ordering, de-duplication, and resume (`cpt-cf-chat-engine-design-stream-resume`).
 
 | event `type` | fields | meaning |
 |--------------|--------|---------|
 | `message.start` | `message_id`, `seq` | Opens the assistant message document (no parts yet). |
-| `message.part.add` | + `op`, `path`, `value` | Opens a new part (`op: add`, `path: parts/{n}`). |
-| `message.text.delta` | + `op`, `path`, `value` | Appends a text fragment (`op: append`, `path: parts/{n}/content/text`). |
-| `message.file_citation.add` | + `op`, `path`, `value` | Appends file citations (`path: parts/{n}/file_citations`). |
-| `message.link_citation.add` | + `op`, `path`, `value` | Appends link citations (`path: parts/{n}/link_citations`). |
-| `message.reference.add` | + `op`, `path`, `value` | Appends URL references (`path: parts/{n}/references`). |
+| `message.part.add` | + `o`, `p`, `v` | Opens a new part (`o: add`, `p: parts/{n}`). |
+| `message.text.delta` | + `o`, `p`, `v` | Appends a text fragment (`o: append`, `p: parts/{n}/content/text`). |
+| `message.file_citation.add` | + `o`, `p`, `v` | Appends file citations (`p: parts/{n}/file_citations`). |
+| `message.link_citation.add` | + `o`, `p`, `v` | Appends link citations (`p: parts/{n}/link_citations`). |
+| `message.reference.add` | + `o`, `p`, `v` | Appends URL references (`p: parts/{n}/references`). |
 | `message.status.changed` | `message_id`, `seq`, `code`, `detail?` | Transient progress (e.g. `thinking`); **not** a document mutation and **not** persisted. |
 | `message.state.changed` | `message_id`, `seq`, `state` | Opaque assistant-message state; persisted into message `metadata.state`. |
 | `session.meta.updated` | `message_id`, `seq`, `patch` | Session-scoped metadata patch; shallow-merged into the owning session's `metadata`. |
 | `message.tool` | `message_id`, `seq`, `tool`, `payload` | Tool-invocation trace; appended to message `metadata.tools`. |
-| `message.complete` | `message_id`, `seq`, `metadata?` | Successful end; terminal. |
+| `message.complete` | `message_id`, `seq`, `o: stop`, `metadata?` | Successful end; terminal. |
 | `message.error` | `message_id`, `seq`, `error` | Terminal error (human-readable description). |
 
-The doc-mutating events (`part.add` / `text.delta` / `*_citation.add` / `reference.add`) carry the `(op, path, value)` patch fields; the out-of-band events (`status.changed` / `state.changed` / `session.meta.updated` / `tool`) carry bespoke fields since they do not patch the document by path. The engine projects these from the plugin's `StreamingEvent` vocabulary (`Start` / `Chunk` / `Status` / `Part` / `Citation` / `State` / `SessionMeta` / `Tool` / `Complete` / `Error`); part indices are gap-free in arrival order. Persistence: `Part` → message parts, mid-stream `Citation` → the text part's citations, `State`/`Tool` → message metadata, `SessionMeta` → session metadata, `Status` is transient.
+The doc-mutating events (`part.add` / `text.delta` / `*_citation.add` / `reference.add`) carry the terse `(o, p, v)` patch fields; the out-of-band events (`status.changed` / `state.changed` / `session.meta.updated` / `tool`) carry bespoke fields since they do not patch the document by path. The engine projects these from the plugin's `StreamingEvent` vocabulary (`Start` / `Chunk` / `Status` / `Part` / `Citation` / `State` / `SessionMeta` / `Tool` / `Complete` / `Error`); part indices are gap-free in arrival order. Persistence: `Part` → message parts, mid-stream `Citation` → the text part's citations, `State`/`Tool` → message metadata, `SessionMeta` → session metadata, `Status` is transient.
 
-**Patch fields** (`op` / `path` / `value`) carried by the delta-family events:
+**Operations** (`o`) carried by the delta-family events:
 
-| op | meaning |
-|----|---------|
-| `add` | Set the value at `path` (create a part, set a field). |
-| `append` | Append `value` to the existing value at `path` (text fragment onto `parts/N/content/text`; element onto an array like `parts/N/file_citations`). |
-| `patch` | Replace a scalar/field at `path` (e.g. a part `title`, message `metadata`). |
-| `remove` | Remove the value at `path` (rarely used; e.g. retract a speculative part). |
+| `o` | meaning |
+|-----|---------|
+| `add` | Set the value at `p` (create a part, set a field). |
+| `append` | Append `v` to the existing value at `p` (text fragment onto `parts/N/content/text`; element onto an array like `parts/N/file_citations`). |
+| `patch` | Replace a scalar/field at `p` (e.g. a part `title`, message `metadata`). |
+| `remove` | Remove the value at `p` (rarely used; e.g. retract a speculative part). |
+| `stop` | Terminal completion marker carried by `message.complete`. |
 
-`path` addresses the message document, mirroring `MessageGetResponse`: `parts/{n}` (a whole `MessagePart`, with `add`), `parts/{n}/content/text` (text body, with `append`), `parts/{n}/content` (typed content of a non-text part), `parts/{n}/file_citations` · `parts/{n}/link_citations` · `parts/{n}/references` (arrays, with `append`), `metadata` (message metadata, with `patch`).
+`p` addresses the message document, mirroring `MessageGetResponse`: `parts/{n}` (a whole `MessagePart`, with `add`), `parts/{n}/content/text` (text body, with `append`), `parts/{n}/content` (typed content of a non-text part), `parts/{n}/file_citations` · `parts/{n}/link_citations` · `parts/{n}/references` (arrays, with `append`), `metadata` (message metadata, with `patch`).
 
 Example stream (text part with a streamed token, then a citation):
 
 ```
 id: 0\nevent: message.start\ndata: {"type":"message.start","message_id":"…","seq":0}
-id: 1\nevent: message.part.add\ndata: {"type":"message.part.add","message_id":"…","seq":1,"op":"add","path":"parts/0","value":{"type":"text","content":{"text":""},"number":0}}
-id: 2\nevent: message.text.delta\ndata: {"type":"message.text.delta","message_id":"…","seq":2,"op":"append","path":"parts/0/content/text","value":"Hel"}
-id: 3\nevent: message.text.delta\ndata: {"type":"message.text.delta","message_id":"…","seq":3,"op":"append","path":"parts/0/content/text","value":"lo"}
-id: 4\nevent: message.file_citation.add\ndata: {"type":"message.file_citation.add","message_id":"…","seq":4,"op":"append","path":"parts/0/file_citations","value":[{"document_id":"doc-1","index":1}]}
-id: 5\nevent: message.complete\ndata: {"type":"message.complete","message_id":"…","seq":5,"metadata":{"finish_reason":"stop"}}
+id: 1\nevent: message.part.add\ndata: {"type":"message.part.add","message_id":"…","seq":1,"o":"add","p":"parts/0","v":{"type":"text","content":{"text":""},"number":0}}
+id: 2\nevent: message.text.delta\ndata: {"type":"message.text.delta","message_id":"…","seq":2,"o":"append","p":"parts/0/content/text","v":"Hel"}
+id: 3\nevent: message.text.delta\ndata: {"type":"message.text.delta","message_id":"…","seq":3,"o":"append","p":"parts/0/content/text","v":"lo"}
+id: 4\nevent: message.file_citation.add\ndata: {"type":"message.file_citation.add","message_id":"…","seq":4,"o":"append","p":"parts/0/file_citations","v":[{"document_id":"doc-1","index":1}]}
+id: 5\nevent: message.complete\ndata: {"type":"message.complete","message_id":"…","seq":5,"o":"stop","metadata":{"finish_reason":"stop"}}
 ```
 
 This typed-delta model makes **all parts and citations stream incrementally** (superseding the earlier per-part-streaming exclusion). Server-side, the engine still accumulates the parts to persist the final message on completion (the events are the wire projection of that build).

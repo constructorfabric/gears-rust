@@ -20,19 +20,21 @@ use uuid::Uuid;
 
 use crate::domain::message::StreamingEvent;
 
-/// Mutation operation carried by a [`WireStreamEvent::Delta`].
+/// Mutation operation carried in a delta event's `o` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeltaOp {
-    /// Set the value at `path` (create a part, set a field).
+    /// Set the value at `p` (create a part, set a field).
     Add,
-    /// Append `value` to the existing value at `path` (text fragment onto a
-    /// text body, element onto a citation array).
+    /// Append `v` to the existing value at `p` (text fragment onto a text body,
+    /// element onto a citation array).
     Append,
-    /// Replace a scalar/field at `path`.
+    /// Replace a scalar/field at `p`.
     Patch,
-    /// Remove the value at `path`.
+    /// Remove the value at `p`.
     Remove,
+    /// Terminal completion marker carried by `message.complete`.
+    Stop,
 }
 
 /// One event of the client-facing **typed** delta stream. Each variant
@@ -40,41 +42,51 @@ pub enum DeltaOp {
 /// `message.part.add`, `message.text.delta`, `message.file_citation.add`,
 /// `message.link_citation.add`, `message.reference.add`, `message.complete`,
 /// `message.error` — mirrored in the SSE `event:` line. The delta-family
-/// events keep the `(op, path, value)` patch fields so the client applies each
-/// to the message document by `path`. `seq` mirrors the SSE `id:` line.
+/// events carry terse `(o, p, v)` patch fields (operation / path / value) so
+/// the client applies each to the message document by `p`. `seq` mirrors the
+/// SSE `id:` line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WireStreamEvent {
     /// Opens the assistant message document (empty; no parts yet).
     #[serde(rename = "message.start")]
     Start { message_id: Uuid, seq: u64 },
-    /// Opens a new message part (`op: add`, `path: parts/{n}`).
+    /// Opens a new message part (`o: add`, `p: parts/{n}`).
     #[serde(rename = "message.part.add")]
     PartAdd {
         message_id: Uuid,
         seq: u64,
+        #[serde(rename = "o")]
         op: DeltaOp,
+        #[serde(rename = "p")]
         path: String,
+        #[serde(rename = "v")]
         value: JsonValue,
     },
     /// Appends a text fragment to a part body
-    /// (`op: append`, `path: parts/{n}/content/text`).
+    /// (`o: append`, `p: parts/{n}/content/text`).
     #[serde(rename = "message.text.delta")]
     TextDelta {
         message_id: Uuid,
         seq: u64,
+        #[serde(rename = "o")]
         op: DeltaOp,
+        #[serde(rename = "p")]
         path: String,
+        #[serde(rename = "v")]
         value: JsonValue,
     },
     /// Appends file citations to a part
-    /// (`op: append`, `path: parts/{n}/file_citations`).
+    /// (`o: append`, `p: parts/{n}/file_citations`).
     #[serde(rename = "message.file_citation.add")]
     FileCitationAdd {
         message_id: Uuid,
         seq: u64,
+        #[serde(rename = "o")]
         op: DeltaOp,
+        #[serde(rename = "p")]
         path: String,
+        #[serde(rename = "v")]
         value: JsonValue,
     },
     /// Appends link citations to a part.
@@ -82,8 +94,11 @@ pub enum WireStreamEvent {
     LinkCitationAdd {
         message_id: Uuid,
         seq: u64,
+        #[serde(rename = "o")]
         op: DeltaOp,
+        #[serde(rename = "p")]
         path: String,
+        #[serde(rename = "v")]
         value: JsonValue,
     },
     /// Appends URL references to a part.
@@ -91,8 +106,11 @@ pub enum WireStreamEvent {
     ReferenceAdd {
         message_id: Uuid,
         seq: u64,
+        #[serde(rename = "o")]
         op: DeltaOp,
+        #[serde(rename = "p")]
         path: String,
+        #[serde(rename = "v")]
         value: JsonValue,
     },
     /// Transient progress indicator (not a document mutation; carries bespoke
@@ -127,11 +145,14 @@ pub enum WireStreamEvent {
         tool: String,
         payload: JsonValue,
     },
-    /// Successful end; carries optional plugin metadata. Terminal.
+    /// Successful end; carries the terminal `o: stop` marker and optional
+    /// plugin metadata. Terminal.
     #[serde(rename = "message.complete")]
     Complete {
         message_id: Uuid,
         seq: u64,
+        #[serde(rename = "o")]
+        op: DeltaOp,
         #[serde(skip_serializing_if = "Option::is_none")]
         metadata: Option<JsonValue>,
     },
@@ -343,6 +364,7 @@ impl DeltaProjector {
                 out.push(WireStreamEvent::Complete {
                     message_id: self.message_id,
                     seq: self.take_seq(),
+                    op: DeltaOp::Stop,
                     metadata: c.metadata,
                 });
                 out
@@ -511,17 +533,28 @@ mod tests {
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["type"], "message.text.delta");
         assert_eq!(v["seq"], 7);
-        assert_eq!(v["op"], "append");
-        assert_eq!(v["path"], "parts/0/content/text");
-        assert_eq!(v["value"], "hi");
+        // Terse patch keys (o/p/v).
+        assert_eq!(v["o"], "append");
+        assert_eq!(v["p"], "parts/0/content/text");
+        assert_eq!(v["v"], "hi");
         // The SSE event: name matches the serialized type.
         assert_eq!(ev.event_name(), "message.text.delta");
     }
 
     #[test]
+    fn complete_carries_stop_op() {
+        let mut p = DeltaProjector::new();
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        let out = p.project(complete(vec![]));
+        let last = serde_json::to_value(out.last().unwrap()).unwrap();
+        assert_eq!(last["type"], "message.complete");
+        assert_eq!(last["o"], "stop");
+    }
+
+    #[test]
     fn terminal_events_are_flagged() {
         assert!(
-            WireStreamEvent::Complete { message_id: mid(), seq: 1, metadata: None }.is_terminal()
+            WireStreamEvent::Complete { message_id: mid(), seq: 1, op: DeltaOp::Stop, metadata: None }.is_terminal()
         );
         assert!(
             WireStreamEvent::Error { message_id: mid(), seq: 1, error: "x".into() }.is_terminal()
@@ -575,7 +608,7 @@ mod tests {
         ));
         let v = serde_json::to_value(&out[0]).unwrap();
         assert_eq!(v["type"], "message.part.add");
-        assert_eq!(v["value"]["number"], 1);
+        assert_eq!(v["v"]["number"], 1);
     }
 
     #[test]
