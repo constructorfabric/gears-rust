@@ -690,7 +690,7 @@ example:
 
 ## Run server with the integrated admin panel (config/admin.yaml, two-role dev auth stub)
 admin:
-	cargo run --bin cf-gears-example-server --features account-management,static-authn,static-authz,static-tenants,static-credstore,otel -- --config config/admin.yaml run
+	cargo run --bin cf-gears-example-server --features account-management,static-authn,static-authz,static-idp,static-tenants,static-credstore,otel -- --config config/admin.yaml run
 
 # mini-chat targets are for running the mini-chat gear locally and in Kubernetes, with options for building Docker images and deploying with Helm.
 ## Run server with fips gear

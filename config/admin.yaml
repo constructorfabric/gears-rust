@@ -104,9 +104,15 @@ gears:
             subject_type: "platform_admin"
         - token: "tenant-admin-dev-token"
           identity:
-            # Tenant admin, homed at the "engineering" division tenant.
+            # Tenant admin. Homed at the bootstrap-seeded platform root so its
+            # tenant-scoped views resolve in AM out of the box (AM seeds only
+            # the root deterministically; child tenant ids are server-assigned
+            # and not stable across a fresh db, so we cannot hardcode a child).
+            # The platform-vs-tenant distinction is still demonstrated via
+            # admin_mode + capabilities. Strict per-child tenant scoping in the
+            # demo needs a seed-then-configure step (follow-up).
             subject_id: "22222222-2222-2222-2222-222222222222"
-            subject_tenant_id: "00000000-0000-0000-0000-000000000002"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
             token_scopes: ["*"]
             subject_type: "tenant_admin"
       s2s_credentials:
@@ -114,6 +120,13 @@ gears:
           client_secret: "mini-chat-dev-secret"
 
   static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  # Demo IdP: implements provision_tenant (needed by AM bootstrap) and the
+  # tenant user surface. NON-PRODUCTION.
+  static-idp-plugin:
     config:
       vendor: "constructorfabric"
       priority: 100
@@ -132,11 +145,12 @@ gears:
         idp_retry_backoff_max: "30s"
         strict: false
       idp:
-        # No IdP plugin wired for the admin v0 stack: user management
-        # (`/tenants/{id}/users`) surfaces as unavailable, matching the
-        # PRD's IdP-placeholder requirement. Set true + enable static-idp
-        # once persistent demo user management is needed.
-        required: false
+        # static-idp-plugin (below, feature `static-idp`) implements
+        # provision_tenant, which the bootstrap saga calls when seeding the
+        # platform root. Without it the saga rolls back and the tenants table
+        # stays empty. required=true wires the plugin before AM in topo-sort.
+        vendor: "constructorfabric"
+        required: true
 
   resource-group:
     database:
@@ -150,6 +164,31 @@ gears:
       file: "settings.db"
     config:
       max_field_length: 100
+
+  # Register the platform-root tenant type so AM's bootstrap saga can seed
+  # the root tenant (the tenant-type checker resolves this via types-registry;
+  # without it the saga fails and the tenants table stays empty -> 404s). The
+  # AM envelope schemas are auto-seeded by the AM SDK; only the concrete
+  # platform/customer types below are operator-controlled.
+  types-registry:
+    config:
+      entities:
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Platform-root tenant type (no parents)."
+          type: "object"
+          x-gts-traits:
+            allowed_parent_types: []
+            idp_provisioning: false
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Customer tenant under the platform root."
+          type: "object"
+          x-gts-traits:
+            allowed_parent_types:
+              - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+              - "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+            idp_provisioning: false
 
   tenant-resolver:
     config:
