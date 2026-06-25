@@ -1,12 +1,13 @@
 # Authoring gears-sdlc specs with kitsoki
 
 [**kitsoki**](https://github.com/constructorfabric/kitsoki) is a deterministic
-state-machine runtime for LLM workflows. One of its stories — **`gears-rust`**
-— drives *this* repo's
-**PRD → Design** spec chain as a guided, conversational walk: you describe an
-idea in a chat UI, answer a few clarifying questions, and it authors two
-[gears-sdlc](spec-templates/gears-sdlc/)-shaped documents straight into the
-target gear's docs folder.
+state-machine runtime for LLM workflows. This repo exposes one day-to-day story
+— **`gears-dev`** — that points Kitsoki's **dev-story** hub at gears-rust. From
+that workbench you can drive the **PRD → Design** spec chain as a guided,
+conversational walk: you describe an idea in a chat UI, answer a few clarifying
+questions, and it authors two [gears-sdlc](spec-templates/gears-sdlc/)-shaped
+documents straight into the target gear's docs folder. The same dev-story hub
+also includes the bugfix pipeline.
 
 It is the worked example of kitsoki's *external-target profile*: the same
 hub kitsoki uses to build itself, pointed at this repo purely through
@@ -68,9 +69,9 @@ All commands run **from this repo's root**, with `kitsoki` on your `PATH`.
 kitsoki web
 ```
 
-Discovery is zero-config: `kitsoki web` walks the default `./stories` dir and
-finds `stories/gears-rust/`. Open the printed URL, pick **gears-rust**, and
-drive the walk in the chat box.
+Discovery is pinned by this repo's `.kitsoki.yaml`: `kitsoki web` finds
+`stories/gears-rust/` as the single default entry. Open the printed URL, pick
+**gears-dev**, and drive the walk in the chat box.
 
 ### Terminal UI
 
@@ -80,7 +81,7 @@ kitsoki run stories/gears-rust/app.yaml
 
 ### The walk
 
-From the landing room (`core.main`):
+From the landing workbench:
 
 ```
 prd                         # start the PRD pipeline (discovery chat opens)
@@ -119,7 +120,7 @@ verdict flows back into the walk.
    automatically (no port wrangling), then pop the chat out to the editor so the
    conversation sits beside the documents it opens.
 
-**Drive the walk.** Pick **gears-rust** in the chat, then drive exactly the
+**Drive the walk.** Pick **gears-dev** in the chat, then drive exactly the
 [same intents](#the-walk) (`prd` → `prd__start` → … → `prd__accept` →
 `continue` → …). What's new is what happens in the editor at each beat:
 
@@ -262,14 +263,14 @@ external target".
   kitsoki checkout needs to be present once the binary is installed; the base
   stories are embedded.
 
-- **`gears-rust` isn't listed by `kitsoki web`.** Discovery walks `./stories`
-  from the directory you launched in — run `kitsoki web` from this repo's root
-  so `stories/gears-rust/` is found (or pass `--stories-dir stories`).
+- **`gears-dev` isn't listed by `kitsoki web`.** Discovery reads this repo's
+  `.kitsoki.yaml` from the directory you launched in — run `kitsoki web` from
+  this repo's root so `stories/gears-rust/` is found.
 
 - **The spec talks about *kitsoki* instead of this repo.** The authoring agent
   must run with this repo as its working directory and the gears-sdlc templates
   as its template dir — both are set by the profile. Confirm you picked the
-  `gears-rust` instance (not the bare `kitsoki-dev` one) and that `workdir` /
+  `gears-dev` instance (not the bare `kitsoki-dev` one) and that `workdir` /
   `repo_root` resolve to this checkout (default `.`).
 
 - **Docs land in kitsoki's own `docs/proposals/` instead of here.** The profile

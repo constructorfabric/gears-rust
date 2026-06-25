@@ -1,0 +1,8 @@
+# Project-level Kitsoki discovery.
+#
+# The default `./stories` walk also finds standalone demo instances such as
+# `stories/gears-bugfix`. The useful day-to-day entry point for this checkout is
+# the dev-story instance below; it already includes the bugfix pipeline through
+# the imported dev-story hub.
+story_dirs:
+  - stories/gears-rust

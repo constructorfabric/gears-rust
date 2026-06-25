@@ -60,7 +60,7 @@ tour:
       # pre-step setup for gr-prd-discovery — type the verb, then the pitch,
       # revealing each turn at a readable pace.
       drive:
-        - { type: wait-state, state: core.main }
+        - { type: wait-state, state: core.landing }
         - { type: type-and-send, text: prd }
         - { type: wait-state, state: core.prd.idle }
         - { type: reveal-turn }

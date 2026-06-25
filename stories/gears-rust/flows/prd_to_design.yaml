@@ -19,9 +19,9 @@
 
 test_kind: flow
 app: ../app.yaml
-initial_state: core.main
+initial_state: core.landing
 initial_world:
-  # A flow starts INSIDE the `core` compound (initial_state: core.main), so
+  # A flow starts INSIDE the `core` compound (initial_state: core.landing), so
   # the instance → core world_in projection never runs (it fires on compound
   # ENTRY from the root). So we seed the core__ profile keys directly — the
   # kitsoki-dev flow pattern. These ARE the gears defaults declared in
@@ -88,7 +88,7 @@ host_handlers:
         follow_up_questions: []
 
 turns:
-  # main → prd discovery. world_in projects workdir / judge_mode (and the doc
+  # landing → prd discovery. world_in projects workdir / judge_mode (and the doc
   # profile) into the prd child.
   - intent: { name: core__go_prd, slots: {} }
     expect_state: core.prd.idle

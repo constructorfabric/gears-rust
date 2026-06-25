@@ -1,4 +1,4 @@
-# gears-rust — dev-story targeting an EXTERNAL project.
+# gears-dev — dev-story targeting the gears-rust project.
 #
 # The worked example of the external-target profile: the same dev-story hub
 # that `kitsoki-dev` points at this repo is here pointed at a foreign repo —
@@ -7,9 +7,9 @@
 # world keys (below) retarget where docs land and what shape they take. No
 # engine or dev-story room change is needed to retarget — the seam is config.
 #
-# # What this instance proves (the POC)
+# # What this instance proves
 #
-#   main → `prd` → author a PRD → `prd_published` → `continue` →
+#   landing → `prd` → author a PRD → `prd_published` → `continue` →
 #   design pipeline → publish a DESIGN
 #
 # lands two gears-sdlc-shaped docs in the gears-rust checkout:
@@ -31,8 +31,8 @@
 #
 # # Quickstart (from the gears repo root, kitsoki binary on PATH)
 #
-#   $ kitsoki web        # discovers stories/gears-rust/ via the default ./stories walk
-#   # Pick "gears-rust"; type `prd` to start the PRD → Design walk. workdir /
+#   $ kitsoki web        # discovers this story via the repo's .kitsoki.yaml
+#   # Pick "gears-dev"; type `prd` to start the PRD → Design walk. workdir /
 #   # repo_root default to `.` (this checkout).
 #
 # Author for a different gear or a checkout elsewhere via a warp scenario:
@@ -48,9 +48,9 @@
 # templates. No code change. See README.md.
 
 app:
-  id: gears-rust
+  id: gears-dev
   version: 0.1.0
-  title: "gears-rust — drive an external project's PRD → Design (gears-sdlc) with dev-story"
+  title: "gears-dev — work on gears-rust with dev-story"
   author: "Kitsoki"
   license: "CC0"
 
@@ -86,6 +86,7 @@ hosts:
   - host.oracle.search
   - host.artifacts_dir
   - host.ide.open_file
+  - host.ide.open_diff
   - host.oracle.converse
   - host.chat.resolve
   - host.diff.open
@@ -93,7 +94,7 @@ hosts:
 imports:
   core:
     source: "@kitsoki/dev-story"
-    entry: main
+    entry: landing
     hosts: declared
 
     host_bindings:

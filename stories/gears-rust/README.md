@@ -1,11 +1,12 @@
-# gears-rust — dev-story targeting an external project
+# gears-dev — dev-story targeting gears-rust
 
 This instance points the **dev-story** hub (kitsoki's flagship conversation-driven
 development story) at *this* repo and drives its **PRD → Design** spec chain. It
-is `kitsoki-dev` with **one thing changed**: a handful of doc-profile world keys
-retarget *where* docs land and *what shape* they take. No engine or dev-story
-room change is needed to retarget — the seam is configuration. It is the worked
-example of the external-target profile (see the
+also exposes the rest of the dev-story workbench, including the imported bugfix
+pipeline. It is `kitsoki-dev` with **one thing changed**: a handful of
+doc-profile world keys retarget *where* docs land and *what shape* they take. No
+engine or dev-story room change is needed to retarget — the seam is
+configuration. It is the worked example of the external-target profile (see the
 [dev-story README → doc profile](https://github.com/constructorfabric/kitsoki/blob/main/stories/dev-story/README.md#doc-profile--targeting-an-external-project)
 in the kitsoki repo).
 
@@ -15,15 +16,15 @@ via `import: { source: "@kitsoki/dev-story" }` (which the kitsoki binary resolve
 from its **embedded** story library) and extends it with the gears doc profile.
 dev-story is a dependency; this repo owns and controls the instance. So this
 repo runs `kitsoki web` / `kitsoki tour` with only the `kitsoki` binary present,
-no kitsoki checkout. Discovery is **zero-config**: `kitsoki web` walks the
-default `./stories` dir, so this instance under `stories/gears-rust/` is found
-with no `.kitsoki.yaml`. The full migration story is in the kitsoki repo's
+no kitsoki checkout. Discovery is pinned by the repo-level `.kitsoki.yaml` so
+the browser home shows this single useful `gears-dev` entry instead of separate
+demo companions. The full migration story is in the kitsoki repo's
 [`kitsoki-as-dependency.md`](https://github.com/constructorfabric/kitsoki/blob/main/docs/proposals/kitsoki-as-dependency.md)
 epic (slice 3).
 
 ## What it proves (the POC)
 
-Walking, from `core.main`:
+Walking, from the dev-story landing workbench:
 
 ```
 prd  →  author a PRD  →  prd_published  →  continue  →  design pipeline  →  publish a DESIGN
@@ -53,8 +54,8 @@ your `PATH`:
 
 ```bash
 kitsoki web
-# Discovers stories/gears-rust/ via the default ./stories walk (zero-config);
-# open the printed URL, pick "gears-rust", and type `prd` to start the walk.
+# Discovers stories/gears-rust/ via .kitsoki.yaml;
+# open the printed URL, pick "gears-dev", and type `prd` to start the walk.
 ```
 
 `workdir` / `repo_root` default to `.` (this checkout), so the PRD and DESIGN

@@ -8,15 +8,15 @@
 # Usage (from the gears repo root):
 #
 #   kitsoki run stories/gears-rust/app.yaml --warp stories/gears-rust/scenarios/gears-rust.yaml
-#   # Lands in core.main; type `prd` to start the PRD → Design walk. The PRD
+#   # Lands in core.landing; type `prd` to start the PRD → Design walk. The PRD
 #   # and DESIGN publish into <workdir>/gears/<gear>/docs/{PRD,DESIGN}.md.
 #
 # Everything here is the doc PROFILE — no code changes retarget the hub.
 
-name:        "gears-rust — PRD → Design against an absolute checkout"
+name:        "gears-dev — PRD → Design against an absolute checkout"
 description: "Point dev-story at a gears-rust checkout (absolute path) and author a gear's PRD → DESIGN."
 
-state: core.main
+state: core.landing
 
 world:
   # ── Target checkout (EDIT to your path) ───────────────────────────

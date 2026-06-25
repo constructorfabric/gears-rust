@@ -141,6 +141,6 @@ turns:
 
   # Back to the day landing.
   - intent: { name: core__go_main, slots: {} }
-    expect_state: core.main
+    expect_state: core.landing
 
 expect_no_errors: true

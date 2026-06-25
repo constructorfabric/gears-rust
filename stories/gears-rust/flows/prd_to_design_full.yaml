@@ -4,7 +4,7 @@
 # prove one half in isolation. This flow proves they compose in a SINGLE
 # session, exactly as the operator (and the tour-driven video) walk it:
 #
-#   main → prd → … → prd_published → continue → design → … → design_done → main
+#   landing → prd → … → prd_published → continue → design → … → design_done → landing
 #
 # publishing BOTH gears-sdlc docs into the gears-rust checkout —
 # gears/notes-service/docs/PRD.md and DESIGN.md — with no kitsoki feature
@@ -26,7 +26,7 @@
 
 test_kind: flow
 app: ../app.yaml
-initial_state: core.main
+initial_state: core.landing
 initial_world:
   judge_mode: "human"
   core__workdir:               "."
@@ -202,6 +202,6 @@ turns:
       core__design_file: "gears/notes-service/docs/DESIGN.md"
       core__ticket_id:   ""
   - intent: { name: core__go_main, slots: {} }
-    expect_state: core.main
+    expect_state: core.landing
 
 expect_no_errors: true
