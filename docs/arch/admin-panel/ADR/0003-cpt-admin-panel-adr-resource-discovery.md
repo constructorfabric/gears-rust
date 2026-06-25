@@ -1,0 +1,120 @@
+---
+status: accepted
+date: 2026-06-25
+decision-makers: gears-rust admin-panel working group
+---
+
+# Discover admin resources OpenAPI-first, with a hardcoded v0 registry
+
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Option A: OpenAPI-first + hardcoded v0 registry](#option-a-openapi-first--hardcoded-v0-registry)
+  - [Option B: Pure OpenAPI introspection only](#option-b-pure-openapi-introspection-only)
+  - [Option C: Build gear-contributed descriptors now](#option-c-build-gear-contributed-descriptors-now)
+- [More Information](#more-information)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
+**ID**: `cpt-admin-panel-adr-resource-discovery`
+
+## Context and Problem Statement
+
+The admin panel must know which resources exist, their fields, operations, filters, ordering, and custom actions, and must render generated screens for them. The PRD requires OpenAPI-first generation with manual overrides, gear-contributed admin metadata, and additive registration so new objects appear without editing the core admin app. The platform already serves an aggregated OpenAPI document (with `x-odata-*` extensions) through the API Gateway, but there is no mechanism today for a gear to ship admin resource descriptors. How should the panel discover and describe admin resources for v0, without blocking on a new backend mechanism?
+
+## Decision Drivers
+
+- **Reuse existing surface** — the aggregated OpenAPI document already describes operations, schemas, filters, and ordering.
+- **Additive extensibility** — long-term, gears should contribute their own admin descriptors without core edits.
+- **Avoid blocking v0** — the gear-contributed descriptor mechanism is new backend work; v0 must not wait on it.
+- **Generated-but-overridable** — default screens from metadata, with per-resource overrides for custom workflows and actions.
+- **Custom actions & partial CRUD** — discovery must capture non-CRUD actions and resources missing some CRUD operations.
+- **Single source of truth drift** — minimize divergence between the API and what the panel shows.
+
+## Considered Options
+
+- **Option A**: OpenAPI-first discovery plus a small, hardcoded resource registry (descriptors + overrides) maintained in the admin app for v0; design the gear-contributed descriptor mechanism as later work.
+- **Option B**: Pure OpenAPI introspection only — derive everything from `/openapi.json` with no curated descriptors.
+- **Option C**: Build the gear-contributed admin-metadata mechanism now and require every gear to ship descriptors before v0.
+
+## Decision Outcome
+
+Chosen option: **Option A — OpenAPI-first discovery plus a hardcoded v0 registry**, because it reuses the existing OpenAPI surface for fields, operations, filters, and pagination, while a small curated registry supplies the things OpenAPI cannot express well (resource grouping, tenant-scope strategy, safety levels, custom-action wiring, layout/label overrides). It delivers v0 without waiting on a new backend mechanism, and the registry is shaped to be replaced later by gear-contributed descriptors (recorded as deferred FR `cpt-admin-panel-fr-gear-contributed-metadata`).
+
+Direction:
+
+- The data provider reads `/openapi.json` (gateway-aggregated) to derive default list/detail/create/update fields, operations, OData filter/order capabilities (`x-odata-*`), and cursor pagination.
+- A curated, in-app **resource registry** declares the v0 resources (tenants, tenant metadata, conversions, resource groups, types/GTS, gateway routes, gear status) with: resource key, owning gear, source operation IDs, tenant-scope strategy, safety level, custom actions, required capabilities, and per-resource layout/label/widget overrides.
+- Where OpenAPI and the registry overlap (fields, operations), OpenAPI provides defaults and the registry overrides.
+- The registry's descriptor shape is designed to match a future gear-contributed descriptor schema, so the v0 hardcoded registry can later be populated from gear-shipped metadata without reworking the frontend.
+
+### Consequences
+
+- A descriptor schema (resource + field + action shapes) must be defined in the admin app and documented; it is the contract the future gear-contributed mechanism will emit.
+- The data provider must map OpenAPI operations and `x-odata-*` extensions onto the descriptor's list/read/create/update/delete/custom-action operations and onto filter/order/pagination behavior.
+- New v0 resources are added by editing the in-app registry; this is an accepted, temporary coupling until gear-contributed descriptors land.
+- Discovery must tolerate resources missing `getOne`/`update`/`delete` and expose the gaps rather than render broken controls.
+- A later ADR/feature will specify the gear-contributed descriptor mechanism (e.g. inventory-based registration alongside route registration) and the migration from the hardcoded registry.
+
+### Confirmation
+
+Confirmed by design review of DESIGN.md (descriptor schema and OpenAPI mapping), by the panel rendering generated screens for the v0 resources from OpenAPI + registry, and by e2e tests covering list/detail/create/edit, filtering/ordering, pagination, and custom actions.
+
+## Pros and Cons of the Options
+
+### Option A: OpenAPI-first + hardcoded v0 registry
+
+Derive defaults from the spec; curate a small in-app registry for what the spec cannot express; defer gear-contributed descriptors.
+
+- Good, because it reuses the existing aggregated OpenAPI surface and `x-odata-*` extensions.
+- Good, because the curated registry expresses grouping, tenant-scope strategy, safety levels, custom actions, and overrides that OpenAPI cannot.
+- Good, because it ships v0 without blocking on a new backend descriptor mechanism.
+- Good, because the registry shape is forward-compatible with gear-contributed descriptors.
+- Neutral, because the registry is a temporary in-app coupling.
+- Bad, because adding a v0 resource means editing the admin app until the gear-contributed mechanism exists.
+
+### Option B: Pure OpenAPI introspection only
+
+Generate the entire panel from `/openapi.json` with no curated descriptors.
+
+- Good, because zero curation and fully automatic.
+- Bad, because OpenAPI cannot express resource grouping, tenant-scope strategy, safety levels, custom-action semantics, or layout overrides.
+- Bad, because custom actions (suspend, approve, convert) and confirmation/destructive semantics would be guessed, risking unsafe UI.
+- Bad, because navigation and capability gating would lack the metadata the PRD requires.
+
+### Option C: Build gear-contributed descriptors now
+
+Require every gear to ship admin descriptors before v0 can render them.
+
+- Good, because it directly realizes the long-term extensibility goal.
+- Bad, because it is new backend work across many gears and blocks v0 delivery.
+- Bad, because it couples the first UI milestone to a cross-cutting backend mechanism whose design is not yet settled.
+
+## More Information
+
+- Issue: constructorfabric/gears-rust#4144
+- The API Gateway serves the aggregated OpenAPI document with vendor extensions `x-odata-filter`, `x-odata-orderby`, `x-rate-limit-rps`.
+- Cursor pagination is provided via the platform's `Page<T>`/`PageInfo` envelope.
+- Deferred mechanism is tracked by `cpt-admin-panel-fr-gear-contributed-metadata` (priority p2).
+
+## Traceability
+
+- **PRD**: [PRD.md](../PRD.md)
+- **DESIGN**: [DESIGN.md](../DESIGN.md)
+
+This decision directly addresses the following requirements or design elements:
+
+- `cpt-admin-panel-fr-openapi-discovery` — defines OpenAPI as the primary discovery source.
+- `cpt-admin-panel-fr-resource-descriptor` — the curated registry implements the descriptor model for v0.
+- `cpt-admin-panel-fr-gear-contributed-metadata` — deferred; the registry shape is forward-compatible with it.
+- `cpt-admin-panel-fr-generated-screens` — generated screens from OpenAPI + registry with overrides.
+- `cpt-admin-panel-fr-partial-crud` — discovery tolerates missing CRUD operations.
+- `cpt-admin-panel-fr-pagination-filtering` — `x-odata-*` and cursor pagination mapped from the spec.
