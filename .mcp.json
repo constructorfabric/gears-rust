@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "kitsoki": {
+      "args": [
+        "mcp",
+        "--stories-dir",
+        "stories"
+      ],
+      "command": "kitsoki"
+    }
+  }
+}

@@ -68,3 +68,8 @@ testing/e2e/logs/
 # tour/demo render output — both scratch, not tracked). See docs/KITSOKI.md.
 .worktrees/
 .artifacts/
+
+# Kitsoki local runtime
+.kitsoki.local.yaml
+.kitsoki/sessions/
+.context/

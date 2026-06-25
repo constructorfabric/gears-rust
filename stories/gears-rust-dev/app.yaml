@@ -53,13 +53,8 @@ imports:
       design_doc_filename:        "{{ world.design_doc_filename }}"
       design_ticket_dir:          "{{ world.design_ticket_dir }}"
       ticket_repo:                "{{ world.ticket_repo }}"
-      # gears-rust is a Rust/cargo monorepo, NOT Go: hand the bugfix gates the
-      # cargo toolchain so onboarded fixes are built/tested with the project's
-      # real conventions (not the host.local `go build ./...` / `go test ./...`
-      # defaults). A specific bug drive SHOULD still pass a SCOPED command
-      # (e.g. test_cmd "cargo test -p <crate> <module>") to keep the gate fast
-      # and isolated from unrelated pre-existing reds; these are the safe
-      # workspace-wide fallbacks.
+      # Project toolchain commands. Empty means dev-story/bugfix keeps its
+      # default gates; non-Go projects should set these from their profile.
       build_cmd:                  "{{ world.build_cmd }}"
       test_cmd:                   "{{ world.test_cmd }}"
 
@@ -70,16 +65,15 @@ world:
   judge_mode:                 { type: string, default: "human" }
   judge_confidence_threshold: { type: float, default: 0.8 }
 
-  publish_durable_path:       { type: string, default: "docs/prd" }
-  prd_doc_filename:           { type: string, default: "" }
-  design_template_dir:        { type: string, default: "docs/proposals/templates" }
-  design_durable_path:        { type: string, default: "docs/proposals" }
-  design_doc_filename:        { type: string, default: "" }
+  # gears-rust's extension of the general dev-story profile: PRD/DESIGN docs
+  # land in the target gear docs folder and use the repo's gears-sdlc templates.
+  publish_durable_path:       { type: string, default: "gears/notes-service/docs" }
+  prd_doc_filename:           { type: string, default: "PRD" }
+  design_template_dir:        { type: string, default: "docs/spec-templates/gears-sdlc" }
+  design_durable_path:        { type: string, default: "gears/notes-service/docs" }
+  design_doc_filename:        { type: string, default: "DESIGN" }
   design_ticket_dir:          { type: string, default: "" }
-
-  # Rust/cargo toolchain — projected into the dev-story → bugfix gates so a
-  # fix is built/tested with gears-rust conventions, not the Go defaults.
-  build_cmd:                  { type: string, default: "cargo build" }
-  test_cmd:                   { type: string, default: "cargo test" }
+  build_cmd:                  { type: string, default: "make build" }
+  test_cmd:                   { type: string, default: "make test" }
 
 root: core

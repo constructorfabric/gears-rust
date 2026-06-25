@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Work decomposition — agent brief manifest",
+  "description": "The structural truth a decomposition must satisfy. A per-object schema can enforce shape; the cross-brief properties (acyclic deps, id uniqueness, coverage, path bounds) are enforced by validate_decomposition.py.",
+  "type": "object",
+  "required": ["briefs", "coverage_note"],
+  "additionalProperties": false,
+  "properties": {
+    "coverage_note": {
+      "type": "string",
+      "minLength": 40,
+      "description": "How the briefs together fully cover the proposal — the completeness claim the adversarial review will attack."
+    },
+    "briefs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "kind", "goal", "scope", "acceptance", "test_plan", "agent_brief", "depends_on"],
+        "additionalProperties": false,
+        "properties": {
+          "id":          { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+          "title":       { "type": "string", "minLength": 4 },
+          "kind":        { "type": "string", "enum": ["story", "runtime", "tui", "tracing", "test", "docs"] },
+          "goal":        { "type": "string", "minLength": 20, "description": "What 'done' looks like, in the reviewer's terms." },
+          "scope":       { "type": "array", "items": { "type": "string" }, "description": "File/dir globs this brief may touch — the write boundary." },
+          "depends_on":  { "type": "array", "items": { "type": "string" }, "description": "ids of briefs that must land first." },
+          "acceptance":  { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "test_plan":   { "type": "string", "minLength": 20, "description": "How it's verified: which flow fixture / go test / manual check." },
+          "agent_brief": { "type": "string", "minLength": 80, "description": "The self-contained prompt handed to the implementer agent." },
+          "risk":        { "type": "string", "enum": ["low", "medium", "high"] }
+        }
+      }
+    }
+  }
+}

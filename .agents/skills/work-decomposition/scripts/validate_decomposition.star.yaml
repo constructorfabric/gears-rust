@@ -1,0 +1,10 @@
+inputs:
+  manifest:
+    type: object
+    required: true
+
+outputs:
+  ok:
+    type: bool
+  errors:
+    type: list

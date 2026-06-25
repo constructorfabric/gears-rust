@@ -1,0 +1,60 @@
+# QA scenarios for the kitsoki onboarding tour video.
+# Each step is an OBSERVABLE claim grounded in a specific frame.
+# Pass --frames .artifacts/tour-video to supply the labeled per-step PNGs
+# (highest fidelity — one PNG per tour step, named by step id).
+
+feature: Kitsoki onboarding tour
+
+scenarios:
+  - id: tour-starts
+    title: Tour overlay appears and opens on the home screen
+    required: true
+    steps:
+      - A spotlight overlay is visible with a darkened backdrop
+      - A popover with a title and description is shown
+      - A Next or action button is present in the popover
+
+  - id: home-landmarks
+    title: Home screen landmarks are spotlighted
+    required: true
+    steps:
+      - A story card or card list is highlighted with a cutout in the backdrop
+      - The popover describes the story catalogue
+      - The New Session button is spotlighted in at least one step
+
+  - id: navigate-to-interactive
+    title: Clicking New Session navigates to the interactive view
+    required: true
+    steps:
+      - The URL or view changes away from the home screen
+      - The interactive (chat) view is visible with a chat section and input area
+
+  - id: interactive-landmarks
+    title: Interactive view landmarks are spotlighted in sequence
+    required: true
+    steps:
+      - The current-state panel is spotlighted with a popover
+      - The chat section is spotlighted with a popover
+      - The input bar is spotlighted with a popover
+      - The state badge is spotlighted with a popover
+
+  - id: trace-panels
+    title: Trace diagram and timeline are spotlighted
+    required: true
+    steps:
+      - A trace diagram panel is spotlighted with a popover
+      - A trace timeline panel is spotlighted with a popover
+
+  - id: trace-lit-up
+    title: One intent is driven so the trace is populated
+    required: false
+    steps:
+      - The trace diagram or timeline shows at least one node or event
+      - The state badge shows a non-initial state
+
+  - id: tour-ends
+    title: Tour concludes and overlay dismisses
+    required: true
+    steps:
+      - A closing / done message is shown in a centered popover
+      - After the final step the overlay is no longer visible

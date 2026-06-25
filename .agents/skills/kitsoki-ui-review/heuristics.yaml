@@ -1,0 +1,163 @@
+# Heuristic catalog for kitsoki UI layout & usability review.
+#
+# This is the EXTENSIBLE surface of the review. The deterministic DOM audit
+# (tour-review.spec.ts → audit.json) is the AUTHORITY for measurable geometry
+# (overflow, off-screen, tiny text/targets, stray tokens, WCAG contrast/labels).
+# These heuristics add the JUDGEMENT calls metrics can't make — and they are
+# handed the audit findings as already-known truth so they don't re-litigate
+# them, only build on them.
+#
+# When a real review surfaces a new bad case worth catching every time, add a
+# check here. Keep each one tight: one defect class, concrete cues, and an
+# explicit false-positive guard (vision models over-report layout problems — the
+# guard is what keeps the review trustworthy).
+#
+# Fields per check:
+#   id        kebab-case, stable — referenced in verdict.json + the report.
+#   title     short human label.
+#   severity  error → blocks the gate · warn → blocks only under --strict ·
+#             info → never blocks (a note worth a human glance).
+#   nielsen   the Nielsen heuristic # it maps to (0 = layout/visual, not Nielsen).
+#   look_for  the literal cues that constitute this defect.
+#   not_this  things that look similar but are NOT this defect (FP guard).
+#
+# Every finding MUST cite a frame filename and quote what is LITERALLY visible.
+
+checks:
+  # ── Layout & visual quality (Nielsen #8: aesthetic & minimalist design) ─────
+  - id: cramped-or-cluttered
+    title: Cramped, cluttered, or no breathing room
+    severity: warn
+    nielsen: 8
+    look_for: >
+      Controls/text packed edge-to-edge with no margin, panels jammed together,
+      a dense wall of elements with no grouping or whitespace to rest the eye.
+    not_this: >
+      A deliberately information-dense view (a trace timeline, a data table) that
+      is still orderly, aligned, and scannable. Tight is fine if it reads clean.
+
+  - id: misaligned-elements
+    title: Elements misaligned / inconsistent spacing
+    severity: warn
+    nielsen: 0
+    look_for: >
+      Controls that should share an edge but don't, labels offset from their
+      fields, buttons of mismatched heights on one row, gutters that visibly
+      differ between otherwise-parallel elements.
+    not_this: >
+      Intentional asymmetry (a left-aligned title with open space to the right).
+      Sub-pixel differences invisible at normal viewing distance.
+
+  - id: weak-visual-hierarchy
+    title: No clear visual hierarchy
+    severity: warn
+    nielsen: 8
+    look_for: >
+      Everything the same size/weight so the eye has no entry point; the primary
+      action indistinguishable from secondary ones; a heading that doesn't read
+      as more important than body text.
+    not_this: >
+      A minimalist screen that is intentionally flat because there is genuinely
+      one thing on it (a centered welcome card).
+
+  - id: lopsided-layout
+    title: Layout lopsided or awkwardly balanced
+    severity: warn
+    nielsen: 0
+    look_for: >
+      Content jammed into one corner with a large empty void elsewhere, two
+      columns of wildly unequal weight, a panel that overruns its half while its
+      neighbour is nearly empty.
+    not_this: >
+      Generous whitespace that reads as deliberate. A sidebar + main split where
+      the asymmetry is the intended information architecture.
+
+  # ── Responsive (Nielsen #7: flexibility & efficiency of use) ────────────────
+  - id: responsive-break
+    title: Layout breaks at this viewport
+    severity: error
+    nielsen: 7
+    look_for: >
+      At a narrow (mobile/tablet) width: columns that should stack still sit
+      side-by-side and crush each other, a fixed-width panel forcing the page
+      wider than the screen, controls overlapping, text wrapping into unreadable
+      slivers, a nav bar whose items collide. (The audit flags horizontal scroll
+      and off-screen clipping deterministically — here judge the softer breakage.)
+    not_this: >
+      A layout that has cleanly adapted (stacked, collapsed into a menu, resized)
+      and is fully usable at this width even if it looks different from desktop.
+
+  - id: touch-ergonomics
+    title: Poor touch ergonomics on a small viewport
+    severity: warn
+    nielsen: 7
+    look_for: >
+      On mobile: tap targets crowded so close a finger would hit the wrong one,
+      a primary action pushed below the fold when it should be reachable, key
+      content requiring horizontal scrolling to read.
+    not_this: >
+      Adequately-spaced controls. Secondary/rare actions placed lower on purpose.
+
+  # ── Clarity & affordance (Nielsen #6: recognition over recall; #4 standards) ─
+  - id: unclear-affordance
+    title: Unclear what is clickable or what an element does
+    severity: warn
+    nielsen: 6
+    look_for: >
+      A control with no label or icon that conveys its purpose, a clickable thing
+      styled like static text (or vice-versa), an icon-only button whose meaning
+      isn't inferable, ambiguous duplicate labels.
+    not_this: >
+      A conventional, well-understood control (an X to close, a ? for help) whose
+      meaning is established by universal convention.
+
+  - id: inconsistent-style
+    title: Inconsistent styling / breaks the design language
+    severity: warn
+    nielsen: 4
+    look_for: >
+      One button styled unlike its peers for no reason, mismatched corner radii
+      or font families across a single view, a control that looks like it came
+      from a different app.
+    not_this: >
+      A deliberately distinct primary/CTA treatment. A semantic colour (red for
+      destructive, green for success) that differs on purpose.
+
+  # ── State communication (Nielsen #1 visibility of status; #5 error prevention) ─
+  - id: poor-empty-state
+    title: Empty / loading / zero state is confusing or blank
+    severity: warn
+    nielsen: 1
+    look_for: >
+      A region that is just blank where the user can't tell if it's empty, broken,
+      or still loading; a list with no "nothing here yet" message; a spinner with
+      no context.
+    not_this: >
+      A clearly-labelled empty state ("No sessions yet — start one above"), or a
+      view that is legitimately mid-content with everything else rendered.
+
+  - id: unreadable-or-broken-content
+    title: Content unreadable, overlapping, or visibly broken
+    severity: error
+    nielsen: 8
+    look_for: >
+      Text overlapping other text or a graphic so it can't be read, content
+      colliding, an image that failed to load (broken-image glyph), a control
+      rendered on top of another, garbled/placeholder copy.
+    not_this: >
+      Text that is merely de-emphasised but legible. Layered UI that is clearly
+      intentional (a popover over dimmed content). NOTE: measurable low contrast
+      and stray template tokens are already caught by the deterministic audit —
+      judge here the cases pixels-alone can't (busy background, muddy hue).
+
+  - id: status-not-visible
+    title: System status not visible when it should be
+    severity: warn
+    nielsen: 1
+    look_for: >
+      An action that clearly happened but the UI gives no visible acknowledgement
+      (no state change, no badge update, no message); the user can't tell where
+      they are in a multi-step flow.
+    not_this: >
+      A status indicator that IS present (a state badge, a breadcrumb, a toast)
+      even if subtle. Judge only what a single frame can show.

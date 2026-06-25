@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kitsoki MCP Debug"
+  short_description: "Debug and test the Kitsoki studio MCP CLI."
+  default_prompt: "Use the Kitsoki MCP debug skill to test the studio MCP server with kitsoki mcp-test."

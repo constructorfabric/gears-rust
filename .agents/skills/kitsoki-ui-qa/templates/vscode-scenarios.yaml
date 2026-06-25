@@ -1,0 +1,67 @@
+# QA scenarios for the VS Code extension tour video.
+# Each step is an OBSERVABLE claim grounded in a specific labeled frame
+# (.artifacts/vscode-tour/NN-<beat>.png — pass via --frames for highest fidelity).
+# These map 1:1 to the recorded beats; the evidence must show the kitsoki UI
+# rendered INSIDE the VS Code chrome (not a browser). The chat lives BOTH as a
+# narrow sidebar pane and as a full editor-area pop-out; Chat / Trace / Graph are
+# INDEPENDENT surfaces that all follow ONE backend session (surface decomposition).
+
+feature: Embed the kitsoki web UI in a VS Code extension
+
+scenarios:
+  - id: a-open-chat-picker
+    title: "Kitsoki: Open Chat" opens a story picker and the started session lands in the sidebar Chat (collapsed)
+    required: true
+    steps:
+      - The VS Code Activity Bar and editor chrome are visible (this is VS Code, not a browser)
+      - The single Kitsoki Activity Bar menu is open with Chat / Trace / Graph sidebar panes
+      - The narrow Chat surface shows an active session (a conversation / intent view, not a "Start a chat" empty state)
+      - The Chat input is collapsed to a single line (a "Type a message…" field with a small disclosure icon), not the full set of action buttons
+      - The surfaces are themed to match the VS Code editor chrome
+
+  - id: b-chat-popout
+    title: The chat pops out to a full editor-area window, opening on the same session with its full input
+    required: true
+    steps:
+      - A Kitsoki chat panel is shown in the editor area (a tab titled "Kitsoki"), beside the narrow sidebar
+      - The popped-out chat shows the SAME active session as the sidebar (the lobby conversation), not the home/story library
+      - Because the editor panel is tall, the chat shows the FULL structured input (e.g. a forecast / climate form), not the collapsed single-line input
+
+  - id: d-turn-driven
+    title: A turn driven in the popped-out chat advances state and renders the Tokyo forecast
+    required: true
+    steps:
+      - The resolved place "Tokyo, Japan" is visible in the rendered report
+      - A report / forecast card is shown (coordinates, conditions, or a 5-day table)
+      - The room has advanced to the "report" state (a badge or current-state shows "report")
+      - The conversation is in the full editor-area chat panel (not the narrow sidebar)
+
+  - id: h-trace-panel
+    title: Trace opens as its own sidebar surface following the same session
+    required: true
+    steps:
+      - The Trace surface shows an event timeline (no longer a collapsed card)
+      - Trace event rows are visible (with subsystem/category filters or timing)
+      - A host (host.starlark.run) row or a host-call event is present in the timeline
+
+  - id: i-graph-panel
+    title: Graph opens as its own sidebar surface following the same session
+    required: true
+    steps:
+      - The state diagram (the room graph) is shown in its own surface
+      - The current station is marked (e.g. "report" highlighted or a "you are here" marker)
+      - Room transitions / other rooms are drawn in the diagram
+
+  - id: e-chat-main
+    title: With the sidebar closed, the popped-out chat fills the main editor area
+    required: true
+    steps:
+      - The Kitsoki chat panel occupies the editor area (the primary side bar is closed or no longer dominant)
+      - The same conversation (the Tokyo report) is still shown — the chat is uninterrupted
+
+  - id: g-split-editor
+    title: The story file is opened ABOVE the chat in one vertical column
+    required: true
+    steps:
+      - A YAML file (app.yaml) is open showing the story source, stacked ABOVE the Kitsoki chat
+      - The Kitsoki chat panel remains visible BELOW the file in the same editor column (vertical split, not side by side)

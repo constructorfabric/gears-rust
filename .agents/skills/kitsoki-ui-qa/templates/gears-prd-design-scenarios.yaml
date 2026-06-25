@@ -1,0 +1,94 @@
+# QA scenarios for the external-target PRD → Design demo video.
+# Each step is an OBSERVABLE claim grounded in a specific frame.
+# Pass --frames .artifacts/gears-prd-design to supply the labeled per-scene /
+# per-scroll-stage PNGs (the recorder emits NN-<scene>-sK.png per scroll stage).
+#
+# The point of THIS scenario set: catch a chat demo that scrolls content past
+# too fast to read. Several scenarios assert INTERMEDIATE conversation segments
+# (the clarification questions, the answer, the brief) — not just the final room
+# view of each step. If the recorder only captured the bottom of each step
+# (instant scroll), those segments are absent from every frame → unsupported →
+# the gate fails. A demo that pans the chat in readable stages holds each
+# segment in its own frame → pass.
+
+feature: External-target PRD → Design (gears-rust), shown legibly in the chat
+
+scenarios:
+  - id: tour-intro
+    title: Tour-driven intro reaches the chat
+    required: true
+    steps:
+      - A tour popover (with a title and body) opens over the home story library
+      - A gears-rust story card is shown on the home story library
+      - The view changes to the interactive chat view (a chat transcript with a current-state badge)
+
+  - id: prd-discovery
+    title: The PRD discovery is a back-and-forth conversation
+    required: true
+    steps:
+      - The operator's pitch for the notes-service gear appears as a chat message
+      - 'A "PRD discovery" agent response block appears in the chat after the pitch (the interviewer''s reply), shown as its own message'
+
+  - id: prd-clarify-round1
+    title: Clarification round 1 — the questions AND the answer are shown
+    required: true
+    steps:
+      - A CLARIFYING room view lists the clarification questions (e.g. the primary actor, the success metric)
+      - The operator's answer (platform users / notes-saved-per-session) appears in the chat
+      - "An 'Answered so far' count shows progress (e.g. 2/2)"
+
+  - id: prd-clarify-round2
+    title: Clarification round 2 — a second round with round 1 preserved
+    required: true
+    steps:
+      - A second CLARIFYING round is shown (a new answer about tenant isolation / admin visibility)
+      - "The first round's Q&A is preserved and visible in a 'Resolved in earlier rounds' / Round 1 log"
+
+  - id: prd-draft
+    title: The drafted PRD is shown for review
+    required: true
+    steps:
+      - A DRAFTING / PRD room view shows the authored PRD (a title like "PRD: Notes Service" and a confidence value)
+
+  - id: prd-published
+    title: The PRD published into the gears tree
+    required: true
+    steps:
+      - A "PRD PUBLISHED" banner is visible in the chat
+      - The chat states the PRD published to gears/notes-service/docs/PRD.md (the gears-rust checkout, not kitsoki's docs/prd/)
+
+  - id: design-intake
+    title: The PRD → Design handoff seeds the design intake
+    required: true
+    steps:
+      - "A design INTAKE view shows it is seeded from the PRD: text referencing 'Author a design from the PRD at gears/notes-service/docs/PRD.md'"
+
+  - id: design-refine
+    title: The design brief refinement (design's clarification loop) is shown
+    required: true
+    steps:
+      - A design refine / brief view is shown with the refiner's flagged gaps (e.g. component model, cpt-IDs, NFR allocation)
+      - The view offers a quality check (a "ready" action) before drafting
+
+  - id: design-published
+    title: The DESIGN published alongside the PRD, no ticket
+    required: true
+    steps:
+      - A "PUBLISHED" banner for the design is visible
+      - The chat states the design published to gears/notes-service/docs/DESIGN.md
+      - The chat does NOT claim a kitsoki feature ticket was filed (it says no feature ticket was filed / tracks work in its own issues)
+
+  - id: conversation-legible
+    title: The whole conversation is visible at a readable pace (no fast scroll)
+    required: true
+    steps:
+      - Each step's conversation is shown across MULTIPLE held frames that pan through it, not a single frame jumped to the bottom
+      - The clarification questions, the operator's answers, and the brief each appear in their own legible frame — none is scrolled past without being shown
+      - Across the scroll-stage frames the chat scroll position advances gradually (top → bottom), so every part of each step's conversation is readable
+
+  - id: popovers-legible
+    title: Tour popovers narrate without hiding the conversation
+    required: false
+    steps:
+      - Each spotlight popover has a readable title and body
+      - The popover does not fully cover the chat transcript it is narrating

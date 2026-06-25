@@ -1,0 +1,41 @@
+# Usage scenarios for UI-demo QA. Each scenario is a thing the demo must SHOW;
+# each step is a single OBSERVABLE claim the reviewer grounds in a frame.
+#
+# Write steps as things visible on screen ("the state badge reads X", "three
+# story cards are listed"), not internal behaviour ("the server persisted Y") —
+# the reviewer can only judge what a frame shows.
+#
+# id/title are echoed into verdict.json; `required: false` makes a scenario
+# non-blocking for the gate (the report still lists it).
+
+feature: Kitsoki web UI — browse the catalogue and drive a story session
+
+scenarios:
+  - id: catalogue
+    title: Browse the story catalogue
+    required: true
+    steps:
+      - The home screen lists multiple story cards
+      - Each card shows a story title and a short description
+
+  - id: open-session
+    title: Open a session from a card
+    required: true
+    steps:
+      - Clicking a story card opens a session view
+      - A state badge is visible showing the current state
+
+  - id: drive
+    title: Drive the session to a new state
+    required: true
+    steps:
+      - The composer lets the operator submit an intent
+      - After submitting, the state badge advances to a different state
+      - The chat transcript shows the agent's response
+
+  - id: reload
+    title: Reload re-runs the room
+    required: false
+    steps:
+      - A reload control is visible on the session view
+      - Triggering reload shows a warning or refreshed view

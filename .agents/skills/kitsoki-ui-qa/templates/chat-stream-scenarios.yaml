@@ -1,0 +1,78 @@
+# QA scenarios for the live-chat-streaming demo video.
+# Each step is an OBSERVABLE claim grounded in a specific frame.
+# Pass --frames .artifacts/chat-stream to supply the labeled per-step PNGs.
+
+feature: Live chat streaming with preserved activity (main chat + meta chat)
+
+scenarios:
+  - id: tour-intro
+    title: Tour-driven intro reaches the chat
+    required: true
+    steps:
+      - A spotlight overlay with a popover opens on the home story library
+      - The bug-fix story card is spotlighted
+      - The New Session button is spotlighted and the view changes to the chat (interactive) view
+
+  - id: stream-grows
+    title: The thinking bubble streams and grows over time
+    required: true
+    steps:
+      - After the start action, a live agent bubble (thinking bubble) is visible
+      - Across the early/mid/late streaming frames the number of feed rows INCREASES
+      - Tool rows show a blue tool name (Read, Grep, Edit, Bash, mcp__validator__submit) with an argument preview
+
+  - id: thinking-interleaved
+    title: 🧠 thoughts appear interleaved, in arrival order
+    required: true
+    steps:
+      - At least one row marked with the 🧠 brain glyph is visible during or after streaming
+      - The thought "The off-by-one is in the loop bound." appears BETWEEN the Grep row and the Edit row, not at the bottom
+      - The thought "I'll read the failing test first." appears ABOVE the Read row
+
+  - id: collapse-on-landing
+    title: The activity collapses into the final reply
+    required: true
+    steps:
+      - After streaming, the agent bubble shows the final room view (REPRODUCING)
+      - A collapsed summary line reading "🧠 3 thoughts · 6 tool calls" is visible inside the agent bubble above the view
+      - The full feed rows are NOT visible while collapsed
+
+  - id: expand-preserved-feed
+    title: Expanding shows the same feed, preserved
+    required: true
+    steps:
+      - After the summary is clicked, the expanded feed is visible inside the agent bubble
+      - The expanded feed shows the same interleaved order — 🧠 thought, Read, Grep, 🧠 thought, Edit, Bash, 🧠 thought, two mcp__validator__submit rows
+      - The final room view is still visible beneath the expanded feed
+
+  - id: meta-open
+    title: The meta overlay opens via the launcher
+    required: true
+    steps:
+      - The ✦ Meta launcher button is spotlighted in the lower-right corner
+      - A mode menu with a "Story Q&A" entry is visible
+      - A dark overlay chat opens with a composer at the bottom
+
+  - id: meta-streams-same-feed
+    title: The meta turn streams the same activity presentation
+    required: true
+    steps:
+      - A typed question is visible in the overlay (composer or as a user message)
+      - While the meta turn streams, a 🧠 thought row reading "Let me look at the story definition first." is visible in the overlay's streaming bubble
+      - A tool row with the name Read and an app.yaml preview appears below the thought, in the same row style as the main chat's feed
+
+  - id: meta-collapse-expand
+    title: The meta activity collapses into the reply and expands back
+    required: true
+    steps:
+      - After the meta reply lands, a collapsed summary reading "🧠 1 thought · 1 tool call" is visible inside the assistant message, above the reply text
+      - After the summary is clicked, the expanded feed shows the same 🧠 thought row and Read tool row
+      - The reply text appears in the message bubble but NOT as a row inside the expanded feed
+
+  - id: popovers-legible
+    title: Tour popovers narrate without hiding the evidence
+    required: false
+    steps:
+      - Each spotlight popover has a readable title and body
+      - On the streaming steps the popover does not fully cover the bubble's feed rows
+      - On the expanded steps the popover does not fully cover the expanded feed

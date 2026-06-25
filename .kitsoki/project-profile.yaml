@@ -1,0 +1,81 @@
+schema: project-profile/v1
+id: gears-rust
+title: Gears Rust
+summary: |
+  Project-local Kitsoki dev-story binding for Gears Rust. The
+  generated instance imports `@kitsoki/dev-story`; this repository owns only the
+  profile values, tool commands, and local setup files.
+
+commands:
+  dev: "make dev"
+  test: "make test"
+  build: "make build"
+  check: "make check"
+
+repo:
+  root: "."
+  vcs: git
+  default_branch: main
+  remote: ""
+  monorepo: true
+
+stack:
+  kind: "rust"
+  languages: [rust]
+  package_managers: [cargo, make]
+
+testing:
+  mechanisms:
+    - kind: unit
+      runner: command
+      command: "make test"
+    - kind: build
+      runner: command
+      command: "make build"
+
+conventions:
+  source: hybrid
+  dirs:
+    context:   { path: ".context",   use: local-runtime }
+    artifacts: { path: ".artifacts", use: local-runtime }
+    worktrees: { path: ".worktrees", use: local-runtime }
+  gitignore:
+    manage: true
+    additions:
+      - ".kitsoki.local.yaml"
+      - ".kitsoki/sessions/"
+      - ".artifacts/"
+      - ".context/"
+      - ".worktrees/"
+
+tracker:
+  provider: "none"
+
+kitsoki:
+  story: dev-story
+  instance:
+    id: gears-rust-dev
+    path: stories/gears-rust-dev/app.yaml
+    bindings:
+      ticket: host.local_files.ticket
+      vcs: host.git
+      ci: host.local
+      workspace: host.git_worktree
+      transport: host.append_to_file
+  judge_mode: human
+  autonomy: supervised
+
+dev_story_profile:
+  docs:
+    publish_durable_path: gears/notes-service/docs
+    prd_doc_filename: PRD
+    design_durable_path: gears/notes-service/docs
+    design_doc_filename: DESIGN
+    design_template_dir: docs/spec-templates/gears-sdlc
+    design_ticket_dir: ""
+  bugfix:
+    build_cmd: "make build"
+    test_cmd: "make test"
+
+readiness:
+  status: not-run
