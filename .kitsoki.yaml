@@ -2,3 +2,4 @@ story_dirs:
   - ./stories
 
 default_story: stories/gears-rust-dev/app.yaml
+project_profile: .kitsoki/project-profile.yaml

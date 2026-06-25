@@ -77,5 +77,11 @@ dev_story_profile:
     build_cmd: "make build"
     test_cmd: "make test"
 
+onboarding:
+  baseline_commit: d8513b0c4e7f12c0e451fde5253eafa0cc38d6a5
+  first_onboarding_commit: f5b4634a
+  deterministic_flow: stories/dev-story/flows/init_rust_project.yaml
+  recording_policy: gated-live-allowed
+
 readiness:
   status: not-run
