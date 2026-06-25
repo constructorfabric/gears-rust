@@ -1048,8 +1048,12 @@ impl Service {
     ///    The PEP request is pre-row (no per-record attribution attributes)
     ///    because the caller has not yet named a specific row — the PDP
     ///    responds with row-scope narrowing via the [`AccessScope`]
-    ///    constraints, not via a tuple match. An unconstrained permit is a
-    ///    legitimate outcome (e.g. platform administrators).
+    ///    constraints, not via a tuple match. It runs under
+    ///    `require_constraints(true)`, so the PDP MUST return row-scope
+    ///    narrowing (a platform admin resolves to the full tenant set, never
+    ///    `allow_all`); a degenerate unconstrained permit is denied in
+    ///    composition by [`authz::scope_to_odata_filter`], not read as "all
+    ///    tenants".
     /// 2. **Compose** the PDP constraints into the user-supplied `OData`
     ///    filter via [`authz::scope_to_odata_filter`]. The composition is
     ///    intersection-only (`composed = user_filter AND constraints`) per
@@ -1126,9 +1130,10 @@ impl Service {
     ///
     /// 1. **Authorize** the request via [`authz::authorize_list_usage_records`]
     ///    (the PEP shape is shared: pre-row, no per-record attribution, with
-    ///    `require_constraints(false)` so an unconstrained permit is a
-    ///    happy-path outcome). An unconstrained permit leaves the user
-    ///    filter unchanged; a constrained permit narrows it.
+    ///    `require_constraints(true)` so the PDP MUST return row-scope
+    ///    narrowing). A constrained permit narrows the user filter; a
+    ///    degenerate unconstrained permit is denied in composition by
+    ///    [`authz::scope_to_odata_filter`], not left unscoped across tenants.
     /// 2. **Compose** the PDP constraints into the user-supplied `OData`
     ///    filter via [`compose_query_with_scope`]. The composition is
     ///    intersection-only per

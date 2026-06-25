@@ -1024,11 +1024,17 @@ mod prepare_list_query_tests {
     }
 
     #[test]
-    fn cursor_present_leaves_orderby_untouched() {
-        // When the toolkit OData extractor sees a cursor it leaves
-        // `order` empty (the order is derived from `cursor.s`). The
-        // gateway must NOT inject the default keyset when the request
-        // is cursor-driven.
+    fn cursor_present_materializes_keyset_order_from_signed_tokens() {
+        // Regression (cursor-continuation 500): the toolkit OData extractor
+        // leaves `order` empty on a cursor request — the effective keyset
+        // order lives in the cursor's signed-token payload (`cursor.s`).
+        // The storage plugin reads `query.order` *directly* to build both
+        // the `ORDER BY` and the keyset continuation predicate; it has no
+        // access to the cursor's token derivation. So `prepare_list_query`
+        // MUST materialize the cursor-derived order back into `query.order`.
+        // Before the fix it was derived "for comparison purposes only" and
+        // the empty order propagated to the plugin, which 500'd with
+        // "keyset order must not be empty" on every cursor follow-up.
         let mut q = ODataQuery::new();
         q.cursor = Some(CursorV1 {
             k: vec!["2026-06-12T00:00:00Z".into(), uuid::Uuid::nil().to_string()],
@@ -1037,12 +1043,11 @@ mod prepare_list_query_tests {
             f: None,
             d: "fwd".to_owned(),
         });
-        // Note: q.order intentionally empty.
+        // Note: q.order intentionally empty (mirrors the toolkit extractor).
         let out = prepare_list_query(q).expect("cursor-driven request validates");
-        assert!(
-            out.order.is_empty(),
-            "with cursor present, prepare_list_query keeps order empty so the \
-             toolkit's cursor-derived order takes effect at the plugin",
+        assert_order_keys(
+            &out.order,
+            &[("created_at", SortDir::Asc), ("uuid", SortDir::Asc)],
         );
     }
 
@@ -1113,6 +1118,12 @@ mod prepare_list_query_tests {
         });
         let out = prepare_list_query(q).expect("matching cursor passes through");
         assert!(out.cursor.is_some());
+        // The cursor-derived keyset order is materialized into `query.order`
+        // so the storage plugin can build the ORDER BY / keyset predicate.
+        assert_order_keys(
+            &out.order,
+            &[("created_at", SortDir::Asc), ("uuid", SortDir::Asc)],
+        );
     }
 }
 
@@ -1568,14 +1579,14 @@ mod handle_list_usage_records_tests {
     use toolkit::api::canonical_prelude::OData;
     use toolkit::client_hub::ClientHub;
     use toolkit_odata::{CursorV1, ODataQuery, Page as ODataPage, PageInfo, SortDir};
-    use toolkit_security::SecurityContext;
+    use toolkit_security::{SecurityContext, pep_properties};
     use uuid::Uuid;
 
     use super::super::handle_list_usage_records;
     use super::sample_persisted_record;
     use crate::domain::Service;
     use crate::domain::test_support::{
-        CountingAllowAllResolver, CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx,
+        CountingPermitResolver, CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx,
         enforcer_for, hub_with_plugin,
     };
 
@@ -1592,7 +1603,10 @@ mod handle_list_usage_records_tests {
             suffix,
             "cyberfabric",
         );
-        let resolver = CountingAllowAllResolver::new();
+        let resolver = CountingPermitResolver::new(
+            pep_properties::OWNER_TENANT_ID,
+            Uuid::from_u128(2).to_string(),
+        );
         let enforcer = enforcer_for(Arc::clone(&resolver) as _);
         Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
     }
@@ -1808,8 +1822,9 @@ mod handle_query_aggregated_usage_records_tests {
     use toolkit::api::canonical_prelude::OData;
     use toolkit::client_hub::ClientHub;
     use toolkit_odata::ODataQuery;
-    use toolkit_security::SecurityContext;
+    use toolkit_security::{SecurityContext, pep_properties};
     use usage_collector_sdk::{AggregationBucket, AggregationResult};
+    use uuid::Uuid;
 
     use super::super::handle_query_aggregated_usage_records;
     use crate::api::rest::dto::{
@@ -1817,7 +1832,7 @@ mod handle_query_aggregated_usage_records_tests {
     };
     use crate::domain::Service;
     use crate::domain::test_support::{
-        CountingAllowAllResolver, CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx,
+        CountingPermitResolver, CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx,
         enforcer_for, hub_with_plugin,
     };
 
@@ -1836,7 +1851,10 @@ mod handle_query_aggregated_usage_records_tests {
             suffix,
             "cyberfabric",
         );
-        let resolver = CountingAllowAllResolver::new();
+        let resolver = CountingPermitResolver::new(
+            pep_properties::OWNER_TENANT_ID,
+            Uuid::from_u128(2).to_string(),
+        );
         let enforcer = enforcer_for(Arc::clone(&resolver) as _);
         Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
     }

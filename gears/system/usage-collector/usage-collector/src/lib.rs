@@ -20,5 +20,6 @@
 pub mod api;
 pub mod config;
 pub mod domain;
+pub(crate) mod gts;
 pub mod infra;
 pub mod module;

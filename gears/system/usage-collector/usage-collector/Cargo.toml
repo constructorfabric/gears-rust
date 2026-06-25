@@ -41,6 +41,16 @@ toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
+# Link-time GTS permission catalog (`src/gts/permissions.rs`): declares
+# AuthzPermissionV1 instances into the toolkit-gts inventory that
+# types-registry aggregates at boot.
+toolkit-gts = { workspace = true }
+# Direct dep needed because `gts_instance!` expansions reference
+# `::gts::*` paths (the compile-time `<S as GtsSchema>::SCHEMA_ID` prefix
+# asserts). Without this the proc-macro emits `::gts::…` identifiers that
+# cannot be resolved.
+gts = { workspace = true }
+inventory = { workspace = true }
 
 [dev-dependencies]
 types-registry-sdk = { workspace = true, features = ["test-util"] }

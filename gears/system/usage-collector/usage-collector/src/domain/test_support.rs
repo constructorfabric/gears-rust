@@ -23,10 +23,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::Constraint;
 use authz_resolver_sdk::models::{
-    Capability, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
 use authz_resolver_sdk::{AuthZResolverClient, AuthZResolverError, PolicyEnforcer};
 use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_security::pep_properties;
 use usage_collector_sdk::{
     AggregationResult, AggregationSpec, MetadataFilter, UsageCollectorPluginError,
     UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
@@ -170,6 +171,79 @@ pub fn permit_with_string_constraint(property: &'static str, value: String) -> E
     }
 }
 
+/// Build a permit `EvaluationResponse` scoped to the request's own
+/// `OWNER_TENANT_ID`, simulating a tenant-scoped grant that authorizes
+/// exactly the tenant the record under test names.
+///
+/// The per-record (`usage_record`) authz path runs under
+/// `require_constraints(true)` and applies an attribution gate
+/// (`authz::scope_admits_attribution_tuple`). A plain empty-constraints permit (e.g.
+/// [`CountingAllowAllResolver`]) fails closed as
+/// `EnforcerError::CompileFailed` there, and a fixed-tenant constraint (e.g.
+/// [`permit_with_string_constraint`]) would only satisfy the gate for one
+/// hard-coded tenant. Echoing the request's `OWNER_TENANT_ID` back as the
+/// granted scope compiles to a non-empty `AccessScope` AND satisfies the gate
+/// for ANY record tenant a test picks. When the request carries no
+/// `OWNER_TENANT_ID` (the subject-only catalog surface, which runs under
+/// `require_constraints(false)`), it falls back to an empty-constraints
+/// `allow_all` permit — the legitimate happy-path there.
+#[must_use]
+pub fn permit_scoped_to_request_tenant(request: &EvaluationRequest) -> EvaluationResponse {
+    match request
+        .resource
+        .properties
+        .get(pep_properties::OWNER_TENANT_ID)
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(tenant) => {
+            permit_with_string_constraint(pep_properties::OWNER_TENANT_ID, tenant.to_owned())
+        }
+        None => EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: Vec::new(),
+                deny_reason: None,
+            },
+        },
+    }
+}
+
+/// Counting PDP fake that permits and scopes the grant to the request's own
+/// `OWNER_TENANT_ID` (see [`permit_scoped_to_request_tenant`]), recording the
+/// call count so per-record dedup tests can still assert the exact number of
+/// PDP round-trips. Use this for the per-record (`usage_record`) paths under
+/// `require_constraints(true)` where [`CountingAllowAllResolver`] would fail
+/// closed.
+#[derive(Debug, Default)]
+pub struct CountingTenantPermitResolver {
+    calls: AtomicUsize,
+}
+
+impl CountingTenantPermitResolver {
+    /// Build a tenant-scoped permit resolver.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Number of `evaluate` calls observed so far.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl AuthZResolverClient for CountingTenantPermitResolver {
+    async fn evaluate(
+        &self,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(permit_scoped_to_request_tenant(&request))
+    }
+}
+
 /// Counting PDP fake that always permits with a fixed string-equality
 /// constraint and records how many times it was called, so the no-cache test
 /// can assert that two identical authorize calls each hit the resolver.
@@ -255,18 +329,22 @@ impl AuthZResolverClient for CountingAllowAllResolver {
     }
 }
 
-/// PDP fake that permits with NO constraints AND captures the most-recent
-/// [`EvaluationRequest`] it received, so tests can inspect the request shape
-/// the PEP composed (rather than only its decision). Used by the
-/// `authz_tests` equivalence regression to prove that the per-record and
-/// per-tuple PDP composers emit byte-identical requests for the same input.
+/// PDP fake that captures the most-recent [`EvaluationRequest`] it received
+/// (so tests can inspect the request shape the PEP composed) AND scopes its
+/// permit to the request's own `OWNER_TENANT_ID` (see
+/// [`permit_scoped_to_request_tenant`]). Used by the `authz_tests`
+/// equivalence regression to prove the per-record and per-tuple PDP composers
+/// emit byte-identical requests for the same input; the tenant-scoped permit
+/// is what lets those calls return `Ok` under the per-record gate's
+/// `require_constraints(true)` posture (a plain empty-constraints permit would
+/// fail closed there).
 #[derive(Debug, Default)]
-pub struct CapturingAllowAllResolver {
+pub struct CapturingTenantPermitResolver {
     last_request: std::sync::Mutex<Option<EvaluationRequest>>,
 }
 
-impl CapturingAllowAllResolver {
-    /// Build a capturing allow-all resolver.
+impl CapturingTenantPermitResolver {
+    /// Build a capturing tenant-scoped permit resolver.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -280,19 +358,14 @@ impl CapturingAllowAllResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for CapturingAllowAllResolver {
+impl AuthZResolverClient for CapturingTenantPermitResolver {
     async fn evaluate(
         &self,
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, AuthZResolverError> {
+        let response = permit_scoped_to_request_tenant(&request);
         *self.last_request.lock().expect("mutex") = Some(request);
-        Ok(EvaluationResponse {
-            decision: true,
-            context: EvaluationResponseContext {
-                constraints: Vec::new(),
-                deny_reason: None,
-            },
-        })
+        Ok(response)
     }
 }
 
@@ -393,12 +466,18 @@ impl AuthZResolverClient for CountingUnreachableResolver {
 }
 
 /// Wrap a `dyn AuthZResolverClient` in a `PolicyEnforcer` for tests, mirroring
-/// the production `module.rs` wiring (`PolicyEnforcer::new(authz)`). The
-/// `TenantHierarchy` capability is advertised so the request shape matches
-/// production.
+/// the production `module.rs` wiring (`PolicyEnforcer::new(authz)`). No
+/// capabilities are advertised, matching production (`module.rs:74`):
+/// `usage_record` is a flat resource that does not advertise
+/// `Capability::TenantHierarchy`, so the PDP expands a caller's tenant closure
+/// eagerly into a flat `OWNER_TENANT_ID In [..]` constraint rather than pushing
+/// it down as an `InTenantSubtree` predicate (see
+/// [`crate::domain::authz::authorize_list_usage_records`]). A test that needs a
+/// hierarchy-aware enforcer must build one explicitly and assert the
+/// `InTenantSubtree` fail-closed behavior at that call site.
 #[must_use]
 pub fn enforcer_for(authz: Arc<dyn AuthZResolverClient>) -> PolicyEnforcer {
-    PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
+    PolicyEnforcer::new(authz)
 }
 
 // ── Plugin Host wiring helpers (`ClientHub` + scoped plugin) ────────────────
@@ -449,23 +528,29 @@ pub fn hub_with_plugin(
 
 /// Build a [`Service`] wired against a permit-by-default PDP and the
 /// supplied plugin stub, registered under the `cyberfabric` vendor.
+///
+/// The PDP fake ([`CountingTenantPermitResolver`]) scopes its permit to the
+/// request's own `OWNER_TENANT_ID`, so per-record paths under
+/// `require_constraints(true)` pass the tenant gate for whatever tenant the
+/// record names, while the subject-only catalog surface (no `OWNER_TENANT_ID`,
+/// `require_constraints(false)`) still gets an `allow_all` permit.
 #[must_use]
 pub fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
     let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
-    let enforcer = enforcer_for(CountingAllowAllResolver::new());
+    let enforcer = enforcer_for(CountingTenantPermitResolver::new());
     Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
 }
 
 /// Variant of [`service_with_permit`] that exposes the underlying
-/// [`CountingAllowAllResolver`] so tests can assert the exact number of
+/// [`CountingTenantPermitResolver`] so tests can assert the exact number of
 /// PDP `evaluate` round-trips the service issued.
 #[must_use]
 pub fn service_with_counting_permit(
     plugin: Arc<dyn UsageCollectorPluginV1>,
     suffix: &str,
-) -> (Arc<Service>, Arc<CountingAllowAllResolver>) {
+) -> (Arc<Service>, Arc<CountingTenantPermitResolver>) {
     let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
-    let resolver = CountingAllowAllResolver::new();
+    let resolver = CountingTenantPermitResolver::new();
     let enforcer = enforcer_for(Arc::clone(&resolver) as Arc<dyn AuthZResolverClient>);
     let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
     (service, resolver)

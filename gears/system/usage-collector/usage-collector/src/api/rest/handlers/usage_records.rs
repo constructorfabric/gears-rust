@@ -440,11 +440,16 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
         );
     }
 
-    // 3. Cursor validation. When a cursor is present, `query.order`
-    // is empty by toolkit convention; `validate_cursor_against`
-    // derives the effective order from the cursor's signed-token
-    // payload, so we synthesise the effective order from the cursor
-    // for comparison purposes only.
+    // 3. Cursor validation + order materialization. When a cursor is
+    // present, `query.order` is empty by toolkit convention; the effective
+    // keyset order lives in the cursor's signed-token payload (`cursor.s`).
+    // Derive it, validate the cursor against it and the parsed filter hash,
+    // then write it back into `query.order` so it propagates to the storage
+    // plugin. The plugin reads `query.order` directly to build BOTH the
+    // `ORDER BY` and the keyset continuation predicate and has no access to
+    // the cursor's token derivation — leaving the order empty makes the
+    // plugin reject the continuation with "keyset order must not be empty"
+    // (surfacing as a 500 on every cursor follow-up).
     if let Some(cursor) = query.cursor.as_ref() {
         let effective_order = toolkit_odata::ODataOrderBy::from_signed_tokens(&cursor.s)
             .map_err(CanonicalError::from)?;
@@ -454,6 +459,7 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
             query.filter_hash.as_deref(),
         )
         .map_err(CanonicalError::from)?;
+        query.order = effective_order;
     }
 
     Ok(query)

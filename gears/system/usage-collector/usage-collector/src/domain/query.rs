@@ -19,10 +19,12 @@ use crate::domain::authz;
 /// [`ODataQuery`] filter under intersection-only semantics, returning a
 /// fresh query ready for plugin dispatch.
 ///
-/// `composed_filter = user_filter AND scope_filter`. When PDP returns an
-/// unconstrained scope the user filter passes through unchanged; when
-/// the user supplied no filter the scope filter alone becomes the
-/// composed filter. `gts_id`, the time window, and the order /
+/// `composed_filter = user_filter AND scope_filter`. The scope always
+/// contributes a narrowing predicate: [`authz::scope_to_odata_filter`]
+/// fails closed on an unconstrained / empty-constraint / deny-all scope
+/// rather than yielding a pass-through, so there is no "filter unchanged"
+/// branch. When the user supplied no filter the scope filter alone becomes
+/// the composed filter. `gts_id`, the time window, and the order /
 /// limit / cursor / select projections on [`ODataQuery`] flow through
 /// verbatim — the composition only touches the `$filter` AST.
 ///
@@ -39,13 +41,12 @@ pub(crate) fn compose_query_with_scope(
 ) -> Result<ODataQuery, UsageCollectorError> {
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-parse-pdp
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-iterate
-    let scope_filter = authz::scope_to_odata_filter(scope).map_err(UsageCollectorError::from)?;
+    // `scope_to_odata_filter` always yields a narrowing predicate or fails
+    // closed: an unconstrained / empty-constraint / deny-all scope is denied,
+    // never passed through as "no row narrowing".
+    let scope_expr = authz::scope_to_odata_filter(scope).map_err(UsageCollectorError::from)?;
     // @cpt-end:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-iterate
     // @cpt-end:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-parse-pdp
-
-    let Some(scope_expr) = scope_filter else {
-        return Ok(user_query.clone());
-    };
 
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-intersect
     let composed_filter: ast::Expr = match user_query.filter().cloned() {
@@ -55,12 +56,19 @@ pub(crate) fn compose_query_with_scope(
     // @cpt-end:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-intersect
 
     let mut composed = user_query.clone();
-    // Keep `filter_hash` consistent with the AND-merged filter so the
-    // (filter, filter_hash) pair stays coupled. Today the handler validates
-    // the cursor before composition, so a stale hash is latent; refreshing
-    // it here pre-empts a contract-drift bite when downstream consumers
-    // re-derive the hash off `composed`.
-    composed.filter_hash = toolkit_odata::short_filter_hash(Some(&composed_filter));
+    // Preserve the caller's `filter_hash` (the hash of the *user* `$filter`,
+    // computed by the gateway) — do NOT re-hash the AND-merged filter. The
+    // keyset cursor's `f` field exists to detect the *user* changing their
+    // `$filter` between paginated requests; the PDP scope AND-merged here is
+    // server-injected and not user-controlled, so it MUST be excluded from the
+    // hash. Both cursor validators (the gateway, pre-composition, and the
+    // plugin's `cursor.f == query.filter_hash` check) compare against the
+    // user-filter hash, and the plugin embeds `query.filter_hash` into the
+    // next_cursor. Re-hashing to `hash(user AND scope)` here would embed a hash
+    // the gateway's `hash(user)` can never match on the follow-up request —
+    // breaking keyset pagination with a spurious `FILTER_MISMATCH` 400 the
+    // moment PDP returns any row scope (latent until LIST began requiring
+    // constraints). `composed` keeps `user_query.filter_hash` from the clone.
     composed.filter = Some(Box::new(composed_filter));
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-return
     Ok(composed)
