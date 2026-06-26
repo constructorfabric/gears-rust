@@ -779,6 +779,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Span::call_site(),
             );
             quote! {
+                #[cfg(not(test))]
                 #[doc(hidden)]
                 pub use #crate_ident as #alias_ident;
             }
