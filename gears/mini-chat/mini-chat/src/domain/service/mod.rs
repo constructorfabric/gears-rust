@@ -210,6 +210,10 @@ impl<
         summary_config: crate::config::background::ThreadSummaryWorkerConfig,
         knowledge_search_config: crate::config::KnowledgeSearchConfig,
         knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
+        function_tools: std::collections::HashMap<
+            String,
+            Arc<dyn crate::domain::ports::FunctionTool>,
+        >,
         anthropic_files_client: Option<
             Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>,
         >,
@@ -287,6 +291,7 @@ impl<
                 Arc::clone(&metrics),
                 knowledge_search_config,
                 knowledge_retriever,
+                function_tools,
             ),
             turns,
             reactions: ReactionService::new(

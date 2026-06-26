@@ -74,6 +74,7 @@ fn make_entry(model_id: &str, tier: ModelTier) -> ModelCatalogEntry {
         }),
         system_prompt: String::new(),
         thread_summary_prompt: String::new(),
+        enabled_function_tools: Vec::new(),
     }
 }
 

@@ -57,6 +57,10 @@ pub struct MiniChatConfig {
     /// Knowledge search (RAG) feature configuration.
     #[serde(default)]
     pub knowledge_search: KnowledgeSearchConfig,
+    /// Exa web-search function-tool configuration.
+    #[expand_vars]
+    #[serde(default)]
+    pub exa_search: ExaSearchConfig,
 }
 
 /// Which file/vector-store implementation to use for RAG operations.
@@ -441,6 +445,7 @@ impl Default for MiniChatConfig {
             cleanup_worker: CleanupWorkerConfig::default(),
             thumbnail: ThumbnailConfig::default(),
             knowledge_search: KnowledgeSearchConfig::default(),
+            exa_search: ExaSearchConfig::default(),
         }
     }
 }
@@ -1042,6 +1047,142 @@ impl KnowledgeSearchConfig {
         }
         Ok(())
     }
+}
+
+/// Configuration for the `exa_search` web-search function tool (exa.ai).
+///
+/// When `enabled` is `true`, an [`crate::domain::ports::FunctionTool`] named
+/// `exa_search` is registered. Models that list `"exa_search"` in their
+/// `enabled_function_tools` may call it; the agentic loop dispatches the call,
+/// issues `POST /{alias}/search` through OAGW, and injects the formatted
+/// results as a `function_call_output`.
+///
+/// Egress goes through OAGW (host + apikey auth plugin), mirroring the LLM
+/// providers — the API key is held by OAGW, never by mini-chat.
+#[derive(Debug, Clone, Serialize, Deserialize, toolkit_macros::ExpandVars)]
+#[serde(deny_unknown_fields)]
+pub struct ExaSearchConfig {
+    /// Enable the `exa_search` function tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Upstream hostname for exa. Default: `"api.exa.ai"`.
+    #[serde(default = "default_exa_host")]
+    pub host: String,
+
+    /// OAGW upstream alias. When `None`, falls back to `host` (OAGW derives
+    /// the alias from the hostname). Set explicitly only for IP-based hosts.
+    #[serde(default)]
+    pub upstream_alias: Option<String>,
+
+    /// OAGW auth plugin type. Example:
+    /// `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1`.
+    #[serde(default)]
+    pub auth_plugin_type: Option<String>,
+
+    /// Auth plugin config (e.g. `header=x-api-key`, `secret_ref=${EXA_API_KEY}`).
+    /// Values support `${VAR}` env expansion via [`config_expanded()`].
+    #[expand_vars]
+    #[serde(default)]
+    pub auth_config: Option<HashMap<String, String>>,
+
+    /// Exa search `type` (`auto`, `fast`, `instant`, `deep`, …). Default: `"auto"`.
+    #[serde(default = "default_exa_search_type")]
+    pub search_type: String,
+
+    /// Number of results requested per call (`numResults`). Default: 10.
+    #[serde(default = "default_exa_num_results")]
+    pub num_results: u32,
+
+    /// Maximum `exa_search` calls per message in the agentic loop. Default: 3.
+    #[serde(default = "default_exa_max_calls")]
+    pub max_calls_per_message: u32,
+
+    /// Maximum characters kept per result after formatting (bounds context cost).
+    /// Default: 2000.
+    #[serde(default = "default_exa_max_chars")]
+    pub max_chars: usize,
+
+    /// Guard instruction appended to the system prompt when enabled.
+    #[serde(default = "default_exa_guard")]
+    pub guard: String,
+}
+
+impl Default for ExaSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_exa_host(),
+            upstream_alias: None,
+            auth_plugin_type: None,
+            auth_config: None,
+            search_type: default_exa_search_type(),
+            num_results: default_exa_num_results(),
+            max_calls_per_message: default_exa_max_calls(),
+            max_chars: default_exa_max_chars(),
+            guard: default_exa_guard(),
+        }
+    }
+}
+
+impl ExaSearchConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled {
+            if self.host.trim().is_empty() {
+                return Err("exa_search.host must not be empty when enabled".to_owned());
+            }
+            if self.search_type.trim().is_empty() {
+                return Err("exa_search.search_type must not be empty when enabled".to_owned());
+            }
+        }
+        if self.num_results == 0 {
+            return Err("exa_search.num_results must be > 0".to_owned());
+        }
+        if self.max_calls_per_message == 0 {
+            return Err("exa_search.max_calls_per_message must be > 0".to_owned());
+        }
+        if self.max_chars == 0 {
+            return Err("exa_search.max_chars must be > 0".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn default_exa_host() -> String {
+    "api.exa.ai".to_owned()
+}
+
+fn default_exa_search_type() -> String {
+    "auto".to_owned()
+}
+
+const fn default_exa_num_results() -> u32 {
+    10
+}
+
+const fn default_exa_max_calls() -> u32 {
+    3
+}
+
+const fn default_exa_max_chars() -> usize {
+    2000
+}
+
+fn default_exa_guard() -> String {
+    "You have access to exactly one web tool: exa_search, which searches the public web \
+     for current information. Use it when the question depends on recent events or facts \
+     that may not be in your training data. You do NOT have a browser: never call `open`, \
+     `find`, `click`, or any other browsing tool. The exa_search results (titles, URLs, \
+     and highlights) are all you get — answer directly from them; do not attempt to open \
+     or fetch pages.\n\
+     \n\
+     Your final answer must contain ONLY the user-facing response. Do not include planning, \
+     reasoning, or meta-commentary in it (e.g. phrases like \"Provide temperature…\", \
+     \"Use the search results\", \"Cite sources\") — keep all of that out of the answer.\n\
+     Cite sources as inline Markdown links using the URLs from the exa_search results, e.g. \
+     [AccuWeather](https://example.com/page). Do NOT use citation markers such as 【1†…】, \
+     footnotes, or bare numbers — only Markdown links."
+        .to_owned()
 }
 
 fn default_url_prefix() -> String {

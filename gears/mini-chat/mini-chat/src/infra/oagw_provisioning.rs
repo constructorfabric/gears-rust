@@ -14,7 +14,7 @@ use std::sync::Arc;
 use oagw_sdk::ServiceGatewayClientV1;
 use tracing::{info, warn};
 
-use crate::config::ProviderEntry;
+use crate::config::{ExaSearchConfig, ProviderEntry};
 
 /// Register OAGW upstreams and routes for each configured provider.
 ///
@@ -68,6 +68,75 @@ pub async fn register_oagw_upstreams(
                 tenant_override.upstream_alias = Some(alias);
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Register the OAGW upstream + `POST /search` route for the exa web-search tool.
+///
+/// Mirrors [`create_upstream`]/[`register_route`] but for a standalone service
+/// (no `ProviderEntry`): host + apikey auth from [`ExaSearchConfig`], a single
+/// route for `POST {alias}/search`.
+#[allow(clippy::cognitive_complexity)]
+pub async fn register_exa_upstream(
+    gateway: &Arc<dyn ServiceGatewayClientV1>,
+    ctx: &toolkit_security::SecurityContext,
+    cfg: &ExaSearchConfig,
+) -> anyhow::Result<()> {
+    use oagw_sdk::{
+        AuthConfig, CreateRouteRequest, CreateUpstreamRequest, Endpoint, HttpMatch, HttpMethod,
+        MatchRules, PathSuffixMode, Scheme, Server,
+    };
+
+    let server = Server {
+        endpoints: vec![Endpoint {
+            scheme: Scheme::Https,
+            host: cfg.host.clone(),
+            port: 443,
+        }],
+    };
+
+    let mut builder =
+        CreateUpstreamRequest::builder(server, "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1")
+            .enabled(true);
+    if let Some(alias) = &cfg.upstream_alias {
+        builder = builder.alias(alias);
+    }
+    if let (Some(plugin_type), Some(config)) = (&cfg.auth_plugin_type, &cfg.auth_config) {
+        builder = builder.auth(AuthConfig {
+            plugin_type: plugin_type.clone(),
+            sharing: oagw_sdk::SharingMode::Inherit,
+            config: Some(config.clone()),
+        });
+    }
+
+    let upstream = gateway
+        .create_upstream(ctx.clone(), builder.build())
+        .await
+        .map_err(|e| anyhow::anyhow!("OAGW exa upstream registration failed: {e}"))?;
+    info!(alias = %upstream.alias, upstream_id = %upstream.id, "OAGW exa upstream registered");
+
+    let match_rules = MatchRules {
+        http: Some(HttpMatch {
+            methods: vec![HttpMethod::Post],
+            path: "/search".to_owned(),
+            query_allowlist: vec![],
+            path_suffix_mode: PathSuffixMode::Disabled,
+        }),
+        grpc: None,
+    };
+    match gateway
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(upstream.id, match_rules)
+                .enabled(true)
+                .build(),
+        )
+        .await
+    {
+        Ok(route) => info!(route_id = %route.id, "OAGW exa /search route registered"),
+        Err(e) => warn!(error = %e, "OAGW exa route registration failed (may already exist)"),
     }
 
     Ok(())
