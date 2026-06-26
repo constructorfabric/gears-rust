@@ -24,7 +24,8 @@ tr-authz = ["dep:tr-authz-plugin"]
 tenant-resolver-rg = ["dep:rg-tr-plugin"]
 static-credstore = ["dep:static-credstore-plugin"]
 mini-chat = ["dep:mini-chat"]
-k8s = ["mini-chat/k8s"]
+chat-engine = ["dep:chat-engine"]
+k8s = ["mini-chat/k8s", "chat-engine?/k8s"]
 otel = ["toolkit/otel"]
 account-management = ["dep:account_management"]
 static-idp = ["dep:static-idp-plugin"]
@@ -71,6 +72,9 @@ clap = { workspace = true }
 
 # Optional mini-chat gear
 mini-chat = { package = "cf-gears-mini-chat", path = "../../gears/mini-chat/mini-chat", optional = true }
+
+# Optional chat-engine gear
+chat-engine = { package = "cf-chat-engine", path = "../../gears/chat-engine/chat-engine", optional = true }
 
 # Optional Account Management gear
 account_management = { package = "cf-gears-account-management", path = "../../gears/system/account-management/account-management", optional = true }
