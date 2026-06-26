@@ -23,6 +23,7 @@ workspace = true
 toolkit-canonical-errors = { workspace = true }
 credstore-sdk = { workspace = true }
 types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

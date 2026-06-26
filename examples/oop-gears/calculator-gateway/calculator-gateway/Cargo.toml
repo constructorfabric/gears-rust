@@ -10,6 +10,7 @@ description = "Calculator gateway module - example in-process REST service"
 [dependencies]
 # External SDKs (dependencies on other modules)
 calculator-sdk = { path = "../../calculator/calculator-sdk" }
+calculator = { path = "../../calculator/calculator" }
 
 # ToolKit
 toolkit = { workspace = true }

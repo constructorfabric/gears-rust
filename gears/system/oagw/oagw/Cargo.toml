@@ -55,9 +55,13 @@ url = { workspace = true }
 gts = { workspace = true }
 utoipa = { workspace = true }
 types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
 authz-resolver-sdk = { workspace = true }
+authz-resolver = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
+tenant-resolver = { workspace = true }
 credstore-sdk = { workspace = true }
+credstore = { workspace = true }
 # Metrics / OpenTelemetry
 opentelemetry = { workspace = true }
 heck = { workspace = true }

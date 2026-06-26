@@ -25,6 +25,8 @@ types-registry-sdk = {
     version = "0.2",
     path = "../../../types-registry/types-registry-sdk"
 }
+types-registry = { workspace = true }
+authn-resolver = { workspace = true }
 
 # ToolKit dependencies
 toolkit.workspace = true

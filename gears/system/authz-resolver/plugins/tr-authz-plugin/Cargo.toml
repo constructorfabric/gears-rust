@@ -22,6 +22,8 @@ workspace = true
 authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.8", path = "../../authz-resolver-sdk" }
 tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.8", path = "../../../tenant-resolver/tenant-resolver-sdk" }
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.2.3", path = "../../../types-registry/types-registry-sdk" }
+types-registry = { workspace = true }
+tenant-resolver = { workspace = true }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
