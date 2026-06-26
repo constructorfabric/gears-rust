@@ -399,7 +399,7 @@ pub fn encode_cursor_value(value: &sea_orm::Value, kind: FieldKind) -> Result<St
             Ok(dt.to_rfc3339_opts(SecondsFormat::Nanos, true))
         }
         (FieldKind::DateTimeUtc, V::TimeDateTimeWithTimeZone(Some(dt))) => {
-            let fmt = time::format_description::parse(
+            let fmt = time::format_description::parse_borrowed::<2>(
                 "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z",
             )
             .map_err(|_| "invalid datetime format".to_owned())?;
