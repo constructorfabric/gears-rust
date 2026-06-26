@@ -768,12 +768,32 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Generate re-exports for gear dependencies so their `inventory::submit!`
+    // registrations survive linking when this gear is pulled in transitively.
+    let dep_reexports: Vec<_> = deps_owned
+        .iter()
+        .map(|dep| {
+            let crate_ident = Ident::new(&dep.replace('-', "_"), Span::call_site());
+            let alias_ident = Ident::new(
+                &format!("_gear_dep_{}", dep.replace('-', "_")),
+                Span::call_site(),
+            );
+            quote! {
+                #[doc(hidden)]
+                pub use #crate_ident as #alias_ident;
+            }
+        })
+        .collect();
+
     // Final expansion:
     let expanded = quote! {
         #input
 
         // Compile-time capability assertions (better errors if trait impls are missing)
         #(#cap_asserts)*
+
+        // Re-export gear dependencies to force-link their inventory registrations
+        #(#dep_reexports)*
 
         // Registrator that targets the *builder*, not the final registry
         #[doc(hidden)]
