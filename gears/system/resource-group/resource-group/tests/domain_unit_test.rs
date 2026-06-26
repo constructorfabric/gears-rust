@@ -7,8 +7,8 @@
 //! Full domain service tests with mock repositories are deferred to
 //! TODO-16 (repository trait abstraction).
 
-use cf_gears_resource_group::domain::error::DomainError;
-use cf_gears_resource_group::domain::validation::{self, RG_TYPE_PREFIX};
+use resource_group::domain::error::DomainError;
+use resource_group::domain::validation::{self, RG_TYPE_PREFIX};
 use toolkit_canonical_errors::{CanonicalError, Problem};
 
 /// Build the wire `Problem` the canonical error middleware would emit
@@ -1039,7 +1039,7 @@ fn toolkit_db_error_maps_to_database() {
 
 #[test]
 fn query_profile_defaults_are_sensible() {
-    use cf_gears_resource_group::domain::group_service::QueryProfile;
+    use resource_group::domain::group_service::QueryProfile;
 
     let profile = QueryProfile::default();
     assert_eq!(profile.max_depth, Some(10));

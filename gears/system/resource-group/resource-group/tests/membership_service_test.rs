@@ -14,12 +14,12 @@ use common::{create_root_type, make_ctx, make_group_service, make_membership_ser
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
-use cf_gears_resource_group::domain::error::DomainError;
-use cf_gears_resource_group::domain::type_service::TypeService;
-use cf_gears_resource_group::infra::storage::entity::resource_group_membership::{
+use resource_group::domain::error::DomainError;
+use resource_group::domain::type_service::TypeService;
+use resource_group::infra::storage::entity::resource_group_membership::{
     Column as MbrColumn, Entity as MbrEntity,
 };
-use cf_gears_resource_group::infra::storage::type_repo::TypeRepository;
+use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::CreateTypeRequest;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use toolkit_db::secure::SecureEntityExt;

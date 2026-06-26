@@ -341,7 +341,7 @@ async fn enforcer_works_for_all_crud_actions() {
 // Scenario: L2-AuthZ-08 - Full chain list_groups calls enforcer with correct params
 #[tokio::test]
 async fn full_chain_list_groups_calls_enforcer_with_correct_params() {
-    use cf_gears_resource_group::domain::group_service::RG_GROUP_RESOURCE;
+    use resource_group::domain::group_service::RG_GROUP_RESOURCE;
     use std::sync::Mutex;
 
     /// Mock that captures requests and returns tenant-scoped allow.
@@ -431,7 +431,7 @@ async fn full_chain_list_groups_calls_enforcer_with_correct_params() {
 // Scenario: L2-AuthZ-09 - Full chain deny-all blocks list_groups
 #[tokio::test]
 async fn full_chain_deny_all_blocks_list_groups() {
-    use cf_gears_resource_group::domain::group_service::RG_GROUP_RESOURCE;
+    use resource_group::domain::group_service::RG_GROUP_RESOURCE;
 
     let authz: Arc<dyn AuthZResolverClient> = Arc::new(DenyAllAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
