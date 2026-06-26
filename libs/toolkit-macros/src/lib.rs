@@ -781,7 +781,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 #[cfg(not(test))]
                 #[doc(hidden)]
-                pub use #crate_ident as #alias_ident;
+                pub use ::#crate_ident as #alias_ident;
             }
         })
         .collect();
