@@ -74,7 +74,7 @@ The concrete renames:
 |---|---|
 | `HealthStatus { Healthy, Unhealthy }` | `InstanceState { Enabled, Disabled }` |
 | `HealthFilter { Healthy, Unhealthy, Any }` | `StateFilter { Enabled, Disabled, Any }` |
-| `ServiceHandle::set_health(HealthStatus)` | `ServiceHandle::set_enabled(bool)` |
+| `ServiceHandle::set_health(HealthStatus)` | `ServiceHandle::set_state(InstanceState)` |
 | `DiscoveryFilter::health` | `DiscoveryFilter::state` |
 | `ServiceInstance.health` | `ServiceInstance.state` |
 | `ServiceDiscovery::discover_healthy(name)` | `ServiceDiscovery::discover(name, filter)` (with `filter.state = StateFilter::Enabled` as the default for primary routing) |
@@ -149,7 +149,7 @@ The default-is-enabled choice keeps consumer code minimal at the common case (`s
 
 ### Confirmation
 
-- A consumer-side smoke test registers an instance with `state: Enabled`, calls `set_enabled(false)`, and asserts that `discover` with default filter returns an empty list.
+- A consumer-side smoke test registers an instance with `state: Enabled`, calls `set_state(InstanceState::Disabled)`, and asserts that `discover` with default filter returns an empty list.
 - A heartbeat-stop test stops a registered instance's heartbeat (without calling `deregister`); after `TTL + epsilon`, asserts the instance disappears from `discover` with `StateFilter::Any`.
 - A docs lint (Phase 0d/0e) greps `ServiceDiscovery` API surface (struct fields, enum variants, method names, doc comments) and asserts no occurrence of "health", "healthy", "unhealthy".
 - Future K8s plugin integration tests register instances as Lease objects and verify discovery returns them; explicitly do NOT register `EndpointSlice` resources.
@@ -175,7 +175,7 @@ The default-is-enabled choice keeps consumer code minimal at the common case (`s
 ### Option 3: Rename to `InstanceState { Enabled, Disabled }` with honest semantics (CHOSEN)
 
 - Good, because the renamed surface accurately models what the API actually does — gear-declared serving intent.
-- Good, because it keeps the useful "drain-traffic" use case intact (a shutting-down gear flips `set_enabled(false)` before it stops heartbeating).
+- Good, because it keeps the useful "drain-traffic" use case intact (a shutting-down gear flips `set_state(InstanceState::Disabled)` before it stops heartbeating).
 - Good, because it's clear that liveness comes from heartbeat/TTL, not from `state`. No room for false confidence.
 - Good, because external probes can be added later as a separate, composable signal without breaking the `state` contract.
 - Good, because the K8s `Lease`-per-instance mapping is a clean, native K8s concept that doesn't lie about probe-driven semantics.
@@ -193,7 +193,7 @@ The default-is-enabled choice keeps consumer code minimal at the common case (`s
 
 **The dispatcher use case that anchored the decision.** The event broker dispatcher routes messages to delivery instances by `topic-shard`. Topics are added at runtime; shard-to-instance assignment is dynamic. The dispatcher needs `discover("delivery", filter.metadata("topic-shard", MetaMatch::OneOf(["t1-s0", "t1-s1", "t2-s0"])))` and the result is the set of instances responsible for those shards. Service discovery with metadata + watch is the right shape; K8s `Service`/`EndpointSlice` is not.
 
-**Why `set_enabled(bool)` and not `set_state(InstanceState)`.** A bool at the call site is unambiguous: `handle.set_enabled(false)`. An enum at the call site invites typos and arguably a stutter (`handle.set_state(InstanceState::Disabled)`). The internal storage uses the enum (`InstanceState`) because it's `#[non_exhaustive]` and may grow new variants; the setter takes a bool because today the field is binary.
+**Why `set_state(InstanceState)` and not `set_enabled(bool)`.** An earlier revision exposed the setter as `set_enabled(bool)`, reasoning that a bool reads unambiguously at the call site. Code review (PR #4098) reversed this: the domain already models the serving-intent state space as the `InstanceState` enum, so a bool forced every backend and the command/request path to re-map `true`/`false` back to `InstanceState` by hand — duplicated mapping that invites inconsistency — and `set_enabled(false)` is in fact *less* self-documenting than `set_state(InstanceState::Disabled)`. The setter therefore takes `InstanceState` directly, carrying the typed intent end-to-end through `ServiceCommand`/`ServiceRequest::SetState` with no lossy bool hop.
 
 **Why state is NOT scoped by `scoped(prefix)`.** Per DESIGN.md §3.8, the per-primitive scoping rules namespace the service `name` only — `metadata` keys/values pass through unchanged, and so does `state`. State is a property of an instance, not a coordination namespace.
 
@@ -218,10 +218,10 @@ This decision directly addresses the following requirements and design elements:
 - `cpt-cf-clst-fr-sd-register` — Heartbeat/TTL renewal is the liveness signal, not state.
 - `cpt-cf-clst-fr-sd-register` — Explicit deregister; no probe-driven endpoint flipping.
 - DESIGN §3.1 `InstanceState` definition and `StateFilter` semantics.
-- DESIGN §3.3 service-discovery contract — `register` / `discover` / `watch` / `set_enabled` method shapes.
+- DESIGN §3.3 service-discovery contract — `register` / `discover` / `watch` / `set_state` method shapes.
 - DESIGN §4.1 K8s plugin mapping — `Lease` per instance, NOT `EndpointSlice`.
 
 **Sibling ADRs:**
 
 - ADR-001 — `CacheBasedServiceDiscoveryBackend` uses heartbeat/TTL liveness consistent with this ADR.
-- ADR-005 — `ServiceDiscoveryV1` facade hosts the renamed `set_enabled` / `state` surface.
+- ADR-005 — `ServiceDiscoveryV1` facade hosts the renamed `set_state` / `state` surface.

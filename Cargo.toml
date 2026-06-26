@@ -56,6 +56,7 @@ members = [
     "gears/system/account-management/account-management-sdk",
     "gears/system/account-management/plugins/static-idp-plugin",
     "gears/system/api-gateway",
+    "gears/system/cluster/cluster-sdk",
     "gears/system/grpc-hub",
     "gears/system/nodes-registry/nodes-registry",
     "gears/system/nodes-registry/nodes-registry-sdk",
