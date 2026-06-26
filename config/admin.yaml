@@ -1,0 +1,251 @@
+# CF/Gears Example Server — Admin Panel configuration
+#
+# Derived from config/quickstart.yaml. Differences vs quickstart:
+#   1. api-gateway.auth_disabled = false  -> bearer-token auth is ON so the
+#      two-role admin stub actually drives the SecurityContext.
+#   2. static-authn-plugin.mode = static_tokens with two NON-PRODUCTION dev
+#      tokens mapped to a platform-admin and a tenant-admin identity. The
+#      role marker rides on `subject_type`; the admin-context endpoint reads
+#      it to select the admin mode.
+#
+# !!! NON-PRODUCTION !!!
+# The static dev tokens below are for local admin-panel development and demos
+# only. They are not secrets and MUST NOT be used in any real deployment.
+#
+# Run:  make admin   (builds the SPA and starts the server with this config)
+
+server:
+  home_dir: "~/.cf-gears"
+
+database:
+  servers:
+    sqlite_users:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/cf-gears.log"
+    file_level: info
+    max_age_days: 28
+    max_backups: 3
+    max_size_mb: 10
+  sqlx:
+    console_level: debug
+    file: "logs/sql.log"
+    file_level: debug
+  api-gateway:
+    console_level: debug
+    file: "logs/api.log"
+    file_level: debug
+    max_age_days: 28
+    max_backups: 3
+    max_size_mb: 100
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      prefix_path: "/cf"
+      openapi:
+        title: "CF/Gears Example Server API"
+        version: "0.1.0"
+        description: "CF/Gears Example Server API Documentation"
+      defaults:
+        body_limit_bytes: 64000000
+        rate_limit:
+          rps: 1000
+          burst: 200
+          in_flight: 64
+
+      # Admin panel: bearer-token auth ENABLED so the two-role stub applies.
+      auth_disabled: false
+
+  gear-orchestrator:
+    config: {}
+
+  grpc-hub:
+    config:
+      listen_addr: "uds:///tmp/cf-gears-grpc"
+
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # NON-PRODUCTION two-role admin stub.
+  # Present a bearer token to authenticate as the matching role:
+  #   Authorization: Bearer platform-admin-dev-token   -> platform admin (root tenant)
+  #   Authorization: Bearer tenant-admin-dev-token      -> tenant admin (engineering tenant)
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: static_tokens
+      tokens:
+        - token: "platform-admin-dev-token"
+          identity:
+            # Platform/operator admin, homed at the structural root tenant.
+            subject_id: "11111111-1111-1111-1111-111111111111"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            token_scopes: ["*"]
+            subject_type: "platform_admin"
+        - token: "tenant-admin-dev-token"
+          identity:
+            # Tenant admin. Homed at the bootstrap-seeded platform root so its
+            # tenant-scoped views resolve in AM out of the box (AM seeds only
+            # the root deterministically; child tenant ids are server-assigned
+            # and not stable across a fresh db, so we cannot hardcode a child).
+            # The platform-vs-tenant distinction is still demonstrated via
+            # admin_mode + capabilities. Strict per-child tenant scoping in the
+            # demo needs a seed-then-configure step (follow-up).
+            subject_id: "22222222-2222-2222-2222-222222222222"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            token_scopes: ["*"]
+            subject_type: "tenant_admin"
+      s2s_credentials:
+        - client_id: "mini-chat"
+          client_secret: "mini-chat-dev-secret"
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  # Demo IdP: implements provision_tenant (needed by AM bootstrap) and the
+  # tenant user surface. NON-PRODUCTION.
+  static-idp-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  account-management:
+    database:
+      server: "sqlite_users"
+      file: "account_management.db"
+    config:
+      bootstrap:
+        root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+        root_name: "e2e-root"
+        root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        idp_wait_timeout: "5m"
+        idp_retry_backoff_initial: "2s"
+        idp_retry_backoff_max: "30s"
+        strict: false
+      idp:
+        # static-idp-plugin (below, feature `static-idp`) implements
+        # provision_tenant, which the bootstrap saga calls when seeding the
+        # platform root. Without it the saga rolls back and the tenants table
+        # stays empty. required=true wires the plugin before AM in topo-sort.
+        vendor: "constructorfabric"
+        required: true
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
+
+  simple-user-settings:
+    database:
+      server: "sqlite_users"
+      file: "settings.db"
+    config:
+      max_field_length: 100
+
+  # Register the platform-root tenant type so AM's bootstrap saga can seed
+  # the root tenant (the tenant-type checker resolves this via types-registry;
+  # without it the saga fails and the tenants table stays empty -> 404s). The
+  # AM envelope schemas are auto-seeded by the AM SDK; only the concrete
+  # platform/customer types below are operator-controlled.
+  types-registry:
+    config:
+      entities:
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Platform-root tenant type (no parents)."
+          type: "object"
+          x-gts-traits:
+            allowed_parent_types: []
+            idp_provisioning: false
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Customer tenant under the platform root."
+          type: "object"
+          x-gts-traits:
+            allowed_parent_types:
+              - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+              - "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+            idp_provisioning: false
+
+  tenant-resolver:
+    config:
+      vendor: "constructorfabric"
+  static-tr-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 20
+      tenants:
+        - id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          name: "default"
+          parent_id: null
+          status: active
+        - id: "00000000-0000-0000-0000-000000000001"
+          name: "company-root"
+          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000002"
+          name: "engineering"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000005"
+          name: "sales"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000004"
+          name: "backend"
+          parent_id: "00000000-0000-0000-0000-000000000002"
+          status: active
+        - id: "00000000-0000-0000-0000-000000000006"
+          name: "enterprise"
+          parent_id: "00000000-0000-0000-0000-000000000005"
+          status: active
+
+  static-credstore-plugin:
+    config:
+      secrets:
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          key: "openai-key"
+          value: "sk-test-e2e-fake-key"
+
+  file-parser:
+    config:
+      allowed_local_base_dir: /tmp
+
+opentelemetry:
+  resource:
+    service_name: "cf-gears-api"
+    attributes:
+      service.version: "1.3.7"
+      deployment.environment: "dev"
+      service.namespace: "cf-gears"
+  exporter:
+    kind: "otlp_grpc"
+    endpoint: "http://127.0.0.1:4317"
+    timeout_ms: 5000
+  tracing:
+    enabled: false
+  metrics:
+    enabled: false

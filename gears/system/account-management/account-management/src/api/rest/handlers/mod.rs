@@ -1,5 +1,6 @@
 //! REST handler functions for the Account Management gear.
 
+pub mod admin_context;
 pub mod common;
 pub mod conversions;
 pub mod me;
@@ -7,6 +8,7 @@ pub mod metadata;
 pub mod tenants;
 pub mod users;
 
+pub(crate) use admin_context::get_admin_context;
 pub(crate) use conversions::{
     get_child_conversion, get_own_conversion, list_child_conversions, list_own_conversions,
     patch_child_conversion, patch_own_conversion, request_child_conversion, request_own_conversion,

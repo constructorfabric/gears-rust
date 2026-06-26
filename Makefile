@@ -677,7 +677,7 @@ fuzz-corpus: fuzz-install
 
 # -------- Main targets --------
 
-.PHONY: all check ci ci_test ci_docs build cargo-build split-debug quickstart example mini-chat mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
+.PHONY: all check ci ci_test ci_docs build cargo-build split-debug quickstart example admin mini-chat mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
 
 # Start server with quickstart config
 quickstart:
@@ -687,6 +687,10 @@ quickstart:
 ## Run server with example gear
 example:
 	cargo run --bin cf-gears-example-server $(E2E_ARGS) -- --config config/quickstart.yaml run
+
+## Run server with the integrated admin panel (config/admin.yaml, two-role dev auth stub)
+admin:
+	cargo run --bin cf-gears-example-server --features account-management,static-authn,static-authz,static-idp,static-tenants,static-credstore,otel -- --config config/admin.yaml run
 
 # mini-chat targets are for running the mini-chat gear locally and in Kubernetes, with options for building Docker images and deploying with Helm.
 ## Run server with fips gear
