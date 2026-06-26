@@ -43,8 +43,11 @@ axum = { workspace = true, features = ["macros"] }
 http = { workspace = true }
 utoipa = { workspace = true, features = ["time"] }
 resource-group-sdk = { workspace = true }
+resource-group = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
+tenant-resolver = { workspace = true }
 types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
 gts = { workspace = true }
 
 uuid = { workspace = true, features = ["v4", "serde"] }
@@ -76,6 +79,7 @@ tokio-util = { workspace = true }
 anyhow = { workspace = true }
 
 authz-resolver-sdk = { workspace = true }
+authz-resolver = { workspace = true }
 
 [features]
 # Gates the Postgres-backed real-DB integration tests. Disabled by

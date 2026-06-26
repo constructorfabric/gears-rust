@@ -37,6 +37,10 @@ oagw-sdk = { workspace = true }
 
 # Types registry for plugin discovery
 types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+authn-resolver = { workspace = true }
+authz-resolver = { workspace = true }
+oagw = { workspace = true }
 
 # Core dependencies
 anyhow = { workspace = true }

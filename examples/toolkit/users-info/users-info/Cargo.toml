@@ -20,6 +20,7 @@ users-info-sdk = { path = "../users-info-sdk", features = ["odata"] }
 
 # AuthZ resolver for authorization (PEP flow)
 authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", path = "../../../../gears/system/authz-resolver/authz-resolver-sdk" }
+authz-resolver = { workspace = true }
 
 # Core dependencies
 anyhow = { workspace = true }

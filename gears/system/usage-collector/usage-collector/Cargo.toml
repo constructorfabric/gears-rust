@@ -20,7 +20,9 @@ workspace = true
 [dependencies]
 usage-collector-sdk = { workspace = true }
 types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
 authz-resolver-sdk = { workspace = true }
+authz-resolver = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

@@ -22,6 +22,8 @@ workspace = true
 tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.8", path = "../../tenant-resolver-sdk" }
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.1.5", path = "../../../resource-group/resource-group-sdk" }
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.2.3", path = "../../../types-registry/types-registry-sdk" }
+types-registry = { workspace = true }
+resource-group = { workspace = true }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
