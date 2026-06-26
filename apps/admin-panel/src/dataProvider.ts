@@ -2,94 +2,111 @@ import type { DataProvider } from "@refinedev/core";
 
 import { API_PREFIX } from "./config";
 import { apiFetch } from "./httpClient";
-import { cachedAdminContext } from "./adminContext";
+import { cachedAdminContext, type AdminContext } from "./adminContext";
+import {
+  getDescriptor,
+  idField,
+  type ResourceDescriptor,
+} from "./resources";
 
-// v0 resource map. OpenAPI-first discovery + a curated registry replaces this
-// hardcoding in a later increment (see ADR-0003). Each resource declares how
-// to build its list/detail paths from the admin context.
-type PathFn = (id?: string) => string;
+// Descriptor-driven Gears data provider. CRUD verbs are resolved from the
+// resource registry: the data provider holds no per-resource knowledge beyond
+// what the descriptors declare, so new resources need no provider changes.
 
-interface ResourceDef {
-  list: PathFn;
-  one?: PathFn;
+function requireContext(): AdminContext {
+  const ctx = cachedAdminContext();
+  if (!ctx) {
+    throw new Error("No admin context — sign in first");
+  }
+  return ctx;
 }
-
-const RESOURCES: Record<string, ResourceDef> = {
-  tenants: {
-    list: () => {
-      const ctx = cachedAdminContext();
-      const root = ctx?.subject_tenant_id ?? "";
-      return `/account-management/v1/tenants/${root}/children`;
-    },
-    one: (id) => `/account-management/v1/tenants/${id}`,
-  },
-  "resource-groups": {
-    list: () => "/resource-group/v1/groups",
-    one: (id) => `/resource-group/v1/groups/${id}`,
-  },
-  types: {
-    list: () => "/types-registry/v1/entities",
-  },
-  gears: {
-    list: () => "/gear-orchestrator/v1/gears",
-  },
-};
 
 // Gears list endpoints return either a bare array (gears, entities) or a
 // cursor `Page<T>` envelope `{ items, page_info }`. Normalize both, and
-// guarantee every record has an `id` for Refine's row key.
-function normalizeList(payload: unknown): Record<string, unknown>[] {
+// guarantee every record carries an `id` (Refine's row key) by falling back
+// to the descriptor's identity field.
+function normalizeList(
+  payload: unknown,
+  d: ResourceDescriptor,
+): Record<string, unknown>[] {
+  // Cursor pages use `items`; types-registry wraps its rows in `entities`.
+  const env = payload as { items?: unknown[]; entities?: unknown[] };
   const items: unknown[] = Array.isArray(payload)
     ? payload
-    : ((payload as { items?: unknown[] })?.items ?? []);
-  return items.map((it, idx) => {
-    const rec = (it ?? {}) as Record<string, unknown>;
-    if (rec.id === undefined) {
-      rec.id = rec.gts_id ?? rec.name ?? String(idx);
-    }
-    return rec;
-  });
+    : (env?.items ?? env?.entities ?? []);
+  return items.map((it, idx) => normalizeRecord(it, d, idx));
 }
 
-function resourceDef(resource: string): ResourceDef {
-  const def = RESOURCES[resource];
-  if (!def) {
-    throw new Error(`Unknown admin resource: ${resource}`);
+function normalizeRecord(
+  it: unknown,
+  d: ResourceDescriptor,
+  idx = 0,
+): Record<string, unknown> {
+  const rec = { ...((it ?? {}) as Record<string, unknown>) };
+  if (rec.id === undefined) {
+    rec.id = rec[idField(d)] ?? rec.gts_id ?? rec.name ?? String(idx);
   }
-  return def;
+  return rec;
+}
+
+function unsupported(verb: string, resource: string): never {
+  throw new Error(`${verb} is not supported for "${resource}"`);
 }
 
 export const dataProvider: DataProvider = {
   getApiUrl: () => API_PREFIX,
 
   getList: async ({ resource }) => {
-    const def = resourceDef(resource);
-    const payload = await apiFetch<unknown>(def.list());
-    const data = normalizeList(payload);
+    const d = getDescriptor(resource);
+    const payload = await apiFetch<unknown>(d.paths.list(requireContext()));
+    const data = normalizeList(payload, d);
     return { data: data as never, total: data.length };
   },
 
   getOne: async ({ resource, id }) => {
-    const def = resourceDef(resource);
-    if (!def.one) {
-      throw new Error(`Resource ${resource} has no detail endpoint`);
-    }
-    const data = await apiFetch<Record<string, unknown>>(def.one(String(id)));
-    return { data: data as never };
-  },
-
-  create: async () => {
-    throw new Error("create is not implemented in the v0 admin data provider");
-  },
-
-  update: async () => {
-    throw new Error("update is not implemented in the v0 admin data provider");
-  },
-
-  deleteOne: async () => {
-    throw new Error(
-      "deleteOne is not implemented in the v0 admin data provider",
+    const d = getDescriptor(resource);
+    if (!d.paths.one) unsupported("getOne", resource);
+    const raw = await apiFetch<Record<string, unknown>>(
+      d.paths.one(requireContext(), String(id)),
     );
+    return { data: normalizeRecord(raw, d) as never };
+  },
+
+  create: async ({ resource, variables }) => {
+    const d = getDescriptor(resource);
+    if (!d.paths.create) unsupported("create", resource);
+    const raw = await apiFetch<Record<string, unknown>>(
+      d.paths.create(requireContext()),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(variables ?? {}),
+      },
+    );
+    return { data: normalizeRecord(raw, d) as never };
+  },
+
+  update: async ({ resource, id, variables }) => {
+    const d = getDescriptor(resource);
+    if (!d.paths.update) unsupported("update", resource);
+    const raw = await apiFetch<Record<string, unknown>>(
+      d.paths.update(requireContext(), String(id)),
+      {
+        method: d.updateMethod ?? "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(variables ?? {}),
+      },
+    );
+    return { data: normalizeRecord(raw, d) as never };
+  },
+
+  deleteOne: async ({ resource, id }) => {
+    const d = getDescriptor(resource);
+    if (!d.paths.remove) unsupported("deleteOne", resource);
+    await apiFetch<unknown>(d.paths.remove(requireContext(), String(id)), {
+      method: "DELETE",
+    });
+    return { data: { id } as never };
   },
 
   custom: async ({ url, method, payload }) => {
