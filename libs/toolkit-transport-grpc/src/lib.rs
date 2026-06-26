@@ -1,6 +1,7 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 mod backoff;
 pub mod client;
+pub mod internal_auth;
 pub mod rpc_retry;
 
 #[cfg(windows)]
@@ -8,6 +9,10 @@ pub mod windows_named_pipe;
 
 #[cfg(windows)]
 pub use windows_named_pipe::{NamedPipeConnection, NamedPipeIncoming, create_named_pipe_incoming};
+
+pub use internal_auth::{
+    InternalAuthInterceptor, attach_internal_token_grpc, extract_internal_token_grpc,
+};
 
 pub const SECCTX_METADATA_KEY: &str = "x-secctx-bin";
 
