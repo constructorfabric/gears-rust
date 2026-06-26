@@ -56,6 +56,11 @@ Direction:
 - Where OpenAPI and the registry overlap (fields, operations), OpenAPI provides defaults and the registry overrides.
 - The registry's descriptor shape is designed to match a future gear-contributed descriptor schema, so the v0 hardcoded registry can later be populated from gear-shipped metadata without reworking the frontend.
 
+#### Implementation status (v0)
+
+- **Done**: the curated descriptor registry (`apps/admin-panel/src/resources`) and a fully descriptor-driven data provider and List/Show/Create/Edit screens. Descriptors carry paths, fields with per-view visibility and create-time immutability, capabilities, safety level, tenant scope, and custom actions; new resources are added by appending a descriptor. Covers tenants (full CRUD + suspend/unsuspend/soft-delete), resource-groups (CRUD), conversions (read + approve/reject/cancel), and read-only types/gears.
+- **Still deferred**: runtime parsing of `/openapi.json` to *derive* field/filter/order defaults (the v0 fields are hand-curated from the served OpenAPI rather than read at runtime), and the gear-contributed descriptor mechanism (`cpt-admin-panel-fr-gear-contributed-metadata`). The descriptor shape is forward-compatible with both.
+
 ### Consequences
 
 - A descriptor schema (resource + field + action shapes) must be defined in the admin app and documented; it is the contract the future gear-contributed mechanism will emit.
