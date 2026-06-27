@@ -1,0 +1,52 @@
+name: Auto DCO Signoff for Docs
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'docs/web-docs/**'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Fetch base repository
+        run: |
+          git remote add base https://github.com/${{ github.event.pull_request.base.repo.full_name }}.git
+          git fetch base ${{ github.base_ref }}
+
+      - name: Add DCO signoff to docs commits
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          NEEDS_SIGNOFF=false
+
+          while IFS= read -r commit; do
+            if ! git log -1 --format=%B "$commit" | grep -q "^Signed-off-by:"; then
+              NEEDS_SIGNOFF=true
+              echo "Adding signoff to $commit"
+            fi
+          done < <(git rev-list base/$BASE_BRANCH..HEAD)
+
+          if [ "$NEEDS_SIGNOFF" = true ]; then
+            GIT_COMMITTER_NAME="github-actions[bot]" \
+            GIT_COMMITTER_EMAIL="github-actions[bot]@users.noreply.github.com" \
+            git rebase --signoff base/$BASE_BRANCH
+            git push --force-with-lease
+            echo "✅ Added DCO signoff"
+          else
+            echo "✅ Already signed"
+          fi

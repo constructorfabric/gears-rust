@@ -8,10 +8,13 @@ on:
       - 'docs/**'
   workflow_dispatch:
 
-# Cancel previous runs for the same ref to save CI minutes.
+# Concurrency strategy:
+# - On pull_request: group by PR number. New commits cancel the in-flight run.
+# - On push (main/develop): include run_id so pushes never cancel each other,
+#   preventing required CI from silently being dropped.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
