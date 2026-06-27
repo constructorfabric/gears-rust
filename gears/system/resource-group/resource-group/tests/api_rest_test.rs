@@ -31,13 +31,13 @@ use toolkit_db::{
 };
 use toolkit_security::{SecurityContext, pep_properties};
 
-use cf_gears_resource_group::domain::group_service::{GroupService, QueryProfile};
-use cf_gears_resource_group::domain::membership_service::MembershipService;
-use cf_gears_resource_group::domain::type_service::TypeService;
-use cf_gears_resource_group::infra::storage::group_repo::GroupRepository;
-use cf_gears_resource_group::infra::storage::membership_repo::MembershipRepository;
-use cf_gears_resource_group::infra::storage::migrations::Migrator;
-use cf_gears_resource_group::infra::storage::type_repo::TypeRepository;
+use resource_group::domain::group_service::{GroupService, QueryProfile};
+use resource_group::domain::membership_service::MembershipService;
+use resource_group::domain::type_service::TypeService;
+use resource_group::infra::storage::group_repo::GroupRepository;
+use resource_group::infra::storage::membership_repo::MembershipRepository;
+use resource_group::infra::storage::migrations::Migrator;
+use resource_group::infra::storage::type_repo::TypeRepository;
 
 // ── Noop OpenAPI Registry for tests ─────────────────────────────────────
 
@@ -149,7 +149,7 @@ async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
     ));
 
     let openapi = NoopOpenApiRegistry;
-    let router = cf_gears_resource_group::api::rest::routes::register_routes(
+    let router = resource_group::api::rest::routes::register_routes(
         Router::new(),
         &openapi,
         type_svc.clone(),
@@ -717,7 +717,7 @@ async fn build_shared_router() -> (
         Arc::new(TypeRepository),
         Arc::new(MembershipRepository),
     ));
-    let router = cf_gears_resource_group::api::rest::routes::register_routes(
+    let router = resource_group::api::rest::routes::register_routes(
         Router::new(),
         &NoopOpenApiRegistry,
         type_svc.clone(),

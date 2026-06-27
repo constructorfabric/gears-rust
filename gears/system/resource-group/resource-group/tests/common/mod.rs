@@ -23,13 +23,13 @@ use toolkit_db::{
 };
 use toolkit_security::{SecurityContext, pep_properties};
 
-use cf_gears_resource_group::domain::group_service::{GroupService, QueryProfile};
-use cf_gears_resource_group::domain::membership_service::MembershipService;
-use cf_gears_resource_group::domain::type_service::TypeService;
-use cf_gears_resource_group::infra::storage::group_repo::GroupRepository;
-use cf_gears_resource_group::infra::storage::membership_repo::MembershipRepository;
-use cf_gears_resource_group::infra::storage::migrations::Migrator;
-use cf_gears_resource_group::infra::storage::type_repo::TypeRepository;
+use resource_group::domain::group_service::{GroupService, QueryProfile};
+use resource_group::domain::membership_service::MembershipService;
+use resource_group::domain::type_service::TypeService;
+use resource_group::infra::storage::group_repo::GroupRepository;
+use resource_group::infra::storage::membership_repo::MembershipRepository;
+use resource_group::infra::storage::migrations::Migrator;
+use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::{
     CreateGroupRequest, CreateTypeRequest, ResourceGroup as ResourceGroupModel, ResourceGroupType,
 };
@@ -394,7 +394,7 @@ pub async fn assert_closure_rows(
     descendant_id: Uuid,
     expected: &[(Uuid, i32)],
 ) {
-    use cf_gears_resource_group::infra::storage::entity::resource_group_closure::{
+    use resource_group::infra::storage::entity::resource_group_closure::{
         Column, Entity as ClosureEntity,
     };
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -429,7 +429,7 @@ pub async fn assert_closure_count(
     group_ids: &[Uuid],
     expected_total: usize,
 ) {
-    use cf_gears_resource_group::infra::storage::entity::resource_group_closure::{
+    use resource_group::infra::storage::entity::resource_group_closure::{
         Column, Entity as ClosureEntity,
     };
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
