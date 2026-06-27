@@ -21,8 +21,8 @@ workspace = true
 # Trait boundaries of consumed SDKs are `CanonicalError` (ADR 0005).
 toolkit-canonical-errors = { workspace = true }
 # Local dependencies
-tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.8", path = "../tenant-resolver-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.2.3", path = "../../types-registry/types-registry-sdk" }
+tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.9", path = "../tenant-resolver-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.0", path = "../../types-registry/types-registry-sdk" }
 
 # ToolKit dependencies
 toolkit = { workspace = true }

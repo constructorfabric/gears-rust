@@ -21,7 +21,7 @@ odata = []
 
 [dependencies]
 # SDK - public API, models, and errors
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.1.5", path = "../resource-group-sdk", features = ["odata"] }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.0", path = "../resource-group-sdk", features = ["odata"] }
 
 # Core dependencies
 anyhow = { workspace = true }
