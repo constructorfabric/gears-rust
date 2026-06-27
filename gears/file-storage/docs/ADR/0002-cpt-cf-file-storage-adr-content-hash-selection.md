@@ -33,7 +33,7 @@ date: 2026-05-13
 
 ## Context and Problem Statement
 
-FileStorage proxies all file content traffic between clients and storage backends (`cpt-cf-file-storage-adr-proxy-content-traffic`). Every byte transits the service, so content integrity verification — covering both accidental corruption (network, disk, broken intermediaries) and adversarial tampering — is a first-order requirement. The service must commit to a hash strategy that:
+FileStorage routes all file content through its data-plane sidecar (`cpt-cf-file-storage-adr-sidecar-data-plane`). Every byte transits the sidecar, so content integrity verification — covering both accidental corruption (network, disk, broken intermediaries) and adversarial tampering — is a first-order requirement. The service must commit to a hash strategy that:
 
 1. Works for **P1** (current scope), where uploads are single-part and the algorithm needs to be predictable, FIPS-acceptable, and operationally boring.
 2. Extends cleanly to **P2**, where multipart upload (`cpt-cf-file-storage-fr-multipart-upload`) lands and the algorithm choice starts to interact with server-side multipart finalization cost, per-tenant policy, per-file-size routing, and storage-backend trust models.
@@ -247,11 +247,11 @@ P1 has no multipart upload. The load-bearing argument for BLAKE3 — tree-mode m
 
 - **PRD**: [PRD.md](../PRD.md)
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
-- **ADR-0001**: [Proxy All File Content Traffic Through FileStorage](./0001-cpt-cf-file-storage-adr-proxy-content-traffic.md)
+- **ADR-0003**: [Split the Data Plane into a Signed-URL Sidecar](./0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)
 
 This decision directly addresses the following requirements or design elements:
 
-* `cpt-cf-file-storage-adr-proxy-content-traffic` — Because all content traffic transits FileStorage, hashing happens on the proxy streaming path; the algorithm choice is a platform decision rather than a backend-native concern
+* `cpt-cf-file-storage-adr-sidecar-data-plane` — Because all content traffic transits the sidecar, hashing happens on the sidecar streaming path; the algorithm choice is a platform decision rather than a backend-native concern
 * `cpt-cf-file-storage-fr-multipart-upload` — P2 multipart upload is the trigger for opening the algorithm choice; tree-mode finalization for BLAKE3 backends interacts with the multipart wire protocol
 * `cpt-cf-file-storage-fr-backend-abstraction` — P2 backend abstraction surfaces the configured `hash_policy` (default, allow-list, selection rules) so that upload / download paths route hashing through the matching implementation
 * `cpt-cf-file-storage-fr-backend-capabilities` — P2 extends per-backend capability declaration with `supported_hash_algorithms`

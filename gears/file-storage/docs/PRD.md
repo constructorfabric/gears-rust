@@ -59,8 +59,28 @@ FileStorage is a universal file storage and management service for the Gears mid
 download, metadata management, and tenant-scoped access control for any gear or user within the platform. All
 access in P1 is authenticated — anonymous/external sharing is deferred to a separate concern (P3, see `§5.3`).
 
-The service supports pluggable storage backends, multiple access protocols (REST, S3-compatible, WebDAV), tenant-scoped
-access control with an ownership model, and policy-driven governance for file types and sizes.
+FileStorage is split into two cooperating planes (see
+[ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)):
+
+- a **control plane** (the FileStorage API/SDK) that owns metadata, authorization, versioning, and
+  conditional-request semantics, and whose REST surface **never carries file content** — it issues short-lived
+  **signed URLs** instead;
+- a **data-plane sidecar** that is the only component to move user bytes, is connected to the storage backends, and
+  serves content exclusively through those signed URLs.
+
+The sidecar is a deliberate **platform-level exception** to the standard "API Gateway owns REST hosting" model: it is
+**not** an ordinary gear REST route fronted by the API Gateway, but a dedicated byte-moving data plane with its own
+host/URL that clients reach directly via signed URLs. This exception is what lets the data plane scale independently
+and keeps content off the control-plane (gateway) path; how it authenticates and is contracted is specified in
+DESIGN.md §3.3 and §4.5.
+
+Consequently every content operation is at least two requests: a control request to obtain a signed URL, plus one or
+more data requests against the sidecar. Backends are never addressed by clients directly — the signed URL always
+points at the sidecar — so backend opacity, centralized per-byte metering, and uniform audit/policy coverage are
+preserved while the byte-moving data plane scales independently of the control plane.
+
+The service supports pluggable storage backends, tenant-scoped access control with an ownership model, and
+policy-driven governance for file types and sizes.
 
 ### 1.2 Background / Problem Statement
 
@@ -99,7 +119,14 @@ Gears security and governance model.
 | Term                | Definition                                                                                                                                                                                                                                                                              |
 |---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | File                | Binary content stored in FileStorage with associated metadata                                                                                                                                                                                                                           |
-| File URL            | The persistent, unsigned URL by which a file is read from FileStorage. The same URL is returned to every consumer — no expiration, no per-user targeting. Concrete REST paths are defined in [DESIGN.md](./DESIGN.md) and [api.md](./api.md)                                                  |
+| Control Plane       | The FileStorage API/SDK. Owns metadata, authorization, versioning, and conditional-request semantics; issues signed URLs. Its REST surface never carries file content                                                                                                                    |
+| Sidecar (Data Plane)| The only component that moves user bytes. Has its own domain/URL, is connected to the storage backends, validates platform auth tokens and signed-URL signatures, and reaches the control plane via the FS SDK. Serves content only through signed URLs                                  |
+| Signed URL          | A short-lived, control-minted **PASETO `v4.public`** token (Ed25519) pointing at the sidecar that authorizes one content operation (`GET`/`PUT`/part) on a specific object, subject to AND-combined claims (`exp`, optional `ip`, optional token-claim predicates, upload size/hash). Carried in the query (`?fs-token=`) or a header; **opaque** to all but control+sidecar (`cpt-cf-file-storage-fr-signed-urls`) |
+| File ID             | The immutable uuid identity of a logical file. The current content is reached by resolving the file's content pointer (`content_id`)                                                                                                                                                     |
+| Version ID          | A uuid assigned by FileStorage (control plane) identifying one immutable content blob; the backend object lives at `/{file_id}/{version_id}` and is never mutated in place                                                                                                                |
+| Content Pointer (`content_id`) | The `version_id` currently bound as a file's live content; changing content is a pointer swap, not an in-place mutation. The content-only ETag derives from `(file_id, content_id)`                                                                                            |
+| Metadata Revision (`meta_version`) | A monotonic counter bumped on metadata-only writes; the validator for `If-Match-Metadata`                                                                                                                                                                          |
+| Bind                | The control-plane operation that swaps a file's `content_id` to a (`pending` → `available`) version under optimistic CAS (`If-Match`). A conflict (`412`) is retried by re-binding the already-uploaded `version_id` — never by re-uploading bytes                                       |
 | Metadata            | File properties: system-managed (name, size, mime_type, GTS file type, dates, owner) and user-defined custom key-value pairs                                                                                                                                                            |
 | Custom Metadata     | User-defined key-value pairs attached to a file, analogous to S3 object metadata                                                                                                                                                                                                        |
 | Owner               | The principal that owns a file: `owner_kind ∈ {user, app}` plus `owner_id`. Every file also has a separate immutable `tenant_id`                                                                                                                                                       |
@@ -107,8 +134,7 @@ Gears security and governance model.
 | Sharable Link       | A FileShare-issued (P3) reference to a FileStorage file with optional content/version pinning and access rules (anonymity, expiration, recipients, maximum download count). Out of P1 scope                                                                                                |
 | Storage Backend     | An underlying storage system (S3, GCS, Azure Blob, NFS, FTP, SMB, WebDAV) used for persisting file content                                                                                                                                                                              |
 | Policy              | A set of rules (allowed file types, size limits, events, sharing models) that constrain file operations; applicable at the tenant level and the user level independently — when both apply, the most restrictive value per aspect wins                                                  |
-| File Version        | An immutable snapshot of file content created on each upload to the same logical path when versioning is enabled; identified by an opaque version identifier assigned by the storage backend                                                                                            |
-| Version Identifier  | An opaque string assigned by the storage backend that uniquely identifies a specific version of a file; format varies by backend and must not be parsed or assumed                                                                                                                      |
+| File Version        | An immutable content blob created on each content write, stored as a distinct backend object `/{file_id}/{version_id}`. FileStorage-level (not backend-native), so versioning works on any backend (`cpt-cf-file-storage-fr-file-versioning`)                                            |
 | File Type (GTS)     | A GTS type identifier assigned to every file at upload time that classifies the file by domain, actor, and purpose (e.g., `gts.cf.fstorage.file.type.v1~x.genai.llm.autogenerated.v1~`); used by the Authorization Service to enforce per-type access control between actors and gears |
 | Backend Capability  | An optional feature that a storage backend may or may not support (e.g., presigned URLs, versioning, multipart upload); FileStorage discovers available capabilities per backend and adapts its behavior accordingly                                                                    |
 
@@ -145,6 +171,11 @@ roles) from the platform authentication middleware.
 
 ### 4.1 In Scope
 
+- Two-plane architecture: a control plane (API/SDK, metadata + authorization) and a data-plane sidecar (byte
+  transfer), per [ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)
+- Signed-URL content access: the control plane issues short-lived signed URLs that authorize a single content
+  operation against the sidecar (constraints: expiry, optional ip, optional token-claim predicates)
+- Immutable-blob + content-pointer model with FileStorage-level versioning (backend-agnostic)
 - Upload, download, delete, and list files
 - Rich file metadata storage, retrieval, and update
 - File ownership by user or app (Gear) within a tenant
@@ -186,24 +217,42 @@ roles) from the platform authentication middleware.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-upload-file`
 
-The system **MUST** accept file content with metadata and persist it, returning a persistent, accessible URL. The
-content of an existing file can be **replaced wholesale** through dedicated content-replacement operations on the
-same file — partial-byte mutation is **not** supported. When the backing storage backend declares the versioning
-capability, each replacement creates a new immutable backend version.
+The system **MUST** accept file content with metadata and persist it. Upload is a two-step exchange: the client first
+asks the control plane for a **signed upload URL** (`cpt-cf-file-storage-fr-signed-urls`), then transfers the bytes to
+the **sidecar** at that URL; the control-plane REST surface never receives the content itself. Each upload writes a
+new **immutable** content blob to the backend object `/{file_id}/{version_id}`; the file's live content is a pointer
+(`content_id`) that is **bound** to that version (`cpt-cf-file-storage-fr-file-versioning`). Backend content is
+**never mutated in place** — replacing content writes a new version and swaps the pointer; partial-byte mutation is
+**not** supported.
+
+Binding the pointer is an optimistic compare-and-swap guarded by `If-Match` (`cpt-cf-file-storage-fr-conditional-requests`):
+if the file's content changed concurrently the bind returns `412`, and the client **MUST** be able to retry the bind
+against the already-uploaded `version_id` **without re-uploading the bytes**. Rebinding is a **control-plane** operation
+independent of the signed upload URL — the upload URL's expiry does **not** affect the retry and the client does **not**
+re-presign; the `412` returns the current content ETag for the fresh `If-Match`. (Re-presigning instead would upload a
+new sibling version, later reconciled by `cpt-cf-file-storage-fr-orphan-reconciliation`.)
 
 **Rationale**: All platform gears and users need to store files — gears store generated content, documents, and
-artifacts, users upload files directly. Coupling content replacement to backend versioning preserves recoverability
-where the backend supports it without forcing consumers to rotate file identifiers.
+artifacts, users upload files directly. Separating the signed control request from the sidecar byte transfer keeps the
+control plane out of the data path; the immutable-blob + pointer model makes versioning backend-agnostic and makes a
+concurrent-write conflict cheap to recover from (re-bind, never re-upload).
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 #### Download File
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-download-file`
 
-The system **MUST** retrieve file content and metadata by URL for consumption by requesting actors.
+The system **MUST** retrieve file content for consumption by requesting actors via a two-step exchange: the client
+asks the control plane for a **signed download URL** (`cpt-cf-file-storage-fr-signed-urls`), then fetches the bytes
+from the **sidecar** at that URL. The signed URL pins a specific `content_id` (an immutable version), so it is stable
+and cacheable; the sidecar serves the bytes, honours `Range` (`cpt-cf-file-storage-fr-range-requests`) and conditional
+requests, and emits the response headers carried in the signed URL. The control-plane REST surface never returns the
+content itself. File **metadata** is retrieved separately and directly from the control plane
+(`cpt-cf-file-storage-fr-get-metadata`).
 
 **Rationale**: All platform gears and users need to retrieve stored files — gears fetch media and documents, users
-download files directly.
+download files directly. Issuing a signed URL keeps the control plane out of the byte path while preserving backend
+opacity (the URL points at the sidecar, never the backend) and central metering/audit on the sidecar.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 #### Delete File
@@ -211,14 +260,17 @@ download files directly.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-delete-file`
 
 The system **MUST** allow any actor authorized for the **delete** action on the file's GTS type
-(`cpt-cf-file-storage-fr-authorization`) to delete a file. For non-versioned files, deletion is permanent — content,
-metadata, and ownership records are removed. When versioning is enabled (`cpt-cf-file-storage-fr-file-versioning`),
-deletion without a version identifier places a soft-delete marker. Permanent removal of a specific version requires
-passing its version identifier explicitly.
+(`cpt-cf-file-storage-fr-authorization`) to delete a file. Deleting a file removes its metadata, ownership records, and
+**all** of its versions; the backend objects are deleted best-effort (a failed backend delete degrades to an orphan
+reconciled by the P2 cleanup engine, `cpt-cf-file-storage-fr-orphan-reconciliation`). Deletion is **idempotent** —
+re-deleting an already-deleted file returns `404`. A single version may instead be removed by `version_id`
+(`cpt-cf-file-storage-fr-file-versioning`), deleting only that version; deleting the only remaining version is
+equivalent to deleting the file.
 
-**Rationale**: Authorized actors need to remove files that are no longer needed. Versioned files default to
-soft-delete to enable recovery from accidental deletions. Permanent removal is an explicit, version-targeted
-operation.
+**Rationale**: Authorized actors need to remove files that are no longer needed. Recovery from an accidental content
+overwrite is provided by versioning/restore within the file's lifetime (`cpt-cf-file-storage-fr-file-versioning`); a
+file-level delete is intentional and removes the whole file. The metadata row is removed before the best-effort
+backend delete, so a deleted file never leaves a row pointing at missing bytes.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 #### Get File Metadata
@@ -277,7 +329,7 @@ the scalability benefits. Rejecting with a clear error lets clients adapt their 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-content-type-validation`
 
 The system **MUST** validate the declared mime_type against the actual file content (magic bytes / file signature) on
-every upload (all upload traffic transits FileStorage). If the declared type does not match the detected type, the
+every upload (all upload traffic transits the sidecar). If the declared type does not match the detected type, the
 system **MUST** reject the upload with an error indicating the mismatch.
 
 For multipart uploads (`cpt-cf-file-storage-fr-multipart-upload`), the system **MUST** validate the declared mime_type
@@ -322,8 +374,15 @@ Authorization Service. Read, write, and delete operations **MUST** be checked ag
 the context of the requesting user. Authorization requests **MUST** include the file's GTS type
 (`cpt-cf-file-storage-fr-file-type-classification`) in the resource context to enable per-type access decisions.
 
+For content operations the read/write decision is made by the **control plane** when it issues the signed URL, and
+the signed URL's constraints carry that authorization to the **sidecar**. When the sidecar must write metadata on the
+user's behalf (e.g. binding an uploaded version), it calls the control plane under its **own app-token plus an
+on-behalf-of `<user>`** claim, and the access decision is made against the **delegated user**, not the sidecar
+identity.
+
 **Rationale**: All file access must be governed by the platform's centralized authorization model to enforce role-based,
-tenant-scoped, and type-scoped permissions.
+tenant-scoped, and type-scoped permissions. Delegation lets the sidecar act in the data path without becoming an
+authorization principal in its own right.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 #### Tenant Boundary Enforcement
@@ -592,77 +651,77 @@ embedding policy decisions in FileStorage.
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-orphan-reconciliation`
 
 The system **MUST** automatically detect and reconcile orphan state between the metadata store and storage backends.
-Even when content traffic transits FileStorage end-to-end, the metadata-DB write and the backend object write are not
-atomic with each other, and several edge cases produce orphans:
+Because content is uploaded to the sidecar and the version is only later **bound** in the metadata DB (the two writes
+are not atomic), several edge cases produce orphans:
 
-- A backend write succeeded, but the DB transaction that would have recorded the row failed (or was rolled back) —
-  the primary P1 case, since single-shot upload uses the write-after model (commit only after a successful `put()`);
-  the in-process best-effort cleanup guard handles the common variants, leaving only hard-process-kill residue here
-- *(P2)* A `content_state = pending` row was committed (multipart pre-completion) but the content write never
-  completed, so the row was never transitioned to `available` (does not arise for P1 single-shot, which never commits
-  a row before the backend write)
-- *(P2)* A multipart upload session was initiated (`POST /files/multipart` per
-  `cpt-cf-file-storage-fr-multipart-upload`), but neither `complete` nor `abort` was ever invoked, leaving a
-  `pending` file row and uploaded parts hanging
+- A version was **pre-registered** (`status = pending`) and the bytes uploaded to the sidecar, but the **bind** never
+  happened — the client abandoned the upload, or dropped after a `412` without retrying. The `pending` version row
+  and its backend object are left dangling
+- A backend object was written (`/{file_id}/{version_id}`) but no version row exists for it (the pre-register itself
+  was lost)
+- A **non-current** version superseded by a later bind and past the retention rule (`cpt-cf-file-storage-fr-retention-policies`)
+- *(P2)* A multipart upload session was initiated but neither `complete` nor `abort` was invoked, leaving a `pending`
+  version row and uploaded parts hanging
 
-After a configurable grace period, the system **MUST** reconcile file rows against actual backend object existence and
-apply the following dispositions:
+After a configurable grace period, the system **MUST** reconcile version rows against actual backend object existence
+and apply the following dispositions:
 
-- File rows in `content_state = pending` past the grace window with **no** matching backend object → metadata row
-  deleted
-- File rows in `content_state = available` with **no** matching backend object → flagged for operator attention (do
-  **NOT** auto-delete; this most likely indicates backend data loss and requires manual review)
-- Backend objects with no matching file row → deleted at the backend (orphaned content; no metadata path can resolve
-  them)
-- *(P2)* Multipart upload sessions past the grace window with no `complete` → aborted at the backend
-  (`abortMultipartUpload`), uploaded parts discarded, the corresponding `pending` file row removed
+- `pending` version past the grace window (never bound) → delete the version row **and** its backend object
+- `available` version with **no** matching backend object → flag for operator attention (do **NOT** auto-delete; most
+  likely backend data loss requiring manual review)
+- Backend object with no matching version row → delete at the backend (orphaned content; no metadata path resolves it)
+- Non-current version beyond the retention rule → delete the version row **and** its backend object
+  (`cpt-cf-file-storage-fr-retention-policies`)
+- *(P2)* Multipart session past the grace window with no `complete` → aborted at the backend
+  (`abortMultipartUpload`), uploaded parts discarded, the corresponding `pending` version row removed
 
-Reconciliation **MUST** be an internal scheduled task — it **MUST NOT** be triggerable from any public API surface —
-and **MUST** emit audit records (`cpt-cf-file-storage-fr-audit-trail`) for every disposition it performs.
+Reconciliation **MUST** be a control-plane internal scheduled task — it **MUST NOT** be triggerable from any public
+API surface, it issues backend deletes via the sidecar — and **MUST** emit audit records
+(`cpt-cf-file-storage-fr-audit-trail`) for every disposition it performs. This engine is unified with version
+retention (`cpt-cf-file-storage-fr-retention-policies`): both prune by deleting a version row plus its backend object.
 
-**Rationale**: Two-phase commit between metadata DB and storage backend is not free; transient failures inevitably
-produce divergent state, and that divergence accumulates over time as DB rows pointing at nothing or backend objects
-no FileStorage user can see. Reconciliation keeps the two stores converged. Auto-deletion is safe for orphan content
-(no metadata points to it, so no consumer can be broken) and for stale `pending` rows (the create never finished, so
-no consumer is depending on them). The diverged-available case is the only one that requires manual handling, because
-it implies either backend data loss or a long-running inconsistency that auto-deletion would mask.
+In **P1 there is no cleanup engine** — `pending`/non-current versions and orphan blobs accumulate (the indefinite-retention
+P1 default, `cpt-cf-file-storage-fr-retention-indefinite`); acceptable at initial-release volumes.
+
+**Rationale**: Upload-then-bind across two stores inevitably produces divergence on failure, and it accumulates as
+`pending` rows pointing at blobs no consumer reached, or blobs with no row. Reconciliation keeps the two stores
+converged. Auto-deletion is safe for orphan content (no metadata points to it) and for stale `pending` versions (the
+bind never finished, so no consumer depends on them). The diverged-`available` case is the only one needing manual
+handling, because it implies backend data loss that auto-deletion would mask.
 **Actors**: `cpt-cf-file-storage-actor-cf-gears`
 
 #### File Versioning
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-file-versioning`
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-file-versioning`
 
-File versioning requires the versioning backend capability (`cpt-cf-file-storage-fr-backend-capabilities`). When the
-versioning capability is available for a backend, the system **MUST**:
+Versioning is a **FileStorage-level** feature and **MUST NOT** depend on a backend versioning capability: each version
+is a **distinct immutable backend object** at `/{file_id}/{version_id}` and the file's live content is the
+`content_id` pointer (`cpt-cf-file-storage-fr-upload-file`). It therefore works identically on every backend (S3, NAS,
+FTP, …). The system **MUST**:
 
-- Create a new version with an opaque version identifier on every file upload to the same logical path
-- Retrieve a specific file version by its version identifier
-- Retrieve metadata of a specific file version by its version identifier
-- List all versions (current and non-current) of a file, including each version's identifier, size, last modified
+- Assign a FileStorage-owned `version_id` (a uuid) on every content write and create the corresponding immutable
+  object; `version_id`s are treated as opaque uuids (never parsed for ordering — use creation time for order)
+- Retrieve a specific version's content and metadata by `version_id`
+- List all versions of a file (current and non-current) with each version's `version_id`, size, hash, creation
   timestamp, and whether it is the current version
-- Soft-delete a file (without specifying a version) by placing a logical delete marker on the current version. The
-  delete marker makes the current version inaccessible through normal file access (download, metadata queries) while
-  all non-current versions remain retrievable by their version identifiers. Soft-deleted content is **not** physically
-  removed from the storage backend — it continues to exist and **MUST** count against the owner's storage quota
-  (`cpt-cf-file-storage-fr-storage-quota`)
-- Restore a soft-deleted file by removing the delete marker, making the most recent non-current version the current
-  version again. Restore **MUST** require the same authorization as upload
-- Permanently delete a specific file version by its version identifier
-- Treat version identifiers as opaque strings — the system **MUST NOT** assume any specific format, ordering, or
-  parseable structure of version identifiers across storage backends
+- **Restore** a prior version by **re-binding** `content_id` to that version's `version_id` — a pointer swap, no
+  re-upload (`cpt-cf-file-storage-fr-conditional-requests`). Restore **MUST** require the same authorization as a
+  content write
+- Permanently delete a specific version by `version_id` (removing its row and backend object); deleting the only
+  remaining version is equivalent to deleting the file (`cpt-cf-file-storage-fr-delete-file`)
 
-Automatic garbage collection does **NOT** apply to soft-deleted versions — soft-delete is an intentional owner
-action, not an orphaned state. Cleanup of soft-deleted versions is governed by retention policies
-(`cpt-cf-file-storage-fr-retention-policies`).
+In P1 there is **no automatic version cleanup** — versions are retained indefinitely (the P1 default, see
+`cpt-cf-file-storage-fr-retention-indefinite`). Automatic pruning by a version-retention policy (keep ≤ X versions
+and/or younger than T) is a P2 concern, unified with orphan reconciliation in the P2 cleanup engine
+(`cpt-cf-file-storage-fr-retention-policies`, `cpt-cf-file-storage-fr-orphan-reconciliation`).
 
 The system **MUST** apply the same authorization, tenant boundary enforcement, and audit requirements to all versioned
-operations as to non-versioned file operations.
+operations as to current-version operations.
 
-**Rationale**: File versioning enables recovery from accidental overwrites and deletions, supports audit and compliance
-workflows that require historical access to file content, and aligns with capabilities universally available across
-major storage backends (S3, GCS, Azure Blob, MinIO, Ceph, Backblaze B2). Logical delete markers (rather than physical
-removal) enable restoration and follow the established pattern of S3 versioned deletes, GCS soft-delete, and Azure Blob
-soft-delete. Counting soft-deleted content against quota prevents quota bypass through repeated soft-delete cycles.
+**Rationale**: Modelling each version as its own immutable object plus a pointer makes versioning a property of
+FileStorage rather than of the backend, so it is uniform across heterogeneous backends, makes "replace content" and
+"restore" cheap pointer swaps, and guarantees content is never mutated in place. Deferring automatic cleanup to P2
+keeps P1 simple (indefinite retention is the safe default); accumulation is acceptable at initial-release volumes.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 #### Backend Migration
@@ -683,7 +742,7 @@ In P1 a file's backend is immutable; this requirement lifts that restriction for
 Migration of versioned files (which carry a backend-owned version chain) is constrained by the backend's versioning
 semantics and is out of scope until a dedicated design addresses version-chain relocation.
 
-**Rationale**: One of the two primary reasons to proxy content through FileStorage (ADR-0001) is the ability to move
+**Rationale**: One of the reasons to keep content behind the FileStorage sidecar (ADR-0003) is the ability to move
 bytes between backends without rotating URLs. Real drivers include cost-tier optimization (move cold data to a cheaper
 tier), backend deprecation/decommissioning, tenant data residency (relocate a tenant's files to an in-region backend),
 capacity rebalancing across buckets, and disaster recovery from a degraded backend. Enforcing `backend_id`
@@ -723,7 +782,7 @@ update). Audit records **MUST** include the operation type, actor identity, file
 
 The system **MUST** support optional audit logging for read operations (downloads and metadata queries), configurable
 per policy. When enabled by policy, the system **MUST** produce an audit record for every read operation. Because all
-content traffic transits FileStorage, read audit applies uniformly to every download — there are no per-flow
+content traffic transits the sidecar, read audit applies uniformly to every download — there are no per-flow
 carve-outs.
 
 **Rationale**: Regulated environments and security-sensitive owners require visibility into who accessed their files and
@@ -751,11 +810,13 @@ backend selection without changing the gear's core logic.
 The system **MUST** define a capability model for storage backends. Each backend **MUST** declare which optional
 capabilities it supports. The system **MUST** support at least the following client-facing capabilities:
 
-- **Versioning** — the backend can maintain multiple versions of a file, identified by opaque version identifiers
 - **Multipart Upload** — the backend natively supports chunked upload with independent part transfers and server-side
   assembly
 - **Server-Side Encryption** — the backend can encrypt file content at rest using backend-managed or customer-provided
   keys
+
+Note: versioning is **not** a backend capability — it is implemented at the FileStorage level (distinct objects per
+version + a pointer) and works on every backend (`cpt-cf-file-storage-fr-file-versioning`).
 
 Backends **MAY** additionally support internal-only capabilities (e.g., presigned URL generation for
 backend-to-backend replication, migration, or backup tooling). Internal-only capabilities are used by FileStorage
@@ -805,24 +866,71 @@ or geographic requirements.
 
 ### 5.9 Access Interfaces
 
-#### REST API
+#### Control-Plane REST API
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-rest-api`
 
-The system **MUST** expose a REST API for all file operations (upload, download, delete, metadata management, backend
-discovery) under a single auth-required namespace (`/api/file-storage/v1`). FileStorage P1 has no anonymous
-namespace — see `§5.3`.
+The system **MUST** expose a control-plane REST API under a single auth-required namespace (`/api/file-storage/v1`)
+for metadata management, listing, backend discovery, version bind, and the issuance of signed content URLs
+(`cpt-cf-file-storage-fr-signed-urls`). This surface **MUST NOT** accept or return file content — content is moved
+exclusively by the sidecar via signed URLs. FileStorage P1 has no anonymous namespace — see `§5.3`.
 
-**Rationale**: REST is the standard access interface for Gears and platform UI.
+**Rationale**: REST is the standard control interface for Gears and platform UI; keeping content off this surface is
+what allows the data plane (sidecar) to scale independently (ADR-0003).
+**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
+
+#### Signed Content URLs
+
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-signed-urls`
+
+The control plane **MUST** issue short-lived **signed URLs** that authorize a single content operation
+(`GET`/`PUT`/part) against the **sidecar** for a specific object. Signed URLs **MUST**:
+
+- be a **stateless, opaque PASETO `v4.public` token** (Ed25519), verifiable by the sidecar without a database lookup,
+  for which the control plane holds the private key (**sole minter**) and the sidecar holds only the public key;
+- be carried either in the `fs-token` URL query parameter (`?fs-token=<token>`, for bare embeddable URLs) or in the
+  `X-FS-Token` request header (for programmatic/batch) — the **same token**, chosen by access intent; it is **never**
+  carried in `Authorization`, which always carries the standard platform JWT;
+- have a format known **only** to the control plane and the sidecar; every other participant (browser, CDN, proxy,
+  app, logs) **MUST** treat the token as opaque bytes and **MUST NOT** parse it — the claim-set and crypto may change;
+- always point at the sidecar, **never** at a backend-addressable URL (`cpt-cf-file-storage-principle-backend-opacity`);
+- bind the **operation** `op` ∈ {GET, PUT, part} into the token (also checked against the HTTP method), so it cannot be
+  reused for a different operation;
+- carry **AND-combined claims**, of which only the expiry is mandatory:
+  - **expiry** (`exp`, required) — and it **MUST NOT** exceed a configured maximum lifetime `max_url_ttl` (recommended
+    7 days), enforced by the control plane at signing; the sidecar rejects once `now > exp`;
+  - optional client `ip`/CIDR;
+  - optional predicates over the caller's auth-token claims (e.g. `typ=user`, `sub=<id>`, `tenant_id=<id>`); when one
+    is present the sidecar **MUST** also validate a real platform token and match each claim;
+  - on **upload** URLs, optional content constraints the sidecar enforces during the stream: a size bound — either
+    `max_size` (≤) **or** `exact_size` (==), mutually exclusive — and an `expected_hash` (`<alg>:<hex>`, `<alg>` from
+    the backend allow-list) the uploaded bytes must match;
+  - *(P2)* a `max_rate` (bandwidth) and a `max_conns` (concurrent connections) scoped to a single `(file_id, op)`;
+- be tamper-evident as a whole — a client **MUST NOT** be able to add, remove, or weaken a constraint without
+  invalidating the signature;
+- optionally carry a set of response headers the sidecar **MUST** echo verbatim on the served response (e.g.
+  `Content-Disposition`, `Content-Type` override, `Cache-Control`), so the sidecar needs no control-plane round-trip.
+
+In P1 a single static signing keypair is used (a `kid` in the PASETO footer is reserved for P2 rotation; no per-token
+revocation and no key rotation in P1; emergency access revocation is the platform auth module's token revocation). Key
+rotation and a multi-key set are deferred to P2, as is enforcement
+of the `max_rate` / `max_conns` constraints (which additionally require coordinating the multi-instance sidecar fleet
+on a shared backend).
+
+**Rationale**: Signed URLs let the control plane delegate the byte transfer to the sidecar without exposing backends
+and without a per-request control round-trip on the data path. AND-combined constraints give per-link access control
+(time-boxed, ip-boxed, principal-boxed) reusing the platform's own token claims.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 #### Random Read Access
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-range-requests`
 
-Download endpoints **MUST** support random (non-sequential) read access to arbitrary byte ranges of stored content so
-that consumers can seek through large files efficiently — most importantly, so that media players can scrub through
-videos and audio without re-downloading the file.
+The **sidecar** download endpoint **MUST** support random (non-sequential) read access to arbitrary byte ranges of
+stored content so that consumers can seek through large files efficiently — most importantly, so that media players
+can scrub through videos and audio without re-downloading the file. Because the `Range` header is **not** part of the
+signed-URL signature, a **single** signed download URL serves **many** range requests at different offsets until it
+expires (random access without re-presigning).
 
 **Rationale**: Without random read access, every seek in a video forces a full re-download from byte 0, which is
 unusable for any clip longer than a few seconds. The protocol-level mechanics (HTTP `Range`/`Content-Range` semantics,
@@ -835,23 +943,25 @@ unusable for any clip longer than a few seconds. The protocol-level mechanics (H
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-conditional-requests`
 
-The system **MUST** support conditional HTTP requests (RFC 7232) for all operations served by FileStorage (downloads,
-metadata requests, content-replacement and metadata-update operations, deletes). The system **MUST**:
+The system **MUST** support conditional HTTP requests (RFC 7232) across both planes — on the sidecar for downloads,
+and on the control plane for metadata reads, version bind, content-replacement, metadata updates, and deletes. The
+system **MUST**:
 
-- Return an `ETag` header with every download and metadata response. ETag is opaque, derived from `(file_id,
-  content_revision)`, and **MUST NOT** equal the content hash (which is exposed separately)
-- Support `If-None-Match` on `GET`/`HEAD` requests — return `304 Not Modified` when ETag matches
-- Support `If-Match` on `GET`/`HEAD` — return `412 Precondition Failed` when ETag does not match
-- Require `If-Match` on every write (`PATCH`, `DELETE`) and on multipart-control operations — `412 Precondition Failed`
-  on mismatch
+- Return an `ETag` header on every download (sidecar) and metadata (control) response. ETag is opaque, derived from
+  `(file_id, content_id)`, and **MUST NOT** equal the content hash (which is exposed separately). Because `content_id`
+  is the current version pointer, the ETag changes exactly when content is (re)bound
+- Support `If-None-Match` on download/metadata reads — return `304 Not Modified` when the ETag matches
+- Support `If-Match` on reads — return `412 Precondition Failed` when the ETag does not match
+- Require `If-Match` on every content **bind** (the optimistic CAS that swaps `content_id`) and on `DELETE` —
+  `412 Precondition Failed` on mismatch. The `412` retry re-binds the already-uploaded `version_id` without re-upload
 
-**ETag is content-only.** Metadata-only updates bump an internal `metadata_revision` and `last_modified_at` but
-**MUST NOT** change the ETag or content hash — both remain tied to the content. Consequently `If-Match` on a
-metadata-only update protects against concurrent **content** writes but does **not** detect concurrent metadata
-writes. To give callers lost-update protection for metadata without coupling it to the content ETag, the system
-**MUST** support an optional metadata-revision precondition on metadata-only updates (matched against
-`metadata_revision`, returning `412` on mismatch); when the caller omits it, metadata updates remain last-write-wins
-(S3-style) for back-compatibility. See DESIGN `cpt-cf-file-storage-principle-content-only-etag`.
+**ETag is content-only.** Metadata-only updates bump `meta_version` and `last_modified_at` but **MUST NOT** change the
+ETag or content hash — both remain tied to the content. Consequently `If-Match` on a metadata-only update protects
+against concurrent **content** writes but does **not** detect concurrent metadata writes. To give callers lost-update
+protection for metadata without coupling it to the content ETag, the system **MUST** support an optional
+metadata-revision precondition on metadata-only updates (matched against `meta_version`, returning `412` on mismatch);
+when the caller omits it, metadata updates remain last-write-wins (S3-style) for back-compatibility. See DESIGN
+`cpt-cf-file-storage-principle-content-only-etag`.
 
 **Rationale**: Conditional downloads eliminate redundant bandwidth for unchanged files and enable downstream caching by
 browsers and reverse proxies. Conditional updates prevent silent data loss when multiple clients modify file metadata
@@ -903,8 +1013,9 @@ Content download latency **MUST** have no fixed overhead exceeding 50ms at p95; 
 file size.
 
 **Threshold**: <50ms + transfer time p95
-**Rationale**: FileStorage is called synchronously in request paths of consuming gears; excessive overhead compounds
-across requests with multiple files.
+**Rationale**: The sidecar serves content synchronously in the request paths of consuming gears; excessive fixed
+overhead compounds across requests with multiple files. (Allocated to the sidecar, per
+ADR-0003.)
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
 
 #### URL Availability
@@ -961,20 +1072,22 @@ requirements, the architecture may adopt patterns (global locks, shared mutable 
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-nfr-bandwidth`
 
-Because every uploaded and downloaded byte transits FileStorage (per ADR-0001 — backends are never addressed directly),
-**bandwidth, not CPU or memory, is the binding capacity constraint**. Each deployment instance **MUST** sustain a
-defined combined ingress+egress budget, and aggregate transfer capacity **MUST** scale horizontally by adding stateless
-instances. Repeat-read egress **MUST** be offloadable to an upstream caching layer (API-Gateway / CDN) using the
-conditional-request headers FileStorage emits (`ETag`, `Cache-Control`, `Vary`), so that cache hits do not re-transit
-FileStorage.
+Because every uploaded and downloaded byte transits the **sidecar** (per
+ADR-0003 — backends are never addressed directly by clients),
+**bandwidth, not CPU or memory, is the binding capacity constraint of the sidecar** (the control plane carries no
+content and is not bandwidth-bound). Each sidecar instance **MUST** sustain a defined combined ingress+egress budget,
+and aggregate transfer capacity **MUST** scale horizontally by adding stateless sidecar instances, independently of
+the control plane. Repeat-read egress **MUST** be offloadable to an upstream caching layer (API-Gateway / CDN) using
+the conditional-request headers the sidecar emits (`ETag`, `Cache-Control`, `Vary`), so that cache hits do not
+re-transit the sidecar.
 
-**Threshold**: ≥ 2.5 GiB/s combined ingress+egress per instance (≈ 25 GbE class); aggregate capacity =
-`ceil(peak aggregate transfer rate / per-instance budget)` instances; conditional re-reads served from CDN/proxy cache
-without FileStorage egress
-**Rationale**: ADR-0001 consciously accepts that all terabyte-scale traffic flows through FileStorage. If the NFR set
-only constrains CPU/memory (the scalability NFR), implementers may size and scale the service against the wrong
-dimension and under-provision network capacity. Making the bandwidth budget explicit, and making download caching a
-first-class offload path, keeps the proxy data plane affordable at scale.
+**Threshold**: ≥ 2.5 GiB/s combined ingress+egress per sidecar instance (≈ 25 GbE class); aggregate capacity =
+`ceil(peak aggregate transfer rate / per-instance budget)` sidecar instances; conditional re-reads served from
+CDN/proxy cache without sidecar egress
+**Rationale**: ADR-0003 confines the terabyte-scale traffic to the sidecar. If the
+NFR set only constrains CPU/memory (the scalability NFR), implementers may size and scale against the wrong dimension
+and under-provision network capacity. Making the bandwidth budget explicit, allocating it to the sidecar, and making
+download caching a first-class offload path keeps the data plane affordable at scale.
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
 
 ### 6.2 NFR Exclusions
@@ -1005,20 +1118,38 @@ The following NFR categories from the platform checklist are **not applicable** 
 
 **Type**: Rust trait (SDK crate)
 **Stability**: unstable
-**Description**: Async trait providing upload, download (with Range), delete, metadata read/update, listing, and
-backend-capability discovery.
+**Description**: Async trait providing upload, download (seekable / with Range), delete, metadata read/update,
+listing, version listing/restore, and backend-capability discovery. The SDK performs the two-step (presign +
+sidecar transfer) **inside the consumer's process** — the control-plane service never streams bytes — so a consuming
+gear sees a normal seekable read/write (`cpt-cf-file-storage-component-sdk-facade`).
 **Breaking Change Policy**: Major version bump required for trait signature changes.
 
-#### REST API
+#### Control-Plane REST API
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-rest-api`
 
 **Type**: REST API (OpenAPI 3.0)
 **URL Prefix**: `/api/file-storage/v1`
 **Stability**: unstable
-**Description**: HTTP REST API for authenticated file operations and metadata management. All endpoints require
-platform JWT — there is no anonymous surface in P1 (see `§5.3`).
+**Description**: HTTP REST API for authenticated metadata operations, listing, backend discovery, version bind, and
+signed-URL issuance. It does **not** carry file content — content moves over signed URLs against the sidecar
+(`cpt-cf-file-storage-fr-signed-urls`). All endpoints require platform JWT — there is no anonymous surface in P1 (see
+`§5.3`).
 **Breaking Change Policy**: Major version bump required for endpoint removal or incompatible schema changes.
+
+#### Sidecar Data-Plane API
+
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-sidecar-api`
+
+**Type**: HTTP (signed-URL authorized)
+**Stability**: unstable
+**Description**: The sidecar's content surface (`GET`/`PUT`/part), addressed only via control-plane-issued signed
+URLs and served from its own domain. Verifies the PASETO `v4.public` token and its claims, validates the platform token
+when a token-claim predicate is present, serves `Range` and conditional requests, and echoes the response headers
+baked into the URL. It holds **no** backend/tenant/user policy or quota state — all such limits (storage quota,
+allowed types, size policy, retention) live in the control plane and are applied at presign; the sidecar enforces only
+the per-URL constraints the signature carries, plus the per-URL connection/rate caps (P2).
+**Breaking Change Policy**: Signed-URL format changes are coordinated with the control plane (shared signing contract).
 
 ### 7.2 External Integration Contracts
 
@@ -1087,13 +1218,17 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 
 **Main Flow**:
 
-1. User uploads file content with metadata (name, mime_type, GTS file type)
-2. FileStorage validates the GTS file type format
-3. FileStorage checks authorization for write on `gts.cf.fstorage.file.type.v1~` with the file type in resource context
-4. *(Phase 2)* FileStorage validates file against policies (type, size); in phase 1 all uploads are accepted
-5. FileStorage persists content, assigns ownership, stores metadata
-6. *(Phase 2)* FileStorage emits audit record for the upload
-7. FileStorage returns persistent URL and file identifier
+1. User asks the control plane to upload, supplying metadata (name, mime_type, GTS file type)
+2. Control plane validates the GTS file type format and checks authorization for write on
+   `gts.cf.fstorage.file.type.v1~` with the file type in resource context
+3. *(Phase 2)* Control plane validates against policies (type, size); in phase 1 all uploads are accepted
+4. Control plane returns a **signed upload URL** to the sidecar (`cpt-cf-file-storage-fr-signed-urls`)
+5. User transfers the bytes to the **sidecar** at that URL; the sidecar streams to the backend object
+   `/{file_id}/{version_id}`, computes the hash, and (on behalf of the user) **binds** the new version as current
+   under optimistic CAS
+6. *(Phase 2)* Audit record emitted for the upload
+7. The client holds the `file_id` and the bound `version_id`; on a bind conflict (`412`) it re-binds without
+   re-uploading
 
 **Postconditions**:
 
@@ -1119,10 +1254,11 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 
 **Main Flow**:
 
-1. Gear calls download with a file URL
-2. FileStorage checks authorization for read on `gts.cf.fstorage.file.type.v1~` with the file's GTS type in resource context
-3. FileStorage retrieves file content from the storage backend
-4. FileStorage returns content with metadata (mime_type, size, GTS file type)
+1. Gear asks the control plane for a download URL for the file
+2. Control plane checks authorization for read on `gts.cf.fstorage.file.type.v1~` with the file's GTS type in resource
+   context and returns a **signed download URL** to the sidecar (pinning the current `content_id`), plus metadata
+3. Gear fetches the bytes from the **sidecar** at that URL (with `Range` for partial/seeking reads)
+4. Sidecar streams the content from the backend; metadata (mime_type, size, GTS file type) came from step 2
 
 **Postconditions**:
 
@@ -1169,46 +1305,33 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - User is authenticated
 - User owns the file
 
-**Main Flow** (non-versioned file):
+**Main Flow** (delete the whole file):
 
 1. Owner requests deletion of a file by its identifier
-2. FileStorage checks authorization for delete on `gts.cf.fstorage.file.type.v1~`
-3. FileStorage deletes the file content from the storage backend
-4. FileStorage removes file metadata and ownership records
-5. *(Phase 2)* FileStorage emits audit record for the deletion
+2. Control plane checks authorization for delete on `gts.cf.fstorage.file.type.v1~`
+3. Control plane removes the file metadata, ownership records, and **all** version rows (metadata-row-first)
+4. Control plane deletes the backend objects best-effort via the sidecar (a failed backend delete degrades to an
+   orphan reconciled by the P2 cleanup engine)
+5. *(Phase 2)* Control plane emits audit record for the deletion
 
 **Postconditions**:
 
-- File content removed from storage backend
-- Metadata and ownership records removed; subsequent requests for the file return `404`
+- Metadata, ownership, and all versions removed; subsequent requests for the file return `404` (idempotent re-delete)
+- Backend objects removed (best-effort; residual orphans swept by `cpt-cf-file-storage-fr-orphan-reconciliation`)
 - *(Phase 2)* Audit record emitted
 
-**Alternative Flow — versioned file, no version identifier** (`cpt-cf-file-storage-fr-file-versioning`):
+**Alternative Flow — delete a single version** (`cpt-cf-file-storage-fr-file-versioning`):
 
-1. Owner requests deletion of a file by its identifier (no version identifier supplied)
-2. FileStorage checks authorization for delete on `gts.cf.fstorage.file.type.v1~`
-3. FileStorage places a soft-delete marker on the current version
-4. *(Phase 2)* FileStorage emits audit record for the soft-delete
-
-**Postconditions**:
-
-- Current version inaccessible through normal file access; non-current versions remain retrievable by version ID
-- Content is **not** physically removed and continues to count against storage quota
-  (`cpt-cf-file-storage-fr-storage-quota`)
-- *(Phase 2)* Audit record emitted
-
-**Alternative Flow — versioned file, with version identifier**:
-
-1. Owner requests deletion of a specific version by file identifier and version identifier
-2. FileStorage checks authorization for delete on `gts.cf.fstorage.file.type.v1~`
-3. FileStorage permanently removes the specified version from the storage backend
-4. *(Phase 2)* FileStorage emits audit record for the permanent version deletion
+1. Owner requests deletion of a specific version by `file_id` and `version_id`
+2. Control plane checks authorization for delete on `gts.cf.fstorage.file.type.v1~`
+3. Control plane removes that version's row and backend object
+4. *(Phase 2)* Control plane emits audit record for the version deletion
 
 **Postconditions**:
 
-- Specified version permanently removed; remaining versions unaffected
-- If the deleted version was the last remaining version, the file is fully removed (equivalent to non-versioned
-  deletion postconditions)
+- The specified version is permanently removed; remaining versions unaffected
+- Deleting the only remaining version is equivalent to deleting the file (Main Flow postconditions)
+- Deleting the **current** version requires the file to have another version to fall back to, or the file is deleted
 - *(Phase 2)* Audit record emitted
 
 **Alternative Flows — error cases**:
@@ -1280,19 +1403,22 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - [ ] File deletion of a non-versioned file permanently removes content; the metadata row is removed before the
   best-effort backend delete, so a deleted file never leaves a row pointing at missing content, and re-deleting an
   already-deleted file is idempotent (`404`)
-- [ ] File deletion of a versioned file without version identifier places a soft-delete marker (no physical removal)
+- [ ] Deleting a file removes all of its versions (metadata-row-first, idempotent); a single version can be deleted by `version_id`
 - [ ] Authorization checked for every file operation via Authorization Service
 - [ ] Tenant boundary enforced — cross-tenant access rejected
 - [ ] Audit record emitted for every write operation
 - [ ] Policies enforce file type and size restrictions on upload (most restrictive wins across tenant and user levels)
-- [ ] All content traffic flows through FileStorage; no backend-addressable URL is returned to any client
+- [ ] All content traffic flows through the **sidecar** via signed URLs; no backend-addressable URL is returned to any client
+- [ ] Content upload and download are each a two-step exchange (control request → signed URL → byte transfer to/from the sidecar); the control REST surface never carries content
+- [ ] The credential is an opaque PASETO `v4.public` token (Ed25519), carried in the query (`?fs-token=`) or a header, stateless, enforcing AND-combined claims (expiry, optional ip, optional token-claim predicates, upload size/hash); altering any claim invalidates the signature; only control+sidecar parse it
 - [ ] file_not_found error returned for non-existent files
 - [ ] access_denied error returned for unauthorized operations
 - [ ] Metadata-only queries complete without transferring file content
 - [ ] Content is mutable through dedicated content-replacement operations; ETag (content-derived) changes on every
   content write; metadata-only updates do not change ETag or content hash
-- [ ] Content replacement requires explicit intent (`?replace_content=true`); a content payload sent without that
-  intent — or the intent sent without a content payload — is rejected (`400`) rather than silently mutating bytes
+- [ ] Content replacement uploads a new immutable version and **binds** it as current under `If-Match` CAS; a
+  conflicting bind returns `412` and is retried by re-binding the already-uploaded `version_id` without re-uploading
+  the bytes; backend content is never mutated in place
 - [ ] `custom_metadata` is updatable by any actor authorized for the **write** action on the file's GTS type;
   system-managed metadata is not user-updatable
 - [ ] Custom metadata update changes the file's last modified date
@@ -1306,29 +1432,28 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - [ ] File listing returns metadata only, is paginated, and requires a mandatory owner-kind filter (`user` or `app`)
 - [ ] Multipart upload assembles parts into a complete file with correct metadata
 - [ ] Upload rejected when declared mime_type does not match actual file content
-- [ ] Each backend declares its supported client-facing capabilities (versioning, multipart upload, server-side
-  encryption); internal-only capabilities are not surfaced on public discovery
+- [ ] Each backend declares its supported client-facing capabilities (multipart upload, server-side encryption);
+  internal-only capabilities are not surfaced on public discovery
 - [ ] Consumers can discover backend capabilities at runtime
 - [ ] Operations requiring an unsupported capability return a clear error
-- [ ] File versioning creates a new version on each content-replacement when backend versioning capability is enabled;
-  metadata-only updates do not create a new backend version
-- [ ] All versions of a file are listable with version ID, size, timestamp, and current-version flag
-- [ ] Soft-delete places a logical delete marker; current version becomes inaccessible but content is not physically
-  removed
-- [ ] Soft-deleted content counts against storage quota
-- [ ] Restore of a soft-deleted file removes the delete marker and reinstates the previous current version
-- [ ] Garbage collection does not clean up soft-deleted versions
+- [ ] Versioning is FileStorage-level and backend-agnostic: each content write creates a new immutable version at
+  `/{file_id}/{version_id}`; metadata-only updates do not create a new version
+- [ ] All versions of a file are listable with `version_id`, size, hash, timestamp, and current-version flag
+- [ ] Restore rebinds `content_id` to a prior version (pointer swap, no re-upload), under the same authorization as a
+  content write
+- [ ] In P1 versions are retained indefinitely (no automatic cleanup); P2 prunes via the retention policy +
+  reconciliation engine
 - [ ] Permanent delete of a specific version removes only that version
 - [ ] Declared capabilities are independently configurable (enable/disable) per backend
 - [ ] A capability disabled by configuration behaves identically to an unsupported capability
-- [ ] Download and metadata responses include `ETag` header derived from `(file_id, content_revision)` and not equal
+- [ ] Download and metadata responses include `ETag` header derived from `(file_id, content_id)` and not equal
   to the content hash
 - [ ] Conditional download with `If-None-Match` returns `304 Not Modified` when file is unchanged
-- [ ] `If-Match` is required on writes (`PATCH`/`DELETE`); missing or mismatching `If-Match` returns `412`
+- [ ] `If-Match` is required on content **bind** and on `DELETE`; missing or mismatching `If-Match` returns `412`
 - [ ] An optional metadata-revision precondition on metadata-only updates returns `412` on mismatch, giving
   lost-update protection for concurrent metadata writers; when omitted, metadata updates remain last-write-wins
-- [ ] An upload that fails after the backend write but before the metadata row commits leaves no referenced row;
-  the orphaned backend object is cleaned up best-effort (residual orphans reconciled per orphan-reconciliation)
+- [ ] An upload whose bind never completes leaves no current pointer to it; the orphan `pending` version and its blob
+  are reconciled by the P2 cleanup engine (`cpt-cf-file-storage-fr-orphan-reconciliation`)
 - [ ] Retried upload with the same idempotency key returns the original result without creating a duplicate file
 - [ ] Retried upload with the same idempotency key by a different owner does not return or create the original owner's
   file
@@ -1369,8 +1494,10 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 - Authorization Service is available and supports `gts.cf.fstorage.file.type.v1~` resource type
 - All file access respects tenant boundaries at the platform level
 - Initial storage backend is configured at deployment time; runtime backend switching is phase 2
-- All FileStorage URLs are internal to Gears and require platform JWT in P1; any external/anonymous sharing
-  is deferred to P3 (see `§5.3`)
+- The control-plane API requires platform JWT in P1; content is reached only via short-lived signed URLs against the
+  sidecar, which carry their own AND-combined constraints. Any external/anonymous sharing is deferred to P3 (see `§5.3`)
+- The control plane and the sidecar share the metadata DB (the sidecar reaches it via the FS SDK) and a signing
+  keypair (private on control, public on the sidecar)
 - Policy configuration is available to tenant administrators and users through the platform
 
 ## 12. Risks
