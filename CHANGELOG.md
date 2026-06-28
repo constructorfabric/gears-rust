@@ -9,6 +9,222 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-noop-usage-collector-plugin-v0.1.0) - 2026-06-28
+
+### Added
+
+- *(usage-collector)* usage-collector gear with usage emission and query (by @capybutler)
+
+### Contributors
+
+* @capybutler
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-usage-collector-v0.1.0) - 2026-06-28
+
+### Added
+
+- *(usage-collector)* usage-collector gear with usage emission and query (by @capybutler)
+
+### Contributors
+
+* @capybutler
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-usage-collector-sdk-v0.1.0) - 2026-06-28
+
+### Added
+
+- *(usage-collector)* usage-collector gear with usage emission and query (by @capybutler)
+- *(usage-collector)* add SDK crate; trim spec bloat and rename Metric → UsageType (by @capybutler)
+
+### Contributors
+
+* @capybutler
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oidc-authn-plugin-v0.1.0...cf-gears-oidc-authn-plugin-v0.1.1) - 2026-06-28
+
+### Added
+
+- *(security)* add DE0708 no-non-FIPS-hasher lint; replace all direct sha2 usage with FNV-1a (by @mattgarmon)
+
+### Other
+
+- preserve non-standard JWT claims + dylint de0708 migration (by @diffora) - #4088
+- per-issuer typ/aud/clock-skew-leeway validation (by @diffora) - #4088
+- release (by @github-actions[bot]) - #4063
+
+### Contributors
+
+* @diffora
+* @mattgarmon
+* @github-actions[bot]
+
+## [0.1.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tr-authz-plugin-v0.1.3...cf-gears-tr-authz-plugin-v0.1.4) - 2026-06-28
+
+### Other
+
+- release (by @github-actions[bot]) - #4063
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.1.22](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-tr-plugin-v0.1.21...cf-gears-static-tr-plugin-v0.1.22) - 2026-06-28
+
+### Other
+
+- detect unused deps (by @fluiderson) - #4089
+- release (by @github-actions[bot]) - #4063
+
+### Contributors
+
+* @fluiderson
+* @github-actions[bot]
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-idp-plugin-v0.1.0...cf-gears-static-idp-plugin-v0.1.1) - 2026-06-28
+
+### Other
+
+- *(type-registry)* adopt SDK canonical-projection pattern (by @asmith987)
+- release (by @github-actions[bot]) - #4063
+
+### Contributors
+
+* @asmith987
+* @github-actions[bot]
+
+## [0.1.19](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-credstore-plugin-v0.1.18...cf-gears-static-credstore-plugin-v0.1.19) - 2026-06-28
+
+### Other
+
+- detect unused deps (by @fluiderson) - #4089
+- release (by @github-actions[bot]) - #4063
+
+### Contributors
+
+* @fluiderson
+* @github-actions[bot]
+
+## [0.1.21](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authz-plugin-v0.1.20...cf-gears-static-authz-plugin-v0.1.21) - 2026-06-28
+
+### Other
+
+- release (by @github-actions[bot]) - #4063
+
+### Contributors
+
+* @github-actions[bot]
+
+## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authn-plugin-v0.3.0...cf-gears-static-authn-plugin-v0.3.1) - 2026-06-28
+
+### Other
+
+- detect unused deps (by @fluiderson) - #4089
+- release (by @github-actions[bot]) - #4063
+
+### Contributors
+
+* @fluiderson
+* @github-actions[bot]
+
+## [0.1.23](https://github.com/constructorfabric/gears-rust/compare/cf-gears-single-tenant-tr-plugin-v0.1.22...cf-gears-single-tenant-tr-plugin-v0.1.23) - 2026-06-28
+
+### Other
+
+- detect unused deps (by @fluiderson) - #4089
+- release (by @github-actions[bot]) - #4063
+
+### Contributors
+
+* @fluiderson
+* @github-actions[bot]
+
+## [0.1.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-rg-tr-plugin-v0.1.3...cf-gears-rg-tr-plugin-v0.1.4) - 2026-06-28
+
+### Other
+
+- detect unused deps (by @fluiderson) - #4089
+- *(resource-group)* adopt SDK canonical-projection pattern (by @asmith987)
+- release (by @github-actions[bot]) - #4063
+
+### Contributors
+
+* @fluiderson
+* @asmith987
+* @github-actions[bot]
+
+## [0.6.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-http-v0.6.7...cf-gears-toolkit-http-v0.6.8) - 2026-06-28
+
+### Other
+
+- FIPS 140-3 documentation improvements and README consolidation (by @MikeFalcon77) - #4101
+- detect unused deps (by @fluiderson) - #4089
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-v0.1.3...cf-gears-account-management-v0.2.0) - 2026-06-28
+
+### Added
+
+- *(account-management)* add child_count to tenant read shape (by @diffora)
+
+### Fixed
+
+- *(account-management)* derive effective realm + children-list filter parity (by @diffora)
+
+### Other
+
+- Merge pull request #4070 from asmith987/refactor/rg-sdk-canonical-projection (by @Artifizer) - #4070
+- *(resource-group)* adopt SDK canonical-projection pattern (by @asmith987)
+
+### Contributors
+
+* @diffora
+* @Artifizer
+* @asmith987
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-sdk-v0.1.3...cf-gears-account-management-sdk-v0.2.0) - 2026-06-28
+
+### Added
+
+- *(account-management)* add child_count to tenant read shape (by @diffora)
+
+### Fixed
+
+- *(account-management)* derive effective realm + children-list filter parity (by @diffora)
+
+### Contributors
+
+* @diffora
+
+## [0.6.13](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-v0.6.12...cf-gears-toolkit-v0.6.13) - 2026-06-28
+
+### Fixed
+
+- *(toolkit-config)* allow k8s env override of gear config via underscore gear names (by @mattgarmon)
+
+### Other
+
+- detect unused deps (by @fluiderson) - #4089
+
+### Contributors
+
+* @mattgarmon
+* @fluiderson
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-rustls-fips-shim-v0.1.1...cf-gears-rustls-fips-shim-v0.1.2) - 2026-06-28
+
+### Other
+
+- detect unused deps (by @fluiderson) - #4089
+- bump the Rust version to 1.96.0 (by @fluiderson) - #4078
+
+### Contributors
+
+* @fluiderson
+
 ## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oidc-authn-plugin-v0.1.0...cf-gears-oidc-authn-plugin-v0.1.1) - 2026-06-11
 
 ### Other

@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-api-gateway"
-version = "0.2.8"
+version = "0.2.9"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -23,7 +23,7 @@ toolkit = { workspace = true }
 toolkit-http = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.17", path = "../authn-resolver/authn-resolver-sdk" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.18", path = "../authn-resolver/authn-resolver-sdk" }
 toolkit-macros = { workspace = true }
 inventory = { workspace = true }
 anyhow = { workspace = true }
