@@ -12,6 +12,9 @@ keywords = ["constructorfabric", "cf-gears", "resource-group"]
 categories = ["web-programming"]
 metadata.docs.rs.all-features = true
 
+[lib]
+name = "resource_group"
+
 [lints]
 workspace = true
 

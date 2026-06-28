@@ -18,9 +18,9 @@ use std::sync::Arc;
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
-use cf_gears_resource_group::domain::read_service::RgReadService;
-use cf_gears_resource_group::domain::type_service::TypeService;
-use cf_gears_resource_group::infra::storage::type_repo::TypeRepository;
+use resource_group::domain::read_service::RgReadService;
+use resource_group::domain::type_service::TypeService;
+use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::{CreateTypeRequest, ResourceGroupReadHierarchy, ResourceGroupType};
 
 /// Root type (`can_be_root = true`) that accepts the given membership types.

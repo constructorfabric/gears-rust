@@ -16,20 +16,20 @@ use std::sync::Arc;
 use serde_json::json;
 use uuid::Uuid;
 
-use cf_gears_resource_group::domain::error::DomainError;
-use cf_gears_resource_group::domain::group_service::{GroupService, QueryProfile};
-use cf_gears_resource_group::domain::type_service::TypeService;
-use cf_gears_resource_group::infra::storage::entity::gts_type::{
+use resource_group::domain::error::DomainError;
+use resource_group::domain::group_service::{GroupService, QueryProfile};
+use resource_group::domain::type_service::TypeService;
+use resource_group::infra::storage::entity::gts_type::{
     Column as GtsTypeColumn, Entity as GtsTypeEntity,
 };
-use cf_gears_resource_group::infra::storage::entity::resource_group::{
+use resource_group::infra::storage::entity::resource_group::{
     Column as RgColumn, Entity as RgEntity,
 };
-use cf_gears_resource_group::infra::storage::entity::resource_group_membership::{
+use resource_group::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
-use cf_gears_resource_group::infra::storage::group_repo::GroupRepository;
-use cf_gears_resource_group::infra::storage::type_repo::TypeRepository;
+use resource_group::infra::storage::group_repo::GroupRepository;
+use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::{CreateGroupRequest, CreateTypeRequest, UpdateGroupRequest};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::secure::{SecureEntityExt, secure_insert};
@@ -1917,7 +1917,7 @@ async fn group_metadata_in_hierarchy_response() {
 /// Helper: build the ADR-001 type ecosystem.
 /// Returns (tenant_type, dept_type, branch_type, user_type, course_type).
 async fn create_adr_types(
-    type_svc: &cf_gears_resource_group::domain::type_service::TypeService<TypeRepository>,
+    type_svc: &resource_group::domain::type_service::TypeService<TypeRepository>,
 ) -> (
     resource_group_sdk::ResourceGroupType,
     resource_group_sdk::ResourceGroupType,
@@ -1982,7 +1982,7 @@ async fn create_adr_types(
 #[tokio::test]
 async fn adr_full_hierarchy_reproduction() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2058,7 +2058,7 @@ async fn adr_full_hierarchy_reproduction() {
 #[tokio::test]
 async fn adr_tenant_self_nesting() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2079,7 +2079,7 @@ async fn adr_tenant_self_nesting() {
 #[tokio::test]
 async fn adr_department_cannot_be_root() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2114,7 +2114,7 @@ async fn adr_department_cannot_be_root() {
 #[tokio::test]
 async fn adr_branch_only_under_department() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2154,7 +2154,7 @@ async fn adr_branch_only_under_department() {
 #[tokio::test]
 async fn adr_branch_allows_users_and_courses() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2188,7 +2188,7 @@ async fn adr_branch_allows_users_and_courses() {
 #[tokio::test]
 async fn adr_tenant_rejects_course_membership() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2219,7 +2219,7 @@ async fn adr_tenant_rejects_course_membership() {
 #[tokio::test]
 async fn adr_same_user_in_multiple_groups() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2252,7 +2252,7 @@ async fn adr_same_user_in_multiple_groups() {
 #[tokio::test]
 async fn adr_same_resource_different_types() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2291,7 +2291,7 @@ async fn adr_same_resource_different_types() {
 #[tokio::test]
 async fn security_group_metadata_sql_injection() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2342,7 +2342,7 @@ async fn security_group_metadata_sql_injection() {
 #[tokio::test]
 async fn security_group_metadata_large_payload() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
@@ -2688,7 +2688,7 @@ async fn tenant_root_self_update_allowed() {
 #[tokio::test]
 async fn get_group_unscoped_returns_group_without_ctx() {
     let db = common::test_db().await;
-    let type_svc = cf_gears_resource_group::domain::type_service::TypeService::new(
+    let type_svc = resource_group::domain::type_service::TypeService::new(
         db.clone(),
         Arc::new(TypeRepository),
     );
