@@ -29,7 +29,14 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     safety: "destructive",
     capabilities: { read: "tenants:read", write: "tenants:write", delete: "tenants:write" },
     updateMethod: "PATCH",
-    formDefaults: (ctx) => ({ parent_id: ctx.subject_tenant_id, self_managed: false }),
+    // Pre-fill a valid create form: parent = home tenant, and a registered
+    // tenant-type GTS id (the `tenant_type` is a GTS chain, not a free word —
+    // the API rejects anything not starting with `gts.`).
+    formDefaults: (ctx) => ({
+      parent_id: ctx.subject_tenant_id,
+      tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~",
+      self_managed: false,
+    }),
     paths: {
       // Hierarchy view: children of the caller's home tenant. There is no
       // global tenant list endpoint; tenant isolation is enforced server-side.

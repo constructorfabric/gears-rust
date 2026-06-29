@@ -12,12 +12,16 @@ export interface ProblemDetails {
 
 export class ApiError extends Error {
   status: number;
+  /// Alias of `status` in Refine's `HttpError` shape, so notifications render
+  /// the real HTTP status instead of "status code: undefined".
+  statusCode: number;
   problem?: ProblemDetails;
 
   constructor(status: number, message: string, problem?: ProblemDetails) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.statusCode = status;
     this.problem = problem;
   }
 }
