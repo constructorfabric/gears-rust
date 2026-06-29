@@ -53,6 +53,15 @@ function unsupported(verb: string, resource: string): never {
   throw new Error(`${verb} is not supported for "${resource}"`);
 }
 
+// The write payload: the whole form object, or — for transparent-body
+// resources — just the declared body field's value.
+function requestBody(
+  d: ResourceDescriptor,
+  vars: Record<string, unknown>,
+): unknown {
+  return d.bodyField ? vars[d.bodyField] : vars;
+}
+
 export const dataProvider: DataProvider = {
   getApiUrl: () => API_PREFIX,
 
@@ -74,27 +83,37 @@ export const dataProvider: DataProvider = {
 
   create: async ({ resource, variables }) => {
     const d = getDescriptor(resource);
-    if (!d.paths.create) unsupported("create", resource);
-    const raw = await apiFetch<Record<string, unknown>>(
-      d.paths.create(requireContext()),
-      {
-        method: "POST",
+    const vars = (variables ?? {}) as Record<string, unknown>;
+    const ctx = requireContext();
+    // Key-addressed upsert: create is a PUT to the entry path, id from a field.
+    if (d.createKeyField && d.paths.update) {
+      const id = String(vars[d.createKeyField]);
+      const raw = await apiFetch<Record<string, unknown>>(d.paths.update(ctx, id), {
+        method: d.updateMethod ?? "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(variables ?? {}),
-      },
-    );
+        body: JSON.stringify(requestBody(d, vars)),
+      });
+      return { data: normalizeRecord(raw, d) as never };
+    }
+    if (!d.paths.create) unsupported("create", resource);
+    const raw = await apiFetch<Record<string, unknown>>(d.paths.create(ctx), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody(d, vars)),
+    });
     return { data: normalizeRecord(raw, d) as never };
   },
 
   update: async ({ resource, id, variables }) => {
     const d = getDescriptor(resource);
     if (!d.paths.update) unsupported("update", resource);
+    const vars = (variables ?? {}) as Record<string, unknown>;
     const raw = await apiFetch<Record<string, unknown>>(
       d.paths.update(requireContext(), String(id)),
       {
         method: d.updateMethod ?? "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(variables ?? {}),
+        body: JSON.stringify(requestBody(d, vars)),
       },
     );
     return { data: normalizeRecord(raw, d) as never };

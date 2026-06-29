@@ -98,4 +98,16 @@ export interface ResourceDescriptor {
   actions?: ActionDef[];
   /** Initial create-form values (e.g. default parent to the home tenant). */
   formDefaults?: (ctx: AdminContext) => Record<string, unknown>;
+  /**
+   * For key-addressed resources (e.g. tenant metadata `PUT .../{type_id}`):
+   * create is an upsert via the `update` path, with the record id taken from
+   * this create-form field instead of being server-generated.
+   */
+  createKeyField?: string;
+  /**
+   * Send only this form field's value as the request body (a "transparent"
+   * payload), instead of the whole form object. Used where the API body is
+   * the bare value, e.g. tenant metadata's `PutTenantMetadataDto`.
+   */
+  bodyField?: string;
 }

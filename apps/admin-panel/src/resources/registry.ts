@@ -6,6 +6,7 @@ import {
   SwapOutlined,
   TagsOutlined,
   UserOutlined,
+  ProfileOutlined,
 } from "@ant-design/icons";
 import { createElement, type ReactNode } from "react";
 
@@ -137,6 +138,36 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
   },
 
   {
+    key: "tenant-metadata",
+    label: "Tenant metadata",
+    owningGear: "account-management",
+    tenantScope: "tenant",
+    safety: "destructive",
+    capabilities: {
+      read: "tenant-metadata:read",
+      write: "tenant-metadata:write",
+      delete: "tenant-metadata:write",
+    },
+    // Entries are keyed by their GTS type_id and upserted with PUT; the body
+    // is the bare metadata value (PutTenantMetadataDto is transparent).
+    updateMethod: "PUT",
+    idField: "type_id",
+    createKeyField: "type_id",
+    bodyField: "value",
+    paths: {
+      list: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata`,
+      one: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata/${id}`,
+      update: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata/${id}`,
+      remove: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata/${id}`,
+    },
+    fields: [
+      { name: "type_id", label: "Type id", inList: true, createOnly: true, required: true },
+      { name: "value", type: "json", inList: true, inForm: true, required: true },
+      { name: "updated_at", label: "Updated", type: "datetime", inList: true },
+    ],
+  },
+
+  {
     key: "resource-groups",
     label: "Resource groups",
     owningGear: "resource-group",
@@ -208,6 +239,7 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
 /** Sidebar icon per resource key (presentation only). */
 const ICONS: Record<string, () => ReactNode> = {
   tenants: () => createElement(TeamOutlined),
+  "tenant-metadata": () => createElement(ProfileOutlined),
   users: () => createElement(UserOutlined),
   conversions: () => createElement(SwapOutlined),
   "resource-groups": () => createElement(ClusterOutlined),
