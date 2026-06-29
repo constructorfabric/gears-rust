@@ -301,6 +301,8 @@ const PLATFORM_CAPABILITIES: &[&str] = &[
     "resource-groups:write",
     "types:read",
     "types:write",
+    "users:read",
+    "users:write",
     "gears:read",
 ];
 
@@ -312,6 +314,8 @@ const TENANT_CAPABILITIES: &[&str] = &[
     "conversions:read",
     "resource-groups:read",
     "types:read",
+    "users:read",
+    "users:write",
 ];
 
 impl AdminContextDto {

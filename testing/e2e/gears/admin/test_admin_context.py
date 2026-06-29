@@ -54,8 +54,15 @@ async def test_platform_admin_projection(base_url, headers_platform_admin):
     assert body["admin_mode"] == "platform"
     assert body["non_production_auth"] is True
     caps = set(body["capabilities"])
-    # Platform admin can mutate tenants and run lifecycle actions.
-    assert {"tenants:read", "tenants:write", "tenants:suspend", "gears:read"} <= caps
+    # Platform admin can mutate tenants, manage users, and run lifecycle actions.
+    assert {
+        "tenants:read",
+        "tenants:write",
+        "tenants:suspend",
+        "users:read",
+        "users:write",
+        "gears:read",
+    } <= caps
 
 
 async def test_tenant_admin_projection(base_url, headers_tenant_admin):
