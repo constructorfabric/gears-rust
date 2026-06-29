@@ -682,8 +682,12 @@ fuzz-corpus: fuzz-install
 
 # -------- Mini chat --------
 
-## Run server with the integrated admin panel (config/admin.yaml, two-role dev auth stub)
-admin:
+## Build the admin-panel SPA (apps/admin-panel/dist) so the server can serve it at /cf/admin
+admin-spa:
+	cd apps/admin-panel && npm install && npm run build
+
+## Run server with the integrated admin panel (config/admin.yaml, two-role dev auth stub); builds + serves the SPA at /cf/admin
+admin: admin-spa
 	cargo run --bin cf-gears-example-server --features account-management,static-authn,static-authz,static-idp,static-tenants,static-credstore,otel -- --config config/admin.yaml run
 
 # mini-chat targets are for running the mini-chat gear locally and in Kubernetes, with options for building Docker images and deploying with Helm.
@@ -808,7 +812,7 @@ mini-chat-down:
 
 # -------- Main targets --------
 
-.PHONY: all check ci ci_test ci_docs build .cargo-build .split-debug quickstart example admin mini-chat mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
+.PHONY: all check ci ci_test ci_docs build .cargo-build .split-debug quickstart example admin admin-spa mini-chat mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
 
 # Start server with quickstart config
 quickstart:

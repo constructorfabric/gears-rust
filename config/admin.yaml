@@ -70,6 +70,12 @@ gears:
       # Admin panel: bearer-token auth ENABLED so the two-role stub applies.
       auth_disabled: false
 
+      # Serve the built admin-panel SPA from disk at /cf/admin (public static
+      # assets, outside the auth stack). Run `npm run build` in
+      # apps/admin-panel/ first; `make admin` does this for you. Unset this to
+      # disable serving the SPA (e.g. when running vite dev separately).
+      admin_spa_dir: "apps/admin-panel/dist"
+
   gear-orchestrator:
     config: {}
 
