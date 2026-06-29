@@ -48,6 +48,7 @@ export const TenantTree = () => {
   const { mutate: remove } = useDelete();
 
   const [rows, setRows] = useState<Row[]>([]);
+  const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -66,6 +67,8 @@ export const TenantTree = () => {
       const root = await apiFetch<Row>(`${AM}/tenants/${home}`);
       root.children = withPlaceholder(await fetchChildren(home));
       setRows([root]);
+      // Expand the root by default so its children are visible immediately.
+      setExpandedKeys([String(root[idKey] ?? root.id)]);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -78,8 +81,11 @@ export const TenantTree = () => {
   }, [load]);
 
   const onExpand = async (expanded: boolean, record: Row) => {
-    if (!expanded) return;
     const id = String(record[idKey] ?? record.id);
+    setExpandedKeys((prev) =>
+      expanded ? [...new Set([...prev, id])] : prev.filter((k) => k !== id),
+    );
+    if (!expanded) return;
     const loaded = record.children?.some((c) => !isPlaceholder(c));
     if (loaded) return;
     const kids = await fetchChildren(id);
@@ -137,7 +143,11 @@ export const TenantTree = () => {
         pagination={false}
         dataSource={rows}
         columns={columns}
-        expandable={{ onExpand, rowExpandable: (r) => Boolean(r.children?.length) }}
+        expandable={{
+          expandedRowKeys: expandedKeys,
+          onExpand,
+          rowExpandable: (r) => Boolean(r.children?.length),
+        }}
       />
     </Card>
   );
