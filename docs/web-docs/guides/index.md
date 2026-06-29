@@ -20,6 +20,8 @@ the guide says so and links to the example.
   service behind the same SDK, selected by configuration.
 - **[Observability](./observability/)** — OpenTelemetry tracing, request IDs, health
   endpoints, and instrumented HTTP clients.
+- **[Admin panel](./admin-panel/)** — the descriptor-driven admin console: platform vs
+  tenant modes, the admin-context endpoint, and how to add a resource.
 
 New here? Start with the [first-gear walkthrough](../get-started/your-first-gear/), which uses
 all of these together.
