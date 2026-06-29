@@ -25,11 +25,24 @@ import { ContextView } from "./pages/ContextView";
 import { ResourceList } from "./pages/ResourceList";
 import { ResourceShow } from "./pages/ResourceShow";
 import { ResourceForm } from "./pages/ResourceForm";
+import { TenantTree } from "./pages/TenantTree";
+
+// Per-resource list-screen overrides (the "per-resource override" escape hatch
+// from ADR-0003). Resources not listed here use the generated ResourceList.
+const LIST_OVERRIDES: Record<string, JSX.Element> = {
+  tenants: <TenantTree />,
+};
 
 // Per-resource CRUD routes are generated from the registry; a verb route is
 // rendered only when the descriptor advertises it (create/edit/show).
 const resourceRoutes = RESOURCE_REGISTRY.flatMap((d) => {
-  const routes = [<Route key={`${d.key}-list`} path={`/${d.key}`} element={<ResourceList />} />];
+  const routes = [
+    <Route
+      key={`${d.key}-list`}
+      path={`/${d.key}`}
+      element={LIST_OVERRIDES[d.key] ?? <ResourceList />}
+    />,
+  ];
   if (d.paths.create) {
     routes.push(
       <Route key={`${d.key}-create`} path={`/${d.key}/create`} element={<ResourceForm />} />,
