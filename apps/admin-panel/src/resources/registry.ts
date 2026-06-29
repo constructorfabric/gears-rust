@@ -5,6 +5,7 @@ import {
   AppstoreOutlined,
   SwapOutlined,
   TagsOutlined,
+  UserOutlined,
 } from "@ant-design/icons";
 import { createElement, type ReactNode } from "react";
 
@@ -110,6 +111,32 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
   },
 
   {
+    key: "users",
+    label: "Users",
+    owningGear: "account-management",
+    tenantScope: "tenant",
+    safety: "destructive",
+    capabilities: { read: "users:read", write: "users:write", delete: "users:write" },
+    paths: {
+      // IdP-backed users for the caller's home tenant. The IdP plugin
+      // exposes list/create/delete only (no get-one / update), so the
+      // descriptor advertises just those verbs and the UI degrades
+      // gracefully. Shown as unavailable when no IdP supports the op.
+      list: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/users`,
+      create: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/users`,
+      remove: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/users/${id}`,
+    },
+    fields: [
+      { name: "id", type: "uuid", inList: true, readOnly: true },
+      { name: "username", inList: true, inForm: true, required: true },
+      { name: "email", inList: true, inForm: true },
+      { name: "display_name", label: "Display name", inList: true, inForm: true },
+      { name: "first_name", label: "First name", inForm: true },
+      { name: "last_name", label: "Last name", inForm: true },
+    ],
+  },
+
+  {
     key: "resource-groups",
     label: "Resource groups",
     owningGear: "resource-group",
@@ -181,6 +208,7 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
 /** Sidebar icon per resource key (presentation only). */
 const ICONS: Record<string, () => ReactNode> = {
   tenants: () => createElement(TeamOutlined),
+  users: () => createElement(UserOutlined),
   conversions: () => createElement(SwapOutlined),
   "resource-groups": () => createElement(ClusterOutlined),
   types: () => createElement(TagsOutlined),
