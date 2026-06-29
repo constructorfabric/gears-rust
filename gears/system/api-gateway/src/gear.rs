@@ -112,6 +112,55 @@ impl ApiGateway {
         top.merge(router)
     }
 
+    /// Mount a built admin-panel SPA (`dist/`) at `{prefix}/admin`, served from
+    /// disk via `ServeDir`.
+    ///
+    /// This is merged at the top level — OUTSIDE the auth/middleware stack — so
+    /// the static assets are public (no bearer required). The SPA's own API
+    /// calls go to the prefixed, authenticated routes as usual.
+    ///
+    /// Paths with no matching file fall back to `index.html` returned with a
+    /// `200` so client-side routes deep-link and survive a refresh (`ServeFile`
+    /// as a `not_found_service` would preserve the `404`). The shell is read
+    /// once into memory; hashed asset files are still streamed fresh from disk.
+    fn mount_admin_spa(router: Router, prefix: &str, dir: &str) -> Router {
+        use axum::response::IntoResponse;
+        use tower_http::services::ServeDir;
+
+        let mount = format!("{prefix}/admin");
+        let index_path = format!("{dir}/index.html");
+        let serve_dir = ServeDir::new(dir);
+
+        match std::fs::read(&index_path) {
+            Ok(index_html) => {
+                let fallback = tower::service_fn(move |_req: axum::extract::Request| {
+                    let body = index_html.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            (
+                                axum::http::StatusCode::OK,
+                                [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                                body,
+                            )
+                                .into_response(),
+                        )
+                    }
+                });
+                tracing::info!(path = %mount, dir = %dir, "Serving admin-panel SPA from disk");
+                // `fallback` (not `not_found_service`) preserves the fallback's
+                // `200` — `not_found_service` wraps it in `SetStatus(404)`.
+                router.nest_service(&mount, serve_dir.fallback(fallback))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %mount, dir = %dir, error = %err,
+                    "admin-panel SPA index.html not readable; serving static assets without SPA fallback"
+                );
+                router.nest_service(&mount, serve_dir)
+            }
+        }
+    }
+
     /// Create a new `ApiGateway` instance with the given configuration
     #[must_use]
     pub fn new(config: ApiGatewayConfig) -> Self {
@@ -739,6 +788,11 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
 
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
         router = Self::apply_prefix_nesting(router, &prefix);
+
+        // Serve the admin-panel SPA from disk (public, outside auth) when configured.
+        if let Some(dir) = config.admin_spa_dir.as_deref() {
+            router = Self::mount_admin_spa(router, &prefix, dir);
+        }
 
         // Keep the finalized router to be used by `serve()`
         *self.final_router.lock() = Some(router.clone());
