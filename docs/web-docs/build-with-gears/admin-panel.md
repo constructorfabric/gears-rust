@@ -46,8 +46,14 @@ Start the example server with the admin feature set and its config:
 make admin
 ```
 
-This serves the Gears APIs at `http://localhost:8087/cf` and exposes two **non-production**
-dev tokens (a platform admin and a tenant admin) via the static-auth stub. Then run the SPA:
+This builds the SPA (`npm install && npm run build`), starts the example server with the
+Gears APIs at `http://localhost:8087/cf`, and **serves the built panel at
+`http://localhost:8087/cf/admin`** — no separate dev server needed. Two **non-production**
+dev tokens (a platform admin and a tenant admin) are exposed via the static-auth stub; open
+`/cf/admin` and pick a role to sign in.
+
+For frontend development with hot reload, run the Vite dev server instead and let it proxy
+the API:
 
 ```sh
 cd apps/admin-panel
@@ -55,8 +61,23 @@ npm install
 npm run dev
 ```
 
-Open the printed URL and pick a role to sign in. In production the built SPA is served by
-the example server under `/cf/admin`.
+### How the SPA is served
+
+The api-gateway serves the built SPA from disk when its `admin_spa_dir` config points at the
+`dist/` directory (set in `config/admin.yaml`):
+
+```yaml
+gears:
+  api-gateway:
+    config:
+      prefix_path: "/cf"
+      admin_spa_dir: "apps/admin-panel/dist"   # serves the SPA at /cf/admin
+```
+
+The static assets are mounted **outside the auth middleware** — the SPA itself is public,
+while its API calls carry a bearer token. Unmatched paths fall back to `index.html` so
+client-side routes deep-link and survive a refresh. Leave `admin_spa_dir` unset to disable
+serving the panel (e.g. when running Vite separately).
 
 ## Resources are described, not hardcoded
 
