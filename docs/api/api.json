@@ -47,6 +47,48 @@
         ],
         "type": "object"
       },
+      "AdminContextDto": {
+        "description": "Startup admin context for the admin panel.\n\nRicher sibling of [`MeDto`]: in addition to the authenticated subject\nand home tenant, it projects the admin **mode** and a coarse\n**capabilities** hint that the frontend uses for capability-driven\nnavigation. The backend remains the final authority on every action;\nthese capabilities are UI hints only.\n\nv0 derives mode and capabilities from the `subject_type` role marker\nset by the **non-production** static auth stub (`platform_admin` /\n`tenant_admin`). `non_production_auth` is `true` whenever that stub\nmarker is present so the UI can surface a demo banner. When a real\nauthorization model replaces the stub, this projection is re-backed by\nit without changing the wire contract. Enabled gears are intentionally\nnot included here — the frontend reads them from the gear orchestrator.",
+        "properties": {
+          "admin_mode": {
+            "description": "`\"platform\"` or `\"tenant\"`.",
+            "type": "string"
+          },
+          "capabilities": {
+            "description": "Coarse capability hints for UI gating (e.g. `tenants:write`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "non_production_auth": {
+            "description": "`true` when the non-production static role stub is in effect.",
+            "type": "boolean"
+          },
+          "subject_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "subject_tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "subject_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "subject_id",
+          "subject_tenant_id",
+          "admin_mode",
+          "capabilities",
+          "non_production_auth"
+        ],
+        "type": "object"
+      },
       "AttachmentSummaryDto": {
         "description": "Lightweight attachment metadata embedded in Message responses.",
         "properties": {
@@ -4461,6 +4503,103 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/account-management/v1/admin/context": {
+      "get": {
+        "description": "Return the authenticated subject's startup admin context -- subject id, subject type, home tenant, admin mode (`platform`/`tenant`), and coarse capability hints -- read from the validated bearer token's security context. Mode and capabilities derive from the `subject_type` role marker; the backend remains the final authority on every action and capability hints are advisory for UI gating only. v0 derives the role from the NON-PRODUCTION static auth stub and sets `non_production_auth=true` when that stub is in effect. Enabled gears are not included here -- read them from the gear orchestrator.",
+        "operationId": "account_management.get_admin_context",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminContextDto"
+                }
+              }
+            },
+            "description": "Authenticated admin startup context"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Return the authenticated admin's startup context",
+        "tags": [
+          "Identity"
+        ]
+      }
+    },
     "/account-management/v1/me": {
       "get": {
         "description": "Return the authenticated subject's identity -- subject id, subject type, and home tenant (`subject_tenant_id`) -- read from the validated bearer token's security context. Non-tenant-scoped: call it right after login to discover your single home tenant before issuing tenant-scoped requests. Pure context reflection: AM performs no tenant-existence check here; a dangling or deleted home tenant surfaces on the tenant-scoped resource routes, not on this endpoint.",
