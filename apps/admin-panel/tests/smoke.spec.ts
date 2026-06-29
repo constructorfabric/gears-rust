@@ -6,7 +6,15 @@ import { test, expect } from "@playwright/test";
 // served by that backend; this test asserts the UI wiring, not the API
 // (the API is covered by testing/e2e/gears/admin).
 
-const RESOURCES = ["Tenants", "Users", "Tenant metadata", "Resource groups", "Gears"];
+const RESOURCES = [
+  "Tenants",
+  "Users",
+  "Tenant metadata",
+  "Resource groups",
+  "Gears",
+  "Egress upstreams",
+  "Egress routes",
+];
 
 test("platform admin: login, context, resource navigation, create form", async ({ page }) => {
   await page.goto("/");

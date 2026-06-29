@@ -7,6 +7,8 @@ import {
   TagsOutlined,
   UserOutlined,
   ProfileOutlined,
+  CloudServerOutlined,
+  NodeIndexOutlined,
 } from "@ant-design/icons";
 import { createElement, type ReactNode } from "react";
 
@@ -241,6 +243,57 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       { name: "deployment_mode", label: "Mode", inList: true },
     ],
   },
+
+  {
+    // Egress gateway upstreams — read-only in v0. Upstream/route bodies are
+    // deeply nested (endpoints, auth, headers, plugins, rate limits, CORS);
+    // editing them via the admin UI is deferred to a dedicated config editor.
+    key: "upstreams",
+    label: "Egress upstreams",
+    owningGear: "oagw",
+    tenantScope: "tenant",
+    safety: "read-only",
+    paths: {
+      list: () => `/oagw/v1/upstreams`,
+      one: (_ctx, id) => `/oagw/v1/upstreams/${id}`,
+    },
+    fields: [
+      { name: "id", inList: true, readOnly: true },
+      { name: "alias", inList: true },
+      { name: "protocol", type: "tag", inList: true },
+      { name: "enabled", type: "boolean", inList: true },
+      { name: "server", type: "json" },
+      { name: "tags", type: "json" },
+      { name: "auth", type: "json" },
+      { name: "headers", type: "json" },
+      { name: "plugins", type: "json" },
+      { name: "rate_limit", label: "Rate limit", type: "json" },
+      { name: "cors", type: "json" },
+    ],
+  },
+
+  {
+    key: "routes",
+    label: "Egress routes",
+    owningGear: "oagw",
+    tenantScope: "tenant",
+    safety: "read-only",
+    paths: {
+      list: () => `/oagw/v1/routes`,
+      one: (_ctx, id) => `/oagw/v1/routes/${id}`,
+    },
+    fields: [
+      { name: "id", inList: true, readOnly: true },
+      { name: "upstream_id", label: "Upstream", inList: true },
+      { name: "priority", type: "number", inList: true },
+      { name: "enabled", type: "boolean", inList: true },
+      { name: "match", type: "json" },
+      { name: "tags", type: "json" },
+      { name: "plugins", type: "json" },
+      { name: "rate_limit", label: "Rate limit", type: "json" },
+      { name: "cors", type: "json" },
+    ],
+  },
 ];
 
 /** Sidebar icon per resource key (presentation only). */
@@ -252,6 +305,8 @@ const ICONS: Record<string, () => ReactNode> = {
   "resource-groups": () => createElement(ClusterOutlined),
   types: () => createElement(TagsOutlined),
   gears: () => createElement(ApiOutlined),
+  upstreams: () => createElement(CloudServerOutlined),
+  routes: () => createElement(NodeIndexOutlined),
 };
 
 export function resourceIcon(key: string): ReactNode {
