@@ -266,6 +266,22 @@ gears:
             subject_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
             subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
             token_scopes: ["*"]
+        # Admin-panel role tokens — drive the GET /admin/context projection.
+        # subject_type is the (non-production) role marker the admin-context
+        # endpoint reads to derive admin_mode + capability hints. Both are
+        # homed at the platform root so tenant-scoped reads resolve.
+        - token: "e2e-token-platform-admin"
+          identity:
+            subject_id: "11111111-0000-0000-0000-0000000000a1"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "platform_admin"
+            token_scopes: ["*"]
+        - token: "e2e-token-tenant-admin"
+          identity:
+            subject_id: "11111111-0000-0000-0000-0000000000a2"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "tenant_admin"
+            token_scopes: ["*"]
         # Hierarchy tenant tokens — used by budget allocation e2e tests
         - token: "e2e-token-hierarchy-root"
           identity:
