@@ -102,10 +102,12 @@ cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml --moc
 An optional Django-admin-style management console (`apps/admin-panel`, React + Refine) is
 available. It manages the platform through the Gears APIs only — with platform-admin and
 per-tenant modes — and is metadata-driven, so new resources are added by registering a
-descriptor. Run the backend with the admin feature set, then the SPA:
+descriptor. `make admin` builds the SPA and serves it from the example server:
 
 ```bash
-make admin                       # Gears APIs at http://localhost:8087/cf (non-prod dev tokens)
+make admin                       # builds the SPA, serves it at http://localhost:8087/cf/admin
+                                 #   (Gears APIs at /cf, non-prod dev tokens)
+# for frontend hot reload instead:
 cd apps/admin-panel && npm install && npm run dev
 ```
 
