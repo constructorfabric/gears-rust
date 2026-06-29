@@ -12,9 +12,30 @@ import {
 } from "@ant-design/icons";
 import { createElement, type ReactNode } from "react";
 
-import type { ResourceDescriptor } from "./types";
+import { apiFetch } from "../httpClient";
+import type { ResourceDescriptor, FieldOption } from "./types";
 
 const AM = "/account-management/v1";
+
+// GTS id prefix shared by every tenant-type entity in the types registry.
+const TENANT_TYPE_PREFIX = "gts.cf.core.am.tenant_type.v1~";
+
+/// Load the registered tenant types for the create-form Type select. Reads the
+/// types registry and keeps only tenant-type entities (the base prefix itself
+/// is skipped — it is not a concrete, assignable type).
+async function loadTenantTypes(): Promise<FieldOption[]> {
+  const res = await apiFetch<{ entities?: { gts_id: string }[] }>(
+    "/types-registry/v1/entities",
+  );
+  return (res.entities ?? [])
+    .map((e) => e.gts_id)
+    .filter((id) => id.startsWith(TENANT_TYPE_PREFIX) && id !== TENANT_TYPE_PREFIX)
+    .map((id) => {
+      const seg = id.split("~").filter(Boolean).pop() ?? id;
+      const name = seg.split(".").slice(-2, -1)[0] ?? seg;
+      return { value: id, label: name };
+    });
+}
 
 /**
  * The curated admin resource registry. Authority boundary is the Gears APIs
@@ -52,7 +73,14 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       { name: "id", type: "uuid", inList: true, readOnly: true },
       { name: "name", inList: true, inForm: true, required: true },
       { name: "status", type: "tag", inList: true },
-      { name: "tenant_type", label: "Type", inList: true, createOnly: true, required: true },
+      {
+        name: "tenant_type",
+        label: "Type",
+        inList: true,
+        createOnly: true,
+        required: true,
+        options: loadTenantTypes,
+      },
       { name: "parent_id", label: "Parent", type: "uuid", relation: "tenants", createOnly: true },
       { name: "self_managed", type: "boolean", createOnly: true },
       { name: "depth", type: "number" },

@@ -45,6 +45,17 @@ export interface FieldDef {
   readOnly?: boolean;
   /** Link target resource key for relation fields. */
   relation?: string;
+  /**
+   * Render this form field as a searchable select whose options are loaded
+   * lazily from the backend (e.g. tenant types from the types registry).
+   */
+  options?: () => Promise<FieldOption[]>;
+}
+
+/** One selectable option for an `options`-backed field. */
+export interface FieldOption {
+  value: string;
+  label: string;
 }
 
 /** A custom (non-CRUD) action, e.g. suspend / approve / cancel. */
