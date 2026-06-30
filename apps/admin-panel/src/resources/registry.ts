@@ -52,6 +52,12 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     safety: "destructive",
     capabilities: { read: "tenants:read", write: "tenants:write", delete: "tenants:write" },
     updateMethod: "PATCH",
+    // Field types/required/readOnly are derived at boot from the `TenantDto`
+    // OpenAPI schema; entries below carry only what the spec can't express —
+    // visibility, labels, relations, the GTS-backed type select, and which
+    // fields are create-only. `status` keeps a `tag` render override (the spec
+    // types it as an enum ref).
+    schema: "TenantDto",
     // Pre-fill a valid create form: parent = home tenant, and a registered
     // tenant-type GTS id (the `tenant_type` is a GTS chain, not a free word —
     // the API rejects anything not starting with `gts.`).
@@ -70,8 +76,8 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       remove: (_ctx, id) => `${AM}/tenants/${id}`,
     },
     fields: [
-      { name: "id", type: "uuid", inList: true, readOnly: true },
-      { name: "name", inList: true, inForm: true, required: true },
+      { name: "id", inList: true },
+      { name: "name", inList: true, inForm: true },
       { name: "status", type: "tag", inList: true },
       {
         name: "tenant_type",
@@ -81,13 +87,9 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
         required: true,
         options: loadTenantTypes,
       },
-      { name: "parent_id", label: "Parent", type: "uuid", relation: "tenants", createOnly: true },
-      { name: "self_managed", type: "boolean", createOnly: true },
-      { name: "depth", type: "number" },
-      { name: "child_count", label: "Children", type: "number", inList: true },
-      { name: "created_at", type: "datetime" },
-      { name: "updated_at", type: "datetime" },
-      { name: "deleted_at", type: "datetime" },
+      { name: "parent_id", label: "Parent", relation: "tenants", createOnly: true },
+      { name: "self_managed", createOnly: true },
+      { name: "child_count", label: "Children", inList: true },
     ],
     actions: [
       {
@@ -216,6 +218,10 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       delete: "resource-groups:write",
     },
     updateMethod: "PUT",
+    // Field types/required/readOnly are derived at boot from the `GroupDto`
+    // OpenAPI schema (resource-group gear); the entries below only add
+    // presentation hints (visibility, labels, relations) the spec can't carry.
+    schema: "GroupDto",
     paths: {
       list: () => `/resource-group/v1/groups`,
       one: (_ctx, id) => `/resource-group/v1/groups/${id}`,
@@ -224,11 +230,11 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       remove: (_ctx, id) => `/resource-group/v1/groups/${id}`,
     },
     fields: [
-      { name: "id", type: "uuid", inList: true, readOnly: true },
-      { name: "name", inList: true, inForm: true, required: true },
-      { name: "type_path", label: "Type", inList: true, createOnly: true, required: true },
-      { name: "parent_id", label: "Parent", type: "uuid", relation: "resource-groups", inForm: true },
-      { name: "metadata", type: "json", inForm: true },
+      { name: "id", inList: true },
+      { name: "name", inList: true, inForm: true },
+      { name: "type", label: "Type", inList: true, createOnly: true },
+      { name: "parent_id", label: "Parent", relation: "resource-groups", inForm: true },
+      { name: "metadata", inForm: true },
     ],
   },
 

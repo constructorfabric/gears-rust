@@ -104,6 +104,14 @@ export interface ResourceDescriptor {
   /** HTTP verb for update. Default "PATCH". */
   updateMethod?: "PATCH" | "PUT";
   capabilities?: ResourceCapabilities;
+  /**
+   * OpenAPI component schema name (e.g. "Group") for this resource's record.
+   * When set, the resource's fields are enriched at boot from the
+   * gateway-aggregated `/openapi.json`: derived type / `required` / `readOnly`
+   * fill the gaps, and the curated `fields` below override presentation
+   * (visibility, labels, relations). See `resources/openapi.ts`.
+   */
+  schema?: string;
   paths: ResourcePaths;
   fields: FieldDef[];
   actions?: ActionDef[];
