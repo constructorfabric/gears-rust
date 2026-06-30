@@ -1,0 +1,5 @@
+error: unknown #[toolkit::consumes] arg `bogus`
+ --> tests/ui/fail/consumes_unknown_arg.rs:9:45
+  |
+9 | #[consumes(contract = FooApi, from = "bar", bogus = 1)]
+  |                                             ^^^^^

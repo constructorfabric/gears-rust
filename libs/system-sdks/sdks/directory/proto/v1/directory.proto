@@ -4,11 +4,14 @@ package gear_orchestrator.v1.directory;
 
 import "google/protobuf/empty.proto";
 
-// DirectoryService provides service discovery for gRPC services.
+// DirectoryService provides service discovery for gRPC and REST services.
 // OoP gears use this to register themselves and discover other services.
 service DirectoryService {
   // Resolve a gRPC service name to an endpoint URI
   rpc ResolveGrpcService(ResolveGrpcServiceRequest) returns (ResolveGrpcServiceResponse);
+
+  // Resolve a REST endpoint for a gear by its name
+  rpc ResolveRestService(ResolveRestServiceRequest) returns (ResolveRestServiceResponse);
 
   // List all instances of a specific gear
   rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
@@ -31,6 +34,14 @@ message ResolveGrpcServiceResponse {
   string endpoint_uri = 1;
 }
 
+message ResolveRestServiceRequest {
+  string gear_name = 1;
+}
+
+message ResolveRestServiceResponse {
+  string endpoint_uri = 1;
+}
+
 message ListInstancesRequest {
   string gear_name = 1;
 }
@@ -38,8 +49,16 @@ message ListInstancesRequest {
 message InstanceInfo {
   string gear_name = 1;
   string instance_id = 2;
-  string endpoint_uri = 3;
+  // Field 3 was previously `string endpoint_uri` (single primary endpoint).
+  // It was repurposed during the External/Embedded Edge work; doing so in
+  // place would have been a wire-protocol break (string vs nested message).
+  // The new `grpc_services` list lives at tag 6 below; the old slot is
+  // permanently retired so no future revision can re-use it.
+  reserved 3;
+  reserved "endpoint_uri";
   string version = 4;
+  optional string rest_endpoint_uri = 5;
+  repeated GrpcServiceEndpoint grpc_services = 6;
 }
 
 message ListInstancesResponse {
@@ -57,6 +76,11 @@ message RegisterInstanceRequest {
   string instance_id = 2;
   repeated GrpcServiceEndpoint grpc_services = 3;
   string version = 4;
+  // Field 5 was skipped during the External/Embedded Edge addition; reserve
+  // it explicitly so a future revision can't accidentally re-use it for an
+  // incompatible type. (Comments are not enforced by protoc; `reserved` is.)
+  reserved 5;
+  optional string rest_endpoint_uri = 6;
 }
 
 message DeregisterInstanceRequest {

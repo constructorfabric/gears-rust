@@ -87,6 +87,16 @@ pub trait ApiGatewayCapability: Send + Sync + 'static {
 
     // Return OpenAPI registry of the gear, e.g., to register endpoints
     fn as_registry(&self) -> &dyn OpenApiRegistry;
+
+    /// The bound REST base URL (e.g. `http://127.0.0.1:8080`) once the gateway's
+    /// server is listening, or `None` before the listener binds.
+    ///
+    /// Mirrors [`GrpcHubCapability::bound_endpoint`]. The runtime polls this in
+    /// its directory-register phase to advertise REST providers in the service
+    /// directory. Defaults to `None` for hosts that don't expose an address.
+    fn bound_endpoint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Capability for gears that have a long-running background task.
