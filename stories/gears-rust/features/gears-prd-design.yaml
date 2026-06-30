@@ -1,0 +1,205 @@
+# yaml-language-server: $schema=feature.schema.json
+id: gears-prd-design
+kind: story-demo
+title: PRD → Design against a foreign repo
+tagline: The same dev-story hub pointed at an external codebase.
+summary: "The dev-story hub aimed at a foreign repo: author a PRD by talking it through — multi-round clarification included — publish it into the external checkout under the fixed gears-sdlc name, carry it into design intake, and publish the conforming DESIGN doc beside it. No engine or story change, only doc-profile keys."
+demo:
+  spec: tests/playwright/gears-prd-design.spec.ts
+  artifactDir: gears-prd-design
+  videoBase: gears-prd-design
+  posterStep: gr-intro-home
+  # Paths are relative to this feature catalog's root (the dir holding features/),
+  # i.e. this gears-rust instance dir — so the instance stays self-contained.
+  story: .
+  flow: flows/prd_to_design_full.yaml
+tour:
+  export: GEARS_PRD_DESIGN_TOUR_STEPS
+  steps:
+    - id: gr-intro-home
+      route: home
+      title: Drive an external project
+      body: "kitsoki's dev-story hub — its PRD → Design authoring story — is pointed here at a FOREIGN repo: the Rust monorepo constructorfabric/gears-rust. It drives that repo's PRD → Design spec chain with no engine or story change — just a handful of doc-profile keys that retarget where docs land and what shape they take."
+      placement: center
+      kind: explain
+      advance: next
+      waitForTarget: home-view
+      dwellMs: 5500
+    - id: gr-intro-story
+      route: home
+      target: story-card
+      title: The gears-rust instance
+      body: "This is kitsoki-dev with one thing changed: the profile points dev-story at a gears-rust checkout, so PRDs and designs publish into gears/<gear>/docs/ as gears-sdlc PRD.md / DESIGN.md — not kitsoki's own flat docs tree."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: story-card
+      dwellMs: 5500
+    - id: gr-new-session
+      route: home
+      target: new-session-btn
+      title: Spin up a run
+      body: Click New session to start a fresh run of the hub against gears-rust. It opens in the chat, on the engineer's-day landing.
+      placement: right
+      kind: action
+      advance: route-match
+      advanceRoute: interactive
+      waitForTarget: new-session-btn
+      dwellMs: 3500
+    - id: gr-prd-discovery
+      route: interactive
+      target: chat-transcript
+      title: Talk through the PRD
+      body: "`prd` opens a discovery conversation, not a form. We're authoring a concrete gear — notes-service — so the talk stays grounded in what it must do: the interviewer takes the pitch and sharpens it into a crisp problem statement before any questions or drafting begin."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 6000
+      # Self-driving (kitsoki tour): the data form of gears-prd-design.spec.ts's
+      # pre-step setup for gr-prd-discovery — type the verb, then the pitch,
+      # revealing each turn at a readable pace.
+      drive:
+        - { type: wait-state, state: core.main }
+        - { type: type-and-send, text: prd }
+        - { type: wait-state, state: core.prd.idle }
+        - { type: reveal-turn }
+        - { type: type-and-send, text: I want a multi-tenant notes-service gear for the platform }
+        - { type: wait-state, state: core.prd.idle }
+        - { type: reveal-turn }
+    - id: gr-prd-search
+      route: interactive
+      target: chat-transcript
+      title: Scan for prior art first
+      body: "Before a single question, kitsoki scouts the repo's existing gear specs for overlap — so a duplicate is caught up front, not after a redundant draft. Here the scan is clean: a net-new gear, no overlap. `confirm` carries it into the clarification round."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 6000
+      drive:
+        - { type: click-intent, intent: core__prd__start }
+        - { type: wait-state, state: core.prd.search }
+        - { type: reveal-turn }
+    - id: gr-prd-clarify
+      route: interactive
+      target: chat-transcript
+      title: Clarify, in rounds
+      body: Discovery isn't one-shot. A structured clarification round asks the questions that most change the PRD — actors, the success metric — and the operator answers in the chat. The brief can loop back for ANOTHER round (here, tenant isolation and admin visibility), so each round sharpens the spec before drafting. The accumulated Q&A becomes the PRD's grounding.
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 6500
+      drive:
+        - { type: click-intent, intent: core__prd__confirm }
+        - { type: wait-state, state: core.prd.clarifying }
+        - { type: reveal-turn }
+        - { type: type-and-send, text: Platform users; the metric is notes-saved-per-session }
+        - { type: wait-state, state: core.prd.clarifying }
+        - { type: reveal-turn }
+        - { type: type-and-send, text: submit }
+        - { type: wait-state, state: core.prd.brief }
+        - { type: reveal-turn }
+        - { type: click-intent, intent: core__prd__clarify }
+        - { type: wait-state, state: core.prd.clarifying }
+        - { type: reveal-turn }
+        - { type: type-and-send, text: Tenant isolation is mandatory; admins see only aggregate metrics }
+        - { type: wait-state, state: core.prd.clarifying }
+        - { type: reveal-turn }
+    - id: gr-prd-draft
+      route: interactive
+      target: chat-transcript
+      title: Review the drafted PRD
+      body: With the clarification rounds settled and a prior-art scan done, the author writes the PRD into a per-session workspace and surfaces it right here — title, confidence, and the full draft to review. Accept publishes it.
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 6000
+      drive:
+        - { type: type-and-send, text: submit }
+        - { type: wait-state, state: core.prd.brief }
+        - { type: reveal-turn }
+        - { type: click-intent, intent: core__prd__confirm }
+        - { type: wait-state, state: core.prd.references }
+        - { type: reveal-turn }
+        - { type: click-intent, intent: core__prd__confirm }
+        - { type: wait-state, state: core.prd.drafting }
+        - { type: reveal-turn }
+    - id: gr-published
+      route: interactive
+      target: chat-transcript
+      title: Published into the gears tree
+      body: "Here is the retarget made concrete: the PRD did not land in kitsoki's docs/prd/ — the chat reports it published to gears/notes-service/docs/PRD.md, the fixed gears-sdlc name, inside the gears-rust checkout. The landing offers `continue` to carry it into the design phase."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 6500
+      drive:
+        - { type: click-intent, intent: core__prd__accept }
+        - { type: wait-state, state: core.prd_published }
+        - { type: reveal-turn }
+    - id: gr-design-intake
+      route: interactive
+      target: chat-transcript
+      title: Carry it into design
+      body: "`continue` seeds the design intake with a pointer to the PRD we just published — the chat shows the design conversation opening from exactly where the PRD left off, grounded in the doc, not a blank idea."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 6000
+      drive:
+        - { type: type-and-send, text: continue }
+        - { type: wait-state, state: core.design }
+        - { type: reveal-turn }
+    - id: gr-design-refine
+      route: interactive
+      target: chat-transcript
+      title: Refine the design brief
+      body: "Design has its own clarification loop: the intake scaffolds a brief, the operator's feedback threads in the component model and cpt-IDs, and the refiner folds it in — flagging what's left (here, allocating the PRD's NFRs to those components). A quality check then gates the brief before the author drafts — the same iterative shaping the PRD did with questions."
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 6500
+      drive:
+        - { type: type-and-send, text: Realize the notes-service PRD as a gears-sdlc DESIGN }
+        - { type: wait-state, state: core.design_search }
+        - { type: reveal-turn }
+        - { type: click-intent, intent: core__confirm }
+        - { type: wait-state, state: core.design_refine }
+        - { type: reveal-turn }
+        - { type: click-intent, intent: core__discuss }
+        - { type: wait-state, state: core.design_refine }
+        - { type: reveal-turn }
+    - id: gr-design-done
+      route: interactive
+      target: chat-transcript
+      title: DESIGN, alongside the PRD
+      body: The design author reads gears-rust's own DESIGN template and threads cpt-IDs, and the chat reports it published to gears/notes-service/docs/DESIGN.md — beside the PRD, no kitsoki feature ticket. PRD → Design is one continuous, grounded walk against the external repo.
+      placement: right
+      kind: explain
+      advance: next
+      waitForTarget: chat-transcript
+      dwellMs: 6500
+      drive:
+        # `ready` runs the brief quality check; on a `continue` verdict the judge
+        # emits advance_brief (emit_intent), which chains straight to design_draft
+        # in one turn — advance_brief is synthetic, not a clickable button.
+        - { type: click-intent, intent: core__ready }
+        - { type: wait-state, state: core.design_draft }
+        - { type: reveal-turn }
+        - { type: click-intent, intent: core__accept }
+        - { type: wait-state, state: core.design_done }
+        - { type: reveal-turn }
+    - id: gr-done
+      route: any
+      title: Retargeted, not rebuilt
+      body: "That's the proof of concept: dev-story's PRD → Design walk — discovery, a prior-art scan, multi-round clarification, brief refinement, publish — pointed at a foreign repo by configuration alone, landing conforming gears-sdlc docs in gears/notes-service/docs/. A second target needs only a new profile. Hit '?' anytime to replay this tour."
+      placement: center
+      kind: explain
+      advance: next
+      dwellMs: 5500
