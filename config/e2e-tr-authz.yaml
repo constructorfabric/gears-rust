@@ -119,10 +119,6 @@ gears:
         description: "CF/Gears Example Server API Documentation"
       defaults:
         body_limit_bytes: 64000000
-        rate_limit:
-          rps: 1000
-          burst: 200
-          in_flight: 64
 
       # Authentication Configuration
       auth_disabled: false
