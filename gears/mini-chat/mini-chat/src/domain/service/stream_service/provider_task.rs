@@ -15,6 +15,7 @@ use toolkit_security::SecurityContext;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::domain::llm::ToolPhase;
+use crate::domain::ports::FunctionTool;
 use crate::domain::ports::knowledge_retriever::{
     KnowledgeRetriever, RetrievalRequest, RetrievedChunk,
 };
@@ -74,6 +75,10 @@ pub(super) struct ProviderTaskConfig {
     pub anthropic_file_ids: std::collections::HashMap<String, String>,
     /// Knowledge search parameters; `None` when the feature is disabled.
     pub knowledge_search: Option<KnowledgeSearchParams>,
+    /// Custom function tools enabled for this request, keyed by tool name.
+    /// The agentic loop dispatches `function_call`s whose name matches a key
+    /// here. Empty when no custom tools are enabled for the model.
+    pub function_tools: std::collections::HashMap<String, Arc<dyn FunctionTool>>,
 }
 
 /// All five terminal paths (provider done, incomplete, provider error,
@@ -109,6 +114,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         provider_file_id_map,
         anthropic_file_ids,
         knowledge_search,
+        function_tools,
     } = config;
 
     let span = if let Some(ref fctx) = fin_ctx {
@@ -148,6 +154,10 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         // raw_input_items grows with each search_knowledge call/output pair.
         let mut raw_input_items: Vec<serde_json::Value> = Vec::new();
         let mut knowledge_call_count: u32 = 0;
+        // Per-custom-tool call counts (keyed by tool name) for generic
+        // function-tool dispatch. Mirrors knowledge_call_count's soft-limit policy.
+        let mut function_tool_calls: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         // Hard cap on agentic-loop iterations. Without it, a model that keeps
         // emitting `search_knowledge` after the soft per-message limit fires
@@ -158,12 +168,23 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         // ignores the notice once. Iterations beyond that are forced into
         // a `Failed` terminal via `agentic_iterations_exceeded` below.
         //
-        // When knowledge_search is None the loop body always returns inside
-        // the first iteration (any ToolUse falls through to `unexpected_tool_use`),
-        // so the cap is effectively 1.
+        // When neither knowledge_search nor any function tool is enabled the
+        // loop body always returns inside the first iteration (any ToolUse
+        // falls through to `unexpected_tool_use`), so the cap is effectively 1.
+        //
+        // Custom function tools add their own per-message budgets on top, so the
+        // model can call them up to their limits before the cap forces a Failed
+        // terminal via `agentic_iterations_exceeded` below.
+        let function_tools_budget: u32 = function_tools
+            .values()
+            .map(|t| t.max_calls())
+            .fold(0u32, u32::saturating_add);
         let max_agentic_iterations: u32 = knowledge_search
             .as_ref()
-            .map_or(1, |ks| ks.max_calls.saturating_add(2));
+            .map_or(0, |ks| ks.max_calls)
+            .saturating_add(function_tools_budget)
+            .saturating_add(2)
+            .max(1);
         let mut agentic_iteration: u32 = 0;
 
         'agentic: loop {
@@ -1252,7 +1273,104 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         continue 'agentic;
                 }
 
-                // Unrecognised tool or feature disabled — treat as a provider failure.
+                // Generic custom function tools (e.g. exa_search). Dispatched by
+                // name through the per-request registry. Mirrors the
+                // search_knowledge path: replay the function_call, execute, inject
+                // the function_call_output, and continue the agentic loop.
+                if let Some(tool) = function_tools.get(&name) {
+                    let raw_arguments =
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
+                    let count = function_tool_calls.entry(name.clone()).or_insert(0);
+
+                    // Soft per-tool limit — inject a notice instead of failing.
+                    if *count >= tool.max_calls() {
+                        warn!(
+                            tool = %name,
+                            limit = tool.max_calls(),
+                            "function tool per-message limit reached, injecting soft limit response"
+                        );
+                        raw_input_items.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": tool_use_id,
+                            "name": name,
+                            "arguments": raw_arguments,
+                        }));
+                        raw_input_items.push(serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": tool_use_id,
+                            "output": "Tool call limit reached for this message. \
+                                       Please answer based on the information already gathered.",
+                        }));
+                        continue 'agentic;
+                    }
+                    *count += 1;
+
+                    // Append the model's function_call item to replay history.
+                    raw_input_items.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": tool_use_id,
+                        "name": name,
+                        "arguments": raw_arguments,
+                    }));
+
+                    let exec_start = std::time::Instant::now();
+                    let output_text = match tool.execute(ctx.clone(), input).await {
+                        Ok(text) => text,
+                        Err(e) => {
+                            // Distinct from a legitimate empty result so the model
+                            // can tell a tool failure from a zero-hit query.
+                            warn!(tool = %name, error = %e, "function tool execution failed");
+                            "Tool call failed; answer without the tool result.".to_owned()
+                        }
+                    };
+                    debug!(
+                        tool = %name,
+                        elapsed_ms = exec_start.elapsed().as_millis() as u64,
+                        "function tool executed"
+                    );
+
+                    raw_input_items.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": output_text,
+                    }));
+
+                    continue 'agentic;
+                }
+
+                // Unrecognised tool while custom function tools ARE enabled.
+                // Models like gpt-oss emit their built-in browser actions
+                // (`open`, `find`, `search`) that we don't provide. Don't fail
+                // the turn — replay the call with an "unavailable" output so the
+                // model answers from what it already gathered (e.g. exa_search
+                // results). The agentic-iteration cap bounds a model that keeps
+                // ignoring the notice.
+                if !function_tools.is_empty() {
+                    warn!(
+                        tool = %name,
+                        "unsupported tool requested; injecting unavailable notice and continuing"
+                    );
+                    let raw_arguments =
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
+                    let notice = format!(
+                        "The tool \"{name}\" is not available. Do not call it again. \
+                         Answer the user directly using the information already gathered."
+                    );
+                    raw_input_items.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": tool_use_id,
+                        "name": name,
+                        "arguments": raw_arguments,
+                    }));
+                    raw_input_items.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": notice,
+                    }));
+                    continue 'agentic;
+                }
+
+                // No custom tools enabled — genuinely unsupported. Fail the turn.
                 warn!(tool = %name, "unexpected ToolUse outcome; finalizing as failed");
                 let code = "unexpected_tool_use".to_owned();
                 let message = "Provider requested an unsupported function tool".to_owned();

@@ -85,6 +85,11 @@ pub struct ModelCatalogEntry {
     /// Maximum tool calls the provider may make per request.
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: u32,
+    /// Names of custom function tools enabled for this model (e.g.
+    /// `["exa_search"]`). Resolved against the gear's function-tool registry at
+    /// request time; unknown names are ignored. Empty = no custom tools.
+    #[serde(default)]
+    pub enabled_function_tools: Vec<String>,
     /// Full general config captured at snapshot time.
     pub general_config: ModelGeneralConfig,
     /// Tenant preference settings captured at snapshot time.
@@ -387,6 +392,7 @@ mod tests {
             }),
             system_prompt: String::new(),
             thread_summary_prompt: String::new(),
+            enabled_function_tools: Vec::new(),
         }
     }
 

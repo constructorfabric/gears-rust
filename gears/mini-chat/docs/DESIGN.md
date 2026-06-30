@@ -5027,6 +5027,53 @@ The surcharge model is **deterministic and independent of provider runtime behav
 - P1 does **NOT** implement proportional infrastructure cost modelling. There is no per-invocation, per-query, or per-retrieval-pass cost tracking.
 - Accurate backend cost accounting for tools, web search, and RAG operations is explicitly **out of scope** for P1. Future phases MAY introduce metered surcharges; any such change MUST be reflected via a new `policy_version`.
 
+##### Custom Function Tools (Generic Registry + exa.ai Web Search)
+
+Beyond the provider-native tools (`file_search`, `web_search`, `code_interpreter`) and the
+built-in `search_knowledge` RAG function, mini-chat supports **pluggable custom function tools**
+through a generic registry. This is how `exa_search` (web search via exa.ai) is added without
+new branches in the agentic loop.
+
+**Mechanism**
+
+- Domain port `FunctionTool` (`domain/ports/function_tool.rs`):
+  `name()`, `definition() -> LlmFunctionDef`, `system_prompt_guard() -> Option<String>`,
+  `max_calls() -> u32`, `async execute(ctx, input) -> Result<String, FunctionToolError>`.
+- The gear builds a registry `HashMap<name, Arc<dyn FunctionTool>>` at init and injects it into
+  `StreamService`. Per request, `resolve_function_tools` intersects the model's
+  `enabled_function_tools` with the registry, yielding the tool descriptors (appended to the LLM
+  request), their system-prompt guards (appended to the system instructions), and a dispatch map.
+- The agentic loop in `provider_task.rs` keeps the bespoke `search_knowledge` branch and adds one
+  **generic** dispatch: on a `function_call` whose name is in the dispatch map, it enforces the
+  tool's `max_calls()` per-message limit (soft-limit notice on overflow, same graceful degradation
+  as `search_knowledge`), calls `execute`, and injects the result as `function_call_output`.
+  Unknown names still fail via `unexpected_tool_use`.
+
+**Per-model enablement**
+
+`ModelCatalogEntry.enabled_function_tools: Vec<String>` (policy-snapshot / CCM driven) lists the
+tool names a model may call, e.g. `["exa_search"]`. Models without the entry never see the tool.
+
+**exa_search tool**
+
+- Descriptor: `{ name: "exa_search", description: "Search the public web …",
+  parameters: { query: string (required) } }`.
+- Egress through OAGW: `POST /{alias}/search` with body
+  `{ "query", "type": <search_type>, "numResults": <n>, "contents": { "highlights": true } }`.
+  The OAGW apikey auth plugin injects the `x-api-key` header — the key lives in the credstore,
+  never in mini-chat. Reuses the `RagHttpClient` JSON-POST primitive.
+- Response `results[]{ title, url, highlights[] }` is formatted into a compact text block
+  (bounded by `exa_search.max_chars`) and returned as the `function_call_output`.
+- Reference: <https://docs.exa.ai/reference/search-api-guide-for-coding-agents>.
+
+**Token cost.** Custom function tools reuse the existing flat `tool_surcharge_tokens`: when a
+model has any enabled function tool, preflight sets `tools_enabled = true` (no per-tool
+surcharge). The tool's output is bounded by `max_chars`, not separately preflighted — consistent
+with `search_knowledge`.
+
+> See ADR `cpt-cf-mini-chat-adr-pluggable-function-tools`. Phase-2 follow-up: migrate
+> `search_knowledge` into the registry and collapse `LlmTool::Function` onto `LlmFunctionDef`.
+
 #### 5.5.7 Reserved Credits Calculation
 
 After estimation (canonical form — identical to section 5.4.1):
@@ -6544,6 +6591,15 @@ Legend:
 | Parameter | Type | Default | Source | Notes |
 |-----------|------|---------|--------|-------|
 | `mini-chat.url_prefix` | `string` | `/mini-chat` | ConfigMap | ToolKit gear config, no CCM API equivalent |
+| `mini-chat.exa_search.enabled` | `bool` | `false` | ConfigMap | Enables the `exa_search` web-search function tool |
+| `mini-chat.exa_search.host` | `string` | `api.exa.ai` | ConfigMap | exa upstream host (OAGW registers it + a `POST /search` route) |
+| `mini-chat.exa_search.upstream_alias` | `string?` | host | ConfigMap | OAGW alias; defaults to `host` |
+| `mini-chat.exa_search.auth_plugin_type` / `auth_config` | object | — | ConfigMap | OAGW apikey auth (`header: x-api-key`, `secret_ref`); key lives in the credstore |
+| `mini-chat.exa_search.search_type` | `string` | `auto` | ConfigMap | exa search type (`auto`/`fast`/`deep`/…) |
+| `mini-chat.exa_search.num_results` | `integer` | `10` | ConfigMap | `numResults` per call |
+| `mini-chat.exa_search.max_calls_per_message` | `integer` | `3` | ConfigMap | Soft per-message call limit (graceful degradation) |
+| `mini-chat.exa_search.max_chars` | `integer` | `2000` | ConfigMap | Max characters kept per formatted result |
+| `mini-chat.exa_search.guard` | `string` | built-in | ConfigMap | System-prompt guard appended when the tool is enabled |
 
 ## B.2 Policy / Models / Limits (via `mini-chat-model-policy-plugin`)
 
@@ -6575,6 +6631,7 @@ All fields below are per-model entries inside the catalog.
 | `api_params.*` | object | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].general_config.api_params` |
 | `features.*` | object | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].general_config.features` |
 | `tool_support.*` | object | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].general_config.tool_support` |
+| `enabled_function_tools` | `string[]` | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].enabled_function_tools` — custom function tools the model may call (e.g. `["exa_search"]`); resolved against the gear's function-tool registry, defaults to `[]` |
 | `sort_order` | `integer` | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].preference.sort_order` |
 
 ### B.2.3 Kill switches / emergency flags
