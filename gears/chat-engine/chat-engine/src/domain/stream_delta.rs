@@ -322,14 +322,12 @@ impl DeltaProjector {
                     value,
                 }]
             }
-            StreamingEvent::Citation(c) => {
-                self.citation_deltas(
-                    c.part_number,
-                    &c.file_citations,
-                    &c.link_citations,
-                    &c.references,
-                )
-            }
+            StreamingEvent::Citation(c) => self.citation_deltas(
+                c.part_number,
+                &c.file_citations,
+                &c.link_citations,
+                &c.references,
+            ),
             StreamingEvent::State(s) => {
                 vec![WireStreamEvent::StateChanged {
                     message_id: self.message_id,
@@ -355,12 +353,8 @@ impl DeltaProjector {
             StreamingEvent::Complete(c) => {
                 // Batch citations (FR-023) attach to the primary text part.
                 let tp = i32::try_from(self.text_part.unwrap_or(0)).unwrap_or(0);
-                let mut out = self.citation_deltas(
-                    tp,
-                    &c.file_citations,
-                    &c.link_citations,
-                    &c.references,
-                );
+                let mut out =
+                    self.citation_deltas(tp, &c.file_citations, &c.link_citations, &c.references);
                 out.push(WireStreamEvent::Complete {
                     message_id: self.message_id,
                     seq: self.take_seq(),
@@ -544,7 +538,9 @@ mod tests {
     #[test]
     fn complete_carries_stop_op() {
         let mut p = DeltaProjector::new();
-        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent {
+            message_id: mid(),
+        }));
         let out = p.project(complete(vec![]));
         let last = serde_json::to_value(out.last().unwrap()).unwrap();
         assert_eq!(last["type"], "message.complete");
@@ -554,19 +550,38 @@ mod tests {
     #[test]
     fn terminal_events_are_flagged() {
         assert!(
-            WireStreamEvent::Complete { message_id: mid(), seq: 1, op: DeltaOp::Stop, metadata: None }.is_terminal()
+            WireStreamEvent::Complete {
+                message_id: mid(),
+                seq: 1,
+                op: DeltaOp::Stop,
+                metadata: None
+            }
+            .is_terminal()
         );
         assert!(
-            WireStreamEvent::Error { message_id: mid(), seq: 1, error: "x".into() }.is_terminal()
+            WireStreamEvent::Error {
+                message_id: mid(),
+                seq: 1,
+                error: "x".into()
+            }
+            .is_terminal()
         );
-        assert!(!WireStreamEvent::Start { message_id: mid(), seq: 0 }.is_terminal());
+        assert!(
+            !WireStreamEvent::Start {
+                message_id: mid(),
+                seq: 0
+            }
+            .is_terminal()
+        );
     }
 
     #[test]
     fn status_projects_transient_typed_event() {
         use chat_engine_sdk::models::StreamingStatusEvent;
         let mut p = DeltaProjector::new();
-        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent {
+            message_id: mid(),
+        }));
         let out = p.project(StreamingEvent::Status(StreamingStatusEvent {
             message_id: mid(),
             code: "thinking".into(),
@@ -584,7 +599,9 @@ mod tests {
     fn part_events_open_gap_free_indexed_parts() {
         use chat_engine_sdk::models::{MessagePartInput, MessagePartType, StreamingPartEvent};
         let mut p = DeltaProjector::new();
-        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent {
+            message_id: mid(),
+        }));
         // A text chunk claims parts/0.
         let _ = p.project(StreamingEvent::Chunk(StreamingChunkEvent {
             message_id: mid(),
@@ -619,7 +636,9 @@ mod tests {
         }))
         .unwrap();
         let mut p = DeltaProjector::new();
-        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent {
+            message_id: mid(),
+        }));
         let out = p.project(StreamingEvent::Citation(StreamingCitationEvent {
             message_id: mid(),
             part_number: 2,
@@ -640,7 +659,9 @@ mod tests {
             StreamingSessionMetaEvent, StreamingStateEvent, StreamingToolEvent,
         };
         let mut p = DeltaProjector::new();
-        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent {
+            message_id: mid(),
+        }));
         let st = p.project(StreamingEvent::State(StreamingStateEvent {
             message_id: mid(),
             state: json!({ "phase": "draft" }),

@@ -71,10 +71,10 @@ use crate::domain::service::plugin_service::PluginService;
 use crate::domain::service::session_service::{Identity, redact_session};
 use crate::domain::service::webhook::{NoopWebhookEmitter, WebhookEmitter, WebhookEvent};
 use crate::domain::session::Session;
+use crate::domain::stream_delta::DeltaProjector;
 use crate::infra::db::repo::message_repo::{
     FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage, PartCitations,
 };
-use crate::domain::stream_delta::DeltaProjector;
 use crate::infra::db::repo::session_repo::SessionRepo;
 use crate::infra::db::repo::session_type_repo::SessionTypeRepo;
 use crate::infra::db::repo::stream_event_repo::StreamEventBuffer;
@@ -2508,7 +2508,12 @@ mod tests {
             variant_index: 0,
             is_active: true,
             role: MessageRole::User,
-            parts: vec![MessagePart::text(Uuid::nil(), Uuid::nil(), 0, format!("msg-{idx}"))],
+            parts: vec![MessagePart::text(
+                Uuid::nil(),
+                Uuid::nil(),
+                0,
+                format!("msg-{idx}"),
+            )],
             file_ids: vec![],
             metadata: None,
             is_complete: true,

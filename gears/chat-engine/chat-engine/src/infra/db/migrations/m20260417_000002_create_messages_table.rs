@@ -209,7 +209,11 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(MessageParts::MessageId).uuid().not_null())
                     .col(ColumnDef::new(MessageParts::Type).string().not_null())
-                    .col(ColumnDef::new(MessageParts::Content).json_binary().not_null())
+                    .col(
+                        ColumnDef::new(MessageParts::Content)
+                            .json_binary()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(MessageParts::Number).integer().not_null())
                     .foreign_key(
                         ForeignKey::create()
@@ -251,8 +255,16 @@ impl MigrationTrait for Migration {
                                 .not_null()
                                 .primary_key(),
                         )
-                        .col(ColumnDef::new(Alias::new("message_part_id")).uuid().not_null())
-                        .col(ColumnDef::new(Alias::new("content")).json_binary().not_null())
+                        .col(
+                            ColumnDef::new(Alias::new("message_part_id"))
+                                .uuid()
+                                .not_null(),
+                        )
+                        .col(
+                            ColumnDef::new(Alias::new("content"))
+                                .json_binary()
+                                .not_null(),
+                        )
                         .col(ColumnDef::new(Alias::new("number")).integer().not_null())
                         .foreign_key(
                             ForeignKey::create()
@@ -332,7 +344,12 @@ impl MigrationTrait for Migration {
         // Drop citation children before their parent `message_parts`.
         for table in CITATION_TABLES {
             manager
-                .drop_table(Table::drop().table(Alias::new(table)).if_exists().to_owned())
+                .drop_table(
+                    Table::drop()
+                        .table(Alias::new(table))
+                        .if_exists()
+                        .to_owned(),
+                )
                 .await?;
         }
 

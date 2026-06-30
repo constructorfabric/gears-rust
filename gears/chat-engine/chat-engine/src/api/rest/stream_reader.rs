@@ -207,9 +207,14 @@ mod tests {
         let mid = Uuid::new_v4();
         let buf = Arc::new(FakeBuffer::default());
         let ttl = OffsetDateTime::now_utc();
-        buf.append(mid, 0, json!({"type": "message.start", "message_id": mid, "seq": 0}), ttl)
-            .await
-            .unwrap();
+        buf.append(
+            mid,
+            0,
+            json!({"type": "message.start", "message_id": mid, "seq": 0}),
+            ttl,
+        )
+        .await
+        .unwrap();
         buf.append(
             mid,
             1,
@@ -243,7 +248,11 @@ mod tests {
         let buf = Arc::new(FakeBuffer::default());
         let ttl = OffsetDateTime::now_utc();
         for seq in 0..3u64 {
-            let ty = if seq == 2 { "message.complete" } else { "message.text.delta" };
+            let ty = if seq == 2 {
+                "message.complete"
+            } else {
+                "message.text.delta"
+            };
             buf.append(mid, seq, json!({"type": ty, "seq": seq}), ttl)
                 .await
                 .unwrap();

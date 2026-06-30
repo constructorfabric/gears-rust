@@ -254,7 +254,11 @@ async fn multi_part_user_message_round_trips_in_order_against_sqlite() {
         "parts must persist in submitted order",
     );
     let numbers: Vec<i32> = parts.iter().map(|(_, n, _)| *n).collect();
-    assert_eq!(numbers, vec![0, 1, 2], "part numbers must be 0-based and contiguous");
+    assert_eq!(
+        numbers,
+        vec![0, 1, 2],
+        "part numbers must be 0-based and contiguous"
+    );
     assert_eq!(
         parts[1].2.get("language").and_then(|v| v.as_str()),
         Some("rust"),
@@ -710,7 +714,10 @@ async fn streamed_parts_and_metadata_persist_against_sqlite() {
     while stream.next().await.is_some() {}
 
     let row = db::wait_for_finalize(&harness.db, session_id, Duration::from_secs(2)).await;
-    assert!(row.is_complete, "completed send must finalize is_complete=true");
+    assert!(
+        row.is_complete,
+        "completed send must finalize is_complete=true"
+    );
 
     // Parts: primary text (number 0) + the streamed links part (number 1).
     let parts = db::message_parts_ordered(&harness.db, session_id, "assistant").await;
@@ -720,12 +727,18 @@ async fn streamed_parts_and_metadata_persist_against_sqlite() {
 
     // State + Tool fold into the persisted message metadata.
     let meta = row.metadata.expect("metadata present");
-    assert_eq!(meta["state"]["phase"], "final", "State event must persist under metadata.state");
+    assert_eq!(
+        meta["state"]["phase"], "final",
+        "State event must persist under metadata.state"
+    );
     assert_eq!(
         meta["tools"][0]["tool"], "file_search",
         "Tool event must persist under metadata.tools",
     );
-    assert_eq!(meta["finish_reason"], "stop", "plugin metadata must be preserved");
+    assert_eq!(
+        meta["finish_reason"], "stop",
+        "plugin metadata must be preserved"
+    );
 }
 
 // ===========================================================================
@@ -796,7 +809,10 @@ async fn streamed_events_are_buffered_for_resume_against_sqlite() {
     // closes; wait for it so the assistant row (and its buffered tail) is
     // settled before we read the buffer.
     let row = db::wait_for_finalize(&harness.db, session_id, Duration::from_secs(2)).await;
-    assert!(row.is_complete, "completed send must finalize is_complete=true");
+    assert!(
+        row.is_complete,
+        "completed send must finalize is_complete=true"
+    );
 
     let events = buffer
         .read_since(row.message_id, None)
@@ -828,6 +844,9 @@ async fn streamed_events_are_buffered_for_resume_against_sqlite() {
 
     // seq is a contiguous per-message counter starting at 0 — the SSE `id:`.
     for (i, e) in events.iter().enumerate() {
-        assert_eq!(e.seq, i as u64, "buffered seq must be contiguous; got {events:?}");
+        assert_eq!(
+            e.seq, i as u64,
+            "buffered seq must be contiguous; got {events:?}"
+        );
     }
 }

@@ -254,7 +254,10 @@ async fn run_stream_buffer_sweep_tick(
 ) {
     match buffer.delete_expired(time::OffsetDateTime::now_utc()).await {
         Ok(removed) if removed > 0 => {
-            info!(removed, "chat-engine stream-buffer TTL sweep removed expired events");
+            info!(
+                removed,
+                "chat-engine stream-buffer TTL sweep removed expired events"
+            );
         }
         Ok(_) => {}
         Err(err) => {
@@ -388,9 +391,11 @@ impl Gear for ChatEngineModule {
         // Resume buffer (FR-024): the driver tees wire events here so dropped
         // connections can resume via `Last-Event-ID`.
         let stream_buffer: Arc<dyn crate::infra::db::repo::stream_event_repo::StreamEventBuffer> =
-            Arc::new(crate::infra::db::repo::stream_event_repo::SeaStreamEventBuffer::new(
-                Arc::clone(&db),
-            ));
+            Arc::new(
+                crate::infra::db::repo::stream_event_repo::SeaStreamEventBuffer::new(Arc::clone(
+                    &db,
+                )),
+            );
 
         let messages = Arc::new(
             MessageService::new(

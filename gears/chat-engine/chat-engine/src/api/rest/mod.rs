@@ -98,8 +98,7 @@ pub(crate) fn sse_delta_stream_response(
         })
         .flatten();
 
-    let body_stream =
-        wire.map(|w| std::result::Result::<_, Infallible>::Ok(sse_frame(&w)));
+    let body_stream = wire.map(|w| std::result::Result::<_, Infallible>::Ok(sse_frame(&w)));
 
     Response::builder()
         .status(StatusCode::OK)
@@ -125,7 +124,13 @@ fn sse_frame(evt: &crate::domain::stream_delta::WireStreamEvent) -> Vec<u8> {
         tracing::error!(error = %err, "failed to serialize wire delta event");
         r#"{"type":"message.error","error":"internal serialization failure"}"#.to_string()
     });
-    format!("id: {}\nevent: {}\ndata: {}\n\n", evt.seq(), evt.event_name(), data).into_bytes()
+    format!(
+        "id: {}\nevent: {}\ndata: {}\n\n",
+        evt.seq(),
+        evt.event_name(),
+        data
+    )
+    .into_bytes()
 }
 
 // ===========================================================================

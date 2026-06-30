@@ -702,7 +702,10 @@ mod tests {
             part_type: "text".into(),
             content: json!({ "text": "hi" }),
         };
-        assert_eq!(SdkMessagePartInput::from(dto).content, json!({ "text": "hi" }));
+        assert_eq!(
+            SdkMessagePartInput::from(dto).content,
+            json!({ "text": "hi" })
+        );
     }
 
     #[test]
@@ -713,7 +716,10 @@ mod tests {
         };
         let sdk = SdkMessagePartInput::from(dto);
         assert_eq!(sdk.part_type, MessagePartType::Links);
-        assert_eq!(sdk.content, json!({ "links": [{ "url": "https://e.com" }] }));
+        assert_eq!(
+            sdk.content,
+            json!({ "links": [{ "url": "https://e.com" }] })
+        );
     }
 
     #[test]

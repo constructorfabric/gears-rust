@@ -383,10 +383,7 @@ impl SeaMessageRepo {
     /// each text part (FR-023). One query per child table for the whole batch,
     /// each ordered by `number`; payloads are deserialized from the stored
     /// JSON. Non-text parts simply have no rows.
-    async fn attach_citations(
-        &self,
-        parts: &mut [MessagePart],
-    ) -> Result<(), ChatEngineError> {
+    async fn attach_citations(&self, parts: &mut [MessagePart]) -> Result<(), ChatEngineError> {
         if parts.is_empty() {
             return Ok(());
         }
@@ -399,7 +396,8 @@ impl SeaMessageRepo {
             .secure()
             .scope_with(&scope)
             .filter(
-                Condition::all().add(file_citation_entity::Column::MessagePartId.is_in(ids.clone())),
+                Condition::all()
+                    .add(file_citation_entity::Column::MessagePartId.is_in(ids.clone())),
             )
             .all(&conn)
             .await?;
@@ -408,7 +406,8 @@ impl SeaMessageRepo {
             .secure()
             .scope_with(&scope)
             .filter(
-                Condition::all().add(link_citation_entity::Column::MessagePartId.is_in(ids.clone())),
+                Condition::all()
+                    .add(link_citation_entity::Column::MessagePartId.is_in(ids.clone())),
             )
             .all(&conn)
             .await?;
@@ -590,7 +589,13 @@ impl MessageRepo for SeaMessageRepo {
                 let mut meta = serde_json::Map::new();
                 meta.insert("cancelled".into(), JsonValue::Bool(true));
                 meta.insert("partial".into(), JsonValue::Bool(true));
-                (text, Some(JsonValue::Object(meta)), false, PartCitations::default(), Vec::new())
+                (
+                    text,
+                    Some(JsonValue::Object(meta)),
+                    false,
+                    PartCitations::default(),
+                    Vec::new(),
+                )
             }
             FinalizeOutcome::Errored {
                 text,
@@ -604,7 +609,13 @@ impl MessageRepo for SeaMessageRepo {
                 );
                 meta.insert("error".into(), JsonValue::String(error));
                 meta.insert("partial".into(), JsonValue::Bool(true));
-                (text, Some(JsonValue::Object(meta)), false, PartCitations::default(), Vec::new())
+                (
+                    text,
+                    Some(JsonValue::Object(meta)),
+                    false,
+                    PartCitations::default(),
+                    Vec::new(),
+                )
             }
         };
 
@@ -718,10 +729,7 @@ impl MessageRepo for SeaMessageRepo {
             .one(&conn)
             .await?;
         match row {
-            Some(row) => Ok(self
-                .attach_parts(vec![Message::from(row)])
-                .await?
-                .pop()),
+            Some(row) => Ok(self.attach_parts(vec![Message::from(row)]).await?.pop()),
             None => Ok(None),
         }
     }
@@ -908,8 +916,7 @@ impl MessageRepo for SeaMessageRepo {
                     // the same session sharing a variant_index, so it must take
                     // the next free root index — hardcoding 0 collides with the
                     // session's first user message.
-                    let variant_index =
-                        compute_next_variant_index(tx, session_id, None).await?;
+                    let variant_index = compute_next_variant_index(tx, session_id, None).await?;
                     let summary_active = message_entity::ActiveModel {
                         message_id: Set(summary_id),
                         session_id: Set(session_id),

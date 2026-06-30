@@ -19,7 +19,9 @@ use toolkit_db::secure::{AccessScope, SecureDeleteExt, SecureEntityExt, SecureIn
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
-use crate::infra::db::entity::stream_event::{self as stream_event_entity, Entity as StreamEventEntity};
+use crate::infra::db::entity::stream_event::{
+    self as stream_event_entity, Entity as StreamEventEntity,
+};
 use crate::infra::db::repo::ChatEngineDb;
 
 /// One buffered wire event, returned by [`StreamEventBuffer::read_since`].
@@ -113,8 +115,7 @@ impl StreamEventBuffer for SeaStreamEventBuffer {
     ) -> Result<Vec<BufferedEvent>, ChatEngineError> {
         let conn = self.db.conn()?;
         let scope = AccessScope::allow_all();
-        let mut cond =
-            Condition::all().add(stream_event_entity::Column::MessageId.eq(message_id));
+        let mut cond = Condition::all().add(stream_event_entity::Column::MessageId.eq(message_id));
         if let Some(after) = after_seq {
             cond = cond.add(stream_event_entity::Column::Seq.gt(seq_to_i64(after)));
         }
@@ -186,12 +187,18 @@ mod tests {
         }
         // Full read.
         let all = buf.read_since(mid, None).await.expect("read all");
-        assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            all.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
         // Tail after seq 1.
         let tail = buf.read_since(mid, Some(1)).await.expect("read tail");
         assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
         // Isolated per message.
-        let other = buf.read_since(Uuid::new_v4(), None).await.expect("read other");
+        let other = buf
+            .read_since(Uuid::new_v4(), None)
+            .await
+            .expect("read other");
         assert!(other.is_empty());
     }
 

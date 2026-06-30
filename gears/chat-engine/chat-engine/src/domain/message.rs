@@ -245,7 +245,10 @@ mod tests {
     #[test]
     fn tenant_and_user_round_trip_through_conversions() {
         let msg: Message = sample_model().into();
-        assert_eq!(msg.tenant_id.as_ref().map(TenantId::as_str), Some("tenant-1"));
+        assert_eq!(
+            msg.tenant_id.as_ref().map(TenantId::as_str),
+            Some("tenant-1")
+        );
         assert_eq!(msg.user_id.as_ref().map(UserId::as_str), Some("user-1"));
 
         let am: message_entity::ActiveModel = msg.into();

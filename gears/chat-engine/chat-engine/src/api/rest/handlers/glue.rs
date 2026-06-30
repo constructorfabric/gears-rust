@@ -32,13 +32,13 @@ use crate::api::rest::handlers::sessions::identity_from_ctx;
 use crate::api::rest::sse_delta_stream_response;
 use crate::api::rest::stream_reader::sse_buffer_reader_response;
 use crate::domain::error::{ChatEngineError, Result};
-use crate::infra::db::repo::stream_event_repo::StreamEventBuffer;
 use crate::domain::reaction::ReactionType;
 use crate::domain::search::SearchQuery;
 use crate::domain::service::message_service::SendMessageRequest;
 use crate::domain::service::{
     IntelligenceService, MessageService, ReactionService, SearchService, VariantService,
 };
+use crate::infra::db::repo::stream_event_repo::StreamEventBuffer;
 
 /// Query parameters for `GET /chat-engine/v1/sessions/{id}/messages`.
 #[derive(Debug, Deserialize)]
@@ -134,10 +134,7 @@ pub async fn resume_message_stream(
     // keeps writing so a later reconnect resumes.
     let cancel = CancellationToken::new();
     Ok(sse_buffer_reader_response(
-        buffer,
-        message_id,
-        from_seq,
-        cancel,
+        buffer, message_id, from_seq, cancel,
     ))
 }
 
@@ -257,9 +254,7 @@ pub async fn summarize_session(
 ) -> Result<Response> {
     let identity = identity_from_ctx(&ctx)?;
     let cancel = CancellationToken::new();
-    let stream = svc
-        .summarize_session(&identity, session_id, cancel)
-        .await?;
+    let stream = svc.summarize_session(&identity, session_id, cancel).await?;
     Ok(sse_delta_stream_response(stream))
 }
 

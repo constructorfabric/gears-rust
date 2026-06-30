@@ -24,6 +24,6 @@ pub use models::{
     StreamingStatusEvent, StreamingToolEvent, TenantId, TextPositionAnchor, UserId, VariantInfo,
 };
 pub use plugin::{
-    ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream,
-    SessionPluginCtx, SessionPluginResponse, empty_stream, stream_from_events,
+    ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream, SessionPluginCtx,
+    SessionPluginResponse, empty_stream, stream_from_events,
 };

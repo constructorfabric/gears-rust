@@ -83,9 +83,7 @@ pub async fn summarize_session(
     // on-demand summary still completes and persists.
     let cancel = CancellationToken::new();
 
-    let event_stream = svc
-        .summarize_session(&identity, session_id, cancel)
-        .await?;
+    let event_stream = svc.summarize_session(&identity, session_id, cancel).await?;
 
     // Project the summary stream into the shared SSE delta protocol (FR-024).
     Ok(crate::api::rest::sse_delta_stream_response(event_stream))

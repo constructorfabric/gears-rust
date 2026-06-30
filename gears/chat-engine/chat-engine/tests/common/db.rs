@@ -21,9 +21,7 @@
 use std::sync::Arc;
 
 use chat_engine::infra::db::Migrator;
-use chat_engine::infra::db::entity::{
-    file_citation, message, message_part, session, session_type,
-};
+use chat_engine::infra::db::entity::{file_citation, message, message_part, session, session_type};
 use chat_engine::infra::db::repo::ChatEngineDb;
 use chat_engine::infra::db::repo::message_repo::{MessageRepo, SeaMessageRepo};
 use chat_engine::infra::db::repo::plugin_config_repo::{PluginConfigRepo, SeaPluginConfigRepo};
