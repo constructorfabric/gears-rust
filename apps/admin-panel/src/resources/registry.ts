@@ -245,10 +245,14 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     tenantScope: "global",
     // Register/list/get only — no update/delete on the API yet (read-only).
     safety: "read-only",
+    // Entities are addressed by their GTS id, not the internal uuid: the
+    // get-one endpoint treats the path param as a gts_id (passing the uuid
+    // 404s as "no entity with GTS ID").
+    idField: "gts_id",
     capabilities: { read: "types:read" },
     paths: {
       list: () => `/types-registry/v1/entities`,
-      one: (_ctx, id) => `/types-registry/v1/entities/${id}`,
+      one: (_ctx, id) => `/types-registry/v1/entities/${encodeURIComponent(id)}`,
     },
     fields: [
       { name: "gts_id", label: "GTS id", inList: true, readOnly: true },
