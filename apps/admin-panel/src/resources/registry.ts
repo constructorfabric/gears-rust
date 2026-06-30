@@ -118,19 +118,23 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     tenantScope: "tenant",
     safety: "normal",
     capabilities: { read: "conversions:read", write: "conversions:write" },
+    // Field types/required/readOnly derive at boot from the OpenAPI schema; the
+    // entries below add only presentation the spec can't carry (tag render,
+    // labels, list visibility). `side`/`comment` are kept curated as the served
+    // DTO names them differently (`initiator_side`) or omits them.
+    schema: "OwnConversionRequestDto",
     paths: {
       // Own conversion requests for the caller's home tenant.
       list: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/conversions`,
       one: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/conversions/${id}`,
     },
     fields: [
-      { name: "id", type: "uuid", inList: true, readOnly: true },
+      { name: "id", inList: true, readOnly: true },
       { name: "status", type: "tag", inList: true },
-      { name: "target_mode", label: "Target mode", inList: true },
+      { name: "target_mode", label: "Target mode", type: "string", inList: true },
       { name: "side", inList: true },
       { name: "comment" },
-      { name: "created_at", type: "datetime" },
-      { name: "updated_at", type: "datetime" },
+      { name: "created_at", inList: true },
     ],
     actions: (
       [
@@ -166,8 +170,9 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       create: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/users`,
       remove: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/users/${id}`,
     },
+    schema: "UserDto",
     fields: [
-      { name: "id", type: "uuid", inList: true, readOnly: true },
+      { name: "id", inList: true, readOnly: true },
       { name: "username", inList: true, inForm: true, required: true },
       { name: "email", inList: true, inForm: true },
       { name: "display_name", label: "Display name", inList: true, inForm: true },
@@ -193,6 +198,7 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     idField: "type_id",
     createKeyField: "type_id",
     bodyField: "value",
+    schema: "TenantMetadataEntryDto",
     paths: {
       list: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata`,
       one: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata/${id}`,
@@ -200,9 +206,9 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       remove: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata/${id}`,
     },
     fields: [
-      { name: "type_id", label: "Type id", inList: true, createOnly: true, required: true },
-      { name: "value", type: "json", inList: true, inForm: true, required: true },
-      { name: "updated_at", label: "Updated", type: "datetime", inList: true },
+      { name: "type_id", label: "Type id", inList: true, createOnly: true },
+      { name: "value", inList: true, inForm: true },
+      { name: "updated_at", label: "Updated", inList: true },
     ],
   },
 
@@ -250,16 +256,16 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     // 404s as "no entity with GTS ID").
     idField: "gts_id",
     capabilities: { read: "types:read" },
+    // `id`/`segments`/`content`/`description` derive from the GtsEntityDto
+    // schema; only the two list-visible, relabelled fields stay curated.
+    schema: "GtsEntityDto",
     paths: {
       list: () => `/types-registry/v1/entities`,
       one: (_ctx, id) => `/types-registry/v1/entities/${encodeURIComponent(id)}`,
     },
     fields: [
       { name: "gts_id", label: "GTS id", inList: true, readOnly: true },
-      { name: "is_schema", label: "Schema?", type: "boolean", inList: true },
-      { name: "id", type: "uuid" },
-      { name: "segments", type: "json" },
-      { name: "content", type: "json" },
+      { name: "is_schema", label: "Schema?", inList: true },
     ],
   },
 
@@ -291,6 +297,9 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     owningGear: "oagw",
     tenantScope: "tenant",
     safety: "read-only",
+    // Nested fields (server/auth/headers/plugins/cors/…) derive as JSON from
+    // the UpstreamResponse schema; only list-visible columns stay curated.
+    schema: "UpstreamResponse",
     paths: {
       list: () => `/oagw/v1/upstreams`,
       one: (_ctx, id) => `/oagw/v1/upstreams/${id}`,
@@ -299,14 +308,8 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       { name: "id", inList: true, readOnly: true },
       { name: "alias", inList: true },
       { name: "protocol", type: "tag", inList: true },
-      { name: "enabled", type: "boolean", inList: true },
-      { name: "server", type: "json" },
-      { name: "tags", type: "json" },
-      { name: "auth", type: "json" },
-      { name: "headers", type: "json" },
-      { name: "plugins", type: "json" },
-      { name: "rate_limit", label: "Rate limit", type: "json" },
-      { name: "cors", type: "json" },
+      { name: "enabled", inList: true },
+      { name: "rate_limit", label: "Rate limit" },
     ],
   },
 
@@ -316,6 +319,9 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     owningGear: "oagw",
     tenantScope: "tenant",
     safety: "read-only",
+    // Nested fields (match/plugins/cors/…) derive as JSON from the RouteResponse
+    // schema; only list-visible columns stay curated.
+    schema: "RouteResponse",
     paths: {
       list: () => `/oagw/v1/routes`,
       one: (_ctx, id) => `/oagw/v1/routes/${id}`,
@@ -323,13 +329,9 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     fields: [
       { name: "id", inList: true, readOnly: true },
       { name: "upstream_id", label: "Upstream", inList: true },
-      { name: "priority", type: "number", inList: true },
-      { name: "enabled", type: "boolean", inList: true },
-      { name: "match", type: "json" },
-      { name: "tags", type: "json" },
-      { name: "plugins", type: "json" },
-      { name: "rate_limit", label: "Rate limit", type: "json" },
-      { name: "cors", type: "json" },
+      { name: "priority", inList: true },
+      { name: "enabled", inList: true },
+      { name: "rate_limit", label: "Rate limit" },
     ],
   },
 ];
