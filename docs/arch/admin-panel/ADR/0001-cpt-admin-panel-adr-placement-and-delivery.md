@@ -7,6 +7,13 @@ decision-makers: gears-rust admin-panel working group
 # Embed the Admin Panel in the gears-rust monorepo, served by the example server
 
 
+> **Revision (2026-06-30) — placement direction updated after review.**
+> Reviewer feedback on [#4145](https://github.com/constructorfabric/gears-rust/pull/4145#discussion_r3495062634) reopened this decision: embedding ~all of the SPA's TypeScript under `apps/admin-panel/` forces every other gears-rust-based project to copy that code to get an admin panel (the Django-admin counter-example: install once, run against any project). The agreed target is a **generic, reusable admin SPA** driven at runtime by the aggregated `/cf/openapi.json` plus gear-emitted admin metadata, shipped as a **pre-built artifact** with **zero per-project TypeScript**, ultimately living in a **dedicated `constructorfabric/` repository** (Option B's home) and loaded by the existing thin Rust serving shim (`mount_admin_spa()` in the api-gateway gear).
+>
+> This does **not** revert to Option B wholesale. Option B's main rejection driver — *atomic changes spanning gear APIs and admin resources become cross-repo* — is mitigated by moving the admin metadata **next to each gear's API** (emitted server-side), so a gear's API and its admin descriptors still change together even after the SPA is extracted. Sequencing: keep the SPA in this monorepo until it is fully generic, then extract it as a follow-up (smaller, reviewable steps). The original Option A analysis below stands as the v0 record; the end-state is the generic/distributable shape.
+>
+> **Open (pending reviewer):** the transport for metadata OpenAPI can't express (custom actions, safety levels, tenant-scope, layout) — a config file shipped with the panel, `x-cf-admin-*` OpenAPI vendor extensions emitted via `OperationBuilder` (leaning), or a dedicated descriptor endpoint. Distribution format (release tarball / npm / container) and the exact extract trigger are a later round. See [ADR-0003](0003-cpt-admin-panel-adr-resource-discovery.md) for the discovery side of this pivot.
+
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)
