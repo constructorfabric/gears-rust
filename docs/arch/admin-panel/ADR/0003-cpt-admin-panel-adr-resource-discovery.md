@@ -7,6 +7,13 @@ decision-makers: gears-rust admin-panel working group
 # Discover admin resources OpenAPI-first, with a hardcoded v0 registry
 
 
+> **Revision (2026-06-30) — discovery direction promoted after review.**
+> Reviewer feedback on [#4145](https://github.com/constructorfabric/gears-rust/pull/4145#discussion_r3495062634) (see [ADR-0001 revision](0001-cpt-admin-panel-adr-placement-and-delivery.md)) requires the SPA to carry **zero per-project TypeScript**, which makes the hardcoded in-app registry a blocker rather than an acceptable v0 coupling. Two parts of this ADR that were "Still deferred" are promoted to the **target/v1**:
+> 1. **Runtime parsing of `/openapi.json`** to derive fields/types/`required`/`readOnly`, CRUD verb mapping, and read-only detection — shrinking the curated registry by ~70%.
+> 2. The **gear-contributed metadata mechanism** (`cpt-admin-panel-fr-gear-contributed-metadata`) for what OpenAPI cannot express (custom actions, safety levels, tenant-scope strategy, layout/labels, irregular list paths). This effectively moves the chosen approach from Option A toward **Option C**, but realized incrementally rather than as an upfront cross-gear blocker.
+>
+> **Open (pending reviewer):** the metadata transport — a config file, `x-cf-admin-*` OpenAPI vendor extensions emitted per-gear via `OperationBuilder` (leaning; keeps metadata next to the API), or a dedicated descriptor endpoint. The descriptor shape defined for the v0 registry is already forward-compatible with all three. No-regret work (runtime OpenAPI discovery + registry shrink) proceeds now regardless of the chosen transport.
+
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)

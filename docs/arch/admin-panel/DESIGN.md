@@ -1,6 +1,8 @@
 # Technical Design — Integrated Admin Panel
 
 
+> **Revision (2026-06-30):** placement and discovery were updated after PR review — the panel becomes a **generic, reusable SPA** (runtime `/cf/openapi.json` + gear-emitted metadata) shipped as a **pre-built artifact** with zero per-project TypeScript, eventually extracted to a dedicated `constructorfabric/` repository (kept in-monorepo until fully generic). The in-app curated registry described below is the v0 state and shrinks to near-zero as runtime OpenAPI discovery and gear-contributed metadata land. See the revision notes in [ADR-0001](ADR/0001-cpt-admin-panel-adr-placement-and-delivery.md) and [ADR-0003](ADR/0003-cpt-admin-panel-adr-resource-discovery.md). Metadata transport (config / `x-cf-admin-*` extensions / descriptor endpoint) is pending reviewer confirmation.
+
 <!-- toc -->
 
 - [1. Architecture Overview](#1-architecture-overview)
