@@ -1758,6 +1758,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-model-registry-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "chrono",
+ "gts",
+ "gts-macros",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-nodes-registry"
 version = "0.1.26"
 dependencies = [
@@ -8272,6 +8289,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "ref-cast",
  "schemars_derive",

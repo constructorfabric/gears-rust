@@ -97,6 +97,7 @@ members = [
     "gears/system/usage-collector/plugins/noop-usage-collector-plugin",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
+    "gears/model-registry/model-registry-sdk",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"

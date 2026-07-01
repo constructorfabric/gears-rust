@@ -5,6 +5,25 @@ date: 2026-02-18
 
 # Pluggable Cache Backend with TTL Strategy
 
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Pluggable Cache Backend](#pluggable-cache-backend)
+  - [Redis-only Distributed Cache](#redis-only-distributed-cache)
+  - [In-memory Cache per Instance](#in-memory-cache-per-instance)
+  - [No Cache (Database Only)](#no-cache-database-only)
+- [More Information](#more-information)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
 **ID**: `cpt-cf-model-registry-adr-pluggable-cache`
 
 ## Context and Problem Statement
