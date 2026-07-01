@@ -108,12 +108,38 @@ P2-5. GET  /files/{id}/multipart/{upload_id}            list uploaded parts (int
 | `declared_mime` | `string` | yes | MIME type of the file being uploaded (e.g. `video/mp4`). Validated against the effective allowed-types policy. |
 | `declared_size` | `uint64` | yes | Total file size in bytes. The control plane validates this against the effective policy size limit and storage quota at initiate time — exactly like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any bytes are transferred. `413` if it exceeds the limit; `507` if it would exceed the storage quota. |
 
-The `declared_size` is validated only at initiate time and is **not** persisted in the `multipart_uploads` session row.
-The complete-time total-size check (summing actual part sizes) is kept as defence-in-depth.
+**`P2-1` initiate response** (`application/json`) — the server-computed plan:
 
-For a `multipart_native` backend the sidecar drives the backend multipart API; otherwise it offset-writes each part
-into the single new-version object. Per-part BLAKE3 subtree hashes are persisted in `multipart_upload_parts.part_hash`
-and combined into the root at `complete`. Detailed envelope/error shapes are owned by the P2 FEATURE.
+```json
+{
+  "upload_id": "uuid",
+  "version_id": "uuid",
+  "part_hash_algorithm": "BLAKE3",
+  "part_size": 8388608,
+  "parts": [
+    { "part_number": 1, "offset": 0, "size": 8388608, "upload_url": "https://sidecar/…?fs-token=…" },
+    { "part_number": 2, "offset": 8388608, "size": 2097152, "upload_url": "…" }
+  ],
+  "expires_at": "RFC3339"
+}
+```
+
+**`P2-2` upload part** — the client `PUT`s each part's raw body to its `upload_url` on the sidecar. Each URL is a
+signed token (ADR-0004) carrying the part's `upload_id`, `part_number`, `offset`, and **exact `size`** as claims. The
+sidecar **MUST** reject a body whose length ≠ the `size` claim with `413` **before** writing — so per-part size is
+enforced at transfer time and oversized bytes never reach the backend. Re-`PUT` of the same part is idempotent
+(enables resume). For a `multipart_native` backend the sidecar drives the backend multipart API; otherwise it
+offset-writes each part into the single new-version object. Per-part BLAKE3 subtree hashes are persisted in
+`multipart_upload_parts.part_hash` and combined into the root at `complete`.
+
+Full request/response envelopes, error taxonomy, token claims, persistence, and resumability are specified in the
+FEATURE artifact **[features/multipart-coordinator.md](./features/multipart-coordinator.md)**.
+
+> **Implementation status**: the interim P2-M3 build is *client-driven* (the client picks `part_number` and `PUT`s raw
+> bytes to a control-plane `.../parts/{n}` route). The initiate-time `declared_size` gate above is already in place;
+> the per-part signed-URL flow and the removal of the control-plane byte route are pending alignment to this contract
+> (FEATURE §8). Until then `declared_size` is validated at initiate but not persisted, and the complete-time
+> total-size check (summing actual part sizes) is the defence-in-depth backstop.
 
 ## Upload, bind, and the conflict retry
 
