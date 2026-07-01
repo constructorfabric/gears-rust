@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use super::tables::OutboxTables;
+
 /// Default batch size for the sequencer (rows per cycle).
 pub const DEFAULT_SEQUENCER_BATCH_SIZE: u32 = 1000;
 
@@ -101,6 +103,9 @@ pub enum OutboxError {
     #[error("invalid payload type: '{0}'")]
     InvalidPayloadType(String),
 
+    #[error("invalid outbox table prefix: '{0}'")]
+    InvalidTablePrefix(String),
+
     #[error(transparent)]
     Database(#[from] sea_orm::DbErr),
 }
@@ -108,6 +113,7 @@ pub enum OutboxError {
 /// Configuration for the outbox subsystem.
 #[derive(Debug, Clone, Default)]
 pub struct OutboxConfig {
+    pub(crate) tables: OutboxTables,
     pub sequencer: SequencerConfig,
 }
 

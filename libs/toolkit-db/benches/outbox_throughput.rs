@@ -35,6 +35,8 @@
 //! (DB seq must be strictly monotonic) and completeness (no lost messages).
 //! Multi-instance profiles verify that competing outbox instances correctly
 //! share partitions via DB-level leases without duplication.
+//! Profiles with `table_prefixes` run independent outbox instances in the same
+//! database. Those measure isolated table families, not lease competition.
 //!
 //! **Run examples:**
 //!   ```sh
@@ -57,7 +59,7 @@ use tokio::sync::Notify;
 
 use toolkit_db::outbox::{
     Batch, EnqueueMessage, HandlerResult, LeasedHandler, Outbox, OutboxHandle, OutboxProfile,
-    Partitions, outbox_migrations,
+    Partitions, outbox_migrations, outbox_migrations_with_prefix,
 };
 use toolkit_db::{ConnectOpts, Db, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -101,6 +103,11 @@ struct BenchProfile {
     /// claimed via DB-level leases, so instances compete for work.
     #[serde(default = "default_one")]
     num_instances: usize,
+    /// Optional per-instance table prefixes. Empty means all instances use the
+    /// default shared table family and compete for DB leases. When set, each
+    /// instance uses its matching prefix and runs independently in the same DB.
+    #[serde(default)]
+    table_prefixes: Vec<String>,
 
     // -- Workload --
     /// Target message count. Automatically rounded up to be evenly divisible
@@ -234,9 +241,18 @@ impl BenchProfile {
         self.num_queues * self.partitions_per_queue as usize
     }
 
-    /// Round message_count up to be evenly divisible by total_partitions.
+    fn verification_partitions(&self) -> usize {
+        let total_parts = self.total_partitions();
+        if self.independent_table_families() {
+            total_parts * self.num_instances
+        } else {
+            total_parts
+        }
+    }
+
+    /// Round message_count up to be evenly divisible by the verified partition space.
     fn aligned_message_count(&self) -> usize {
-        let tp = self.total_partitions();
+        let tp = self.verification_partitions();
         let remainder = self.message_count % tp;
         if remainder == 0 {
             self.message_count
@@ -267,6 +283,23 @@ impl BenchProfile {
             ProducerMode::SmallBatch(n) => n,
             ProducerMode::FullBatch => BATCH_SIZE,
         }
+    }
+
+    fn independent_table_families(&self) -> bool {
+        !self.table_prefixes.is_empty()
+    }
+
+    fn validate_table_prefixes(&self) {
+        assert!(
+            self.table_prefixes.is_empty() || self.table_prefixes.len() == self.num_instances,
+            "table_prefixes must be empty or contain one prefix per outbox instance"
+        );
+        let unique: HashSet<&str> = self.table_prefixes.iter().map(String::as_str).collect();
+        assert_eq!(
+            unique.len(),
+            self.table_prefixes.len(),
+            "table_prefixes must be distinct for independent outbox instances"
+        );
     }
 }
 
@@ -301,6 +334,7 @@ fn validation_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 10_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -316,6 +350,7 @@ fn validation_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 100_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -331,6 +366,7 @@ fn validation_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 100_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -346,6 +382,7 @@ fn validation_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 100_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -361,6 +398,7 @@ fn validation_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 100_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -382,6 +420,7 @@ fn longhaul_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 1_000_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -397,6 +436,7 @@ fn longhaul_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 1_000_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -419,6 +459,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 1_000_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -434,6 +475,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 1_000_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -452,6 +494,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 1_000_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -470,6 +513,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 1_000_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -488,6 +532,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 1_000_000,
             num_instances: 1,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Realistic { hot_queues: 8 },
             pool_size: None,
             criterion,
@@ -504,6 +549,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 100_000,
             num_instances: 2,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion: validation,
@@ -519,6 +565,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 100_000,
             num_instances: 2,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion: validation,
@@ -534,6 +581,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 100_000,
             num_instances: 2,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion: validation,
@@ -549,6 +597,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 1_000_000,
             num_instances: 2,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
@@ -564,9 +613,26 @@ fn stress_profiles() -> Vec<BenchProfile> {
             partitions_per_queue: 64,
             message_count: 1_000_000,
             num_instances: 2,
+            table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
             pool_size: None,
             criterion,
+        },
+        BenchProfile {
+            name: "2i_independent_prefix_batch".into(),
+            tier: Tier::Stress,
+            producer_mode: ProducerMode::FullBatch,
+            num_producers: 16,
+            num_processors: 8,
+            maintenance: MaintenanceConfig::default(),
+            num_queues: 1,
+            partitions_per_queue: 64,
+            message_count: 100_000,
+            num_instances: 2,
+            table_prefixes: vec!["bench_outbox_a".into(), "bench_outbox_b".into()],
+            load_distribution: LoadDistribution::Uniform,
+            pool_size: None,
+            criterion: validation,
         },
     ]
 }
@@ -636,6 +702,7 @@ struct BenchHandler {
     counter: Arc<AtomicUsize>,
     notify: Arc<Notify>,
     expected_total: usize,
+    partition_key_offset: i64,
 }
 
 #[async_trait::async_trait]
@@ -646,11 +713,9 @@ impl LeasedHandler for BenchHandler {
             let (_, seq_str) = payload.split_once(':').unwrap();
             let seq: u64 = seq_str.parse().unwrap();
 
-            self.consumed.entry(msg.partition_id).or_default().push(seq);
-            self.db_seqs
-                .entry(msg.partition_id)
-                .or_default()
-                .push(msg.seq);
+            let partition_key = self.partition_key_offset + msg.partition_id;
+            self.consumed.entry(partition_key).or_default().push(seq);
+            self.db_seqs.entry(partition_key).or_default().push(msg.seq);
 
             batch.ack();
 
@@ -663,13 +728,14 @@ impl LeasedHandler for BenchHandler {
     }
 }
 
-fn make_handler(state: &BenchState) -> BenchHandler {
+fn make_handler(state: &BenchState, partition_key_offset: i64) -> BenchHandler {
     BenchHandler {
         consumed: Arc::clone(&state.consumed),
         db_seqs: Arc::clone(&state.db_seqs),
         counter: Arc::clone(&state.counter),
         notify: Arc::clone(&state.notify),
         expected_total: state.expected_total,
+        partition_key_offset,
     }
 }
 
@@ -704,7 +770,7 @@ async fn wait_for_completion(state: &BenchState, timeout: Duration) {
 /// For realistic distributions, checks total count and per-partition ordering only.
 fn verify_results(state: &BenchState, profile: &BenchProfile) {
     let msg_count = profile.aligned_message_count();
-    let total_parts = profile.total_partitions();
+    let verification_parts = profile.verification_partitions();
 
     // DB-seq ordering: must be strictly monotonically increasing per partition
     for entry in state.db_seqs.iter() {
@@ -724,12 +790,12 @@ fn verify_results(state: &BenchState, profile: &BenchProfile) {
 
     match profile.load_distribution {
         LoadDistribution::Uniform => {
-            let msgs_per_partition = msg_count / total_parts;
+            let msgs_per_partition = msg_count / verification_parts;
 
             assert_eq!(
                 state.consumed.len(),
-                total_parts,
-                "expected {total_parts} partitions, got {}",
+                verification_parts,
+                "expected {verification_parts} partitions, got {}",
                 state.consumed.len()
             );
 
@@ -1010,6 +1076,8 @@ async fn start_instance(
     profile: &BenchProfile,
     queue_prefix: &str,
     state: &BenchState,
+    table_prefix: Option<&str>,
+    partition_key_offset: i64,
 ) -> OutboxHandle {
     let mut builder = Outbox::builder(db.clone())
         .profile(OutboxProfile::high_throughput())
@@ -1017,10 +1085,14 @@ async fn start_instance(
         .maintenance(profile.maintenance.guaranteed, profile.maintenance.shared)
         .stats_interval(Duration::from_secs(10));
 
+    if let Some(prefix) = table_prefix {
+        builder = builder.table_prefix(prefix).unwrap();
+    }
+
     for name in queue_names(queue_prefix, profile) {
         builder = builder
             .queue(&name, Partitions::of(profile.partitions_per_queue))
-            .leased(make_handler(state))
+            .leased(make_handler(state, partition_key_offset))
             .done();
     }
 
@@ -1038,6 +1110,7 @@ async fn setup_pipeline(
     profile: &BenchProfile,
     queue_prefix: &str,
 ) -> (Db, Vec<OutboxHandle>, Arc<BenchState>) {
+    profile.validate_table_prefixes();
     let is_sqlite = db_url.starts_with("sqlite");
     let max_conns = profile.effective_pool_size(is_sqlite);
     let msg_count = profile.aligned_message_count();
@@ -1054,40 +1127,93 @@ async fn setup_pipeline(
 
     let state = Arc::new(BenchState::new(msg_count));
 
+    if profile.independent_table_families() {
+        for prefix in &profile.table_prefixes {
+            run_migrations_for_testing(&db, outbox_migrations_with_prefix(prefix).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+
     let mut handles = Vec::with_capacity(profile.num_instances);
-    for _ in 0..profile.num_instances {
-        handles.push(start_instance(&db, profile, queue_prefix, &state).await);
+    for instance_idx in 0..profile.num_instances {
+        let table_prefix = profile.table_prefixes.get(instance_idx).map(String::as_str);
+        let partition_key_offset = if profile.independent_table_families() {
+            i64::try_from(instance_idx).unwrap() * 1_000_000_000
+        } else {
+            0
+        };
+        handles.push(
+            start_instance(
+                &db,
+                profile,
+                queue_prefix,
+                &state,
+                table_prefix,
+                partition_key_offset,
+            )
+            .await,
+        );
     }
 
     (db, handles, state)
 }
 
-/// Delete all data from outbox tables after each iteration.
-async fn cleanup_outbox_tables(db_url: &str) {
-    use sea_orm::{ConnectionTrait, Database, Statement};
+fn cleanup_prefixes(profile: &BenchProfile) -> Vec<&str> {
+    if profile.independent_table_families() {
+        profile.table_prefixes.iter().map(String::as_str).collect()
+    } else {
+        vec!["toolkit_outbox"]
+    }
+}
 
-    const TABLES: &[&str] = &[
-        "toolkit_outbox_dead_letters",
-        "toolkit_outbox_outgoing",
-        "toolkit_outbox_incoming",
-        "toolkit_outbox_vacuum_counter",
-        "toolkit_outbox_processor",
-        "toolkit_outbox_body",
-        "toolkit_outbox_partitions",
-    ];
+fn table_family(prefix: &str) -> [String; 7] {
+    [
+        format!("{prefix}_dead_letters"),
+        format!("{prefix}_outgoing"),
+        format!("{prefix}_incoming"),
+        format!("{prefix}_vacuum_counter"),
+        format!("{prefix}_processor"),
+        format!("{prefix}_body"),
+        format!("{prefix}_partitions"),
+    ]
+}
+
+fn sequence_tables(prefix: &str) -> [String; 2] {
+    [
+        format!("{prefix}_body_id_sequence"),
+        format!("{prefix}_incoming_id_sequence"),
+    ]
+}
+
+/// Delete all data from the configured outbox table families after each iteration.
+async fn cleanup_outbox_tables(db_url: &str, profile: &BenchProfile) {
+    use sea_orm::{ConnectionTrait, Database, Statement};
 
     let db = Database::connect(db_url).await.unwrap();
     let backend = db.get_database_backend();
-    for table in TABLES {
-        let sql = match backend {
-            sea_orm::DbBackend::Postgres => format!("TRUNCATE TABLE {table} CASCADE"),
-            sea_orm::DbBackend::Sqlite | sea_orm::DbBackend::MySql => {
-                format!("DELETE FROM {table}")
+    for prefix in cleanup_prefixes(profile) {
+        for table in table_family(prefix) {
+            let sql = match backend {
+                sea_orm::DbBackend::Postgres => format!("TRUNCATE TABLE {table} CASCADE"),
+                sea_orm::DbBackend::Sqlite | sea_orm::DbBackend::MySql => {
+                    format!("DELETE FROM {table}")
+                }
+            };
+            db.execute(Statement::from_string(backend, sql))
+                .await
+                .unwrap();
+        }
+        if backend == sea_orm::DbBackend::MySql {
+            for table in sequence_tables(prefix) {
+                db.execute(Statement::from_string(
+                    backend,
+                    format!("UPDATE {table} SET next_id = 1 WHERE slot = 1"),
+                ))
+                .await
+                .unwrap();
             }
-        };
-        db.execute(Statement::from_string(backend, sql))
-            .await
-            .unwrap();
+        }
     }
 }
 
@@ -1144,7 +1270,7 @@ fn run_profile(
                         h.stop().await;
                     }
                     drop(db);
-                    cleanup_outbox_tables(&db_url).await;
+                    cleanup_outbox_tables(&db_url, &profile).await;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 total

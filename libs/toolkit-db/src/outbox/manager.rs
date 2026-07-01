@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use sea_orm::ConnectionTrait;
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -10,6 +11,7 @@ use super::builder::QueueBuilder;
 use super::core::Outbox;
 use super::prioritizer::SharedPrioritizer;
 use super::stats::{StatsListener, StatsRegistry, StatsReporter};
+use super::tables::OutboxTables;
 use super::taskward::{
     BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, PanicPolicy, TaskSet,
     TracingListener, WorkerBuilder, poker,
@@ -112,6 +114,7 @@ pub struct OutboxBuilder {
     sequencer_tuning: Option<WorkerTuning>,
     vacuum_tuning: Option<WorkerTuning>,
     reconciler_tuning: Option<WorkerTuning>,
+    tables: OutboxTables,
     pub(crate) queue_declarations: Vec<QueueDeclaration>,
 }
 
@@ -130,8 +133,23 @@ impl OutboxBuilder {
             sequencer_tuning: None,
             vacuum_tuning: None,
             reconciler_tuning: None,
+            tables: OutboxTables::default(),
             queue_declarations: Vec::new(),
         }
+    }
+
+    /// Select a custom table prefix for this outbox instance.
+    ///
+    /// The same prefix must be used when registering outbox migrations with
+    /// [`super::outbox_migrations_with_prefix`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboxError::InvalidTablePrefix`] if the prefix cannot be used
+    /// as a portable SQL identifier.
+    pub fn table_prefix(mut self, prefix: impl Into<String>) -> Result<Self, OutboxError> {
+        self.tables = OutboxTables::new(prefix)?;
+        Ok(self)
     }
 
     /// Maximum number of concurrent partition processors across all queues.
@@ -350,13 +368,18 @@ impl OutboxBuilder {
     /// See the `maintenance()` doc comment for the full two-tier model.
     fn spawn_vacuum_workers(
         ctx: &mut StartContext<'_>,
+        outbox: &Arc<Outbox>,
         tuning: &WorkerTuning,
         shared_sem: &Arc<Semaphore>,
         count: usize,
     ) {
         for i in 0..count {
             #[allow(unused_mut)]
-            let vacuum = VacuumTask::new(ctx.db.clone(), tuning.batch_size as usize);
+            let vacuum = VacuumTask::new(
+                ctx.db.clone(),
+                outbox.statements_arc(),
+                tuning.batch_size as usize,
+            );
             let name = format!("vacuum-{i}");
             let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
             let mut builder = WorkerBuilder::<VacuumReport>::new(&name, ctx.cancel.clone())
@@ -461,6 +484,7 @@ impl OutboxBuilder {
         let shared_prioritizer = Arc::new(SharedPrioritizer::new());
 
         let config = OutboxConfig {
+            tables: self.tables.clone(),
             sequencer: SequencerConfig {
                 batch_size: tuning.sequencer.batch_size,
                 poll_interval: tuning.sequencer.idle_interval,
@@ -468,7 +492,8 @@ impl OutboxBuilder {
                 max_inner_iterations: self.max_inner_iterations,
             },
         };
-        let outbox = Arc::new(Outbox::new(config));
+        let backend = self.db.sea_internal().get_database_backend();
+        let outbox = Arc::new(Outbox::new_with_backend(config, backend));
         let cancel = CancellationToken::new();
         let mut task_set = TaskSet::new(cancel.clone());
         let start_notify = Arc::new(Notify::new());
@@ -564,7 +589,7 @@ impl OutboxBuilder {
         Self::spawn_cold_reconciler(&mut ctx, &outbox, &shared_prioritizer, &tuning.reconciler);
 
         // 9. Spawn vacuum workers
-        Self::spawn_vacuum_workers(&mut ctx, &tuning.vacuum, &shared_sem, shared);
+        Self::spawn_vacuum_workers(&mut ctx, &outbox, &tuning.vacuum, &shared_sem, shared);
 
         // 10. Spawn stats reporter (if enabled)
         if let Some(interval) = self.stats_interval {

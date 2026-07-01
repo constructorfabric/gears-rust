@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::super::Outbox;
-use super::super::dialect::{AllocSql, Dialect};
+use super::super::dialect::AllocSql;
 use super::super::prioritizer::SharedPrioritizer;
+use super::super::store::OutboxStore;
 use super::super::taskward::{Directive, WorkerAction};
 use super::super::types::{OutboxError, SequencerConfig};
 use crate::Db;
@@ -67,8 +68,11 @@ impl Sequencer {
         partition_id: i64,
     ) -> Result<PartitionProcessResult, PartitionError> {
         let conn = self.db.sea_internal();
-        let backend = conn.get_database_backend();
-        let dialect = Dialect::from(backend);
+        debug_assert_eq!(
+            conn.get_database_backend(),
+            self.outbox.statements().backend()
+        );
+        let store = OutboxStore::new(self.outbox.statements());
 
         let mut drained = true;
         let mut total_claimed: u32 = 0;
@@ -77,9 +81,9 @@ impl Sequencer {
             let txn = conn.begin().await?;
 
             // Try to acquire row lock
-            if let Some(lock_sql) = dialect.lock_partition() {
+            if let Some(lock_sql) = store.lock_partition() {
                 let locked = self
-                    .try_lock_partition(&txn, backend, partition_id, lock_sql)
+                    .try_lock_partition(&txn, &store, partition_id, lock_sql)
                     .await?;
                 if !locked {
                     // Rollback (drop txn) and signal skip
@@ -90,7 +94,7 @@ impl Sequencer {
 
             // Claim incoming for this partition
             let claimed = self
-                .claim_incoming_for_partition(&txn, backend, &dialect, partition_id)
+                .claim_incoming_for_partition(&txn, &store, partition_id)
                 .await?;
 
             if claimed.is_empty() {
@@ -108,10 +112,10 @@ impl Sequencer {
 
             // Allocate sequences
             let start_seq = self
-                .allocate_sequences(&txn, backend, &dialect, partition_id, item_count)
+                .allocate_sequences(&txn, &store, partition_id, item_count)
                 .await?;
 
-            let outgoing_sql = dialect.build_insert_outgoing_batch(claimed.len());
+            let outgoing_sql = store.build_insert_outgoing_batch(claimed.len());
             let mut values: Vec<sea_orm::Value> = Vec::with_capacity(claimed.len() * 3);
             for (i, item) in claimed.iter().enumerate() {
                 #[allow(clippy::cast_possible_wrap)]
@@ -121,7 +125,7 @@ impl Sequencer {
                 values.push(seq.into());
             }
             txn.execute(Statement::from_sql_and_values(
-                backend,
+                store.backend(),
                 &outgoing_sql,
                 values,
             ))
@@ -255,13 +259,13 @@ impl Sequencer {
     async fn try_lock_partition(
         &self,
         txn: &impl ConnectionTrait,
-        backend: DbBackend,
+        store: &OutboxStore<'_>,
         partition_id: i64,
         sql: &str,
     ) -> Result<bool, OutboxError> {
         let row = txn
             .query_one(Statement::from_sql_and_values(
-                backend,
+                store.backend(),
                 sql,
                 [partition_id.into()],
             ))
@@ -277,15 +281,14 @@ impl Sequencer {
     async fn claim_incoming_for_partition(
         &self,
         txn: &impl ConnectionTrait,
-        backend: DbBackend,
-        dialect: &Dialect,
+        store: &OutboxStore<'_>,
         partition_id: i64,
     ) -> Result<Vec<ClaimedIncoming>, OutboxError> {
-        let claim = dialect.claim_incoming(self.config.batch_size);
+        let claim = store.claim_incoming(self.config.batch_size);
 
         // SELECT id, body_id ... ORDER BY id
         let rows = ClaimedIncoming::find_by_statement(Statement::from_sql_and_values(
-            backend,
+            store.backend(),
             &claim.select,
             [partition_id.into()],
         ))
@@ -297,10 +300,14 @@ impl Sequencer {
         }
 
         // DELETE the selected rows by id
-        let delete_sql = dialect.delete_incoming_batch(rows.len());
+        let delete_sql = store.delete_incoming_batch(rows.len());
         let values: Vec<sea_orm::Value> = rows.iter().map(|r| r.id.into()).collect();
-        txn.execute(Statement::from_sql_and_values(backend, &delete_sql, values))
-            .await?;
+        txn.execute(Statement::from_sql_and_values(
+            store.backend(),
+            &delete_sql,
+            values,
+        ))
+        .await?;
 
         Ok(rows)
     }
@@ -310,17 +317,16 @@ impl Sequencer {
     async fn allocate_sequences(
         &self,
         txn: &impl ConnectionTrait,
-        backend: DbBackend,
-        dialect: &Dialect,
+        store: &OutboxStore<'_>,
         partition_id: i64,
         count: i64,
     ) -> Result<i64, OutboxError> {
-        match dialect.allocate_sequences() {
+        match store.allocate_sequences() {
             AllocSql::UpdateReturning(sql) => {
                 // Pg/SQLite: UPDATE ... RETURNING — $1 = partition_id, $2 = count
                 let row = txn
                     .query_one(Statement::from_sql_and_values(
-                        backend,
+                        store.backend(),
                         sql,
                         [partition_id.into(), count.into()],
                     ))
@@ -339,14 +345,14 @@ impl Sequencer {
                 // MySQL: UPDATE then SELECT
                 // ? order: (count, partition_id) matching SQL occurrence
                 txn.execute(Statement::from_sql_and_values(
-                    backend,
+                    store.backend(),
                     update,
                     [count.into(), partition_id.into()],
                 ))
                 .await?;
                 let row = txn
                     .query_one(Statement::from_sql_and_values(
-                        backend,
+                        store.backend(),
                         select,
                         [count.into(), partition_id.into()],
                     ))

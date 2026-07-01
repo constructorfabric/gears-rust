@@ -11,6 +11,62 @@ cancellation).
 
 ## Usage
 
+Default usage keeps the existing `toolkit_outbox_*` tables:
+
+```rust
+run_migrations_for_testing(&db, outbox_migrations()).await?;
+
+let handle = Outbox::builder(db)
+    .queue("orders", Partitions::of(4))
+    .leased(OrderHandler { client })
+    .start().await?;
+```
+
+### Custom table prefix
+
+Use the same prefix for migrations and the runtime builder. The prefix creates
+a complete independent table family by appending fixed suffixes such as
+`_body`, `_partitions`, `_incoming`, `_outgoing`, and `_dead_letters`.
+
+```rust
+run_migrations_for_testing(
+    &db,
+    outbox_migrations_with_prefix("mini_chat_outbox")?,
+).await?;
+
+let handle = Outbox::builder(db)
+    .table_prefix("mini_chat_outbox")?
+    .queue("orders", Partitions::of(4))
+    .leased(OrderHandler { client })
+    .start().await?;
+```
+
+Changing the prefix points the outbox at a different table family. It does not
+rename tables or move existing rows. To move data between prefixes, drain or
+migrate the rows explicitly.
+
+Prefixes are validated before SQL is generated: they must be non-empty ASCII
+identifiers, start with a letter, contain only letters, digits, and underscores,
+and stay short enough that derived table and index names fit common backend
+identifier limits. Schema-qualified input such as `public.outbox`, quoting,
+spaces, semicolons, and other punctuation are rejected. Table and index names
+are SQL identifiers, so they cannot be bound as query parameters; only validated
+identifiers are interpolated, while queue names, payloads, partition IDs, lease
+IDs, limits, and filters remain SQL parameters.
+
+At runtime, the validated table names and detected backend are compiled once
+into an internal `OutboxStatements` catalog. Fixed-shape SQL is reused from that
+catalog instead of being rebuilt through default table-name replacement on every
+operation. Dynamic SQL is still built for runtime-cardinality cases such as
+multi-row inserts and `IN (...)` lists.
+
+For MySQL, migrations also create `<prefix>_body_id_sequence` and
+`<prefix>_incoming_id_sequence`. Batch enqueue reserves body IDs first and
+incoming IDs second by locking the singleton row with `SELECT ... FOR UPDATE`,
+advancing `next_id`, then inserting rows with explicit IDs. On MySQL-compatible
+clusters such as Percona XtraDB Cluster/Galera, retry the whole transaction on
+deadlock, serialization, or certification-conflict errors.
+
 ### Single-message handler (leased)
 
 ```rust

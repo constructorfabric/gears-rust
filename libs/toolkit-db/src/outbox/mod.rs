@@ -24,6 +24,8 @@
 //! # Usage
 //!
 //! ```ignore
+//! run_migrations_for_testing(&db, outbox_migrations()).await?;
+//!
 //! let handle = Outbox::builder(db)
 //!     .profile(OutboxProfile::low_latency())
 //!     .queue("orders", Partitions::of(4))
@@ -33,13 +35,36 @@
 //! handle.stop().await;
 //! ```
 //!
+//! Custom table prefixes are supported when migrations and runtime use the
+//! same validated prefix:
+//!
+//! ```ignore
+//! run_migrations_for_testing(&db, outbox_migrations_with_prefix("mini_chat_outbox")?).await?;
+//!
+//! let handle = Outbox::builder(db)
+//!     .table_prefix("mini_chat_outbox")?
+//!     .queue("orders", Partitions::of(4))
+//!         .leased(my_handler)
+//!     .start().await?;
+//! ```
+//!
+//! Prefix changes create a new outbox table family; they do not rename or move
+//! existing rows. Prefixes are validated as portable SQL identifiers because
+//! table and index names cannot be bound as SQL parameters.
+//! At runtime the validated table names and detected database backend are
+//! compiled once into an internal statement catalog; fixed SQL is not produced
+//! by repeated default-table-name replacement.
+//!
 //! # Backend notes
 //!
 //! - **`PostgreSQL`** — Full support. Uses `FOR UPDATE SKIP LOCKED` for partition
 //!   locking and `INSERT ... RETURNING` for body ID retrieval.
 //! - **`MySQL` 8.0+** — Requires `MySQL` 8.0 or later for `FOR UPDATE SKIP LOCKED`
 //!   support (added in 8.0.1). Earlier versions will fail at runtime when
-//!   attempting to acquire partition locks. Uses `LAST_INSERT_ID()` for body IDs.
+//!   attempting to acquire partition locks. Batch enqueue reserves explicit IDs
+//!   from `<prefix>_body_id_sequence` and `<prefix>_incoming_id_sequence` in a
+//!   fixed order; retry the whole transaction on deadlock or cluster
+//!   certification failures.
 //! - **`SQLite`** — Single-process only. `SQLite` has no row-level locking; the
 //!   outbox relies on `SQLite`'s single-writer model. Suitable for development,
 //!   testing, and single-instance deployments. Not recommended for production
@@ -93,8 +118,11 @@ mod handler;
 mod manager;
 mod migrations;
 pub(crate) mod prioritizer;
+mod statements;
 pub(crate) mod stats;
+mod store;
 mod strategy;
+mod tables;
 #[doc(hidden)]
 pub mod taskward;
 mod types;
@@ -115,7 +143,7 @@ pub use handler::{
     PerMessageAdapter, TransactionalHandler, TransactionalMessageHandler,
 };
 pub use manager::{OutboxBuilder, OutboxHandle};
-pub use migrations::outbox_migrations;
+pub use migrations::{outbox_migrations, outbox_migrations_with_prefix};
 pub use types::{
     EnqueueMessage, LeaseConfig, OutboxError, OutboxMessageId, OutboxProfile, Partitions,
     WorkerTuning,

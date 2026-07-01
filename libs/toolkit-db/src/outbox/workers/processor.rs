@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use sea_orm::ConnectionTrait;
@@ -5,6 +6,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::super::handler::HandlerResult;
+use super::super::statements::OutboxStatements;
+use super::super::store::OutboxStore;
 use super::super::strategy::{ProcessContext, ProcessingStrategy};
 use super::super::taskward::{Directive, WorkerAction};
 use super::super::types::OutboxError;
@@ -156,6 +159,7 @@ pub struct PartitionProcessor<S: ProcessingStrategy> {
     partition_id: i64,
     tuning: super::super::types::WorkerTuning,
     db: Db,
+    statements: Arc<OutboxStatements>,
     partition_mode: PartitionMode,
 }
 
@@ -165,12 +169,14 @@ impl<S: ProcessingStrategy> PartitionProcessor<S> {
         partition_id: i64,
         tuning: super::super::types::WorkerTuning,
         db: Db,
+        statements: Arc<OutboxStatements>,
     ) -> Self {
         Self {
             strategy,
             partition_id,
             tuning,
             db,
+            statements,
             partition_mode: PartitionMode::new(),
         }
     }
@@ -184,11 +190,12 @@ impl<S: ProcessingStrategy> WorkerAction for PartitionProcessor<S> {
         &mut self,
         _cancel: &CancellationToken,
     ) -> Result<Directive<ProcessorReport>, OutboxError> {
-        let (backend, dialect) = {
+        let backend = {
             let sea_conn = self.db.sea_internal();
-            let b = sea_conn.get_database_backend();
-            (b, super::super::dialect::Dialect::from(b))
+            sea_conn.get_database_backend()
         };
+        debug_assert_eq!(backend, self.statements.backend());
+        let store = OutboxStore::new(&self.statements);
 
         let effective_size = self
             .partition_mode
@@ -196,8 +203,7 @@ impl<S: ProcessingStrategy> WorkerAction for PartitionProcessor<S> {
 
         let ctx = ProcessContext {
             db: &self.db,
-            backend,
-            dialect,
+            store,
             partition_id: self.partition_id,
         };
 

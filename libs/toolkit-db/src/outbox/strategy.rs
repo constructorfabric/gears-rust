@@ -1,17 +1,16 @@
 use std::collections::HashMap;
 
 use super::batch::Batch;
-use super::dialect::Dialect;
 use super::handler::{HandlerResult, LeasedHandler, OutboxMessage, TransactionalHandler};
+use super::store::OutboxStore;
 use super::types::{LeaseConfig, OutboxError};
 use crate::Db;
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
 
 /// Context for processing a single partition's batch.
 pub struct ProcessContext<'a> {
     pub db: &'a Db,
-    pub backend: DbBackend,
-    pub dialect: Dialect,
+    pub store: OutboxStore<'a>,
     pub partition_id: i64,
 }
 
@@ -71,8 +70,7 @@ struct BodyRow {
 
 async fn read_messages(
     txn: &impl ConnectionTrait,
-    backend: DbBackend,
-    dialect: &Dialect,
+    store: &OutboxStore<'_>,
     partition_id: i64,
     proc_row: &ProcessorRow,
     msg_batch_size: u32,
@@ -80,8 +78,8 @@ async fn read_messages(
     // Use seq > processed_seq (not seq >= processed_seq + 1) - the cursor
     // stores the last processed seq, so `>` is the natural predicate.
     let outgoing_rows = OutgoingRow::find_by_statement(Statement::from_sql_and_values(
-        backend,
-        dialect.read_outgoing_batch(msg_batch_size),
+        store.backend(),
+        store.read_outgoing_batch(msg_batch_size),
         [partition_id.into(), proc_row.processed_seq.into()],
     ))
     .all(txn)
@@ -93,10 +91,10 @@ async fn read_messages(
 
     // Batch body read: single SELECT ... WHERE id IN (...) instead of N+1 queries
     let body_ids: Vec<i64> = outgoing_rows.iter().map(|r| r.body_id).collect();
-    let body_sql = dialect.build_read_body_batch(body_ids.len());
+    let body_sql = store.build_read_body_batch(body_ids.len());
     let body_values: Vec<sea_orm::Value> = body_ids.iter().map(|&id| id.into()).collect();
     let body_rows = BodyRow::find_by_statement(Statement::from_sql_and_values(
-        backend,
+        store.backend(),
         &body_sql,
         body_values,
     ))
@@ -131,8 +129,7 @@ async fn read_messages(
 /// Vacuum handles cleanup of processed outgoing + body rows.
 async fn ack(
     txn: &impl ConnectionTrait,
-    backend: DbBackend,
-    dialect: &Dialect,
+    store: &OutboxStore<'_>,
     partition_id: i64,
     msgs: &[OutboxMessage],
     result: &HandlerResult,
@@ -142,22 +139,22 @@ async fn ack(
     match result {
         HandlerResult::Success => {
             txn.execute(Statement::from_sql_and_values(
-                backend,
-                dialect.advance_processed_seq(),
+                store.backend(),
+                store.advance_processed_seq(),
                 [last_seq.into(), partition_id.into()],
             ))
             .await?;
             txn.execute(Statement::from_sql_and_values(
-                backend,
-                dialect.bump_vacuum_counter(),
+                store.backend(),
+                store.bump_vacuum_counter(),
                 [partition_id.into()],
             ))
             .await?;
         }
         HandlerResult::Retry { reason } => {
             txn.execute(Statement::from_sql_and_values(
-                backend,
-                dialect.record_retry(),
+                store.backend(),
+                store.record_retry(),
                 [reason.as_str().into(), partition_id.into()],
             ))
             .await?;
@@ -165,8 +162,8 @@ async fn ack(
         HandlerResult::Reject { reason } => {
             for msg in msgs {
                 txn.execute(Statement::from_sql_and_values(
-                    backend,
-                    dialect.insert_dead_letter(),
+                    store.backend(),
+                    store.insert_dead_letter(),
                     [
                         partition_id.into(),
                         msg.seq.into(),
@@ -181,14 +178,14 @@ async fn ack(
             }
 
             txn.execute(Statement::from_sql_and_values(
-                backend,
-                dialect.advance_processed_seq(),
+                store.backend(),
+                store.advance_processed_seq(),
                 [last_seq.into(), partition_id.into()],
             ))
             .await?;
             txn.execute(Statement::from_sql_and_values(
-                backend,
-                dialect.bump_vacuum_counter(),
+                store.backend(),
+                store.bump_vacuum_counter(),
                 [partition_id.into()],
             ))
             .await?;
@@ -200,14 +197,13 @@ async fn ack(
 
 async fn try_lock_and_read_state(
     txn: &impl ConnectionTrait,
-    backend: DbBackend,
-    dialect: &Dialect,
+    store: &OutboxStore<'_>,
     partition_id: i64,
 ) -> Result<Option<ProcessorRow>, OutboxError> {
-    if let Some(lock_sql) = dialect.lock_processor() {
+    if let Some(lock_sql) = store.lock_processor() {
         let row = txn
             .query_one(Statement::from_sql_and_values(
-                backend,
+                store.backend(),
                 lock_sql,
                 [partition_id.into()],
             ))
@@ -218,8 +214,8 @@ async fn try_lock_and_read_state(
     }
 
     let proc_row = ProcessorRow::find_by_statement(Statement::from_sql_and_values(
-        backend,
-        dialect.read_processor(),
+        store.backend(),
+        store.read_processor(),
         [partition_id.into()],
     ))
     .one(txn)
@@ -251,8 +247,7 @@ impl ProcessingStrategy for TransactionalStrategy {
         let conn = ctx.db.sea_internal();
         let txn = conn.begin().await?;
 
-        let Some(proc_row) =
-            try_lock_and_read_state(&txn, ctx.backend, &ctx.dialect, ctx.partition_id).await?
+        let Some(proc_row) = try_lock_and_read_state(&txn, &ctx.store, ctx.partition_id).await?
         else {
             txn.commit().await?;
             return Ok(None);
@@ -260,8 +255,7 @@ impl ProcessingStrategy for TransactionalStrategy {
 
         let msgs = read_messages(
             &txn,
-            ctx.backend,
-            &ctx.dialect,
+            &ctx.store,
             ctx.partition_id,
             &proc_row,
             msg_batch_size,
@@ -286,15 +280,7 @@ impl ProcessingStrategy for TransactionalStrategy {
         // the handler's successful work is atomic with the cursor advance.
         // The `processed_count` is still recorded in ProcessResult so the
         // PartitionMode state machine can degrade batch size intelligently.
-        ack(
-            &txn,
-            ctx.backend,
-            &ctx.dialect,
-            ctx.partition_id,
-            &msgs,
-            &result,
-        )
-        .await?;
+        ack(&txn, &ctx.store, ctx.partition_id, &msgs, &result).await?;
 
         txn.commit().await?;
 
@@ -321,8 +307,8 @@ async fn acquire_lease_and_read(
     let txn = sea_conn.begin().await?;
 
     let proc_row = ctx
-        .dialect
-        .exec_lease_acquire(&txn, ctx.backend, lease_id, lease_secs, ctx.partition_id)
+        .store
+        .exec_lease_acquire(&txn, lease_id, lease_secs, ctx.partition_id)
         .await?
         .map(|(processed_seq, attempts)| ProcessorRow {
             processed_seq,
@@ -339,8 +325,7 @@ async fn acquire_lease_and_read(
 
     let msgs = read_messages(
         &txn,
-        ctx.backend,
-        &ctx.dialect,
+        &ctx.store,
         ctx.partition_id,
         &proc_row,
         msg_batch_size,
@@ -358,8 +343,8 @@ async fn acquire_lease_and_read(
         // empty cycles.
         let conn = ctx.db.sea_internal();
         conn.execute(Statement::from_sql_and_values(
-            ctx.backend,
-            ctx.dialect.lease_release(),
+            ctx.store.backend(),
+            ctx.store.lease_release(),
             [ctx.partition_id.into(), lease_id.into()],
         ))
         .await?;
@@ -395,8 +380,8 @@ async fn advance_cursor(
 ) -> Result<bool, OutboxError> {
     if seq == 0 {
         txn.execute(Statement::from_sql_and_values(
-            ctx.backend,
-            ctx.dialect.lease_release(),
+            ctx.store.backend(),
+            ctx.store.lease_release(),
             [ctx.partition_id.into(), lease_id.into()],
         ))
         .await?;
@@ -405,8 +390,8 @@ async fn advance_cursor(
 
     let res = txn
         .execute(Statement::from_sql_and_values(
-            ctx.backend,
-            ctx.dialect.lease_ack_advance(),
+            ctx.store.backend(),
+            ctx.store.lease_ack_advance(),
             [seq.into(), ctx.partition_id.into(), lease_id.into()],
         ))
         .await?;
@@ -415,8 +400,8 @@ async fn advance_cursor(
     }
 
     txn.execute(Statement::from_sql_and_values(
-        ctx.backend,
-        ctx.dialect.bump_vacuum_counter(),
+        ctx.store.backend(),
+        ctx.store.bump_vacuum_counter(),
         [ctx.partition_id.into()],
     ))
     .await?;
@@ -433,8 +418,8 @@ async fn record_retry(
 ) -> Result<bool, OutboxError> {
     let res = txn
         .execute(Statement::from_sql_and_values(
-            ctx.backend,
-            ctx.dialect.lease_record_retry(),
+            ctx.store.backend(),
+            ctx.store.lease_record_retry(),
             [reason.into(), ctx.partition_id.into(), lease_id.into()],
         ))
         .await?;
@@ -524,8 +509,8 @@ async fn insert_dead_letter(
     reason: &str,
 ) -> Result<(), OutboxError> {
     txn.execute(Statement::from_sql_and_values(
-        ctx.backend,
-        ctx.dialect.insert_dead_letter(),
+        ctx.store.backend(),
+        ctx.store.insert_dead_letter(),
         [
             ctx.partition_id.into(),
             msg.seq.into(),

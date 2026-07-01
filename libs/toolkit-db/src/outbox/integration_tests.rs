@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use sea_orm_migration::prelude::MigrationTrait;
 use tokio_util::sync::CancellationToken;
 
 use super::batch::Batch;
@@ -27,7 +28,9 @@ use super::handler::{
     PerMessageAdapter, TransactionalHandler, TransactionalMessageHandler,
 };
 use super::prioritizer::SharedPrioritizer;
+use super::store::OutboxStore;
 use super::strategy::{LeasedStrategy, ProcessContext, ProcessingStrategy, TransactionalStrategy};
+use super::tables::OutboxTables;
 use super::taskward::{Directive, WorkerAction};
 use super::types::{EnqueueMessage, LeaseConfig, OutboxConfig, SequencerConfig, WorkerTuning};
 use super::workers::sequencer::Sequencer;
@@ -81,16 +84,24 @@ struct DeadLetterSnapshot {
 // ======================================================================
 
 async fn setup_db(name: &str) -> Db {
+    setup_db_with_migrations(name, super::outbox_migrations()).await
+}
+
+async fn setup_db_with_migrations(name: &str, migrations: Vec<Box<dyn MigrationTrait>>) -> Db {
+    let db = setup_empty_db(name).await;
+    run_migrations_for_testing(&db, migrations)
+        .await
+        .expect("migrations");
+    db
+}
+
+async fn setup_empty_db(name: &str) -> Db {
     let url = format!("sqlite:file:{name}?mode=memory&cache=shared");
     let opts = ConnectOpts {
         max_conns: Some(1),
         ..Default::default()
     };
-    let db = connect_db(&url, opts).await.expect("connect");
-    run_migrations_for_testing(&db, super::outbox_migrations())
-        .await
-        .expect("migrations");
-    db
+    connect_db(&url, opts).await.expect("connect")
 }
 
 // Must be async: `prioritizer` is a tokio::sync::RwLock and `blocking_write()`
@@ -179,14 +190,26 @@ async fn enqueue_and_sequence(
 }
 
 async fn simulate_crash(db: &Db, partition_id: i64, lease_secs: i64) {
+    simulate_crash_for_tables(db, &OutboxTables::default(), partition_id, lease_secs).await;
+}
+
+async fn simulate_crash_for_tables(
+    db: &Db,
+    tables: &OutboxTables,
+    partition_id: i64,
+    lease_secs: i64,
+) {
     let conn = db.sea_internal();
     conn.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE toolkit_outbox_processor \
+        format!(
+            "UPDATE {} \
          SET locked_by = $1, \
              locked_until = datetime('now', '+' || $2 || ' seconds'), \
              attempts = attempts + 1 \
          WHERE partition_id = $3",
+            tables.processor()
+        ),
         ["crashed-pod".into(), lease_secs.into(), partition_id.into()],
     ))
     .await
@@ -194,12 +217,19 @@ async fn simulate_crash(db: &Db, partition_id: i64, lease_secs: i64) {
 }
 
 async fn expire_lease(db: &Db, partition_id: i64) {
+    expire_lease_for_tables(db, &OutboxTables::default(), partition_id).await;
+}
+
+async fn expire_lease_for_tables(db: &Db, tables: &OutboxTables, partition_id: i64) {
     let conn = db.sea_internal();
     conn.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE toolkit_outbox_processor \
+        format!(
+            "UPDATE {} \
          SET locked_until = datetime('now', '-1 seconds') \
          WHERE partition_id = $1",
+            tables.processor()
+        ),
         [partition_id.into()],
     ))
     .await
@@ -227,7 +257,39 @@ async fn count_rows(db: &Db, table: &str) -> i64 {
     .cnt
 }
 
+async fn table_exists(db: &Db, table: &str) -> bool {
+    #[derive(Debug, FromQueryResult)]
+    struct Exists {
+        cnt: i64,
+    }
+    let conn = db.sea_internal();
+    Exists::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type = 'table' AND name = $1",
+        [table.into()],
+    ))
+    .one(&conn)
+    .await
+    .expect("table-exists query")
+    .expect("table-exists row")
+    .cnt == 1
+}
+
+async fn assert_table_family_exists(db: &Db, tables: &OutboxTables) {
+    for table in tables.table_names() {
+        assert!(table_exists(db, table).await, "expected table {table}");
+    }
+}
+
 async fn read_processor_state(db: &Db, partition_id: i64) -> ProcessorSnapshot {
+    read_processor_state_for_tables(db, &OutboxTables::default(), partition_id).await
+}
+
+async fn read_processor_state_for_tables(
+    db: &Db,
+    tables: &OutboxTables,
+    partition_id: i64,
+) -> ProcessorSnapshot {
     #[derive(Debug, FromQueryResult)]
     struct Row {
         processed_seq: i64,
@@ -239,9 +301,12 @@ async fn read_processor_state(db: &Db, partition_id: i64) -> ProcessorSnapshot {
     let conn = db.sea_internal();
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "SELECT processed_seq, attempts, last_error, locked_by, \
+        format!(
+            "SELECT processed_seq, attempts, last_error, locked_by, \
          CAST(locked_until AS TEXT) AS locked_until \
-         FROM toolkit_outbox_processor WHERE partition_id = $1",
+         FROM {} WHERE partition_id = $1",
+            tables.processor()
+        ),
         [partition_id.into()],
     ))
     .one(&conn)
@@ -258,6 +323,14 @@ async fn read_processor_state(db: &Db, partition_id: i64) -> ProcessorSnapshot {
 }
 
 async fn read_outgoing(db: &Db, partition_id: i64) -> Vec<OutgoingSnapshot> {
+    read_outgoing_for_tables(db, &OutboxTables::default(), partition_id).await
+}
+
+async fn read_outgoing_for_tables(
+    db: &Db,
+    tables: &OutboxTables,
+    partition_id: i64,
+) -> Vec<OutgoingSnapshot> {
     #[derive(Debug, FromQueryResult)]
     struct Row {
         id: i64,
@@ -268,8 +341,11 @@ async fn read_outgoing(db: &Db, partition_id: i64) -> Vec<OutgoingSnapshot> {
     let conn = db.sea_internal();
     Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "SELECT id, partition_id, body_id, seq \
-         FROM toolkit_outbox_outgoing WHERE partition_id = $1 ORDER BY seq",
+        format!(
+            "SELECT id, partition_id, body_id, seq \
+         FROM {} WHERE partition_id = $1 ORDER BY seq",
+            tables.outgoing()
+        ),
         [partition_id.into()],
     ))
     .all(&conn)
@@ -286,6 +362,10 @@ async fn read_outgoing(db: &Db, partition_id: i64) -> Vec<OutgoingSnapshot> {
 }
 
 async fn read_dead_letters(db: &Db) -> Vec<DeadLetterSnapshot> {
+    read_dead_letters_for_tables(db, &OutboxTables::default()).await
+}
+
+async fn read_dead_letters_for_tables(db: &Db, tables: &OutboxTables) -> Vec<DeadLetterSnapshot> {
     #[derive(Debug, FromQueryResult)]
     struct Row {
         id: i64,
@@ -302,10 +382,13 @@ async fn read_dead_letters(db: &Db) -> Vec<DeadLetterSnapshot> {
     let conn = db.sea_internal();
     Row::find_by_statement(Statement::from_string(
         DbBackend::Sqlite,
-        "SELECT id, partition_id, seq, payload, payload_type, last_error, \
+        format!(
+            "SELECT id, partition_id, seq, payload, payload_type, last_error, \
          attempts, status, CAST(completed_at AS TEXT) AS completed_at, \
          CAST(deadline AS TEXT) AS deadline \
-         FROM toolkit_outbox_dead_letters ORDER BY seq",
+         FROM {} ORDER BY seq",
+            tables.dead_letters()
+        ),
     ))
     .all(&conn)
     .await
@@ -327,6 +410,14 @@ async fn read_dead_letters(db: &Db) -> Vec<DeadLetterSnapshot> {
 }
 
 async fn read_partition_sequence(db: &Db, partition_id: i64) -> i64 {
+    read_partition_sequence_for_tables(db, &OutboxTables::default(), partition_id).await
+}
+
+async fn read_partition_sequence_for_tables(
+    db: &Db,
+    tables: &OutboxTables,
+    partition_id: i64,
+) -> i64 {
     #[derive(Debug, FromQueryResult)]
     struct Row {
         sequence: i64,
@@ -334,7 +425,7 @@ async fn read_partition_sequence(db: &Db, partition_id: i64) -> i64 {
     let conn = db.sea_internal();
     Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "SELECT sequence FROM toolkit_outbox_partitions WHERE id = $1",
+        format!("SELECT sequence FROM {} WHERE id = $1", tables.partitions()),
         [partition_id.into()],
     ))
     .one(&conn)
@@ -472,6 +563,40 @@ impl LeasedMessageHandler for PoisonMessageHandler {
             MessageResult::Ok
         }
     }
+}
+
+// ======================================================================
+// Chapter 0: Migrations
+// ======================================================================
+
+#[tokio::test]
+async fn migrations_create_default_table_family() {
+    let db = setup_db("ch0_default_tables").await;
+
+    assert_table_family_exists(&db, &OutboxTables::default()).await;
+}
+
+#[tokio::test]
+async fn migrations_create_custom_table_family() {
+    let tables = OutboxTables::new("mini_chat_outbox").unwrap();
+    let db = setup_db_with_migrations(
+        "ch0_custom_tables",
+        super::outbox_migrations_with_prefix(tables.prefix()).unwrap(),
+    )
+    .await;
+
+    assert_table_family_exists(&db, &tables).await;
+}
+
+#[tokio::test]
+async fn migrations_create_default_and_custom_table_families_together() {
+    let custom_tables = OutboxTables::new("mini_chat_outbox").unwrap();
+    let mut migrations = super::outbox_migrations();
+    migrations.extend(super::outbox_migrations_with_prefix(custom_tables.prefix()).unwrap());
+    let db = setup_db_with_migrations("ch0_default_and_custom_tables", migrations).await;
+
+    assert_table_family_exists(&db, &OutboxTables::default()).await;
+    assert_table_family_exists(&db, &custom_tables).await;
 }
 
 // ======================================================================
@@ -1099,14 +1224,14 @@ async fn run_transactional(
 ) -> Option<super::strategy::ProcessResult> {
     let conn = db.sea_internal();
     let backend = conn.get_database_backend();
-    let dialect = Dialect::from(backend);
     drop(conn);
 
     let strategy = TransactionalStrategy::new(Box::new(handler));
+    let tables = OutboxTables::default();
+    let statements = super::statements::OutboxStatements::new(backend, &tables);
     let ctx = ProcessContext {
         db,
-        backend,
-        dialect,
+        store: OutboxStore::new(&statements),
         partition_id,
     };
     strategy.process(&ctx, msg_batch_size).await.unwrap()
@@ -1219,7 +1344,6 @@ async fn run_leased(
 ) -> Option<super::strategy::ProcessResult> {
     let conn = db.sea_internal();
     let backend = conn.get_database_backend();
-    let dialect = Dialect::from(backend);
     drop(conn);
 
     let strategy = LeasedStrategy::new(
@@ -1230,10 +1354,11 @@ async fn run_leased(
             headroom: Duration::from_secs(2),
         },
     );
+    let tables = OutboxTables::default();
+    let statements = super::statements::OutboxStatements::new(backend, &tables);
     let ctx = ProcessContext {
         db,
-        backend,
-        dialect,
+        store: OutboxStore::new(&statements),
         partition_id,
     };
     strategy.process(&ctx, msg_batch_size).await.unwrap()
@@ -1630,6 +1755,10 @@ async fn adaptive_batch_isolates_poison_message() {
 /// Run the vacuum for a single partition: read `processed_seq`, delete
 /// outgoing + body rows in batches, then reset the vacuum counter.
 async fn run_vacuum(db: &Db, partition_id: i64) {
+    run_vacuum_for_tables(db, &OutboxTables::default(), partition_id).await;
+}
+
+async fn run_vacuum_for_tables(db: &Db, tables: &OutboxTables, partition_id: i64) {
     #[derive(Debug, FromQueryResult)]
     struct ProcRow {
         processed_seq: i64,
@@ -1637,11 +1766,15 @@ async fn run_vacuum(db: &Db, partition_id: i64) {
 
     let conn = db.sea_internal();
     let backend = conn.get_database_backend();
-    let dialect = Dialect::from(backend);
+    let statements = super::statements::OutboxStatements::new(backend, tables);
+    let store = OutboxStore::new(&statements);
 
     let proc_row = ProcRow::find_by_statement(Statement::from_sql_and_values(
-        backend,
-        "SELECT processed_seq FROM toolkit_outbox_processor WHERE partition_id = $1",
+        store.backend(),
+        format!(
+            "SELECT processed_seq FROM {} WHERE partition_id = $1",
+            tables.processor()
+        ),
         [partition_id.into()],
     ))
     .one(&conn)
@@ -1653,14 +1786,14 @@ async fn run_vacuum(db: &Db, partition_id: i64) {
         return;
     }
 
-    let vacuum_sql = dialect.vacuum_cleanup();
+    let vacuum_sql = store.vacuum_cleanup();
 
     // Fetch outgoing rows in bounded chunks.
     loop {
         let rows = conn
             .query_all(Statement::from_sql_and_values(
-                backend,
-                vacuum_sql.select_outgoing_chunk,
+                store.backend(),
+                &vacuum_sql.select_outgoing_chunk,
                 [
                     partition_id.into(),
                     proc_row.processed_seq.into(),
@@ -1674,32 +1807,42 @@ async fn run_vacuum(db: &Db, partition_id: i64) {
         }
         let outgoing_ids: Vec<i64> = rows
             .iter()
-            .filter_map(|r| r.try_get_by_index::<i64>(0).ok())
-            .collect();
+            .map(|r| r.try_get_by_index::<i64>(0))
+            .collect::<Result<_, _>>()
+            .expect("outgoing id column");
         let body_ids: Vec<i64> = rows
             .iter()
-            .filter_map(|r| r.try_get_by_index::<i64>(1).ok())
-            .collect();
+            .map(|r| r.try_get_by_index::<i64>(1))
+            .collect::<Result<_, _>>()
+            .expect("body id column");
         // Delete outgoing by ID
-        let del_out = dialect.build_delete_outgoing_batch(outgoing_ids.len());
+        let del_out = store.build_delete_outgoing_batch(outgoing_ids.len());
         let values: Vec<sea_orm::Value> = outgoing_ids.iter().map(|&id| id.into()).collect();
-        conn.execute(Statement::from_sql_and_values(backend, &del_out, values))
-            .await
-            .unwrap();
+        conn.execute(Statement::from_sql_and_values(
+            store.backend(),
+            &del_out,
+            values,
+        ))
+        .await
+        .unwrap();
         // Delete body by ID
         if !body_ids.is_empty() {
-            let del_body = dialect.build_delete_body_batch(body_ids.len());
+            let del_body = store.build_delete_body_batch(body_ids.len());
             let values: Vec<sea_orm::Value> = body_ids.iter().map(|&id| id.into()).collect();
-            conn.execute(Statement::from_sql_and_values(backend, &del_body, values))
-                .await
-                .unwrap();
+            conn.execute(Statement::from_sql_and_values(
+                store.backend(),
+                &del_body,
+                values,
+            ))
+            .await
+            .unwrap();
         }
     }
 
     // Reset vacuum counter after cleanup.
     conn.execute(Statement::from_sql_and_values(
-        backend,
-        dialect.reset_vacuum_counter(),
+        store.backend(),
+        store.reset_vacuum_counter(),
         [partition_id.into()],
     ))
     .await
@@ -1798,6 +1941,10 @@ async fn vacuum_preserves_unprocessed_rows() {
 
 /// Read the vacuum counter for a partition.
 async fn read_vacuum_counter(db: &Db, partition_id: i64) -> i64 {
+    read_vacuum_counter_for_tables(db, &OutboxTables::default(), partition_id).await
+}
+
+async fn read_vacuum_counter_for_tables(db: &Db, tables: &OutboxTables, partition_id: i64) -> i64 {
     #[derive(Debug, FromQueryResult)]
     struct Row {
         counter: i64,
@@ -1805,7 +1952,10 @@ async fn read_vacuum_counter(db: &Db, partition_id: i64) -> i64 {
     let conn = db.sea_internal();
     Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "SELECT counter FROM toolkit_outbox_vacuum_counter WHERE partition_id = $1",
+        format!(
+            "SELECT counter FROM {} WHERE partition_id = $1",
+            tables.vacuum_counter()
+        ),
         [partition_id.into()],
     ))
     .one(&conn)
@@ -1817,10 +1967,22 @@ async fn read_vacuum_counter(db: &Db, partition_id: i64) -> i64 {
 
 /// Set the vacuum counter to an arbitrary value (test helper).
 async fn set_vacuum_counter(db: &Db, partition_id: i64, value: i64) {
+    set_vacuum_counter_for_tables(db, &OutboxTables::default(), partition_id, value).await;
+}
+
+async fn set_vacuum_counter_for_tables(
+    db: &Db,
+    tables: &OutboxTables,
+    partition_id: i64,
+    value: i64,
+) {
     let conn = db.sea_internal();
     conn.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE toolkit_outbox_vacuum_counter SET counter = $1 WHERE partition_id = $2",
+        format!(
+            "UPDATE {} SET counter = $1 WHERE partition_id = $2",
+            tables.vacuum_counter()
+        ),
         [value.into(), partition_id.into()],
     ))
     .await
@@ -2345,6 +2507,379 @@ async fn builder_partitions_of_all_valid_values() {
         let p = Partitions::of(n);
         assert_eq!(p.count(), n);
     }
+}
+
+#[tokio::test]
+async fn default_prefix_builder_enqueue_uses_default_tables() {
+    let db = setup_db("ch10_default_prefix_builder").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+
+    t.outbox
+        .enqueue(
+            &db.conn().unwrap(),
+            "q",
+            0,
+            b"default".to_vec(),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(count_rows(&db, "toolkit_outbox_body").await, 1);
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 1);
+}
+
+#[tokio::test]
+async fn custom_prefix_builder_registers_queue() {
+    let tables = OutboxTables::new("mini_chat_outbox").unwrap();
+    let db = setup_db_with_migrations(
+        "ch10_custom_prefix_register",
+        super::outbox_migrations_with_prefix(tables.prefix()).unwrap(),
+    )
+    .await;
+
+    let handle = Outbox::builder(db.clone())
+        .table_prefix(tables.prefix())
+        .unwrap()
+        .queue("q", Partitions::of(1))
+        .leased(CountingMessageHandler {
+            count: Arc::new(AtomicU32::new(0)),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    assert_eq!(count_rows(&db, tables.partitions()).await, 1);
+    assert_eq!(count_rows(&db, tables.processor()).await, 1);
+    assert!(!table_exists(&db, "toolkit_outbox_partitions").await);
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn custom_prefix_containing_default_body_token_registers_and_enqueues() {
+    let tables = OutboxTables::new("toolkit_outbox_body").unwrap();
+    let db = setup_db_with_migrations(
+        "ch10_custom_prefix_body_token",
+        super::outbox_migrations_with_prefix(tables.prefix()).unwrap(),
+    )
+    .await;
+
+    let handle = Outbox::builder(db.clone())
+        .table_prefix(tables.prefix())
+        .unwrap()
+        .queue("q", Partitions::of(1))
+        .leased(CountingMessageHandler {
+            count: Arc::new(AtomicU32::new(0)),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let message_id = handle
+        .outbox()
+        .enqueue(
+            &db.conn().unwrap(),
+            "q",
+            0,
+            b"nasty-prefix".to_vec(),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+
+    assert!(message_id.0 > 0);
+    assert_eq!(count_rows(&db, tables.body()).await, 1);
+    assert!(!table_exists(&db, "toolkit_outbox_body").await);
+    assert!(!table_exists(&db, "toolkit_outbox_body_body_dead_letters").await);
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn custom_prefix_processes_message_without_default_tables() {
+    let tables = OutboxTables::new("mini_chat_outbox").unwrap();
+    let db = setup_db_with_migrations(
+        "ch10_custom_prefix_process",
+        super::outbox_migrations_with_prefix(tables.prefix()).unwrap(),
+    )
+    .await;
+    let processed = Arc::new(AtomicU32::new(0));
+
+    let handle = Outbox::builder(db.clone())
+        .table_prefix(tables.prefix())
+        .unwrap()
+        .processor_tuning(
+            WorkerTuning::processor_default().idle_interval(Duration::from_millis(20)),
+        )
+        .sequencer_tuning(
+            WorkerTuning::sequencer_default().idle_interval(Duration::from_millis(20)),
+        )
+        .queue("q", Partitions::of(1))
+        .leased(CountingMessageHandler {
+            count: processed.clone(),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let outbox = handle.outbox();
+    outbox
+        .enqueue(
+            &db.conn().unwrap(),
+            "q",
+            0,
+            b"custom".to_vec(),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    outbox.flush();
+
+    poll_until(
+        || {
+            let processed = processed.load(Ordering::Relaxed);
+            async move { processed >= 1 }
+        },
+        5000,
+    )
+    .await;
+
+    assert_eq!(count_rows(&db, tables.body()).await, 1);
+    assert_eq!(count_rows(&db, tables.outgoing()).await, 1);
+    assert!(!table_exists(&db, "toolkit_outbox_body").await);
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn custom_prefix_dead_letter_uses_custom_table() {
+    let tables = OutboxTables::new("mini_chat_outbox").unwrap();
+    let db = setup_db_with_migrations(
+        "ch10_custom_prefix_dead_letter",
+        super::outbox_migrations_with_prefix(tables.prefix()).unwrap(),
+    )
+    .await;
+
+    let handle = Outbox::builder(db.clone())
+        .table_prefix(tables.prefix())
+        .unwrap()
+        .processor_tuning(
+            WorkerTuning::processor_default().idle_interval(Duration::from_millis(20)),
+        )
+        .sequencer_tuning(
+            WorkerTuning::sequencer_default().idle_interval(Duration::from_millis(20)),
+        )
+        .queue("q", Partitions::of(1))
+        .leased(AlwaysRejectHandler)
+        .start()
+        .await
+        .unwrap();
+
+    let outbox = handle.outbox();
+    outbox
+        .enqueue(
+            &db.conn().unwrap(),
+            "q",
+            0,
+            b"reject".to_vec(),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    outbox.flush();
+
+    poll_until(
+        || {
+            let db = db.clone();
+            let table = tables.dead_letters().to_owned();
+            async move { count_rows(&db, &table).await >= 1 }
+        },
+        5000,
+    )
+    .await;
+
+    assert_eq!(count_rows(&db, tables.dead_letters()).await, 1);
+    assert!(!table_exists(&db, "toolkit_outbox_dead_letters").await);
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn custom_prefix_vacuum_cleans_custom_tables() {
+    use super::workers::vacuum::VacuumTask;
+
+    let tables = OutboxTables::new("mini_chat_outbox").unwrap();
+    let db = setup_db_with_migrations(
+        "ch10_custom_prefix_vacuum",
+        super::outbox_migrations_with_prefix(tables.prefix()).unwrap(),
+    )
+    .await;
+    let processed = Arc::new(AtomicU32::new(0));
+
+    let handle = Outbox::builder(db.clone())
+        .table_prefix(tables.prefix())
+        .unwrap()
+        .processor_tuning(
+            WorkerTuning::processor_default().idle_interval(Duration::from_millis(20)),
+        )
+        .sequencer_tuning(
+            WorkerTuning::sequencer_default().idle_interval(Duration::from_millis(20)),
+        )
+        .queue("q", Partitions::of(1))
+        .leased(CountingMessageHandler {
+            count: processed.clone(),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let outbox = handle.outbox();
+    outbox
+        .enqueue(
+            &db.conn().unwrap(),
+            "q",
+            0,
+            b"vacuum".to_vec(),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    outbox.flush();
+
+    poll_until(
+        || {
+            let processed = processed.load(Ordering::Relaxed);
+            async move { processed >= 1 }
+        },
+        5000,
+    )
+    .await;
+
+    handle.stop().await;
+
+    assert_eq!(count_rows(&db, tables.outgoing()).await, 1);
+    assert_eq!(count_rows(&db, tables.body()).await, 1);
+
+    let cancel = CancellationToken::new();
+    let statements = Arc::new(super::statements::OutboxStatements::new(
+        db.sea_internal().get_database_backend(),
+        &tables,
+    ));
+    let mut vacuum = VacuumTask::new(db.clone(), statements, 10_000);
+    vacuum.execute(&cancel).await.unwrap();
+
+    assert_eq!(count_rows(&db, tables.outgoing()).await, 0);
+    assert_eq!(count_rows(&db, tables.body()).await, 0);
+    assert!(!table_exists(&db, "toolkit_outbox_outgoing").await);
+}
+
+#[tokio::test]
+async fn default_and_custom_prefix_instances_coexist() {
+    let custom_tables = OutboxTables::new("mini_chat_outbox").unwrap();
+    let mut migrations = super::outbox_migrations();
+    migrations.extend(super::outbox_migrations_with_prefix(custom_tables.prefix()).unwrap());
+    let db = setup_db_with_migrations("ch10_prefix_instances_coexist", migrations).await;
+
+    let default_count = Arc::new(AtomicU32::new(0));
+    let custom_count = Arc::new(AtomicU32::new(0));
+
+    let default_handle = Outbox::builder(db.clone())
+        .processor_tuning(
+            WorkerTuning::processor_default().idle_interval(Duration::from_millis(20)),
+        )
+        .sequencer_tuning(
+            WorkerTuning::sequencer_default().idle_interval(Duration::from_millis(20)),
+        )
+        .queue("q", Partitions::of(1))
+        .leased(CountingMessageHandler {
+            count: default_count.clone(),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let custom_handle = Outbox::builder(db.clone())
+        .table_prefix(custom_tables.prefix())
+        .unwrap()
+        .processor_tuning(
+            WorkerTuning::processor_default().idle_interval(Duration::from_millis(20)),
+        )
+        .sequencer_tuning(
+            WorkerTuning::sequencer_default().idle_interval(Duration::from_millis(20)),
+        )
+        .queue("q", Partitions::of(1))
+        .leased(CountingMessageHandler {
+            count: custom_count.clone(),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    default_handle
+        .outbox()
+        .enqueue(
+            &db.conn().unwrap(),
+            "q",
+            0,
+            b"default".to_vec(),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    custom_handle
+        .outbox()
+        .enqueue(
+            &db.conn().unwrap(),
+            "q",
+            0,
+            b"custom".to_vec(),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    default_handle.outbox().flush();
+    custom_handle.outbox().flush();
+
+    poll_until(
+        || {
+            let default_count = default_count.load(Ordering::Relaxed);
+            let custom_count = custom_count.load(Ordering::Relaxed);
+            async move { default_count >= 1 && custom_count >= 1 }
+        },
+        5000,
+    )
+    .await;
+
+    assert_eq!(count_rows(&db, "toolkit_outbox_body").await, 1);
+    assert_eq!(count_rows(&db, custom_tables.body()).await, 1);
+
+    default_handle.stop().await;
+    custom_handle.stop().await;
+}
+
+#[tokio::test]
+async fn custom_prefix_without_matching_migration_fails_startup() {
+    let db = setup_empty_db("ch10_custom_prefix_missing_migration").await;
+    let result = Outbox::builder(db)
+        .table_prefix("mini_chat_outbox")
+        .unwrap()
+        .queue("q", Partitions::of(1))
+        .leased(CountingMessageHandler {
+            count: Arc::new(AtomicU32::new(0)),
+        })
+        .start()
+        .await;
+    let err = match result {
+        Ok(handle) => {
+            handle.stop().await;
+            panic!("expected startup to fail without matching migrations");
+        }
+        Err(err) => err,
+    };
+
+    assert!(matches!(err, OutboxError::Database(_)));
 }
 
 #[tokio::test]
@@ -2938,13 +3473,25 @@ async fn processed_count_exceeds_batch_is_clamped() {
 
 /// Helper: insert raw incoming rows bypassing enqueue (no dirty flag set).
 async fn insert_raw_incoming(db: &Db, partition_id: i64, count: usize) {
+    insert_raw_incoming_for_tables(db, &OutboxTables::default(), partition_id, count).await;
+}
+
+async fn insert_raw_incoming_for_tables(
+    db: &Db,
+    tables: &OutboxTables,
+    partition_id: i64,
+    count: usize,
+) {
     let conn = db.sea_internal();
     for _ in 0..count {
         // Insert a body row first
         let body_id = conn
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
-                "INSERT INTO toolkit_outbox_body (payload, payload_type) VALUES (X'AA', 'raw') RETURNING id",
+                format!(
+                    "INSERT INTO {} (payload, payload_type) VALUES (X'AA', 'raw') RETURNING id",
+                    tables.body()
+                ),
             ))
             .await
             .expect("insert body")
@@ -2954,7 +3501,10 @@ async fn insert_raw_incoming(db: &Db, partition_id: i64, count: usize) {
 
         conn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO toolkit_outbox_incoming (partition_id, body_id) VALUES ($1, $2)",
+            format!(
+                "INSERT INTO {} (partition_id, body_id) VALUES ($1, $2)",
+                tables.incoming()
+            ),
             [partition_id.into(), body_id.into()],
         ))
         .await
@@ -3378,9 +3928,10 @@ async fn vacuum_counter_decrement_is_idempotent() {
     // First decrement: 5 - 5 = 0
     let conn = db.sea_internal();
     let dialect = Dialect::from(conn.get_database_backend());
+    let tables = OutboxTables::default();
     conn.execute(Statement::from_sql_and_values(
         conn.get_database_backend(),
-        dialect.decrement_vacuum_counter(),
+        dialect.decrement_vacuum_counter(&tables),
         [5i64.into(), pid.into()],
     ))
     .await
@@ -3390,7 +3941,7 @@ async fn vacuum_counter_decrement_is_idempotent() {
     // Second decrement (stale snapshot): GREATEST(0 - 5, 0) = 0
     conn.execute(Statement::from_sql_and_values(
         conn.get_database_backend(),
-        dialect.decrement_vacuum_counter(),
+        dialect.decrement_vacuum_counter(&tables),
         [5i64.into(), pid.into()],
     ))
     .await
@@ -3426,8 +3977,13 @@ async fn vacuum_concurrent_workers_safe() {
 
     // Run two vacuum workers sequentially (SQLite single connection)
     let cancel = CancellationToken::new();
-    let mut vac1 = VacuumTask::new(db.clone(), 10_000);
-    let mut vac2 = VacuumTask::new(db.clone(), 10_000);
+    let tables = OutboxTables::default();
+    let statements = Arc::new(super::statements::OutboxStatements::new(
+        db.sea_internal().get_database_backend(),
+        &tables,
+    ));
+    let mut vac1 = VacuumTask::new(db.clone(), Arc::clone(&statements), 10_000);
+    let mut vac2 = VacuumTask::new(db.clone(), statements, 10_000);
 
     vac1.execute(&cancel).await.unwrap();
     vac2.execute(&cancel).await.unwrap();

@@ -48,7 +48,13 @@ fn build_processor_worker<S: super::strategy::ProcessingStrategy + 'static>(
     ctx: &SpawnContext,
     strategy: S,
 ) -> (String, Pin<Box<dyn Future<Output = ()> + Send>>) {
-    let processor = PartitionProcessor::new(strategy, ctx.pid, ctx.tuning.clone(), ctx.db.clone());
+    let processor = PartitionProcessor::new(
+        strategy,
+        ctx.pid,
+        ctx.tuning.clone(),
+        ctx.db.clone(),
+        ctx.outbox.statements_arc(),
+    );
     let name = format!("processor-{}", ctx.pid);
     let (poker_notify, _poker_handle) =
         super::taskward::poker(ctx.tuning.idle_interval, ctx.cancel.clone());

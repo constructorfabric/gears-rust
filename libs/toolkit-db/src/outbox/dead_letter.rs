@@ -40,6 +40,10 @@ use sea_orm::{
     TryGetable,
 };
 
+use super::statements::OutboxStatements;
+use super::store::OutboxStore;
+#[cfg(test)]
+use super::tables::OutboxTables;
 use super::types::OutboxError;
 use crate::secure::SeaOrmRunner;
 
@@ -221,11 +225,13 @@ impl Default for DeadLetterFilter {
 /// List dead-lettered messages with optional filtering.
 pub(super) async fn dead_letter_list(
     runner: SeaOrmRunner<'_>,
+    statements: &OutboxStatements,
     filter: &DeadLetterFilter,
 ) -> Result<Vec<DeadLetterMessage>, OutboxError> {
-    let backend = runner_backend(&runner);
-    let (sql, values) = build_select_query(backend, filter);
-    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+    debug_assert_eq!(runner_backend(&runner), statements.backend());
+    let store = OutboxStore::new(statements);
+    let (sql, values) = build_select_query(&store, filter);
+    let stmt = Statement::from_sql_and_values(store.backend(), &sql, values);
 
     let rows = match &runner {
         SeaOrmRunner::Conn(c) => DeadLetterMessage::find_by_statement(stmt).all(*c).await?,
@@ -237,6 +243,7 @@ pub(super) async fn dead_letter_list(
 /// Count dead-lettered messages matching the filter.
 pub(super) async fn dead_letter_count(
     runner: SeaOrmRunner<'_>,
+    statements: &OutboxStatements,
     filter: &DeadLetterFilter,
 ) -> Result<u64, OutboxError> {
     #[derive(Debug, FromQueryResult)]
@@ -244,9 +251,10 @@ pub(super) async fn dead_letter_count(
         cnt: i64,
     }
 
-    let backend = runner_backend(&runner);
-    let (sql, values) = build_count_query(backend, filter);
-    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+    debug_assert_eq!(runner_backend(&runner), statements.backend());
+    let store = OutboxStore::new(statements);
+    let (sql, values) = build_count_query(&store, filter);
+    let stmt = Statement::from_sql_and_values(store.backend(), &sql, values);
 
     let row = match &runner {
         SeaOrmRunner::Conn(c) => Count::find_by_statement(stmt).one(*c).await?,
@@ -268,21 +276,26 @@ pub(super) async fn dead_letter_count(
 /// callers from claiming the same rows.
 pub(super) async fn dead_letter_replay(
     runner: SeaOrmRunner<'_>,
+    statements: &OutboxStatements,
     scope: &DeadLetterScope,
     timeout: Duration,
 ) -> Result<Vec<DeadLetterMessage>, OutboxError> {
-    let backend = runner_backend(&runner);
+    debug_assert_eq!(runner_backend(&runner), statements.backend());
+    let store = OutboxStore::new(statements);
 
     let txn = match &runner {
         SeaOrmRunner::Conn(c) => c.begin().await?,
         SeaOrmRunner::Tx(t) => t.begin().await?,
     };
 
-    let (sql, values) = build_replay_select(backend, scope);
-    let rows =
-        DeadLetterMessage::find_by_statement(Statement::from_sql_and_values(backend, &sql, values))
-            .all(&txn)
-            .await?;
+    let (sql, values) = build_replay_select(&store, scope);
+    let rows = DeadLetterMessage::find_by_statement(Statement::from_sql_and_values(
+        store.backend(),
+        &sql,
+        values,
+    ))
+    .all(&txn)
+    .await?;
 
     if rows.is_empty() {
         txn.commit().await?;
@@ -290,7 +303,7 @@ pub(super) async fn dead_letter_replay(
     }
 
     let dl_ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let claim_sql = build_batch_claim(backend, dl_ids.len());
+    let claim_sql = build_batch_claim(&store, dl_ids.len());
     let mut claim_values: Vec<sea_orm::Value> = Vec::with_capacity(1 + dl_ids.len());
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     claim_values.push((timeout.as_secs() as i64).into());
@@ -298,7 +311,7 @@ pub(super) async fn dead_letter_replay(
         claim_values.push(id.into());
     }
     txn.execute(Statement::from_sql_and_values(
-        backend,
+        store.backend(),
         &claim_sql,
         claim_values,
     ))
@@ -315,15 +328,17 @@ pub(super) async fn dead_letter_replay(
 /// skipped (returns 0 for those).
 pub(super) async fn dead_letter_resolve(
     runner: SeaOrmRunner<'_>,
+    statements: &OutboxStatements,
     ids: &[i64],
 ) -> Result<u64, OutboxError> {
     if ids.is_empty() {
         return Ok(0);
     }
-    let backend = runner_backend(&runner);
-    let sql = build_batch_resolve(backend, ids.len());
+    debug_assert_eq!(runner_backend(&runner), statements.backend());
+    let store = OutboxStore::new(statements);
+    let sql = build_batch_resolve(&store, ids.len());
     let values: Vec<sea_orm::Value> = ids.iter().map(|&id| id.into()).collect();
-    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+    let stmt = Statement::from_sql_and_values(store.backend(), &sql, values);
     let result = match &runner {
         SeaOrmRunner::Conn(c) => c.execute(stmt).await?,
         SeaOrmRunner::Tx(t) => t.execute(stmt).await?,
@@ -337,20 +352,22 @@ pub(super) async fn dead_letter_resolve(
 /// Returns count of rejected rows.
 pub(super) async fn dead_letter_reject(
     runner: SeaOrmRunner<'_>,
+    statements: &OutboxStatements,
     ids: &[i64],
     reason: &str,
 ) -> Result<u64, OutboxError> {
     if ids.is_empty() {
         return Ok(0);
     }
-    let backend = runner_backend(&runner);
-    let sql = build_batch_reject(backend, ids.len());
+    debug_assert_eq!(runner_backend(&runner), statements.backend());
+    let store = OutboxStore::new(statements);
+    let sql = build_batch_reject(&store, ids.len());
     let mut values: Vec<sea_orm::Value> = Vec::with_capacity(1 + ids.len());
     values.push(reason.to_owned().into());
     for &id in ids {
         values.push(id.into());
     }
-    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+    let stmt = Statement::from_sql_and_values(store.backend(), &sql, values);
     let result = match &runner {
         SeaOrmRunner::Conn(c) => c.execute(stmt).await?,
         SeaOrmRunner::Tx(t) => t.execute(stmt).await?,
@@ -363,6 +380,7 @@ pub(super) async fn dead_letter_reject(
 /// Uses `FOR UPDATE SKIP LOCKED` for concurrent safety.
 pub(super) async fn dead_letter_discard(
     runner: SeaOrmRunner<'_>,
+    statements: &OutboxStatements,
     scope: &DeadLetterScope,
 ) -> Result<u64, OutboxError> {
     #[derive(Debug, FromQueryResult)]
@@ -370,18 +388,23 @@ pub(super) async fn dead_letter_discard(
         id: i64,
     }
 
-    let backend = runner_backend(&runner);
+    debug_assert_eq!(runner_backend(&runner), statements.backend());
+    let store = OutboxStore::new(statements);
 
     let txn = match &runner {
         SeaOrmRunner::Conn(c) => c.begin().await?,
         SeaOrmRunner::Tx(t) => t.begin().await?,
     };
 
-    let (sql, values) = build_discard_select(backend, scope);
+    let (sql, values) = build_discard_select(&store, scope);
 
-    let rows = Id::find_by_statement(Statement::from_sql_and_values(backend, &sql, values))
-        .all(&txn)
-        .await?;
+    let rows = Id::find_by_statement(Statement::from_sql_and_values(
+        store.backend(),
+        &sql,
+        values,
+    ))
+    .all(&txn)
+    .await?;
 
     if rows.is_empty() {
         txn.commit().await?;
@@ -389,10 +412,10 @@ pub(super) async fn dead_letter_discard(
     }
 
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let update_sql = build_batch_discard(backend, ids.len());
+    let update_sql = build_batch_discard(&store, ids.len());
     let update_values: Vec<sea_orm::Value> = ids.iter().map(|&id| id.into()).collect();
     txn.execute(Statement::from_sql_and_values(
-        backend,
+        store.backend(),
         &update_sql,
         update_values,
     ))
@@ -409,11 +432,13 @@ pub(super) async fn dead_letter_discard(
 /// `pending` and `reprocessing` rows are always preserved.
 pub(super) async fn dead_letter_cleanup(
     runner: SeaOrmRunner<'_>,
+    statements: &OutboxStatements,
     scope: &DeadLetterScope,
 ) -> Result<u64, OutboxError> {
-    let backend = runner_backend(&runner);
-    let (sql, values) = build_delete_query(backend, scope);
-    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+    debug_assert_eq!(runner_backend(&runner), statements.backend());
+    let store = OutboxStore::new(statements);
+    let (sql, values) = build_delete_query(&store, scope);
+    let stmt = Statement::from_sql_and_values(store.backend(), &sql, values);
     let result = match &runner {
         SeaOrmRunner::Conn(c) => c.execute(stmt).await?,
         SeaOrmRunner::Tx(t) => t.execute(stmt).await?,
@@ -500,7 +525,7 @@ impl QueryBuilder {
     }
 }
 
-fn apply_scope(qb: &mut QueryBuilder, scope: &DeadLetterScope) {
+fn apply_scope(qb: &mut QueryBuilder, store: &OutboxStore<'_>, scope: &DeadLetterScope) {
     if let Some(pid) = scope.partition_id {
         let idx = qb.param_idx;
         qb.add_condition(&format!("d.partition_id = ${idx}"), pid.into());
@@ -509,7 +534,8 @@ fn apply_scope(qb: &mut QueryBuilder, scope: &DeadLetterScope) {
         let idx = qb.param_idx;
         qb.add_condition(
             &format!(
-                "d.partition_id IN (SELECT id FROM toolkit_outbox_partitions WHERE queue = ${idx})"
+                "d.partition_id IN (SELECT id FROM {} WHERE queue = ${idx})",
+                store.tables().partitions()
             ),
             queue.clone().into(),
         );
@@ -523,60 +549,56 @@ fn apply_scope(qb: &mut QueryBuilder, scope: &DeadLetterScope) {
     }
 }
 
-fn apply_filter(qb: &mut QueryBuilder, filter: &DeadLetterFilter) {
-    apply_scope(qb, &filter.scope);
+fn apply_filter(qb: &mut QueryBuilder, store: &OutboxStore<'_>, filter: &DeadLetterFilter) {
+    apply_scope(qb, store, &filter.scope);
     if let Some(status) = filter.status {
         let idx = qb.param_idx;
         qb.add_condition(&format!("d.status = ${idx}"), status.to_string().into());
     }
 }
 
-const SELECT_COLUMNS: &str = "SELECT d.id, d.partition_id, d.seq, d.payload, d.payload_type, \
-     d.created_at, d.failed_at, d.last_error, d.attempts, d.status, d.completed_at, d.deadline \
-     FROM toolkit_outbox_dead_letters d";
-
 fn build_select_query(
-    backend: DbBackend,
+    store: &OutboxStore<'_>,
     filter: &DeadLetterFilter,
 ) -> (String, Vec<sea_orm::Value>) {
-    let mut qb = QueryBuilder::new(SELECT_COLUMNS, backend);
-    apply_filter(&mut qb, filter);
+    let mut qb = QueryBuilder::new(store.dead_letter_select_columns(), store.backend());
+    apply_filter(&mut qb, store, filter);
     qb.finish(filter.scope.limit.or(Some(DEFAULT_DEAD_LETTER_LIMIT)))
 }
 
 fn build_count_query(
-    backend: DbBackend,
+    store: &OutboxStore<'_>,
     filter: &DeadLetterFilter,
 ) -> (String, Vec<sea_orm::Value>) {
-    let mut qb = QueryBuilder::new(
-        "SELECT COUNT(*) AS cnt FROM toolkit_outbox_dead_letters d",
-        backend,
-    );
-    apply_filter(&mut qb, filter);
+    let mut qb = QueryBuilder::new(store.dead_letter_count_base(), store.backend());
+    apply_filter(&mut qb, store, filter);
     qb.finish_no_order(None)
 }
 
 /// Build a DELETE query for cleanup — only terminal states.
 fn build_delete_query(
-    backend: DbBackend,
+    store: &OutboxStore<'_>,
     scope: &DeadLetterScope,
 ) -> (String, Vec<sea_orm::Value>) {
-    let mut inner_qb = QueryBuilder::new("SELECT d.id FROM toolkit_outbox_dead_letters d", backend);
-    apply_scope(&mut inner_qb, scope);
+    let mut inner_qb = QueryBuilder::new(store.dead_letter_id_select_base(), store.backend());
+    apply_scope(&mut inner_qb, store, scope);
     inner_qb.add_raw_condition("d.status IN ('resolved', 'discarded')");
     let (inner_sql, values) = inner_qb.finish_locking_no_order(scope.limit, true);
-    let sql = format!("DELETE FROM toolkit_outbox_dead_letters WHERE id IN ({inner_sql})");
+    let sql = format!(
+        "DELETE FROM {} WHERE id IN ({inner_sql})",
+        store.tables().dead_letters()
+    );
     (sql, values)
 }
 
 /// Build the replay SELECT with orphan recovery: pending rows + expired reprocessing rows.
 fn build_replay_select(
-    backend: DbBackend,
+    store: &OutboxStore<'_>,
     scope: &DeadLetterScope,
 ) -> (String, Vec<sea_orm::Value>) {
-    let mut qb = QueryBuilder::new(SELECT_COLUMNS, backend);
-    apply_scope(&mut qb, scope);
-    let now_fn = db_now(backend);
+    let mut qb = QueryBuilder::new(store.dead_letter_select_columns(), store.backend());
+    apply_scope(&mut qb, store, scope);
+    let now_fn = db_now(store.backend());
     qb.add_raw_condition(&format!(
         "(d.status = 'pending' OR (d.status = 'reprocessing' AND d.deadline < {now_fn}))"
     ));
@@ -601,11 +623,14 @@ fn build_replay_select(
 }
 
 /// Build `UPDATE ... SET status = 'reprocessing', deadline = now() + timeout WHERE id IN (...)`.
-fn build_batch_claim(backend: DbBackend, count: usize) -> String {
+fn build_batch_claim(store: &OutboxStore<'_>, count: usize) -> String {
+    let backend = store.backend();
     let is_mysql = backend == DbBackend::MySql;
     let now_fn = db_now(backend);
-    let mut sql =
-        String::from("UPDATE toolkit_outbox_dead_letters SET status = 'reprocessing', deadline = ");
+    let mut sql = format!(
+        "UPDATE {} SET status = 'reprocessing', deadline = ",
+        store.tables().dead_letters()
+    );
     match backend {
         DbBackend::Postgres => {
             #[allow(clippy::let_underscore_must_use)]
@@ -636,11 +661,13 @@ fn build_batch_claim(backend: DbBackend, count: usize) -> String {
 }
 
 /// Build `UPDATE ... SET status = 'resolved', completed_at = now(), deadline = NULL WHERE id IN (...) AND status = 'reprocessing'`.
-fn build_batch_resolve(backend: DbBackend, count: usize) -> String {
+fn build_batch_resolve(store: &OutboxStore<'_>, count: usize) -> String {
+    let backend = store.backend();
     let is_mysql = backend == DbBackend::MySql;
     let now_fn = db_now(backend);
     let mut sql = format!(
-        "UPDATE toolkit_outbox_dead_letters SET status = 'resolved', completed_at = {now_fn}, deadline = NULL WHERE id IN ("
+        "UPDATE {} SET status = 'resolved', completed_at = {now_fn}, deadline = NULL WHERE id IN (",
+        store.tables().dead_letters()
     );
     for i in 0..count {
         if i > 0 {
@@ -658,13 +685,15 @@ fn build_batch_resolve(backend: DbBackend, count: usize) -> String {
 }
 
 /// Build `UPDATE ... SET status = 'pending', attempts = attempts + 1, last_error = $reason, failed_at = now(), deadline = NULL WHERE id IN (...) AND status = 'reprocessing'`.
-fn build_batch_reject(backend: DbBackend, count: usize) -> String {
+fn build_batch_reject(store: &OutboxStore<'_>, count: usize) -> String {
+    let backend = store.backend();
     let is_mysql = backend == DbBackend::MySql;
     let now_fn = db_now(backend);
     // First param is the reason string, then IDs
     let mut sql = format!(
-        "UPDATE toolkit_outbox_dead_letters SET status = 'pending', attempts = attempts + 1, \
+        "UPDATE {} SET status = 'pending', attempts = attempts + 1, \
          last_error = {reason}, failed_at = {now_fn}, deadline = NULL WHERE id IN (",
+        store.tables().dead_letters(),
         reason = if is_mysql { "?" } else { "$1" },
     );
     for i in 0..count {
@@ -684,21 +713,23 @@ fn build_batch_reject(backend: DbBackend, count: usize) -> String {
 
 /// Build discard SELECT: pending rows only, with FOR UPDATE SKIP LOCKED.
 fn build_discard_select(
-    backend: DbBackend,
+    store: &OutboxStore<'_>,
     scope: &DeadLetterScope,
 ) -> (String, Vec<sea_orm::Value>) {
-    let mut qb = QueryBuilder::new("SELECT d.id FROM toolkit_outbox_dead_letters d", backend);
-    apply_scope(&mut qb, scope);
+    let mut qb = QueryBuilder::new(store.dead_letter_id_select_base(), store.backend());
+    apply_scope(&mut qb, store, scope);
     qb.add_raw_condition("d.status = 'pending'");
     qb.finish_locking_no_order(scope.limit, true)
 }
 
 /// Build `UPDATE ... SET status = 'discarded', completed_at = now() WHERE id IN (...)`.
-fn build_batch_discard(backend: DbBackend, count: usize) -> String {
+fn build_batch_discard(store: &OutboxStore<'_>, count: usize) -> String {
+    let backend = store.backend();
     let is_mysql = backend == DbBackend::MySql;
     let now_fn = db_now(backend);
     let mut sql = format!(
-        "UPDATE toolkit_outbox_dead_letters SET status = 'discarded', completed_at = {now_fn} WHERE id IN ("
+        "UPDATE {} SET status = 'discarded', completed_at = {now_fn} WHERE id IN (",
+        store.tables().dead_letters()
     );
     for i in 0..count {
         if i > 0 {
@@ -727,6 +758,88 @@ fn db_now(backend: DbBackend) -> &'static str {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    fn default_tables() -> OutboxTables {
+        OutboxTables::default()
+    }
+
+    fn build_select_query(
+        backend: DbBackend,
+        filter: &DeadLetterFilter,
+    ) -> (String, Vec<sea_orm::Value>) {
+        let tables = default_tables();
+        let statements = OutboxStatements::new(backend, &tables);
+        let store = OutboxStore::new(&statements);
+        super::build_select_query(&store, filter)
+    }
+
+    fn build_count_query(
+        backend: DbBackend,
+        filter: &DeadLetterFilter,
+    ) -> (String, Vec<sea_orm::Value>) {
+        let tables = default_tables();
+        let statements = OutboxStatements::new(backend, &tables);
+        let store = OutboxStore::new(&statements);
+        super::build_count_query(&store, filter)
+    }
+
+    fn build_delete_query(
+        backend: DbBackend,
+        scope: &DeadLetterScope,
+    ) -> (String, Vec<sea_orm::Value>) {
+        let tables = default_tables();
+        let statements = OutboxStatements::new(backend, &tables);
+        let store = OutboxStore::new(&statements);
+        super::build_delete_query(&store, scope)
+    }
+
+    fn build_replay_select(
+        backend: DbBackend,
+        scope: &DeadLetterScope,
+    ) -> (String, Vec<sea_orm::Value>) {
+        let tables = default_tables();
+        let statements = OutboxStatements::new(backend, &tables);
+        let store = OutboxStore::new(&statements);
+        super::build_replay_select(&store, scope)
+    }
+
+    fn build_batch_claim(backend: DbBackend, count: usize) -> String {
+        let tables = default_tables();
+        let statements = OutboxStatements::new(backend, &tables);
+        let store = OutboxStore::new(&statements);
+        super::build_batch_claim(&store, count)
+    }
+
+    fn build_batch_resolve(backend: DbBackend, count: usize) -> String {
+        let tables = default_tables();
+        let statements = OutboxStatements::new(backend, &tables);
+        let store = OutboxStore::new(&statements);
+        super::build_batch_resolve(&store, count)
+    }
+
+    fn build_batch_reject(backend: DbBackend, count: usize) -> String {
+        let tables = default_tables();
+        let statements = OutboxStatements::new(backend, &tables);
+        let store = OutboxStore::new(&statements);
+        super::build_batch_reject(&store, count)
+    }
+
+    fn build_discard_select(
+        backend: DbBackend,
+        scope: &DeadLetterScope,
+    ) -> (String, Vec<sea_orm::Value>) {
+        let tables = default_tables();
+        let statements = OutboxStatements::new(backend, &tables);
+        let store = OutboxStore::new(&statements);
+        super::build_discard_select(&store, scope)
+    }
+
+    fn apply_scope(qb: &mut QueryBuilder, scope: &DeadLetterScope) {
+        let tables = default_tables();
+        let statements = OutboxStatements::new(DbBackend::Postgres, &tables);
+        let store = OutboxStore::new(&statements);
+        super::apply_scope(qb, &store, scope);
+    }
 
     // --- Filter / scope tests ---
 

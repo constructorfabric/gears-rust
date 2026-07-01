@@ -103,6 +103,10 @@ required-features = ["sqlite", "preview-outbox"]
 name = "outbox_batch_multi_queue"
 required-features = ["sqlite", "preview-outbox"]
 
+[[example]]
+name = "outbox_custom_prefix"
+required-features = ["sqlite", "preview-outbox"]
+
 [[bench]]
 name = "outbox_throughput"
 harness = false

@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
+};
 use tokio::sync::{Notify, RwLock};
 
-use super::dialect::Dialect;
 use super::manager::OutboxBuilder;
 use super::prioritizer::SharedPrioritizer;
+use super::statements::OutboxStatements;
+use super::store::OutboxStore;
 use super::types::{EnqueueMessage, OutboxConfig, OutboxError, OutboxMessageId};
 use crate::Db;
 use crate::secure::SeaOrmRunner;
@@ -24,6 +27,7 @@ const BATCH_CHUNK_SIZE: usize = 100;
 /// Core outbox handle. Holds partition cache and notification channels.
 pub struct Outbox {
     config: OutboxConfig,
+    statements: Arc<OutboxStatements>,
     /// Cached partition lookup: `partitions[queue_name][partition_number] = partitions.id` (PK).
     partitions: DashMap<String, Vec<i64>>,
     /// Reverse map: `partition_id → queue_name`. Populated during `register_queue`.
@@ -54,9 +58,17 @@ impl Outbox {
 
     /// Create a new outbox. Construction goes through [`OutboxBuilder::start()`].
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn new(config: OutboxConfig) -> Self {
+        Self::new_with_backend(config, DbBackend::Sqlite)
+    }
+
+    #[must_use]
+    pub(crate) fn new_with_backend(config: OutboxConfig, backend: DbBackend) -> Self {
+        let statements = Arc::new(OutboxStatements::new(backend, &config.tables));
         Self {
             config,
+            statements,
             partitions: DashMap::new(),
             partition_to_queue: DashMap::new(),
             all_partition_ids: RwLock::new(Vec::new()),
@@ -91,13 +103,11 @@ impl Outbox {
         super::validation::validate_queue_name(queue)?;
         let conn = db.sea_internal();
         let txn = conn.begin().await?;
-        let backend = txn.get_database_backend();
-        let dialect = Dialect::from(backend);
+        let store = OutboxStore::new(self.statements());
 
-        let ids =
-            Self::ensure_partition_rows(&txn, backend, &dialect, queue, num_partitions).await?;
-        Self::ensure_processor_rows(&txn, backend, &dialect, &ids).await?;
-        Self::ensure_vacuum_counter_rows(&txn, backend, &dialect, &ids).await?;
+        let ids = Self::ensure_partition_rows(&txn, &store, queue, num_partitions).await?;
+        Self::ensure_processor_rows(&txn, &store, &ids).await?;
+        Self::ensure_vacuum_counter_rows(&txn, &store, &ids).await?;
 
         txn.commit().await?;
 
@@ -111,14 +121,13 @@ impl Outbox {
     /// already present or freshly inserted.
     async fn ensure_partition_rows<C: ConnectionTrait>(
         conn: &C,
-        backend: DbBackend,
-        dialect: &Dialect,
+        store: &OutboxStore<'_>,
         queue: &str,
         num_partitions: u16,
     ) -> Result<Vec<i64>, OutboxError> {
         let existing = PartitionRow::find_by_statement(Statement::from_sql_and_values(
-            backend,
-            dialect.register_queue_select(),
+            store.backend(),
+            store.register_queue_select(),
             [queue.into()],
         ))
         .all(conn)
@@ -138,8 +147,8 @@ impl Outbox {
         // First registration — insert partition rows
         for p in 0..num_partitions {
             conn.execute(Statement::from_sql_and_values(
-                backend,
-                dialect.register_queue_insert(),
+                store.backend(),
+                store.register_queue_insert(),
                 #[allow(clippy::cast_possible_wrap)]
                 [queue.into(), (p as i16).into()],
             ))
@@ -148,8 +157,8 @@ impl Outbox {
 
         // Read back inserted rows to get their PKs
         let rows = PartitionRow::find_by_statement(Statement::from_sql_and_values(
-            backend,
-            dialect.register_queue_select(),
+            store.backend(),
+            store.register_queue_select(),
             [queue.into()],
         ))
         .all(conn)
@@ -162,14 +171,13 @@ impl Outbox {
     /// `ON CONFLICT DO NOTHING`).
     async fn ensure_processor_rows<C: ConnectionTrait>(
         conn: &C,
-        backend: DbBackend,
-        dialect: &Dialect,
+        store: &OutboxStore<'_>,
         ids: &[i64],
     ) -> Result<(), OutboxError> {
         for &id in ids {
             conn.execute(Statement::from_sql_and_values(
-                backend,
-                dialect.insert_processor_row(),
+                store.backend(),
+                store.insert_processor_row(),
                 [id.into()],
             ))
             .await?;
@@ -181,14 +189,13 @@ impl Outbox {
     /// `ON CONFLICT DO NOTHING`).
     async fn ensure_vacuum_counter_rows<C: ConnectionTrait>(
         conn: &C,
-        backend: DbBackend,
-        dialect: &Dialect,
+        store: &OutboxStore<'_>,
         ids: &[i64],
     ) -> Result<(), OutboxError> {
         for &id in ids {
             conn.execute(Statement::from_sql_and_values(
-                backend,
-                dialect.insert_vacuum_counter_row(),
+                store.backend(),
+                store.insert_vacuum_counter_row(),
                 [id.into()],
             ))
             .await?;
@@ -253,8 +260,14 @@ impl Outbox {
         let partition_id = self.resolve_partition(queue, partition)?;
 
         let runner = db.as_seaorm();
-        let incoming_id =
-            Self::insert_body_and_incoming(&runner, partition_id, payload, payload_type).await?;
+        let incoming_id = Self::insert_body_and_incoming(
+            &runner,
+            self.statements(),
+            partition_id,
+            payload,
+            payload_type,
+        )
+        .await?;
 
         self.push_dirty(partition_id);
 
@@ -285,7 +298,7 @@ impl Outbox {
         }
 
         let runner = db.as_seaorm();
-        let ids = Self::insert_batch(&runner, &resolved, items).await?;
+        let ids = Self::insert_batch(&runner, self.statements(), &resolved, items).await?;
 
         // Push dirty for each distinct partition_id in the batch
         for &pid in &resolved {
@@ -298,14 +311,34 @@ impl Outbox {
     /// Insert a batch of body + incoming rows using multi-row INSERTs.
     async fn insert_batch(
         runner: &SeaOrmRunner<'_>,
+        statements: &OutboxStatements,
         partition_ids: &[i64],
         items: &[EnqueueMessage<'_>],
     ) -> Result<Vec<OutboxMessageId>, OutboxError> {
-        let (conn, backend): (&dyn ConnectionTrait, DbBackend) = match runner {
-            SeaOrmRunner::Conn(c) => (*c, c.get_database_backend()),
-            SeaOrmRunner::Tx(t) => (*t, t.get_database_backend()),
+        let backend = Self::runner_backend(runner);
+        debug_assert_eq!(backend, statements.backend());
+
+        if let Some(c) = Self::conn_requiring_composite_write_tx(runner) {
+            let txn = c.begin().await?;
+            let ids = Self::insert_batch_on_conn(&txn, statements, partition_ids, items).await?;
+            txn.commit().await?;
+            return Ok(ids);
+        }
+
+        let conn: &dyn ConnectionTrait = match runner {
+            SeaOrmRunner::Conn(c) => *c,
+            SeaOrmRunner::Tx(t) => *t,
         };
-        let dialect = Dialect::from(backend);
+        Self::insert_batch_on_conn(conn, statements, partition_ids, items).await
+    }
+
+    async fn insert_batch_on_conn(
+        conn: &dyn ConnectionTrait,
+        statements: &OutboxStatements,
+        partition_ids: &[i64],
+        items: &[EnqueueMessage<'_>],
+    ) -> Result<Vec<OutboxMessageId>, OutboxError> {
+        let store = OutboxStore::new(statements);
 
         if items.is_empty() {
             return Ok(Vec::new());
@@ -319,9 +352,7 @@ impl Outbox {
                 .iter()
                 .map(|item| (item.payload.as_slice(), item.payload_type))
                 .collect();
-            let chunk_ids = dialect
-                .exec_insert_body_batch(conn, backend, &payloads)
-                .await?;
+            let chunk_ids = store.exec_insert_body_batch(conn, &payloads).await?;
             all_body_ids.extend(chunk_ids);
         }
 
@@ -333,9 +364,7 @@ impl Outbox {
             let entries: Vec<(i64, i64)> = (chunk_start..chunk_end)
                 .map(|i| (partition_ids[i], all_body_ids[i]))
                 .collect();
-            let chunk_ids = dialect
-                .exec_insert_incoming_batch(conn, backend, &entries)
-                .await?;
+            let chunk_ids = store.exec_insert_incoming_batch(conn, &entries).await?;
             all_incoming_ids.extend(chunk_ids.into_iter().map(OutboxMessageId));
         }
 
@@ -345,21 +374,50 @@ impl Outbox {
     /// Insert body + incoming rows, returning the `incoming_id`.
     async fn insert_body_and_incoming(
         runner: &SeaOrmRunner<'_>,
+        statements: &OutboxStatements,
         partition_id: i64,
         payload: Vec<u8>,
         payload_type: &str,
     ) -> Result<i64, OutboxError> {
-        let (conn, backend): (&dyn ConnectionTrait, DbBackend) = match runner {
-            SeaOrmRunner::Conn(c) => (*c, c.get_database_backend()),
-            SeaOrmRunner::Tx(t) => (*t, t.get_database_backend()),
-        };
-        let dialect = Dialect::from(backend);
+        let backend = Self::runner_backend(runner);
+        debug_assert_eq!(backend, statements.backend());
 
-        let incoming_id = dialect
-            .exec_insert_body_and_incoming(conn, backend, partition_id, payload, payload_type)
+        if let Some(c) = Self::conn_requiring_composite_write_tx(runner) {
+            let txn = c.begin().await?;
+            let store = OutboxStore::new(statements);
+            let incoming_id = store
+                .exec_insert_body_and_incoming(&txn, partition_id, payload, payload_type)
+                .await?;
+            txn.commit().await?;
+            return Ok(incoming_id);
+        }
+
+        let conn: &dyn ConnectionTrait = match runner {
+            SeaOrmRunner::Conn(c) => *c,
+            SeaOrmRunner::Tx(t) => *t,
+        };
+        let store = OutboxStore::new(statements);
+        let incoming_id = store
+            .exec_insert_body_and_incoming(conn, partition_id, payload, payload_type)
             .await?;
 
         Ok(incoming_id)
+    }
+
+    fn runner_backend(runner: &SeaOrmRunner<'_>) -> DbBackend {
+        match runner {
+            SeaOrmRunner::Conn(c) => c.get_database_backend(),
+            SeaOrmRunner::Tx(t) => t.get_database_backend(),
+        }
+    }
+
+    fn conn_requiring_composite_write_tx<'a>(
+        runner: &'a SeaOrmRunner<'_>,
+    ) -> Option<&'a DatabaseConnection> {
+        match runner {
+            SeaOrmRunner::Conn(c) if c.get_database_backend() == DbBackend::MySql => Some(*c),
+            SeaOrmRunner::Conn(_) | SeaOrmRunner::Tx(_) => None,
+        }
     }
 
     /// List dead-lettered messages with optional filtering.
@@ -376,7 +434,7 @@ impl Outbox {
         db: &(impl crate::secure::DBRunner + Sync),
         filter: &super::dead_letter::DeadLetterFilter,
     ) -> Result<Vec<super::dead_letter::DeadLetterMessage>, OutboxError> {
-        super::dead_letter::dead_letter_list(db.as_seaorm(), filter).await
+        super::dead_letter::dead_letter_list(db.as_seaorm(), self.statements(), filter).await
     }
 
     /// Count dead-lettered messages matching the filter.
@@ -388,7 +446,7 @@ impl Outbox {
         db: &(impl crate::secure::DBRunner + Sync),
         filter: &super::dead_letter::DeadLetterFilter,
     ) -> Result<u64, OutboxError> {
-        super::dead_letter::dead_letter_count(db.as_seaorm(), filter).await
+        super::dead_letter::dead_letter_count(db.as_seaorm(), self.statements(), filter).await
     }
 
     /// Claim dead letters for reprocessing. Returns the claimed messages.
@@ -404,7 +462,8 @@ impl Outbox {
         scope: &super::dead_letter::DeadLetterScope,
         timeout: std::time::Duration,
     ) -> Result<Vec<super::dead_letter::DeadLetterMessage>, OutboxError> {
-        super::dead_letter::dead_letter_replay(db.as_seaorm(), scope, timeout).await
+        super::dead_letter::dead_letter_replay(db.as_seaorm(), self.statements(), scope, timeout)
+            .await
     }
 
     /// Transition claimed dead letters to `resolved`.
@@ -416,7 +475,7 @@ impl Outbox {
         db: &(impl crate::secure::DBRunner + Sync),
         ids: &[i64],
     ) -> Result<u64, OutboxError> {
-        super::dead_letter::dead_letter_resolve(db.as_seaorm(), ids).await
+        super::dead_letter::dead_letter_resolve(db.as_seaorm(), self.statements(), ids).await
     }
 
     /// Transition claimed dead letters back to `pending` with attempts++.
@@ -429,7 +488,7 @@ impl Outbox {
         ids: &[i64],
         reason: &str,
     ) -> Result<u64, OutboxError> {
-        super::dead_letter::dead_letter_reject(db.as_seaorm(), ids, reason).await
+        super::dead_letter::dead_letter_reject(db.as_seaorm(), self.statements(), ids, reason).await
     }
 
     /// Discard pending dead letters — transitions to `discarded`.
@@ -441,7 +500,7 @@ impl Outbox {
         db: &(impl crate::secure::DBRunner + Sync),
         scope: &super::dead_letter::DeadLetterScope,
     ) -> Result<u64, OutboxError> {
-        super::dead_letter::dead_letter_discard(db.as_seaorm(), scope).await
+        super::dead_letter::dead_letter_discard(db.as_seaorm(), self.statements(), scope).await
     }
 
     /// Delete terminal-state dead letters (`resolved` + `discarded`).
@@ -453,7 +512,7 @@ impl Outbox {
         db: &(impl crate::secure::DBRunner + Sync),
         scope: &super::dead_letter::DeadLetterScope,
     ) -> Result<u64, OutboxError> {
-        super::dead_letter::dead_letter_cleanup(db.as_seaorm(), scope).await
+        super::dead_letter::dead_letter_cleanup(db.as_seaorm(), self.statements(), scope).await
     }
 
     /// Install the shared prioritizer. Called once during `start()`.
@@ -543,6 +602,16 @@ impl Outbox {
     #[must_use]
     pub fn config(&self) -> &OutboxConfig {
         &self.config
+    }
+
+    #[must_use]
+    pub(super) fn statements(&self) -> &OutboxStatements {
+        &self.statements
+    }
+
+    #[must_use]
+    pub(super) fn statements_arc(&self) -> Arc<OutboxStatements> {
+        Arc::clone(&self.statements)
     }
 
     /// Returns the partition IDs for a specific queue, in order.
