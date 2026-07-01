@@ -171,6 +171,23 @@ impl FileRepo {
         Ok(res.rows_affected > 0)
     }
 
+    /// List every file across all tenants, for the retention sweep engine.
+    ///
+    /// @cpt-cf-file-storage-fr-retention-policies
+    pub async fn list_all_for_sweep<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<Vec<File>, DomainError> {
+        let rows = Entity::find()
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// Update `owner_kind` and `owner_id` for a file row, and bump
     /// `last_modified_at`. Returns `true` if a row was found and updated.
     ///
