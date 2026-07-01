@@ -60,6 +60,25 @@ pub trait RestApiCapability: Send + Sync {
         router: Router,
         openapi: &dyn OpenApiRegistry,
     ) -> anyhow::Result<Router>;
+
+    /// Return a readiness healthcheck for this gear, if any.
+    ///
+    /// Called once during the REST wiring phase, after [`register_rest`](Self::register_rest)
+    /// succeeds. The returned check is registered in [`RestHealthcheckRegistry`] and run on
+    /// every `/readyz` and `/health` request.
+    ///
+    /// Return `None` (the default) to opt out of readiness probing.
+    ///
+    /// # gRPC healthcheck
+    ///
+    /// // TODO: Add gRPC healthcheck hook in a follow-up PR.
+    /// // This PR intentionally implements REST readiness healthchecks only.
+    fn healthcheck(
+        &self,
+        _ctx: &crate::context::GearCtx,
+    ) -> Option<std::sync::Arc<dyn crate::healthcheck::Healthcheck>> {
+        None
+    }
 }
 
 /// API Gateway capability: handles gateway hosting with prepare/finalize phases.

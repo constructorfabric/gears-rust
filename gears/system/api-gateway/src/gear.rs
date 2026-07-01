@@ -77,6 +77,8 @@ pub struct ApiGateway {
     pub(crate) final_router: Mutex<Option<axum::Router>>,
     // AuthN Resolver client (resolved during init, None when auth_disabled)
     pub(crate) authn_client: Mutex<Option<Arc<dyn AuthNResolverClient>>>,
+    // Readiness healthcheck registry — populated during REST wiring phase
+    pub(crate) healthcheck_registry: Mutex<Option<Arc<toolkit::RestHealthcheckRegistry>>>,
 
     // Duplicate detection (per (method, path) and per handler id)
     pub(crate) registered_routes: DashMap<(Method, String), ()>,
@@ -92,6 +94,7 @@ impl Default for ApiGateway {
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
             authn_client: Mutex::new(None),
+            healthcheck_registry: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
         }
@@ -99,17 +102,39 @@ impl Default for ApiGateway {
 }
 
 impl ApiGateway {
-    fn apply_prefix_nesting(mut router: Router, prefix: &str) -> Router {
+    fn apply_prefix_nesting(
+        mut router: Router,
+        prefix: &str,
+        hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
+    ) -> Router {
         if prefix.is_empty() {
             return router;
         }
 
-        let top = Router::new()
-            .route("/health", get(web::health_check))
-            .route("/healthz", get(|| async { "ok" }));
-
+        let top = Self::health_routes(hc_registry);
         router = Router::new().nest(prefix, router);
         top.merge(router)
+    }
+
+    fn health_routes(hc_registry: Arc<toolkit::RestHealthcheckRegistry>) -> Router {
+        let reg_h = hc_registry.clone();
+        let reg_r = hc_registry;
+        Router::new()
+            .route(
+                "/health",
+                get(move || {
+                    let r = reg_h.clone();
+                    async move { web::health_detail(r).await }
+                }),
+            )
+            .route("/healthz", get(|| async { "ok" }))
+            .route(
+                "/readyz",
+                get(move || {
+                    let r = reg_r.clone();
+                    async move { web::readyz_check(r).await }
+                }),
+            )
     }
 
     /// Create a new `ApiGateway` instance with the given configuration
@@ -122,6 +147,7 @@ impl ApiGateway {
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
             authn_client: Mutex::new(None),
+            healthcheck_registry: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
         }
@@ -160,6 +186,7 @@ impl ApiGateway {
         // Always mark built-in health check routes as public
         public_routes.insert((Method::GET, "/health".to_owned()));
         public_routes.insert((Method::GET, "/healthz".to_owned()));
+        public_routes.insert((Method::GET, "/readyz".to_owned()));
 
         public_routes.insert((Method::GET, "/docs".to_owned()));
         public_routes.insert((Method::GET, "/openapi.json".to_owned()));
@@ -484,11 +511,15 @@ impl ApiGateway {
         }
 
         tracing::debug!("Building new router (standalone/fallback mode)");
-        // In standalone mode (no REST pipeline), register both health endpoints here.
+        // In standalone mode (no REST pipeline), register health endpoints here.
         // In normal operation, rest_prepare() registers these instead.
-        let mut router = Router::new()
-            .route("/health", get(web::health_check))
-            .route("/healthz", get(|| async { "ok" }));
+        let hc_registry = self
+            .healthcheck_registry
+            .lock()
+            .clone()
+            .unwrap_or_else(|| Arc::new(toolkit::RestHealthcheckRegistry::new()));
+
+        let mut router = Self::health_routes(hc_registry.clone());
 
         // Apply all middleware layers including auth, above the router
         let authn_client = self.authn_client.lock().clone();
@@ -496,7 +527,7 @@ impl ApiGateway {
 
         let config = self.get_cached_config();
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
-        router = Self::apply_prefix_nesting(router, &prefix);
+        router = Self::apply_prefix_nesting(router, &prefix, hc_registry);
 
         // Cache the built router for future use
         self.router_cache.store(router.clone());
@@ -706,17 +737,24 @@ impl toolkit::Gear for ApiGateway {
 impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
     fn rest_prepare(
         &self,
-        _ctx: &toolkit::context::GearCtx,
+        ctx: &toolkit::context::GearCtx,
         router: axum::Router,
     ) -> anyhow::Result<axum::Router> {
-        // Add health check endpoints:
-        // - /health: detailed JSON response with status and timestamp
-        // - /healthz: simple "ok" liveness probe (Kubernetes-style)
-        let router = router
-            .route("/health", get(web::health_check))
-            .route("/healthz", get(|| async { "ok" }));
+        // Retrieve the healthcheck registry created in run_rest_phase before this call.
+        // Falls back to an empty registry so standalone tests still compile.
+        let hc_registry = ctx
+            .client_hub()
+            .get::<toolkit::RestHealthcheckRegistry>()
+            .unwrap_or_else(|_| Arc::new(toolkit::RestHealthcheckRegistry::new()));
 
-        // You may attach global middlewares here (trace, compression, cors), but do not start server.
+        *self.healthcheck_registry.lock() = Some(hc_registry.clone());
+
+        // Add health endpoints:
+        // - /healthz: shallow liveness probe, never runs user checks
+        // - /readyz: readiness probe, runs user REST healthchecks
+        // - /health: detailed readiness JSON with per-component status
+        let router = router.merge(Self::health_routes(hc_registry));
+
         tracing::debug!("REST host prepared base router with health check endpoints");
         Ok(router)
     }
@@ -737,8 +775,14 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
         let authn_client = self.authn_client.lock().clone();
         router = self.apply_middleware_stack(router, authn_client)?;
 
+        let hc_registry = self
+            .healthcheck_registry
+            .lock()
+            .clone()
+            .unwrap_or_else(|| Arc::new(toolkit::RestHealthcheckRegistry::new()));
+
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
-        router = Self::apply_prefix_nesting(router, &prefix);
+        router = Self::apply_prefix_nesting(router, &prefix, hc_registry);
 
         // Keep the finalized router to be used by `serve()`
         *self.final_router.lock() = Some(router.clone());
