@@ -77,11 +77,12 @@ make exammple
 # $ make example
 # visit: http://127.0.0.1:8087/cf/docs
 
-# Check if server is ready (detailed JSON response)
-curl http://127.0.0.1:8087/cf/health
-
-# Kubernetes-style liveness probe (simple "ok" response)
-curl http://127.0.0.1:8087/healthz
+# Readiness (detailed JSON) and liveness ("ok"). The example runs with prefix_path=/cf,
+# and in the default health.serve=main mode the probes ride the main listener, so they
+# sit under the same prefix as every other route.
+curl http://127.0.0.1:8087/cf/health     # detailed JSON, all component checks
+curl http://127.0.0.1:8087/cf/readyz      # readiness: 200 ready / 503 not ready
+curl http://127.0.0.1:8087/cf/healthz     # liveness: "ok"
 ```
 
 Other quick start examples:

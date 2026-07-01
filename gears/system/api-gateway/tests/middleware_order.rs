@@ -84,7 +84,11 @@ async fn real_middlewares_observe_documented_order() -> Result<()> {
         .register(router, &api);
 
     // Apply the real gateway middleware stack.
-    let app = api.rest_finalize(&ctx, router)?;
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
 
     // --------------------
     // Req1: invalid Content-Type -> should be rejected by MIME validation (BAD_REQUEST / 400),
@@ -203,7 +207,11 @@ async fn real_middlewares_observe_documented_order_with_prefix() -> Result<()> {
         .register(router, &api);
 
     // Apply the real gateway middleware stack.
-    let app = api.rest_finalize(&ctx, router)?;
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
 
     // --------------------
     // Req1: invalid Content-Type -> should be rejected by MIME validation (BAD_REQUEST / 400),

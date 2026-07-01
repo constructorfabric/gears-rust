@@ -8,8 +8,12 @@ fn default_body_limit_bytes() -> usize {
     16 * 1024 * 1024
 }
 
+fn default_healthcheck_timeout_ms() -> u64 {
+    500
+}
+
 /// API gateway configuration - reused from `api_gateway` gear
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiGatewayConfig {
@@ -57,6 +61,71 @@ pub struct ApiGatewayConfig {
     /// HTTP metrics configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    /// Per-check `/health`/`/readyz` timeout (ms); raise for slow dependencies.
+    #[serde(default = "default_healthcheck_timeout_ms")]
+    pub healthcheck_timeout_ms: u64,
+
+    /// Health-probe serving configuration (listener placement, bind address).
+    #[serde(default)]
+    pub health: HealthConfig,
+}
+
+/// Which listener(s) serve the health-probe endpoints (`/healthz`, `/readyz`, `/health`).
+///
+/// Health endpoints are unauthenticated in every mode; see [`HealthConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthServeMode {
+    /// Serve health endpoints on the main gateway listener (`bind_addr`). Default.
+    #[default]
+    Main,
+    /// Serve health endpoints only on a separate listener (`health.bind_addr`), e.g. a
+    /// private/management port not exposed alongside the main API.
+    Separate,
+    /// Serve health endpoints on both the main and the separate listener.
+    Both,
+}
+
+/// Health-probe serving configuration.
+///
+/// The endpoints (`/healthz`, `/readyz`, `/health`) never require authentication in any mode.
+/// In `main`/`both` mode they ride the main listener as public routes on the gateway
+/// middleware surface and inherit `prefix_path` (e.g. `/cf/healthz`); operators must keep the
+/// main gateway on a private network if the per-component detail in `/health` is sensitive. In
+/// `separate`/`both` mode they are also served at unprefixed paths on `bind_addr`, protected
+/// only by network placement of that listener.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HealthConfig {
+    /// Which listener(s) serve the health endpoints.
+    pub serve: HealthServeMode,
+    /// Bind address for the separate health listener (e.g. `"0.0.0.0:8081"`).
+    /// Required when `serve` is `separate` or `both`; unused for `main`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+}
+
+impl Default for ApiGatewayConfig {
+    // Manual (not derived) so defaults match the `#[serde(default = ...)]` fns above;
+    // a derived Default would zero each field (e.g. timeout 0 = instant probe failure).
+    fn default() -> Self {
+        Self {
+            bind_addr: String::default(),
+            enable_docs: false,
+            cors_enabled: false,
+            cors: None,
+            openapi: OpenApiConfig::default(),
+            defaults: Defaults::default(),
+            auth_disabled: false,
+            require_auth_by_default: default_require_auth_by_default(),
+            prefix_path: String::default(),
+            route_policies: RoutePoliciesConfig::default(),
+            metrics: MetricsConfig::default(),
+            healthcheck_timeout_ms: default_healthcheck_timeout_ms(),
+            health: HealthConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

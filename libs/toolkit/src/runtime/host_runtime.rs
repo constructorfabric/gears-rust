@@ -439,13 +439,22 @@ impl HostRuntime {
         // use host as the registry
         let registry: &dyn crate::contracts::OpenApiRegistry = host.as_registry();
 
+        // Healthcheck registry, passed explicitly to the REST host and providers below
+        // (not via ClientHub). Seeded with the host's shutdown token so in-flight checks
+        // are aborted on shutdown.
+        let hc_registry = Arc::new(
+            crate::healthcheck::RestHealthcheckRegistry::with_cancellation(
+                host_ctx.cancellation_token().clone(),
+            ),
+        );
+
         // 1) Host prepare: base Router / global middlewares / basic OAS meta
-        router =
-            host.rest_prepare(&host_ctx, router)
-                .map_err(|source| RegistryError::RestPrepare {
-                    gear: host_entry.name,
-                    source,
-                })?;
+        router = host
+            .rest_prepare(&host_ctx, router, hc_registry.clone())
+            .map_err(|source| RegistryError::RestPrepare {
+                gear: host_entry.name,
+                source,
+            })?;
 
         // 2) Register all REST providers (in the current discovery order)
         for e in self.registry.gears() {
@@ -463,16 +472,21 @@ impl HostRuntime {
                         gear: e.name,
                         source,
                     })?;
+
+                // Register the gear's readiness healthcheck after successful route registration.
+                if let Some(hc) = rest.healthcheck(&ctx) {
+                    hc_registry.register(e.name, hc);
+                }
             }
         }
 
         // 3) Host finalize: attach /openapi.json and /docs, persist Router if needed (no server start)
-        router = host.rest_finalize(&host_ctx, router).map_err(|source| {
-            RegistryError::RestFinalize {
+        router = host
+            .rest_finalize(&host_ctx, router, hc_registry)
+            .map_err(|source| RegistryError::RestFinalize {
                 gear: host_entry.name,
                 source,
-            }
-        })?;
+            })?;
 
         Ok(router)
     }

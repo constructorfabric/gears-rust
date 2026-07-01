@@ -116,7 +116,11 @@ async fn test_body_limit_configured() {
         .expect("Failed to register routes");
 
     let _final_router = api_gateway
-        .rest_finalize(&ctx, router)
+        .rest_finalize(
+            &ctx,
+            router,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
         .expect("Failed to finalize router");
 
     // Verify router builds with custom body limit
@@ -141,7 +145,11 @@ async fn test_body_limit_with_cors() {
         .expect("Failed to register routes");
 
     let _final_router = api_gateway
-        .rest_finalize(&ctx, router)
+        .rest_finalize(
+            &ctx,
+            router,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
         .expect("Failed to finalize router");
 
     // Both CORS and body limit should be active
@@ -180,7 +188,11 @@ async fn test_default_body_limit() {
         .expect("Failed to register routes");
 
     let _final_router = api_gateway
-        .rest_finalize(&ctx, router)
+        .rest_finalize(
+            &ctx,
+            router,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
         .expect("Failed to finalize router");
 
     // Verify default body limit is applied (16MB)

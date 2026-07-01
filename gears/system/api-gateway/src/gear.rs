@@ -3,7 +3,7 @@
 //! Contains the `ApiGateway` gear struct and its trait implementations.
 
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -12,7 +12,7 @@ use anyhow::Result;
 use axum::error_handling::HandleErrorLayer;
 use axum::http::Method;
 use axum::middleware::from_fn_with_state;
-use axum::{Router, extract::DefaultBodyLimit, middleware::from_fn, routing::get};
+use axum::{Extension, Router, extract::DefaultBodyLimit, middleware::from_fn, routing::get};
 use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -49,7 +49,7 @@ async fn timeout_to_canonical(err: BoxError) -> axum::response::Response {
 
 use authn_resolver_sdk::AuthNResolverClient;
 
-use crate::config::ApiGatewayConfig;
+use crate::config::{ApiGatewayConfig, HealthServeMode};
 use crate::middleware::auth;
 use toolkit_security::SecurityContext;
 use toolkit_security::constants::{DEFAULT_SUBJECT_ID, DEFAULT_TENANT_ID};
@@ -77,6 +77,12 @@ pub struct ApiGateway {
     pub(crate) final_router: Mutex<Option<axum::Router>>,
     // AuthN Resolver client (resolved during init, None when auth_disabled)
     pub(crate) authn_client: Mutex<Option<Arc<dyn AuthNResolverClient>>>,
+    // Readiness registry, set once from `rest_prepare`; `OnceLock` = lock-free reads.
+    pub(crate) healthcheck_registry: OnceLock<Arc<toolkit::RestHealthcheckRegistry>>,
+    // Built-once standalone health router. Served on the separate health listener in
+    // `separate`/`both` mode and merged onto the main router in `main`/`both` mode. Cached
+    // so repeat `health_router()`/`build_health_router()` calls are cheap.
+    pub(crate) health_router: OnceLock<axum::Router>,
 
     // Duplicate detection (per (method, path) and per handler id)
     pub(crate) registered_routes: DashMap<(Method, String), ()>,
@@ -92,24 +98,84 @@ impl Default for ApiGateway {
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
             authn_client: Mutex::new(None),
+            healthcheck_registry: OnceLock::new(),
+            health_router: OnceLock::new(),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
         }
     }
 }
 
+// Built-in health-probe paths, shared by route registration and auth policy so they can't drift.
+const HEALTH_DETAIL_PATH: &str = "/health";
+const HEALTHZ_PATH: &str = "/healthz";
+const READYZ_PATH: &str = "/readyz";
+
 impl ApiGateway {
-    fn apply_prefix_nesting(mut router: Router, prefix: &str) -> Router {
+    /// Nest `router` under `prefix`. Returns `router` unchanged when `prefix` is empty.
+    ///
+    /// Auth matching is keyed on unprefixed `OperationBuilder` paths, so the caller must
+    /// apply `router`'s middleware before this strips/adds the prefix via `nest()`.
+    fn apply_prefix(router: Router, prefix: &str) -> Router {
         if prefix.is_empty() {
-            return router;
+            router
+        } else {
+            Router::new().nest(prefix, router)
         }
+    }
 
-        let top = Router::new()
-            .route("/health", get(web::health_check))
-            .route("/healthz", get(|| async { "ok" }));
+    /// Standalone health-probe router (`/health`, `/healthz`, `/readyz`): all public, no
+    /// gateway middleware, no auth, and NOT part of the `OpenAPI` document. In `separate`/`both`
+    /// mode the framework binds this on the separate health listener (`health.bind_addr`) from
+    /// [`serve`](Self::serve); it is also exposed for embedders that want to serve it themselves.
+    ///
+    /// # Errors
+    /// Returns an error if [`rest_prepare`](toolkit::contracts::ApiGatewayCapability::rest_prepare)
+    /// has not run yet (the healthcheck registry is unset).
+    pub fn health_router(&self) -> Result<Router> {
+        let hc_registry = self.healthcheck_registry.get().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "healthcheck_registry not set; call rest_prepare before health_router()"
+            )
+        })?;
+        let config = self.get_cached_config();
+        Ok(self.build_health_router(
+            hc_registry,
+            Duration::from_millis(config.healthcheck_timeout_ms),
+        ))
+    }
 
-        router = Router::new().nest(prefix, router);
-        top.merge(router)
+    /// Build (or return the cached) standalone health router. Deps (`hc_registry`,
+    /// `healthcheck_timeout`) are fixed after `rest_prepare`, so the first build is
+    /// authoritative; later calls reuse the clone.
+    fn build_health_router(
+        &self,
+        hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
+        healthcheck_timeout: Duration,
+    ) -> Router {
+        if let Some(cached) = self.health_router.get() {
+            return cached.clone();
+        }
+        let built = Self::health_routes(hc_registry, healthcheck_timeout);
+        // First build wins; a concurrent racer's `set` is a no-op (builds are sequential
+        // during lifecycle setup, so this is a belt-and-braces guard).
+        drop(self.health_router.set(built.clone()));
+        built
+    }
+
+    /// Health-probe routes as plain Axum routes (no `OperationBuilder`, so they never enter
+    /// the `OpenAPI` registry). All three are public; deps injected via `Extension`. Merged
+    /// onto the main router in `main`/`both` mode and used standalone on the separate listener.
+    fn health_routes(
+        hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
+        healthcheck_timeout: Duration,
+    ) -> Router {
+        Router::new()
+            .route(HEALTH_DETAIL_PATH, get(web::health_detail))
+            .route(HEALTHZ_PATH, get(|| async { "ok" }))
+            .route(READYZ_PATH, get(web::readyz_check))
+            .layer(Extension(hc_registry))
+            .layer(Extension(web::HealthcheckTimeout(healthcheck_timeout)))
     }
 
     /// Create a new `ApiGateway` instance with the given configuration
@@ -122,6 +188,8 @@ impl ApiGateway {
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
             authn_client: Mutex::new(None),
+            healthcheck_registry: OnceLock::new(),
+            health_router: OnceLock::new(),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
         }
@@ -157,12 +225,22 @@ impl ApiGateway {
         let mut authenticated_routes = std::collections::HashSet::new();
         let mut public_routes = std::collections::HashSet::new();
 
-        // Always mark built-in health check routes as public
-        public_routes.insert((Method::GET, "/health".to_owned()));
-        public_routes.insert((Method::GET, "/healthz".to_owned()));
-
         public_routes.insert((Method::GET, "/docs".to_owned()));
         public_routes.insert((Method::GET, "/openapi.json".to_owned()));
+
+        // In main/both mode the health probes are merged onto the main router *before* the
+        // middleware stack (see `rest_finalize`), so the auth layer resolves them: mark them
+        // explicitly public so no bearer token is ever required. Auth matches on the unprefixed
+        // path, so these keys stay unprefixed even when `prefix_path` is set.
+        let config = self.get_cached_config();
+        if matches!(
+            config.health.serve,
+            HealthServeMode::Main | HealthServeMode::Both
+        ) {
+            for path in [HEALTHZ_PATH, READYZ_PATH, HEALTH_DETAIL_PATH] {
+                public_routes.insert((Method::GET, path.to_owned()));
+            }
+        }
 
         for spec in &self.openapi_registry.operation_specs {
             let spec = spec.value();
@@ -178,7 +256,6 @@ impl ApiGateway {
             }
         }
 
-        let config = self.get_cached_config();
         let requirements_count = authenticated_routes.len();
         let public_routes_count = public_routes.len();
 
@@ -256,7 +333,11 @@ impl ApiGateway {
         // 14) Propagate MatchedPath to response extensions (route_layer — innermost).
         // This copies MatchedPath from the request (populated by Axum route matching)
         // into the response so outer layer() middleware (metrics) can read it.
-        router = router.route_layer(from_fn(middleware::http_metrics::propagate_matched_path));
+        // `route_layer` panics on a routeless router — reachable when no REST provider
+        // has registered anything yet.
+        if router.has_routes() {
+            router = router.route_layer(from_fn(middleware::http_metrics::propagate_matched_path));
+        }
 
         let config = self.get_cached_config();
 
@@ -484,19 +565,14 @@ impl ApiGateway {
         }
 
         tracing::debug!("Building new router (standalone/fallback mode)");
-        // In standalone mode (no REST pipeline), register both health endpoints here.
-        // In normal operation, rest_prepare() registers these instead.
-        let mut router = Router::new()
-            .route("/health", get(web::health_check))
-            .route("/healthz", get(|| async { "ok" }));
-
-        // Apply all middleware layers including auth, above the router
+        // No "main" routes here — the empty router is tolerated (`has_routes` guard).
+        // Health probes are not part of this router; see `health_router`.
         let authn_client = self.authn_client.lock().clone();
-        router = self.apply_middleware_stack(router, authn_client)?;
+        let router = self.apply_middleware_stack(Router::new(), authn_client)?;
 
         let config = self.get_cached_config();
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
-        router = Self::apply_prefix_nesting(router, &prefix);
+        let router = Self::apply_prefix(router, &prefix);
 
         // Cache the built router for future use
         self.router_cache.store(router.clone());
@@ -527,6 +603,29 @@ impl ApiGateway {
             .map_err(|e| anyhow::anyhow!("Invalid bind address '{bind_addr}': {e}"))
     }
 
+    /// Resolve the separate health listener address, if the config demands one.
+    ///
+    /// `Ok(None)` for `serve = main`. For `separate`/`both`, `health.bind_addr` must be present
+    /// and parseable — used both to fail fast at `init` and to bind at `serve`.
+    ///
+    /// # Errors
+    /// Returns an error if `serve` needs a separate listener but `health.bind_addr` is missing
+    /// or not a valid socket address.
+    fn health_bind_addr(cfg: &ApiGatewayConfig) -> anyhow::Result<Option<SocketAddr>> {
+        match cfg.health.serve {
+            HealthServeMode::Main => Ok(None),
+            HealthServeMode::Separate | HealthServeMode::Both => {
+                let raw = cfg.health.bind_addr.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "health.serve = {:?} requires health.bind_addr to be set",
+                        cfg.health.serve
+                    )
+                })?;
+                Ok(Some(Self::parse_bind_address(raw)?))
+            }
+        }
+    }
+
     /// Get the finalized router or build a default one.
     fn get_or_build_router(self: &Arc<Self>) -> anyhow::Result<Router> {
         let stored = { self.final_router.lock().take() };
@@ -553,27 +652,53 @@ impl ApiGateway {
         let addr = Self::parse_bind_address(&cfg.bind_addr)?;
         let router = self.get_or_build_router()?;
 
-        // Bind the socket, only now consider the service "ready"
+        // Bind the main socket.
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("HTTP server bound on {}", addr);
+
+        // Bind the separate health listener (if `serve` = separate|both) BEFORE signalling
+        // ready, so readiness reflects every listener the pod must accept traffic on.
+        let health_bound = self.bind_health_listener(&cfg).await?;
+
         ready.notify(); // Starting -> Running
 
-        // Graceful shutdown on cancel
-        let shutdown = {
-            let cancel = cancel.clone();
-            async move {
-                cancel.cancelled().await;
-                tracing::info!("HTTP server shutting down gracefully (cancellation)");
-            }
-        };
-
-        axum::serve(
+        let main_server = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))
+        .with_graceful_shutdown(Self::shutdown_signal(cancel.clone(), "HTTP server"));
+
+        // Both listeners share the runtime cancellation token, so shutdown fans out to both.
+        if let Some((health_listener, health_router)) = health_bound {
+            let health_server = axum::serve(health_listener, health_router.into_make_service())
+                .with_graceful_shutdown(Self::shutdown_signal(cancel, "health server"));
+            tokio::try_join!(
+                async { main_server.await.map_err(|e| anyhow::anyhow!(e)) },
+                async { health_server.await.map_err(|e| anyhow::anyhow!(e)) },
+            )?;
+            Ok(())
+        } else {
+            main_server.await.map_err(|e| anyhow::anyhow!(e))
+        }
+    }
+
+    /// Bind the separate health listener when `serve` = separate|both, else `None`.
+    async fn bind_health_listener(
+        &self,
+        cfg: &ApiGatewayConfig,
+    ) -> anyhow::Result<Option<(tokio::net::TcpListener, Router)>> {
+        let Some(health_addr) = Self::health_bind_addr(cfg)? else {
+            return Ok(None);
+        };
+        let health_listener = tokio::net::TcpListener::bind(health_addr).await?;
+        tracing::info!("health server bound on {}", health_addr);
+        Ok(Some((health_listener, self.health_router()?)))
+    }
+
+    /// Future that resolves when `cancel` fires, logging the graceful-shutdown of `name`.
+    async fn shutdown_signal(cancel: CancellationToken, name: &'static str) {
+        cancel.cancelled().await;
+        tracing::info!("{name} shutting down gracefully (cancellation)");
     }
 
     /// Check if `handler_id` is already registered (returns true if duplicate)
@@ -683,6 +808,10 @@ impl toolkit::Gear for ApiGateway {
         // tower-http would otherwise assert-panic during eager router
         // layering — a startup crash-loop with no pointer at the config.
         crate::cors::validate_cors_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+        // Fail fast when health.serve needs a separate listener but health.bind_addr is
+        // missing or unparseable, rather than crashing later in serve() after other gears
+        // have started.
+        Self::health_bind_addr(&cfg)?;
         self.config.store(Arc::new(cfg.clone()));
 
         debug!(
@@ -712,16 +841,15 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
         &self,
         _ctx: &toolkit::context::GearCtx,
         router: axum::Router,
+        hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
     ) -> anyhow::Result<axum::Router> {
-        // Add health check endpoints:
-        // - /health: detailed JSON response with status and timestamp
-        // - /healthz: simple "ok" liveness probe (Kubernetes-style)
-        let router = router
-            .route("/health", get(web::health_check))
-            .route("/healthz", get(|| async { "ok" }));
+        // Store for use when health routes are added in rest_finalize. A second set
+        // means rest_prepare ran twice — a lifecycle bug; fail fast rather than mask it.
+        if self.healthcheck_registry.set(hc_registry).is_err() {
+            anyhow::bail!("healthcheck_registry already set; rest_prepare called more than once");
+        }
 
-        // You may attach global middlewares here (trace, compression, cors), but do not start server.
-        tracing::debug!("REST host prepared base router with health check endpoints");
+        tracing::debug!("REST host prepared base router");
         Ok(router)
     }
 
@@ -729,6 +857,7 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
         &self,
         _ctx: &toolkit::context::GearCtx,
         mut router: axum::Router,
+        hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
     ) -> anyhow::Result<axum::Router> {
         let config = self.get_cached_config();
 
@@ -736,15 +865,33 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
             router = self.add_openapi_routes(router)?;
         }
 
-        // Apply middleware stack (including auth) to the final router
+        // Health probes (`main`/`both` mode): merge them onto the main router BEFORE the
+        // middleware stack, so they share the gateway's unified surface (request id, tracing,
+        // metrics, error mapping, ...). They are marked public in the route policy (see
+        // `build_route_policy_from_specs`), so the auth layer lets them through without a bearer
+        // token. Like every other route they inherit `prefix_path` via the nesting below.
+        // `separate` mode omits them here; `serve()` binds them on the dedicated health listener.
+        if matches!(
+            config.health.serve,
+            HealthServeMode::Main | HealthServeMode::Both
+        ) {
+            let health = Self::health_routes(
+                hc_registry,
+                Duration::from_millis(config.healthcheck_timeout_ms),
+            );
+            router = router.merge(health);
+        }
+
+        // Middleware on the main router before nesting (auth matching keyed on
+        // unprefixed OperationBuilder paths; layers run before nest() strips the prefix).
         tracing::debug!("Applying middleware stack to finalized router");
         let authn_client = self.authn_client.lock().clone();
         router = self.apply_middleware_stack(router, authn_client)?;
 
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
-        router = Self::apply_prefix_nesting(router, &prefix);
+        router = Self::apply_prefix(router, &prefix);
 
-        // Keep the finalized router to be used by `serve()`
+        // Keep the finalized router to be used by `serve()`.
         *self.final_router.lock() = Some(router.clone());
 
         tracing::info!("REST host finalized router with OpenAPI endpoints and auth middleware");

@@ -60,22 +60,45 @@ pub trait RestApiCapability: Send + Sync {
         router: Router,
         openapi: &dyn OpenApiRegistry,
     ) -> anyhow::Result<Router>;
+
+    /// Readiness healthcheck for this gear, run on every `/readyz` and `/health`.
+    /// `None` (default) opts out.
+    ///
+    /// Return **one composite check per gear** that aggregates the gear's critical
+    /// dependencies, rather than many fine-grained probes — the aggregate is what decides
+    /// whether the pod stays in traffic. External SaaS/LLM dependencies should usually **not**
+    /// gate readiness: a provider outage would evict every pod from rotation and take the
+    /// whole service down. Report such dependencies as `degraded` (kept in rotation), reserving
+    /// `unhealthy` for failures the gear itself cannot serve through.
+    fn healthcheck(
+        &self,
+        _ctx: &crate::context::GearCtx,
+    ) -> Option<std::sync::Arc<dyn crate::healthcheck::Healthcheck>> {
+        None
+    }
 }
 
 /// API Gateway capability: handles gateway hosting with prepare/finalize phases.
 /// Must be sync. Runs during REST phase, but doesn't start the server.
 #[allow(dead_code)]
 pub trait ApiGatewayCapability: Send + Sync + 'static {
-    /// Prepare a base Router (e.g., global middlewares, /healthz) and optionally touch `OpenAPI` meta.
-    /// Do NOT start the server here.
+    /// Prepare a base Router (e.g., global middlewares) and optionally touch `OpenAPI` meta.
+    /// Do NOT start the server here. `hc_registry` is the runtime's shared healthcheck
+    /// registry, passed explicitly (not via `ClientHub`, which is for inter-gear clients).
     ///
     /// # Errors
     /// Returns an error if router preparation fails.
-    fn rest_prepare(&self, ctx: &crate::context::GearCtx, router: Router)
-    -> anyhow::Result<Router>;
+    fn rest_prepare(
+        &self,
+        ctx: &crate::context::GearCtx,
+        router: Router,
+        hc_registry: std::sync::Arc<crate::healthcheck::RestHealthcheckRegistry>,
+    ) -> anyhow::Result<Router>;
 
-    /// Finalize before start: attach /openapi.json, /docs, persist the Router internally if needed.
-    /// Do NOT start the server here.
+    /// Finalize before start: attach /openapi.json, /docs, health endpoints, persist the
+    /// Router internally if needed. Do NOT start the server here.
+    ///
+    /// `hc_registry` is the same registry instance passed to [`rest_prepare`](Self::rest_prepare).
     ///
     /// # Errors
     /// Returns an error if router finalization fails.
@@ -83,6 +106,7 @@ pub trait ApiGatewayCapability: Send + Sync + 'static {
         &self,
         ctx: &crate::context::GearCtx,
         router: Router,
+        hc_registry: std::sync::Arc<crate::healthcheck::RestHealthcheckRegistry>,
     ) -> anyhow::Result<Router>;
 
     // Return OpenAPI registry of the gear, e.g., to register endpoints

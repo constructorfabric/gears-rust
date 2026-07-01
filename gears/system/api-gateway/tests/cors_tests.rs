@@ -145,7 +145,11 @@ async fn test_cors_layer_builds_with_config() {
 
     // Build the final router with CORS middleware
     let _final_router = api_gateway
-        .rest_finalize(&ctx, router)
+        .rest_finalize(
+            &ctx,
+            router,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
         .expect("Failed to finalize router");
 
     // Verify router builds successfully with CORS enabled
@@ -165,7 +169,11 @@ async fn test_cors_permissive_mode() {
         .expect("Failed to register routes");
 
     let _final_router = api_gateway
-        .rest_finalize(&ctx, router)
+        .rest_finalize(
+            &ctx,
+            router,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
         .expect("Failed to finalize router");
 
     // Verify permissive CORS builds successfully
@@ -199,7 +207,11 @@ async fn test_cors_disabled() {
         .expect("Failed to register routes");
 
     let _final_router = api_gateway
-        .rest_finalize(&ctx, router)
+        .rest_finalize(
+            &ctx,
+            router,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
         .expect("Failed to finalize router");
 
     // Verify router builds without CORS layer
@@ -226,7 +238,11 @@ async fn test_cors_default_exposes_etag_header() {
         .register_rest(&ctx, Router::new(), &api_gateway)
         .expect("Failed to register routes");
     let app = api_gateway
-        .rest_finalize(&ctx, router)
+        .rest_finalize(
+            &ctx,
+            router,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
         .expect("Failed to finalize router");
 
     let response = app
@@ -291,7 +307,11 @@ async fn test_cors_configured_exposed_headers_reach_response() {
         .register_rest(&ctx, Router::new(), &api_gateway)
         .expect("Failed to register routes");
     let app = api_gateway
-        .rest_finalize(&ctx, router)
+        .rest_finalize(
+            &ctx,
+            router,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
         .expect("Failed to finalize router");
 
     let response = app
