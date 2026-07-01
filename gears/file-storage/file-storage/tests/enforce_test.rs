@@ -28,7 +28,7 @@ use file_storage::domain::policy::{MetadataLimits, PolicyBody, PolicyScope, Size
 use file_storage::domain::ports::DataPlanePort;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
-use file_storage::infra::quota::{QuotaClient, QuotaDecision};
+use file_storage::infra::external_clients::{QuotaClient, QuotaDecision};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;

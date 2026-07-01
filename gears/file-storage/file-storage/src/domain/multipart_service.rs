@@ -22,7 +22,7 @@ use crate::domain::multipart::{MultipartPart, MultipartUploadSession, MultipartU
 use crate::domain::policy::{PolicyResolver, PolicyScope};
 use crate::domain::ports::MultipartStore;
 use crate::infra::backend::BackendRegistry;
-use crate::infra::quota::{QuotaClient, QuotaDecision};
+use crate::infra::external_clients::{QuotaClient, QuotaDecision};
 
 /// Quota metric name (duplicated from service.rs; both refer to the same
 /// platform metric — no abstraction needed here).

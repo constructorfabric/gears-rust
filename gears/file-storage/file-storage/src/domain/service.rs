@@ -11,10 +11,11 @@
 //!
 //! This is a **top-level orchestrator**: high fan-out is its job — every core
 //! file flow legitimately coordinates persistence ([`Store`]), byte storage
-//! (backends), URL signing, authorization, quota, usage, events, and the
-//! policy/etag domain rules. Its fan-in is fixed at the four control-plane entry
-//! points (REST handlers, route registration, the data plane, and gear wiring),
-//! none of which can be removed without relocating the crossroads.
+//! (backends), URL signing, authorization, external-service clients (quota,
+//! usage), events, and the policy/etag domain rules. Its fan-in is fixed at
+//! three control-plane entry points (REST handlers, route registration, and
+//! gear wiring); the data plane accesses it through the narrow [`DataPlanePort`]
+//! ISP port, so it carries no fan-in edge to this file.
 //!
 //! The self-contained bounded contexts have already been extracted into their
 //! own service types — see [`crate::domain::multipart_service::MultipartService`].
@@ -48,11 +49,10 @@ use crate::domain::policy::{
 };
 use crate::domain::ports::DataPlanePort;
 use crate::infra::backend::{BackendCapabilities, BackendRegistry};
-use crate::infra::quota::{QuotaClient, QuotaDecision};
+use crate::infra::external_clients::{QuotaClient, QuotaDecision, UsageDelta, UsageReporter};
 use crate::infra::signed_url::{Claims, Issuer, Op, UploadConstraints};
 use crate::infra::storage::Store;
 use crate::infra::storage::store::IdempotencyInsert;
-use crate::infra::usage::{UsageDelta, UsageReporter};
 
 /// Service-level configuration distilled from [`crate::config::FileStorageConfig`].
 #[allow(unknown_lints, de0309_must_have_domain_model)]
