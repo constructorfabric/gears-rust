@@ -313,6 +313,50 @@ fn empty_policy_body_serializes_to_valid_json() {
     assert!(parsed.is_object());
 }
 
+// ── mime_allowed ──────────────────────────────────────────────────────────────
+
+#[test]
+fn mime_allowed_exact_match() {
+    assert!(PolicyResolver::mime_allowed(
+        "image/jpeg",
+        &["image/jpeg".to_owned()]
+    ));
+}
+
+#[test]
+fn mime_allowed_wildcard_subtype() {
+    assert!(PolicyResolver::mime_allowed(
+        "image/jpeg",
+        &["image/*".to_owned()]
+    ));
+}
+
+#[test]
+fn mime_allowed_wildcard_does_not_match_different_type() {
+    assert!(!PolicyResolver::mime_allowed(
+        "video/mp4",
+        &["image/*".to_owned()]
+    ));
+}
+
+/// A stored pattern without a `/` (e.g. `"image"`) must NOT act as a wildcard
+/// that matches any `image/…` subtype. Only well-formed `"type/*"` patterns
+/// are wildcards. (An exact match `"image"` == `"image"` is still accepted by
+/// the exact-match branch, which is correct and intentional.)
+#[test]
+fn mime_allowed_malformed_pattern_without_slash_never_matches_as_wildcard() {
+    // `"image"` stored as an allowed pattern must not match `"image/jpeg"`.
+    assert!(!PolicyResolver::mime_allowed(
+        "image/jpeg",
+        &["image".to_owned()]
+    ));
+    // Likewise `"text"` must not match `"text/plain"`.
+    assert!(!PolicyResolver::mime_allowed(
+        "text/plain",
+        &["text".to_owned()]
+    ));
+}
+
 // ── PolicyScope / RetentionScope parse round-trips ─────────────────────────────
 
 #[test]

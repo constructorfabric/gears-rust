@@ -501,15 +501,21 @@ impl PolicyResolver {
 impl PolicyResolver {
     /// Returns `true` if `mime_type` matches any pattern in `allowed`.
     /// Supports exact match and `*` wildcard for subtype (e.g. `"image/*"`).
+    /// A pattern without a `/` (e.g. `"image"`) is malformed and never matches.
     #[must_use]
     pub(crate) fn mime_allowed(mime_type: &str, allowed: &[String]) -> bool {
         allowed.iter().any(|pat| {
             if pat == mime_type {
                 return true;
             }
-            // wildcard subtype: "image/*" matches "image/jpeg"
-            let (pt, ps) = pat.split_once('/').unwrap_or((pat, "*"));
-            let (mt, _) = mime_type.split_once('/').unwrap_or((mime_type, ""));
+            // wildcard subtype: "image/*" matches "image/jpeg".
+            // A pattern without a `/` is malformed and must not act as a wildcard.
+            let Some((pt, ps)) = pat.split_once('/') else {
+                return false;
+            };
+            let Some((mt, _)) = mime_type.split_once('/') else {
+                return false;
+            };
             ps == "*" && pt == mt
         })
     }

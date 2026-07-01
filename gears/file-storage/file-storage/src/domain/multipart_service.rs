@@ -140,6 +140,57 @@ impl MultipartService {
         }
     }
 
+    /// Best-effort compensation when session persistence fails after the backend
+    /// handle was already created and the pending version row was already inserted.
+    ///
+    /// Aborts the backend multipart handle and removes the pending version row so
+    /// they are not left as orphans. Both steps are best-effort: errors are logged
+    /// but not propagated — the caller's original error is returned instead, and
+    /// any remaining orphans are reclaimed by the orphan-reconciliation sweep.
+    async fn compensate_failed_session_create(
+        &self,
+        ctx: &SecurityContext,
+        upload_id: Uuid,
+        file_id: Uuid,
+        version_id: Uuid,
+        backend_path: &str,
+        backend_handle: &str,
+    ) {
+        // Best-effort: abort the backend handle.
+        let backend = self.backends.default_backend();
+        if let Err(abort_err) = backend.abort_multipart(backend_path, backend_handle).await {
+            tracing::warn!(
+                ?abort_err,
+                %upload_id,
+                "best-effort backend abort failed after session persistence error"
+            );
+        }
+        // Best-effort: remove the pending version row.
+        if let Err(del_err) = self
+            .store
+            .delete_version(
+                file_id,
+                version_id,
+                Self::audit_ok(
+                    ctx,
+                    Some(file_id),
+                    AuditOperation::DeleteVersion,
+                    serde_json::json!({
+                        "version_id": version_id,
+                        "reason": "multipart_session_create_failed"
+                    }),
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                ?del_err,
+                %upload_id,
+                "best-effort pending-version delete failed after session persistence error"
+            );
+        }
+    }
+
     // ── multipart upload (P2-M3) ─────────────────────────────────────────────
 
     /// `POST /files/{id}/multipart`: initiate a multipart upload session.
@@ -201,7 +252,10 @@ impl MultipartService {
         // Default TTL for multipart sessions: 7 days.
         let expires_at = now + time::Duration::days(7);
 
-        self.store
+        // Persist the session row. On failure, best-effort compensate to avoid
+        // orphaning the backend handle and the pending version row.
+        if let Err(err) = self
+            .store
             .create_multipart_upload(
                 upload_id,
                 file_id,
@@ -211,7 +265,19 @@ impl MultipartService {
                 expires_at,
                 now,
             )
-            .await?;
+            .await
+        {
+            self.compensate_failed_session_create(
+                ctx,
+                upload_id,
+                file_id,
+                version_id,
+                &backend_path,
+                &backend_handle,
+            )
+            .await;
+            return Err(err);
+        }
 
         Ok(MultipartUploadSession {
             upload_id,
@@ -274,6 +340,14 @@ impl MultipartService {
         );
         let backend = self.backends.get(&backend_id)?;
         let backend_path = Self::backend_path(file_id, session.version_id);
+
+        // Part numbers are 1-based (S3 convention; 0 is invalid).
+        if part_number == 0 {
+            return Err(DomainError::validation(
+                "part_number",
+                "part number must be >= 1 (1-based)",
+            ));
+        }
 
         let data_size = i64::try_from(data.len())
             .map_err(|_| DomainError::validation("data", "part data too large"))?;
@@ -436,9 +510,19 @@ impl MultipartService {
             AuditOperation::MultipartComplete,
             serde_json::json!({ "upload_id": upload_id, "version_id": session.version_id }),
         );
-        self.store
+        let completed = self
+            .store
             .complete_multipart_upload(upload_id, audit)
             .await?;
+        if !completed {
+            // Concurrent complete/abort already transitioned the session out of
+            // `in_progress`. The backend object was already assembled above; the
+            // now-orphaned blob is reclaimed by the orphan-reconciliation sweep.
+            return Err(DomainError::multipart_upload_not_in_progress(
+                upload_id,
+                session.state.as_str(),
+            ));
+        }
 
         Ok(())
     }
@@ -503,8 +587,20 @@ impl MultipartService {
             serde_json::json!({ "upload_id": upload_id, "version_id": session.version_id }),
         );
 
-        // Mark the session aborted.
-        self.store.abort_multipart_upload(upload_id, audit).await?;
+        // Mark the session aborted (CAS: in_progress → aborted).
+        let aborted = self.store.abort_multipart_upload(upload_id, audit).await?;
+        if !aborted {
+            // A concurrent complete/abort transitioned the session out of
+            // `in_progress` between our snapshot read and this CAS. Surface a
+            // conflict and STOP — critically, we must not fall through to the
+            // pending-version delete below: had the race been a concurrent
+            // *complete*, that version is now finalized/bound and deleting it
+            // would corrupt the completed upload.
+            return Err(DomainError::multipart_upload_not_in_progress(
+                upload_id,
+                session.state.as_str(),
+            ));
+        }
 
         // Delete the pending version row (no audit row — a pending version is
         // an implementation detail, not a distinct audited file version). A
