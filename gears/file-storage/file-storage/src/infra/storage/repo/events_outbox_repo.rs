@@ -7,20 +7,10 @@ use toolkit_db::secure::{DBRunner, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use crate::domain::audit::FileEvent;
 use crate::domain::error::DomainError;
 use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::events_outbox::{ActiveModel, Column, Entity, Model};
-
-/// A file-event to be enqueued in the outbox.
-#[allow(unknown_lints, de0309_must_have_domain_model)]
-#[derive(Debug, Clone)]
-pub struct FileEvent {
-    pub tenant_id: Uuid,
-    pub owner_id: Uuid,
-    pub file_id: Uuid,
-    pub event_type: String,
-    pub payload: serde_json::Value,
-}
 
 /// Repository over the `events_outbox` table.
 #[derive(Clone, Default)]

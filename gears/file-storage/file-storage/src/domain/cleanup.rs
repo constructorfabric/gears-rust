@@ -19,12 +19,11 @@
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::domain::audit::{AuditEntry, AuditOperation, AuditOutcome};
+use crate::domain::audit::{AuditEntry, AuditOperation, AuditOutcome, FileEvent};
 use crate::domain::multipart::MultipartUploadSession;
 use crate::domain::policy::RetentionScope;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::storage::Store;
-use crate::infra::storage::repo::FileEvent;
 
 /// Page size for the keyset-paginated retention file scan. Bounds how many
 /// `File` rows the sweep holds in memory at once, independent of total count.

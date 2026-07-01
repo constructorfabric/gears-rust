@@ -31,7 +31,9 @@
 //! service depends on it. That is a legitimate hub by design: its fan-in equals
 //! the number of services that persist state and grows by one with each new
 //! service, and its fan-out already collapses the nine repositories behind a
-//! single [`Repos`] aggregate (the DIP remedy). Splitting it into per-context
+//! single [`Repos`] aggregate (the DIP remedy) and takes the two test-only
+//! outbox row types via the `repo` layer (`AuditRow` / `FileEventRow`) rather
+//! than reaching into `entity::*` directly. Splitting it into per-context
 //! store slices does not dissolve the coupling — the cross-cutting flows
 //! (a multipart *complete*, for example, touches files, versions, the multipart
 //! session, and the audit outbox in one transaction) would each still depend on
@@ -54,7 +56,7 @@ use file_storage_sdk::{
     VersionStatus,
 };
 
-use crate::domain::audit::AuditEntry;
+use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
 use crate::domain::idempotency::IdempotencyRecord;
 use crate::domain::multipart::{MultipartPart, MultipartUploadSession};
@@ -63,9 +65,7 @@ use crate::domain::policy::{
 };
 use crate::infra::content::hash;
 use crate::infra::storage::db::db_err;
-use crate::infra::storage::entity::audit_outbox::Model as AuditModel;
-use crate::infra::storage::entity::events_outbox::Model as FileEventModel;
-use crate::infra::storage::repo::{FileEvent, InsertRetentionRule, Repos};
+use crate::infra::storage::repo::{AuditRow, FileEventRow, InsertRetentionRule, Repos};
 
 /// An idempotency-key row to persist in the **same** transaction as a file
 /// creation, so a committed `POST /files` always leaves a replay record behind
@@ -787,7 +787,7 @@ impl Store {
     /// Intended for testing; not exposed on the REST API.
     ///
     /// @cpt-cf-file-storage-fr-audit-trail
-    pub async fn list_audit(&self, file_id: Uuid) -> Result<Vec<AuditModel>, DomainError> {
+    pub async fn list_audit(&self, file_id: Uuid) -> Result<Vec<AuditRow>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos.audit.list_for_file(&conn, file_id).await
     }
@@ -1132,7 +1132,7 @@ impl Store {
     pub async fn list_file_events(
         &self,
         file_id: Uuid,
-    ) -> Result<Vec<FileEventModel>, DomainError> {
+    ) -> Result<Vec<FileEventRow>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos.events_outbox.list_for_file(&conn, file_id).await
     }

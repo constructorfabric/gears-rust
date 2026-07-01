@@ -38,7 +38,7 @@ use file_storage_sdk::{
     CustomMetadataEntry, CustomMetadataPatch, File, FileVersion, NewFile, OwnerFilter,
 };
 
-use crate::domain::audit::{AuditEntry, AuditOperation};
+use crate::domain::audit::{AuditEntry, AuditOperation, FileEvent};
 use crate::domain::authz::{Authorizer, actions};
 use crate::domain::error::DomainError;
 use crate::domain::etag;
@@ -51,7 +51,6 @@ use crate::infra::content::hash;
 use crate::infra::quota::{QuotaClient, QuotaDecision};
 use crate::infra::signed_url::{Claims, Issuer, Op, UploadConstraints};
 use crate::infra::storage::Store;
-use crate::infra::storage::repo::FileEvent;
 use crate::infra::storage::store::IdempotencyInsert;
 use crate::infra::usage::{UsageDelta, UsageReporter};
 

@@ -1,11 +1,18 @@
-//! Audit trail domain types for the file-storage gear.
+//! Transactional-outbox domain records for the file-storage gear.
 //!
-//! An [`AuditEntry`] is inserted into the `audit_outbox` table in the **same
-//! DB transaction** as every write mutation, guaranteeing 100% coverage with
-//! no silent drops (the transactional-outbox pattern).
+//! An [`AuditEntry`] is inserted into the `audit_outbox` table, and a
+//! [`FileEvent`] into the `events_outbox` table, in the **same DB transaction**
+//! as every write mutation, guaranteeing 100% coverage with no silent drops
+//! (the transactional-outbox pattern). Both are pure domain records: the
+//! control-plane services build them and hand them to the [`Store`] facade,
+//! which persists them — so neither the services nor the store depend on the
+//! persistence repo layer for these types.
+//!
+//! [`Store`]: crate::infra::storage::Store
 //!
 //! @cpt-cf-file-storage-fr-audit-trail
 //! @cpt-cf-file-storage-nfr-audit-completeness
+//! @cpt-cf-file-storage-fr-file-events
 
 #![allow(unknown_lints, de0309_must_have_domain_model)]
 
@@ -90,6 +97,22 @@ impl AuditOutcome {
             Self::Failure => "failure",
         }
     }
+}
+
+/// A file-event to be enqueued in the `events_outbox` table.
+///
+/// Built by the control-plane services (and the cleanup engine) and handed to
+/// the `Store`, which enqueues it in the same transaction as the mutation it
+/// describes — the file-event counterpart to [`AuditEntry`].
+///
+/// @cpt-cf-file-storage-fr-file-events
+#[derive(Debug, Clone)]
+pub struct FileEvent {
+    pub tenant_id: Uuid,
+    pub owner_id: Uuid,
+    pub file_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
 }
 
 /// All data needed to emit one audit row.

@@ -21,7 +21,7 @@ mod retention_rule_repo;
 mod version_repo;
 
 pub use audit_repo::AuditRepo;
-pub use events_outbox_repo::{EventsOutboxRepo, FileEvent};
+pub use events_outbox_repo::EventsOutboxRepo;
 pub use file_repo::FileRepo;
 pub use idempotency_repo::IdempotencyRepo;
 pub use metadata_repo::MetadataRepo;
@@ -29,6 +29,17 @@ pub use multipart_repo::MultipartRepo;
 pub use policy_repo::PolicyRepo;
 pub use retention_rule_repo::{InsertRetentionRule, RetentionRuleRepo};
 pub use version_repo::VersionRepo;
+
+/// Row types returned by the audit / file-event outbox repositories.
+///
+/// Defined on the repo-layer facade (rather than re-exported from the ORM
+/// `entity` modules) so callers such as [`Store`](crate::infra::storage::store)
+/// depend on this one module for the row types instead of reaching directly
+/// into `entity::*` — keeping the store's fan-out on the repo layer it already
+/// talks to.
+pub type AuditRow = crate::infra::storage::entity::audit_outbox::Model;
+/// See [`AuditRow`].
+pub type FileEventRow = crate::infra::storage::entity::events_outbox::Model;
 
 /// The full set of tenant-scoped repositories, owned by the persistence
 /// [`Store`](crate::infra::storage::store::Store).
