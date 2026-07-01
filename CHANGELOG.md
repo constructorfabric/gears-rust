@@ -9,6 +9,96 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-noop-usage-collector-plugin-v0.1.0...cf-gears-noop-usage-collector-plugin-v0.1.1) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-usage-collector-sdk
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-v0.1.0...cf-gears-usage-collector-v0.1.1) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-authz-resolver-sdk, cf-gears-usage-collector-sdk
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-sdk-v0.1.0...cf-gears-usage-collector-sdk-v0.1.1) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oidc-authn-plugin-v0.1.1...cf-gears-oidc-authn-plugin-v0.1.2) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit
+
+## [0.1.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tr-authz-plugin-v0.1.4...cf-gears-tr-authz-plugin-v0.1.5) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-tenant-resolver-sdk, cf-gears-authz-resolver-sdk
+
+## [0.1.23](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-tr-plugin-v0.1.22...cf-gears-static-tr-plugin-v0.1.23) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-idp-plugin-v0.1.1...cf-gears-static-idp-plugin-v0.1.2) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-account-management-sdk
+
+## [0.1.20](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-credstore-plugin-v0.1.19...cf-gears-static-credstore-plugin-v0.1.20) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-credstore-sdk
+
+## [0.1.22](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authz-plugin-v0.1.21...cf-gears-static-authz-plugin-v0.1.22) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-authz-resolver-sdk
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authn-plugin-v0.3.1...cf-gears-static-authn-plugin-v0.3.2) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-authn-resolver-sdk
+
+## [0.1.24](https://github.com/constructorfabric/gears-rust/compare/cf-gears-single-tenant-tr-plugin-v0.1.23...cf-gears-single-tenant-tr-plugin-v0.1.24) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
+## [0.1.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-rg-tr-plugin-v0.1.4...cf-gears-rg-tr-plugin-v0.1.5) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-tenant-resolver-sdk, cf-gears-resource-group-sdk
+
+## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-v0.2.0...cf-gears-account-management-v0.2.1) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-db, cf-gears-toolkit, cf-gears-tenant-resolver-sdk, cf-gears-account-management-sdk, cf-gears-authz-resolver-sdk, cf-gears-resource-group-sdk
+
+## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-sdk-v0.2.0...cf-gears-account-management-sdk-v0.2.1) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
+## [0.6.14](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-v0.6.13...cf-gears-toolkit-v0.6.14) - 2026-07-01
+
+### Other
+
+- updated the following local packages: cf-gears-system-sdks, cf-gears-toolkit-db, cf-gears-toolkit-db, cf-gears-toolkit-sdk
+
 ## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-noop-usage-collector-plugin-v0.1.0) - 2026-06-29
 
 ### Added
