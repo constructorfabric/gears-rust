@@ -212,8 +212,10 @@ pub struct OperationSpec {
     pub authenticated: bool,
     /// Explicitly mark route as public (no auth required)
     pub is_public: bool,
-    /// Optional rate & concurrency limits for this operation
-    pub rate_limit: Option<RateLimitSpec>,
+    /// Optional zone-based throttling configuration for this operation.
+    /// Binds the operation to gateway throttling zones and supplies the
+    /// identity extractor for identity-keyed zones.
+    pub throttling: Option<ThrottlingSpec>,
     /// Optional whitelist of allowed request Content-Type values (without parameters).
     /// Example: Some(vec!["application/json", "multipart/form-data", "application/pdf"])
     /// When set, gateway middleware will enforce these types and return HTTP 415 for
@@ -239,15 +241,53 @@ pub struct ODataPagination<T> {
     pub allowed_fields: T,
 }
 
-/// Per-operation rate & concurrency limit specification
+/// Extracts a throttling key (identity) from an incoming request.
+///
+/// Implementations are supplied in code by gear authors and referenced by an
+/// operation's [`ThrottlingSpec`]. They are used by the API gateway when a
+/// throttling zone is configured with `key.type = identity`: the returned
+/// string becomes the per-key bucket identifier (e.g. a subject id, tenant id,
+/// or a value derived from a request header).
+///
+/// The `Debug` supertrait keeps [`OperationSpec`]'s `#[derive(Debug)]` valid
+/// when stored behind an `Arc<dyn IdentityExtractor>`.
+pub trait IdentityExtractor: Send + Sync + std::fmt::Debug {
+    /// Compute the identity key for the given request.
+    fn extract(&self, req: &axum::extract::Request) -> String;
+}
+
+/// Per-operation throttling specification.
+///
+/// References throttling zones (defined in the API gateway configuration) by
+/// name and, for identity-keyed zones, supplies the [`IdentityExtractor`] used
+/// to compute per-request keys. Limits themselves live in config (zones are the
+/// primary source of truth); this struct only binds an operation to zones and
+/// provides the code-side behavior that config cannot express.
 #[derive(Clone, Debug, Default)]
-pub struct RateLimitSpec {
-    /// Target steady-state requests per second
-    pub rps: u32,
-    /// Maximum burst size (token bucket capacity)
-    pub burst: u32,
-    /// Maximum number of in-flight requests for this route
-    pub in_flight: u32,
+pub struct ThrottlingSpec {
+    /// Name of the rate-limit zone this operation participates in.
+    pub rate_limit_zone: String,
+    /// Name of the in-flight-limit zone this operation participates in.
+    pub in_flight_limit_zone: String,
+    /// Identity extractor used when the referenced zone is identity-keyed.
+    pub identity_extractor: Option<std::sync::Arc<dyn IdentityExtractor>>,
+    /// Whether this operation's throttling must run after authentication
+    /// (so a `SecurityContext` / subject identity is available).
+    ///
+    /// - `false` (default): the operation is throttled *before* auth, using
+    ///   IP-keyed zones only.
+    /// - `true`: the operation is throttled *after* auth, allowing
+    ///   identity-keyed zones (keyed by the subject id or a custom extractor).
+    pub require_security_context: bool,
+    /// Observe-but-don't-enforce mode.
+    ///
+    /// - `false` (default): limits are enforced normally (over-limit requests
+    ///   are rejected).
+    /// - `true`: requests are never rejected by this operation's rate-limit or
+    ///   in-flight limits. Instead, whenever a limit *would* have triggered, the
+    ///   gateway emits a `warn` log (with the offending key) and serves the
+    ///   request. Useful for tuning zones before enabling enforcement.
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -435,7 +475,7 @@ impl<S> OperationBuilder<Missing, Missing, S, AuthNotSet> {
                 handler_id,
                 authenticated: false,
                 is_public: false,
-                rate_limit: None,
+                throttling: None,
                 allowed_request_content_types: None,
                 vendor_extensions: VendorExtensions::default(),
                 license_requirement: None,
@@ -500,14 +540,14 @@ where
         self
     }
 
-    /// Require per-route rate and concurrency limits.
-    /// Stores metadata for the gateway to enforce.
-    pub fn require_rate_limit(&mut self, rps: u32, burst: u32, in_flight: u32) -> &mut Self {
-        self.spec.rate_limit = Some(RateLimitSpec {
-            rps,
-            burst,
-            in_flight,
-        });
+    /// Attach zone-based throttling configuration to this operation.
+    ///
+    /// Binds the operation to gateway throttling zones (by name) and, for
+    /// identity-keyed zones, supplies the [`IdentityExtractor`] used to compute
+    /// per-request keys. The limits themselves are defined in the gateway
+    /// configuration.
+    pub fn with_throttling(mut self, spec: ThrottlingSpec) -> Self {
+        self.spec.throttling = Some(spec);
         self
     }
 
@@ -1707,6 +1747,42 @@ mod tests {
 
     #[toolkit_macros::api_dto(response)]
     struct SampleDtoResponse;
+
+    #[derive(Debug)]
+    struct StaticIdentity(&'static str);
+
+    impl IdentityExtractor for StaticIdentity {
+        fn extract(&self, _req: &axum::extract::Request) -> String {
+            self.0.to_owned()
+        }
+    }
+
+    #[test]
+    fn builder_with_throttling_sets_spec_and_extractor() {
+        let builder = OperationBuilder::<Missing, Missing, (), AuthNotSet>::get("/tests/v1/test")
+            .with_throttling(ThrottlingSpec {
+                rate_limit_zone: "rl_identity".to_owned(),
+                in_flight_limit_zone: "ifl_identity".to_owned(),
+                identity_extractor: Some(std::sync::Arc::new(StaticIdentity("subject-123"))),
+                require_security_context: true,
+                dry_run: false,
+            });
+
+        let throttling = builder.spec.throttling.as_ref().expect("throttling set");
+        assert_eq!(throttling.rate_limit_zone, "rl_identity");
+        assert_eq!(throttling.in_flight_limit_zone, "ifl_identity");
+
+        let extractor = throttling
+            .identity_extractor
+            .as_ref()
+            .expect("extractor set");
+        let req = axum::extract::Request::new(axum::body::Body::empty());
+        assert_eq!(extractor.extract(&req), "subject-123");
+
+        // OperationSpec must remain Clone + Debug with the Arc<dyn ...> field.
+        let cloned = builder.spec.clone();
+        assert!(format!("{cloned:?}").contains("rl_identity"));
+    }
 
     #[test]
     fn builder_descriptive_methods() {

@@ -23,8 +23,8 @@ pub use error_layer::{
 };
 pub use openapi_registry::{OpenApiInfo, OpenApiRegistry, OpenApiRegistryImpl, ensure_schema};
 pub use operation_builder::{
-    Missing, OperationBuilder, OperationSpec, ParamLocation, ParamSpec, Present, RateLimitSpec,
-    ResponseSpec, state,
+    IdentityExtractor, Missing, OperationBuilder, OperationSpec, ParamLocation, ParamSpec, Present,
+    ResponseSpec, ThrottlingSpec, state,
 };
 pub use select::{apply_select, page_to_projected_json, project_json};
 

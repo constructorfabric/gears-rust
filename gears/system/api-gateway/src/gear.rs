@@ -248,7 +248,8 @@ impl ApiGateway {
         //
         // Desired request execution order (outermost -> innermost):
         // SetRequestId -> PropagateRequestId -> Trace -> push_req_id_to_extensions
-        // -> Timeout -> BodyLimit -> CORS -> MIME validation -> RateLimit -> ErrorMapping -> Auth -> ScopeEnforcement -> License -> Router
+        // -> Timeout -> BodyLimit -> CORS -> MIME validation -> PreAuthThrottling -> ErrorMapping
+        // -> Auth -> ScopeEnforcement -> PostAuthThrottling -> License -> Router
         //
         // Therefore we must add layers in the reverse order (innermost -> outermost) below.
         // Due future refactoring, this order must be maintained.
@@ -260,7 +261,10 @@ impl ApiGateway {
 
         let config = self.get_cached_config();
 
-        // Collect specs once; used by MIME validation + rate limiting maps.
+        // Fail fast on invalid throttling configuration (undefined zone refs, zero limits, etc.).
+        config.validate_throttling()?;
+
+        // Collect specs once; used by MIME validation + throttling maps.
         let specs: Vec<_> = self
             .openapi_registry
             .operation_specs
@@ -275,6 +279,16 @@ impl ApiGateway {
             move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let map = license_map.clone();
                 middleware::license_validation::license_validation_middleware(map, req, next)
+            },
+        ));
+
+        // 11b) Post-auth throttling (identity-keyed zones). Added before the auth
+        // layer so it runs AFTER auth and can read SecurityContext for identity keys.
+        let throttling_map = middleware::throttling::ThrottlingMap::from_specs(&specs, &config)?;
+        router = router.layer(from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let map = throttling_map.clone();
+                middleware::throttling::throttling_middleware(map, req, next)
             },
         ));
 
@@ -337,13 +351,14 @@ impl ApiGateway {
         // 11) Error mapping (outer to auth so it can translate auth/handler errors)
         router = router.layer(from_fn(toolkit::api::error_layer::error_mapping_middleware));
 
-        // 10) Per-route rate limiting & in-flight limits
-        let rate_map = middleware::rate_limit::RateLimiterMap::from_specs(&specs, &config)?;
-
+        // 9b) Pre-auth throttling (IP-keyed zones). Added after the auth layer so
+        // it runs BEFORE auth; identity keying is not available here.
+        let throttling_map_noauth =
+            middleware::throttling::ThrottlingMapNoAuth::from_specs(&specs, &config)?;
         router = router.layer(from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let map = rate_map.clone();
-                middleware::rate_limit::rate_limit_middleware(map, req, next)
+                let map = throttling_map_noauth.clone();
+                middleware::throttling::throttling_no_auth_middleware(map, req, next)
             },
         ));
 

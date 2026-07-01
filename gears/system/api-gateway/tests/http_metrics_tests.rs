@@ -21,7 +21,10 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use toolkit::{
-    Gear, api::OperationBuilder, config::ConfigProvider, context::GearCtx,
+    Gear,
+    api::{OperationBuilder, ThrottlingSpec},
+    config::ConfigProvider,
+    context::GearCtx,
     contracts::ApiGatewayCapability,
 };
 use tower::ServiceExt;
@@ -135,9 +138,6 @@ fn base_config() -> serde_json::Value {
                 "bind_addr": "127.0.0.1:0",
                 "cors_enabled": false,
                 "auth_disabled": true,
-                "defaults": {
-                    "rate_limit": { "rps": 1000, "burst": 1000, "in_flight": 64 }
-                },
             }
         }
     })
@@ -202,9 +202,7 @@ async fn metrics_capture_mime_rejection() -> Result<()> {
     let api = api_gateway::ApiGateway::default();
     api.init(&ctx).await?;
 
-    let mut builder = OperationBuilder::post("/tests/v1/items");
-    builder.require_rate_limit(1000, 1000, 64);
-    let router = builder
+    let router = OperationBuilder::post("/tests/v1/items")
         .operation_id("test:create-item")
         .summary("Create item")
         .public()
@@ -254,8 +252,13 @@ async fn metrics_capture_rate_limit() -> Result<()> {
                 "bind_addr": "127.0.0.1:0",
                 "cors_enabled": false,
                 "auth_disabled": true,
-                "defaults": {
-                    "rate_limit": { "rps": 1, "burst": 1, "in_flight": 64 }
+                "rate_limit_zones": {
+                    "rl_limited": {
+                        "rate_limit": "1/s",
+                        "burst_limit": 1,
+                        "key": { "type": "ip" },
+                        "max_keys": 1000
+                    }
                 },
             }
         }
@@ -266,12 +269,17 @@ async fn metrics_capture_rate_limit() -> Result<()> {
     let api = api_gateway::ApiGateway::default();
     api.init(&ctx).await?;
 
-    let mut builder = OperationBuilder::get("/tests/v1/limited");
-    builder.require_rate_limit(1, 1, 64);
-    let router = builder
+    let router = OperationBuilder::get("/tests/v1/limited")
         .operation_id("test:limited")
         .summary("Rate-limited endpoint")
         .public()
+        .with_throttling(ThrottlingSpec {
+            rate_limit_zone: "rl_limited".to_owned(),
+            in_flight_limit_zone: String::new(),
+            identity_extractor: None,
+            require_security_context: false,
+            dry_run: false,
+        })
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
@@ -430,9 +438,6 @@ fn prefixed_config() -> serde_json::Value {
                 "cors_enabled": false,
                 "auth_disabled": true,
                 "metrics": { "prefix": "myapp" },
-                "defaults": {
-                    "rate_limit": { "rps": 1000, "burst": 1000, "in_flight": 64 }
-                },
             }
         }
     })

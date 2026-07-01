@@ -61,10 +61,6 @@ data:
             description: "Mini-Chat server"
           defaults:
             body_limit_bytes: 64000000
-            rate_limit:
-              rps: 1000
-              burst: 200
-              in_flight: 64
           auth_disabled: true
 
       gear-orchestrator:
