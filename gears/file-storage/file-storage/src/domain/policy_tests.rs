@@ -77,16 +77,21 @@ fn resolve_user_restricted_tenant_unrestricted_returns_user_set() {
 #[test]
 fn resolve_intersection_of_mime_types() {
     // Tenant allows image/* and video/mp4; user allows image/jpeg and video/mp4.
-    // Intersection: image/jpeg (image/* ∩ image/jpeg) and video/mp4 (exact match).
+    // The intersection must resolve to the NARROWER pattern: image/* ∩ image/jpeg
+    // = image/jpeg (NOT image/*, which would keep admitting image/png once the
+    // list is enforced as an allow-list), and video/mp4 is an exact match.
     let tenant = body_with_mimes(&["image/*", "video/mp4"]);
     let user = body_with_mimes(&["image/jpeg", "video/mp4"]);
     let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
     let mimes = ep.allowed_mime_types.expect("should be restricted");
-    // image/* matches image/jpeg and video/mp4 is exact.
-    assert!(mimes.contains(&"image/*".to_owned()) || mimes.contains(&"image/jpeg".to_owned()));
-    // video/mp4 should be in the result — either from tenant (if user matched it) or vice versa.
-    // The intersection is computed from tenant's perspective (filtering tenant by user match),
-    // so "image/*" passes if "image/jpeg" matches it, and "video/mp4" passes exactly.
+    assert!(
+        mimes.contains(&"image/jpeg".to_owned()),
+        "intersection must narrow image/* down to image/jpeg, got {mimes:?}"
+    );
+    assert!(
+        !mimes.contains(&"image/*".to_owned()),
+        "the broader image/* wildcard must not survive the intersection, got {mimes:?}"
+    );
     assert!(mimes.contains(&"video/mp4".to_owned()));
 }
 
@@ -166,6 +171,40 @@ fn resolve_per_mime_overrides_merged_most_restrictive() {
         .find(|e| e.mime == "text/plain")
         .unwrap();
     assert_eq!(text.max_bytes, 1_000_000);
+}
+
+#[test]
+fn resolve_per_mime_specific_is_tightened_by_covering_wildcard() {
+    // A broader wildcard cap must tighten the more-specific entry it covers,
+    // otherwise the most-specific-match consumer would ignore the stricter cap.
+    let mut tenant = PolicyBody::default();
+    tenant.size_limits.per_mime = vec![MimeSizeOverride {
+        mime: "image/*".to_owned(),
+        max_bytes: 10_000_000, // 10 MB wildcard cap
+    }];
+    let mut user = PolicyBody::default();
+    user.size_limits.per_mime = vec![MimeSizeOverride {
+        mime: "image/png".to_owned(),
+        max_bytes: 50_000_000, // 50 MB — looser than the covering wildcard
+    }];
+    let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
+
+    let png = ep
+        .per_mime_max_bytes
+        .iter()
+        .find(|e| e.mime == "image/png")
+        .expect("image/png entry present");
+    assert_eq!(
+        png.max_bytes, 10_000_000,
+        "image/png must be capped by the covering image/* wildcard (10MB), not its own 50MB"
+    );
+    // The wildcard entry itself is retained for other image subtypes.
+    let wildcard = ep
+        .per_mime_max_bytes
+        .iter()
+        .find(|e| e.mime == "image/*")
+        .expect("image/* entry present");
+    assert_eq!(wildcard.max_bytes, 10_000_000);
 }
 
 // ── metadata limits ────────────────────────────────────────────────────────────

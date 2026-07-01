@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -33,10 +32,12 @@ use crate::domain::policy::{
     StoredPolicy, StoredRetentionRule,
 };
 use crate::infra::backend::{BackendCapabilities, BackendRegistry, StorageBackend};
+use crate::infra::content::hash;
 use crate::infra::quota::{QuotaClient, QuotaDecision};
 use crate::infra::signed_url::{Claims, Issuer, Op, UploadConstraints};
 use crate::infra::storage::Store;
 use crate::infra::storage::repo::FileEvent;
+use crate::infra::storage::store::IdempotencyInsert;
 use crate::infra::usage::{UsageDelta, UsageReporter};
 
 /// Service-level configuration distilled from [`crate::config::FileStorageConfig`].
@@ -500,36 +501,16 @@ impl FileService {
             serde_json::json!({ "version_id": version_id, "gts_file_type": new.gts_file_type }),
         ));
 
-        self.store
-            .create_file_with_pending_version_and_event(
-                &new,
-                file_id,
-                version_id,
-                tenant_id,
-                &backend_id,
-                &backend_path,
-                now,
-                audit,
-                event,
-            )
-            .await?;
-
-        // @cpt-cf-file-storage-fr-usage-reporting
-        // Fire-and-forget: report +1 file to usage collector.
-        self.report_usage(UsageDelta {
-            tenant_id,
-            owner_id,
-            bytes_delta: 0, // bytes unknown at creation; finalize_upload updates the backend
-            file_count_delta: 1,
-        });
-
+        // Sign the upload URL up front — `sign_url` has no DB dependency, so the
+        // ticket (and the idempotency replay body derived from it) can be built
+        // before the create transaction and persisted atomically within it.
         let upload_url = self.sign_url(
             Op::Put,
             &VersionRef {
                 file_id,
                 version_id,
-                backend_id,
-                backend_path,
+                backend_id: backend_id.clone(),
+                backend_path: backend_path.clone(),
             },
             UploadConstraints {
                 max_size: effective_max,
@@ -543,8 +524,10 @@ impl FileService {
         };
 
         // @cpt-cf-file-storage-fr-upload-idempotency
-        // Persist the idempotency record so retries return the same response.
-        if let Some(ref key) = idempotency_key {
+        // Build the idempotency row so the create transaction persists it in the
+        // same commit as the file — a committed create always leaves a replay
+        // record behind, so a retry with the same key never creates a 2nd file.
+        let idempotency = idempotency_key.as_ref().map(|key| {
             let response_body = serde_json::to_string(&IdempotencyTicket {
                 file_id: ticket.file_id,
                 version_id: ticket.version_id,
@@ -555,23 +538,41 @@ impl FileService {
                 + time::Duration::seconds(
                     i64::try_from(self.cfg.idempotency_ttl_secs).unwrap_or(86400),
                 );
-            drop(
-                self.store
-                    .insert_idempotency_key(
-                        tenant_id,
-                        &owner_kind_str,
-                        owner_id,
-                        key,
-                        ticket.file_id,
-                        201,
-                        &response_body,
-                        "",
-                        expires_at,
-                        now,
-                    )
-                    .await,
-            );
-        }
+            IdempotencyInsert {
+                tenant_id,
+                owner_kind: owner_kind_str.clone(),
+                owner_id,
+                key: key.clone(),
+                response_status: 201,
+                response_body,
+                response_etag: String::new(),
+                expires_at,
+            }
+        });
+
+        self.store
+            .create_file_with_pending_version_and_event(
+                &new,
+                file_id,
+                version_id,
+                tenant_id,
+                &backend_id,
+                &backend_path,
+                now,
+                audit,
+                event,
+                idempotency,
+            )
+            .await?;
+
+        // @cpt-cf-file-storage-fr-usage-reporting
+        // Fire-and-forget: report +1 file to usage collector.
+        self.report_usage(UsageDelta {
+            tenant_id,
+            owner_id,
+            bytes_delta: 0, // bytes unknown at creation; finalize_upload updates the backend
+            file_count_delta: 1,
+        });
 
         Ok(ticket)
     }
@@ -1343,6 +1344,9 @@ impl FileService {
             scope: policy_scope,
             scope_owner_id,
             body,
+            // The upsert wrote both timestamps to `now`.
+            created_at: now,
+            updated_at: now,
         })
     }
 
@@ -1432,6 +1436,7 @@ impl FileService {
             scope: retention_scope,
             scope_target_id,
             body,
+            created_at: now,
         })
     }
 
@@ -1556,6 +1561,15 @@ impl FileService {
             .await?
             .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
 
+        // Bind the session to the authorized path `file_id`. Authorization above
+        // checks the path file, but the session is loaded by `upload_id` alone —
+        // without this a caller could drive another file's upload (and corrupt
+        // state via a recomputed backend path). Reported as "not found" so a
+        // foreign `upload_id` is not distinguishable from a missing one.
+        if session.file_id != file_id {
+            return Err(DomainError::multipart_upload_not_found(upload_id));
+        }
+
         if session.state != MultipartUploadState::InProgress {
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id,
@@ -1631,6 +1645,15 @@ impl FileService {
             .await?
             .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
 
+        // Bind the session to the authorized path `file_id`. Authorization above
+        // checks the path file, but the session is loaded by `upload_id` alone —
+        // without this a caller could drive another file's upload (and corrupt
+        // state via a recomputed backend path). Reported as "not found" so a
+        // foreign `upload_id` is not distinguishable from a missing one.
+        if session.file_id != file_id {
+            return Err(DomainError::multipart_upload_not_found(upload_id));
+        }
+
         if session.state != MultipartUploadState::InProgress {
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id,
@@ -1668,20 +1691,17 @@ impl FileService {
             ));
         }
 
-        // SHA-256 of concatenated part hashes.
-        let mut hasher = Sha256::new();
-        for p in &parts {
-            hasher.update(&p.part_hash);
-        }
-        let combined_hash: Vec<u8> = hasher.finalize().to_vec();
-
         // Build the parts list for the backend.
         let backend_parts: Vec<(u32, String)> = parts
             .iter()
             .map(|p| (p.part_number, p.backend_etag.clone()))
             .collect();
 
-        backend
+        // Assemble on the backend, which returns the SHA-256 of the fully
+        // assembled object. This is the hash of the bytes actually stored — a
+        // hash over concatenated part digests would not match a later `get` +
+        // recompute and would break `migrate_backend`'s integrity check.
+        let content_hash = backend
             .complete_multipart(
                 &backend_path,
                 &session.backend_upload_handle,
@@ -1696,15 +1716,25 @@ impl FileService {
             AuditOperation::FinalizeVersion,
             serde_json::json!({ "version_id": session.version_id, "upload_id": upload_id, "size": total_size }),
         );
-        self.store
+        let finalized = self
+            .store
             .finalize_version(
                 file_id,
                 session.version_id,
                 total_size,
-                combined_hash,
+                content_hash,
                 finalize_audit,
             )
             .await?;
+        if !finalized {
+            // The pending version row disappeared (concurrent abort or cleanup)
+            // after the backend assembled the object. Fail loudly instead of
+            // reporting success with no bound version; the now-orphaned blob at
+            // `backend_path` is reclaimed by the orphan-reconciliation sweep.
+            return Err(DomainError::conflict(format!(
+                "multipart upload {upload_id}: version row was removed before completion"
+            )));
+        }
 
         // Mark the session completed and emit the main audit row.
         // @cpt-cf-file-storage-fr-audit-trail
@@ -1744,6 +1774,15 @@ impl FileService {
             .await?
             .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
 
+        // Bind the session to the authorized path `file_id`. Authorization above
+        // checks the path file, but the session is loaded by `upload_id` alone —
+        // without this a caller could drive another file's upload (and corrupt
+        // state via a recomputed backend path). Reported as "not found" so a
+        // foreign `upload_id` is not distinguishable from a missing one.
+        if session.file_id != file_id {
+            return Err(DomainError::multipart_upload_not_found(upload_id));
+        }
+
         if session.state != MultipartUploadState::InProgress {
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id,
@@ -1776,22 +1815,23 @@ impl FileService {
         self.store.abort_multipart_upload(upload_id, audit).await?;
 
         // Delete the pending version row (no audit row — a pending version is
-        // an implementation detail, not a distinct audited file version).
-        drop(
-            self.store
-                .delete_version(
-                    file_id,
-                    session.version_id,
-                    // Deleted as part of abort — record as delete_version for completeness.
-                    Self::audit_ok(
-                        ctx,
-                        Some(file_id),
-                        AuditOperation::DeleteVersion,
-                        serde_json::json!({ "version_id": session.version_id, "reason": "multipart_abort" }),
-                    ),
-                )
-                .await,
-        );
+        // an implementation detail, not a distinct audited file version). A
+        // DB error must not be swallowed; a missing row (`false`) is acceptable
+        // for an abort, since the pending version being already gone is the
+        // desired end state.
+        self.store
+            .delete_version(
+                file_id,
+                session.version_id,
+                // Deleted as part of abort — record as delete_version for completeness.
+                Self::audit_ok(
+                    ctx,
+                    Some(file_id),
+                    AuditOperation::DeleteVersion,
+                    serde_json::json!({ "version_id": session.version_id, "reason": "multipart_abort" }),
+                ),
+            )
+            .await?;
 
         Ok(())
     }
@@ -1855,7 +1895,7 @@ impl FileService {
         let bytes = source.get(&version.backend_path).await?;
 
         // Verify content hash before writing to destination.
-        let computed_hash: Vec<u8> = Sha256::digest(&bytes).to_vec();
+        let computed_hash: Vec<u8> = hash::sha256(&bytes);
         if computed_hash != version.hash_value {
             return Err(DomainError::hash_mismatch(
                 hex::encode(&version.hash_value),
@@ -1970,5 +2010,5 @@ impl From<IdempotencyTicket> for UploadTicket {
 }
 
 #[cfg(test)]
-#[path = "service_enforce_tests.rs"]
-mod service_enforce_tests;
+#[path = "service_tests.rs"]
+mod service_tests;

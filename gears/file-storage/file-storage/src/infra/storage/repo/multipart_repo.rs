@@ -77,20 +77,28 @@ impl MultipartRepo {
             .one(conn)
             .await
             .map_err(db_err)?;
-        Ok(found.map(session_from_model))
+        found.map(session_from_model).transpose()
     }
 
-    /// Update the `state` field of a multipart upload session.
+    /// Compare-and-set the `state` of a multipart upload session: transition to
+    /// `new_state` only if the row is currently in `expected_state`. Returns
+    /// `true` if a row matched and was updated, `false` on a stale transition
+    /// (e.g. a `complete`/`abort` race where another writer already moved it).
     pub async fn update_state<C: DBRunner>(
         &self,
         conn: &C,
         upload_id: Uuid,
-        state: &str,
+        expected_state: &str,
+        new_state: &str,
     ) -> Result<bool, DomainError> {
         use sea_orm::sea_query::Expr;
         let res = UploadEntity::update_many()
-            .col_expr(UploadColumn::State, Expr::value(state))
-            .filter(UploadColumn::UploadId.eq(upload_id))
+            .col_expr(UploadColumn::State, Expr::value(new_state))
+            .filter(
+                sea_orm::Condition::all()
+                    .add(UploadColumn::UploadId.eq(upload_id))
+                    .add(UploadColumn::State.eq(expected_state)),
+            )
             .secure()
             .scope_with(&AccessScope::allow_all())
             .exec(conn)
@@ -153,7 +161,7 @@ impl MultipartRepo {
             .all(conn)
             .await
             .map_err(db_err)?;
-        Ok(rows.into_iter().map(part_from_model).collect())
+        rows.into_iter().map(part_from_model).collect()
     }
 
     /// List all `in_progress` upload sessions whose `expires_at` is before `now`.
@@ -177,31 +185,48 @@ impl MultipartRepo {
             .all(conn)
             .await
             .map_err(db_err)?;
-        Ok(rows.into_iter().map(session_from_model).collect())
+        rows.into_iter().map(session_from_model).collect()
     }
 }
 
-fn session_from_model(m: UploadModel) -> MultipartUploadSession {
-    MultipartUploadSession {
+fn session_from_model(m: UploadModel) -> Result<MultipartUploadSession, DomainError> {
+    // A persisted state we cannot parse is a data-contract violation, not an
+    // `in_progress` session — surface it rather than manufacturing a default
+    // that would let callers operate on a bogus session.
+    let state = MultipartUploadState::parse(&m.state).ok_or_else(|| {
+        DomainError::database(format!(
+            "invalid multipart upload state in DB for {}: {}",
+            m.upload_id, m.state
+        ))
+    })?;
+    Ok(MultipartUploadSession {
         upload_id: m.upload_id,
         file_id: m.file_id,
         version_id: m.version_id,
         backend_upload_handle: m.backend_upload_handle,
-        state: MultipartUploadState::parse(&m.state).unwrap_or(MultipartUploadState::InProgress),
+        state,
         declared_mime: m.declared_mime,
         mime_validated: m.mime_validated,
         created_at: m.created_at,
         expires_at: m.expires_at,
-    }
+    })
 }
 
-fn part_from_model(m: PartModel) -> MultipartPart {
-    MultipartPart {
+fn part_from_model(m: PartModel) -> Result<MultipartPart, DomainError> {
+    // Part numbers are `> 0` by DB CHECK; a value that does not fit `u32` is
+    // corruption, not part `0`.
+    let part_number = u32::try_from(m.part_number).map_err(|_| {
+        DomainError::database(format!(
+            "invalid part_number in DB for upload {}: {}",
+            m.upload_id, m.part_number
+        ))
+    })?;
+    Ok(MultipartPart {
         upload_id: m.upload_id,
-        part_number: u32::try_from(m.part_number).unwrap_or(0),
+        part_number,
         backend_etag: m.backend_etag,
         part_hash: m.part_hash,
         size: m.size,
         uploaded_at: m.uploaded_at,
-    }
+    })
 }

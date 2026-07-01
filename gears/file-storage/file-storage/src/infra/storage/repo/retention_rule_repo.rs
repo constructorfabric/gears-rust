@@ -166,5 +166,6 @@ fn map_model(m: Model) -> Result<StoredRetentionRule, DomainError> {
         scope,
         scope_target_id: m.scope_target_id,
         body,
+        created_at: m.created_at,
     })
 }

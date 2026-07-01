@@ -10,6 +10,7 @@
 //! @cpt-cf-file-storage-fr-retention-policies
 
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -227,6 +228,8 @@ pub struct StoredPolicy {
     /// `None` for `scope = Tenant`; the user's `owner_id` for `scope = User`.
     pub scope_owner_id: Option<Uuid>,
     pub body: PolicyBody,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
 }
 
 /// A stored retention rule row.
@@ -239,6 +242,7 @@ pub struct StoredRetentionRule {
     /// `None` for tenant scope; `user_id` for user scope; `file_id` for file scope.
     pub scope_target_id: Option<Uuid>,
     pub body: RetentionRuleBody,
+    pub created_at: OffsetDateTime,
 }
 
 // ── Effective policy (resolved) ───────────────────────────────────────────────
@@ -353,32 +357,44 @@ impl PolicyResolver {
             (Some(t), None) => Some(t.clone()),
             (None, Some(u)) => Some(u.clone()),
             (Some(t), Some(u)) => {
-                // Intersection: keep types that appear in both sets.
-                let intersection: Vec<String> = t
-                    .iter()
-                    .filter(|mt| u.iter().any(|u_mt| Self::mime_matches(mt, u_mt)))
-                    .cloned()
-                    .collect();
+                // Intersection, resolved to the NARROWER pattern for asymmetric
+                // wildcard overlaps: tenant `image/*` ∩ user `image/png` yields
+                // `image/png`, not `image/*` (which would wrongly keep admitting
+                // `image/jpeg` once the list is enforced as an allow-list).
+                let mut intersection: Vec<String> = Vec::new();
+                for t_mt in t {
+                    for u_mt in u {
+                        if let Some(narrow) = Self::intersect_mime(t_mt, u_mt)
+                            && !intersection.contains(&narrow)
+                        {
+                            intersection.push(narrow);
+                        }
+                    }
+                }
                 Some(intersection)
             }
         }
     }
 
-    /// Returns `true` if two mime patterns overlap.
-    ///
-    /// Supports simple exact match and `*` wildcard for subtype, e.g. `"image/*"`
-    /// matches `"image/jpeg"`. Cross-wildcard intersections are treated as
-    /// matching if the base type matches.
-    fn mime_matches(a: &str, b: &str) -> bool {
+    /// Intersect two mime patterns: return the **narrower** pattern when they
+    /// overlap, or `None` when they are disjoint. `image/*` ∩ `image/png` =
+    /// `image/png`; `image/png` ∩ `image/jpeg` = `None`.
+    fn intersect_mime(a: &str, b: &str) -> Option<String> {
         if a == b {
-            return true;
+            return Some(a.to_owned());
         }
         let (a_type, a_sub) = Self::split_mime(a);
         let (b_type, b_sub) = Self::split_mime(b);
         if a_type != b_type {
-            return false;
+            return None;
         }
-        a_sub == "*" || b_sub == "*"
+        match (a_sub, b_sub) {
+            ("*", "*") => Some(a.to_owned()),
+            ("*", _) => Some(b.to_owned()),
+            (_, "*") => Some(a.to_owned()),
+            // Two different concrete subtypes under the same base type: disjoint.
+            _ => None,
+        }
     }
 
     fn split_mime(mime: &str) -> (&str, &str) {
@@ -397,14 +413,20 @@ impl PolicyResolver {
         }
     }
 
-    /// Merge per-mime overrides: union of patterns, most-restrictive value per pattern.
+    /// Merge per-mime overrides: union of patterns, most-restrictive value per
+    /// pattern, and — critically — collapse *overlapping* patterns so a broader
+    /// wildcard cap always tightens the more-specific entries it covers.
+    ///
+    /// Consumers pick the most-specific matching entry, so without the final
+    /// tightening pass `image/png = 50MB` alongside `image/* = 10MB` would let a
+    /// PNG upload use 50MB and silently ignore the stricter 10MB wildcard cap.
     fn merge_per_mime(
         tenant: &[MimeSizeOverride],
         user: &[MimeSizeOverride],
     ) -> Vec<MimeSizeOverride> {
         let mut result: Vec<MimeSizeOverride> = tenant.to_vec();
 
-        // Merge user entries: update existing if smaller, or add new.
+        // 1. Union: for an identical pattern take the smaller value, else add.
         for u in user {
             if let Some(existing) = result.iter_mut().find(|e| e.mime == u.mime) {
                 existing.max_bytes = existing.max_bytes.min(u.max_bytes);
@@ -413,7 +435,30 @@ impl PolicyResolver {
             }
         }
 
+        // 2. Tighten each entry by every *broader* pattern that also covers it,
+        //    so a specific entry can never be looser than a matching wildcard.
+        let snapshot = result.clone();
+        for e in &mut result {
+            for o in &snapshot {
+                if Self::mime_pattern_covers(&o.mime, &e.mime) {
+                    e.max_bytes = e.max_bytes.min(o.max_bytes);
+                }
+            }
+        }
+
         result
+    }
+
+    /// Does `pattern` cover `other` — i.e. does every concrete mime matching
+    /// `other` also match `pattern`? True for exact equality or a `type/*`
+    /// wildcard over the same base type.
+    fn mime_pattern_covers(pattern: &str, other: &str) -> bool {
+        if pattern == other {
+            return true;
+        }
+        let (p_type, p_sub) = Self::split_mime(pattern);
+        let (o_type, _) = Self::split_mime(other);
+        p_type == o_type && p_sub == "*"
     }
 
     /// Merge metadata limits: smallest non-None value from each field.

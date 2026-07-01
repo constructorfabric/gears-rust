@@ -24,6 +24,7 @@ use crate::domain::multipart::MultipartUploadSession;
 use crate::domain::policy::RetentionScope;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::storage::Store;
+use crate::infra::storage::repo::FileEvent;
 
 /// Configuration knobs for the cleanup engine.
 #[derive(Debug, Clone)]
@@ -399,8 +400,27 @@ impl CleanupEngine {
             occurred_at: now,
         };
 
+        // Emit `file.deleted` on the same transactional-outbox path user-initiated
+        // deletes use, so downstream consumers observe retention-driven deletions
+        // too (a plain `delete_file` would silently skip the event).
+        // @cpt-cf-file-storage-fr-file-events
+        let event = Some(FileEvent {
+            tenant_id: file.tenant_id,
+            owner_id: file.owner_id,
+            file_id: file.file_id,
+            event_type: "file.deleted".to_owned(),
+            payload: serde_json::json!({
+                "reason": "retention_policy_expired",
+                "expired_at": now,
+            }),
+        });
+
         let scope = toolkit_security::AccessScope::allow_all();
-        match self.store.delete_file(&scope, file.file_id, audit).await {
+        match self
+            .store
+            .delete_file_with_event(&scope, file.file_id, audit, event)
+            .await
+        {
             Ok(true) => {
                 for v in &versions {
                     self.best_effort_delete(&v.backend_id, &v.backend_path)

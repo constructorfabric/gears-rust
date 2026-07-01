@@ -4,9 +4,9 @@
 //! record is inserted; on a retry the stored record is returned unchanged.
 //! All queries are scoped by `(tenant_id, owner_kind, owner_id, key)`.
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
 use time::OffsetDateTime;
-use toolkit_db::secure::{DBRunner, SecureEntityExt, secure_insert};
+use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -52,8 +52,18 @@ impl IdempotencyRepo {
         Ok(found.map(record_from_model))
     }
 
-    /// Insert a new idempotency record. If a record with the same PK already
-    /// exists (e.g., concurrent request), silently ignore the conflict.
+    /// Insert an idempotency record, replacing any prior row for the same key.
+    ///
+    /// This runs inside the same transaction as the file creation it records,
+    /// so a committed create always leaves a replay record behind. A stale
+    /// **expired** row for the same key is deleted first (its TTL lapsed, so the
+    /// new request legitimately supersedes it — a bare insert would collide with
+    /// the leftover primary key). Every failure is propagated — never swallowed —
+    /// so the surrounding transaction rolls back rather than reporting success
+    /// with no persisted record. A live-key conflict from a concurrent create
+    /// racing the same key therefore also rolls that creation back; the client
+    /// retries and replays the winner's record via [`get`] instead of creating a
+    /// second file.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert<C: DBRunner>(
         &self,
@@ -69,6 +79,26 @@ impl IdempotencyRepo {
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
+        // Remove only a lapsed row for this key first (insert-or-replace on an
+        // expired PK). A still-live row is deliberately left in place: if a
+        // concurrent create already committed a fresh row for this key, our
+        // insert below then hits the primary key and rolls this creation back —
+        // exactly the behaviour that stops a duplicate file from being created.
+        Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(Column::TenantId.eq(tenant_id))
+                    .add(Column::OwnerKind.eq(owner_kind.to_owned()))
+                    .add(Column::OwnerId.eq(owner_id))
+                    .add(Column::IdempotencyKey.eq(key.to_owned()))
+                    .add(Column::ExpiresAt.lte(now)),
+            )
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+
         let am = ActiveModel {
             tenant_id: Set(tenant_id),
             owner_kind: Set(owner_kind.to_owned()),
@@ -81,12 +111,9 @@ impl IdempotencyRepo {
             created_at: Set(now),
             expires_at: Set(expires_at),
         };
-        // Ignore PK conflicts — a concurrent retry already stored the record.
-        drop(
-            secure_insert::<Entity>(am, &AccessScope::allow_all(), conn)
-                .await
-                .map_err(db_err),
-        );
+        secure_insert::<Entity>(am, &AccessScope::allow_all(), conn)
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 }

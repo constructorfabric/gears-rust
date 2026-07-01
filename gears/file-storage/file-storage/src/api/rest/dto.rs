@@ -373,10 +373,8 @@ impl From<StoredPolicy> for PolicyDto {
             scope: p.scope.as_str().to_owned(),
             scope_owner_id: p.scope_owner_id,
             body: p.body.into(),
-            // StoredPolicy has no timestamps — use epoch as a placeholder since
-            // these come from the DB model; for upsert results we don't re-read.
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
         }
     }
 }
@@ -554,7 +552,7 @@ impl From<StoredRetentionRule> for RetentionRuleDto {
             scope: r.scope.as_str().to_owned(),
             scope_target_id: r.scope_target_id,
             body: r.body.into(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            created_at: r.created_at,
         }
     }
 }

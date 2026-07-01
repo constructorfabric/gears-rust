@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS retention_rules (
     scope            text         NOT NULL  CHECK (scope IN ('tenant', 'user', 'file')),
     scope_target_id  uuid,
     body             jsonb        NOT NULL,
-    created_at       timestamptz  NOT NULL  DEFAULT now()
+    created_at       timestamptz  NOT NULL  DEFAULT now(),
+    CHECK ((scope = 'tenant' AND scope_target_id IS NULL) OR
+           (scope IN ('user', 'file') AND scope_target_id IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS retention_rules_scope_idx
@@ -153,7 +155,9 @@ CREATE TABLE IF NOT EXISTS policies (
     scope_owner_id   TEXT,
     body             TEXT  NOT NULL,
     created_at       TEXT  NOT NULL  DEFAULT CURRENT_TIMESTAMP,
-    updated_at       TEXT  NOT NULL  DEFAULT CURRENT_TIMESTAMP
+    updated_at       TEXT  NOT NULL  DEFAULT CURRENT_TIMESTAMP,
+    CHECK ((scope = 'user' AND scope_owner_id IS NOT NULL) OR
+           (scope = 'tenant' AND scope_owner_id IS NULL))
 );
 
 CREATE INDEX IF NOT EXISTS policies_scope_idx
@@ -165,7 +169,9 @@ CREATE TABLE IF NOT EXISTS retention_rules (
     scope            TEXT  NOT NULL  CHECK (scope IN ('tenant', 'user', 'file')),
     scope_target_id  TEXT,
     body             TEXT  NOT NULL,
-    created_at       TEXT  NOT NULL  DEFAULT CURRENT_TIMESTAMP
+    created_at       TEXT  NOT NULL  DEFAULT CURRENT_TIMESTAMP,
+    CHECK ((scope = 'tenant' AND scope_target_id IS NULL) OR
+           (scope IN ('user', 'file') AND scope_target_id IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS retention_rules_scope_idx

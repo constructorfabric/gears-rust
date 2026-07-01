@@ -249,6 +249,11 @@ impl VersionRepo {
         let rows = Entity::find()
             .filter(
                 Condition::all()
+                    // Restrict to finalized/available versions so unfinished
+                    // `pending` uploads are left to the orphan-reconciliation
+                    // sweep (`list_pending_older_than`) and never deleted here
+                    // as retention-superseded.
+                    .add(Column::Status.eq(VersionStatus::Available.as_str()))
                     .add(Column::IsCurrent.eq(false))
                     .add(Column::CreatedAt.lt(older_than)),
             )

@@ -115,5 +115,7 @@ fn map_model(m: Model) -> Result<StoredPolicy, DomainError> {
         scope,
         scope_owner_id: m.scope_owner_id,
         body,
+        created_at: m.created_at,
+        updated_at: m.updated_at,
     })
 }

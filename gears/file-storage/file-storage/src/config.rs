@@ -85,6 +85,26 @@ pub struct FileStorageConfig {
     pub enable_background_sweep: bool,
 }
 
+impl FileStorageConfig {
+    /// Validates cross-field invariants that `serde` cannot express.
+    ///
+    /// Called at gear init (see `gear.rs`) before the config is used to wire
+    /// anything up, so a misconfiguration fails fast with a clear message
+    /// rather than manifesting as runtime misbehaviour.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // A zero sweep interval with the sweep enabled turns the background
+        // loop (`sleep(Duration::from_secs(0))`) into a tight spin that pegs
+        // the runtime and floods the logs. Reject it up front.
+        if self.enable_background_sweep && self.sweep_interval_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: sweep_interval_secs must be > 0 when \
+                 enable_background_sweep is true"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Debug for FileStorageConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FileStorageConfig")

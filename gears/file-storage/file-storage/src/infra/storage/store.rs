@@ -52,6 +52,20 @@ use crate::infra::storage::entity::audit_outbox::Model as AuditModel;
 use crate::infra::storage::entity::events_outbox::Model as FileEventModel;
 use crate::infra::storage::repo::{FileEvent, InsertRetentionRule, Repos};
 
+/// An idempotency-key row to persist in the **same** transaction as a file
+/// creation, so a committed `POST /files` always leaves a replay record behind
+/// (no window where the file exists but the key does not).
+pub struct IdempotencyInsert {
+    pub tenant_id: Uuid,
+    pub owner_kind: String,
+    pub owner_id: Uuid,
+    pub key: String,
+    pub response_status: i32,
+    pub response_body: String,
+    pub response_etag: String,
+    pub expires_at: OffsetDateTime,
+}
+
 /// Persistence facade — the only type that holds `DBProvider` and drives
 /// transactions. Cheap to clone (an `Arc` + a bundle of unit-struct repos).
 ///
@@ -688,7 +702,9 @@ impl Store {
             .db()
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
-                    let updated = multipart.update_state(tx, upload_id, "completed").await?;
+                    let updated = multipart
+                        .update_state(tx, upload_id, "in_progress", "completed")
+                        .await?;
                     if updated {
                         // @cpt-cf-file-storage-nfr-audit-completeness
                         audit_repo.insert(tx, &audit).await?;
@@ -716,7 +732,9 @@ impl Store {
             .db()
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
-                    let updated = multipart.update_state(tx, upload_id, "aborted").await?;
+                    let updated = multipart
+                        .update_state(tx, upload_id, "in_progress", "aborted")
+                        .await?;
                     if updated {
                         // @cpt-cf-file-storage-nfr-audit-completeness
                         audit_repo.insert(tx, &audit).await?;
@@ -744,42 +762,6 @@ impl Store {
         self.repos
             .idempotency_keys
             .get(&conn, tenant_id, owner_kind, owner_id, key, now)
-            .await
-    }
-
-    /// Insert an idempotency record for a completed create-file request.
-    ///
-    /// @cpt-cf-file-storage-fr-upload-idempotency
-    #[allow(clippy::too_many_arguments)]
-    pub async fn insert_idempotency_key(
-        &self,
-        tenant_id: Uuid,
-        owner_kind: &str,
-        owner_id: Uuid,
-        key: &str,
-        file_id: Uuid,
-        response_status: i32,
-        response_body: &str,
-        response_etag: &str,
-        expires_at: OffsetDateTime,
-        now: OffsetDateTime,
-    ) -> Result<(), DomainError> {
-        let conn = self.db.conn().map_err(db_err)?;
-        self.repos
-            .idempotency_keys
-            .insert(
-                &conn,
-                tenant_id,
-                owner_kind,
-                owner_id,
-                key,
-                file_id,
-                response_status,
-                response_body,
-                response_etag,
-                expires_at,
-                now,
-            )
             .await
     }
 
@@ -1049,6 +1031,7 @@ impl Store {
         now: OffsetDateTime,
         audit: AuditEntry,
         event: Option<FileEvent>,
+        idempotency: Option<IdempotencyInsert>,
     ) -> Result<(), DomainError> {
         let file = File {
             file_id,
@@ -1081,6 +1064,7 @@ impl Store {
         let metadata = self.repos.metadata.clone();
         let audit_repo = self.repos.audit.clone();
         let events_repo = self.repos.events_outbox.clone();
+        let idempotency_repo = self.repos.idempotency_keys.clone();
         self.db
             .db()
             .transaction_ref_mapped(move |tx| {
@@ -1097,6 +1081,27 @@ impl Store {
                     audit_repo.insert(tx, &audit).await?;
                     if let Some(ev) = event {
                         events_repo.enqueue(tx, &ev).await?;
+                    }
+                    // Persist the idempotency record in the same transaction, so
+                    // a committed create always has a replay record. A PK
+                    // conflict (concurrent duplicate) is tolerated inside the
+                    // repo; any real DB error rolls the whole creation back.
+                    if let Some(idem) = idempotency {
+                        idempotency_repo
+                            .insert(
+                                tx,
+                                idem.tenant_id,
+                                &idem.owner_kind,
+                                idem.owner_id,
+                                &idem.key,
+                                file_id,
+                                idem.response_status,
+                                &idem.response_body,
+                                &idem.response_etag,
+                                idem.expires_at,
+                                now,
+                            )
+                            .await?;
                     }
                     Ok::<(), DomainError>(())
                 })

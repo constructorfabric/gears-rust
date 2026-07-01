@@ -8,10 +8,10 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::infra::content::hash;
 
 use super::{BackendCapabilities, StorageBackend};
 
@@ -98,7 +98,7 @@ impl StorageBackend for InMemoryBackend {
         part_number: u32,
         data: Bytes,
     ) -> Result<(String, Vec<u8>), DomainError> {
-        let hash_bytes = Sha256::digest(&data).to_vec();
+        let hash_bytes = hash::sha256(&data);
         let etag = hex::encode(&hash_bytes);
 
         let mut mp = self.lock_multipart()?;
@@ -117,7 +117,7 @@ impl StorageBackend for InMemoryBackend {
         _path: &str,
         upload_handle: &str,
         _parts: &[(u32, String)],
-    ) -> Result<(), DomainError> {
+    ) -> Result<Vec<u8>, DomainError> {
         let (final_path, parts_map) = {
             let mut mp = self.lock_multipart()?;
             mp.remove(upload_handle).ok_or_else(|| {
@@ -127,14 +127,17 @@ impl StorageBackend for InMemoryBackend {
                 )
             })?
         };
-        // Assemble parts in ascending part_number order.
+        // Assemble parts in ascending part_number order (BTreeMap iterates sorted).
         let mut assembled = Vec::new();
         for (_, part_data) in parts_map {
             assembled.extend_from_slice(&part_data);
         }
+        // Hash the assembled object so the caller stores the digest of the bytes
+        // actually persisted (consistent with `get` + integrity recomputes).
+        let digest = hash::sha256(&assembled);
         self.lock_blobs()?
             .insert(final_path, Bytes::from(assembled));
-        Ok(())
+        Ok(digest)
     }
 
     async fn abort_multipart(&self, _path: &str, upload_handle: &str) -> Result<(), DomainError> {

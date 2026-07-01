@@ -388,6 +388,7 @@ pub(crate) fn register_routes(
             StatusCode::OK,
             "Multipart session",
         )
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)

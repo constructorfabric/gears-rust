@@ -54,6 +54,7 @@ impl Default for FileStorageGear {
 impl Gear for FileStorageGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: FileStorageConfig = ctx.config_or_default()?;
+        cfg.validate()?;
         debug!(
             sidecar = %cfg.sidecar_base_url,
             storage_root = %cfg.storage_root,

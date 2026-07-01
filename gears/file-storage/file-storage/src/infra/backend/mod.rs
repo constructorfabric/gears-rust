@@ -106,13 +106,18 @@ pub trait StorageBackend: Send + Sync {
 
     /// Complete a multipart upload, assembling all uploaded parts in order.
     ///
+    /// Returns the SHA-256 digest of the fully assembled object, so the control
+    /// plane can persist the hash of the *actual* stored bytes (matching what
+    /// `get`/`migrate_backend` would recompute) rather than a hash derived from
+    /// the individual part digests.
+    ///
     /// @cpt-cf-file-storage-fr-multipart-upload
     async fn complete_multipart(
         &self,
         _path: &str,
         _upload_handle: &str,
         _parts: &[(u32, String)],
-    ) -> Result<(), DomainError> {
+    ) -> Result<Vec<u8>, DomainError> {
         Err(DomainError::multipart_not_supported(self.id()))
     }
 
