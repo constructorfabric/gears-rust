@@ -3,7 +3,7 @@
 //!
 //! [`DataPlaneService`] holds only what it needs to look up a version's backend
 //! location and move bytes; it delegates the post-upload finalize step to the
-//! control plane via [`FileService::finalize_upload`].
+//! control plane via the [`DataPlanePort`] callback.
 //!
 //! # Responsibilities (data-plane only)
 //! * Validate the declared MIME type against the actual bytes.
@@ -27,37 +27,31 @@ use uuid::Uuid;
 use file_storage_sdk::ByteRange;
 
 use crate::domain::error::DomainError;
-use crate::domain::service::FileService;
+use crate::domain::ports::DataPlanePort;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::content::{hash, mime};
-use crate::infra::storage::Store;
 
 /// Data-plane service: moves bytes between callers and the storage backend.
 ///
-/// Constructed from an `Arc<FileService>` to access the control-plane
-/// `finalize_upload` callback; it borrows the backend registry and `Store`
-/// from the same `FileService` via `pub(crate)` accessors.
+/// Constructed from an `Arc<dyn DataPlanePort>` to access the control-plane
+/// `finalize_upload` callback and version look-ups. Using the narrow port
+/// trait (ISP) instead of the full `FileService` type keeps `data_plane.rs`
+/// decoupled from the entire control-plane implementation.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 pub struct DataPlaneService {
-    control: Arc<FileService>,
+    control: Arc<dyn DataPlanePort>,
     backends: BackendRegistry,
-    store: Store,
 }
 
 impl DataPlaneService {
     /// Build a `DataPlaneService` that delegates finalize to `control`.
     ///
-    /// The backends and `Store` are cloned from the control-plane service so
-    /// both layers share the same resources without duplication.
+    /// The backend registry is cloned from `control` so both layers share
+    /// the same resources without duplication.
     #[must_use]
-    pub fn new(control: Arc<FileService>) -> Self {
+    pub fn new(control: Arc<dyn DataPlanePort>) -> Self {
         let backends = control.backends().clone();
-        let store = control.store().clone();
-        Self {
-            control,
-            backends,
-            store,
-        }
+        Self { control, backends }
     }
 
     /// Validate, store, hash, and finalize an uploaded blob in one step.
@@ -82,7 +76,7 @@ impl DataPlaneService {
         self.control.authorize_write(ctx, file_id).await?;
 
         let version = self
-            .store
+            .control
             .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
@@ -106,7 +100,7 @@ impl DataPlaneService {
         range: Option<ByteRange>,
     ) -> Result<Bytes, DomainError> {
         let version = self
-            .store
+            .control
             .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;

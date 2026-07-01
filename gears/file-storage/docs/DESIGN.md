@@ -756,7 +756,8 @@ intended decomposition. Their detailed designs live in P2/P3 FEATURE artifacts (
 ##### Multipart upload — P2 (server-authoritative parts plan)
 
 The detailed multipart contract is **owned by the P2 FEATURE for `multipart-coordinator`**
-(`cpt-cf-file-storage-fr-multipart-upload`); only its shape is fixed here. Multipart is **server-authoritative**: the
+([features/multipart-coordinator.md](./features/multipart-coordinator.md),
+`cpt-cf-file-storage-fr-multipart-upload`); only its shape is fixed here. Multipart is **server-authoritative**: the
 client sends its desired parameters (total size, preferred part size, concurrency) and the control plane returns the
 **exact** plan — part sizes/offsets plus a **signed URL per part** pointing at the sidecar. (This reverses an earlier
 draft that rejected a server-authoritative plan in favour of a client-driven `.../parts/{n}` model; in the sidecar
@@ -765,6 +766,9 @@ architecture the server owns the plan, and server-chosen part boundaries can be 
 - For a `multipart_native` backend the sidecar drives the backend's multipart API (`CreateMultipartUpload` → `PutPart`
   → `CompleteMultipartUpload`); for a non-native backend the sidecar offset-writes each part into the single
   new-version object `/{file_id}/{version_id}` (still never mutating an existing object)
+- Each **per-part signed URL carries the part's exact `size` as a token claim**; the sidecar rejects a body whose
+  length ≠ the claim (`413`) **before** writing, so oversized bytes never reach the backend — per-part size enforcement
+  is therefore transfer-time, not deferred to `complete`
 - Each part's **BLAKE3 subtree hash** is persisted by the sidecar (via SDK) in `multipart_upload_parts.part_hash` in
   the shared DB — durable so an upload is resumable and survives a sidecar crash; combined into the root at `complete`
 - `complete` binds the new version exactly like single-shot (CAS on `content_id`, `412` → rebind)
@@ -772,8 +776,11 @@ architecture the server owns the plan, and server-chosen part boundaries can be 
   (`cpt-cf-file-storage-adr-content-hash-selection`); P1 leaves `capabilities.multipart_native` declared on
   `GET /storages` but inactive
 
-Concrete request/response shapes (envelope fields, error codes, idempotency) are left to the P2 FEATURE so reviewers
-approving this PR are not implicitly ratifying them.
+Concrete request/response shapes (envelope fields, error codes, idempotency) are specified in the FEATURE artifact
+([features/multipart-coordinator.md](./features/multipart-coordinator.md)) and in [api.md](./api.md). **Note**: the
+interim P2-M3 implementation is *client-driven* (client picks `part_number` and `PUT`s raw bytes to a control-plane
+`.../parts/{n}` route) and is **superseded** by the server-authoritative contract above — see the FEATURE artifact
+§8 for the migration.
 
 ### 3.3 API Contracts
 
@@ -1061,6 +1068,48 @@ sequenceDiagram
     DB-->>MS: rows
     MS-->>CTL: rows + next_cursor
     CTL-->>C: 200 + JSON {items, next_cursor}
+```
+
+#### Configure policy (P2-M1)
+
+**ID**: `cpt-cf-file-storage-seq-configure-policy`
+
+**Use cases**: `cpt-cf-file-storage-usecase-configure-policy`
+
+**Functional requirements**: `cpt-cf-file-storage-fr-allowed-types-policy`,
+`cpt-cf-file-storage-fr-size-limits-policy`, `cpt-cf-file-storage-fr-metadata-limits`,
+`cpt-cf-file-storage-fr-retention-policies`
+
+The `configure-policy` use case lets operators set a tenant-scoped (or user-scoped) policy that governs
+allowed MIME types, size limits, custom-metadata limits, and retention rules.  The effective policy seen
+by enforcement (P2-M2) is the **most-restrictive intersection** of the tenant policy and the requesting
+user's policy:
+
+- **Allowed MIME types**: intersection of both sets (empty = deny all); if only one side is set, that
+  side wins; if neither is set, all types are allowed.
+- **Max file size / per-MIME size**: minimum of both limits; missing on one side means the other
+  side's limit applies.
+- **Metadata limits** (`max_pairs`, `max_key_len`, `max_value_len`, `max_total_bytes`): minimum of
+  each field across both sides.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Admin / operator
+    participant CTL as Control plane
+    participant AZ as authz-adapter
+    participant DB as Postgres
+
+    A->>CTL: PUT /api/file-storage/v1/policy?scope=tenant
+    CTL->>AZ: check(action=write, resource=policy)
+    AZ-->>CTL: Allow
+    CTL->>DB: DELETE existing row (tenant_id, scope, scope_owner_id IS NULL)
+    CTL->>DB: INSERT new policy row (UUID v7, body = JSON)
+    DB-->>CTL: OK
+    CTL-->>A: 200 { policy_id, ... }
+
+    Note over A,CTL: GET /policy?scope=tenant returns the stored body.
+    Note over A,CTL: GET /policy/effective?user_owner_id=<u> resolves tenant + user policies and returns the merged result.
 ```
 
 ### 3.7 Database Schemas & Tables

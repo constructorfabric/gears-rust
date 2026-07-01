@@ -14,6 +14,7 @@ fn sample_claims(op: Op, exp: i64) -> Claims {
         backend_path: "/f/v".to_owned(),
         exp,
         upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
     }
 }
 

@@ -130,4 +130,45 @@ impl StorageBackend for LocalFsBackend {
             Err(e) => Err(self.io_err(e)),
         }
     }
+
+    /// Walk the root directory recursively and return all file paths as
+    /// backend-relative paths in the form `"/{component}/{component}"`.
+    ///
+    /// Non-existent root (fresh install with no uploads yet) returns an empty
+    /// vec rather than an error.
+    ///
+    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
+        // If the root does not exist yet (no blobs written), return empty.
+        match tokio::fs::metadata(&self.root).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(self.io_err(e)),
+        }
+
+        let mut paths = Vec::new();
+        let mut stack = vec![self.root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let mut entries = tokio::fs::read_dir(&dir)
+                .await
+                .map_err(|e| self.io_err(e))?;
+
+            while let Some(entry) = entries.next_entry().await.map_err(|e| self.io_err(e))? {
+                let ft = entry.file_type().await.map_err(|e| self.io_err(e))?;
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                } else if ft.is_file() {
+                    // Strip the root prefix and convert OS separator to '/'.
+                    let abs = entry.path();
+                    if let Ok(rel) = abs.strip_prefix(&self.root) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        paths.push(format!("/{rel_str}"));
+                    }
+                }
+            }
+        }
+
+        Ok(paths)
+    }
 }

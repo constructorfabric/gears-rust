@@ -94,16 +94,55 @@ Multipart is **server-authoritative**: the client sends desired parameters and t
 parts plan (sizes/offsets) with **one signed URL per part** pointing at the sidecar.
 
 ```text
-P2-1. POST /files/{id}/multipart            initiate (JSON: size, preferred part size, concurrency); returns the parts plan + per-part signed URLs
+P2-1. POST /files/{id}/multipart            initiate (JSON: declared_mime, declared_size, preferred part size, concurrency); returns the parts plan + per-part signed URLs
 P2-2. PUT  <signed part url>                upload one part to the sidecar (raw body)
 P2-3. POST /files/{id}/multipart/{upload_id}/complete   finalize (combine BLAKE3 subtree hashes → root); binds the version  — If-Match
 P2-4. DELETE /files/{id}/multipart/{upload_id}          abort; parts discarded
 P2-5. GET  /files/{id}/multipart/{upload_id}            list uploaded parts (introspection)
 ```
 
-For a `multipart_native` backend the sidecar drives the backend multipart API; otherwise it offset-writes each part
-into the single new-version object. Per-part BLAKE3 subtree hashes are persisted in `multipart_upload_parts.part_hash`
-and combined into the root at `complete`. Detailed envelope/error shapes are owned by the P2 FEATURE.
+**`P2-1` initiate request body** (`application/json`):
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `declared_mime` | `string` | yes | MIME type of the file being uploaded (e.g. `video/mp4`). Validated against the effective allowed-types policy. |
+| `declared_size` | `uint64` | yes | Total file size in bytes. The control plane validates this against the effective policy size limit and storage quota at initiate time — exactly like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any bytes are transferred. `413` if it exceeds the limit; `507` if it would exceed the storage quota. |
+
+**`P2-1` initiate response** (`application/json`) — the server-computed plan:
+
+```json
+{
+  "upload_id": "uuid",
+  "version_id": "uuid",
+  "part_hash_algorithm": "BLAKE3",
+  "part_size": 8388608,
+  "parts": [
+    { "part_number": 1, "offset": 0, "size": 8388608, "upload_url": "https://sidecar/…?fs-token=…" },
+    { "part_number": 2, "offset": 8388608, "size": 2097152, "upload_url": "…" }
+  ],
+  "expires_at": "RFC3339"
+}
+```
+
+**`P2-2` upload part** — the client `PUT`s each part's raw body to its `upload_url` on the sidecar. Each URL is a
+signed token (ADR-0004) carrying the part's `upload_id`, `part_number`, `offset`, and **exact `size`** as claims. The
+sidecar **MUST** reject a body whose length ≠ the `size` claim with `413` **before** writing — so per-part size is
+enforced at transfer time and oversized bytes never reach the backend. Re-`PUT` of the same part is idempotent
+(enables resume). For a `multipart_native` backend the sidecar drives the backend multipart API; otherwise it
+offset-writes each part into the single new-version object. Per-part BLAKE3 subtree hashes are persisted in
+`multipart_upload_parts.part_hash` and combined into the root at `complete`.
+
+Full request/response envelopes, error taxonomy, token claims, persistence, and resumability are specified in the
+FEATURE artifact **[features/multipart-coordinator.md](./features/multipart-coordinator.md)**.
+
+> **Implementation status**: the server-authoritative flow is **shipped**. `POST /files/{id}/multipart` computes the
+> parts plan and returns one signed sidecar URL per part (each token carrying `upload_id`, `part_number`, `offset`, and
+> the exact `size` claim); the sidecar enforces the per-part size at transfer with `413` **before** any write. The
+> initiate-time `declared_size` gate is in place and `declared_size`/`part_size` are persisted on the session row so the
+> plan can be reconstituted for resume. The interim client-driven control-plane byte route (`PUT .../parts/{n}`) has
+> been **removed** — bytes flow exclusively to the sidecar (ADR-0003, FEATURE §8 migration). The complete-time
+> total-size check (assembled size == `declared_size`) remains as the defence-in-depth backstop. Note: per-part hashes
+> are **SHA-256** in P2 (not BLAKE3 subtree hashes); BLAKE3 alignment is deferred.
 
 ## Upload, bind, and the conflict retry
 

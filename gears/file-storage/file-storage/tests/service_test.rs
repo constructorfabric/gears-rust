@@ -18,6 +18,7 @@ use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
+use file_storage::domain::ports::DataPlanePort;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -62,10 +63,13 @@ async fn build_service() -> (Arc<FileService>, DataPlaneService) {
         sidecar_base_url: "http://sidecar.test".to_owned(),
         default_page_size: 50,
         max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
     };
     let store = Store::new(Arc::clone(&db));
-    let svc = Arc::new(FileService::new(store, backends, issuer, authorizer, cfg));
-    let dp = DataPlaneService::new(Arc::clone(&svc));
+    let svc = Arc::new(FileService::new(
+        store, backends, issuer, authorizer, cfg, None, None,
+    ));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     (svc, dp)
 }
 
@@ -97,7 +101,7 @@ async fn full_upload_bind_download_lifecycle() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file()).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
     assert!(ticket.upload_url.contains("fs-token="), "signed upload URL");
     assert!(ticket.upload_url.starts_with("http://sidecar.test"));
 
@@ -158,7 +162,7 @@ async fn full_upload_bind_download_lifecycle() {
 async fn bind_with_wrong_if_match_returns_precondition_failed() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t1 = svc.create_file(&ctx, new_file()).await.unwrap();
+    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -208,7 +212,7 @@ async fn tenant_isolation_hides_other_tenants_files() {
     let ctx_a = ctx(Uuid::now_v7());
     let ctx_b = ctx(Uuid::now_v7());
 
-    let t = svc.create_file(&ctx_a, new_file()).await.unwrap();
+    let t = svc.create_file(&ctx_a, new_file(), None).await.unwrap();
     // Tenant B cannot see tenant A's file.
     let err = svc.get_file(&ctx_b, t.file_id).await.unwrap_err();
     assert!(
@@ -225,7 +229,7 @@ async fn content_type_mismatch_is_rejected() {
     let ctx = ctx(Uuid::now_v7());
     let mut nf = new_file();
     nf.mime_type = "image/png".to_owned();
-    let t = svc.create_file(&ctx, nf).await.unwrap();
+    let t = svc.create_file(&ctx, nf, None).await.unwrap();
 
     // Declared png, but the bytes are a PDF signature → mismatch.
     let err = dp
@@ -248,7 +252,7 @@ async fn content_type_mismatch_is_rejected() {
 async fn update_metadata_merges_and_bumps_meta_version() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t = svc.create_file(&ctx, new_file()).await.unwrap();
+    let t = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
     let patch = CustomMetadataPatch {
         entries: vec![
@@ -283,7 +287,7 @@ async fn update_metadata_merges_and_bumps_meta_version() {
 async fn restore_prior_version_rebinds_pointer() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t1 = svc.create_file(&ctx, new_file()).await.unwrap();
+    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -329,7 +333,7 @@ async fn restore_prior_version_rebinds_pointer() {
 async fn delete_file_then_get_returns_not_found() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t = svc.create_file(&ctx, new_file()).await.unwrap();
+    let t = svc.create_file(&ctx, new_file(), None).await.unwrap();
     // No bound content yet: use "*" (wildcard If-Match).
     svc.delete_file(&ctx, t.file_id, Some("*")).await.unwrap();
     let err = svc.get_file(&ctx, t.file_id).await.unwrap_err();
@@ -345,7 +349,7 @@ async fn download_url_pending_version_is_rejected() {
     let ctx = ctx(Uuid::now_v7());
 
     // Create a file — the first version is pending (upload not yet finalized).
-    let ticket = svc.create_file(&ctx, new_file()).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
     // Requesting a signed URL for a pending version must fail with Conflict.
     let err = svc
@@ -364,7 +368,7 @@ async fn delete_file_if_match_required_and_enforced() {
     let ctx = ctx(Uuid::now_v7());
 
     // Create, upload, and bind a file so it has a real content ETag.
-    let ticket = svc.create_file(&ctx, new_file()).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -419,7 +423,7 @@ async fn list_files_filters_by_owner() {
     let owner = Uuid::now_v7();
     let mut nf = new_file();
     nf.owner_id = owner;
-    let t = svc.create_file(&ctx, nf).await.unwrap();
+    let t = svc.create_file(&ctx, nf, None).await.unwrap();
 
     let found = svc
         .list_files(

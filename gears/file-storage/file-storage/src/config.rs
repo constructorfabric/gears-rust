@@ -51,6 +51,58 @@ pub struct FileStorageConfig {
     /// the sidecar must be reconfigured. Configure this in any real deployment.
     #[serde(default)]
     pub signing_key_seed: Option<String>,
+
+    /// Window (seconds) for which an idempotency key is retained.
+    /// After this window, a retry with the same key is treated as a fresh request.
+    /// Default: 86400 (24 hours).
+    ///
+    /// @cpt-cf-file-storage-fr-upload-idempotency
+    #[serde(default = "default_idempotency_ttl_secs")]
+    pub idempotency_ttl_secs: u64,
+
+    /// Grace period (seconds) before a pending version or abandoned multipart
+    /// session is eligible for orphan reconciliation.
+    /// Default: 3600 (1 hour).
+    ///
+    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    #[serde(default = "default_orphan_grace_secs")]
+    pub orphan_grace_secs: u64,
+
+    /// How often (seconds) the background cleanup sweep fires.
+    /// Default: 3600 (1 hour).
+    ///
+    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    /// @cpt-cf-file-storage-fr-retention-policies
+    #[serde(default = "default_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
+
+    /// When `true`, the background cleanup sweep is started at gear init.
+    /// **Must be `false` by default** so integration tests are deterministic.
+    ///
+    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    /// @cpt-cf-file-storage-fr-retention-policies
+    #[serde(default = "default_enable_background_sweep")]
+    pub enable_background_sweep: bool,
+}
+
+impl FileStorageConfig {
+    /// Validates cross-field invariants that `serde` cannot express.
+    ///
+    /// Called at gear init (see `gear.rs`) before the config is used to wire
+    /// anything up, so a misconfiguration fails fast with a clear message
+    /// rather than manifesting as runtime misbehaviour.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // A zero sweep interval with the sweep enabled turns the background
+        // loop (`sleep(Duration::from_secs(0))`) into a tight spin that pegs
+        // the runtime and floods the logs. Reject it up front.
+        if self.enable_background_sweep && self.sweep_interval_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: sweep_interval_secs must be > 0 when \
+                 enable_background_sweep is true"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for FileStorageConfig {
@@ -62,6 +114,10 @@ impl fmt::Debug for FileStorageConfig {
             .field("default_page_size", &self.default_page_size)
             .field("max_page_size", &self.max_page_size)
             .field("storage_root", &self.storage_root)
+            .field("idempotency_ttl_secs", &self.idempotency_ttl_secs)
+            .field("orphan_grace_secs", &self.orphan_grace_secs)
+            .field("sweep_interval_secs", &self.sweep_interval_secs)
+            .field("enable_background_sweep", &self.enable_background_sweep)
             // Never print the signing key — only whether one is configured.
             .field(
                 "signing_key_seed",
@@ -81,6 +137,10 @@ impl Default for FileStorageConfig {
             max_page_size: default_max_page_size(),
             storage_root: default_storage_root(),
             signing_key_seed: None,
+            idempotency_ttl_secs: default_idempotency_ttl_secs(),
+            orphan_grace_secs: default_orphan_grace_secs(),
+            sweep_interval_secs: default_sweep_interval_secs(),
+            enable_background_sweep: default_enable_background_sweep(),
         }
     }
 }
@@ -110,6 +170,22 @@ fn default_max_page_size() -> u64 {
 
 fn default_storage_root() -> String {
     "./.file-storage-data".to_owned()
+}
+
+fn default_idempotency_ttl_secs() -> u64 {
+    86400 // 24 hours
+}
+
+fn default_orphan_grace_secs() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_sweep_interval_secs() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_enable_background_sweep() -> bool {
+    false // must be false so tests are deterministic
 }
 
 #[cfg(test)]

@@ -39,6 +39,8 @@ pub struct BackendCapabilities {
     pub range_native: bool,
     /// Internal-only presigned URLs (backend-to-backend tooling); never exposed.
     pub presigned_url_internal: bool,
+    /// Maximum blob size the backend accepts in bytes. `None` = unbounded.
+    pub max_size_bytes: Option<u64>,
 }
 
 /// A storage backend: moves immutable content blobs. All methods are keyed by an
@@ -79,6 +81,64 @@ pub trait StorageBackend: Send + Sync {
 
     /// Whether a blob exists at `path`.
     async fn exists(&self, path: &str) -> Result<bool, DomainError>;
+
+    /// Initiate a multipart upload for `path`. Returns an opaque backend handle.
+    /// Default returns an error — backends must opt-in by overriding this method
+    /// and setting `multipart_native: true` in their capabilities.
+    ///
+    /// @cpt-cf-file-storage-fr-multipart-upload
+    async fn initiate_multipart(&self, _path: &str) -> Result<String, DomainError> {
+        Err(DomainError::multipart_not_supported(self.id()))
+    }
+
+    /// Upload one part. Returns `(backend_etag, part_hash_bytes)`.
+    ///
+    /// @cpt-cf-file-storage-fr-multipart-upload
+    async fn upload_part(
+        &self,
+        _path: &str,
+        _upload_handle: &str,
+        _part_number: u32,
+        _data: Bytes,
+    ) -> Result<(String, Vec<u8>), DomainError> {
+        Err(DomainError::multipart_not_supported(self.id()))
+    }
+
+    /// Complete a multipart upload, assembling all uploaded parts in order.
+    ///
+    /// Returns the SHA-256 digest of the fully assembled object, so the control
+    /// plane can persist the hash of the *actual* stored bytes (matching what
+    /// `get`/`migrate_backend` would recompute) rather than a hash derived from
+    /// the individual part digests.
+    ///
+    /// @cpt-cf-file-storage-fr-multipart-upload
+    async fn complete_multipart(
+        &self,
+        _path: &str,
+        _upload_handle: &str,
+        _parts: &[(u32, String)],
+    ) -> Result<Vec<u8>, DomainError> {
+        Err(DomainError::multipart_not_supported(self.id()))
+    }
+
+    /// Abort a multipart upload, discarding all uploaded parts.
+    ///
+    /// @cpt-cf-file-storage-fr-multipart-upload
+    async fn abort_multipart(&self, _path: &str, _upload_handle: &str) -> Result<(), DomainError> {
+        Err(DomainError::multipart_not_supported(self.id()))
+    }
+
+    /// Enumerate all object paths stored by this backend (for orphan
+    /// reconciliation). Returns paths in the same format they are stored in
+    /// `file_versions.backend_path` (e.g. `"/{file_id}/{version_id}"`).
+    ///
+    /// The default implementation returns an empty vec — backends that cannot
+    /// enumerate their contents are treated conservatively (unknown = skip).
+    ///
+    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
+        Ok(vec![])
+    }
 }
 
 /// Registry of configured backends, with one designated default for new uploads.

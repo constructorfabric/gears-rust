@@ -49,6 +49,44 @@ fn rejects_unknown_fields() {
 }
 
 #[test]
+fn validate_rejects_zero_sweep_interval_when_sweep_enabled() {
+    // A zero interval with the sweep on would spin the background loop tight.
+    let cfg = FileStorageConfig {
+        sweep_interval_secs: 0,
+        enable_background_sweep: true,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "sweep_interval_secs == 0 must be rejected when the sweep is enabled"
+    );
+}
+
+#[test]
+fn validate_accepts_positive_sweep_interval_when_sweep_enabled() {
+    let cfg = FileStorageConfig {
+        sweep_interval_secs: 60,
+        enable_background_sweep: true,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "a positive sweep interval must pass validation"
+    );
+}
+
+#[test]
+fn validate_ignores_zero_sweep_interval_when_sweep_disabled() {
+    // With the sweep off the interval is unused, so it need not be constrained.
+    let cfg = FileStorageConfig {
+        sweep_interval_secs: 0,
+        enable_background_sweep: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
 fn serde_round_trip_preserves_value() {
     let original = FileStorageConfig {
         max_url_ttl_secs: 12_345,

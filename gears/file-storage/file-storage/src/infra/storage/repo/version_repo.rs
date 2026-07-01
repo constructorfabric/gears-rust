@@ -2,13 +2,14 @@
 
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, Set};
+use time::OffsetDateTime;
 use toolkit_db::secure::{
     DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, secure_insert,
 };
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use file_storage_sdk::FileVersion;
+use file_storage_sdk::{FileVersion, VersionStatus};
 
 use crate::domain::error::DomainError;
 use crate::infra::storage::db::db_err;
@@ -197,6 +198,90 @@ impl VersionRepo {
         version_id: Uuid,
     ) -> Result<bool, DomainError> {
         let res = Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(Column::FileId.eq(file_id))
+                    .add(Column::VersionId.eq(version_id)),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// List all `pending` version rows whose `created_at` is older than
+    /// `older_than`. Used by the orphan-reconciliation sweep.
+    ///
+    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    pub async fn list_pending_older_than<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        older_than: OffsetDateTime,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        let rows = Entity::find()
+            .filter(
+                Condition::all()
+                    .add(Column::Status.eq(VersionStatus::Pending.as_str()))
+                    .add(Column::CreatedAt.lt(older_than)),
+            )
+            .order_by_asc(Column::CreatedAt)
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// List all non-current version rows whose `created_at` is older than
+    /// `older_than`. Used by the retention-policy sweep for superseded versions.
+    ///
+    /// @cpt-cf-file-storage-fr-retention-policies
+    pub async fn list_non_current_older_than<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        older_than: OffsetDateTime,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        let rows = Entity::find()
+            .filter(
+                Condition::all()
+                    // Restrict to finalized/available versions so unfinished
+                    // `pending` uploads are left to the orphan-reconciliation
+                    // sweep (`list_pending_older_than`) and never deleted here
+                    // as retention-superseded.
+                    .add(Column::Status.eq(VersionStatus::Available.as_str()))
+                    .add(Column::IsCurrent.eq(false))
+                    .add(Column::CreatedAt.lt(older_than)),
+            )
+            .order_by_asc(Column::CreatedAt)
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Transactionally update `backend_id` and `backend_path` for a version row.
+    /// Used by backend migration.
+    ///
+    /// @cpt-cf-file-storage-fr-backend-migration
+    pub async fn rebind_backend<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        version_id: Uuid,
+        new_backend_id: &str,
+        new_backend_path: &str,
+    ) -> Result<bool, DomainError> {
+        let res = Entity::update_many()
+            .col_expr(Column::BackendId, Expr::value(new_backend_id))
+            .col_expr(Column::BackendPath, Expr::value(new_backend_path))
             .filter(
                 Condition::all()
                     .add(Column::FileId.eq(file_id))

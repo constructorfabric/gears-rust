@@ -52,6 +52,43 @@ pub enum DomainError {
 
     #[error("Internal error")]
     InternalError,
+
+    /// 422 — mime type not permitted by the effective policy.
+    #[error("MIME type '{mime_type}' is not permitted by policy")]
+    PolicyMimeNotAllowed { mime_type: String },
+
+    /// 413 — file size exceeds policy or backend limit.
+    #[error("File size exceeds limit: {limit_bytes} bytes ({limit_source})")]
+    PolicySizeExceeded {
+        limit_bytes: u64,
+        limit_source: String,
+    },
+
+    /// 422 — custom metadata violates policy limits.
+    #[error("Metadata limit exceeded: {reason}")]
+    PolicyMetadataExceeded { reason: String },
+
+    /// 403 — storage quota would be exceeded.
+    #[error("Storage quota exceeded: {reason}")]
+    QuotaExceeded { reason: String },
+
+    /// 422 — backend does not support native multipart upload.
+    #[error("Backend '{backend_id}' does not support multipart upload")]
+    MultipartNotSupported { backend_id: String },
+
+    /// 404 — the multipart upload session does not exist.
+    #[error("Multipart upload session not found: {upload_id}")]
+    MultipartUploadNotFound { upload_id: Uuid },
+
+    /// 409 — the multipart upload session is not in the `in_progress` state.
+    #[error("Multipart upload session {upload_id} is not in progress (state: {state})")]
+    MultipartUploadNotInProgress { upload_id: Uuid, state: String },
+
+    /// 409 — backend migration was requested for a versioned file (>1 version).
+    ///
+    /// @cpt-cf-file-storage-fr-backend-migration
+    #[error("File {file_id} has multiple versions and cannot be migrated between backends")]
+    VersionedFileMigrationNotSupported { file_id: Uuid },
 }
 
 impl DomainError {
@@ -130,5 +167,62 @@ impl DomainError {
         Self::TokenInvalid {
             reason: reason.into(),
         }
+    }
+
+    #[must_use]
+    pub fn policy_mime_not_allowed(mime_type: impl Into<String>) -> Self {
+        Self::PolicyMimeNotAllowed {
+            mime_type: mime_type.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn policy_size_exceeded(limit_bytes: u64, source: impl Into<String>) -> Self {
+        Self::PolicySizeExceeded {
+            limit_bytes,
+            limit_source: source.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn policy_metadata_exceeded(reason: impl Into<String>) -> Self {
+        Self::PolicyMetadataExceeded {
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn quota_exceeded(reason: impl Into<String>) -> Self {
+        Self::QuotaExceeded {
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn multipart_not_supported(backend_id: impl Into<String>) -> Self {
+        Self::MultipartNotSupported {
+            backend_id: backend_id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn multipart_upload_not_found(upload_id: Uuid) -> Self {
+        Self::MultipartUploadNotFound { upload_id }
+    }
+
+    #[must_use]
+    pub fn multipart_upload_not_in_progress(upload_id: Uuid, state: impl Into<String>) -> Self {
+        Self::MultipartUploadNotInProgress {
+            upload_id,
+            state: state.into(),
+        }
+    }
+
+    /// 409 — the file has multiple versions and cannot be migrated between backends.
+    ///
+    /// @cpt-cf-file-storage-fr-backend-migration
+    #[must_use]
+    pub fn versioned_file_migration_not_supported(file_id: Uuid) -> Self {
+        Self::VersionedFileMigrationNotSupported { file_id }
     }
 }

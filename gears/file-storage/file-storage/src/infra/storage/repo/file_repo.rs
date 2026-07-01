@@ -170,4 +170,61 @@ impl FileRepo {
             .map_err(db_err)?;
         Ok(res.rows_affected > 0)
     }
+
+    /// List files across all tenants for the retention sweep engine,
+    /// **keyset-paginated by `file_id`** to bound sweep memory on large
+    /// deployments. Returns up to `limit` files ordered by `file_id`, starting
+    /// strictly after `after` (`None` = from the beginning); the caller loops,
+    /// advancing `after` to the last returned `file_id`, until it gets a short
+    /// page. Keyset (not offset) paging is used so that deleting expired files
+    /// mid-sweep does not shift the window and skip rows.
+    ///
+    /// @cpt-cf-file-storage-fr-retention-policies
+    pub async fn list_all_for_sweep<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        let mut query = Entity::find();
+        if let Some(after_id) = after {
+            query = query.filter(Column::FileId.gt(after_id));
+        }
+        let rows = query
+            .order_by_asc(Column::FileId)
+            .limit(limit)
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Update `owner_kind` and `owner_id` for a file row, and bump
+    /// `last_modified_at`. Returns `true` if a row was found and updated.
+    ///
+    /// @cpt-cf-file-storage-fr-ownership-transfer
+    pub async fn update_owner<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        new_owner_kind: &str,
+        new_owner_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        let res = Entity::update_many()
+            .col_expr(Column::OwnerKind, Expr::value(new_owner_kind.to_owned()))
+            .col_expr(Column::OwnerId, Expr::value(new_owner_id))
+            .col_expr(Column::LastModifiedAt, Expr::value(now))
+            .filter(Column::FileId.eq(file_id))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected > 0)
+    }
 }
