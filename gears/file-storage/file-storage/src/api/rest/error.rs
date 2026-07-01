@@ -82,6 +82,67 @@ impl From<DomainError> for CanonicalError {
                 tracing::error!(error = ?e, "internal error");
                 CanonicalError::internal("internal error").create()
             }
+            DomainError::PolicyMimeNotAllowed { mime_type } => {
+                FileResourceError::invalid_argument()
+                    .with_field_violation(
+                        "mime_type",
+                        format!("MIME type '{mime_type}' is not permitted by policy"),
+                        "POLICY_MIME_NOT_ALLOWED",
+                    )
+                    .create()
+            }
+            DomainError::PolicySizeExceeded {
+                limit_bytes,
+                limit_source,
+            } => FileResourceError::out_of_range(format!(
+                "file size exceeds limit of {limit_bytes} bytes ({limit_source})"
+            ))
+            .with_field_violation(
+                "size",
+                format!("exceeds limit of {limit_bytes} bytes ({limit_source})"),
+                "POLICY_SIZE_EXCEEDED",
+            )
+            .create(),
+            DomainError::PolicyMetadataExceeded { reason } => FileResourceError::invalid_argument()
+                .with_field_violation(
+                    "custom_metadata",
+                    reason.clone(),
+                    "POLICY_METADATA_EXCEEDED",
+                )
+                .create(),
+            DomainError::QuotaExceeded { reason } => {
+                FileResourceError::resource_exhausted(reason.clone())
+                    .with_quota_violation("storage_bytes", reason.clone())
+                    .create()
+            }
+            DomainError::MultipartNotSupported { backend_id } => {
+                FileResourceError::invalid_argument()
+                    .with_field_violation(
+                        "backend",
+                        format!("backend '{backend_id}' does not support multipart upload"),
+                        "MULTIPART_NOT_SUPPORTED",
+                    )
+                    .create()
+            }
+            DomainError::MultipartUploadNotFound { upload_id } => FileResourceError::not_found(
+                format!("Multipart upload session {upload_id} not found"),
+            )
+            .with_resource(upload_id.to_string())
+            .create(),
+            DomainError::MultipartUploadNotInProgress { upload_id, state } => {
+                FileResourceError::aborted(format!(
+                    "Multipart upload session {upload_id} is not in progress (state: {state})"
+                ))
+                .with_reason("MULTIPART_NOT_IN_PROGRESS")
+                .create()
+            }
+            DomainError::VersionedFileMigrationNotSupported { file_id } => {
+                FileResourceError::aborted(format!(
+                    "File {file_id} has multiple versions and cannot be migrated between backends"
+                ))
+                .with_reason("VERSIONED_FILE_MIGRATION_NOT_SUPPORTED")
+                .create()
+            }
         }
     }
 }

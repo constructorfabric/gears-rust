@@ -1063,6 +1063,48 @@ sequenceDiagram
     CTL-->>C: 200 + JSON {items, next_cursor}
 ```
 
+#### Configure policy (P2-M1)
+
+**ID**: `cpt-cf-file-storage-seq-configure-policy`
+
+**Use cases**: `cpt-cf-file-storage-usecase-configure-policy`
+
+**Functional requirements**: `cpt-cf-file-storage-fr-allowed-types-policy`,
+`cpt-cf-file-storage-fr-size-limits-policy`, `cpt-cf-file-storage-fr-metadata-limits`,
+`cpt-cf-file-storage-fr-retention-policies`
+
+The `configure-policy` use case lets operators set a tenant-scoped (or user-scoped) policy that governs
+allowed MIME types, size limits, custom-metadata limits, and retention rules.  The effective policy seen
+by enforcement (P2-M2) is the **most-restrictive intersection** of the tenant policy and the requesting
+user's policy:
+
+- **Allowed MIME types**: intersection of both sets (empty = deny all); if only one side is set, that
+  side wins; if neither is set, all types are allowed.
+- **Max file size / per-MIME size**: minimum of both limits; missing on one side means the other
+  side's limit applies.
+- **Metadata limits** (`max_pairs`, `max_key_len`, `max_value_len`, `max_total_bytes`): minimum of
+  each field across both sides.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Admin / operator
+    participant CTL as Control plane
+    participant AZ as authz-adapter
+    participant DB as Postgres
+
+    A->>CTL: PUT /api/file-storage/v1/policy?scope=tenant
+    CTL->>AZ: check(action=write, resource=policy)
+    AZ-->>CTL: Allow
+    CTL->>DB: DELETE existing row (tenant_id, scope, scope_owner_id IS NULL)
+    CTL->>DB: INSERT new policy row (UUID v7, body = JSON)
+    DB-->>CTL: OK
+    CTL-->>A: 200 { policy_id, ... }
+
+    Note over A,CTL: GET /policy?scope=tenant returns the stored body.
+    Note over A,CTL: GET /policy/effective?user_owner_id=<u> resolves tenant + user policies and returns the merged result.
+```
+
 ### 3.7 Database Schemas & Tables
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-db-overview`

@@ -8,5 +8,7 @@
 pub mod authz;
 pub mod backend;
 pub mod content;
+pub mod quota;
 pub mod signed_url;
 pub mod storage;
+pub mod usage;

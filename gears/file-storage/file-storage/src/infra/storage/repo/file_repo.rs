@@ -170,4 +170,30 @@ impl FileRepo {
             .map_err(db_err)?;
         Ok(res.rows_affected > 0)
     }
+
+    /// Update `owner_kind` and `owner_id` for a file row, and bump
+    /// `last_modified_at`. Returns `true` if a row was found and updated.
+    ///
+    /// @cpt-cf-file-storage-fr-ownership-transfer
+    pub async fn update_owner<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        new_owner_kind: &str,
+        new_owner_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        let res = Entity::update_many()
+            .col_expr(Column::OwnerKind, Expr::value(new_owner_kind.to_owned()))
+            .col_expr(Column::OwnerId, Expr::value(new_owner_id))
+            .col_expr(Column::LastModifiedAt, Expr::value(now))
+            .filter(Column::FileId.eq(file_id))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected > 0)
+    }
 }

@@ -16,6 +16,7 @@ use tracing::{debug, info};
 use crate::api::rest::routes;
 use crate::config::FileStorageConfig;
 use crate::domain::authz::Authorizer;
+use crate::domain::cleanup::{CleanupConfig, CleanupEngine};
 use crate::domain::local_client::FileStorageLocalClient;
 use crate::domain::service::{FileService, ServiceConfig};
 use crate::infra::authz::PolicyEnforcerAuthorizer;
@@ -107,15 +108,51 @@ impl Gear for FileStorageGear {
             sidecar_base_url: cfg.sidecar_base_url,
             default_page_size: cfg.default_page_size,
             max_page_size: cfg.max_page_size,
+            idempotency_ttl_secs: cfg.idempotency_ttl_secs,
         };
 
         let store = Store::new(Arc::clone(&db));
+
+        // Clone store + backends before moving them into FileService so the
+        // cleanup engine can share them (both types are `Clone`).
+        let sweep_store = store.clone();
+        let sweep_backends = backends.clone();
+
+        // TODO(P2): wire the quota-enforcement client once the Quota Enforcement
+        // gear exposes an SDK crate. For now, no quota checks are performed.
+        // TODO(P2-M5): wire the usage reporter once a Usage Collector SDK is available.
         let service = Arc::new(FileService::new(
-            store, backends, issuer, authorizer, svc_cfg,
+            store, backends, issuer, authorizer, svc_cfg, None, // quota_client
+            None, // usage_reporter
         ));
         self.service
             .set(service)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+
+        // Optional background cleanup sweep (disabled by default so tests are
+        // deterministic; enable via `enable_background_sweep = true` in config).
+        if cfg.enable_background_sweep {
+            let sweep_secs = cfg.sweep_interval_secs;
+            let engine = Arc::new(CleanupEngine::new(
+                sweep_store,
+                sweep_backends,
+                CleanupConfig {
+                    orphan_grace_secs: cfg.orphan_grace_secs,
+                },
+            ));
+            tokio::spawn(async move {
+                let interval = tokio::time::Duration::from_secs(sweep_secs);
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let result = engine.run_sweep().await;
+                    tracing::info!(?result, "file-storage cleanup sweep completed");
+                }
+            });
+            info!(
+                "file-storage background cleanup sweep enabled (interval={}s, grace={}s)",
+                sweep_secs, cfg.orphan_grace_secs
+            );
+        }
 
         ctx.client_hub()
             .register::<dyn file_storage_sdk::FileStorageClientV1>(Arc::new(

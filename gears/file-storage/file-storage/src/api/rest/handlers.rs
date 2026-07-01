@@ -17,11 +17,15 @@ use toolkit_security::SecurityContext;
 use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 
 use super::dto::{
-    BindReq, CreateFileReq, DownloadTicketDto, FileDto, StorageDto, UpdateMetadataReq,
+    BindReq, CreateFileReq, CreateRetentionRuleReq, DownloadTicketDto, EffectivePolicyDto, FileDto,
+    InitiateMultipartReq, MigrateBackendReq, MultipartSessionDto, PolicyDto, RetentionRuleDto,
+    SetPolicyReq, StorageDto, TransferOwnershipReq, UpdateMetadataReq, UploadPartDto,
     UploadTicketDto, VersionDto,
 };
 use crate::domain::error::DomainError;
 use crate::domain::etag;
+use crate::domain::multipart::MultipartUploadSession;
+use crate::domain::policy::{PolicyScope, RetentionScope};
 use crate::domain::service::FileService;
 
 type Svc = Extension<Arc<FileService>>;
@@ -75,7 +79,7 @@ pub async fn create_file(
             })
             .collect(),
     };
-    let ticket = svc.create_file(&ctx, new).await?;
+    let ticket = svc.create_file(&ctx, new, req.idempotency_key).await?;
     let id = ticket.file_id.to_string();
     Ok(created_json(
         UploadTicketDto {
@@ -254,4 +258,236 @@ pub async fn get_storage(
 ) -> ApiResult<JsonBody<StorageDto>> {
     let (id, caps) = svc.get_backend(&storage_id)?;
     Ok(Json(StorageDto::new(id, caps)))
+}
+
+// ── policy (P2-M1) ──────────────────────────────────────────────────────────────
+
+/// Query params for `GET /policy` (own policy for a given scope).
+#[derive(Debug, Deserialize)]
+pub struct GetPolicyQuery {
+    /// `"tenant"` or `"user"`.
+    pub scope: String,
+    /// Required when `scope = "user"`.
+    pub scope_owner_id: Option<Uuid>,
+}
+
+/// Query params for `GET /policy/effective`.
+#[derive(Debug, Deserialize)]
+pub struct EffectivePolicyQuery {
+    /// The user owner id to include in the effective resolution (optional).
+    pub user_owner_id: Option<Uuid>,
+}
+
+/// `GET /policy` — return the raw own policy for a scope.
+///
+/// @cpt-cf-file-storage-usecase-configure-policy
+pub async fn get_policy(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Query(q): Query<GetPolicyQuery>,
+) -> ApiResult<impl axum::response::IntoResponse> {
+    let policy_scope = PolicyScope::parse(&q.scope)
+        .ok_or_else(|| DomainError::validation("scope", "must be 'tenant' or 'user'"))?;
+    let stored = svc
+        .get_own_policy(&ctx, policy_scope, q.scope_owner_id)
+        .await?;
+    match stored {
+        Some(p) => Ok((StatusCode::OK, Json(PolicyDto::from(p))).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+/// `PUT /policy` — upsert the policy for a scope.
+///
+/// @cpt-cf-file-storage-usecase-configure-policy
+pub async fn set_policy(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Json(req): Json<SetPolicyReq>,
+) -> ApiResult<JsonBody<PolicyDto>> {
+    let policy_scope = PolicyScope::parse(&req.scope)
+        .ok_or_else(|| DomainError::validation("scope", "must be 'tenant' or 'user'"))?;
+    let body = req.body.into();
+    let stored = svc
+        .set_policy(&ctx, policy_scope, req.scope_owner_id, body)
+        .await?;
+    Ok(Json(PolicyDto::from(stored)))
+}
+
+/// `GET /policy/effective` — compute the effective (most-restrictive) policy.
+///
+/// @cpt-cf-file-storage-usecase-configure-policy
+pub async fn get_effective_policy(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Query(q): Query<EffectivePolicyQuery>,
+) -> ApiResult<JsonBody<EffectivePolicyDto>> {
+    let ep = svc.get_effective_policy(&ctx, q.user_owner_id).await?;
+    Ok(Json(EffectivePolicyDto::from(ep)))
+}
+
+// ── retention rules (P2-M1) ────────────────────────────────────────────────────
+
+/// `GET /retention-rules` — list all retention rules for the caller's tenant.
+///
+/// @cpt-cf-file-storage-fr-retention-policies
+pub async fn list_retention_rules(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+) -> ApiResult<JsonBody<Vec<RetentionRuleDto>>> {
+    let rules = svc.list_retention_rules(&ctx).await?;
+    Ok(Json(
+        rules.into_iter().map(RetentionRuleDto::from).collect(),
+    ))
+}
+
+/// `POST /retention-rules` — create a new retention rule.
+///
+/// @cpt-cf-file-storage-fr-retention-policies
+pub async fn create_retention_rule(
+    uri: Uri,
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Json(req): Json<CreateRetentionRuleReq>,
+) -> ApiResult<impl axum::response::IntoResponse> {
+    let retention_scope = RetentionScope::parse(&req.scope)
+        .ok_or_else(|| DomainError::validation("scope", "must be 'tenant', 'user', or 'file'"))?;
+    let body = req.body.into();
+    let rule = svc
+        .create_retention_rule(&ctx, retention_scope, req.scope_target_id, body)
+        .await?;
+    let id = rule.rule_id.to_string();
+    Ok(created_json(RetentionRuleDto::from(rule), &uri, &id).into_response())
+}
+
+/// `DELETE /retention-rules/{rule_id}` — delete a retention rule.
+///
+/// @cpt-cf-file-storage-fr-retention-policies
+pub async fn delete_retention_rule(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Path(rule_id): Path<Uuid>,
+) -> ApiResult<impl axum::response::IntoResponse> {
+    let removed = svc.delete_retention_rule(&ctx, rule_id).await?;
+    if removed {
+        Ok(no_content().into_response())
+    } else {
+        Err(DomainError::file_not_found(rule_id).into())
+    }
+}
+
+// ── multipart upload (P2-M3) ────────────────────────────────────────────────────
+
+fn session_to_dto(s: MultipartUploadSession) -> MultipartSessionDto {
+    MultipartSessionDto {
+        upload_id: s.upload_id,
+        file_id: s.file_id,
+        version_id: s.version_id,
+        state: s.state.as_str().to_owned(),
+        declared_mime: s.declared_mime,
+        expires_at: s.expires_at,
+    }
+}
+
+/// `POST /files/{id}/multipart` — initiate a multipart upload session.
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+pub async fn initiate_multipart(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Path(file_id): Path<Uuid>,
+    Json(req): Json<InitiateMultipartReq>,
+) -> ApiResult<JsonBody<MultipartSessionDto>> {
+    let session = svc
+        .initiate_multipart_upload(&ctx, file_id, &req.declared_mime)
+        .await?;
+    Ok(Json(session_to_dto(session)))
+}
+
+/// `PUT /files/{id}/multipart/{upload_id}/parts/{part_number}` — upload one part.
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+pub async fn upload_multipart_part(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Path((file_id, upload_id, part_number)): Path<(Uuid, Uuid, u32)>,
+    body: axum::body::Bytes,
+) -> ApiResult<JsonBody<UploadPartDto>> {
+    let part = svc
+        .upload_multipart_part(&ctx, file_id, upload_id, part_number, body)
+        .await?;
+    Ok(Json(UploadPartDto {
+        part_number: part.part_number,
+        backend_etag: part.backend_etag,
+        size: part.size,
+    }))
+}
+
+/// `POST /files/{id}/multipart/{upload_id}/complete` — finalize all parts.
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+pub async fn complete_multipart(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Path((file_id, upload_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<impl IntoResponse> {
+    svc.complete_multipart_upload(&ctx, file_id, upload_id)
+        .await?;
+    Ok(no_content().into_response())
+}
+
+/// `DELETE /files/{id}/multipart/{upload_id}` — abort a multipart upload.
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+pub async fn abort_multipart(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Path((file_id, upload_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<impl IntoResponse> {
+    svc.abort_multipart_upload(&ctx, file_id, upload_id).await?;
+    Ok(no_content().into_response())
+}
+
+// ── backend migration (P2-M4) ─────────────────────────────────────────────────
+
+/// `POST /files/{id}/migrate` — migrate a file's content to a different backend.
+///
+/// Non-versioned files only. Preserves identity and verifies content hash.
+///
+/// @cpt-cf-file-storage-fr-backend-migration
+pub async fn migrate_backend(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Path(file_id): Path<Uuid>,
+    Json(req): Json<MigrateBackendReq>,
+) -> ApiResult<impl IntoResponse> {
+    svc.migrate_backend(&ctx, file_id, &req.target_backend_id)
+        .await?;
+    Ok(no_content().into_response())
+}
+
+// ── ownership transfer (P2-M5) ────────────────────────────────────────────────
+
+/// `POST /files/{id}/transfer` — transfer ownership of a file to a new owner.
+///
+/// @cpt-cf-file-storage-fr-ownership-transfer
+pub async fn transfer_ownership(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+    Path(file_id): Path<Uuid>,
+    Json(req): Json<TransferOwnershipReq>,
+) -> ApiResult<JsonBody<FileDto>> {
+    let new_owner_kind = file_storage_sdk::OwnerKind::parse(&req.new_owner_kind)
+        .ok_or_else(|| DomainError::validation("new_owner_kind", "must be 'user' or 'app'"))?;
+    let file = svc
+        .transfer_ownership(&ctx, file_id, new_owner_kind, req.new_owner_id)
+        .await?;
+    // Re-read metadata for the full response. After transfer the scope may differ,
+    // so we fetch using the updated file's data.
+    let meta = svc
+        .get_file_with_metadata(&ctx, file_id)
+        .await
+        .map(|(_, m)| m)
+        .unwrap_or_default();
+    Ok(Json(FileDto::from_parts(file, meta)))
 }

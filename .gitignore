@@ -364,6 +364,9 @@ testing/e2e/logs/
 .cf-studio/config/kits/sdlc/*
 .cf-studio/.cache/explore/*
 
+# code-ranker reports
+.code-ranker/
+
 # Cached checkout of the web docs site for `make docs-preview`
 .web-docs-preview/
 
