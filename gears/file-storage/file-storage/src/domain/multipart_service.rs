@@ -118,19 +118,21 @@ impl MultipartService {
 
     /// Run a quota preflight check for `additional_bytes` of new storage.
     ///
+    /// At multipart initiate time this is called with the declared total size,
+    /// giving the quota service a precise figure rather than a pessimistic ceiling.
+    ///
     /// **Fail-closed**: a failing quota client denies the request.
     ///
     /// @cpt-cf-file-storage-fr-storage-quota
-    async fn check_quota(
+    async fn check_quota_bytes(
         &self,
         tenant_id: Uuid,
         owner_id: Uuid,
-        effective_max_bytes: Option<u64>,
+        additional_bytes: u64,
     ) -> Result<(), DomainError> {
         let Some(qc) = &self.quota_client else {
             return Ok(());
         };
-        let additional_bytes = effective_max_bytes.unwrap_or(1);
         match qc
             .check_storage_quota(tenant_id, owner_id, additional_bytes, QUOTA_METRIC_NAME)
             .await?
@@ -195,12 +197,23 @@ impl MultipartService {
 
     /// `POST /files/{id}/multipart`: initiate a multipart upload session.
     ///
+    /// The caller **must** declare the total file size up front.  The service
+    /// validates `declared_size` against the effective policy limit and storage
+    /// quota at this point — mirroring what single-part upload does at
+    /// create/presign time — so that an oversized upload is rejected before
+    /// any bytes are transferred (DESIGN §4.6, server-authoritative model).
+    ///
+    /// The complete-time total-size check is kept as defence-in-depth.
+    ///
     /// @cpt-cf-file-storage-fr-multipart-upload
+    /// @cpt-cf-file-storage-fr-size-limits-policy
+    /// @cpt-cf-file-storage-fr-storage-quota
     pub async fn initiate_multipart_upload(
         &self,
         ctx: &SecurityContext,
         file_id: Uuid,
         declared_mime: &str,
+        declared_size: u64,
     ) -> Result<MultipartUploadSession, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
@@ -214,7 +227,10 @@ impl MultipartService {
             return Err(DomainError::multipart_not_supported(backend.id()));
         }
 
-        // Policy checks: allowed mime type and size.
+        // Policy checks: allowed mime type and size (at initiate, against the
+        // declared total size — DESIGN §4.6 server-authoritative gate).
+        //
+        // @cpt-cf-file-storage-fr-size-limits-policy
         let tenant_id = ctx.subject_tenant_id();
         let policy = self
             .get_effective_policy_internal(tenant_id, file.owner_id)
@@ -225,7 +241,28 @@ impl MultipartService {
             declared_mime,
             backend.capabilities().max_size_bytes,
         );
-        self.check_quota(tenant_id, file.owner_id, effective_max)
+
+        // Gate: reject if the declared total size exceeds the effective limit.
+        // This is the DESIGN-aligned fix for CodeRabbit F2: validate up front at
+        // initiate time rather than deferring to complete time (which allowed a
+        // client to store oversized parts and never call complete).
+        //
+        // @cpt-cf-file-storage-fr-size-limits-policy
+        if let Some(limit) = effective_max
+            && declared_size > limit
+        {
+            return Err(DomainError::policy_size_exceeded(
+                limit,
+                "policy size limit",
+            ));
+        }
+
+        // Quota check against the declared size (not the pessimistic effective_max).
+        // PRD §5.4: "check before accepting any operation that increases storage
+        // consumption" — the declared size is our best estimate at this stage.
+        //
+        // @cpt-cf-file-storage-fr-storage-quota
+        self.check_quota_bytes(tenant_id, file.owner_id, declared_size)
             .await?;
 
         let now = OffsetDateTime::now_utc();

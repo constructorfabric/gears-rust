@@ -574,11 +574,23 @@ pub struct CreateRetentionRuleReq {
 /// Request to initiate a multipart upload (`POST /files/{id}/multipart`).
 ///
 /// @cpt-cf-file-storage-fr-multipart-upload
+/// @cpt-cf-file-storage-fr-size-limits-policy
+/// @cpt-cf-file-storage-fr-storage-quota
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct InitiateMultipartReq {
     /// Declared MIME type for the file content.
     pub declared_mime: String,
+    /// Declared total file size in bytes.
+    ///
+    /// **Required** (per DESIGN §4.6 "server-authoritative" model). The control
+    /// plane validates this value against the effective policy size limit and the
+    /// storage quota at initiate time — exactly as single-part upload does — so
+    /// that an oversized upload is rejected before any bytes are transferred.
+    ///
+    /// @cpt-cf-file-storage-fr-size-limits-policy
+    /// @cpt-cf-file-storage-fr-storage-quota
+    pub declared_size: u64,
 }
 
 /// Response for an initiated multipart upload session.

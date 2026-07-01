@@ -396,6 +396,8 @@ fn session_to_dto(s: MultipartUploadSession) -> MultipartSessionDto {
 /// `POST /files/{id}/multipart` — initiate a multipart upload session.
 ///
 /// @cpt-cf-file-storage-fr-multipart-upload
+/// @cpt-cf-file-storage-fr-size-limits-policy
+/// @cpt-cf-file-storage-fr-storage-quota
 pub async fn initiate_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
@@ -403,7 +405,7 @@ pub async fn initiate_multipart(
     Json(req): Json<InitiateMultipartReq>,
 ) -> ApiResult<JsonBody<MultipartSessionDto>> {
     let session = svc
-        .initiate_multipart_upload(&ctx, file_id, &req.declared_mime)
+        .initiate_multipart_upload(&ctx, file_id, &req.declared_mime, req.declared_size)
         .await?;
     Ok(Json(session_to_dto(session)))
 }

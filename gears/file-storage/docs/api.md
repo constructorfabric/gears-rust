@@ -94,12 +94,22 @@ Multipart is **server-authoritative**: the client sends desired parameters and t
 parts plan (sizes/offsets) with **one signed URL per part** pointing at the sidecar.
 
 ```text
-P2-1. POST /files/{id}/multipart            initiate (JSON: size, preferred part size, concurrency); returns the parts plan + per-part signed URLs
+P2-1. POST /files/{id}/multipart            initiate (JSON: declared_mime, declared_size, preferred part size, concurrency); returns the parts plan + per-part signed URLs
 P2-2. PUT  <signed part url>                upload one part to the sidecar (raw body)
 P2-3. POST /files/{id}/multipart/{upload_id}/complete   finalize (combine BLAKE3 subtree hashes → root); binds the version  — If-Match
 P2-4. DELETE /files/{id}/multipart/{upload_id}          abort; parts discarded
 P2-5. GET  /files/{id}/multipart/{upload_id}            list uploaded parts (introspection)
 ```
+
+**`P2-1` initiate request body** (`application/json`):
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `declared_mime` | `string` | yes | MIME type of the file being uploaded (e.g. `video/mp4`). Validated against the effective allowed-types policy. |
+| `declared_size` | `uint64` | yes | Total file size in bytes. The control plane validates this against the effective policy size limit and storage quota at initiate time — exactly like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any bytes are transferred. `413` if it exceeds the limit; `507` if it would exceed the storage quota. |
+
+The `declared_size` is validated only at initiate time and is **not** persisted in the `multipart_uploads` session row.
+The complete-time total-size check (summing actual part sizes) is kept as defence-in-depth.
 
 For a `multipart_native` backend the sidecar drives the backend multipart API; otherwise it offset-writes each part
 into the single new-version object. Per-part BLAKE3 subtree hashes are persisted in `multipart_upload_parts.part_hash`

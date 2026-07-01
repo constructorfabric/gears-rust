@@ -15,7 +15,9 @@ use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart_service::MultipartService;
-use file_storage::domain::ports::{DataPlanePort, MultipartStore};
+use file_storage::domain::policy::{PolicyBody, PolicyScope, SizeLimits};
+use file_storage::domain::policy_service::PolicyService;
+use file_storage::domain::ports::{DataPlanePort, MultipartStore, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{
     BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend,
@@ -89,6 +91,49 @@ async fn build_service() -> (Arc<FileService>, Arc<MultipartService>, DataPlaneS
     build_service_with_config(86400).await
 }
 
+/// Like `build_service` but also returns a `PolicyService` so tests can
+/// configure size-limit policies.
+async fn build_service_with_policy() -> (
+    Arc<FileService>,
+    Arc<MultipartService>,
+    Arc<PolicyService>,
+    DataPlaneService,
+) {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::new(store) as Arc<dyn MultipartStore>,
+        backends,
+        Arc::clone(&authorizer),
+        None,
+    ));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
+    (svc, msvc, psvc, dp)
+}
+
 fn ctx(tenant: Uuid) -> SecurityContext {
     SecurityContext::builder()
         .subject_id(Uuid::now_v7())
@@ -119,9 +164,9 @@ async fn multipart_happy_path_in_memory() {
     // Create the file (pending, no content yet).
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
-    // Initiate multipart.
+    // Initiate multipart. Declare total size = 13 bytes ("Hello, World!").
     let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream")
+        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream", 13)
         .await
         .unwrap();
     assert_eq!(session.file_id, ticket.file_id);
@@ -200,7 +245,7 @@ async fn multipart_rejected_on_local_fs() {
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
     let err = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream")
+        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream", 1024)
         .await
         .unwrap_err();
     assert!(
@@ -218,8 +263,9 @@ async fn multipart_resumable_part_reupload() {
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    // Declare total size = 6 bytes (size of final "SECOND").
     let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream")
+        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream", 6)
         .await
         .unwrap();
 
@@ -342,4 +388,117 @@ async fn idempotency_expiry_creates_new_file() {
         t1.file_id, t2.file_id,
         "after expiry, the same key must create a new file"
     );
+}
+
+// ── 7. Size enforcement at initiate time (CodeRabbit F2 fix) ─────────────────
+
+/// Declaring a total size that exceeds the policy limit at initiate time
+/// must be rejected immediately — before any backend state is created.
+///
+/// This is the DESIGN §4.6 (server-authoritative) fix for CodeRabbit F2: the
+/// control plane gates the declared total size at initiate so that an
+/// oversized upload cannot be started at all, not merely rejected at complete.
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+/// @cpt-cf-file-storage-fr-size-limits-policy
+#[tokio::test]
+async fn initiate_multipart_rejected_when_declared_size_exceeds_policy_limit() {
+    let (svc, msvc, psvc, _dp) = build_service_with_policy().await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let owner = Uuid::now_v7();
+
+    // Set a 10-byte cap at tenant level.
+    psvc.set_policy(
+        &ctx,
+        PolicyScope::Tenant,
+        None,
+        PolicyBody {
+            size_limits: SizeLimits {
+                max_bytes: Some(10),
+                ..SizeLimits::default()
+            },
+            ..PolicyBody::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let ticket = svc
+        .create_file(
+            &ctx,
+            NewFile {
+                owner_kind: OwnerKind::User,
+                owner_id: owner,
+                name: "large.bin".to_owned(),
+                gts_file_type: GTS.to_owned(),
+                mime_type: "application/octet-stream".to_owned(),
+                custom_metadata: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Initiate with declared_size = 11 bytes > 10-byte cap → must be rejected.
+    let err = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream", 11)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::PolicySizeExceeded { .. }),
+        "expected PolicySizeExceeded at initiate, got {err:?}"
+    );
+}
+
+/// Declaring a total size within the policy limit succeeds.
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+/// @cpt-cf-file-storage-fr-size-limits-policy
+#[tokio::test]
+async fn initiate_multipart_allowed_when_declared_size_within_policy_limit() {
+    let (svc, msvc, psvc, _dp) = build_service_with_policy().await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let owner = Uuid::now_v7();
+
+    // Set a 100-byte cap at tenant level.
+    psvc.set_policy(
+        &ctx,
+        PolicyScope::Tenant,
+        None,
+        PolicyBody {
+            size_limits: SizeLimits {
+                max_bytes: Some(100),
+                ..SizeLimits::default()
+            },
+            ..PolicyBody::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let ticket = svc
+        .create_file(
+            &ctx,
+            NewFile {
+                owner_kind: OwnerKind::User,
+                owner_id: owner,
+                name: "small.bin".to_owned(),
+                gts_file_type: GTS.to_owned(),
+                mime_type: "application/octet-stream".to_owned(),
+                custom_metadata: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Initiate with declared_size = 50 bytes ≤ 100-byte cap → must be accepted.
+    let session = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream", 50)
+        .await
+        .unwrap();
+    assert_eq!(session.file_id, ticket.file_id);
+    assert_eq!(session.state.as_str(), "in_progress");
 }

@@ -336,7 +336,7 @@ async fn multipart_complete_leaves_audit_rows() {
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
     let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream")
+        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream", 5)
         .await
         .unwrap();
 

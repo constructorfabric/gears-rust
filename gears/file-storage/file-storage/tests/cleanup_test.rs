@@ -295,7 +295,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
     // Create a file and initiate a multipart session.
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
     let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain")
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024)
         .await
         .unwrap();
 
