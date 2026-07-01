@@ -439,6 +439,12 @@ impl HostRuntime {
         // use host as the registry
         let registry: &dyn crate::contracts::OpenApiRegistry = host.as_registry();
 
+        // Create the healthcheck registry and publish it to ClientHub so both
+        // the REST provider loop (below) and the API Gateway can access it.
+        let hc_registry = Arc::new(crate::healthcheck::RestHealthcheckRegistry::new());
+        self.client_hub
+            .register::<crate::healthcheck::RestHealthcheckRegistry>(hc_registry.clone());
+
         // 1) Host prepare: base Router / global middlewares / basic OAS meta
         router =
             host.rest_prepare(&host_ctx, router)
@@ -463,6 +469,11 @@ impl HostRuntime {
                         gear: e.name,
                         source,
                     })?;
+
+                // Register the gear's readiness healthcheck after successful route registration.
+                if let Some(hc) = rest.healthcheck(&ctx) {
+                    hc_registry.register(e.name, hc);
+                }
             }
         }
 

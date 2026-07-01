@@ -136,6 +136,13 @@ pub use directory::{
     ServiceInstanceInfo,
 };
 
+// REST healthcheck infrastructure
+pub mod healthcheck;
+pub use healthcheck::{
+    Healthcheck, HealthcheckAggregateStatus, HealthcheckComponentReport, HealthcheckReport,
+    HealthcheckResult, HealthcheckStatus, RestHealthcheckRegistry,
+};
+
 // GTS schema support
 pub mod gts;
 

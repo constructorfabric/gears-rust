@@ -1,10 +1,23 @@
 use axum::{
     http::StatusCode,
-    response::{Html, Json},
+    response::{Html, IntoResponse, Json, Response},
     routing::{MethodRouter, get},
 };
 use chrono::{SecondsFormat, Utc};
-use serde_json::{Value, json};
+use serde_json::json;
+use std::sync::Arc;
+use std::time::Duration;
+use toolkit::RestHealthcheckRegistry;
+
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn status_for_report(report_ready: bool) -> StatusCode {
+    if report_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
 
 /// Returns a 501 Not Implemented handler for operations without implementations
 #[allow(dead_code)]
@@ -20,11 +33,28 @@ pub fn placeholder_handler_501() -> MethodRouter {
     })
 }
 
-pub async fn health_check() -> Json<Value> {
-    Json(json!({
-        "status": "healthy",
-        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
-    }))
+/// Detailed readiness JSON endpoint (`GET /health`).
+///
+/// Runs all registered REST healthchecks and returns a JSON report.
+/// Returns 200 (Healthy or Degraded), 503 (Unhealthy).
+pub async fn health_detail(registry: Arc<RestHealthcheckRegistry>) -> Response {
+    let report = registry.report(HEALTHCHECK_TIMEOUT).await;
+    let status_code = status_for_report(report.is_ready());
+    let body = Json(json!({
+        "status": report.status,
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "components": report.components,
+    }));
+    (status_code, body).into_response()
+}
+
+/// Shallow readiness probe (`GET /readyz`).
+///
+/// Runs all registered REST healthchecks.
+/// Returns 200 (Healthy or Degraded), 503 (Unhealthy).
+pub async fn readyz_check(registry: Arc<RestHealthcheckRegistry>) -> StatusCode {
+    let report = registry.report(HEALTHCHECK_TIMEOUT).await;
+    status_for_report(report.is_ready())
 }
 
 #[cfg(not(feature = "embed_elements"))]
