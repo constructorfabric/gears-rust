@@ -11,6 +11,7 @@ use toolkit::api::operation_builder::{LicenseFeature, OperationBuilder};
 
 use super::dto;
 use super::handlers;
+use crate::domain::multipart_service::MultipartService;
 use crate::domain::service::FileService;
 
 const API_TAG: &str = "File Storage";
@@ -26,12 +27,13 @@ impl AsRef<str> for License {
 
 impl LicenseFeature for License {}
 
-/// Register all file-storage control-plane routes and attach the service.
+/// Register all file-storage control-plane routes and attach the services.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub(crate) fn register_routes(
     mut router: Router,
     openapi: &dyn OpenApiRegistry,
     service: Arc<FileService>,
+    multipart_service: Arc<MultipartService>,
 ) -> Router {
     // POST /files — create + presign upload
     router = OperationBuilder::post(format!("{BASE}/files"))
@@ -504,5 +506,7 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    router.layer(axum::Extension(service))
+    router
+        .layer(axum::Extension(multipart_service))
+        .layer(axum::Extension(service))
 }

@@ -14,6 +14,7 @@ use uuid::Uuid;
 use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
+use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{
     BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend,
@@ -45,9 +46,11 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
+/// Build both `FileService` (file CRUD + bind) and `MultipartService` (multipart
+/// ops) sharing the same store, backends, and authorizer via `Clone` / `Arc`.
 async fn build_service_with_config(
     idempotency_ttl_secs: u64,
-) -> (Arc<FileService>, DataPlaneService) {
+) -> (Arc<FileService>, Arc<MultipartService>, DataPlaneService) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
@@ -61,14 +64,22 @@ async fn build_service_with_config(
         idempotency_ttl_secs,
     };
     let store = Store::new(Arc::clone(&db));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> = authorizer;
     let svc = Arc::new(FileService::new(
-        store, backends, issuer, authorizer, cfg, None, None,
+        store.clone(),
+        backends.clone(),
+        issuer,
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
     ));
+    let msvc = Arc::new(MultipartService::new(store, backends, authorizer, None));
     let dp = DataPlaneService::new(Arc::clone(&svc));
-    (svc, dp)
+    (svc, msvc, dp)
 }
 
-async fn build_service() -> (Arc<FileService>, DataPlaneService) {
+async fn build_service() -> (Arc<FileService>, Arc<MultipartService>, DataPlaneService) {
     build_service_with_config(86400).await
 }
 
@@ -96,14 +107,14 @@ fn new_file() -> NewFile {
 /// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_happy_path_in_memory() {
-    let (svc, dp) = build_service().await;
+    let (svc, msvc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     // Create the file (pending, no content yet).
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
     // Initiate multipart.
-    let session = svc
+    let session = msvc
         .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream")
         .await
         .unwrap();
@@ -113,11 +124,11 @@ async fn multipart_happy_path_in_memory() {
     // Upload two parts.
     let part1_data = Bytes::from_static(b"Hello, ");
     let part2_data = Bytes::from_static(b"World!");
-    let p1 = svc
+    let p1 = msvc
         .upload_multipart_part(&ctx, ticket.file_id, session.upload_id, 1, part1_data)
         .await
         .unwrap();
-    let p2 = svc
+    let p2 = msvc
         .upload_multipart_part(&ctx, ticket.file_id, session.upload_id, 2, part2_data)
         .await
         .unwrap();
@@ -125,7 +136,7 @@ async fn multipart_happy_path_in_memory() {
     assert_eq!(p2.part_number, 2);
 
     // Complete: marks the version available.
-    svc.complete_multipart_upload(&ctx, ticket.file_id, session.upload_id)
+    msvc.complete_multipart_upload(&ctx, ticket.file_id, session.upload_id)
         .await
         .unwrap();
 
@@ -162,14 +173,22 @@ async fn multipart_rejected_on_local_fs() {
         idempotency_ttl_secs: 86400,
     };
     let store = Store::new(Arc::clone(&db));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> = authorizer;
     let svc = Arc::new(FileService::new(
-        store, backends, issuer, authorizer, cfg, None, None,
+        store.clone(),
+        backends.clone(),
+        issuer,
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
     ));
+    let msvc = Arc::new(MultipartService::new(store, backends, authorizer, None));
 
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
-    let err = svc
+    let err = msvc
         .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream")
         .await
         .unwrap_err();
@@ -184,17 +203,17 @@ async fn multipart_rejected_on_local_fs() {
 /// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_resumable_part_reupload() {
-    let (svc, dp) = build_service().await;
+    let (svc, msvc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
-    let session = svc
+    let session = msvc
         .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream")
         .await
         .unwrap();
 
     // Upload part 1 twice — second upload wins.
-    svc.upload_multipart_part(
+    msvc.upload_multipart_part(
         &ctx,
         ticket.file_id,
         session.upload_id,
@@ -203,7 +222,7 @@ async fn multipart_resumable_part_reupload() {
     )
     .await
     .unwrap();
-    svc.upload_multipart_part(
+    msvc.upload_multipart_part(
         &ctx,
         ticket.file_id,
         session.upload_id,
@@ -213,7 +232,7 @@ async fn multipart_resumable_part_reupload() {
     .await
     .unwrap();
 
-    svc.complete_multipart_upload(&ctx, ticket.file_id, session.upload_id)
+    msvc.complete_multipart_upload(&ctx, ticket.file_id, session.upload_id)
         .await
         .unwrap();
     svc.bind(&ctx, ticket.file_id, session.version_id, None)
@@ -233,7 +252,7 @@ async fn multipart_resumable_part_reupload() {
 /// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn idempotency_same_key_returns_same_file() {
-    let (svc, _dp) = build_service().await;
+    let (svc, _msvc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     let mut nf = new_file();
@@ -261,7 +280,7 @@ async fn idempotency_same_key_returns_same_file() {
 /// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn idempotency_different_owner_different_file() {
-    let (svc, _dp) = build_service().await;
+    let (svc, _msvc, _dp) = build_service().await;
     let tenant = Uuid::now_v7();
     let ctx_a = ctx(tenant);
     let ctx_b = ctx(tenant); // same tenant, different subject (different owner_id in NewFile)
@@ -291,7 +310,7 @@ async fn idempotency_different_owner_different_file() {
 #[tokio::test]
 async fn idempotency_expiry_creates_new_file() {
     // Very short TTL: 1 second.
-    let (svc, _dp) = build_service_with_config(1).await;
+    let (svc, _msvc, _dp) = build_service_with_config(1).await;
     let ctx = ctx(Uuid::now_v7());
     let mut nf = new_file();
     let owner_id = nf.owner_id;

@@ -28,6 +28,7 @@ use uuid::Uuid;
 use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
 use file_storage::domain::data_plane::DataPlaneService;
+use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
@@ -62,14 +63,23 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 
 /// Build a service + cleanup engine sharing the same Store and BackendRegistry.
 /// `grace_secs = 0` means every pending version is immediately eligible for sweep.
-async fn build_all(grace_secs: u64) -> (Arc<FileService>, DataPlaneService, Store, CleanupEngine) {
+async fn build_all(
+    grace_secs: u64,
+) -> (
+    Arc<FileService>,
+    Arc<MultipartService>,
+    DataPlaneService,
+    Store,
+    CleanupEngine,
+) {
     let db = build_db().await;
 
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
 
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer = Arc::new(TenantOnlyAuthorizer);
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
     let cfg = ServiceConfig {
         default_url_ttl_secs: 3600,
         sidecar_base_url: "http://sidecar.test".to_owned(),
@@ -85,11 +95,17 @@ async fn build_all(grace_secs: u64) -> (Arc<FileService>, DataPlaneService, Stor
 
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
-        authorizer,
+        Arc::clone(&authorizer),
         cfg,
         None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        store.clone(),
+        backends,
+        authorizer,
         None,
     ));
     let dp = DataPlaneService::new(Arc::clone(&svc));
@@ -100,7 +116,7 @@ async fn build_all(grace_secs: u64) -> (Arc<FileService>, DataPlaneService, Stor
             orphan_grace_secs: grace_secs,
         },
     );
-    (svc, dp, store, engine)
+    (svc, msvc, dp, store, engine)
 }
 
 /// Build a service + cleanup engine with TWO in-memory backends ("mem" and "alt").
@@ -181,7 +197,7 @@ fn new_file() -> NewFile {
 #[tokio::test]
 async fn abandoned_pending_version_is_deleted_by_sweep() {
     // grace = 0 → any pre-existing pending version is eligible immediately.
-    let (svc, _dp, store, engine) = build_all(0).await;
+    let (svc, _msvc, _dp, store, engine) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -230,7 +246,7 @@ async fn abandoned_pending_version_is_deleted_by_sweep() {
 #[tokio::test]
 async fn recent_pending_version_is_not_swept_within_grace_window() {
     // grace = 24 hours → a freshly created version must not be deleted.
-    let (svc, _dp, store, engine) = build_all(86400).await;
+    let (svc, _msvc, _dp, store, engine) = build_all(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -266,13 +282,13 @@ async fn recent_pending_version_is_not_swept_within_grace_window() {
 /// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn expired_multipart_session_is_aborted_by_sweep() {
-    let (svc, _dp, store, engine) = build_all(0).await;
+    let (svc, msvc, _dp, store, engine) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
     // Create a file and initiate a multipart session.
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
-    let session = svc
+    let session = msvc
         .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain")
         .await
         .unwrap();
@@ -372,7 +388,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
 /// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn retention_expired_file_is_deleted_by_sweep() {
-    let (svc, dp, store, engine) = build_all(86400).await;
+    let (svc, _msvc, dp, store, engine) = build_all(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -406,7 +422,7 @@ async fn retention_expired_file_is_deleted_by_sweep() {
     .unwrap();
 
     // Verify the file exists before sweep.
-    let before = store.list_all_files_for_sweep().await.unwrap();
+    let before = store.list_all_files_for_sweep(None, 1000).await.unwrap();
     assert!(
         before.iter().any(|f| f.file_id == ticket.file_id),
         "file must be present before sweep"
@@ -446,7 +462,7 @@ async fn retention_expired_file_is_deleted_by_sweep() {
 /// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn file_without_matching_retention_rule_is_not_deleted() {
-    let (svc, dp, _store, engine) = build_all(86400).await;
+    let (svc, _msvc, dp, _store, engine) = build_all(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 

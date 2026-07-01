@@ -23,6 +23,21 @@
 //!
 //! @cpt-cf-file-storage-fr-audit-trail
 //! @cpt-cf-file-storage-nfr-audit-completeness
+//!
+//! ## Accepted Henry-Kafura hub (do not fragment further)
+//!
+//! `Store` is the **single unit-of-work persistence facade** — the one type that
+//! holds the `DBProvider` and drives connections/transactions, so every domain
+//! service depends on it. That is a legitimate hub by design: its fan-in equals
+//! the number of services that persist state and grows by one with each new
+//! service, and its fan-out already collapses the nine repositories behind a
+//! single [`Repos`] aggregate (the DIP remedy). Splitting it into per-context
+//! store slices does not dissolve the coupling — the cross-cutting flows
+//! (a multipart *complete*, for example, touches files, versions, the multipart
+//! session, and the audit outbox in one transaction) would each still depend on
+//! several slices, relocating the crossroads rather than removing it. The
+//! transaction boundary is the natural seam and it is already here, so the
+//! facade is deliberately kept whole.
 
 // Domain terms (ETag, If-Match) appear in the module docs.
 #![allow(clippy::doc_markdown)]
@@ -1122,14 +1137,20 @@ impl Store {
         self.repos.events_outbox.list_for_file(&conn, file_id).await
     }
 
-    /// List all files across all tenants — for the retention sweep engine.
+    /// List files across all tenants for the retention sweep, keyset-paginated
+    /// by `file_id` (see [`FileRepo::list_all_for_sweep`]). `after = None` starts
+    /// from the beginning; the caller loops until it gets fewer than `limit`.
     ///
     /// @cpt-cf-file-storage-fr-retention-policies
-    pub async fn list_all_files_for_sweep(&self) -> Result<Vec<File>, DomainError> {
+    pub async fn list_all_files_for_sweep(
+        &self,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .files
-            .list_all_for_sweep(&conn, &AccessScope::allow_all())
+            .list_all_for_sweep(&conn, &AccessScope::allow_all(), after, limit)
             .await
     }
 

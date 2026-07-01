@@ -18,6 +18,7 @@ use crate::config::FileStorageConfig;
 use crate::domain::authz::Authorizer;
 use crate::domain::cleanup::{CleanupConfig, CleanupEngine};
 use crate::domain::local_client::FileStorageLocalClient;
+use crate::domain::multipart_service::MultipartService;
 use crate::domain::service::{FileService, ServiceConfig};
 use crate::infra::authz::PolicyEnforcerAuthorizer;
 use crate::infra::backend::{BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend};
@@ -40,12 +41,14 @@ const MEMORY_ID: &str = "memory";
 )]
 pub struct FileStorageGear {
     service: OnceLock<Arc<FileService>>,
+    multipart_service: OnceLock<Arc<MultipartService>>,
 }
 
 impl Default for FileStorageGear {
     fn default() -> Self {
         Self {
             service: OnceLock::new(),
+            multipart_service: OnceLock::new(),
         }
     }
 }
@@ -123,12 +126,27 @@ impl Gear for FileStorageGear {
         // gear exposes an SDK crate. For now, no quota checks are performed.
         // TODO(P2-M5): wire the usage reporter once a Usage Collector SDK is available.
         let service = Arc::new(FileService::new(
-            store, backends, issuer, authorizer, svc_cfg, None, // quota_client
+            store.clone(),
+            backends.clone(),
+            issuer,
+            Arc::clone(&authorizer),
+            svc_cfg,
+            None, // quota_client
             None, // usage_reporter
         ));
         self.service
-            .set(service)
+            .set(Arc::clone(&service))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+
+        let multipart_svc = Arc::new(MultipartService::new(
+            store, backends, authorizer, None, // quota_client
+        ));
+        self.multipart_service.set(multipart_svc).map_err(|_| {
+            anyhow::anyhow!(
+                "{} multipart service already initialized",
+                Self::MODULE_NAME
+            )
+        })?;
 
         // Optional background cleanup sweep (disabled by default so tests are
         // deterministic; enable via `enable_background_sweep = true` in config).
@@ -185,8 +203,18 @@ impl RestApiCapability for FileStorageGear {
             .get()
             .ok_or_else(|| anyhow::anyhow!("file-storage service not initialized"))?
             .clone();
+        let multipart_service = self
+            .multipart_service
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("file-storage multipart service not initialized"))?
+            .clone();
         info!("Registering file-storage control-plane REST routes");
-        Ok(routes::register_routes(router, openapi, service))
+        Ok(routes::register_routes(
+            router,
+            openapi,
+            service,
+            multipart_service,
+        ))
     }
 }
 

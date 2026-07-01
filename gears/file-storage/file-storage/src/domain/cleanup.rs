@@ -26,6 +26,10 @@ use crate::infra::backend::BackendRegistry;
 use crate::infra::storage::Store;
 use crate::infra::storage::repo::FileEvent;
 
+/// Page size for the keyset-paginated retention file scan. Bounds how many
+/// `File` rows the sweep holds in memory at once, independent of total count.
+const RETENTION_SWEEP_BATCH: u64 = 500;
+
 /// Configuration knobs for the cleanup engine.
 #[derive(Debug, Clone)]
 pub struct CleanupConfig {
@@ -308,16 +312,12 @@ impl CleanupEngine {
     }
 
     /// Delete files that have been expired by a retention rule.
+    ///
+    /// Files are scanned in keyset-paginated batches (by `file_id`) so the sweep
+    /// never materializes every file across every tenant at once — memory stays
+    /// bounded regardless of deployment size. Retention rules are fetched once
+    /// and reused across batches (the rule set is small relative to the files).
     async fn sweep_retention_expiry(&self, now: OffsetDateTime) -> usize {
-        // Fetch all files and all retention rules in bulk to avoid N+1 queries.
-        let files = match self.store.list_all_files_for_sweep().await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(error = ?e, "cleanup: failed to list files for retention sweep");
-                return 0;
-            }
-        };
-
         let all_rules = match self.store.list_all_retention_rules().await {
             Ok(r) => r,
             Err(e) => {
@@ -325,10 +325,60 @@ impl CleanupEngine {
                 return 0;
             }
         };
+        // No rules configured → nothing to expire; skip the file scan entirely.
+        if all_rules.is_empty() {
+            return 0;
+        }
 
         let mut count = 0_usize;
-        for file in &files {
-            count += self.maybe_expire_file(file, &all_rules, now).await;
+        let mut after: Option<Uuid> = None;
+        // Keyset cursor loop: each page advances `after` past its last file_id.
+        // Safe even though `expire_batch` deletes rows — the next query filters
+        // `file_id > after`, so deletions never shift the window. A short page
+        // (or `None` from a query error) ends the sweep.
+        while let Some(batch) = self.next_retention_page(after).await {
+            if batch.is_empty() {
+                break;
+            }
+            after = batch.last().map(|f| f.file_id);
+            let last_page = (batch.len() as u64) < RETENTION_SWEEP_BATCH;
+            count += self.expire_batch(&batch, &all_rules, now).await;
+            if last_page {
+                break;
+            }
+        }
+        count
+    }
+
+    /// Fetch the next keyset page of files for the retention sweep. Returns
+    /// `None` (ending the sweep) on a query error, logging it best-effort.
+    async fn next_retention_page(
+        &self,
+        after: Option<Uuid>,
+    ) -> Option<Vec<file_storage_sdk::File>> {
+        match self
+            .store
+            .list_all_files_for_sweep(after, RETENTION_SWEEP_BATCH)
+            .await
+        {
+            Ok(files) => Some(files),
+            Err(e) => {
+                tracing::warn!(error = ?e, "cleanup: failed to list files for retention sweep");
+                None
+            }
+        }
+    }
+
+    /// Apply retention rules to one page of files. Returns the number deleted.
+    async fn expire_batch(
+        &self,
+        batch: &[file_storage_sdk::File],
+        all_rules: &[crate::domain::policy::StoredRetentionRule],
+        now: OffsetDateTime,
+    ) -> usize {
+        let mut count = 0_usize;
+        for file in batch {
+            count += self.maybe_expire_file(file, all_rules, now).await;
         }
         count
     }

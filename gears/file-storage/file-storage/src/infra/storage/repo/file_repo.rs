@@ -171,15 +171,29 @@ impl FileRepo {
         Ok(res.rows_affected > 0)
     }
 
-    /// List every file across all tenants, for the retention sweep engine.
+    /// List files across all tenants for the retention sweep engine,
+    /// **keyset-paginated by `file_id`** to bound sweep memory on large
+    /// deployments. Returns up to `limit` files ordered by `file_id`, starting
+    /// strictly after `after` (`None` = from the beginning); the caller loops,
+    /// advancing `after` to the last returned `file_id`, until it gets a short
+    /// page. Keyset (not offset) paging is used so that deleting expired files
+    /// mid-sweep does not shift the window and skip rows.
     ///
     /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_all_for_sweep<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
+        after: Option<Uuid>,
+        limit: u64,
     ) -> Result<Vec<File>, DomainError> {
-        let rows = Entity::find()
+        let mut query = Entity::find();
+        if let Some(after_id) = after {
+            query = query.filter(Column::FileId.gt(after_id));
+        }
+        let rows = query
+            .order_by_asc(Column::FileId)
+            .limit(limit)
             .secure()
             .scope_with(scope)
             .all(conn)
