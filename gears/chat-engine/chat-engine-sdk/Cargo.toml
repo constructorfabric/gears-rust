@@ -11,6 +11,9 @@ readme = "README.md"
 keywords = ["constructorfabric", "cf-gears"]
 categories = ["artificial-intelligence"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lib]
 name = "chat_engine_sdk"
 

@@ -333,7 +333,7 @@ gts-docs:
 		docs gears libs examples
 
 install-tools:
-	@command -v cargo-nextest >/dev/null 2>&1 || cargo install cargo-nextest
+	@command -v cargo-nextest >/dev/null 2>&1 || cargo install --locked cargo-nextest
 
 ## List all custom project compliance lints (see tools/dylint_lints/README.md)
 dylint-list:

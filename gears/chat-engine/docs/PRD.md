@@ -1,5 +1,5 @@
 Created:  2026-03-06 by Constructor Tech
-Updated:  2026-03-06 by Constructor Tech
+Updated:  2026-06-23 by Constructor Tech
 # PRD — Chat Engine
 
 
@@ -91,9 +91,13 @@ The core value proposition is enabling flexible, stateful conversation managemen
 | **Backend Plugin** | A Gear plugin gear implementing `ChatEngineBackendPlugin` trait; co-located in the same Gears process and called directly via `ClientHub`. External HTTP backends are supported via the `chat-engine-webhook-adapter` plugin. See ADR-0022. |
 | **Message Tree** | A tree structure where each message references a parent message; sibling nodes with the same parent are variants |
 | **Message Variant** | An alternative response at the same position in the conversation tree — created by regeneration or branching |
+| **Message Part** | An ordered, typed fragment of a message body (`text`, `code`, `images`, `videos`, `links`, `statuses`). A message is composed of one or more parts; the parts in order form the message body. See FR-022. |
+| **Citation** | A plugin-supplied attribution attached to a `text` message part, anchoring a `[N]` marker in the text to a source: a retrieved document (file citation) or a web page (link citation). Carries quote, source location, and the text offsets of the marker. See FR-023. |
+| **Reference** | A lightweight URL badge attached to a `text` message part (URL + position, no quote/anchor). See FR-023. |
 | **Capability** | A typed feature declared by the backend plugin (`bool`, `enum`, `str`, `int`). `SessionType.available_capabilities` is the maximum set the plugin supports; `Session.enabled_capabilities` is the confirmed set for a specific session. Per-message settings are passed as `CapabilityValue` (id + value). |
 | **CapabilityValue** | A per-message capability setting: `{id, value}` where value matches the type declared in the corresponding `Capability` definition |
-| **Streaming Response** | Real-time forwarding of response chunks from the backend plugin to the client as they are generated |
+| **Streaming Response** | Real-time forwarding of the backend plugin's output to the client as a Server-Sent Events **delta** stream (`start` → `delta` → `complete`/`error`); the client maintains the message document and applies each `(op, path, value)` delta. See FR-024. |
+| **Streaming Delta** | One mutation of the in-flight message document: `{op, path, value}` where `op` ∈ add/append/patch/remove and `path` addresses a part, text body, or citation array. Carries a per-message `seq` for ordering and resume. |
 | **Lifecycle State** | One of four session states: `active`, `archived`, `soft_deleted`, `hard_deleted` |
 | **is_hidden_from_user** | Message visibility flag that excludes the message from client-facing APIs |
 | **is_hidden_from_backend** | Message visibility flag that excludes the message from the context sent to backend plugins |
@@ -191,6 +195,9 @@ No gear-specific environment constraints beyond platform defaults.
 - Session lifecycle management (create, delete, retrieve)
 - Message routing to backend plugins with real-time streaming
 - Message variant preservation (regeneration, branching)
+- Structured message bodies as ordered typed parts (text, code, images, videos, links, statuses) (see FR-022)
+- Per-part citations and references (file/link citations, URL badges) anchoring text to sources (see FR-023)
+- Real-time delta streaming over Server-Sent Events with resumable connections (see FR-024)
 - File attachment references in messages
 - Session type switching mid-conversation
 - Session export (JSON, Markdown, TXT)
@@ -234,7 +241,7 @@ The system **MUST** create a new session with a specified session type and clien
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-fr-send-message`
 
 <!-- fdd-id-content -->
-The system **MUST** forward user messages to backend plugin with full session context (session metadata, capabilities, message history) and stream responses back to client in real-time. The system persists the complete message exchange (user message and assistant response) after streaming completes.
+The system **MUST** forward user messages to backend plugin with full session context (session metadata, capabilities, message history) and stream responses back to client in real-time. The system persists the complete message exchange (user message and assistant response) after streaming completes. Each persisted user message is stamped with its authoring `user_id` and the owning `tenant_id`, both taken from the JWT bearer token and never accepted from the request body; assistant and system messages have no authoring user (`user_id` is unset) but carry the same `tenant_id`. These identifiers enable author attribution in multi-user and shared sessions and tenant-scoped message queries. Message bodies — both the inbound user message and the streamed/persisted assistant response — are structured as an ordered list of typed parts (see FR-022), not a single content blob. The assistant response is streamed to the client as a Server-Sent Events **delta** stream (see FR-024).
 
 **Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
 <!-- fdd-id-content -->
@@ -303,7 +310,9 @@ Webhook backends receive message history with file_ids (UUIDs). Backends must im
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-fr-stop-streaming`
 
 <!-- fdd-id-content -->
-The system **MUST** allow canceling streaming responses mid-generation. When cancellation occurs, the system stops forwarding data from backend plugin, closes the connection, and saves the partial response as an incomplete message with appropriate metadata.
+The system **MUST** allow canceling a streaming response mid-generation via an **explicit** stop action. On an explicit stop the system stops forwarding data from the backend plugin and saves the partial response as an incomplete message with appropriate metadata.
+
+Merely **closing the HTTP connection does NOT cancel generation** — under true live-tail streaming (`cpt-cf-chat-engine-design-stream-resume`) the response is resumable: the system keeps generating and buffering events so the client can reconnect with `Last-Event-ID` and continue. A disconnected stream therefore finalizes as a **complete** message (not a cancelled partial) unless an explicit stop, the plugin deadline, or a plugin error intervenes.
 
 **Actors**: `cpt-cf-chat-engine-actor-client`
 <!-- fdd-id-content -->
@@ -488,7 +497,7 @@ The system **SHOULD** provide guidance and capabilities to support conversation 
 - [x] `p1` - **ID**: `cpt-cf-chat-engine-fr-delete-message`
 
 <!-- fdd-id-content -->
-The system **MUST** support deletion of individual messages within a session. When a message is deleted, all associated reactions are cascade-deleted automatically to maintain referential integrity. The system validates ownership (authenticated user must own the message) before deletion and notifies the backend plugin of the deletion event.
+The system **MUST** support deletion of individual messages within a session. When a message is deleted, all associated reactions are cascade-deleted automatically to maintain referential integrity. The system validates ownership before deletion — the authenticated `user_id` must match the message's authoring `user_id` (assistant and system messages, which have no authoring user, are never user-deletable) — and notifies the backend plugin of the deletion event.
 
 **Deletion Behavior**:
 - **Hard delete only**: Messages are permanently removed (no soft delete for individual messages)
@@ -655,7 +664,7 @@ The system **SHOULD** provide extensible, versioned base schemas for all core do
 
 | Category | Base Schemas | Extension Point |
 |---|---|---|
-| **Message content types** | `TextContent`, `ImageContent`, `AudioContent`, `VideoContent`, `DocumentContent`, `CodeContent` | Plugins declare custom `ContentPart` subtypes |
+| **Message part types** | `text`, `code`, `images`, `videos`, `links`, `statuses` (`MessagePart`, see FR-022) | Plugins declare custom `MessagePartType` values and part `content` schemas |
 | **Event types** | `MessageNewEvent`, `SessionCreatedEvent`, `StreamingChunkEvent`, etc. | Plugins emit custom typed events via webhook response extensions |
 | **Error types** | `ErrorResponse`, `ErrorCode` | Plugins define domain-specific error codes in the `ErrorCode` enum space |
 | **Session / Message metadata** | `Session.metadata`, `Message.metadata` | Plugins store and validate typed custom metadata blobs |
@@ -678,6 +687,98 @@ The system **SHOULD** provide extensible, versioned base schemas for all core do
 - Base schema fields cannot be overridden by plugin extensions; attempts are rejected
 
 **Actors**: `cpt-cf-chat-engine-actor-backend-plugin`, `cpt-cf-chat-engine-actor-tenant-admin`
+<!-- fdd-id-content -->
+
+#### FR-022: Structured Message Parts
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-fr-message-parts`
+
+<!-- fdd-id-content -->
+The system **MUST** represent a message body as an **ordered list of typed parts** rather than a single content blob. Each part has a `type` and a typed `content` payload; the parts in order constitute the message. This lets a single assistant or user message mix prose, code, media, links, and progress statuses while preserving rendering order.
+
+**Supported part types (initial set)**:
+- **text** — plain text (`content`, optional `title`)
+- **code** — code block (`language`, `code`)
+- **images** — one or more image references (file UUIDs + optional dimensions/mime)
+- **videos** — one or more video references (file UUIDs + optional thumbnail/format)
+- **links** — link preview cards (`url`, optional `title`/`description`/`icon`/`source`)
+- **statuses** — progress/status indicators (`code`, optional `detail`)
+
+**Behavioral rules**:
+- Parts are **ordered** within a message and the order is stable across reads (persisted ordinal).
+- Media parts (`images`, `videos`) reference files by UUID via the File Storage Service (`cpt-cf-chat-engine-fr-attach-files`); Chat Engine never stores or fetches the bytes.
+- Streaming assistant responses are delivered as incremental deltas per part (text token-by-token, richer parts as they open); the engine persists the assembled parts on completion (see FR-024).
+- The part type set is **extensible** by plugin vendors via GTS without forking Chat Engine core (`cpt-cf-chat-engine-fr-schema-extensibility`).
+- Deleting a message deletes its parts (cascade); parts are not independently addressable for deletion.
+
+**Acceptance criteria**:
+- A message sent with multiple ordered parts is persisted and returned with the same parts in the same order.
+- A `text` part's content is full-text searchable (`cpt-cf-chat-engine-fr-search-session`, `cpt-cf-chat-engine-fr-search-sessions`); non-text parts are excluded from text search.
+- An `images`/`videos` part referencing a file UUID is forwarded to backend plugins without the engine fetching the file.
+- A message with no parts is rejected as an invalid request.
+
+**Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
+<!-- fdd-id-content -->
+
+#### FR-023: Per-Part Citations & References
+
+- [ ] `p2` - **ID**: `cpt-cf-chat-engine-fr-citations`
+
+<!-- fdd-id-content -->
+The system **SHOULD** persist and serve **citations and references attached to a `text` message part**, allowing a backend plugin to attribute spans of an answer to their sources. Citations attach to a specific text part (not the whole message), so a multi-part answer can cite per text block.
+
+**Kinds**:
+- **File citation** — a citation into a retrieved document (document id/name/title, quote, page/timestamp, chunk preview, source-offset anchors).
+- **Link citation** — a citation into a web page (url, title, quote, preview, favicon).
+- **Reference** — a lightweight URL badge (url + position, no quote/anchor).
+
+**Behavioral rules**:
+- Citations and references are **supplied by the backend plugin** on its response; Chat Engine stores and serves them but does **not** generate or interpret them (`cpt-cf-chat-engine-principle-zero-business-logic`).
+- A citation's `index` corresponds to a `[N]` marker in the part's text (1-indexed); **file and link citations share one `[N]` numbering** within a part.
+- The plugin provides the marker offsets in the text (`text_positions`) and per-marker source anchors **verbatim**; the system **MUST NOT** scan message text to compute positions.
+- Citations/references stream incrementally as deltas (appended to the relevant part as the plugin emits them; see FR-024), are persisted with the assistant's text part on completion, and are **cascade-deleted** with their part (and message).
+- On read, each `text` part exposes its file citations, link citations, and references.
+
+**Acceptance criteria**:
+- A plugin response carrying file/link citations and references is persisted and returned, attached to the correct text part, with `index`/`text_positions` preserved verbatim.
+- Deleting a message (or its part) removes all attached citations and references.
+- Citations referencing files/documents do not cause the engine to fetch any content (attribution metadata only).
+
+**Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
+<!-- fdd-id-content -->
+
+#### FR-024: Delta Streaming Protocol & Resume
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-fr-delta-streaming`
+
+<!-- fdd-id-content -->
+The system **MUST** stream assistant responses to the client as a **delta protocol** over Server-Sent Events (`text/event-stream`): a `start` event opens an (empty) message document, `delta` events mutate it, and a `complete` or `error` event terminates it. The client maintains the message document locally and applies each delta, so the rendered result equals the persisted message.
+
+**Event types**:
+- **start** — opens the assistant message (carries `message_id`, `seq`).
+- **delta** — one mutation `{op, path, value}` (carries `message_id`, `seq`).
+- **complete** — successful end (carries `o: stop` and optional `metadata`); no further events.
+- **error** — terminal error (carries a human-readable `error`).
+
+**Delta semantics** (delta-family events carry terse `(o, p, v)` keys — operation / path / value):
+- `o` ∈ `add` (set value at `p`), `append` (append text fragment / array element), `patch` (replace a field), `remove` (retract), `stop` (terminal completion marker on `message.complete`).
+- `p` addresses the message document: a part (`parts/N`), a text body (`parts/N/content/text`), a citation array (`parts/N/file_citations` …), or message `metadata`.
+- All parts and citations stream incrementally (text token-by-token; richer parts and citations as the plugin emits them).
+- Events are **typed**: `message.start`, `message.part.add`, `message.text.delta`, `message.{file,link}_citation.add`, `message.reference.add`, `message.status.changed` (transient progress), `message.state.changed`, `session.meta.updated`, `message.tool`, `message.complete`, `message.error`. The engine projects these from the plugin's event vocabulary and persists the durable ones: streamed parts → message parts, citations → the relevant part, state/tool → message metadata, session-meta → session metadata; status events are transient.
+
+**Ordering & resume**:
+- Every event carries a per-message monotonically-increasing `seq`, mirrored in the SSE `id:` field; clients order and de-duplicate by `seq`.
+- A dropped connection is resumable: the client reconnects with `Last-Event-ID: <seq>` and the system replays buffered events with `seq` greater than the last, then continues live — **without re-running the backend plugin**.
+- Resume is best-effort within a short live-stream window. If the buffer has expired or the stream already terminated, the client falls back to fetching the final message (`GET /messages/{id}`). The buffer is **not** durable conversation history.
+
+**Cancellation**: closing the connection does **not** cancel generation — the response is resumable (see "Ordering & resume" above). Cancellation is an explicit action that stops generation and saves the partial response (see `cpt-cf-chat-engine-fr-stop-streaming`).
+
+**Acceptance criteria**:
+- A streamed assistant response applied delta-by-delta on the client yields a document identical to the persisted message read via `GET /messages/{id}`.
+- Reconnecting mid-stream with `Last-Event-ID` resumes without duplicate or missing deltas and without re-invoking the backend.
+- After the buffer window expires, a resume attempt returns no replay and the client can still recover the full message via a one-shot GET.
+
+**Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
 <!-- fdd-id-content -->
 
 ## 6. Non-Functional Requirements
@@ -721,7 +822,7 @@ All messages must be persisted to database before sending acknowledgment to clie
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-nfr-streaming`
 
 <!-- fdd-id-content -->
-Streaming latency overhead (time between receiving chunk from backend and forwarding to client) must be less than 10ms at p95. First byte of streamed response must arrive at client within 200ms of backend starting to stream. Streaming must support backpressure to handle slow clients.
+Streaming latency overhead (time between receiving a unit from backend and forwarding the corresponding delta to client) must be less than 10ms at p95. First byte of streamed response must arrive at client within 200ms of backend starting to stream. Streaming must support backpressure to handle slow clients. Delivery uses the Server-Sent Events delta protocol (FR-024); a dropped connection is resumable via `Last-Event-ID` within the live-stream window without re-running the backend.
 <!-- fdd-id-content -->
 
 #### NFR-006: Authentication
@@ -1026,7 +1127,8 @@ Backend Plugin integration is defined through the `ChatEngineBackendPlugin` trai
 **Postconditions**: User and assistant messages persisted; client receives complete streaming response
 
 **Alternative Flows**:
-- **Client cancels mid-stream**: System stops forwarding, saves partial response with incomplete status (see `cpt-cf-chat-engine-fr-stop-streaming`)
+- **Client disconnects mid-stream**: Generation continues to completion and events keep buffering; the client may reconnect with `Last-Event-ID` to resume (see `cpt-cf-chat-engine-design-stream-resume`). The message finalizes as complete.
+- **Client explicitly cancels mid-stream**: System stops forwarding, saves partial response with incomplete status (see `cpt-cf-chat-engine-fr-stop-streaming`)
 - **Webhook backend timeout**: System closes stream, saves error message with timeout metadata, returns appropriate timeout error to client
 - **Webhook backend returns error**: System saves error message, propagates structured error to client
 <!-- fdd-id-content -->
@@ -1212,6 +1314,13 @@ Common transitions:
 - soft_deleted → active (restoration, before expiry)
 - archived → active (new activity or manual restore)
 
+Administrative / forced transitions (allowed by the SDK state machine, used by GDPR right-to-erasure flows and admin tooling):
+- active → hard_deleted (direct hard delete, bypassing soft-delete grace period)
+- archived → hard_deleted (direct hard delete from archive)
+- archived → soft_deleted (manually mark an archived session for deletion)
+
+Terminal state: `hard_deleted` accepts no outbound transitions. The full set of allowed transitions is enforced programmatically by `LifecycleState::can_transition_to` in `chat-engine-sdk::models`. Self-loops (e.g. `active → active`) are rejected.
+
 **State Inheritance:**
 Messages inherit lifecycle state from their session. When a session transitions, all its messages transition together to maintain referential integrity.
 
@@ -1309,7 +1418,7 @@ The following checklist categories are **not applicable** to this PRD. Each is e
 | **Deployment Requirements (OPS-PRD-001)** | Deferred | Deployment environment, release cadence, and rollback policies are defined in the Gears middleware-level PRD and infrastructure documentation. Chat Engine inherits these. |
 | **Monitoring Requirements (OPS-PRD-002)** | Deferred | Alerting, dashboards, and log retention are governed by the Gears middleware observability standards. Chat Engine must emit standard structured logs and metrics — specifics defined in DESIGN. |
 | **Industry Standards (COMPL-PRD-002)** | Partial | Applicable standards are referenced inline: GDPR (Art. 17, 25), CCPA, and ACID transaction guarantees. No formal certification (ISO 27001, SOC 2) is currently required. |
-| **WebSocket Protocol** (FR-015) | Excluded | Excluded per ADR-0006 — HTTP streaming with NDJSON chosen over WebSocket for client communication. WebSocket adds connection state, sticky sessions, and deployment complexity incompatible with stateless scaling architecture. |
+| **WebSocket Protocol** (FR-015) | Excluded | Excluded per ADR-0006 — HTTP streaming (Server-Sent Events delta protocol; see FR-024) chosen over WebSocket for client communication. WebSocket adds connection state, sticky sessions, and deployment complexity incompatible with stateless scaling architecture. |
 | **WebSocket Performance** (NFR-011) | Excluded | Excluded per ADR-0006 — WebSocket protocol not adopted; performance NFRs not applicable. |
 | **WebSocket Reliability** (NFR-012) | Excluded | Excluded per ADR-0006 — WebSocket protocol not adopted; reliability NFRs not applicable. |
 | **Audit Logging / Trail** (SEC-PRD-004) | Deferred | Audit logging and trail requirements are the responsibility of the platform-level observability infrastructure, not individual gears. Chat Engine emits standard structured logs and metrics consumed by the platform. |

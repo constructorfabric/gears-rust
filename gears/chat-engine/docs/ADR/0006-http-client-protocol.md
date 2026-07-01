@@ -147,11 +147,11 @@ All requests use JWT Bearer token authentication.
 
 **StreamingStartEvent**: Signals the beginning of streaming, contains type "start" and message_id.
 
-**StreamingChunkEvent**: Contains type "chunk", message_id, and chunk object with content type, content text, and index.
+**StreamingChunkEvent**: Contains type "chunk", message_id, and `chunk` — a plain string text fragment to be appended to the assistant message content. Multiple chunks concatenate to the full message text. Wire shape: `{"type": "chunk", "message_id": "<uuid>", "chunk": "<text>"}`.
 
-**StreamingCompleteEvent**: Signals end of streaming, contains type "complete", message_id, and metadata with usage statistics (input_units, output_units).
+**StreamingCompleteEvent**: Signals end of streaming, contains type "complete", message_id, and optional `metadata` (plugin-defined object — typically holds `model`, `finish_reason`, and `usage.{input_units,output_units}`). When the plugin produces no metadata the field is omitted from the wire payload (not serialized as `null`). Wire shape: `{"type": "complete", "message_id": "<uuid>", "metadata": {...}?}`.
 
-**StreamingErrorEvent**: Signals streaming error, contains type "error", message_id, and error object with error code and message.
+**StreamingErrorEvent**: Signals a mid-stream failure, contains type "error", message_id, and `error` — a single string describing the failure. After an error event the stream is closed and no further events follow. Wire shape: `{"type": "error", "message_id": "<uuid>", "error": "<text>"}`. When a programmatic discriminator is needed (e.g. `context_overflow`, `stream_interrupted`), plugins prefix it to the human-readable description: `"context_overflow: context window exceeded"`.
 
 ### Cancellation Mechanism
 
