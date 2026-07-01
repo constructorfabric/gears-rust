@@ -112,6 +112,78 @@ impl ApiGateway {
         top.merge(router)
     }
 
+    /// Mount a built admin-panel SPA (`dist/`) at `{prefix}/admin`, served from
+    /// disk via `ServeDir`.
+    ///
+    /// This is merged at the top level — OUTSIDE the auth/middleware stack — so
+    /// the static assets are public (no bearer required). The SPA's own API
+    /// calls go to the prefixed, authenticated routes as usual.
+    ///
+    /// Client-side routes with no matching file fall back to `index.html`
+    /// returned with a `200` so deep-links survive a refresh (`ServeFile` as a
+    /// `not_found_service` would preserve the `404`). Two caveats are handled:
+    /// missing `/assets/*` requests `404` instead of returning the HTML shell
+    /// (a browser rejects an HTML body served as a JS module), and the shell is
+    /// sent `Cache-Control: no-cache` so a stale cached `index.html` can never
+    /// keep pointing at a hashed asset that a rebuild has removed. The shell is
+    /// read once into memory; hashed asset files are streamed fresh from disk.
+    fn mount_admin_spa(router: Router, prefix: &str, dir: &str) -> Router {
+        use axum::response::IntoResponse;
+        use tower_http::services::ServeDir;
+
+        let mount = format!("{prefix}/admin");
+        let index_path = format!("{dir}/index.html");
+        // Don't let ServeDir serve `index.html` for the directory request
+        // itself — route the entry point through the fallback below so the
+        // shell always carries `Cache-Control: no-cache`. Otherwise the cached
+        // entry shell keeps pointing at asset hashes a rebuild has removed.
+        let serve_dir = ServeDir::new(dir).append_index_html_on_directories(false);
+
+        match std::fs::read(&index_path) {
+            Ok(index_html) => {
+                let fallback = tower::service_fn(move |req: axum::extract::Request| {
+                    let body = index_html.clone();
+                    let path = req.uri().path().to_owned();
+                    async move {
+                        // A missing hashed asset must 404, not return the HTML
+                        // shell with 200 — the browser would reject the HTML as
+                        // an invalid module MIME type and render a blank page.
+                        if path.contains("/assets/") {
+                            return Ok::<_, std::convert::Infallible>(
+                                axum::http::StatusCode::NOT_FOUND.into_response(),
+                            );
+                        }
+                        Ok::<_, std::convert::Infallible>(
+                            (
+                                axum::http::StatusCode::OK,
+                                [
+                                    (
+                                        axum::http::header::CONTENT_TYPE,
+                                        "text/html; charset=utf-8",
+                                    ),
+                                    (axum::http::header::CACHE_CONTROL, "no-cache"),
+                                ],
+                                body,
+                            )
+                                .into_response(),
+                        )
+                    }
+                });
+                tracing::info!(path = %mount, dir = %dir, "Serving admin-panel SPA from disk");
+                // `fallback` (not `not_found_service`) preserves the fallback's
+                // `200` — `not_found_service` wraps it in `SetStatus(404)`.
+                router.nest_service(&mount, serve_dir.fallback(fallback))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %mount, dir = %dir, error = %err,
+                    "admin-panel SPA index.html not readable; serving static assets without SPA fallback"
+                );
+                router.nest_service(&mount, serve_dir)
+            }
+        }
+    }
+
     /// Create a new `ApiGateway` instance with the given configuration
     #[must_use]
     pub fn new(config: ApiGatewayConfig) -> Self {
@@ -739,6 +811,11 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
 
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
         router = Self::apply_prefix_nesting(router, &prefix);
+
+        // Serve the admin-panel SPA from disk (public, outside auth) when configured.
+        if let Some(dir) = config.admin_spa_dir.as_deref() {
+            router = Self::mount_admin_spa(router, &prefix, dir);
+        }
 
         // Keep the finalized router to be used by `serve()`
         *self.final_router.lock() = Some(router.clone());
