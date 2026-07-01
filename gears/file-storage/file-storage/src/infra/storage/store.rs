@@ -50,29 +50,20 @@ use crate::infra::content::hash;
 use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::audit_outbox::Model as AuditModel;
 use crate::infra::storage::entity::events_outbox::Model as FileEventModel;
-use crate::infra::storage::repo::{
-    AuditRepo, EventsOutboxRepo, FileEvent, FileRepo, IdempotencyRepo, InsertRetentionRule,
-    MetadataRepo, MultipartRepo, PolicyRepo, RetentionRuleRepo, VersionRepo,
-};
+use crate::infra::storage::repo::{FileEvent, InsertRetentionRule, Repos};
 
 /// Persistence facade — the only type that holds `DBProvider` and drives
-/// transactions. Cheap to clone (an `Arc` + unit-struct repos).
+/// transactions. Cheap to clone (an `Arc` + a bundle of unit-struct repos).
+///
+/// The repositories are held together in a single [`Repos`] aggregate rather
+/// than as nine separate fields, so this module depends on one collaborator
+/// instead of naming every repo type — the coupling to the individual repo
+/// modules lives on `Repos`, not on this crossroads.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Clone)]
 pub struct Store {
     db: Arc<DBProvider<DbError>>,
-    files: FileRepo,
-    versions: VersionRepo,
-    metadata: MetadataRepo,
-    policies: PolicyRepo,
-    retention_rules: RetentionRuleRepo,
-    multipart: MultipartRepo,
-    idempotency_keys: IdempotencyRepo,
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
-    audit: AuditRepo,
-    /// @cpt-cf-file-storage-fr-file-events
-    events_outbox: EventsOutboxRepo,
+    repos: Repos,
 }
 
 impl Store {
@@ -81,15 +72,7 @@ impl Store {
     pub fn new(db: Arc<DBProvider<DbError>>) -> Self {
         Self {
             db,
-            files: FileRepo::new(),
-            versions: VersionRepo::new(),
-            metadata: MetadataRepo::new(),
-            policies: PolicyRepo::new(),
-            retention_rules: RetentionRuleRepo::new(),
-            multipart: MultipartRepo::new(),
-            idempotency_keys: IdempotencyRepo::new(),
-            audit: AuditRepo::new(),
-            events_outbox: EventsOutboxRepo::new(),
+            repos: Repos::default(),
         }
     }
 
@@ -102,7 +85,7 @@ impl Store {
         file_id: Uuid,
     ) -> Result<Option<File>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.files.get(&conn, scope, file_id).await
+        self.repos.files.get(&conn, scope, file_id).await
     }
 
     /// Like [`get_file`] but errors with `FileNotFound` when absent.
@@ -125,7 +108,10 @@ impl Store {
         offset: u64,
     ) -> Result<Vec<File>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.files.list(&conn, scope, owner, limit, offset).await
+        self.repos
+            .files
+            .list(&conn, scope, owner, limit, offset)
+            .await
     }
 
     /// Delete a file row (FK cascade removes versions + custom metadata) and
@@ -141,8 +127,8 @@ impl Store {
         file_id: Uuid,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
-        let files = self.files.clone();
-        let audit_repo = self.audit.clone();
+        let files = self.repos.files.clone();
+        let audit_repo = self.repos.audit.clone();
         let del_scope = scope.clone();
         self.db
             .db()
@@ -208,10 +194,10 @@ impl Store {
             .map(|e| (e.key.clone(), e.value.clone()))
             .collect();
 
-        let files = self.files.clone();
-        let versions = self.versions.clone();
-        let metadata = self.metadata.clone();
-        let audit_repo = self.audit.clone();
+        let files = self.repos.files.clone();
+        let versions = self.repos.versions.clone();
+        let metadata = self.repos.metadata.clone();
+        let audit_repo = self.repos.audit.clone();
         self.db
             .db()
             .transaction_ref_mapped(move |tx| {
@@ -254,7 +240,8 @@ impl Store {
             backend_path,
             now,
         );
-        self.versions
+        self.repos
+            .versions
             .insert(&conn, &AccessScope::allow_all(), &pending)
             .await
     }
@@ -266,7 +253,8 @@ impl Store {
         version_id: Uuid,
     ) -> Result<Option<FileVersion>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.versions
+        self.repos
+            .versions
             .get(&conn, &AccessScope::allow_all(), file_id, version_id)
             .await
     }
@@ -274,7 +262,8 @@ impl Store {
     /// List all versions of a file, newest first.
     pub async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.versions
+        self.repos
+            .versions
             .list_by_file(&conn, &AccessScope::allow_all(), file_id)
             .await
     }
@@ -307,8 +296,8 @@ impl Store {
         hash_value: Vec<u8>,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
-        let versions = self.versions.clone();
-        let audit_repo = self.audit.clone();
+        let versions = self.repos.versions.clone();
+        let audit_repo = self.repos.audit.clone();
         self.db
             .db()
             .transaction_ref_mapped(move |tx| {
@@ -344,8 +333,8 @@ impl Store {
         version_id: Uuid,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
-        let versions = self.versions.clone();
-        let audit_repo = self.audit.clone();
+        let versions = self.repos.versions.clone();
+        let audit_repo = self.repos.audit.clone();
         self.db
             .db()
             .transaction_ref_mapped(move |tx| {
@@ -371,7 +360,8 @@ impl Store {
         file_id: Uuid,
     ) -> Result<Vec<CustomMetadataEntry>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.metadata
+        self.repos
+            .metadata
             .list(&conn, &AccessScope::allow_all(), file_id)
             .await
     }
@@ -401,9 +391,9 @@ impl Store {
         now: OffsetDateTime,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
-        let files = self.files.clone();
-        let versions = self.versions.clone();
-        let audit_repo = self.audit.clone();
+        let files = self.repos.files.clone();
+        let versions = self.repos.versions.clone();
+        let audit_repo = self.repos.audit.clone();
         let bind_scope = scope.clone();
         self.db
             .db()
@@ -456,9 +446,9 @@ impl Store {
         now: OffsetDateTime,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
-        let files = self.files.clone();
-        let metadata = self.metadata.clone();
-        let audit_repo = self.audit.clone();
+        let files = self.repos.files.clone();
+        let metadata = self.repos.metadata.clone();
+        let audit_repo = self.repos.audit.clone();
         let patch_scope = scope.clone();
         self.db
             .db()
@@ -504,7 +494,8 @@ impl Store {
         scope_owner_id: Option<Uuid>,
     ) -> Result<Option<StoredPolicy>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.policies
+        self.repos
+            .policies
             .get(&conn, scope, tenant_id, policy_scope, scope_owner_id)
             .await
     }
@@ -521,7 +512,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<Uuid, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.policies
+        self.repos
+            .policies
             .upsert(
                 &conn,
                 scope,
@@ -541,7 +533,8 @@ impl Store {
         tenant_id: Uuid,
     ) -> Result<Vec<StoredRetentionRule>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.retention_rules
+        self.repos
+            .retention_rules
             .list_for_tenant(&conn, scope, tenant_id)
             .await
     }
@@ -553,7 +546,7 @@ impl Store {
         rule_id: Uuid,
     ) -> Result<Option<StoredRetentionRule>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.retention_rules.get(&conn, scope, rule_id).await
+        self.repos.retention_rules.get(&conn, scope, rule_id).await
     }
 
     /// Insert a new retention rule. Returns the assigned `rule_id`.
@@ -567,7 +560,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<Uuid, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.retention_rules
+        self.repos
+            .retention_rules
             .insert(
                 &conn,
                 scope,
@@ -589,7 +583,10 @@ impl Store {
         rule_id: Uuid,
     ) -> Result<bool, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.retention_rules.delete(&conn, scope, rule_id).await
+        self.repos
+            .retention_rules
+            .delete(&conn, scope, rule_id)
+            .await
     }
 
     // ── multipart uploads (P2-M3) ─────────────────────────────────────────────
@@ -609,7 +606,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.multipart
+        self.repos
+            .multipart
             .create(
                 &conn,
                 upload_id,
@@ -631,7 +629,7 @@ impl Store {
         upload_id: Uuid,
     ) -> Result<Option<MultipartUploadSession>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.multipart.get(&conn, upload_id).await
+        self.repos.multipart.get(&conn, upload_id).await
     }
 
     /// Insert or replace a multipart upload part.
@@ -648,7 +646,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.multipart
+        self.repos
+            .multipart
             .upsert_part(
                 &conn,
                 upload_id,
@@ -669,7 +668,7 @@ impl Store {
         upload_id: Uuid,
     ) -> Result<Vec<MultipartPart>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.multipart.list_parts(&conn, upload_id).await
+        self.repos.multipart.list_parts(&conn, upload_id).await
     }
 
     /// Mark a multipart upload session as `completed` and record the audit row
@@ -683,8 +682,8 @@ impl Store {
         upload_id: Uuid,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
-        let multipart = self.multipart.clone();
-        let audit_repo = self.audit.clone();
+        let multipart = self.repos.multipart.clone();
+        let audit_repo = self.repos.audit.clone();
         self.db
             .db()
             .transaction_ref_mapped(move |tx| {
@@ -711,8 +710,8 @@ impl Store {
         upload_id: Uuid,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
-        let multipart = self.multipart.clone();
-        let audit_repo = self.audit.clone();
+        let multipart = self.repos.multipart.clone();
+        let audit_repo = self.repos.audit.clone();
         self.db
             .db()
             .transaction_ref_mapped(move |tx| {
@@ -742,7 +741,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<Option<IdempotencyRecord>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.idempotency_keys
+        self.repos
+            .idempotency_keys
             .get(&conn, tenant_id, owner_kind, owner_id, key, now)
             .await
     }
@@ -765,7 +765,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.idempotency_keys
+        self.repos
+            .idempotency_keys
             .insert(
                 &conn,
                 tenant_id,
@@ -791,7 +792,7 @@ impl Store {
     /// @cpt-cf-file-storage-fr-audit-trail
     pub async fn list_audit(&self, file_id: Uuid) -> Result<Vec<AuditModel>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.audit.list_for_file(&conn, file_id).await
+        self.repos.audit.list_for_file(&conn, file_id).await
     }
 
     // ── cleanup engine (P2-M4 lifecycle) ─────────────────────────────────────
@@ -804,7 +805,8 @@ impl Store {
         older_than: OffsetDateTime,
     ) -> Result<Vec<FileVersion>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.versions
+        self.repos
+            .versions
             .list_pending_older_than(&conn, &AccessScope::allow_all(), older_than)
             .await
     }
@@ -817,7 +819,8 @@ impl Store {
         older_than: OffsetDateTime,
     ) -> Result<Vec<FileVersion>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.versions
+        self.repos
+            .versions
             .list_non_current_older_than(&conn, &AccessScope::allow_all(), older_than)
             .await
     }
@@ -830,7 +833,7 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.multipart.list_expired(&conn, now).await
+        self.repos.multipart.list_expired(&conn, now).await
     }
 
     /// Transactionally update `backend_id` and `backend_path` for a version row,
@@ -847,8 +850,8 @@ impl Store {
         new_backend_path: &str,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
-        let versions = self.versions.clone();
-        let audit_repo = self.audit.clone();
+        let versions = self.repos.versions.clone();
+        let audit_repo = self.repos.audit.clone();
         let new_backend_id = new_backend_id.to_owned();
         let new_backend_path = new_backend_path.to_owned();
         self.db
@@ -894,9 +897,9 @@ impl Store {
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<bool, DomainError> {
-        let files = self.files.clone();
-        let audit_repo = self.audit.clone();
-        let events_repo = self.events_outbox.clone();
+        let files = self.repos.files.clone();
+        let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
         let transfer_scope = scope.clone();
         let new_owner_kind = new_owner_kind.to_owned();
         self.db
@@ -946,9 +949,9 @@ impl Store {
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<bool, DomainError> {
-        let files = self.files.clone();
-        let audit_repo = self.audit.clone();
-        let events_repo = self.events_outbox.clone();
+        let files = self.repos.files.clone();
+        let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
         let del_scope = scope.clone();
         self.db
             .db()
@@ -987,10 +990,10 @@ impl Store {
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<bool, DomainError> {
-        let files = self.files.clone();
-        let versions = self.versions.clone();
-        let audit_repo = self.audit.clone();
-        let events_repo = self.events_outbox.clone();
+        let files = self.repos.files.clone();
+        let versions = self.repos.versions.clone();
+        let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
         let bind_scope = scope.clone();
         self.db
             .db()
@@ -1073,11 +1076,11 @@ impl Store {
             .map(|e| (e.key.clone(), e.value.clone()))
             .collect();
 
-        let files = self.files.clone();
-        let versions = self.versions.clone();
-        let metadata = self.metadata.clone();
-        let audit_repo = self.audit.clone();
-        let events_repo = self.events_outbox.clone();
+        let files = self.repos.files.clone();
+        let versions = self.repos.versions.clone();
+        let metadata = self.repos.metadata.clone();
+        let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
         self.db
             .db()
             .transaction_ref_mapped(move |tx| {
@@ -1111,25 +1114,18 @@ impl Store {
         file_id: Uuid,
     ) -> Result<Vec<FileEventModel>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.events_outbox.list_for_file(&conn, file_id).await
+        self.repos.events_outbox.list_for_file(&conn, file_id).await
     }
 
     /// List all files across all tenants — for the retention sweep engine.
     ///
     /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_all_files_for_sweep(&self) -> Result<Vec<File>, DomainError> {
-        use crate::infra::storage::entity::file::Entity as FileEntity;
-        use sea_orm::EntityTrait;
-        use toolkit_db::secure::SecureEntityExt;
-
         let conn = self.db.conn().map_err(db_err)?;
-        let rows = FileEntity::find()
-            .secure()
-            .scope_with(&AccessScope::allow_all())
-            .all(&conn)
+        self.repos
+            .files
+            .list_all_for_sweep(&conn, &AccessScope::allow_all())
             .await
-            .map_err(db_err)?;
-        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     /// List retention rules for a specific file (`scope = 'file'`), across all
@@ -1139,83 +1135,24 @@ impl Store {
     pub async fn list_file_retention_rules(
         &self,
         file_id: Uuid,
-    ) -> Result<Vec<crate::domain::policy::StoredRetentionRule>, DomainError> {
-        use crate::infra::storage::entity::retention_rule::{Column as RrCol, Entity as RrEntity};
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use toolkit_db::secure::SecureEntityExt;
-
+    ) -> Result<Vec<StoredRetentionRule>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        let rows = RrEntity::find()
-            .filter(
-                sea_orm::Condition::all()
-                    .add(RrCol::Scope.eq("file"))
-                    .add(RrCol::ScopeTargetId.eq(file_id)),
-            )
-            .secure()
-            .scope_with(&AccessScope::allow_all())
-            .all(&conn)
+        self.repos
+            .retention_rules
+            .list_by_file_scope(&conn, &AccessScope::allow_all(), file_id)
             .await
-            .map_err(db_err)?;
-
-        rows.into_iter()
-            .map(|m| {
-                let scope =
-                    crate::domain::policy::RetentionScope::parse(&m.scope).ok_or_else(|| {
-                        DomainError::database(format!("invalid retention scope in DB: {}", m.scope))
-                    })?;
-                let body: crate::domain::policy::RetentionRuleBody = serde_json::from_str(&m.body)
-                    .map_err(|e| {
-                        DomainError::database(format!("retention body deserialization: {e}"))
-                    })?;
-                Ok(crate::domain::policy::StoredRetentionRule {
-                    rule_id: m.rule_id,
-                    tenant_id: m.tenant_id,
-                    scope,
-                    scope_target_id: m.scope_target_id,
-                    body,
-                })
-            })
-            .collect()
     }
 
     /// List all retention rules across all tenants and scopes — for the sweep
     /// engine.
     ///
     /// @cpt-cf-file-storage-fr-retention-policies
-    pub async fn list_all_retention_rules(
-        &self,
-    ) -> Result<Vec<crate::domain::policy::StoredRetentionRule>, DomainError> {
-        use crate::infra::storage::entity::retention_rule::Entity as RrEntity;
-        use sea_orm::EntityTrait;
-        use toolkit_db::secure::SecureEntityExt;
-
+    pub async fn list_all_retention_rules(&self) -> Result<Vec<StoredRetentionRule>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        let rows = RrEntity::find()
-            .secure()
-            .scope_with(&AccessScope::allow_all())
-            .all(&conn)
+        self.repos
+            .retention_rules
+            .list_all(&conn, &AccessScope::allow_all())
             .await
-            .map_err(db_err)?;
-
-        rows.into_iter()
-            .map(|m| {
-                let scope =
-                    crate::domain::policy::RetentionScope::parse(&m.scope).ok_or_else(|| {
-                        DomainError::database(format!("invalid retention scope in DB: {}", m.scope))
-                    })?;
-                let body: crate::domain::policy::RetentionRuleBody = serde_json::from_str(&m.body)
-                    .map_err(|e| {
-                        DomainError::database(format!("retention body deserialization: {e}"))
-                    })?;
-                Ok(crate::domain::policy::StoredRetentionRule {
-                    rule_id: m.rule_id,
-                    tenant_id: m.tenant_id,
-                    scope,
-                    scope_target_id: m.scope_target_id,
-                    body,
-                })
-            })
-            .collect()
     }
 }
 

@@ -29,3 +29,27 @@ pub use multipart_repo::MultipartRepo;
 pub use policy_repo::PolicyRepo;
 pub use retention_rule_repo::{InsertRetentionRule, RetentionRuleRepo};
 pub use version_repo::VersionRepo;
+
+/// The full set of tenant-scoped repositories, owned by the persistence
+/// [`Store`](crate::infra::storage::store::Store).
+///
+/// Bundling the nine repositories into one aggregate lets `Store` depend on a
+/// single collaborator instead of naming each repo type directly — the repo
+/// membership (and its coupling to the nine repo modules) lives here, on a node
+/// that nothing else routes through, rather than on the `Store` crossroads.
+/// Every field is a cheap unit struct, so `Repos` is trivially `Clone`.
+#[derive(Clone, Default)]
+pub struct Repos {
+    pub files: FileRepo,
+    pub versions: VersionRepo,
+    pub metadata: MetadataRepo,
+    pub policies: PolicyRepo,
+    pub retention_rules: RetentionRuleRepo,
+    pub multipart: MultipartRepo,
+    pub idempotency_keys: IdempotencyRepo,
+    /// @cpt-cf-file-storage-fr-audit-trail
+    /// @cpt-cf-file-storage-nfr-audit-completeness
+    pub audit: AuditRepo,
+    /// @cpt-cf-file-storage-fr-file-events
+    pub events_outbox: EventsOutboxRepo,
+}

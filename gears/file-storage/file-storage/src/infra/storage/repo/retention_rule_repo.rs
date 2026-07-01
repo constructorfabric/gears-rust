@@ -1,6 +1,6 @@
 //! Repository for the `retention_rules` table.
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
@@ -89,6 +89,50 @@ impl RetentionRuleRepo {
             .await
             .map_err(db_err)?;
         Ok(rule_id)
+    }
+
+    /// List retention rules for a specific file (`scope = 'file'`), across all
+    /// tenants — for the retention sweep engine.
+    ///
+    /// @cpt-cf-file-storage-fr-retention-policies
+    pub async fn list_by_file_scope<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+    ) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        let rows = Entity::find()
+            .filter(
+                Condition::all()
+                    .add(Column::Scope.eq("file"))
+                    .add(Column::ScopeTargetId.eq(file_id)),
+            )
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+
+        rows.into_iter().map(map_model).collect()
+    }
+
+    /// List every retention rule across all tenants and scopes — for the
+    /// retention sweep engine.
+    ///
+    /// @cpt-cf-file-storage-fr-retention-policies
+    pub async fn list_all<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        let rows = Entity::find()
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+
+        rows.into_iter().map(map_model).collect()
     }
 
     /// Delete a retention rule by `rule_id`. Returns `true` if a row was removed.
