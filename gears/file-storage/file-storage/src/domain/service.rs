@@ -47,7 +47,7 @@ use crate::domain::policy::{EffectivePolicy, PolicyResolver, PolicyScope};
 use crate::domain::ports::DataPlanePort;
 use crate::infra::backend::{BackendCapabilities, BackendRegistry};
 use crate::infra::external_clients::{QuotaClient, QuotaDecision, UsageDelta, UsageReporter};
-use crate::infra::signed_url::{Claims, Issuer, Op, UploadConstraints};
+use crate::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 use crate::infra::storage::Store;
 use crate::infra::storage::store::IdempotencyInsert;
 
@@ -165,11 +165,13 @@ impl FileService {
             backend_path: v.backend_path.clone(),
             exp: now.unix_timestamp() + self.cfg.default_url_ttl_secs,
             upload: constraints,
+            multipart: MultipartClaims::default(),
         };
         let token = self.issuer.issue(claims, now)?;
         let verb = match op {
             Op::Get => "download",
             Op::Put => "upload",
+            Op::MultipartPart => "multipart-part",
         };
         Ok(format!(
             "{}/api/file-storage-data/v1/{}/{}/{}?fs-token={}",

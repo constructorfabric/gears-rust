@@ -112,6 +112,9 @@ async fn build_all(
         backends,
         Arc::clone(&authorizer),
         None,
+        Arc::new(Issuer::generate(3600).expect("issuer")),
+        "http://sidecar.test".to_owned(),
+        3600,
     ));
     let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
     let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
@@ -295,7 +298,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
     // Create a file and initiate a multipart session.
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
     let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None)
         .await
         .unwrap();
 
@@ -338,6 +341,8 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
             version_id2,
             "fake-backend-handle",
             "text/plain",
+            0u64,      // declared_size (not relevant for sweep test)
+            0u64,      // part_size (not relevant for sweep test)
             past_time, // expires in the past
             now_t,
         )

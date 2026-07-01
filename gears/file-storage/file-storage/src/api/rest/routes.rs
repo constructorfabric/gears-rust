@@ -377,20 +377,25 @@ pub(crate) fn register_routes(
 
     // ── Multipart upload (P2-M3) ─────────────────────────────────────────────────
 
-    // POST /files/{id}/multipart — initiate multipart session
+    // POST /files/{id}/multipart — initiate multipart session (server-authoritative plan)
     router = OperationBuilder::post(format!("{BASE}/files/{{id}}/multipart"))
         .operation_id("file_storage.initiate_multipart")
         .authenticated()
         .require_license_features::<License>([])
-        .summary("Initiate a multipart upload session")
+        .summary("Initiate a server-authoritative multipart upload and get the parts plan")
+        .description(
+            "Returns the exact parts plan (sizes, offsets) plus one signed sidecar URL per \
+             part. The client PUTs bytes directly to the sidecar; the control plane never \
+             carries content bytes (ADR-0003, DESIGN \u{a7}4.6).",
+        )
         .tag(API_TAG)
         .path_param("id", "File UUID")
         .json_request::<dto::InitiateMultipartReq>(openapi, "Multipart initiation")
         .handler(handlers::initiate_multipart)
-        .json_response_with_schema::<dto::MultipartSessionDto>(
+        .json_response_with_schema::<dto::MultipartPlanDto>(
             openapi,
             StatusCode::OK,
-            "Multipart session",
+            "Server-authoritative parts plan",
         )
         .error_400(openapi)
         .error_401(openapi)
@@ -400,26 +405,10 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // PUT /files/{id}/multipart/{upload_id}/parts/{part_number} — upload a part
-    router = OperationBuilder::put(format!(
-        "{BASE}/files/{{id}}/multipart/{{upload_id}}/parts/{{part_number}}"
-    ))
-    .operation_id("file_storage.upload_multipart_part")
-    .authenticated()
-    .require_license_features::<License>([])
-    .summary("Upload one part of a multipart upload")
-    .tag(API_TAG)
-    .path_param("id", "File UUID")
-    .path_param("upload_id", "Upload session UUID")
-    .path_param("part_number", "Part number (1-based)")
-    .handler(handlers::upload_multipart_part)
-    .json_response_with_schema::<dto::UploadPartDto>(openapi, StatusCode::OK, "Part info")
-    .error_401(openapi)
-    .error_403(openapi)
-    .error_404(openapi)
-    .error_409(openapi)
-    .error_500(openapi)
-    .register(router, openapi);
+    // NOTE: The control-plane PUT .../parts/{part_number} byte route is intentionally
+    // absent — bytes flow exclusively to the sidecar via the per-part signed URLs
+    // returned by the initiate response (ADR-0003 "no bytes through the control
+    // plane"; multipart-coordinator FEATURE §8 migration).
 
     // POST /files/{id}/multipart/{upload_id}/complete — finalize
     router = OperationBuilder::post(format!(

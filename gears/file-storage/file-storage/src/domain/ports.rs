@@ -136,6 +136,8 @@ pub trait MultipartStore: Send + Sync {
         version_id: Uuid,
         backend_upload_handle: &str,
         declared_mime: &str,
+        declared_size: u64,
+        part_size: u64,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError>;

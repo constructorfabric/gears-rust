@@ -569,9 +569,12 @@ pub struct CreateRetentionRuleReq {
     pub body: RetentionRuleBodyDto,
 }
 
-// ── Multipart upload DTOs (P2-M3) ──────────────────────────────────────────────
+// ── Multipart upload DTOs (multipart-coordinator feature) ─────────────────────
 
 /// Request to initiate a multipart upload (`POST /files/{id}/multipart`).
+///
+/// The server returns a server-authoritative parts plan with one signed sidecar
+/// URL per part (FEATURE §3, §4; DESIGN §4.6).
 ///
 /// @cpt-cf-file-storage-fr-multipart-upload
 /// @cpt-cf-file-storage-fr-size-limits-policy
@@ -591,32 +594,53 @@ pub struct InitiateMultipartReq {
     /// @cpt-cf-file-storage-fr-size-limits-policy
     /// @cpt-cf-file-storage-fr-storage-quota
     pub declared_size: u64,
+    /// Client hint for the preferred part size in bytes. The server may override
+    /// it to satisfy the backend's minimum part size requirements (FEATURE §3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_part_size: Option<u64>,
+    /// Advisory hint for upload concurrency; does not change the parts plan
+    /// (FEATURE §3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
 }
 
-/// Response for an initiated multipart upload session.
+/// One part in the server-authoritative parts plan.
 ///
 /// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
-pub struct MultipartSessionDto {
+pub struct MultipartPartPlanDto {
+    /// 1-based part number (S3 convention).
+    pub part_number: u32,
+    /// Byte offset of this part within the final assembled object.
+    pub offset: u64,
+    /// Exact byte length this part's body must be.
+    pub size: u64,
+    /// Sidecar signed URL for `PUT`-ing this part's bytes.
+    /// The URL embeds the exact `size` claim the sidecar enforces.
+    pub upload_url: String,
+}
+
+/// Server-authoritative parts plan returned by `POST /files/{id}/multipart`.
+///
+/// The client `PUT`s each part's bytes to its `upload_url`; the sidecar
+/// enforces the `size` claim before writing any bytes (FEATURE §4).
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct MultipartPlanDto {
     pub upload_id: Uuid,
-    pub file_id: Uuid,
     pub version_id: Uuid,
-    pub state: String,
-    pub declared_mime: String,
+    /// Hash algorithm used for per-part hashes (`"SHA-256"` in P2).
+    pub part_hash_algorithm: String,
+    /// Uniform part size in bytes (the final part may be smaller).
+    pub part_size: u64,
+    /// Parts in ascending `part_number` order, each with its signed upload URL.
+    pub parts: Vec<MultipartPartPlanDto>,
+    /// Expiry of all per-part URLs (RFC 3339).
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: time::OffsetDateTime,
-}
-
-/// Response for an uploaded part.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(response)]
-pub struct UploadPartDto {
-    pub part_number: u32,
-    pub backend_etag: String,
-    pub size: i64,
 }
 
 // ── Backend migration DTOs (P2-M4) ─────────────────────────────────────────────

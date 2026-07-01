@@ -32,12 +32,20 @@ pub use provider::{Ed25519Provider, SignatureProvider, SignatureVerifier};
 /// The content operation a token authorizes (bound into the token and checked
 /// against the HTTP method by the sidecar).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Op {
     /// Download (`GET`).
     Get,
-    /// Upload (`PUT`).
+    /// Single-part upload (`PUT`).
     Put,
+    /// One part of a server-authoritative multipart upload (`PUT` to the sidecar).
+    ///
+    /// Carries additional multipart-specific claims (`upload_id`, `part_number`,
+    /// `offset`, exact `size`) that the sidecar enforces before writing any bytes.
+    /// The control plane is the sole minter; the sidecar only verifies (ADR-0004).
+    ///
+    /// @cpt-cf-file-storage-fr-multipart-upload (FEATURE §4)
+    MultipartPart,
 }
 
 /// Upload-only content constraints the sidecar enforces while streaming.
@@ -54,13 +62,31 @@ pub struct UploadConstraints {
     pub expected_hash: Option<String>,
 }
 
+/// Multipart-part-specific claims carried in `op = multipart_part` tokens.
+///
+/// The sidecar reads these to enforce the plan (part boundaries, exact size)
+/// before writing a single byte — this is the mechanism that closes the
+/// per-part abuse vector (FEATURE §4, DESIGN §4.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultipartClaims {
+    /// The multipart session that owns this part.
+    pub upload_id: Uuid,
+    /// 1-based part number (S3 convention; 0 is invalid).
+    pub part_number: u32,
+    /// Byte offset of this part within the final assembled object.
+    pub offset: u64,
+    /// **Exact** byte length the sidecar will accept for this part.
+    /// The sidecar rejects with `413` if `body.len() ≠ size` (FEATURE §4, point 2).
+    pub size: u64,
+}
+
 /// The signed token's claim set (AND-combined; `exp` is mandatory).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
     pub op: Op,
     pub file_id: Uuid,
     /// The specific immutable blob: `content_id` for GET, the pending version
-    /// for PUT.
+    /// for PUT / `multipart_part`.
     pub version_id: Uuid,
     pub backend_id: String,
     pub backend_path: String,
@@ -68,10 +94,17 @@ pub struct Claims {
     pub exp: i64,
     #[serde(default, skip_serializing_if = "is_default_constraints")]
     pub upload: UploadConstraints,
+    /// Non-empty only when `op = multipart_part`.
+    #[serde(default, skip_serializing_if = "is_default_multipart")]
+    pub multipart: MultipartClaims,
 }
 
 fn is_default_constraints(c: &UploadConstraints) -> bool {
     *c == UploadConstraints::default()
+}
+
+fn is_default_multipart(c: &MultipartClaims) -> bool {
+    *c == MultipartClaims::default()
 }
 
 /// The control-plane signing key (sole minter). Delegates the signing primitive

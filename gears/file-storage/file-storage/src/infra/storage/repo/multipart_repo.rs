@@ -43,9 +43,15 @@ impl MultipartRepo {
         version_id: Uuid,
         backend_upload_handle: &str,
         declared_mime: &str,
+        declared_size: u64,
+        part_size: u64,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
+        let declared_size_i64 = i64::try_from(declared_size)
+            .map_err(|_| DomainError::validation("declared_size", "declared_size overflows i64"))?;
+        let part_size_i64 = i64::try_from(part_size)
+            .map_err(|_| DomainError::validation("part_size", "part_size overflows i64"))?;
         let am = UploadActiveModel {
             upload_id: Set(upload_id),
             file_id: Set(file_id),
@@ -54,6 +60,8 @@ impl MultipartRepo {
             state: Set("in_progress".to_owned()),
             declared_mime: Set(declared_mime.to_owned()),
             mime_validated: Set(false),
+            declared_size: Set(declared_size_i64),
+            part_size: Set(part_size_i64),
             created_at: Set(now),
             expires_at: Set(expires_at),
         };
@@ -199,6 +207,8 @@ fn session_from_model(m: UploadModel) -> Result<MultipartUploadSession, DomainEr
             m.upload_id, m.state
         ))
     })?;
+    let declared_size = u64::try_from(m.declared_size).unwrap_or(0);
+    let part_size = u64::try_from(m.part_size).unwrap_or(0);
     Ok(MultipartUploadSession {
         upload_id: m.upload_id,
         file_id: m.file_id,
@@ -207,6 +217,8 @@ fn session_from_model(m: UploadModel) -> Result<MultipartUploadSession, DomainEr
         state,
         declared_mime: m.declared_mime,
         mime_validated: m.mime_validated,
+        declared_size,
+        part_size,
         created_at: m.created_at,
         expires_at: m.expires_at,
     })

@@ -1,16 +1,23 @@
 //! `MultipartService` — multipart upload control-plane logic.
 //!
-//! Owns the P2-M3 flows: initiate, upload-part, complete, and abort.
+//! Owns the P2-M3 / multipart-coordinator flows: initiate (server-authoritative
+//! plan + per-part signed URLs), complete, and abort.
+//!
+//! The control-plane byte route (`upload_multipart_part`) has been removed as
+//! part of the multipart-coordinator feature — bytes now flow exclusively to
+//! the sidecar via the per-part signed URLs returned by `initiate_multipart_upload`
+//! (DESIGN §4.6, ADR-0003, FEATURE §8 migration).
+//!
 //! Holds its own copies of the shared dependencies (`Store`, `BackendRegistry`,
-//! `Authorizer`, `QuotaClient`) so it does NOT reference `FileService` — that
-//! keeps the fan-in graph clean and avoids raising the HK score of `FileService`.
+//! `Authorizer`, `QuotaClient`, `Issuer`) so it does NOT reference `FileService`
+//! — that keeps the fan-in graph clean and avoids raising the HK score of
+//! `FileService`.
 
-// Domain terms (ETag, If-Match, FileStorage, GET/PUT) recur throughout the docs.
+// Domain terms (ETag, If-Match, FileStorage, GET/PUT, BLAKE3) appear in the docs.
 #![allow(clippy::doc_markdown)]
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -18,27 +25,36 @@ use uuid::Uuid;
 use crate::domain::audit::{AuditEntry, AuditOperation};
 use crate::domain::authz::{Authorizer, actions};
 use crate::domain::error::DomainError;
-use crate::domain::multipart::{MultipartPart, MultipartUploadSession, MultipartUploadState};
+use crate::domain::multipart::{
+    MultipartPartPlan, MultipartPlan, MultipartUploadState, compute_plan,
+};
 use crate::domain::policy::{PolicyResolver, PolicyScope};
 use crate::domain::ports::MultipartStore;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::external_clients::{QuotaClient, QuotaDecision};
+use crate::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 
 /// Quota metric name (duplicated from service.rs; both refer to the same
 /// platform metric — no abstraction needed here).
 const QUOTA_METRIC_NAME: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1";
 
-/// The multipart-upload service (P2-M3).
+/// The multipart-upload service (multipart-coordinator feature).
 ///
 /// Extracted from `FileService` to reduce its Henry-Kafura coupling score.
-/// All four multipart operations live here; the struct is wired alongside
-/// `FileService` in `gear.rs` and served under the same REST prefix.
+/// All multipart control-plane operations live here; the struct is wired
+/// alongside `FileService` in `gear.rs` and served under the same REST prefix.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 pub struct MultipartService {
     store: Arc<dyn MultipartStore>,
     backends: BackendRegistry,
     authorizer: Arc<dyn Authorizer>,
     quota_client: Option<Arc<dyn QuotaClient>>,
+    /// Signed-URL issuer for minting per-part sidecar tokens.
+    issuer: Arc<Issuer>,
+    /// Base URL of the sidecar (e.g. `"http://sidecar.example.com"`).
+    sidecar_base_url: String,
+    /// Signed-URL TTL in seconds (shared with the session expiry).
+    url_ttl_secs: i64,
 }
 
 impl MultipartService {
@@ -47,12 +63,18 @@ impl MultipartService {
         backends: BackendRegistry,
         authorizer: Arc<dyn Authorizer>,
         quota_client: Option<Arc<dyn QuotaClient>>,
+        issuer: Arc<Issuer>,
+        sidecar_base_url: String,
+        url_ttl_secs: i64,
     ) -> Self {
         Self {
             store,
             backends,
             authorizer,
             quota_client,
+            issuer,
+            sidecar_base_url,
+            url_ttl_secs,
         }
     }
 
@@ -193,15 +215,19 @@ impl MultipartService {
         }
     }
 
-    // ── multipart upload (P2-M3) ─────────────────────────────────────────────
+    // ── multipart upload (multipart-coordinator feature) ─────────────────────
 
     /// `POST /files/{id}/multipart`: initiate a multipart upload session.
     ///
-    /// The caller **must** declare the total file size up front.  The service
-    /// validates `declared_size` against the effective policy limit and storage
-    /// quota at this point — mirroring what single-part upload does at
-    /// create/presign time — so that an oversized upload is rejected before
-    /// any bytes are transferred (DESIGN §4.6, server-authoritative model).
+    /// Server-authoritative: validates the intent, pre-registers a `pending`
+    /// version, creates the backend session, computes the **exact parts plan**,
+    /// and returns **one signed URL per part** pointing at the sidecar
+    /// (FEATURE §2, §3, §4; DESIGN §4.6).
+    ///
+    /// Policy/quota gates (FEATURE §7):
+    /// - Allowed MIME: `415`
+    /// - Declared size ≤ effective max: `413`
+    /// - Storage quota: `507`
     ///
     /// The complete-time total-size check is kept as defence-in-depth.
     ///
@@ -214,7 +240,9 @@ impl MultipartService {
         file_id: Uuid,
         declared_mime: &str,
         declared_size: u64,
-    ) -> Result<MultipartUploadSession, DomainError> {
+        preferred_part_size: Option<u64>,
+        _concurrency: Option<u32>,
+    ) -> Result<MultipartPlan, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
@@ -244,8 +272,7 @@ impl MultipartService {
 
         // Gate: reject if the declared total size exceeds the effective limit.
         // This is the DESIGN-aligned fix for CodeRabbit F2: validate up front at
-        // initiate time rather than deferring to complete time (which allowed a
-        // client to store oversized parts and never call complete).
+        // initiate time rather than deferring to complete time.
         //
         // @cpt-cf-file-storage-fr-size-limits-policy
         if let Some(limit) = effective_max
@@ -271,6 +298,11 @@ impl MultipartService {
         let backend_path = Self::backend_path(file_id, version_id);
         let backend_id = backend.id().to_owned();
 
+        // Compute the server-authoritative parts plan (FEATURE §3).
+        // `backend_min_part_size` is not yet exposed by the BackendCapabilities
+        // API so we fall back to the `DEFAULT_MIN_PART_SIZE` constant.
+        let (chosen_part_size, raw_parts) = compute_plan(declared_size, preferred_part_size, None);
+
         // Pre-register the pending file_versions row.
         self.store
             .insert_pending_version(
@@ -286,8 +318,8 @@ impl MultipartService {
         // Initiate the multipart upload on the backend.
         let backend_handle = backend.initiate_multipart(&backend_path).await?;
 
-        // Default TTL for multipart sessions: 7 days.
-        let expires_at = now + time::Duration::days(7);
+        // Use the configured TTL for both the session row and the signed URLs.
+        let expires_at = now + time::Duration::seconds(self.url_ttl_secs.max(1));
 
         // Persist the session row. On failure, best-effort compensate to avoid
         // orphaning the backend handle and the pending version row.
@@ -299,6 +331,8 @@ impl MultipartService {
                 version_id,
                 &backend_handle,
                 declared_mime,
+                declared_size,
+                chosen_part_size,
                 expires_at,
                 now,
             )
@@ -316,109 +350,46 @@ impl MultipartService {
             return Err(err);
         }
 
-        Ok(MultipartUploadSession {
-            upload_id,
-            file_id,
-            version_id,
-            backend_upload_handle: backend_handle,
-            state: MultipartUploadState::InProgress,
-            declared_mime: declared_mime.to_owned(),
-            mime_validated: false,
-            created_at: now,
-            expires_at,
-        })
-    }
-
-    /// `PUT /files/{id}/multipart/{upload_id}/parts/{part_number}`: upload one part.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    pub async fn upload_multipart_part(
-        &self,
-        ctx: &SecurityContext,
-        file_id: Uuid,
-        upload_id: Uuid,
-        part_number: u32,
-        data: Bytes,
-    ) -> Result<MultipartPart, DomainError> {
-        let prefetch = Self::tenant_scope(ctx);
-        let file = self.store.require_file(&prefetch, file_id).await?;
-        let _scope = self
-            .authorizer
-            .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
-            .await?;
-
-        let session = self
-            .store
-            .get_multipart_upload(upload_id)
-            .await?
-            .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
-
-        // Bind the session to the authorized path `file_id`. Authorization above
-        // checks the path file, but the session is loaded by `upload_id` alone —
-        // without this a caller could drive another file's upload (and corrupt
-        // state via a recomputed backend path). Reported as "not found" so a
-        // foreign `upload_id` is not distinguishable from a missing one.
-        if session.file_id != file_id {
-            return Err(DomainError::multipart_upload_not_found(upload_id));
-        }
-
-        if session.state != MultipartUploadState::InProgress {
-            return Err(DomainError::multipart_upload_not_in_progress(
-                upload_id,
-                session.state.as_str(),
-            ));
-        }
-
-        // Fetch the backend from the version row.
-        let version = self.store.get_version(file_id, session.version_id).await?;
-        let backend_id = version.as_ref().map_or_else(
-            || self.backends.default_id().to_owned(),
-            |v| v.backend_id.clone(),
-        );
-        let backend = self.backends.get(&backend_id)?;
-        let backend_path = Self::backend_path(file_id, session.version_id);
-
-        // Part numbers are 1-based (S3 convention; 0 is invalid).
-        if part_number == 0 {
-            return Err(DomainError::validation(
-                "part_number",
-                "part number must be >= 1 (1-based)",
-            ));
-        }
-
-        let data_size = i64::try_from(data.len())
-            .map_err(|_| DomainError::validation("data", "part data too large"))?;
-        let (backend_etag, part_hash) = backend
-            .upload_part(
-                &backend_path,
-                &session.backend_upload_handle,
+        // Mint one signed URL per part (FEATURE §4).
+        // Each token carries the exact `size` claim the sidecar will enforce.
+        let exp = expires_at.unix_timestamp();
+        let mut parts = Vec::with_capacity(raw_parts.len());
+        for (part_number, offset, size) in raw_parts {
+            let claims = Claims {
+                op: Op::MultipartPart,
+                file_id,
+                version_id,
+                backend_id: backend_id.clone(),
+                backend_path: backend_path.clone(),
+                exp,
+                upload: UploadConstraints::default(),
+                multipart: MultipartClaims {
+                    upload_id,
+                    part_number,
+                    offset,
+                    size,
+                },
+            };
+            let token = self.issuer.issue(claims, now)?;
+            let upload_url = format!(
+                "{}/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/{part_number}?fs-token={token}",
+                self.sidecar_base_url
+            );
+            parts.push(MultipartPartPlan {
                 part_number,
-                data,
-            )
-            .await?;
+                offset,
+                size,
+                upload_url,
+            });
+        }
 
-        let now = OffsetDateTime::now_utc();
-        let part_number_i32 = i32::try_from(part_number)
-            .map_err(|_| DomainError::validation("part_number", "part number too large"))?;
-
-        self.store
-            .upsert_multipart_part(
-                upload_id,
-                part_number_i32,
-                &backend_etag,
-                part_hash.clone(),
-                data_size,
-                now,
-            )
-            .await?;
-
-        Ok(MultipartPart {
+        Ok(MultipartPlan {
             upload_id,
-            part_number,
-            backend_etag,
-            part_hash,
-            size: data_size,
-            uploaded_at: now,
+            version_id,
+            part_hash_algorithm: "SHA-256".to_owned(),
+            part_size: chosen_part_size,
+            parts,
+            expires_at,
         })
     }
 
@@ -472,8 +443,24 @@ impl MultipartService {
         let backend = self.backends.get(&backend_id)?;
         let backend_path = Self::backend_path(file_id, session.version_id);
 
-        // Compute total size.
+        // Compute total assembled size from the parts that the sidecar wrote.
         let total_size: i64 = parts.iter().map(|p| p.size).sum();
+
+        // Defence-in-depth: verify the assembled size matches `declared_size`
+        // (FEATURE §6, §7 — "Total assembled size = declared_size").
+        //
+        // The primary enforcement is per-part at the sidecar (the `size` claim
+        // in each token); this check catches residual mismatches (e.g. a
+        // missing/extra part).
+        if session.declared_size > 0 {
+            let expected = i64::try_from(session.declared_size).unwrap_or(i64::MAX);
+            if total_size != expected {
+                return Err(DomainError::conflict(format!(
+                    "multipart upload {upload_id}: assembled size {total_size} \
+                     does not match declared_size {expected}"
+                )));
+            }
+        }
 
         // Policy size check.
         let policy = self

@@ -18,13 +18,13 @@ use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 
 use super::dto::{
     BindReq, CreateFileReq, CreateRetentionRuleReq, DownloadTicketDto, EffectivePolicyDto, FileDto,
-    InitiateMultipartReq, MigrateBackendReq, MultipartSessionDto, PolicyDto, RetentionRuleDto,
-    SetPolicyReq, StorageDto, TransferOwnershipReq, UpdateMetadataReq, UploadPartDto,
+    InitiateMultipartReq, MigrateBackendReq, MultipartPartPlanDto, MultipartPlanDto, PolicyDto,
+    RetentionRuleDto, SetPolicyReq, StorageDto, TransferOwnershipReq, UpdateMetadataReq,
     UploadTicketDto, VersionDto,
 };
 use crate::domain::error::DomainError;
 use crate::domain::etag;
-use crate::domain::multipart::MultipartUploadSession;
+use crate::domain::multipart::MultipartPlan;
 use crate::domain::multipart_service::MultipartService;
 use crate::domain::policy::{PolicyScope, RetentionScope};
 use crate::domain::policy_service::PolicyService;
@@ -380,20 +380,30 @@ pub async fn delete_retention_rule(
     }
 }
 
-// ── multipart upload (P2-M3) ────────────────────────────────────────────────────
+// ── multipart upload (multipart-coordinator feature) ──────────────────────────
 
-fn session_to_dto(s: MultipartUploadSession) -> MultipartSessionDto {
-    MultipartSessionDto {
-        upload_id: s.upload_id,
-        file_id: s.file_id,
-        version_id: s.version_id,
-        state: s.state.as_str().to_owned(),
-        declared_mime: s.declared_mime,
-        expires_at: s.expires_at,
+fn plan_to_dto(p: MultipartPlan) -> MultipartPlanDto {
+    MultipartPlanDto {
+        upload_id: p.upload_id,
+        version_id: p.version_id,
+        part_hash_algorithm: p.part_hash_algorithm,
+        part_size: p.part_size,
+        parts: p
+            .parts
+            .into_iter()
+            .map(|pp| MultipartPartPlanDto {
+                part_number: pp.part_number,
+                offset: pp.offset,
+                size: pp.size,
+                upload_url: pp.upload_url,
+            })
+            .collect(),
+        expires_at: p.expires_at,
     }
 }
 
-/// `POST /files/{id}/multipart` — initiate a multipart upload session.
+/// `POST /files/{id}/multipart` — initiate a server-authoritative multipart
+/// upload session and return the parts plan with per-part signed sidecar URLs.
 ///
 /// @cpt-cf-file-storage-fr-multipart-upload
 /// @cpt-cf-file-storage-fr-size-limits-policy
@@ -403,30 +413,18 @@ pub async fn initiate_multipart(
     Extension(svc): MultiSvc,
     Path(file_id): Path<Uuid>,
     Json(req): Json<InitiateMultipartReq>,
-) -> ApiResult<JsonBody<MultipartSessionDto>> {
-    let session = svc
-        .initiate_multipart_upload(&ctx, file_id, &req.declared_mime, req.declared_size)
+) -> ApiResult<JsonBody<MultipartPlanDto>> {
+    let plan = svc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            &req.declared_mime,
+            req.declared_size,
+            req.preferred_part_size,
+            req.concurrency,
+        )
         .await?;
-    Ok(Json(session_to_dto(session)))
-}
-
-/// `PUT /files/{id}/multipart/{upload_id}/parts/{part_number}` — upload one part.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-pub async fn upload_multipart_part(
-    Extension(ctx): Ctx,
-    Extension(svc): MultiSvc,
-    Path((file_id, upload_id, part_number)): Path<(Uuid, Uuid, u32)>,
-    body: axum::body::Bytes,
-) -> ApiResult<JsonBody<UploadPartDto>> {
-    let part = svc
-        .upload_multipart_part(&ctx, file_id, upload_id, part_number, body)
-        .await?;
-    Ok(Json(UploadPartDto {
-        part_number: part.part_number,
-        backend_etag: part.backend_etag,
-        size: part.size,
-    }))
+    Ok(Json(plan_to_dto(plan)))
 }
 
 /// `POST /files/{id}/multipart/{upload_id}/complete` — finalize all parts.

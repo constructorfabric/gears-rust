@@ -639,6 +639,8 @@ impl Store {
         version_id: Uuid,
         backend_upload_handle: &str,
         declared_mime: &str,
+        declared_size: u64,
+        part_size: u64,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
@@ -652,6 +654,8 @@ impl Store {
                 version_id,
                 backend_upload_handle,
                 declared_mime,
+                declared_size,
+                part_size,
                 expires_at,
                 now,
             )
@@ -1336,6 +1340,8 @@ impl MultipartStore for Store {
         version_id: Uuid,
         backend_upload_handle: &str,
         declared_mime: &str,
+        declared_size: u64,
+        part_size: u64,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
@@ -1346,6 +1352,8 @@ impl MultipartStore for Store {
             version_id,
             backend_upload_handle,
             declared_mime,
+            declared_size,
+            part_size,
             expires_at,
             now,
         )

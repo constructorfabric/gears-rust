@@ -89,6 +89,9 @@ async fn build_service() -> (
         backends,
         authorizer,
         None,
+        Arc::new(Issuer::generate(3600).expect("issuer")),
+        "http://sidecar.test".to_owned(),
+        3600,
     ));
     let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     (svc, msvc, dp, store)
@@ -325,32 +328,97 @@ async fn delete_version_leaves_audit_row() {
     assert_eq!(del_ver_rows[0].outcome, "success");
 }
 
-// ── 7. multipart complete leaves audit rows ───────────────────────────────────
+// -- 7. multipart complete leaves audit rows ----------------------------------
 
 /// @cpt-cf-file-storage-fr-audit-trail
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn multipart_complete_leaves_audit_rows() {
-    let (svc, msvc, dp, store) = build_service().await;
-    let ctx = ctx(Uuid::now_v7());
+    // Build a custom setup that exposes both the MultipartStore and the
+    // InMemoryBackend directly, so the test can simulate the sidecar path
+    // (upload_part + upsert_multipart_part) without going through the removed
+    // control-plane byte route (ADR-0003 / FEATURE §8 migration).
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let multipart_store: Arc<dyn file_storage::domain::ports::MultipartStore> =
+        Arc::new(store.clone());
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::clone(&multipart_store),
+        backends.clone(),
+        Arc::clone(&authorizer),
+        None,
+        Arc::clone(&issuer),
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
 
+    let ctx = ctx(Uuid::now_v7());
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
-    let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream", 5)
+
+    // Declare total size = 5 bytes ("part1").
+    let part_data = Bytes::from_static(b"part1");
+    let declared_size: u64 = part_data.len() as u64;
+
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            declared_size,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
-    msvc.upload_multipart_part(
-        &ctx,
-        ticket.file_id,
-        session.upload_id,
-        1,
-        Bytes::from_static(b"part1"),
-    )
-    .await
-    .unwrap();
+    // Retrieve the backend handle and simulate the sidecar part write.
+    let session = multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session must exist");
+    let backend_path = format!("/{}/{}", ticket.file_id, plan.version_id);
 
-    msvc.complete_multipart_upload(&ctx, ticket.file_id, session.upload_id)
+    let (backend_etag, part_hash) = backend
+        .upload_part(&backend_path, &session.backend_upload_handle, 1, part_data)
+        .await
+        .unwrap();
+    let size = i64::try_from(declared_size).unwrap();
+    multipart_store
+        .upsert_multipart_part(
+            plan.upload_id,
+            1,
+            &backend_etag,
+            part_hash,
+            size,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+
+    msvc.complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id)
         .await
         .unwrap();
 
@@ -376,7 +444,7 @@ async fn multipart_complete_leaves_audit_rows() {
     );
 
     // Also verify bind after multipart still adds exactly 1 more patch_content row.
-    svc.bind(&ctx, ticket.file_id, session.version_id, None)
+    svc.bind(&ctx, ticket.file_id, plan.version_id, None)
         .await
         .unwrap();
     let rows2 = store.list_audit(ticket.file_id).await.unwrap();

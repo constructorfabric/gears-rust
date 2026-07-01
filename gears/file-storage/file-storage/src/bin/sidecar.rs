@@ -33,6 +33,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use file_storage::infra::backend::{LocalFsBackend, StorageBackend};
+use file_storage::infra::content::hash::sha256;
 use file_storage::infra::content::{hash, range};
 use file_storage::infra::signed_url::{Op, Verifier};
 
@@ -77,6 +78,13 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/file-storage-data/v1/download/{file_id}/{version_id}",
             get(download),
+        )
+        // Server-authoritative multipart part upload (multipart-coordinator feature).
+        // The control plane mints a `multipart_part` token for each part; the
+        // sidecar verifies and enforces the exact `size` claim before writing.
+        .route(
+            "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/{part_number}",
+            put(upload_multipart_part),
         )
         .with_state(state);
 
@@ -142,6 +150,103 @@ async fn upload(
         }
         Err(e) => {
             tracing::error!(error = %e, "backend put failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response()
+        }
+    }
+}
+
+/// `PUT` multipart part: verify `op=multipart_part` token, enforce the exact
+/// `size` claim (FEATURE §4, point 2: reject `413` before writing any bytes),
+/// write the part via the backend, compute and return the part hash.
+///
+/// This is the sidecar half of the server-authoritative multipart model. The
+/// control plane mints the token (sole minter, ADR-0004); the sidecar only
+/// verifies and enforces — it can never mint a token.
+///
+/// Idempotent per `(upload_id, part_number)`: a re-PUT with the same token
+/// overwrites the earlier part (safe for resume — ADR-0004 §4).
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+async fn upload_multipart_part(
+    State(state): State<SidecarState>,
+    Path((file_id, version_id, part_number)): Path<(Uuid, Uuid, u32)>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(token) = extract_token(&q, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing fs-token").into_response();
+    };
+    let claims = match state
+        .verifier
+        .verify(&token, time::OffsetDateTime::now_utc())
+    {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    };
+
+    // Verify op and path bindings.
+    if claims.op != Op::MultipartPart
+        || claims.file_id != file_id
+        || claims.version_id != version_id
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "token does not authorize this operation",
+        )
+            .into_response();
+    }
+
+    // Verify part-number binding (prevents replaying another part's token here).
+    if claims.multipart.part_number != part_number {
+        return (
+            StatusCode::FORBIDDEN,
+            "token part_number does not match path",
+        )
+            .into_response();
+    }
+
+    // FEATURE §4, point 2: reject 413 if body length ≠ size claim — BEFORE writing.
+    // This is the enforcement point that closes the oversized-part abuse vector.
+    let body_len = body.len() as u64;
+    if body_len != claims.multipart.size {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "part body length {} does not match token size claim {}",
+                body_len, claims.multipart.size
+            ),
+        )
+            .into_response();
+    }
+
+    // Compute the part hash before the write so the caller can persist it.
+    let part_hash = sha256(&body);
+    let part_etag = hex::encode(&part_hash);
+
+    // Write the part. For a `multipart_native` backend this would call
+    // `upload_part`; the sidecar here uses the simple `put` into the versioned
+    // path for the local-fs backend (offset-write model, §4 "otherwise
+    // offset-write into /{file_id}/{version_id}").
+    //
+    // NOTE: a production sidecar would call `backend.upload_part(...)` when the
+    // backend supports native multipart. For the current thin binary (local-fs
+    // only, no S3) we persist each part as a separate object keyed by path + part
+    // and rely on `complete_multipart_upload` to assemble them.
+    let part_path = format!("{}.part.{}", claims.backend_path, part_number);
+    match state.backend.put(&part_path, body).await {
+        Ok(()) => {
+            // Return the part hash and ETag so callers can track per-part integrity.
+            let body = serde_json::json!({
+                "part_number": part_number,
+                "etag": part_etag,
+                "hash_algorithm": "SHA-256",
+                "hash": part_etag,
+            });
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, part_number, "backend part write failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response()
         }
     }

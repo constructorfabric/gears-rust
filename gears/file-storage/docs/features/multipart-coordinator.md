@@ -184,23 +184,34 @@ Abandoned in-flight sessions are reclaimed by the orphan/TTL sweep
 
 ## 8. Migration from the interim implementation
 
-The shipped P2-M3 multipart is **client-driven**: the client picks `part_number`
-and `PUT`s raw bytes to a **control-plane** route
-(`PUT /files/{id}/multipart/{upload_id}/parts/{part_number}`), which proxies them
-to the backend. That contradicts DESIGN §4.6 (server owns the plan) and ADR-0003
-(no bytes through the control plane), and it is why per-part size cannot be
-enforced today.
+The former P2-M3 multipart was **client-driven**: the client picked `part_number`
+and `PUT` raw bytes to a **control-plane** route
+(`PUT /files/{id}/multipart/{upload_id}/parts/{part_number}`), which proxied them
+to the backend. That contradicted DESIGN §4.6 (server owns the plan) and ADR-0003
+(no bytes through the control plane), and it is why per-part size could not be
+enforced.
 
-This feature supersedes it:
+This feature **has superseded it** (shipped):
 
 - `initiate` returns a parts plan + per-part sidecar signed URLs (was: a single
   session handle).
 - Part bytes move to the **sidecar** via those URLs; the control-plane
   `.../parts/{n}` byte route is **removed**.
-- Per-part size is enforced at the sidecar via the token size claim.
+- Per-part size is enforced at the sidecar via the token `size` claim (`413`
+  before any write).
+- `declared_size` and `part_size` are persisted on `multipart_uploads`
+  (migration `m20260701_000002_multipart_plan_columns`) so the plan is
+  reconstitutable for resume.
 
-The already-landed initiate-time `declared_size` gate (PR #4170 F2) is a forward
-step toward this contract and is retained.
+The already-landed initiate-time `declared_size` gate (PR #4170 F2) is retained
+as the up-front rejection, and the complete-time total-size check
+(assembled size == `declared_size`) remains as defence-in-depth.
+
+**Implementation note:** per-part hashes are **SHA-256** in P2 (see §5 — the
+BLAKE3 subtree scheme is deferred). For a `multipart_native` backend the sidecar
+drives the backend's native multipart API; the thin local-fs sidecar binary
+offset-writes each part into a per-part object and relies on `complete` to
+assemble.
 
 ## 9. Traceability
 

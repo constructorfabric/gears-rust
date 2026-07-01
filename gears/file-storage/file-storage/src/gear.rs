@@ -128,13 +128,17 @@ impl Gear for FileStorageGear {
         let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
         let sweep_backends = backends.clone();
 
+        // Extract values needed by both services before moving svc_cfg.
+        let sidecar_base_url = svc_cfg.sidecar_base_url.clone();
+        let url_ttl_secs = svc_cfg.default_url_ttl_secs;
+
         // TODO(P2): wire the quota-enforcement client once the Quota Enforcement
         // gear exposes an SDK crate. For now, no quota checks are performed.
         // TODO(P2-M5): wire the usage reporter once a Usage Collector SDK is available.
         let service = Arc::new(FileService::new(
             store,
             backends.clone(),
-            issuer,
+            Arc::clone(&issuer),
             Arc::clone(&authorizer),
             svc_cfg,
             None, // quota_client
@@ -149,6 +153,9 @@ impl Gear for FileStorageGear {
             backends,
             Arc::clone(&authorizer),
             None, // quota_client
+            Arc::clone(&issuer),
+            sidecar_base_url,
+            url_ttl_secs,
         ));
         self.multipart_service.set(multipart_svc).map_err(|_| {
             anyhow::anyhow!(

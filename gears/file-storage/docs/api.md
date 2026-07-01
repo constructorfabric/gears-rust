@@ -135,11 +135,14 @@ offset-writes each part into the single new-version object. Per-part BLAKE3 subt
 Full request/response envelopes, error taxonomy, token claims, persistence, and resumability are specified in the
 FEATURE artifact **[features/multipart-coordinator.md](./features/multipart-coordinator.md)**.
 
-> **Implementation status**: the interim P2-M3 build is *client-driven* (the client picks `part_number` and `PUT`s raw
-> bytes to a control-plane `.../parts/{n}` route). The initiate-time `declared_size` gate above is already in place;
-> the per-part signed-URL flow and the removal of the control-plane byte route are pending alignment to this contract
-> (FEATURE §8). Until then `declared_size` is validated at initiate but not persisted, and the complete-time
-> total-size check (summing actual part sizes) is the defence-in-depth backstop.
+> **Implementation status**: the server-authoritative flow is **shipped**. `POST /files/{id}/multipart` computes the
+> parts plan and returns one signed sidecar URL per part (each token carrying `upload_id`, `part_number`, `offset`, and
+> the exact `size` claim); the sidecar enforces the per-part size at transfer with `413` **before** any write. The
+> initiate-time `declared_size` gate is in place and `declared_size`/`part_size` are persisted on the session row so the
+> plan can be reconstituted for resume. The interim client-driven control-plane byte route (`PUT .../parts/{n}`) has
+> been **removed** — bytes flow exclusively to the sidecar (ADR-0003, FEATURE §8 migration). The complete-time
+> total-size check (assembled size == `declared_size`) remains as the defence-in-depth backstop. Note: per-part hashes
+> are **SHA-256** in P2 (not BLAKE3 subtree hashes); BLAKE3 alignment is deferred.
 
 ## Upload, bind, and the conflict retry
 
