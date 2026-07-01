@@ -27,8 +27,10 @@ pub use idempotency_repo::IdempotencyRepo;
 pub use metadata_repo::MetadataRepo;
 pub use multipart_repo::MultipartRepo;
 pub use policy_repo::PolicyRepo;
-pub use retention_rule_repo::{InsertRetentionRule, RetentionRuleRepo};
+pub use retention_rule_repo::RetentionRuleRepo;
 pub use version_repo::VersionRepo;
+
+use crate::domain::policy::{RetentionRuleBody, RetentionScope};
 
 /// Row types returned by the audit / file-event outbox repositories.
 ///
@@ -40,6 +42,19 @@ pub use version_repo::VersionRepo;
 pub type AuditRow = crate::infra::storage::entity::audit_outbox::Model;
 /// See [`AuditRow`].
 pub type FileEventRow = crate::infra::storage::entity::events_outbox::Model;
+
+/// Parameters for inserting a new retention rule.
+///
+/// Defined on the repo-layer facade (like [`AuditRow`] / [`FileEventRow`]) so
+/// [`Store`](crate::infra::storage::store) depends on this one module for the
+/// type instead of reaching into the `retention_rule_repo` submodule directly.
+pub struct InsertRetentionRule<'a> {
+    pub tenant_id: uuid::Uuid,
+    pub retention_scope: &'a RetentionScope,
+    pub scope_target_id: Option<uuid::Uuid>,
+    pub body: &'a RetentionRuleBody,
+    pub now: time::OffsetDateTime,
+}
 
 /// The full set of tenant-scoped repositories, owned by the persistence
 /// [`Store`](crate::infra::storage::store::Store).

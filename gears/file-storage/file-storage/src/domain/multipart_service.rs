@@ -20,9 +20,9 @@ use crate::domain::authz::{Authorizer, actions};
 use crate::domain::error::DomainError;
 use crate::domain::multipart::{MultipartPart, MultipartUploadSession, MultipartUploadState};
 use crate::domain::policy::{PolicyResolver, PolicyScope};
+use crate::domain::ports::MultipartStore;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::quota::{QuotaClient, QuotaDecision};
-use crate::infra::storage::Store;
 
 /// Quota metric name (duplicated from service.rs; both refer to the same
 /// platform metric — no abstraction needed here).
@@ -35,7 +35,7 @@ const QUOTA_METRIC_NAME: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.file_stor
 /// `FileService` in `gear.rs` and served under the same REST prefix.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 pub struct MultipartService {
-    store: Store,
+    store: Arc<dyn MultipartStore>,
     backends: BackendRegistry,
     authorizer: Arc<dyn Authorizer>,
     quota_client: Option<Arc<dyn QuotaClient>>,
@@ -43,7 +43,7 @@ pub struct MultipartService {
 
 impl MultipartService {
     pub fn new(
-        store: Store,
+        store: Arc<dyn MultipartStore>,
         backends: BackendRegistry,
         authorizer: Arc<dyn Authorizer>,
         quota_client: Option<Arc<dyn QuotaClient>>,

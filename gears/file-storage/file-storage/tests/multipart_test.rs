@@ -15,6 +15,7 @@ use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart_service::MultipartService;
+use file_storage::domain::ports::MultipartStore;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{
     BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend,
@@ -74,7 +75,12 @@ async fn build_service_with_config(
         None,
         None,
     ));
-    let msvc = Arc::new(MultipartService::new(store, backends, authorizer, None));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::new(store) as Arc<dyn MultipartStore>,
+        backends,
+        authorizer,
+        None,
+    ));
     let dp = DataPlaneService::new(Arc::clone(&svc));
     (svc, msvc, dp)
 }
@@ -183,7 +189,12 @@ async fn multipart_rejected_on_local_fs() {
         None,
         None,
     ));
-    let msvc = Arc::new(MultipartService::new(store, backends, authorizer, None));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::new(store) as Arc<dyn MultipartStore>,
+        backends,
+        authorizer,
+        None,
+    ));
 
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();

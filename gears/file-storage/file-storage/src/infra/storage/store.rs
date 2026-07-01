@@ -27,19 +27,26 @@
 //! ## Accepted Henry-Kafura hub (do not fragment further)
 //!
 //! `Store` is the **single unit-of-work persistence facade** — the one type that
-//! holds the `DBProvider` and drives connections/transactions, so every domain
-//! service depends on it. That is a legitimate hub by design: its fan-in equals
-//! the number of services that persist state and grows by one with each new
-//! service, and its fan-out already collapses the nine repositories behind a
-//! single [`Repos`] aggregate (the DIP remedy) and takes the two test-only
-//! outbox row types via the `repo` layer (`AuditRow` / `FileEventRow`) rather
-//! than reaching into `entity::*` directly. Splitting it into per-context
-//! store slices does not dissolve the coupling — the cross-cutting flows
-//! (a multipart *complete*, for example, touches files, versions, the multipart
-//! session, and the audit outbox in one transaction) would each still depend on
-//! several slices, relocating the crossroads rather than removing it. The
-//! transaction boundary is the natural seam and it is already here, so the
-//! facade is deliberately kept whole.
+//! holds the `DBProvider` and drives connections/transactions. The transaction
+//! boundary is the natural seam, so the facade itself is deliberately kept whole
+//! rather than fragmented into per-context store slices (a cross-cutting flow
+//! such as a multipart *complete* touches files, versions, the multipart
+//! session, and the audit outbox in one transaction, so slicing would only
+//! relocate the crossroads).
+//!
+//! Two structural remedies keep its Henry-Kafura coupling in check without
+//! fragmenting the transaction logic:
+//!
+//! - **fan-out** collapses the nine repositories behind a single [`Repos`]
+//!   aggregate (the DIP remedy), and takes the repo-layer row / param types
+//!   (`AuditRow`, `FileEventRow`, `InsertRetentionRule`) via the `repo` facade
+//!   rather than reaching into `entity::*` or individual repo submodules.
+//! - **fan-in** is held down by the domain-owned capability ports in
+//!   [`crate::domain::ports`] ([`CleanupStore`](crate::domain::ports::CleanupStore),
+//!   [`MultipartStore`](crate::domain::ports::MultipartStore)): narrow consumers
+//!   depend on the segregated trait they actually use (ISP), so only `FileService`
+//!   and the composition root (`gear`) name the concrete `Store`. New background
+//!   or bounded-context consumers should take a port, not the concrete facade.
 
 // Domain terms (ETag, If-Match) appear in the module docs.
 #![allow(clippy::doc_markdown)]
@@ -1129,10 +1136,7 @@ impl Store {
     /// Intended for testing; not exposed on the REST API.
     ///
     /// @cpt-cf-file-storage-fr-file-events
-    pub async fn list_file_events(
-        &self,
-        file_id: Uuid,
-    ) -> Result<Vec<FileEventRow>, DomainError> {
+    pub async fn list_file_events(&self, file_id: Uuid) -> Result<Vec<FileEventRow>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos.events_outbox.list_for_file(&conn, file_id).await
     }
@@ -1179,6 +1183,232 @@ impl Store {
             .retention_rules
             .list_all(&conn, &AccessScope::allow_all())
             .await
+    }
+}
+
+// ── trait implementations ─────────────────────────────────────────────────────
+
+use crate::domain::ports::{CleanupStore, MultipartStore};
+use async_trait::async_trait;
+
+#[async_trait]
+impl CleanupStore for Store {
+    async fn list_abandoned_pending_versions(
+        &self,
+        older_than: OffsetDateTime,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        Store::list_abandoned_pending_versions(self, older_than).await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: crate::domain::audit::AuditEntry,
+    ) -> Result<bool, DomainError> {
+        Store::delete_version(self, file_id, version_id, audit).await
+    }
+
+    async fn list_expired_multipart_uploads(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Vec<crate::domain::multipart::MultipartUploadSession>, DomainError> {
+        Store::list_expired_multipart_uploads(self, now).await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: crate::domain::audit::AuditEntry,
+    ) -> Result<bool, DomainError> {
+        Store::abort_multipart_upload(self, upload_id, audit).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError> {
+        Store::get_version(self, file_id, version_id).await
+    }
+
+    async fn list_all_retention_rules(
+        &self,
+    ) -> Result<Vec<crate::domain::policy::StoredRetentionRule>, DomainError> {
+        Store::list_all_retention_rules(self).await
+    }
+
+    async fn list_all_files_for_sweep(
+        &self,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<file_storage_sdk::File>, DomainError> {
+        Store::list_all_files_for_sweep(self, after, limit).await
+    }
+
+    async fn list_metadata(
+        &self,
+        file_id: Uuid,
+    ) -> Result<Vec<file_storage_sdk::CustomMetadataEntry>, DomainError> {
+        Store::list_metadata(self, file_id).await
+    }
+
+    async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
+        Store::list_versions(self, file_id).await
+    }
+
+    async fn delete_file_with_event(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        file_id: Uuid,
+        audit: crate::domain::audit::AuditEntry,
+        event: Option<crate::domain::audit::FileEvent>,
+    ) -> Result<bool, DomainError> {
+        Store::delete_file_with_event(self, scope, file_id, audit, event).await
+    }
+}
+
+#[async_trait]
+impl MultipartStore for Store {
+    async fn require_file(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        file_id: Uuid,
+    ) -> Result<file_storage_sdk::File, DomainError> {
+        Store::require_file(self, scope, file_id).await
+    }
+
+    async fn get_policy(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &crate::domain::policy::PolicyScope,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<Option<crate::domain::policy::StoredPolicy>, DomainError> {
+        Store::get_policy(self, scope, tenant_id, policy_scope, scope_owner_id).await
+    }
+
+    async fn insert_pending_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        mime_type: &str,
+        backend_id: &str,
+        backend_path: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        Store::insert_pending_version(
+            self,
+            file_id,
+            version_id,
+            mime_type,
+            backend_id,
+            backend_path,
+            now,
+        )
+        .await
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        file_id: Uuid,
+        version_id: Uuid,
+        backend_upload_handle: &str,
+        declared_mime: &str,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        Store::create_multipart_upload(
+            self,
+            upload_id,
+            file_id,
+            version_id,
+            backend_upload_handle,
+            declared_mime,
+            expires_at,
+            now,
+        )
+        .await
+    }
+
+    async fn get_multipart_upload(
+        &self,
+        upload_id: Uuid,
+    ) -> Result<Option<crate::domain::multipart::MultipartUploadSession>, DomainError> {
+        Store::get_multipart_upload(self, upload_id).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError> {
+        Store::get_version(self, file_id, version_id).await
+    }
+
+    async fn upsert_multipart_part(
+        &self,
+        upload_id: Uuid,
+        part_number: i32,
+        backend_etag: &str,
+        part_hash: Vec<u8>,
+        size: i64,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        Store::upsert_multipart_part(
+            self,
+            upload_id,
+            part_number,
+            backend_etag,
+            part_hash,
+            size,
+            now,
+        )
+        .await
+    }
+
+    async fn list_multipart_parts(
+        &self,
+        upload_id: Uuid,
+    ) -> Result<Vec<crate::domain::multipart::MultipartPart>, DomainError> {
+        Store::list_multipart_parts(self, upload_id).await
+    }
+
+    async fn finalize_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        size: i64,
+        hash_value: Vec<u8>,
+        audit: crate::domain::audit::AuditEntry,
+    ) -> Result<bool, DomainError> {
+        Store::finalize_version(self, file_id, version_id, size, hash_value, audit).await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: crate::domain::audit::AuditEntry,
+    ) -> Result<bool, DomainError> {
+        Store::complete_multipart_upload(self, upload_id, audit).await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: crate::domain::audit::AuditEntry,
+    ) -> Result<bool, DomainError> {
+        Store::abort_multipart_upload(self, upload_id, audit).await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: crate::domain::audit::AuditEntry,
+    ) -> Result<bool, DomainError> {
+        Store::delete_version(self, file_id, version_id, audit).await
     }
 }
 

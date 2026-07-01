@@ -1,7 +1,6 @@
 //! Repository for the `retention_rules` table.
 
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
-use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -11,14 +10,7 @@ use crate::domain::policy::{RetentionRuleBody, RetentionScope, StoredRetentionRu
 use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::retention_rule::{ActiveModel, Column, Entity, Model};
 
-/// Parameters for inserting a new retention rule.
-pub struct InsertRetentionRule<'a> {
-    pub tenant_id: Uuid,
-    pub retention_scope: &'a RetentionScope,
-    pub scope_target_id: Option<Uuid>,
-    pub body: &'a RetentionRuleBody,
-    pub now: OffsetDateTime,
-}
+use super::InsertRetentionRule;
 
 /// Repository over the `retention_rules` table.
 #[derive(Clone, Default)]

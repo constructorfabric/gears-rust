@@ -1503,9 +1503,14 @@ impl FileService {
         &self.backends
     }
 
-    /// Store (shared with the data plane).
-    pub(crate) fn store(&self) -> &Store {
-        &self.store
+    /// Fetch a single version by `(file_id, version_id)` — delegated to the
+    /// data plane so it does not need to hold a direct `Store` reference.
+    pub(crate) async fn get_version(
+        &self,
+        file_id: uuid::Uuid,
+        version_id: uuid::Uuid,
+    ) -> Result<Option<file_storage_sdk::FileVersion>, crate::domain::error::DomainError> {
+        self.store.get_version(file_id, version_id).await
     }
 }
 

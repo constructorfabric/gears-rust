@@ -30,34 +30,27 @@ use crate::domain::error::DomainError;
 use crate::domain::service::FileService;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::content::{hash, mime};
-use crate::infra::storage::Store;
 
 /// Data-plane service: moves bytes between callers and the storage backend.
 ///
 /// Constructed from an `Arc<FileService>` to access the control-plane
-/// `finalize_upload` callback; it borrows the backend registry and `Store`
-/// from the same `FileService` via `pub(crate)` accessors.
+/// `finalize_upload` callback and version look-ups; it borrows the backend
+/// registry from the same `FileService` via a `pub(crate)` accessor.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 pub struct DataPlaneService {
     control: Arc<FileService>,
     backends: BackendRegistry,
-    store: Store,
 }
 
 impl DataPlaneService {
     /// Build a `DataPlaneService` that delegates finalize to `control`.
     ///
-    /// The backends and `Store` are cloned from the control-plane service so
-    /// both layers share the same resources without duplication.
+    /// The backend registry is cloned from the control-plane service so both
+    /// layers share the same resources without duplication.
     #[must_use]
     pub fn new(control: Arc<FileService>) -> Self {
         let backends = control.backends().clone();
-        let store = control.store().clone();
-        Self {
-            control,
-            backends,
-            store,
-        }
+        Self { control, backends }
     }
 
     /// Validate, store, hash, and finalize an uploaded blob in one step.
@@ -82,7 +75,7 @@ impl DataPlaneService {
         self.control.authorize_write(ctx, file_id).await?;
 
         let version = self
-            .store
+            .control
             .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
@@ -106,7 +99,7 @@ impl DataPlaneService {
         range: Option<ByteRange>,
     ) -> Result<Bytes, DomainError> {
         let version = self
-            .store
+            .control
             .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;

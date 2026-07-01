@@ -19,6 +19,7 @@ use crate::domain::authz::Authorizer;
 use crate::domain::cleanup::{CleanupConfig, CleanupEngine};
 use crate::domain::local_client::FileStorageLocalClient;
 use crate::domain::multipart_service::MultipartService;
+use crate::domain::ports::{CleanupStore, MultipartStore};
 use crate::domain::service::{FileService, ServiceConfig};
 use crate::infra::authz::PolicyEnforcerAuthorizer;
 use crate::infra::backend::{BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend};
@@ -117,16 +118,17 @@ impl Gear for FileStorageGear {
 
         let store = Store::new(Arc::clone(&db));
 
-        // Clone store + backends before moving them into FileService so the
-        // cleanup engine can share them (both types are `Clone`).
-        let sweep_store = store.clone();
+        // Upcast to the narrow capability traits before distributing.
+        // `Store` is Clone, so each consumer gets its own clone wrapped in Arc.
+        let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+        let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
         let sweep_backends = backends.clone();
 
         // TODO(P2): wire the quota-enforcement client once the Quota Enforcement
         // gear exposes an SDK crate. For now, no quota checks are performed.
         // TODO(P2-M5): wire the usage reporter once a Usage Collector SDK is available.
         let service = Arc::new(FileService::new(
-            store.clone(),
+            store,
             backends.clone(),
             issuer,
             Arc::clone(&authorizer),
@@ -139,7 +141,10 @@ impl Gear for FileStorageGear {
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         let multipart_svc = Arc::new(MultipartService::new(
-            store, backends, authorizer, None, // quota_client
+            multipart_store,
+            backends,
+            authorizer,
+            None, // quota_client
         ));
         self.multipart_service.set(multipart_svc).map_err(|_| {
             anyhow::anyhow!(

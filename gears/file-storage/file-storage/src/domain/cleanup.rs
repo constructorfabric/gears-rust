@@ -16,14 +16,16 @@
 
 #![allow(unknown_lints, de0309_must_have_domain_model)]
 
+use std::sync::Arc;
+
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::audit::{AuditEntry, AuditOperation, AuditOutcome, FileEvent};
 use crate::domain::multipart::MultipartUploadSession;
 use crate::domain::policy::RetentionScope;
+use crate::domain::ports::CleanupStore;
 use crate::infra::backend::BackendRegistry;
-use crate::infra::storage::Store;
 
 /// Page size for the keyset-paginated retention file scan. Bounds how many
 /// `File` rows the sweep holds in memory at once, independent of total count.
@@ -62,7 +64,7 @@ pub struct SweepResult {
 /// @cpt-cf-file-storage-fr-orphan-reconciliation
 /// @cpt-cf-file-storage-fr-retention-policies
 pub struct CleanupEngine {
-    store: Store,
+    store: Arc<dyn CleanupStore>,
     backends: BackendRegistry,
     config: CleanupConfig,
 }
@@ -70,7 +72,11 @@ pub struct CleanupEngine {
 impl CleanupEngine {
     /// Create a new `CleanupEngine`.
     #[must_use]
-    pub fn new(store: Store, backends: BackendRegistry, config: CleanupConfig) -> Self {
+    pub fn new(
+        store: Arc<dyn CleanupStore>,
+        backends: BackendRegistry,
+        config: CleanupConfig,
+    ) -> Self {
         Self {
             store,
             backends,

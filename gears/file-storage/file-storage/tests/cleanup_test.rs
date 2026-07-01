@@ -30,6 +30,7 @@ use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
+use file_storage::domain::ports::{CleanupStore, MultipartStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -89,8 +90,9 @@ async fn build_all(
     };
     let store = Store::new(Arc::clone(&db));
 
-    // Clone before moving into FileService.
-    let sweep_store = store.clone();
+    // Upcast to narrow capability traits.
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
     let sweep_backends = backends.clone();
 
     let svc = Arc::new(FileService::new(
@@ -103,7 +105,7 @@ async fn build_all(
         None,
     ));
     let msvc = Arc::new(MultipartService::new(
-        store.clone(),
+        multipart_store,
         backends,
         authorizer,
         None,
@@ -143,7 +145,7 @@ async fn build_all_dual_backend(
         idempotency_ttl_secs: 86400,
     };
     let store = Store::new(Arc::clone(&db));
-    let sweep_store = store.clone();
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
     let sweep_backends = backends.clone();
 
     let svc = Arc::new(FileService::new(
