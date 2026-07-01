@@ -53,6 +53,7 @@
 
 use std::sync::Arc;
 
+use hex;
 use time::OffsetDateTime;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::AccessScope;
@@ -838,6 +839,25 @@ impl Store {
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos.multipart.list_expired(&conn, now).await
+    }
+
+    /// Verify that `blob` matches `expected_hash` (SHA-256).
+    ///
+    /// Returns `Ok(())` on a match; `Err(DomainError::hash_mismatch)` on a
+    /// digest mismatch. The hash computation is confined here because this
+    /// module already owns the SHA-256 allow-list usage (see `hash.rs` docs),
+    /// keeping `FileService` free of a direct `hash` import.
+    ///
+    /// @cpt-cf-file-storage-fr-backend-migration
+    pub fn verify_content_hash(blob: &[u8], expected_hash: &[u8]) -> Result<(), DomainError> {
+        let computed = hash::sha256(blob);
+        if computed != expected_hash {
+            return Err(DomainError::hash_mismatch(
+                hex::encode(expected_hash),
+                hex::encode(&computed),
+            ));
+        }
+        Ok(())
     }
 
     /// Transactionally update `backend_id` and `backend_path` for a version row,

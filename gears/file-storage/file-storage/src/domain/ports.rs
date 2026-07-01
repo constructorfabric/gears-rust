@@ -13,7 +13,7 @@
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
-use toolkit_security::AccessScope;
+use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use file_storage_sdk::{CustomMetadataEntry, File, FileVersion};
@@ -200,4 +200,51 @@ pub trait MultipartStore: Send + Sync {
         version_id: Uuid,
         audit: AuditEntry,
     ) -> Result<bool, DomainError>;
+}
+
+// ── DataPlanePort ─────────────────────────────────────────────────────────────
+
+/// Narrow control-plane port for the data-plane service.
+///
+/// `DataPlaneService` only needs four control-plane operations:
+/// access to the backend registry (for construction), pre-flight auth,
+/// version look-up, and post-upload finalization. Exposing a focused
+/// trait here (ISP/DIP) lets `data_plane.rs` avoid a direct dependency
+/// on the full `FileService` type, keeping its fan-in off `service.rs`
+/// and reducing `service.rs`'s HK `fan_in`.
+///
+/// `FileService` implements this trait in `domain/service.rs`.
+#[async_trait]
+pub trait DataPlanePort: Send + Sync {
+    /// The backend registry shared between the control and data planes.
+    /// Used by `DataPlaneService::new` to clone the registry without
+    /// needing a direct reference to `FileService`.
+    fn backends(&self) -> &crate::infra::backend::BackendRegistry;
+
+    /// Authorize a write operation for the given file before bytes are
+    /// persisted. Called as a pre-flight check before the blob is written
+    /// to the backend so a rejected request never touches storage.
+    async fn authorize_write(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+    ) -> Result<(), DomainError>;
+
+    /// Fetch a single version by `(file_id, version_id)`.
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError>;
+
+    /// Record an uploaded version's size + hash and mark it available.
+    /// Re-checks authorization and policy as defense-in-depth.
+    async fn finalize_upload(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        size: i64,
+        hash_value: Vec<u8>,
+    ) -> Result<(), DomainError>;
 }

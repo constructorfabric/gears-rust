@@ -25,7 +25,7 @@ use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart_service::MultipartService;
-use file_storage::domain::ports::MultipartStore;
+use file_storage::domain::ports::{DataPlanePort, MultipartStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -90,7 +90,7 @@ async fn build_service() -> (
         authorizer,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     (svc, msvc, dp, store)
 }
 

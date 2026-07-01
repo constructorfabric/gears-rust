@@ -25,6 +25,7 @@ use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::policy::{MetadataLimits, PolicyBody, PolicyScope, SizeLimits};
+use file_storage::domain::ports::DataPlanePort;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::quota::{QuotaClient, QuotaDecision};
@@ -126,7 +127,7 @@ async fn build_service(
     let svc = Arc::new(FileService::new(
         store, backends, issuer, authorizer, cfg, quota, None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     (svc, dp)
 }
 

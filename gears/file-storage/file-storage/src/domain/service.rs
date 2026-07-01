@@ -46,8 +46,8 @@ use crate::domain::policy::{
     EffectivePolicy, PolicyBody, PolicyResolver, PolicyScope, RetentionRuleBody, RetentionScope,
     StoredPolicy, StoredRetentionRule,
 };
+use crate::domain::ports::DataPlanePort;
 use crate::infra::backend::{BackendCapabilities, BackendRegistry};
-use crate::infra::content::hash;
 use crate::infra::quota::{QuotaClient, QuotaDecision};
 use crate::infra::signed_url::{Claims, Issuer, Op, UploadConstraints};
 use crate::infra::storage::Store;
@@ -1423,13 +1423,9 @@ impl FileService {
         let bytes = source.get(&version.backend_path).await?;
 
         // Verify content hash before writing to destination.
-        let computed_hash: Vec<u8> = hash::sha256(&bytes);
-        if computed_hash != version.hash_value {
-            return Err(DomainError::hash_mismatch(
-                hex::encode(&version.hash_value),
-                hex::encode(&computed_hash),
-            ));
-        }
+        // Hash computation stays in `Store` (which already owns the SHA-256
+        // allow-list import), so `FileService` needs no direct `hash` edge.
+        Store::verify_content_hash(&bytes, &version.hash_value)?;
 
         // Write to the destination at the canonical path.
         let dest_path = Self::backend_path(file_id, version.version_id);
@@ -1498,11 +1494,6 @@ impl FileService {
 
     // ── pub(crate) accessors for DataPlaneService ─────────────────────────────
 
-    /// Backend registry (shared with the data plane).
-    pub(crate) fn backends(&self) -> &BackendRegistry {
-        &self.backends
-    }
-
     /// Fetch a single version by `(file_id, version_id)` — delegated to the
     /// data plane so it does not need to hold a direct `Store` reference.
     pub(crate) async fn get_version(
@@ -1539,6 +1530,45 @@ impl From<IdempotencyTicket> for UploadTicket {
             version_id: t.version_id,
             upload_url: t.upload_url,
         }
+    }
+}
+
+// ── DataPlanePort implementation ──────────────────────────────────────────────
+
+/// Implement the narrow data-plane port so `DataPlaneService` can hold
+/// `Arc<dyn DataPlanePort>` instead of a direct `Arc<FileService>` reference.
+/// This decouples `data_plane.rs` from the full `FileService` type (ISP).
+#[async_trait::async_trait]
+impl DataPlanePort for FileService {
+    fn backends(&self) -> &BackendRegistry {
+        &self.backends
+    }
+
+    async fn authorize_write(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+    ) -> Result<(), DomainError> {
+        FileService::authorize_write(self, ctx, file_id).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<file_storage_sdk::FileVersion>, DomainError> {
+        FileService::get_version(self, file_id, version_id).await
+    }
+
+    async fn finalize_upload(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        size: i64,
+        hash_value: Vec<u8>,
+    ) -> Result<(), DomainError> {
+        FileService::finalize_upload(self, ctx, file_id, version_id, size, hash_value).await
     }
 }
 

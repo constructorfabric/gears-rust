@@ -30,7 +30,7 @@ use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
-use file_storage::domain::ports::{CleanupStore, MultipartStore};
+use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -110,7 +110,7 @@ async fn build_all(
         authorizer,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     let engine = CleanupEngine::new(
         sweep_store,
         sweep_backends,
@@ -157,7 +157,7 @@ async fn build_all_dual_backend(
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     let engine = CleanupEngine::new(
         sweep_store,
         sweep_backends,
