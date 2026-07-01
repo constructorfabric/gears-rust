@@ -12,6 +12,7 @@ use toolkit::api::operation_builder::{LicenseFeature, OperationBuilder};
 use super::dto;
 use super::handlers;
 use crate::domain::multipart_service::MultipartService;
+use crate::domain::policy_service::PolicyService;
 use crate::domain::service::FileService;
 
 const API_TAG: &str = "File Storage";
@@ -34,6 +35,7 @@ pub(crate) fn register_routes(
     openapi: &dyn OpenApiRegistry,
     service: Arc<FileService>,
     multipart_service: Arc<MultipartService>,
+    policy_service: Arc<PolicyService>,
 ) -> Router {
     // POST /files — create + presign upload
     router = OperationBuilder::post(format!("{BASE}/files"))
@@ -507,6 +509,7 @@ pub(crate) fn register_routes(
         .register(router, openapi);
 
     router
+        .layer(axum::Extension(policy_service))
         .layer(axum::Extension(multipart_service))
         .layer(axum::Extension(service))
 }

@@ -25,7 +25,8 @@ use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::policy::{MetadataLimits, PolicyBody, PolicyScope, SizeLimits};
-use file_storage::domain::ports::DataPlanePort;
+use file_storage::domain::policy_service::PolicyService;
+use file_storage::domain::ports::{DataPlanePort, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::external_clients::{QuotaClient, QuotaDecision};
@@ -110,12 +111,13 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 
 async fn build_service(
     quota: Option<Arc<dyn QuotaClient>>,
-) -> (Arc<FileService>, DataPlaneService) {
+) -> (Arc<FileService>, Arc<PolicyService>, DataPlaneService) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer = Arc::new(TenantOnlyAuthorizer);
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
     let cfg = ServiceConfig {
         default_url_ttl_secs: 3600,
         sidecar_base_url: "http://sidecar.test".to_owned(),
@@ -124,11 +126,19 @@ async fn build_service(
         idempotency_ttl_secs: 86400,
     };
     let store = Store::new(Arc::clone(&db));
+    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
     let svc = Arc::new(FileService::new(
-        store, backends, issuer, authorizer, cfg, quota, None,
+        store,
+        backends,
+        issuer,
+        Arc::clone(&authorizer),
+        cfg,
+        quota,
+        None,
     ));
     let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
-    (svc, dp)
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
+    (svc, psvc, dp)
 }
 
 fn ctx(tenant: Uuid) -> SecurityContext {
@@ -154,11 +164,11 @@ fn new_file(owner: Uuid, mime: &str) -> NewFile {
 
 #[tokio::test]
 async fn create_file_with_disallowed_mime_is_rejected() {
-    let (svc, _dp) = build_service(None).await;
+    let (svc, psvc, _dp) = build_service(None).await;
     let ctx = ctx(Uuid::now_v7());
 
     // Tenant policy allows only image/*.
-    svc.set_policy(
+    psvc.set_policy(
         &ctx,
         PolicyScope::Tenant,
         None,
@@ -190,12 +200,12 @@ async fn create_file_with_disallowed_mime_is_rejected() {
 
 #[tokio::test]
 async fn finalize_oversized_upload_is_rejected() {
-    let (svc, _dp) = build_service(None).await;
+    let (svc, psvc, _dp) = build_service(None).await;
     let ctx = ctx(Uuid::now_v7());
     let owner = Uuid::now_v7();
 
     // Tenant policy: global 10-byte cap.
-    svc.set_policy(
+    psvc.set_policy(
         &ctx,
         PolicyScope::Tenant,
         None,
@@ -242,9 +252,9 @@ async fn create_file_bakes_max_size_into_upload_url() {
     // When a policy caps size, the signed URL carries the constraint so the
     // sidecar enforces mid-stream. We can't decode the opaque token here, but
     // the URL must still be issued (the gate did not reject create).
-    let (svc, _dp) = build_service(None).await;
+    let (svc, psvc, _dp) = build_service(None).await;
     let ctx = ctx(Uuid::now_v7());
-    svc.set_policy(
+    psvc.set_policy(
         &ctx,
         PolicyScope::Tenant,
         None,
@@ -269,9 +279,9 @@ async fn create_file_bakes_max_size_into_upload_url() {
 
 #[tokio::test]
 async fn create_file_with_too_many_metadata_pairs_is_rejected() {
-    let (svc, _dp) = build_service(None).await;
+    let (svc, psvc, _dp) = build_service(None).await;
     let ctx = ctx(Uuid::now_v7());
-    svc.set_policy(
+    psvc.set_policy(
         &ctx,
         PolicyScope::Tenant,
         None,
@@ -306,9 +316,9 @@ async fn create_file_with_too_many_metadata_pairs_is_rejected() {
 
 #[tokio::test]
 async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
-    let (svc, _dp) = build_service(None).await;
+    let (svc, psvc, _dp) = build_service(None).await;
     let ctx = ctx(Uuid::now_v7());
-    svc.set_policy(
+    psvc.set_policy(
         &ctx,
         PolicyScope::Tenant,
         None,
@@ -363,9 +373,9 @@ async fn quota_exceeded_rejects_create_when_client_present() {
     // Cap of 10 bytes; the policy caps size at 100, so each create preflights
     // 100 bytes → the first create busts the 10-byte quota.
     let quota: Arc<dyn QuotaClient> = Arc::new(CappedQuota::new(10));
-    let (svc, _dp) = build_service(Some(quota)).await;
+    let (svc, psvc, _dp) = build_service(Some(quota)).await;
     let ctx = ctx(Uuid::now_v7());
-    svc.set_policy(
+    psvc.set_policy(
         &ctx,
         PolicyScope::Tenant,
         None,
@@ -396,9 +406,9 @@ async fn quota_gates_version_creation_not_just_first_upload() {
     // (allowed, total 60). presign_version preflights another 60 (total 120 >
     // 100) → version creation is denied, proving quota covers overwrites too.
     let quota: Arc<dyn QuotaClient> = Arc::new(CappedQuota::new(100));
-    let (svc, _dp) = build_service(Some(quota)).await;
+    let (svc, psvc, _dp) = build_service(Some(quota)).await;
     let ctx = ctx(Uuid::now_v7());
-    svc.set_policy(
+    psvc.set_policy(
         &ctx,
         PolicyScope::Tenant,
         None,
@@ -428,7 +438,7 @@ async fn quota_gates_version_creation_not_just_first_upload() {
 #[tokio::test]
 async fn quota_client_error_fails_closed() {
     let quota: Arc<dyn QuotaClient> = Arc::new(ErroringQuota);
-    let (svc, _dp) = build_service(Some(quota)).await;
+    let (svc, _psvc, _dp) = build_service(Some(quota)).await;
     let ctx = ctx(Uuid::now_v7());
 
     // No policy configured, but the quota client errors → fail closed (deny).
@@ -446,7 +456,7 @@ async fn quota_client_error_fails_closed() {
 
 #[tokio::test]
 async fn no_policy_and_no_quota_is_fully_permissive() {
-    let (svc, _dp) = build_service(None).await;
+    let (svc, _psvc, _dp) = build_service(None).await;
     let ctx = ctx(Uuid::now_v7());
 
     // Any mime, any size finalize, any metadata — all accepted.

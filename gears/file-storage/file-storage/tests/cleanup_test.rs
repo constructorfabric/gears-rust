@@ -30,7 +30,8 @@ use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
-use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore};
+use file_storage::domain::policy_service::PolicyService;
+use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -68,6 +69,7 @@ async fn build_all(
     grace_secs: u64,
 ) -> (
     Arc<FileService>,
+    Arc<PolicyService>,
     Arc<MultipartService>,
     DataPlaneService,
     Store,
@@ -93,6 +95,7 @@ async fn build_all(
     // Upcast to narrow capability traits.
     let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
     let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
     let sweep_backends = backends.clone();
 
     let svc = Arc::new(FileService::new(
@@ -107,9 +110,10 @@ async fn build_all(
     let msvc = Arc::new(MultipartService::new(
         multipart_store,
         backends,
-        authorizer,
+        Arc::clone(&authorizer),
         None,
     ));
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
     let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     let engine = CleanupEngine::new(
         sweep_store,
@@ -118,7 +122,7 @@ async fn build_all(
             orphan_grace_secs: grace_secs,
         },
     );
-    (svc, msvc, dp, store, engine)
+    (svc, psvc, msvc, dp, store, engine)
 }
 
 /// Build a service + cleanup engine with TWO in-memory backends ("mem" and "alt").
@@ -199,7 +203,7 @@ fn new_file() -> NewFile {
 #[tokio::test]
 async fn abandoned_pending_version_is_deleted_by_sweep() {
     // grace = 0 → any pre-existing pending version is eligible immediately.
-    let (svc, _msvc, _dp, store, engine) = build_all(0).await;
+    let (svc, _psvc, _msvc, _dp, store, engine) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -248,7 +252,7 @@ async fn abandoned_pending_version_is_deleted_by_sweep() {
 #[tokio::test]
 async fn recent_pending_version_is_not_swept_within_grace_window() {
     // grace = 24 hours → a freshly created version must not be deleted.
-    let (svc, _msvc, _dp, store, engine) = build_all(86400).await;
+    let (svc, _psvc, _msvc, _dp, store, engine) = build_all(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -284,7 +288,7 @@ async fn recent_pending_version_is_not_swept_within_grace_window() {
 /// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn expired_multipart_session_is_aborted_by_sweep() {
-    let (svc, msvc, _dp, store, engine) = build_all(0).await;
+    let (svc, _psvc, msvc, _dp, store, engine) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -390,7 +394,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
 /// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn retention_expired_file_is_deleted_by_sweep() {
-    let (svc, _msvc, dp, store, engine) = build_all(86400).await;
+    let (svc, psvc, _msvc, dp, store, engine) = build_all(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -410,7 +414,7 @@ async fn retention_expired_file_is_deleted_by_sweep() {
         .unwrap();
 
     // Create a tenant retention rule: max_age_days = 0 (expires immediately).
-    svc.create_retention_rule(
+    psvc.create_retention_rule(
         &ctx,
         RetentionScope::Tenant,
         None,
@@ -464,7 +468,7 @@ async fn retention_expired_file_is_deleted_by_sweep() {
 /// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn file_without_matching_retention_rule_is_not_deleted() {
-    let (svc, _msvc, dp, _store, engine) = build_all(86400).await;
+    let (svc, _psvc, _msvc, dp, _store, engine) = build_all(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 

@@ -21,7 +21,9 @@ use file_storage_sdk::{CustomMetadataEntry, File, FileVersion};
 use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
 use crate::domain::multipart::{MultipartPart, MultipartUploadSession};
-use crate::domain::policy::{PolicyScope, StoredPolicy, StoredRetentionRule};
+use crate::domain::policy::{
+    PolicyBody, PolicyScope, RetentionRuleBody, RetentionScope, StoredPolicy, StoredRetentionRule,
+};
 
 // ── CleanupStore ──────────────────────────────────────────────────────────────
 
@@ -199,6 +201,62 @@ pub trait MultipartStore: Send + Sync {
         file_id: Uuid,
         version_id: Uuid,
         audit: AuditEntry,
+    ) -> Result<bool, DomainError>;
+}
+
+// ── PolicyStore ───────────────────────────────────────────────────────────────
+
+/// Narrow persistence port for the policy administration service.
+///
+/// Contains only the `Store` methods that `PolicyService` invokes.
+/// `Store` implements this trait in `infra/storage/store.rs`.
+#[async_trait]
+pub trait PolicyStore: Send + Sync {
+    /// Fetch the raw policy for a given `(policy_scope, scope_owner_id)` within
+    /// a tenant. Returns `None` when none is configured.
+    async fn get_policy(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &PolicyScope,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<Option<StoredPolicy>, DomainError>;
+
+    /// Upsert the policy for a given `(policy_scope, scope_owner_id)`.
+    /// Returns the `policy_id`.
+    async fn upsert_policy(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &PolicyScope,
+        scope_owner_id: Option<Uuid>,
+        body: &PolicyBody,
+        now: OffsetDateTime,
+    ) -> Result<Uuid, DomainError>;
+
+    /// List all retention rules for a tenant (all scopes).
+    async fn list_retention_rules(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<Vec<StoredRetentionRule>, DomainError>;
+
+    /// Insert a new retention rule. Returns the assigned `rule_id`.
+    async fn insert_retention_rule(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        retention_scope: &RetentionScope,
+        scope_target_id: Option<Uuid>,
+        body: &RetentionRuleBody,
+        now: OffsetDateTime,
+    ) -> Result<Uuid, DomainError>;
+
+    /// Delete a retention rule by `rule_id`. Returns `true` if a row was removed.
+    async fn delete_retention_rule(
+        &self,
+        scope: &AccessScope,
+        rule_id: Uuid,
     ) -> Result<bool, DomainError>;
 }
 

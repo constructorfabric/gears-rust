@@ -1432,6 +1432,77 @@ impl MultipartStore for Store {
     }
 }
 
+#[async_trait]
+impl crate::domain::ports::PolicyStore for Store {
+    async fn get_policy(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &crate::domain::policy::PolicyScope,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<Option<crate::domain::policy::StoredPolicy>, DomainError> {
+        Store::get_policy(self, scope, tenant_id, policy_scope, scope_owner_id).await
+    }
+
+    async fn upsert_policy(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &crate::domain::policy::PolicyScope,
+        scope_owner_id: Option<Uuid>,
+        body: &crate::domain::policy::PolicyBody,
+        now: OffsetDateTime,
+    ) -> Result<Uuid, DomainError> {
+        Store::upsert_policy(
+            self,
+            scope,
+            tenant_id,
+            policy_scope,
+            scope_owner_id,
+            body,
+            now,
+        )
+        .await
+    }
+
+    async fn list_retention_rules(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<Vec<crate::domain::policy::StoredRetentionRule>, DomainError> {
+        Store::list_retention_rules(self, scope, tenant_id).await
+    }
+
+    async fn insert_retention_rule(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        tenant_id: Uuid,
+        retention_scope: &crate::domain::policy::RetentionScope,
+        scope_target_id: Option<Uuid>,
+        body: &crate::domain::policy::RetentionRuleBody,
+        now: OffsetDateTime,
+    ) -> Result<Uuid, DomainError> {
+        Store::insert_retention_rule(
+            self,
+            scope,
+            tenant_id,
+            retention_scope,
+            scope_target_id,
+            body,
+            now,
+        )
+        .await
+    }
+
+    async fn delete_retention_rule(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        rule_id: Uuid,
+    ) -> Result<bool, DomainError> {
+        Store::delete_retention_rule(self, scope, rule_id).await
+    }
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// Build a `pending` version row with placeholder size/hash (filled at finalize).

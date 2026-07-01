@@ -19,7 +19,8 @@ use crate::domain::authz::Authorizer;
 use crate::domain::cleanup::{CleanupConfig, CleanupEngine};
 use crate::domain::local_client::FileStorageLocalClient;
 use crate::domain::multipart_service::MultipartService;
-use crate::domain::ports::{CleanupStore, MultipartStore};
+use crate::domain::policy_service::PolicyService;
+use crate::domain::ports::{CleanupStore, MultipartStore, PolicyStore};
 use crate::domain::service::{FileService, ServiceConfig};
 use crate::infra::authz::PolicyEnforcerAuthorizer;
 use crate::infra::backend::{BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend};
@@ -43,6 +44,7 @@ const MEMORY_ID: &str = "memory";
 pub struct FileStorageGear {
     service: OnceLock<Arc<FileService>>,
     multipart_service: OnceLock<Arc<MultipartService>>,
+    policy_service: OnceLock<Arc<PolicyService>>,
 }
 
 impl Default for FileStorageGear {
@@ -50,6 +52,7 @@ impl Default for FileStorageGear {
         Self {
             service: OnceLock::new(),
             multipart_service: OnceLock::new(),
+            policy_service: OnceLock::new(),
         }
     }
 }
@@ -121,6 +124,7 @@ impl Gear for FileStorageGear {
         // Upcast to the narrow capability traits before distributing.
         // `Store` is Clone, so each consumer gets its own clone wrapped in Arc.
         let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+        let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
         let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
         let sweep_backends = backends.clone();
 
@@ -143,7 +147,7 @@ impl Gear for FileStorageGear {
         let multipart_svc = Arc::new(MultipartService::new(
             multipart_store,
             backends,
-            authorizer,
+            Arc::clone(&authorizer),
             None, // quota_client
         ));
         self.multipart_service.set(multipart_svc).map_err(|_| {
@@ -151,6 +155,11 @@ impl Gear for FileStorageGear {
                 "{} multipart service already initialized",
                 Self::MODULE_NAME
             )
+        })?;
+
+        let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer));
+        self.policy_service.set(policy_svc).map_err(|_| {
+            anyhow::anyhow!("{} policy service already initialized", Self::MODULE_NAME)
         })?;
 
         // Optional background cleanup sweep (disabled by default so tests are
@@ -213,12 +222,18 @@ impl RestApiCapability for FileStorageGear {
             .get()
             .ok_or_else(|| anyhow::anyhow!("file-storage multipart service not initialized"))?
             .clone();
+        let policy_service = self
+            .policy_service
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("file-storage policy service not initialized"))?
+            .clone();
         info!("Registering file-storage control-plane REST routes");
         Ok(routes::register_routes(
             router,
             openapi,
             service,
             multipart_service,
+            policy_service,
         ))
     }
 }

@@ -27,10 +27,12 @@ use crate::domain::etag;
 use crate::domain::multipart::MultipartUploadSession;
 use crate::domain::multipart_service::MultipartService;
 use crate::domain::policy::{PolicyScope, RetentionScope};
+use crate::domain::policy_service::PolicyService;
 use crate::domain::service::FileService;
 
 type Svc = Extension<Arc<FileService>>;
 type MultiSvc = Extension<Arc<MultipartService>>;
+type PolicySvc = Extension<Arc<PolicyService>>;
 type Ctx = Extension<SecurityContext>;
 
 /// Query params for `GET /files`.
@@ -285,7 +287,7 @@ pub struct EffectivePolicyQuery {
 /// @cpt-cf-file-storage-usecase-configure-policy
 pub async fn get_policy(
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): PolicySvc,
     Query(q): Query<GetPolicyQuery>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
     let policy_scope = PolicyScope::parse(&q.scope)
@@ -304,7 +306,7 @@ pub async fn get_policy(
 /// @cpt-cf-file-storage-usecase-configure-policy
 pub async fn set_policy(
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): PolicySvc,
     Json(req): Json<SetPolicyReq>,
 ) -> ApiResult<JsonBody<PolicyDto>> {
     let policy_scope = PolicyScope::parse(&req.scope)
@@ -321,7 +323,7 @@ pub async fn set_policy(
 /// @cpt-cf-file-storage-usecase-configure-policy
 pub async fn get_effective_policy(
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): PolicySvc,
     Query(q): Query<EffectivePolicyQuery>,
 ) -> ApiResult<JsonBody<EffectivePolicyDto>> {
     let ep = svc.get_effective_policy(&ctx, q.user_owner_id).await?;
@@ -335,7 +337,7 @@ pub async fn get_effective_policy(
 /// @cpt-cf-file-storage-fr-retention-policies
 pub async fn list_retention_rules(
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): PolicySvc,
 ) -> ApiResult<JsonBody<Vec<RetentionRuleDto>>> {
     let rules = svc.list_retention_rules(&ctx).await?;
     Ok(Json(
@@ -349,7 +351,7 @@ pub async fn list_retention_rules(
 pub async fn create_retention_rule(
     uri: Uri,
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): PolicySvc,
     Json(req): Json<CreateRetentionRuleReq>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
     let retention_scope = RetentionScope::parse(&req.scope)
@@ -367,7 +369,7 @@ pub async fn create_retention_rule(
 /// @cpt-cf-file-storage-fr-retention-policies
 pub async fn delete_retention_rule(
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): PolicySvc,
     Path(rule_id): Path<Uuid>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
     let removed = svc.delete_retention_rule(&ctx, rule_id).await?;
