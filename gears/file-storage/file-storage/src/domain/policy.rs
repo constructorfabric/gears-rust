@@ -496,6 +496,135 @@ impl PolicyResolver {
     }
 }
 
+// ── Pure policy-enforcement helpers ───────────────────────────────────────────
+
+impl PolicyResolver {
+    /// Returns `true` if `mime_type` matches any pattern in `allowed`.
+    /// Supports exact match and `*` wildcard for subtype (e.g. `"image/*"`).
+    #[must_use]
+    pub(crate) fn mime_allowed(mime_type: &str, allowed: &[String]) -> bool {
+        allowed.iter().any(|pat| {
+            if pat == mime_type {
+                return true;
+            }
+            // wildcard subtype: "image/*" matches "image/jpeg"
+            let (pt, ps) = pat.split_once('/').unwrap_or((pat, "*"));
+            let (mt, _) = mime_type.split_once('/').unwrap_or((mime_type, ""));
+            ps == "*" && pt == mt
+        })
+    }
+
+    /// Check that `mime_type` is permitted by the effective policy.
+    ///
+    /// - `None` `allowed_mime_types` → all types permitted (no restriction).
+    /// - `Some([])` → nothing permitted.
+    /// - `Some(list)` → must match a pattern in the list.
+    ///
+    /// @cpt-cf-file-storage-fr-allowed-types-policy
+    pub(crate) fn check_allowed_mime(
+        policy: &EffectivePolicy,
+        mime_type: &str,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        let Some(allowed) = &policy.allowed_mime_types else {
+            return Ok(()); // no restriction
+        };
+        if Self::mime_allowed(mime_type, allowed) {
+            Ok(())
+        } else {
+            Err(crate::domain::error::DomainError::policy_mime_not_allowed(
+                mime_type,
+            ))
+        }
+    }
+
+    /// Compute the effective maximum blob size for `mime_type`, taking the most
+    /// restrictive of:
+    ///   1. Backend hardware ceiling (`backend_max`).
+    ///   2. Policy global limit (`EffectivePolicy.max_bytes`).
+    ///   3. Policy per-mime override (`EffectivePolicy.per_mime_max_bytes`).
+    ///
+    /// `None` means unbounded from all sources.
+    ///
+    /// @cpt-cf-file-storage-fr-size-limits-policy
+    #[must_use]
+    pub(crate) fn compute_effective_max_bytes(
+        policy: &EffectivePolicy,
+        mime_type: &str,
+        backend_max: Option<u64>,
+    ) -> Option<u64> {
+        let policy_global = policy.max_bytes;
+
+        // Find the most specific per-mime override that matches.
+        let per_mime_max: Option<u64> = policy
+            .per_mime_max_bytes
+            .iter()
+            .filter(|o| Self::mime_allowed(mime_type, std::slice::from_ref(&o.mime)))
+            .map(|o| o.max_bytes)
+            .reduce(u64::min);
+
+        // Most restrictive = minimum of all non-None ceilings.
+        [backend_max, policy_global, per_mime_max]
+            .into_iter()
+            .flatten()
+            .reduce(u64::min)
+    }
+
+    /// Validate `entries` against the metadata limits in `policy`.
+    ///
+    /// @cpt-cf-file-storage-fr-metadata-limits
+    pub(crate) fn check_metadata_limits(
+        policy: &EffectivePolicy,
+        entries: &[(String, String)],
+    ) -> Result<(), crate::domain::error::DomainError> {
+        let limits = &policy.metadata_limits;
+
+        if let Some(max_pairs) = limits.max_pairs
+            && entries.len() > max_pairs as usize
+        {
+            return Err(crate::domain::error::DomainError::policy_metadata_exceeded(
+                format!("too many metadata pairs: {} > {max_pairs}", entries.len()),
+            ));
+        }
+
+        let mut total_bytes: usize = 0;
+        for (key, value) in entries {
+            if let Some(max_key_len) = limits.max_key_len
+                && key.len() > max_key_len as usize
+            {
+                return Err(crate::domain::error::DomainError::policy_metadata_exceeded(
+                    format!(
+                        "metadata key '{key}' length {} exceeds limit of {max_key_len}",
+                        key.len()
+                    ),
+                ));
+            }
+            if let Some(max_value_len) = limits.max_value_len
+                && value.len() > max_value_len as usize
+            {
+                return Err(crate::domain::error::DomainError::policy_metadata_exceeded(
+                    format!(
+                        "metadata value for key '{key}' length {} exceeds limit of {max_value_len}",
+                        value.len()
+                    ),
+                ));
+            }
+            total_bytes += key.len() + value.len();
+        }
+
+        if let Some(max_total_bytes) = limits.max_total_bytes
+            && total_bytes > max_total_bytes as usize
+        {
+            return Err(crate::domain::error::DomainError::policy_metadata_exceeded(
+                format!(
+                    "total metadata size {total_bytes} bytes exceeds limit of {max_total_bytes} bytes"
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[path = "policy_tests.rs"]
 mod policy_tests;

@@ -24,6 +24,7 @@ use uuid::Uuid;
 use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
+use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -53,12 +54,18 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
-async fn build_service() -> (Arc<FileService>, DataPlaneService, Store) {
+async fn build_service() -> (
+    Arc<FileService>,
+    Arc<MultipartService>,
+    DataPlaneService,
+    Store,
+) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer = Arc::new(TenantOnlyAuthorizer);
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
     let cfg = ServiceConfig {
         default_url_ttl_secs: 3600,
         sidecar_base_url: "http://sidecar.test".to_owned(),
@@ -69,15 +76,21 @@ async fn build_service() -> (Arc<FileService>, DataPlaneService, Store) {
     let store = Store::new(Arc::clone(&db));
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
-        authorizer,
+        Arc::clone(&authorizer),
         cfg,
         None,
         None,
     ));
+    let msvc = Arc::new(MultipartService::new(
+        store.clone(),
+        backends,
+        authorizer,
+        None,
+    ));
     let dp = DataPlaneService::new(Arc::clone(&svc));
-    (svc, dp, store)
+    (svc, msvc, dp, store)
 }
 
 fn ctx(tenant: Uuid) -> SecurityContext {
@@ -105,7 +118,7 @@ fn new_file() -> NewFile {
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn create_file_leaves_one_audit_row() {
-    let (svc, _dp, store) = build_service().await;
+    let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
@@ -123,7 +136,7 @@ async fn create_file_leaves_one_audit_row() {
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn finalize_upload_leaves_audit_row() {
-    let (svc, dp, store) = build_service().await;
+    let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
@@ -157,7 +170,7 @@ async fn finalize_upload_leaves_audit_row() {
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn bind_leaves_audit_row() {
-    let (svc, dp, store) = build_service().await;
+    let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
@@ -194,7 +207,7 @@ async fn bind_leaves_audit_row() {
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn update_metadata_leaves_audit_row() {
-    let (svc, _dp, store) = build_service().await;
+    let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
@@ -224,7 +237,7 @@ async fn update_metadata_leaves_audit_row() {
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn delete_file_leaves_audit_row() {
-    let (svc, _dp, store) = build_service().await;
+    let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
@@ -254,7 +267,7 @@ async fn delete_file_leaves_audit_row() {
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn delete_version_leaves_audit_row() {
-    let (svc, dp, store) = build_service().await;
+    let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     // Create + upload v1 and bind it.
@@ -317,16 +330,16 @@ async fn delete_version_leaves_audit_row() {
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn multipart_complete_leaves_audit_rows() {
-    let (svc, dp, store) = build_service().await;
+    let (svc, msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
-    let session = svc
+    let session = msvc
         .initiate_multipart_upload(&ctx, ticket.file_id, "application/octet-stream")
         .await
         .unwrap();
 
-    svc.upload_multipart_part(
+    msvc.upload_multipart_part(
         &ctx,
         ticket.file_id,
         session.upload_id,
@@ -336,7 +349,7 @@ async fn multipart_complete_leaves_audit_rows() {
     .await
     .unwrap();
 
-    svc.complete_multipart_upload(&ctx, ticket.file_id, session.upload_id)
+    msvc.complete_multipart_upload(&ctx, ticket.file_id, session.upload_id)
         .await
         .unwrap();
 
@@ -388,7 +401,7 @@ async fn multipart_complete_leaves_audit_rows() {
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn failed_metadata_cas_leaves_no_audit_row() {
-    let (svc, _dp, store) = build_service().await;
+    let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
@@ -426,7 +439,7 @@ async fn failed_metadata_cas_leaves_no_audit_row() {
 /// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn failed_bind_cas_leaves_no_audit_row() {
-    let (svc, dp, store) = build_service().await;
+    let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     // Bind v1 successfully.

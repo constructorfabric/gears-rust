@@ -25,10 +25,12 @@ use super::dto::{
 use crate::domain::error::DomainError;
 use crate::domain::etag;
 use crate::domain::multipart::MultipartUploadSession;
+use crate::domain::multipart_service::MultipartService;
 use crate::domain::policy::{PolicyScope, RetentionScope};
 use crate::domain::service::FileService;
 
 type Svc = Extension<Arc<FileService>>;
+type MultiSvc = Extension<Arc<MultipartService>>;
 type Ctx = Extension<SecurityContext>;
 
 /// Query params for `GET /files`.
@@ -394,7 +396,7 @@ fn session_to_dto(s: MultipartUploadSession) -> MultipartSessionDto {
 /// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn initiate_multipart(
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): MultiSvc,
     Path(file_id): Path<Uuid>,
     Json(req): Json<InitiateMultipartReq>,
 ) -> ApiResult<JsonBody<MultipartSessionDto>> {
@@ -409,7 +411,7 @@ pub async fn initiate_multipart(
 /// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn upload_multipart_part(
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): MultiSvc,
     Path((file_id, upload_id, part_number)): Path<(Uuid, Uuid, u32)>,
     body: axum::body::Bytes,
 ) -> ApiResult<JsonBody<UploadPartDto>> {
@@ -428,7 +430,7 @@ pub async fn upload_multipart_part(
 /// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn complete_multipart(
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): MultiSvc,
     Path((file_id, upload_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<impl IntoResponse> {
     svc.complete_multipart_upload(&ctx, file_id, upload_id)
@@ -441,7 +443,7 @@ pub async fn complete_multipart(
 /// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn abort_multipart(
     Extension(ctx): Ctx,
-    Extension(svc): Svc,
+    Extension(svc): MultiSvc,
     Path((file_id, upload_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<impl IntoResponse> {
     svc.abort_multipart_upload(&ctx, file_id, upload_id).await?;

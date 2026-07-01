@@ -6,6 +6,23 @@
 //! backend registry (byte storage), the signed-URL issuer, and an [`Authorizer`].
 //! Content bytes never flow through this service — they move via
 //! [`crate::domain::data_plane::DataPlaneService`].
+//!
+//! ## Accepted Henry-Kafura hub (do not fragment further)
+//!
+//! This is a **top-level orchestrator**: high fan-out is its job — every core
+//! file flow legitimately coordinates persistence ([`Store`]), byte storage
+//! (backends), URL signing, authorization, quota, usage, events, and the
+//! policy/etag domain rules. Its fan-in is fixed at the four control-plane entry
+//! points (REST handlers, route registration, the data plane, and gear wiring),
+//! none of which can be removed without relocating the crossroads.
+//!
+//! The self-contained bounded contexts have already been extracted into their
+//! own service types — see [`crate::domain::multipart_service::MultipartService`].
+//! Extracting *more* does not lower total coupling: each new service still
+//! depends on the shared [`Store`] facade, which merely moves the Henry-Kafura
+//! mass onto `store.rs` (its fan-in grows by one per service). The remaining
+//! core is irreducible by the metric's own definition of a legitimate hub, so it
+//! is deliberately left whole rather than split into artificial micro-services.
 
 // Domain terms (ETag, If-Match, FileStorage, GET/PUT) recur throughout the docs.
 #![allow(clippy::doc_markdown)]
@@ -13,7 +30,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -26,12 +42,11 @@ use crate::domain::audit::{AuditEntry, AuditOperation};
 use crate::domain::authz::{Authorizer, actions};
 use crate::domain::error::DomainError;
 use crate::domain::etag;
-use crate::domain::multipart::{MultipartPart, MultipartUploadSession, MultipartUploadState};
 use crate::domain::policy::{
     EffectivePolicy, PolicyBody, PolicyResolver, PolicyScope, RetentionRuleBody, RetentionScope,
     StoredPolicy, StoredRetentionRule,
 };
-use crate::infra::backend::{BackendCapabilities, BackendRegistry, StorageBackend};
+use crate::infra::backend::{BackendCapabilities, BackendRegistry};
 use crate::infra::content::hash;
 use crate::infra::quota::{QuotaClient, QuotaDecision};
 use crate::infra::signed_url::{Claims, Issuer, Op, UploadConstraints};
@@ -228,123 +243,6 @@ impl FileService {
         ))
     }
 
-    /// Returns `true` if `mime_type` matches any pattern in `allowed`.
-    /// Supports exact match and `*` wildcard for subtype (e.g. `"image/*"`).
-    pub(crate) fn mime_allowed(mime_type: &str, allowed: &[String]) -> bool {
-        allowed.iter().any(|pat| {
-            if pat == mime_type {
-                return true;
-            }
-            // wildcard subtype: "image/*" matches "image/jpeg"
-            let (pt, ps) = pat.split_once('/').unwrap_or((pat, "*"));
-            let (mt, _) = mime_type.split_once('/').unwrap_or((mime_type, ""));
-            ps == "*" && pt == mt
-        })
-    }
-
-    /// Check that `mime_type` is permitted by the effective policy.
-    ///
-    /// - `None` allowed_mime_types → all types permitted (no restriction).
-    /// - `Some([])` → nothing permitted.
-    /// - `Some(list)` → must match a pattern in the list.
-    ///
-    /// @cpt-cf-file-storage-fr-allowed-types-policy
-    pub(crate) fn check_allowed_mime(
-        policy: &EffectivePolicy,
-        mime_type: &str,
-    ) -> Result<(), DomainError> {
-        let Some(allowed) = &policy.allowed_mime_types else {
-            return Ok(()); // no restriction
-        };
-        if Self::mime_allowed(mime_type, allowed) {
-            Ok(())
-        } else {
-            Err(DomainError::policy_mime_not_allowed(mime_type))
-        }
-    }
-
-    /// Compute the effective maximum blob size for `mime_type`, taking the most
-    /// restrictive of:
-    ///   1. Backend hardware ceiling (`BackendCapabilities.max_size_bytes`).
-    ///   2. Policy global limit (`EffectivePolicy.max_bytes`).
-    ///   3. Policy per-mime override (`EffectivePolicy.per_mime_max_bytes`).
-    ///
-    /// `None` means unbounded from all sources.
-    ///
-    /// @cpt-cf-file-storage-fr-size-limits-policy
-    pub(crate) fn compute_effective_max_bytes(
-        policy: &EffectivePolicy,
-        mime_type: &str,
-        backend: &Arc<dyn StorageBackend>,
-    ) -> Option<u64> {
-        let backend_max = backend.capabilities().max_size_bytes;
-        let policy_global = policy.max_bytes;
-
-        // Find the most specific per-mime override that matches.
-        let per_mime_max: Option<u64> = policy
-            .per_mime_max_bytes
-            .iter()
-            .filter(|o| Self::mime_allowed(mime_type, std::slice::from_ref(&o.mime)))
-            .map(|o| o.max_bytes)
-            .reduce(u64::min);
-
-        // Most restrictive = minimum of all non-None ceilings.
-        [backend_max, policy_global, per_mime_max]
-            .into_iter()
-            .flatten()
-            .reduce(u64::min)
-    }
-
-    /// Validate `entries` against the metadata limits in `policy`.
-    ///
-    /// @cpt-cf-file-storage-fr-metadata-limits
-    pub(crate) fn check_metadata_limits(
-        policy: &EffectivePolicy,
-        entries: &[(String, String)],
-    ) -> Result<(), DomainError> {
-        let limits = &policy.metadata_limits;
-
-        if let Some(max_pairs) = limits.max_pairs
-            && entries.len() > max_pairs as usize
-        {
-            return Err(DomainError::policy_metadata_exceeded(format!(
-                "too many metadata pairs: {} > {max_pairs}",
-                entries.len()
-            )));
-        }
-
-        let mut total_bytes: usize = 0;
-        for (key, value) in entries {
-            if let Some(max_key_len) = limits.max_key_len
-                && key.len() > max_key_len as usize
-            {
-                return Err(DomainError::policy_metadata_exceeded(format!(
-                    "metadata key '{key}' length {} exceeds limit of {max_key_len}",
-                    key.len()
-                )));
-            }
-            if let Some(max_value_len) = limits.max_value_len
-                && value.len() > max_value_len as usize
-            {
-                return Err(DomainError::policy_metadata_exceeded(format!(
-                    "metadata value for key '{key}' length {} exceeds limit of {max_value_len}",
-                    value.len()
-                )));
-            }
-            total_bytes += key.len() + value.len();
-        }
-
-        if let Some(max_total_bytes) = limits.max_total_bytes
-            && total_bytes > max_total_bytes as usize
-        {
-            return Err(DomainError::policy_metadata_exceeded(format!(
-                "total metadata size {total_bytes} bytes exceeds limit of {max_total_bytes} bytes"
-            )));
-        }
-
-        Ok(())
-    }
-
     /// Run a quota preflight check for `additional_bytes` of new storage.
     ///
     /// Passes `effective_max_bytes.unwrap_or(1)` as the pessimistic upper bound:
@@ -461,11 +359,15 @@ impl FileService {
             .await?;
 
         // Validate allowed mime types.
-        Self::check_allowed_mime(&policy, &new.mime_type)?;
+        PolicyResolver::check_allowed_mime(&policy, &new.mime_type)?;
 
         // Compute effective size ceiling and validate initial metadata.
         let backend = self.backends.default_backend();
-        let effective_max = Self::compute_effective_max_bytes(&policy, &new.mime_type, &backend);
+        let effective_max = PolicyResolver::compute_effective_max_bytes(
+            &policy,
+            &new.mime_type,
+            backend.capabilities().max_size_bytes,
+        );
 
         // Validate initial custom metadata against limits.
         let initial_meta: Vec<(String, String)> = new
@@ -473,7 +375,7 @@ impl FileService {
             .iter()
             .map(|e| (e.key.clone(), e.value.clone()))
             .collect();
-        Self::check_metadata_limits(&policy, &initial_meta)?;
+        PolicyResolver::check_metadata_limits(&policy, &initial_meta)?;
 
         // Quota preflight — pessimistic: check whether max allowed size fits quota.
         self.check_quota(tenant_id, owner_id, effective_max).await?;
@@ -607,10 +509,14 @@ impl FileService {
             .get_effective_policy_internal(tenant_id, owner_id)
             .await?;
 
-        Self::check_allowed_mime(&policy, &mime_type)?;
+        PolicyResolver::check_allowed_mime(&policy, &mime_type)?;
 
         let backend = self.backends.default_backend();
-        let effective_max = Self::compute_effective_max_bytes(&policy, &mime_type, &backend);
+        let effective_max = PolicyResolver::compute_effective_max_bytes(
+            &policy,
+            &mime_type,
+            backend.capabilities().max_size_bytes,
+        );
 
         self.check_quota(tenant_id, owner_id, effective_max).await?;
 
@@ -706,7 +612,11 @@ impl FileService {
         } else {
             self.backends.get(&backend_id)?
         };
-        let effective_max = Self::compute_effective_max_bytes(&policy, &version_mime, &backend);
+        let effective_max = PolicyResolver::compute_effective_max_bytes(
+            &policy,
+            &version_mime,
+            backend.capabilities().max_size_bytes,
+        );
         if let Some(limit) = effective_max
             && size > 0
             && size.cast_unsigned() > limit
@@ -926,7 +836,7 @@ impl FileService {
             }
         }
         let result_pairs: Vec<(String, String)> = merged.into_iter().collect();
-        Self::check_metadata_limits(&policy, &result_pairs)?;
+        PolicyResolver::check_metadata_limits(&policy, &result_pairs)?;
 
         // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
@@ -1453,387 +1363,6 @@ impl FileService {
             .authorize(ctx, actions::DELETE, "", None)
             .await?;
         self.store.delete_retention_rule(&scope, rule_id).await
-    }
-
-    // ── multipart upload (P2-M3) ──────────────────────────────────────────────
-
-    /// `POST /files/{id}/multipart`: initiate a multipart upload session.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    pub async fn initiate_multipart_upload(
-        &self,
-        ctx: &SecurityContext,
-        file_id: Uuid,
-        declared_mime: &str,
-    ) -> Result<MultipartUploadSession, DomainError> {
-        let prefetch = Self::tenant_scope(ctx);
-        let file = self.store.require_file(&prefetch, file_id).await?;
-        let _scope = self
-            .authorizer
-            .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
-            .await?;
-
-        let backend = self.backends.default_backend();
-        if !backend.capabilities().multipart_native {
-            return Err(DomainError::multipart_not_supported(backend.id()));
-        }
-
-        // Policy checks: allowed mime type and size.
-        let tenant_id = ctx.subject_tenant_id();
-        let policy = self
-            .get_effective_policy_internal(tenant_id, file.owner_id)
-            .await?;
-        Self::check_allowed_mime(&policy, declared_mime)?;
-        let effective_max = Self::compute_effective_max_bytes(&policy, declared_mime, &backend);
-        self.check_quota(tenant_id, file.owner_id, effective_max)
-            .await?;
-
-        let now = OffsetDateTime::now_utc();
-        let upload_id = Uuid::now_v7();
-        let version_id = Uuid::now_v7();
-        let backend_path = Self::backend_path(file_id, version_id);
-        let backend_id = backend.id().to_owned();
-
-        // Pre-register the pending file_versions row.
-        self.store
-            .insert_pending_version(
-                file_id,
-                version_id,
-                declared_mime,
-                &backend_id,
-                &backend_path,
-                now,
-            )
-            .await?;
-
-        // Initiate the multipart upload on the backend.
-        let backend_handle = backend.initiate_multipart(&backend_path).await?;
-
-        // Default TTL for multipart sessions: 7 days.
-        let expires_at = now + time::Duration::days(7);
-
-        self.store
-            .create_multipart_upload(
-                upload_id,
-                file_id,
-                version_id,
-                &backend_handle,
-                declared_mime,
-                expires_at,
-                now,
-            )
-            .await?;
-
-        Ok(MultipartUploadSession {
-            upload_id,
-            file_id,
-            version_id,
-            backend_upload_handle: backend_handle,
-            state: MultipartUploadState::InProgress,
-            declared_mime: declared_mime.to_owned(),
-            mime_validated: false,
-            created_at: now,
-            expires_at,
-        })
-    }
-
-    /// `PUT /files/{id}/multipart/{upload_id}/parts/{part_number}`: upload one part.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    pub async fn upload_multipart_part(
-        &self,
-        ctx: &SecurityContext,
-        file_id: Uuid,
-        upload_id: Uuid,
-        part_number: u32,
-        data: Bytes,
-    ) -> Result<MultipartPart, DomainError> {
-        let prefetch = Self::tenant_scope(ctx);
-        let file = self.store.require_file(&prefetch, file_id).await?;
-        let _scope = self
-            .authorizer
-            .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
-            .await?;
-
-        let session = self
-            .store
-            .get_multipart_upload(upload_id)
-            .await?
-            .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
-
-        // Bind the session to the authorized path `file_id`. Authorization above
-        // checks the path file, but the session is loaded by `upload_id` alone —
-        // without this a caller could drive another file's upload (and corrupt
-        // state via a recomputed backend path). Reported as "not found" so a
-        // foreign `upload_id` is not distinguishable from a missing one.
-        if session.file_id != file_id {
-            return Err(DomainError::multipart_upload_not_found(upload_id));
-        }
-
-        if session.state != MultipartUploadState::InProgress {
-            return Err(DomainError::multipart_upload_not_in_progress(
-                upload_id,
-                session.state.as_str(),
-            ));
-        }
-
-        // Fetch the backend from the version row.
-        let version = self.store.get_version(file_id, session.version_id).await?;
-        let backend_id = version.as_ref().map_or_else(
-            || self.backends.default_id().to_owned(),
-            |v| v.backend_id.clone(),
-        );
-        let backend = self.backends.get(&backend_id)?;
-        let backend_path = Self::backend_path(file_id, session.version_id);
-
-        let data_size = i64::try_from(data.len())
-            .map_err(|_| DomainError::validation("data", "part data too large"))?;
-        let (backend_etag, part_hash) = backend
-            .upload_part(
-                &backend_path,
-                &session.backend_upload_handle,
-                part_number,
-                data,
-            )
-            .await?;
-
-        let now = OffsetDateTime::now_utc();
-        let part_number_i32 = i32::try_from(part_number)
-            .map_err(|_| DomainError::validation("part_number", "part number too large"))?;
-
-        self.store
-            .upsert_multipart_part(
-                upload_id,
-                part_number_i32,
-                &backend_etag,
-                part_hash.clone(),
-                data_size,
-                now,
-            )
-            .await?;
-
-        Ok(MultipartPart {
-            upload_id,
-            part_number,
-            backend_etag,
-            part_hash,
-            size: data_size,
-            uploaded_at: now,
-        })
-    }
-
-    /// `POST /files/{id}/multipart/{upload_id}/complete`: finalize all parts.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-audit-trail
-    pub async fn complete_multipart_upload(
-        &self,
-        ctx: &SecurityContext,
-        file_id: Uuid,
-        upload_id: Uuid,
-    ) -> Result<(), DomainError> {
-        let prefetch = Self::tenant_scope(ctx);
-        let file = self.store.require_file(&prefetch, file_id).await?;
-        let _scope = self
-            .authorizer
-            .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
-            .await?;
-
-        let session = self
-            .store
-            .get_multipart_upload(upload_id)
-            .await?
-            .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
-
-        // Bind the session to the authorized path `file_id`. Authorization above
-        // checks the path file, but the session is loaded by `upload_id` alone —
-        // without this a caller could drive another file's upload (and corrupt
-        // state via a recomputed backend path). Reported as "not found" so a
-        // foreign `upload_id` is not distinguishable from a missing one.
-        if session.file_id != file_id {
-            return Err(DomainError::multipart_upload_not_found(upload_id));
-        }
-
-        if session.state != MultipartUploadState::InProgress {
-            return Err(DomainError::multipart_upload_not_in_progress(
-                upload_id,
-                session.state.as_str(),
-            ));
-        }
-
-        let parts = self.store.list_multipart_parts(upload_id).await?;
-
-        // Fetch the backend from the version row.
-        let version = self.store.get_version(file_id, session.version_id).await?;
-        let backend_id = version.as_ref().map_or_else(
-            || self.backends.default_id().to_owned(),
-            |v| v.backend_id.clone(),
-        );
-        let backend = self.backends.get(&backend_id)?;
-        let backend_path = Self::backend_path(file_id, session.version_id);
-
-        // Compute total size.
-        let total_size: i64 = parts.iter().map(|p| p.size).sum();
-
-        // Policy size check.
-        let policy = self
-            .get_effective_policy_internal(ctx.subject_tenant_id(), file.owner_id)
-            .await?;
-        let effective_max =
-            Self::compute_effective_max_bytes(&policy, &session.declared_mime, &backend);
-        if let Some(limit) = effective_max
-            && total_size > 0
-            && total_size.cast_unsigned() > limit
-        {
-            return Err(DomainError::policy_size_exceeded(
-                limit,
-                "policy size limit",
-            ));
-        }
-
-        // Build the parts list for the backend.
-        let backend_parts: Vec<(u32, String)> = parts
-            .iter()
-            .map(|p| (p.part_number, p.backend_etag.clone()))
-            .collect();
-
-        // Assemble on the backend, which returns the SHA-256 of the fully
-        // assembled object. This is the hash of the bytes actually stored — a
-        // hash over concatenated part digests would not match a later `get` +
-        // recompute and would break `migrate_backend`'s integrity check.
-        let content_hash = backend
-            .complete_multipart(
-                &backend_path,
-                &session.backend_upload_handle,
-                &backend_parts,
-            )
-            .await?;
-
-        // Finalize the version row (no separate audit row — complete below covers it).
-        let finalize_audit = Self::audit_ok(
-            ctx,
-            Some(file_id),
-            AuditOperation::FinalizeVersion,
-            serde_json::json!({ "version_id": session.version_id, "upload_id": upload_id, "size": total_size }),
-        );
-        let finalized = self
-            .store
-            .finalize_version(
-                file_id,
-                session.version_id,
-                total_size,
-                content_hash,
-                finalize_audit,
-            )
-            .await?;
-        if !finalized {
-            // The pending version row disappeared (concurrent abort or cleanup)
-            // after the backend assembled the object. Fail loudly instead of
-            // reporting success with no bound version; the now-orphaned blob at
-            // `backend_path` is reclaimed by the orphan-reconciliation sweep.
-            return Err(DomainError::conflict(format!(
-                "multipart upload {upload_id}: version row was removed before completion"
-            )));
-        }
-
-        // Mark the session completed and emit the main audit row.
-        // @cpt-cf-file-storage-fr-audit-trail
-        let audit = Self::audit_ok(
-            ctx,
-            Some(file_id),
-            AuditOperation::MultipartComplete,
-            serde_json::json!({ "upload_id": upload_id, "version_id": session.version_id }),
-        );
-        self.store
-            .complete_multipart_upload(upload_id, audit)
-            .await?;
-
-        Ok(())
-    }
-
-    /// `DELETE /files/{id}/multipart/{upload_id}`: abort a multipart upload.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-audit-trail
-    pub async fn abort_multipart_upload(
-        &self,
-        ctx: &SecurityContext,
-        file_id: Uuid,
-        upload_id: Uuid,
-    ) -> Result<(), DomainError> {
-        let prefetch = Self::tenant_scope(ctx);
-        let file = self.store.require_file(&prefetch, file_id).await?;
-        let _scope = self
-            .authorizer
-            .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
-            .await?;
-
-        let session = self
-            .store
-            .get_multipart_upload(upload_id)
-            .await?
-            .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
-
-        // Bind the session to the authorized path `file_id`. Authorization above
-        // checks the path file, but the session is loaded by `upload_id` alone —
-        // without this a caller could drive another file's upload (and corrupt
-        // state via a recomputed backend path). Reported as "not found" so a
-        // foreign `upload_id` is not distinguishable from a missing one.
-        if session.file_id != file_id {
-            return Err(DomainError::multipart_upload_not_found(upload_id));
-        }
-
-        if session.state != MultipartUploadState::InProgress {
-            return Err(DomainError::multipart_upload_not_in_progress(
-                upload_id,
-                session.state.as_str(),
-            ));
-        }
-
-        // Fetch the backend from the version row.
-        let version = self.store.get_version(file_id, session.version_id).await?;
-        let backend_id = version.as_ref().map_or_else(
-            || self.backends.default_id().to_owned(),
-            |v| v.backend_id.clone(),
-        );
-        let backend = self.backends.get(&backend_id)?;
-        let backend_path = Self::backend_path(file_id, session.version_id);
-
-        backend
-            .abort_multipart(&backend_path, &session.backend_upload_handle)
-            .await?;
-
-        // @cpt-cf-file-storage-fr-audit-trail
-        let audit = Self::audit_ok(
-            ctx,
-            Some(file_id),
-            AuditOperation::MultipartAbort,
-            serde_json::json!({ "upload_id": upload_id, "version_id": session.version_id }),
-        );
-
-        // Mark the session aborted.
-        self.store.abort_multipart_upload(upload_id, audit).await?;
-
-        // Delete the pending version row (no audit row — a pending version is
-        // an implementation detail, not a distinct audited file version). A
-        // DB error must not be swallowed; a missing row (`false`) is acceptable
-        // for an abort, since the pending version being already gone is the
-        // desired end state.
-        self.store
-            .delete_version(
-                file_id,
-                session.version_id,
-                // Deleted as part of abort — record as delete_version for completeness.
-                Self::audit_ok(
-                    ctx,
-                    Some(file_id),
-                    AuditOperation::DeleteVersion,
-                    serde_json::json!({ "version_id": session.version_id, "reason": "multipart_abort" }),
-                ),
-            )
-            .await?;
-
-        Ok(())
     }
 
     // ── backend migration (P2-M4) ─────────────────────────────────────────────
