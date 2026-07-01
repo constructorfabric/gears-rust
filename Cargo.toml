@@ -59,6 +59,8 @@ members = [
     "gears/system/account-management/account-management-sdk",
     "gears/system/account-management/plugins/static-idp-plugin",
     "gears/system/api-gateway",
+    "gears/system/cluster/cluster-sdk",
+    "gears/system/cluster/cluster",
     "gears/system/grpc-hub",
     "gears/system/nodes-registry/nodes-registry",
     "gears/system/nodes-registry/nodes-registry-sdk",
@@ -269,6 +271,8 @@ cf-gears-system-sdk-directory = { version = "0.1.37", path = "libs/system-sdks/s
 
 # System gears
 types-registry = { package = "cf-gears-types-registry", version = "0.1.23", path = "gears/system/types-registry/types-registry" }
+
+cf-gears-cluster-sdk = { version = "0.1.0", path = "gears/system/cluster/cluster-sdk" }
 
 # System gears SDKs
 account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.2.0", path = "gears/system/account-management/account-management-sdk" }

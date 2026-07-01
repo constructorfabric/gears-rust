@@ -1,0 +1,60 @@
+[package]
+name = "cf-gears-cluster-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SDK foundation for the cluster module: unified error model, typed profile marker, profile-scope helpers, and the dyn-compatibility assertion harness"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "cluster_sdk"
+
+[lints]
+workspace = true
+
+[features]
+# Pulls in the OpenTelemetry-backed `ClusterMetrics` adapter
+# (`observability::otel::OtelClusterMetrics`). Off by default so the SDK core
+# carries no OpenTelemetry dependency; plugins that emit metrics enable it.
+otel = ["dep:opentelemetry"]
+
+[dependencies]
+toolkit = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+# `CancellationToken` carries the graceful-shutdown signal from the wiring into
+# the SDK default backends' background tasks so a leader observes loss before
+# shutdown completes (cpt-cf-clst-fr-shutdown-revoke). No public SDK type exposes
+# `tokio_util`.
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+# Used solely by the watch auto-restart combinator's full-jitter backoff
+# (`RetryPolicy::backoff_for`). It is a runtime randomness source only — no
+# public SDK type exposes `rand`.
+rand = { workspace = true }
+# GTS plugin-spec scaffolding (`src/gts.rs`). serde/serde_json/schemars back the
+# `gts_type_schema` macro for the plugin-discovery spec only; the coordination
+# contract types stay serde-free per `cpt-cf-clst-constraint-no-serde`.
+gts = { workspace = true }
+toolkit-gts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+# Optional: backs the `otel` feature's `OtelClusterMetrics` adapter only. Gated
+# so the SDK core stays OpenTelemetry-free; the metrics feature is enabled by
+# plugins that emit (see `observability::otel`).
+opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `test-util` (not part of the `full` feature set) enables `tokio::time::pause`
+# /`advance` and `#[tokio::test(start_paused = true)]` so renewal and TTL logic
+# is driven deterministically without real sleeps.
+tokio = { workspace = true, features = ["test-util"] }
+
