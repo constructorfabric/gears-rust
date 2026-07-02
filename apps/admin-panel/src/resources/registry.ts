@@ -51,7 +51,6 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     tenantScope: "tenant",
     safety: "destructive",
     capabilities: { read: "tenants:read", write: "tenants:write", delete: "tenants:write" },
-    updateMethod: "PATCH",
     // Field types/required/readOnly are derived at boot from the `TenantDto`
     // OpenAPI schema; entries below carry only what the spec can't express —
     // visibility, labels, relations, the GTS-backed type select, and which
@@ -66,15 +65,12 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~",
       self_managed: false,
     }),
-    paths: {
-      // Hierarchy view: children of the caller's home tenant. There is no
-      // global tenant list endpoint; tenant isolation is enforced server-side.
-      list: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/children`,
-      one: (_ctx, id) => `${AM}/tenants/${id}`,
-      create: () => `${AM}/tenants`,
-      update: (_ctx, id) => `${AM}/tenants/${id}`,
-      remove: (_ctx, id) => `${AM}/tenants/${id}`,
-    },
+    // CRUD paths derive from the tenants collection (POST create, and
+    // GET/PATCH/DELETE on `/tenants/{tenant_id}`). There is no global tenant
+    // list endpoint, so list is overridden to the caller's home-tenant subtree;
+    // tenant isolation is enforced server-side.
+    basePath: `${AM}/tenants`,
+    listPath: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/children`,
     fields: [
       { name: "id", inList: true },
       { name: "name", inList: true, inForm: true },
@@ -123,11 +119,11 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     // labels, list visibility). `side`/`comment` are kept curated as the served
     // DTO names them differently (`initiator_side`) or omits them.
     schema: "OwnConversionRequestDto",
-    paths: {
-      // Own conversion requests for the caller's home tenant.
-      list: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/conversions`,
-      one: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/conversions/${id}`,
-    },
+    // List/detail derive from the conversions collection. The API also exposes
+    // POST (request) and PATCH (state change), but the panel drives state via
+    // the approve/reject/cancel actions below, not a generic create/edit form.
+    basePath: `${AM}/tenants/{tenant_id}/conversions`,
+    suppressVerbs: ["create", "update"],
     fields: [
       { name: "id", inList: true, readOnly: true },
       { name: "status", type: "tag", inList: true },
@@ -161,15 +157,10 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     tenantScope: "tenant",
     safety: "destructive",
     capabilities: { read: "users:read", write: "users:write", delete: "users:write" },
-    paths: {
-      // IdP-backed users for the caller's home tenant. The IdP plugin
-      // exposes list/create/delete only (no get-one / update), so the
-      // descriptor advertises just those verbs and the UI degrades
-      // gracefully. Shown as unavailable when no IdP supports the op.
-      list: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/users`,
-      create: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/users`,
-      remove: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/users/${id}`,
-    },
+    // IdP-backed users for the caller's home tenant. The API exposes only
+    // list/create/delete (no get-one / update), so those are the only verbs
+    // that derive; the UI degrades gracefully where an op is unsupported.
+    basePath: `${AM}/tenants/{tenant_id}/users`,
     schema: "UserDto",
     fields: [
       { name: "id", inList: true, readOnly: true },
@@ -199,12 +190,9 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     createKeyField: "type_id",
     bodyField: "value",
     schema: "TenantMetadataEntryDto",
-    paths: {
-      list: (ctx) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata`,
-      one: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata/${id}`,
-      update: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata/${id}`,
-      remove: (ctx, id) => `${AM}/tenants/${ctx.subject_tenant_id}/metadata/${id}`,
-    },
+    // Derives list/one/update(PUT)/remove; there is no POST collection endpoint
+    // (create is the keyed PUT upsert above).
+    basePath: `${AM}/tenants/{tenant_id}/metadata`,
     fields: [
       { name: "type_id", label: "Type id", inList: true, createOnly: true },
       { name: "value", inList: true, inForm: true },
@@ -223,18 +211,12 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
       write: "resource-groups:write",
       delete: "resource-groups:write",
     },
-    updateMethod: "PUT",
     // Field types/required/readOnly are derived at boot from the `GroupDto`
     // OpenAPI schema (resource-group gear); the entries below only add
     // presentation hints (visibility, labels, relations) the spec can't carry.
     schema: "GroupDto",
-    paths: {
-      list: () => `/resource-group/v1/groups`,
-      one: (_ctx, id) => `/resource-group/v1/groups/${id}`,
-      create: () => `/resource-group/v1/groups`,
-      update: (_ctx, id) => `/resource-group/v1/groups/${id}`,
-      remove: (_ctx, id) => `/resource-group/v1/groups/${id}`,
-    },
+    // Full CRUD derives from the groups collection (update is PUT per spec).
+    basePath: `/resource-group/v1/groups`,
     fields: [
       { name: "id", inList: true },
       { name: "name", inList: true, inForm: true },
@@ -259,10 +241,10 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     // `id`/`segments`/`content`/`description` derive from the GtsEntityDto
     // schema; only the two list-visible, relabelled fields stay curated.
     schema: "GtsEntityDto",
-    paths: {
-      list: () => `/types-registry/v1/entities`,
-      one: (_ctx, id) => `/types-registry/v1/entities/${encodeURIComponent(id)}`,
-    },
+    // The API exposes register (POST) + list/get, but v0 policy is read-only,
+    // so the `read-only` safety above suppresses the write verbs; list/get
+    // derive. Item id is a gts_id (URL-encoded by the resolver).
+    basePath: `/types-registry/v1/entities`,
     fields: [
       { name: "gts_id", label: "GTS id", inList: true, readOnly: true },
       { name: "is_schema", label: "Schema?", inList: true },
@@ -277,9 +259,10 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     safety: "read-only",
     idField: "name",
     capabilities: { read: "gears:read" },
-    paths: {
-      list: () => `/gear-orchestrator/v1/gears`,
-    },
+    // List-only (the orchestrator exposes no item/CRUD ops). No component
+    // schema — the list element is an unnamed array type — so fields stay
+    // curated.
+    basePath: `/gear-orchestrator/v1/gears`,
     fields: [
       { name: "name", inList: true, readOnly: true },
       { name: "capabilities", type: "json", inList: true },
@@ -300,10 +283,9 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     // Nested fields (server/auth/headers/plugins/cors/…) derive as JSON from
     // the UpstreamResponse schema; only list-visible columns stay curated.
     schema: "UpstreamResponse",
-    paths: {
-      list: () => `/oagw/v1/upstreams`,
-      one: (_ctx, id) => `/oagw/v1/upstreams/${id}`,
-    },
+    // The API exposes full CRUD, but v0 is read-only (the `read-only` safety
+    // suppresses writes); list/get derive.
+    basePath: `/oagw/v1/upstreams`,
     fields: [
       { name: "id", inList: true, readOnly: true },
       { name: "alias", inList: true },
@@ -322,10 +304,9 @@ export const RESOURCE_REGISTRY: ResourceDescriptor[] = [
     // Nested fields (match/plugins/cors/…) derive as JSON from the RouteResponse
     // schema; only list-visible columns stay curated.
     schema: "RouteResponse",
-    paths: {
-      list: () => `/oagw/v1/routes`,
-      one: (_ctx, id) => `/oagw/v1/routes/${id}`,
-    },
+    // Full CRUD in the API; v0 read-only (writes suppressed by `read-only`
+    // safety); list/get derive.
+    basePath: `/oagw/v1/routes`,
     fields: [
       { name: "id", inList: true, readOnly: true },
       { name: "upstream_id", label: "Upstream", inList: true },

@@ -6,6 +6,7 @@ import { cachedAdminContext, type AdminContext } from "./adminContext";
 import {
   getDescriptor,
   idField,
+  resourcePaths,
   type ResourceDescriptor,
 } from "./resources";
 
@@ -67,36 +68,38 @@ export const dataProvider: DataProvider = {
 
   getList: async ({ resource }) => {
     const d = getDescriptor(resource);
-    const payload = await apiFetch<unknown>(d.paths.list(requireContext()));
+    const payload = await apiFetch<unknown>(resourcePaths(d).list(requireContext()));
     const data = normalizeList(payload, d);
     return { data: data as never, total: data.length };
   },
 
   getOne: async ({ resource, id }) => {
     const d = getDescriptor(resource);
-    if (!d.paths.one) unsupported("getOne", resource);
+    const one = resourcePaths(d).one;
+    if (!one) unsupported("getOne", resource);
     const raw = await apiFetch<Record<string, unknown>>(
-      d.paths.one(requireContext(), String(id)),
+      one(requireContext(), String(id)),
     );
     return { data: normalizeRecord(raw, d) as never };
   },
 
   create: async ({ resource, variables }) => {
     const d = getDescriptor(resource);
+    const p = resourcePaths(d);
     const vars = (variables ?? {}) as Record<string, unknown>;
     const ctx = requireContext();
     // Key-addressed upsert: create is a PUT to the entry path, id from a field.
-    if (d.createKeyField && d.paths.update) {
+    if (d.createKeyField && p.update) {
       const id = String(vars[d.createKeyField]);
-      const raw = await apiFetch<Record<string, unknown>>(d.paths.update(ctx, id), {
+      const raw = await apiFetch<Record<string, unknown>>(p.update(ctx, id), {
         method: d.updateMethod ?? "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody(d, vars)),
       });
       return { data: normalizeRecord(raw, d) as never };
     }
-    if (!d.paths.create) unsupported("create", resource);
-    const raw = await apiFetch<Record<string, unknown>>(d.paths.create(ctx), {
+    if (!p.create) unsupported("create", resource);
+    const raw = await apiFetch<Record<string, unknown>>(p.create(ctx), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(requestBody(d, vars)),
@@ -106,10 +109,11 @@ export const dataProvider: DataProvider = {
 
   update: async ({ resource, id, variables }) => {
     const d = getDescriptor(resource);
-    if (!d.paths.update) unsupported("update", resource);
+    const update = resourcePaths(d).update;
+    if (!update) unsupported("update", resource);
     const vars = (variables ?? {}) as Record<string, unknown>;
     const raw = await apiFetch<Record<string, unknown>>(
-      d.paths.update(requireContext(), String(id)),
+      update(requireContext(), String(id)),
       {
         method: d.updateMethod ?? "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -121,8 +125,9 @@ export const dataProvider: DataProvider = {
 
   deleteOne: async ({ resource, id }) => {
     const d = getDescriptor(resource);
-    if (!d.paths.remove) unsupported("deleteOne", resource);
-    await apiFetch<unknown>(d.paths.remove(requireContext(), String(id)), {
+    const remove = resourcePaths(d).remove;
+    if (!remove) unsupported("deleteOne", resource);
+    await apiFetch<unknown>(remove(requireContext(), String(id)), {
       method: "DELETE",
     });
     return { data: { id } as never };

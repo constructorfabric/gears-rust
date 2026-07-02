@@ -47,7 +47,7 @@ export const ResourceList = () => {
     <Card
       title={d.label}
       extra={
-        d.paths.create ? (
+        d.paths?.create ? (
           <Button type="primary" onClick={() => create(key)}>
             Create
           </Button>
@@ -70,17 +70,17 @@ export const ResourceList = () => {
               const id = String(record[idKey] ?? record.id);
               return (
                 <Space wrap size={4}>
-                  {d.paths.one && (
+                  {d.paths?.one && (
                     <Button size="small" onClick={() => show(key, id)}>
                       View
                     </Button>
                   )}
-                  {d.paths.update && (
+                  {d.paths?.update && (
                     <Button size="small" onClick={() => edit(key, id)}>
                       Edit
                     </Button>
                   )}
-                  {d.paths.remove && (
+                  {d.paths?.remove && (
                     <Popconfirm
                       title={`Delete this ${d.label.replace(/s$/, "").toLowerCase()}?`}
                       okText="Delete"

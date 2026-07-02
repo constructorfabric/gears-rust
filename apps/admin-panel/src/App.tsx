@@ -43,17 +43,17 @@ const resourceRoutes = RESOURCE_REGISTRY.flatMap((d) => {
       element={LIST_OVERRIDES[d.key] ?? <ResourceList />}
     />,
   ];
-  if (d.paths.create) {
+  if (d.paths?.create) {
     routes.push(
       <Route key={`${d.key}-create`} path={`/${d.key}/create`} element={<ResourceForm />} />,
     );
   }
-  if (d.paths.update) {
+  if (d.paths?.update) {
     routes.push(
       <Route key={`${d.key}-edit`} path={`/${d.key}/edit/:id`} element={<ResourceForm />} />,
     );
   }
-  if (d.paths.one) {
+  if (d.paths?.one) {
     routes.push(
       <Route key={`${d.key}-show`} path={`/${d.key}/show/:id`} element={<ResourceShow />} />,
     );

@@ -13,11 +13,13 @@
 
 import { apiFetch } from "../httpClient";
 import { RESOURCE_REGISTRY } from "./registry";
-import type { FieldDef, FieldType, ResourceDescriptor } from "./types";
+import { buildPaths, deriveOps } from "./openapiOps";
+import type { FieldDef, FieldType, Verb } from "./types";
 
 /** Minimal slice of an OpenAPI 3.1 document — only what discovery reads. */
 interface OpenApiSpec {
   components?: { schemas?: Record<string, JsonSchema> };
+  paths?: Record<string, Record<string, unknown>>;
 }
 
 /** Minimal JSON Schema node (utoipa output). */
@@ -124,32 +126,44 @@ export function loadOpenApiSpec(): Promise<OpenApiSpec> {
   return specPromise;
 }
 
-// Enrich each descriptor's `fields` in place, exactly once.
+// Resolve each descriptor (fields + CRUD paths) in place, exactly once.
 let resolved = false;
 
 /**
- * Fill descriptor fields from the OpenAPI spec for resources that declare a
- * `schema`. Runs once per session, mutating the in-memory registry before
- * any screen renders (called from the auth gate). Idempotent and best-effort:
- * a spec fetch failure leaves the curated fields untouched so the panel still
- * works against a backend that does not serve `/openapi.json`.
+ * Resolve the in-memory registry against the aggregated OpenAPI spec, mutating
+ * each descriptor before any screen renders. For every resource this builds the
+ * CRUD `paths` from its `basePath` (the API is the source of truth for which
+ * verbs exist); for resources that also declare a `schema` it enriches
+ * `fields` (derived type / `required` / `readOnly` fill gaps, curated entries
+ * override presentation).
+ *
+ * Runs once per session (idempotent). Best-effort: if the spec cannot be
+ * fetched, descriptors keep their curated fields and gain no `paths` — the auth
+ * gate retries on the next check, and the spec is public so it normally
+ * succeeds whenever the backend is reachable.
  */
-export async function ensureSchemasResolved(): Promise<void> {
+export async function ensureRegistryResolved(): Promise<void> {
   if (resolved) return;
-  const withSchema = RESOURCE_REGISTRY.filter((d) => d.schema);
-  if (withSchema.length === 0) {
-    resolved = true;
-    return;
-  }
   let spec: OpenApiSpec;
   try {
     spec = await loadOpenApiSpec();
   } catch {
-    return; // keep curated fields; retry on the next auth check
+    return; // retry on the next auth check
   }
-  for (const d of withSchema as ResourceDescriptor[]) {
-    const derived = deriveFields(spec, d.schema!);
-    if (derived.length > 0) d.fields = mergeFields(d.fields, derived);
+  for (const d of RESOURCE_REGISTRY) {
+    if (d.schema) {
+      const derived = deriveFields(spec, d.schema);
+      if (derived.length > 0) d.fields = mergeFields(d.fields, derived);
+    }
+    const ops = deriveOps(spec, d.basePath);
+    // A read-only resource offers no writes even where the API exposes them.
+    const readOnlyVerbs: Verb[] =
+      d.safety === "read-only" ? ["create", "update", "remove"] : [];
+    d.paths = buildPaths(ops, {
+      listPath: d.listPath,
+      suppress: [...(d.suppressVerbs ?? []), ...readOnlyVerbs],
+    });
+    if (ops.updateMethod && !d.updateMethod) d.updateMethod = ops.updateMethod;
   }
   resolved = true;
 }

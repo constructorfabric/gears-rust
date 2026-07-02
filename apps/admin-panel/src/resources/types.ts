@@ -76,6 +76,9 @@ export interface ActionDef {
   visible?: (record: Record<string, unknown>) => boolean;
 }
 
+/** The standard CRUD verbs, keyed as in `ResourcePaths`. */
+export type Verb = "list" | "one" | "create" | "update" | "remove";
+
 /** Path builders for the standard CRUD verbs. Absent verb => unsupported. */
 export interface ResourcePaths {
   list: (ctx: AdminContext) => string;
@@ -112,7 +115,33 @@ export interface ResourceDescriptor {
    * (visibility, labels, relations). See `resources/openapi.ts`.
    */
   schema?: string;
-  paths: ResourcePaths;
+  /**
+   * The resource's collection path in the aggregated OpenAPI spec, e.g.
+   * `/resource-group/v1/groups` or, for a tenant-scoped resource,
+   * `/account-management/v1/tenants/{tenant_id}/conversions`. The standard
+   * CRUD `paths` are derived from this at boot (see `resources/openapiOps.ts`);
+   * the API is the single source of truth for which verbs exist.
+   */
+  basePath: string;
+  /**
+   * Irregular list path that OpenAPI can't express as `GET {basePath}` — e.g.
+   * tenants list via the caller's `/{home}/children` subtree. Overrides the
+   * derived list path.
+   */
+  listPath?: (ctx: AdminContext) => string;
+  /**
+   * Verbs the admin policy intentionally does NOT offer even though the API
+   * exposes them (e.g. conversions edit their state via actions, not a generic
+   * update form). A `read-only` safety level suppresses create/update/remove
+   * automatically; this list is for finer-grained cases.
+   */
+  suppressVerbs?: Verb[];
+  /**
+   * CRUD path builders. Built at boot from `basePath` + the OpenAPI spec (with
+   * `listPath`/`suppressVerbs`/`safety` applied); not authored by hand. Present
+   * after `ensureRegistryResolved()` runs.
+   */
+  paths?: ResourcePaths;
   fields: FieldDef[];
   actions?: ActionDef[];
   /** Initial create-form values (e.g. default parent to the home tenant). */

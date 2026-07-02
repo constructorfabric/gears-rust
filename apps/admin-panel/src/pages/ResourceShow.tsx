@@ -31,7 +31,7 @@ export const ResourceShow = () => {
       extra={
         <Space>
           <ResourceActions descriptor={d} record={record} size="middle" />
-          {d.paths.update && (
+          {d.paths?.update && (
             <Button type="primary" onClick={() => edit(key, String(id ?? ""))}>
               Edit
             </Button>

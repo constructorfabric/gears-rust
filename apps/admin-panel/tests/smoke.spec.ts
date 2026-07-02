@@ -42,5 +42,10 @@ test("platform admin: login, context, resource navigation, create form", async (
   await page.getByRole("button", { name: /^Create$/ }).first().click();
   await expect(page.getByText("Create Tenants")).toBeVisible();
   await expect(page.getByLabel("Name")).toBeVisible();
-  await expect(page.getByLabel("Type")).toBeVisible();
+  // Type is a searchable async Select (tenant types loaded from the registry),
+  // not a plain input — assert the combobox rendered with its loaded default
+  // ("customer"). An async Select does not associate a `for`/label, so
+  // getByLabel would not match it.
+  await expect(page.getByRole("combobox").first()).toBeVisible();
+  await expect(page.getByText("customer").first()).toBeVisible();
 });

@@ -1,10 +1,25 @@
 import type { IResourceItem } from "@refinedev/core";
 
 import { RESOURCE_REGISTRY, resourceIcon } from "./registry";
-import type { ResourceDescriptor, FieldDef } from "./types";
+import type { ResourceDescriptor, FieldDef, ResourcePaths } from "./types";
 
 export type { ResourceDescriptor, FieldDef, ActionDef } from "./types";
 export { RESOURCE_REGISTRY, resourceIcon } from "./registry";
+export { ensureRegistryResolved } from "./openapi";
+
+/**
+ * The resource's resolved CRUD paths. Built at boot from the OpenAPI spec by
+ * `ensureRegistryResolved()`; throws if that has not run (or the spec was
+ * unreachable), which surfaces as a clear error rather than a silent no-op.
+ */
+export function resourcePaths(d: ResourceDescriptor): ResourcePaths {
+  if (!d.paths) {
+    throw new Error(
+      `Resource "${d.key}" has no resolved paths — the OpenAPI spec was not loaded`,
+    );
+  }
+  return d.paths;
+}
 
 const BY_KEY: Record<string, ResourceDescriptor> = Object.fromEntries(
   RESOURCE_REGISTRY.map((d) => [d.key, d]),
@@ -53,13 +68,13 @@ export function refineResources(): IResourceItem[] {
   return RESOURCE_REGISTRY.map((d) => ({
     name: d.key,
     list: `/${d.key}`,
-    ...(d.paths.one ? { show: `/${d.key}/show/:id` } : {}),
-    ...(d.paths.create ? { create: `/${d.key}/create` } : {}),
-    ...(d.paths.update ? { edit: `/${d.key}/edit/:id` } : {}),
+    ...(d.paths?.one ? { show: `/${d.key}/show/:id` } : {}),
+    ...(d.paths?.create ? { create: `/${d.key}/create` } : {}),
+    ...(d.paths?.update ? { edit: `/${d.key}/edit/:id` } : {}),
     meta: {
       label: d.label,
       icon: resourceIcon(d.key),
-      canDelete: Boolean(d.paths.remove),
+      canDelete: Boolean(d.paths?.remove),
     },
   }));
 }

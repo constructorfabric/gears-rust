@@ -2,7 +2,7 @@ import type { AuthProvider } from "@refinedev/core";
 
 import { TOKEN_STORAGE_KEY, CONTEXT_STORAGE_KEY } from "./config";
 import { fetchAdminContext, cachedAdminContext } from "./adminContext";
-import { ensureSchemasResolved } from "./resources/openapi";
+import { ensureRegistryResolved } from "./resources/openapi";
 
 /// Bearer-token auth provider over the platform auth flow.
 ///
@@ -20,7 +20,7 @@ export const authProvider: AuthProvider = {
     localStorage.setItem(TOKEN_STORAGE_KEY, token);
     try {
       await fetchAdminContext();
-      await ensureSchemasResolved();
+      await ensureRegistryResolved();
     } catch {
       localStorage.removeItem(TOKEN_STORAGE_KEY);
       return {
@@ -47,7 +47,7 @@ export const authProvider: AuthProvider = {
     }
     try {
       await fetchAdminContext();
-      await ensureSchemasResolved();
+      await ensureRegistryResolved();
       return { authenticated: true };
     } catch {
       localStorage.removeItem(TOKEN_STORAGE_KEY);
