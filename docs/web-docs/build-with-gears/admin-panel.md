@@ -81,42 +81,52 @@ serving the panel (e.g. when running Vite separately).
 
 ## Resources are described, not hardcoded
 
-Every manageable object is one **resource descriptor** in
-`apps/admin-panel/src/resources/registry.ts`. A descriptor declares the resource key, owning
-gear, the API paths for each CRUD verb, the fields (with per-view visibility and
-create-time immutability), required capabilities, a safety level, tenant scope, and any
-custom actions. The data provider and the generated List / Show / Create / Edit screens are
-driven entirely off these descriptors — a verb is offered only when its path is declared, so
-resources without full CRUD degrade gracefully instead of rendering broken controls.
+Every manageable object is one entry in
+**`apps/admin-panel/src/resources/admin.config.json`** — declarative data, not TypeScript.
+Discovery is split by concern:
 
-Adding a new admin object is therefore additive: append a descriptor, no core changes. For
-example, a read-only resource backed by a list endpoint:
+- **API-intrinsic facts come from OpenAPI.** At startup the panel reads the gateway-aggregated
+  `/cf/openapi.json` and derives each resource's field types / `required` / `readOnly`, its
+  CRUD verb→path mapping, custom operations, and tenant scope. The API is the single source of
+  truth for what exists.
+- **Presentation and policy come from the config.** Each entry supplies only what the spec
+  can't express: list columns and labels, the component `schema` name, an irregular list path,
+  verbs the panel intentionally withholds (`suppressVerbs`, or a `read-only` safety), custom
+  actions, and field option sources.
 
-```ts
+Adding an admin object — here, or in another `gears-rust` project that ships the pre-built
+panel — is therefore a JSON edit with **no TypeScript and no core changes**. A read-only
+resource backed by a list endpoint:
+
+```json
 {
-  key: "gears",
-  label: "Gears",
-  owningGear: "gear-orchestrator",
-  tenantScope: "global",
-  safety: "read-only",
-  idField: "name",
-  capabilities: { read: "gears:read" },
-  paths: { list: () => `/gear-orchestrator/v1/gears` },
-  fields: [
-    { name: "name", inList: true, readOnly: true },
-    { name: "deployment_mode", label: "Mode", inList: true },
-  ],
+  "key": "gears",
+  "label": "Gears",
+  "owningGear": "gear-orchestrator",
+  "tenantScope": "global",
+  "safety": "read-only",
+  "basePath": "/gear-orchestrator/v1/gears",
+  "idField": "name",
+  "capabilities": { "read": "gears:read" },
+  "fields": [
+    { "name": "name", "inList": true, "readOnly": true },
+    { "name": "deployment_mode", "label": "Mode", "inList": true }
+  ]
 }
 ```
 
-Custom (non-CRUD) actions — tenant `suspend` / `unsuspend` / soft-delete, conversion
-`approve` / `reject` / `cancel` — are declared the same way, with a capability gate and a
-confirmation prompt for destructive ones.
+The panel derives the available verbs from the spec under `basePath` — here only a list
+endpoint exists, so only a list screen renders. Custom (non-CRUD) actions — tenant `suspend` /
+`unsuspend`, conversion `approve` / `reject` / `cancel` — are declared declaratively too: a
+path template (`{tenant}` / `{id}` placeholders), an optional static body, a capability gate,
+a safety level, and a `visibleWhen` predicate; destructive ones get a confirmation prompt.
 
 ## v0 coverage
 
 The first version covers the admin shell, the session/context view, the enabled-gears
 summary, tenants (list, detail, create/update and lifecycle actions), resource groups
-(CRUD), conversions (list/detail + actions), and read-only types/GTS and gear status. See
-`docs/arch/admin-panel/` (PRD, DESIGN, ADRs) for the full design and the deferred items
-(runtime OpenAPI discovery, gear-contributed descriptors, raw-database operator fallback).
+(CRUD), conversions (list/detail + actions), and read-only types/GTS and gear status.
+Runtime OpenAPI discovery (fields **and** routes) and declarative JSON registration are in
+place. See `docs/arch/admin-panel/` (PRD, DESIGN, ADRs) for the full design and the deferred
+items (extraction to a dedicated `constructorfabric/` repo as a pre-built artifact, a
+production admin-role model beyond the dev stub, and the raw-database operator fallback).
