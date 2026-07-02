@@ -61,8 +61,13 @@ const resourceRoutes = RESOURCE_REGISTRY.flatMap((d) => {
   return routes;
 });
 
+// Vite's BASE_URL carries a trailing slash (e.g. "/cf/admin/"). react-router
+// v6 will not match a no-trailing-slash location ("/cf/admin") against a
+// trailing-slash basename and renders a blank page, so normalize it off.
+const ROUTER_BASENAME = import.meta.env.BASE_URL.replace(/\/+$/, "") || "/";
+
 export const App = () => (
-  <BrowserRouter basename={import.meta.env.BASE_URL}>
+  <BrowserRouter basename={ROUTER_BASENAME}>
     <ConfigProvider theme={RefineThemes.Blue}>
       <AntdApp>
         <Refine
