@@ -158,6 +158,63 @@ fn question_mark_propagation_serde_json() {
 }
 
 // =========================================================================
+// Runtime-scope constructors — used by generic middleware (e.g.
+// toolkit-http-middleware) to emit canonical errors under a GTS scope chosen
+// at runtime, without a compile-time #[resource_error] type.
+// =========================================================================
+
+const SCOPE: &str = "gts.cf.core.gateway.route.v1~";
+
+#[test]
+fn scoped_invalid_argument_carries_category_and_scope() {
+    let err = CanonicalError::scoped_invalid_argument(SCOPE)
+        .with_field_violation("field", "bad format", "INVALID_FORMAT")
+        .create();
+
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(err.title(), "Invalid Argument");
+    assert_eq!(
+        err.gts_type(),
+        "gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"
+    );
+    // The runtime scope is stamped as the resource type...
+    assert_eq!(err.resource_type(), Some(SCOPE));
+    // ...and survives conversion to the wire Problem.
+    let problem = Problem::from(err);
+    assert_eq!(problem.context["resource_type"], SCOPE);
+}
+
+#[test]
+fn scoped_permission_denied_carries_category_and_scope() {
+    let err = CanonicalError::scoped_permission_denied(SCOPE)
+        .with_reason("INSUFFICIENT_ROLE")
+        .create();
+
+    assert_eq!(err.status_code(), 403);
+    assert_eq!(err.title(), "Permission Denied");
+    assert_eq!(
+        err.gts_type(),
+        "gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
+    );
+    assert_eq!(err.resource_type(), Some(SCOPE));
+}
+
+#[test]
+fn scoped_resource_exhausted_carries_category_and_scope() {
+    let err = CanonicalError::scoped_resource_exhausted(SCOPE)
+        .with_quota_violation("requests", "limit reached")
+        .create();
+
+    assert_eq!(err.status_code(), 429);
+    assert_eq!(err.title(), "Resource Exhausted");
+    assert_eq!(
+        err.gts_type(),
+        "gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~"
+    );
+    assert_eq!(err.resource_type(), Some(SCOPE));
+}
+
+// =========================================================================
 // GTS ID validation — ensures all IDs in the crate are valid GTS identifiers
 // =========================================================================
 

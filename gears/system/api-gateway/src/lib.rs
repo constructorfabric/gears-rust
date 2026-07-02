@@ -10,8 +10,10 @@ pub use gear::ApiGateway;
 
 // === INTERNAL MODULES ===
 mod assets;
+mod authn_adapter;
 mod config;
 mod cors;
+pub mod errors;
 pub mod middleware;
 mod router_cache;
 mod web;

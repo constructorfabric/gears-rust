@@ -112,7 +112,7 @@ SetRequestId → PropagateRequestId → Trace → push_req_id_to_extensions
   requirement (`OperationBuilder::authenticated()` registers the route as
   `Required`), extracts the bearer token, calls the AuthN Resolver, and injects
   `SecurityContext` as a request `Extension`. See
-  `@gears/system/api-gateway/src/middleware/auth.rs:205-251`.
+  `security_context_middleware` in `@libs/toolkit-http-middleware/src/auth.rs`.
 - **ScopeEnforcement** — optional coarse-grained `token_scopes` gate (see
   *Gateway Scope Enforcement* in the authorization DESIGN); rejects early without
   calling the PDP.

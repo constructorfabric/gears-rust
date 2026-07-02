@@ -1,20 +1,70 @@
-//! Gateway Scope Enforcement Middleware
+//! Gateway-style scope enforcement middleware.
 //!
 //! Performs coarse-grained early rejection of requests based on token scopes
-//! without calling the PDP. This is an optimization for performance-critical routes.
+//! without calling the PDP — an optimization for performance-critical routes.
 //!
-//! See `docs/arch/authorization/DESIGN.md` section "Gateway Scope Enforcement" for details.
+//! The consuming gear supplies the compiled rules (built from its own
+//! configuration via [`ScopeEnforcementRules::from_rules`]) and the GTS `scope`
+//! used to render `permission_denied` rejections, so this crate stays free of
+//! any gear-specific config or error identity.
 
 use std::sync::Arc;
 
 use axum::response::IntoResponse;
 use glob::{MatchOptions, Pattern};
+use serde::{Deserialize, Serialize};
 
-use crate::config::RoutePoliciesConfig;
-use crate::middleware::common;
-use crate::middleware::errors::ApiGatewayRouteError;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
+
+use crate::common;
+
+/// A single scope enforcement rule (the deserializable config unit and the
+/// input to [`ScopeEnforcementRules::from_rules`]).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeRule {
+    /// Glob path pattern (`*` = one segment, `**` = any depth), e.g. `/admin/**`.
+    pub path: String,
+    /// HTTP method to match. `None` (omitted) matches any method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Required scopes; the request passes if the token has ANY of these.
+    /// Must not be empty.
+    pub required_scopes: Vec<String>,
+}
+
+/// Deserializable configuration for the scope enforcement middleware.
+///
+/// Enables coarse-grained early rejection of requests based on token scopes
+/// without calling the PDP — an optimization for performance-critical routes.
+///
+/// # Example YAML
+///
+/// ```yaml
+/// route_policies:
+///   enabled: true
+///   rules:
+///     - path: "/admin/**"
+///       required_scopes: ["admin"]
+///     - path: "/events/v1/*"
+///       required_scopes: ["read:events", "write:events"]  # any of these
+/// ```
+///
+/// # Behavior
+///
+/// - Rules are evaluated in declaration order (first match wins)
+/// - If `token_scopes: ["*"]` → always pass (first-party app)
+/// - If `token_scopes` contains any of `required_scopes` → pass
+/// - Otherwise → 403 Forbidden (before PDP call)
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScopeEnforcementConfig {
+    /// Whether scope enforcement is enabled.
+    pub enabled: bool,
+    /// Rules evaluated in declaration order (first match wins).
+    pub rules: Vec<ScopeRule>,
+}
 
 /// Compiled scope enforcement rules for efficient runtime matching.
 #[derive(Clone, Debug)]
@@ -23,6 +73,8 @@ pub struct ScopeEnforcementRules {
     rules: Arc<[CompiledRule]>,
     /// Whether scope enforcement is enabled.
     enabled: bool,
+    /// GTS scope used to render `permission_denied` rejections.
+    scope: &'static str,
 }
 
 /// A single compiled rule: glob pattern + optional method + required scopes.
@@ -35,22 +87,47 @@ struct CompiledRule {
 }
 
 impl ScopeEnforcementRules {
-    /// Build scope enforcement rules from configuration.
+    /// Build compiled rules from a [`ScopeEnforcementConfig`].
+    ///
+    /// `scope` is the GTS resource-type under which `permission_denied`
+    /// rejections are rendered.
     ///
     /// # Errors
     ///
-    /// Returns an error if any glob pattern is invalid or if any rule has empty `required_scopes`.
-    pub fn from_config(config: &RoutePoliciesConfig) -> Result<Self, anyhow::Error> {
-        if !config.enabled {
+    /// Returns an error if any glob pattern is invalid or if any rule has empty
+    /// `required_scopes`.
+    pub fn from_config(
+        scope: &'static str,
+        config: &ScopeEnforcementConfig,
+    ) -> Result<Self, anyhow::Error> {
+        Self::from_rules(scope, config.enabled, config.rules.iter().cloned())
+    }
+
+    /// Build compiled rules from neutral [`ScopeRule`]s.
+    ///
+    /// `scope` is the GTS resource-type under which `permission_denied`
+    /// rejections are rendered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any glob pattern is invalid or if any rule has empty
+    /// `required_scopes`.
+    pub fn from_rules(
+        scope: &'static str,
+        enabled: bool,
+        rules: impl IntoIterator<Item = ScopeRule>,
+    ) -> Result<Self, anyhow::Error> {
+        if !enabled {
             return Ok(Self {
                 rules: Arc::from([]),
                 enabled: false,
+                scope,
             });
         }
 
-        let mut rules = Vec::with_capacity(config.rules.len());
+        let mut compiled = Vec::new();
 
-        for rule in &config.rules {
+        for rule in rules {
             // Validate: empty required_scopes is likely a config mistake
             if rule.required_scopes.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -67,7 +144,7 @@ impl ScopeEnforcementRules {
                 )
             })?;
 
-            rules.push(CompiledRule {
+            compiled.push(CompiledRule {
                 pattern,
                 method: rule.method.as_ref().map(|m| m.to_uppercase()),
                 required_scopes: rule.required_scopes.clone(),
@@ -75,14 +152,15 @@ impl ScopeEnforcementRules {
         }
 
         tracing::info!(
-            rules_count = rules.len(),
+            rules_count = compiled.len(),
             "Route policy enforcement enabled with {} rules",
-            rules.len()
+            compiled.len()
         );
 
         Ok(Self {
-            rules: Arc::from(rules),
+            rules: Arc::from(compiled),
             enabled: true,
+            scope,
         })
     }
 
@@ -165,7 +243,7 @@ impl ScopeEnforcementRules {
                     "Route policy enforcement denied: insufficient scopes"
                 );
 
-                return Err(ApiGatewayRouteError::permission_denied()
+                return Err(CanonicalError::scoped_permission_denied(self.scope)
                     .with_reason("INSUFFICIENT_SCOPES")
                     .create());
             }
@@ -176,12 +254,6 @@ impl ScopeEnforcementRules {
     }
 }
 
-/// Scope enforcement middleware state.
-#[derive(Clone)]
-pub struct ScopeEnforcementState {
-    pub rules: ScopeEnforcementRules,
-}
-
 /// Scope enforcement middleware.
 ///
 /// Checks if the request's token scopes satisfy the configured requirements
@@ -189,12 +261,12 @@ pub struct ScopeEnforcementState {
 ///
 /// This middleware MUST run AFTER the auth middleware (which populates `SecurityContext`).
 pub async fn scope_enforcement_middleware(
-    axum::extract::State(state): axum::extract::State<ScopeEnforcementState>,
+    axum::extract::State(rules): axum::extract::State<ScopeEnforcementRules>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     // Skip if enforcement is disabled
-    if !state.rules.enabled {
+    if !rules.enabled {
         return next.run(req).await;
     }
 
@@ -209,7 +281,7 @@ pub async fn scope_enforcement_middleware(
         // No SecurityContext means auth middleware didn't run or request is unauthenticated.
         // If the path matches a protected route, reject with 401 Unauthorized.
         // Otherwise, let it pass through for public/unprotected routes.
-        if state.rules.matches_protected_route(&path, method) {
+        if rules.matches_protected_route(&path, method) {
             tracing::warn!(
                 path = %path,
                 method = %method,
@@ -230,10 +302,7 @@ pub async fn scope_enforcement_middleware(
     };
 
     // Check scopes
-    if let Err(canonical) = state
-        .rules
-        .check(&path, method, security_context.token_scopes())
-    {
+    if let Err(canonical) = rules.check(&path, method, security_context.token_scopes()) {
         // `instance` / `trace_id` are filled by the canonical error
         // middleware (`toolkit::api::canonical_error_middleware`) on the
         // way out — this middleware sits inside its layer.
@@ -250,35 +319,35 @@ pub async fn scope_enforcement_middleware(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::config::RoutePolicyRule;
     use toolkit_canonical_errors::Problem;
 
-    fn build_config(enabled: bool, routes: Vec<(&str, Vec<&str>)>) -> RoutePoliciesConfig {
-        build_config_with_methods(
-            enabled,
-            routes.into_iter().map(|(p, s)| (p, None, s)).collect(),
-        )
+    /// Test GTS scope (any valid `&'static str`; not asserted on the wire).
+    const TEST_SCOPE: &str = "gts.cf.core.api_gateway.route.v1~";
+
+    fn rules(routes: Vec<(&str, Vec<&str>)>) -> Vec<ScopeRule> {
+        rules_with_methods(routes.into_iter().map(|(p, s)| (p, None, s)).collect())
     }
 
     type TestRoute<'a> = (&'a str, Option<&'a str>, Vec<&'a str>);
 
-    fn build_config_with_methods(enabled: bool, routes: Vec<TestRoute<'_>>) -> RoutePoliciesConfig {
-        let rules = routes
+    fn rules_with_methods(routes: Vec<TestRoute<'_>>) -> Vec<ScopeRule> {
+        routes
             .into_iter()
-            .map(|(path, method, scopes)| RoutePolicyRule {
+            .map(|(path, method, scopes)| ScopeRule {
                 path: path.to_owned(),
                 method: method.map(String::from),
                 required_scopes: scopes.into_iter().map(String::from).collect(),
             })
-            .collect();
+            .collect()
+    }
 
-        RoutePoliciesConfig { enabled, rules }
+    fn compiled(enabled: bool, routes: Vec<(&str, Vec<&str>)>) -> ScopeEnforcementRules {
+        ScopeEnforcementRules::from_rules(TEST_SCOPE, enabled, rules(routes)).unwrap()
     }
 
     #[test]
     fn disabled_enforcement_always_passes() {
-        let config = build_config(false, vec![("/admin/*", vec!["admin"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(false, vec![("/admin/*", vec!["admin"])]);
 
         // Even with no scopes, should pass when disabled
         assert!(rules.check("/admin/users", "GET", &[]).is_ok());
@@ -286,8 +355,7 @@ mod tests {
 
     #[test]
     fn first_party_app_always_passes() {
-        let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(true, vec![("/admin/*", vec!["admin"])]);
 
         // First-party apps have ["*"] scope
         let scopes = vec!["*".to_owned()];
@@ -296,8 +364,7 @@ mod tests {
 
     #[test]
     fn matching_scope_passes() {
-        let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(true, vec![("/admin/*", vec!["admin"])]);
 
         let scopes = vec!["admin".to_owned()];
         assert!(rules.check("/admin/users", "GET", &scopes).is_ok());
@@ -305,11 +372,10 @@ mod tests {
 
     #[test]
     fn any_of_required_scopes_passes() {
-        let config = build_config(
+        let rules = compiled(
             true,
             vec![("/events/v1/*", vec!["read:events", "write:events"])],
         );
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
 
         // Having just one of the required scopes should pass
         let scopes = vec!["read:events".to_owned()];
@@ -321,8 +387,7 @@ mod tests {
 
     #[test]
     fn missing_scope_returns_forbidden() {
-        let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(true, vec![("/admin/*", vec!["admin"])]);
 
         // No matching scope
         let scopes = vec!["read:events".to_owned()];
@@ -341,8 +406,7 @@ mod tests {
 
     #[test]
     fn empty_scopes_returns_forbidden() {
-        let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(true, vec![("/admin/*", vec!["admin"])]);
 
         // Empty scopes = no permissions (fail-closed)
         let result = rules.check("/admin/users", "GET", &[]);
@@ -359,8 +423,7 @@ mod tests {
 
     #[test]
     fn unmatched_route_passes() {
-        let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(true, vec![("/admin/*", vec!["admin"])]);
 
         // Route doesn't match any pattern, should pass even with unrelated scope
         let scopes = vec!["unrelated:scope".to_owned()];
@@ -369,8 +432,7 @@ mod tests {
 
     #[test]
     fn glob_single_star_matches_single_segment_only() {
-        let config = build_config(true, vec![("/api/*/items", vec!["api:read"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(true, vec![("/api/*/items", vec!["api:read"])]);
 
         let scopes = vec!["api:read".to_owned()];
 
@@ -389,8 +451,7 @@ mod tests {
 
     #[test]
     fn glob_double_star_matches_multiple_segments() {
-        let config = build_config(true, vec![("/api/**", vec!["api:access"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(true, vec![("/api/**", vec!["api:access"])]);
 
         let scopes = vec!["api:access".to_owned()];
 
@@ -406,15 +467,18 @@ mod tests {
 
     #[test]
     fn invalid_glob_pattern_returns_error() {
-        let config = build_config(true, vec![("/admin/[invalid", vec!["admin"])]);
-        let result = ScopeEnforcementRules::from_config(&config);
+        let result = ScopeEnforcementRules::from_rules(
+            TEST_SCOPE,
+            true,
+            rules(vec![("/admin/[invalid", vec!["admin"])]),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn empty_required_scopes_returns_error() {
-        let config = build_config(true, vec![("/admin/*", vec![])]);
-        let result = ScopeEnforcementRules::from_config(&config);
+        let result =
+            ScopeEnforcementRules::from_rules(TEST_SCOPE, true, rules(vec![("/admin/*", vec![])]));
         let err = result.expect_err("should fail with empty required_scopes");
         assert!(
             err.to_string().contains("empty required_scopes"),
@@ -425,14 +489,13 @@ mod tests {
     #[test]
     fn multiple_non_overlapping_rules() {
         // Non-overlapping patterns: each path matches exactly one rule
-        let config = build_config(
+        let rules = compiled(
             true,
             vec![
                 ("/admin/*", vec!["admin"]),
                 ("/events/**", vec!["events:read"]),
             ],
         );
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
 
         // Admin route needs admin scope
         let admin_scopes = vec!["admin".to_owned()];
@@ -461,14 +524,13 @@ mod tests {
     fn overlapping_rules_first_match_wins() {
         // Path /api/admin/users matches BOTH rules with DIFFERENT scope requirements.
         // First-match-wins: only the first matching rule is evaluated.
-        let config = build_config(
+        let rules = compiled(
             true,
             vec![
                 ("/api/**", vec!["basic"]), // Matches /api/admin/users, requires "basic"
                 ("/api/admin/**", vec!["admin"]), // Also matches, requires "admin" (never evaluated)
             ],
         );
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
 
         // /api/admin/users matches both rules, but first rule wins
         let basic_scopes = vec!["basic".to_owned()];
@@ -495,8 +557,7 @@ mod tests {
 
     #[test]
     fn matches_protected_route_returns_true_for_matching_path() {
-        let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(true, vec![("/admin/*", vec!["admin"])]);
 
         assert!(rules.matches_protected_route("/admin/users", "GET"));
         assert!(rules.matches_protected_route("/admin/settings", "POST"));
@@ -504,8 +565,7 @@ mod tests {
 
     #[test]
     fn matches_protected_route_returns_false_for_non_matching_path() {
-        let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(true, vec![("/admin/*", vec!["admin"])]);
 
         assert!(!rules.matches_protected_route("/public/health", "GET"));
         assert!(!rules.matches_protected_route("/api/v1/users", "GET"));
@@ -513,8 +573,7 @@ mod tests {
 
     #[test]
     fn matches_protected_route_returns_false_when_disabled() {
-        let config = build_config(false, vec![("/admin/*", vec!["admin"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = compiled(false, vec![("/admin/*", vec!["admin"])]);
 
         // Even matching paths return false when enforcement is disabled
         assert!(!rules.matches_protected_route("/admin/users", "GET"));
@@ -523,14 +582,13 @@ mod tests {
     #[test]
     fn first_match_wins_more_specific_rule_first() {
         // More specific rule declared first should take precedence
-        let config = build_config(
+        let rules = compiled(
             true,
             vec![
                 ("/api/admin/**", vec!["admin"]), // More specific, declared first
                 ("/api/**", vec!["basic"]),       // Broader, declared second
             ],
         );
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
 
         // /api/admin/users matches first rule, requires "admin"
         let admin_scopes = vec!["admin".to_owned()];
@@ -557,14 +615,13 @@ mod tests {
     #[test]
     fn first_match_wins_broader_rule_first() {
         // If broader rule is declared first, it takes precedence
-        let config = build_config(
+        let rules = compiled(
             true,
             vec![
                 ("/api/**", vec!["basic"]),       // Broader, declared first
                 ("/api/admin/**", vec!["admin"]), // More specific, declared second (never reached)
             ],
         );
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
 
         let basic_scopes = vec!["basic".to_owned()];
 
@@ -579,14 +636,15 @@ mod tests {
     #[test]
     fn method_matching_specific_method() {
         // Rule with specific method only matches that method
-        let config = build_config_with_methods(
+        let rules = ScopeEnforcementRules::from_rules(
+            TEST_SCOPE,
             true,
-            vec![
+            rules_with_methods(vec![
                 ("/users/*", Some("POST"), vec!["users:write"]),
                 ("/users/*", Some("GET"), vec!["users:read"]),
-            ],
-        );
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+            ]),
+        )
+        .unwrap();
 
         let read_scopes = vec!["users:read".to_owned()];
         let write_scopes = vec!["users:write".to_owned()];
@@ -608,8 +666,12 @@ mod tests {
     #[test]
     fn method_matching_any_method() {
         // Rule without method matches any method
-        let config = build_config_with_methods(true, vec![("/api/**", None, vec!["api:access"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = ScopeEnforcementRules::from_rules(
+            TEST_SCOPE,
+            true,
+            rules_with_methods(vec![("/api/**", None, vec!["api:access"])]),
+        )
+        .unwrap();
 
         let scopes = vec!["api:access".to_owned()];
 
@@ -623,9 +685,12 @@ mod tests {
     #[test]
     fn method_matching_case_insensitive() {
         // Method matching should be case-insensitive
-        let config =
-            build_config_with_methods(true, vec![("/api/**", Some("get"), vec!["api:read"])]);
-        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+        let rules = ScopeEnforcementRules::from_rules(
+            TEST_SCOPE,
+            true,
+            rules_with_methods(vec![("/api/**", Some("get"), vec!["api:read"])]),
+        )
+        .unwrap();
 
         let scopes = vec!["api:read".to_owned()];
 

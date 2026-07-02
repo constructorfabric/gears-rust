@@ -5,11 +5,28 @@ use axum::{
     body::{Body, to_bytes},
     routing::get,
 };
-use http::{Request as HttpRequest, StatusCode, header};
+use http::{Method, Request as HttpRequest, StatusCode, header};
 use toolkit_security::{
     InternalAuthNError, InternalAuthenticator, PlatformIdentity, SecurityContext,
 };
 use tower::ServiceExt;
+
+use crate::policy::{AuthRequirement, RouteAuthPolicy};
+
+/// Route policy stand-in returning a fixed [`AuthRequirement`] for every route.
+struct StubPolicy(AuthRequirement);
+
+impl RouteAuthPolicy for StubPolicy {
+    fn resolve(&self, _method: &Method, _path: &str) -> AuthRequirement {
+        self.0
+    }
+}
+
+/// Build tenant-plane middleware state for the given authenticator + requirement.
+fn secctx_state(requirement: AuthRequirement) -> SecurityContextLayerState<StubAuthenticator> {
+    let policy: Arc<dyn RouteAuthPolicy> = Arc::new(StubPolicy(requirement));
+    SecurityContextLayerState::new(Arc::new(StubAuthenticator), policy)
+}
 
 const GOOD_TOKEN: &str = "valid-token";
 const UNAVAILABLE_TOKEN: &str = "unavailable-token";
@@ -38,26 +55,21 @@ impl BearerAuthenticator for StubAuthenticator {
 }
 
 fn app(is_public: bool) -> Router {
-    let authenticator = Arc::new(StubAuthenticator);
-
-    // `security_context_middleware` runs as a `route_layer` (after routing); the
-    // `PublicRoute` marker is added as an outer router `layer` so it is
-    // present in the request extensions by the time the middleware reads it
-    // (this mirrors how the bootstrap layer surfaces `OperationSpec.is_public` per-route).
+    // The route policy decides whether `/` requires a JWT; a public route
+    // resolves to `AuthRequirement::None`, a protected one to `Required`.
+    let requirement = if is_public {
+        AuthRequirement::None
+    } else {
+        AuthRequirement::Required
+    };
     let secctx = axum::middleware::from_fn_with_state(
-        authenticator,
+        secctx_state(requirement),
         security_context_middleware::<StubAuthenticator>,
     );
 
-    let router = Router::new()
+    Router::new()
         .route("/", get(|| async { StatusCode::OK }))
-        .route_layer(secctx);
-
-    if is_public {
-        router.layer(axum::Extension(PublicRoute))
-    } else {
-        router
-    }
+        .route_layer(secctx)
 }
 
 /// Drive a request through `router` and return `(status, content_type)`.
@@ -121,10 +133,9 @@ fn platform_app() -> Router {
 /// Stacked app: `internal_auth_middleware` (outermost, runs first) then
 /// `security_context_middleware`, mirroring the DESIGN § 3.2 middleware order.
 fn stacked_app() -> Router {
-    let bearer = Arc::new(StubAuthenticator);
     let internal = Arc::new(StubInternalAuthenticator);
     let secctx = axum::middleware::from_fn_with_state(
-        bearer,
+        secctx_state(AuthRequirement::Required),
         security_context_middleware::<StubAuthenticator>,
     );
     let internal_layer = axum::middleware::from_fn_with_state(
@@ -138,10 +149,9 @@ fn stacked_app() -> Router {
 }
 
 fn stacked_public_app() -> Router {
-    let bearer = Arc::new(StubAuthenticator);
     let internal = Arc::new(StubInternalAuthenticator);
     let secctx = axum::middleware::from_fn_with_state(
-        bearer,
+        secctx_state(AuthRequirement::None),
         security_context_middleware::<StubAuthenticator>,
     );
     let internal_layer = axum::middleware::from_fn_with_state(
@@ -152,7 +162,6 @@ fn stacked_public_app() -> Router {
         .route("/", get(|| async { StatusCode::OK }))
         .route_layer(secctx)
         .route_layer(internal_layer)
-        .layer(axum::Extension(PublicRoute))
 }
 
 /// Drive a request with arbitrary headers through `router`, returning
@@ -229,9 +238,59 @@ async fn public_route_without_auth_passes_through() {
 }
 
 #[tokio::test]
-async fn public_route_revalidates_present_token() {
+async fn public_route_ignores_present_token() {
+    // Converged (gateway) behaviour: a `None` route is never authenticated, so
+    // even a forged token is ignored and the request passes through with an
+    // anonymous `SecurityContext`.
     let (status, _) = send(app(true), Some("Bearer forged-token")).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Build a `Required`-policy app whose CORS-preflight bypass is toggled.
+fn preflight_app(bypass: bool) -> Router {
+    let policy: Arc<dyn RouteAuthPolicy> = Arc::new(StubPolicy(AuthRequirement::Required));
+    let mut state = SecurityContextLayerState::new(Arc::new(StubAuthenticator), policy);
+    if bypass {
+        state = state.with_cors_preflight_bypass();
+    }
+    let secctx = axum::middleware::from_fn_with_state(
+        state,
+        security_context_middleware::<StubAuthenticator>,
+    );
+    Router::new()
+        .route(
+            "/",
+            get(|| async { StatusCode::OK }).options(|| async { StatusCode::OK }),
+        )
+        .route_layer(secctx)
+}
+
+/// Drive a CORS preflight (`OPTIONS` + `Origin` + `Access-Control-Request-Method`).
+async fn send_preflight(router: Router) -> StatusCode {
+    let request = HttpRequest::builder()
+        .method(Method::OPTIONS)
+        .uri("/")
+        .header(header::ORIGIN, "https://example.com")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .body(Body::empty())
+        .unwrap();
+    router.oneshot(request).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn cors_preflight_bypasses_auth_when_enabled() {
+    // Edge/gateway behaviour: preflight skips auth and reaches the handler.
+    assert_eq!(send_preflight(preflight_app(true)).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cors_preflight_enforced_by_default() {
+    // Default (OoP gears): CORS bypass is edge-only, so a preflight to a
+    // `Required` route with no token is rejected like any other request.
+    assert_eq!(
+        send_preflight(preflight_app(false)).await,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -324,14 +383,93 @@ async fn invalid_internal_token_rejected_before_tenant_plane() {
 
 #[tokio::test]
 async fn system_call_to_public_endpoint_passes() {
-    // Valid SA token, no JWT, route is PublicRoute — the normal probe/platform path.
+    // Valid SA token, no JWT, public route — the normal probe/platform path.
     let (status, _, _) = send_headers(stacked_public_app(), &[(INTERNAL_HEADER, SA_GOOD)]).await;
     assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn public_endpoint_with_no_credentials_passes() {
-    // No SA token and no JWT on a PublicRoute: passes (health probe).
+    // No SA token and no JWT on a public route: passes (health probe).
     let (status, _, _) = send_headers(stacked_public_app(), &[]).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// App driven by the real [`MatchitRouteAuthPolicy`] (the tests above use a
+/// fixed `StubPolicy`; these exercise per-route matching): `/public` is
+/// explicitly public, `/protected` explicitly authenticated, and `/other` is
+/// unmatched (governed by `require_auth_by_default`).
+fn matchit_policy_app(require_auth_by_default: bool) -> Router {
+    let authenticated: std::collections::HashSet<(Method, String)> =
+        [(Method::GET, "/protected".to_owned())]
+            .into_iter()
+            .collect();
+    let public: std::collections::HashSet<(Method, String)> =
+        [(Method::GET, "/public".to_owned())].into_iter().collect();
+    let policy: Arc<dyn RouteAuthPolicy> = Arc::new(
+        crate::MatchitRouteAuthPolicy::from_route_sets(
+            authenticated,
+            public,
+            require_auth_by_default,
+        )
+        .expect("valid route patterns"),
+    );
+    let secctx = axum::middleware::from_fn_with_state(
+        SecurityContextLayerState::new(Arc::new(StubAuthenticator), policy),
+        security_context_middleware::<StubAuthenticator>,
+    );
+    Router::new()
+        .route("/public", get(|| async { StatusCode::OK }))
+        .route("/protected", get(|| async { StatusCode::OK }))
+        .route("/other", get(|| async { StatusCode::OK }))
+        .route_layer(secctx)
+}
+
+/// Drive a `GET path` through `router` and return the response status.
+async fn get_status(router: Router, path: &str, auth: Option<&str>) -> StatusCode {
+    let mut builder = HttpRequest::builder().uri(path).method(Method::GET);
+    if let Some(value) = auth {
+        builder = builder.header(header::AUTHORIZATION, value);
+    }
+    let request = builder.body(Body::empty()).unwrap();
+    router.oneshot(request).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn matchit_policy_public_route_passes_without_token() {
+    assert_eq!(
+        get_status(matchit_policy_app(true), "/public", None).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn matchit_policy_protected_route_rejects_without_token() {
+    assert_eq!(
+        get_status(matchit_policy_app(false), "/protected", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn matchit_policy_protected_route_accepts_valid_token() {
+    let bearer = format!("Bearer {GOOD_TOKEN}");
+    assert_eq!(
+        get_status(matchit_policy_app(false), "/protected", Some(&bearer)).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn matchit_policy_unmatched_route_follows_require_auth_by_default() {
+    // require_auth_by_default = true → unmatched `/other` needs a token.
+    assert_eq!(
+        get_status(matchit_policy_app(true), "/other", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // require_auth_by_default = false → unmatched `/other` passes anonymously.
+    assert_eq!(
+        get_status(matchit_policy_app(false), "/other", None).await,
+        StatusCode::OK
+    );
 }

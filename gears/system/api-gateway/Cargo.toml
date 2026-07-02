@@ -21,6 +21,7 @@ workspace = true
 [dependencies]
 toolkit = { workspace = true }
 toolkit-http = { workspace = true }
+toolkit-http-middleware = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.18", path = "../authn-resolver/authn-resolver-sdk" }
@@ -37,26 +38,21 @@ parking_lot = { workspace = true }
 
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
-nanoid = { workspace = true }
 
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
-matchit = { workspace = true }
-governor = { workspace = true }
-glob = { workspace = true }
 
-opentelemetry = { workspace = true }
 chrono = { workspace = true }
 
 utoipa = { workspace = true }
 http = { workspace = true }
-http-body = { workspace = true }
-bytes = { workspace = true }
 rust-embed = { workspace = true }
 
 [dev-dependencies]
 futures-core = { workspace = true }
+bytes = { workspace = true }
+opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

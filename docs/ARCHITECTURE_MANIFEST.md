@@ -141,7 +141,7 @@ This produces one recognizable API dialect across gears:
 - Shared pagination/filter/order conventions
 - OData-style filtering for collection resources where applicable
 - Consistent auth, rate-limit, timeout, and observability behavior at the gateway
-- [x] Rate limiting — governor-based rate limiter with policy headers and inflight semaphores is implemented in the API Gateway middleware stack (`gears/system/api-gateway/src/middleware/rate_limit.rs`). OAGW has a separate rate-limiting implementation for outbound traffic.
+- [x] Rate limiting — governor-based rate limiter with policy headers and inflight semaphores is implemented in the shared HTTP middleware crate (`libs/toolkit-http-middleware/src/rate_limit.rs`) and installed by the API Gateway. OAGW has a separate rate-limiting implementation for outbound traffic.
 - [~] License posture declaration — OperationBuilder declaration and base-license gate implemented; per-feature entitlement validation against license resolver pending.
 
 **Why.** Consumers, SDK authors, tests, docs, and gateway behavior all stay predictable. A gear does not invent its own filtering language, pagination rules, or error envelope, so cross-gear tooling and client generation remain feasible.

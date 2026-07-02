@@ -18,9 +18,7 @@ use toolkit::api::OperationSpec;
 use toolkit_canonical_errors::Problem;
 use tower::ServiceExt; // for oneshot
 
-use api_gateway::middleware::mime_validation::{
-    build_mime_validation_map, mime_validation_middleware,
-};
+use api_gateway::middleware::{build_mime_validation_map, mime_validation_middleware};
 use toolkit::api::operation_builder::VendorExtensions;
 
 const INVALID_ARGUMENT_TYPE: &str =
@@ -72,12 +70,9 @@ async fn test_middleware_allows_configured_content_type() {
 
     let validation_map = build_mime_validation_map(&specs);
 
-    let app =
-        Router::new()
-            .route("/api/data", post(test_handler))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                mime_validation_middleware(validation_map.clone(), req, next)
-            }));
+    let app = Router::new().route("/api/data", post(test_handler)).layer(
+        axum::middleware::from_fn_with_state(validation_map, mime_validation_middleware),
+    );
 
     // Test: Send request with allowed content type
     let request = Request::builder()
@@ -117,12 +112,9 @@ async fn test_middleware_strips_content_type_parameters() {
 
     let validation_map = build_mime_validation_map(&specs);
 
-    let app =
-        Router::new()
-            .route("/api/data", post(test_handler))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                mime_validation_middleware(validation_map.clone(), req, next)
-            }));
+    let app = Router::new().route("/api/data", post(test_handler)).layer(
+        axum::middleware::from_fn_with_state(validation_map, mime_validation_middleware),
+    );
 
     // Test: Send request with charset parameter
     let request = Request::builder()
@@ -162,12 +154,9 @@ async fn test_middleware_rejects_disallowed_content_type() {
 
     let validation_map = build_mime_validation_map(&specs);
 
-    let app =
-        Router::new()
-            .route("/api/data", post(test_handler))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                mime_validation_middleware(validation_map.clone(), req, next)
-            }));
+    let app = Router::new().route("/api/data", post(test_handler)).layer(
+        axum::middleware::from_fn_with_state(validation_map, mime_validation_middleware),
+    );
 
     // Test: Send request with disallowed content type
     let request = Request::builder()
@@ -225,9 +214,10 @@ async fn test_middleware_rejects_missing_content_type() {
 
     let app = Router::new()
         .route("/files/v1/upload", post(test_handler))
-        .layer(axum::middleware::from_fn(move |req, next| {
-            mime_validation_middleware(validation_map.clone(), req, next)
-        }));
+        .layer(axum::middleware::from_fn_with_state(
+            validation_map,
+            mime_validation_middleware,
+        ));
 
     // Test: Send request without content-type header
     let request = Request::builder()
@@ -271,9 +261,10 @@ async fn test_middleware_passes_through_unconfigured_routes() {
     // Apply middleware AFTER routing (like in real usage)
     let app = Router::new()
         .route("/tests/v1/public", post(test_handler))
-        .layer(axum::middleware::from_fn(move |req, next| {
-            mime_validation_middleware(validation_map.clone(), req, next)
-        }));
+        .layer(axum::middleware::from_fn_with_state(
+            validation_map,
+            mime_validation_middleware,
+        ));
 
     // Test: Send request with JSON body (even without content-type, should work if no validation)
     let request = Request::builder()
@@ -319,9 +310,10 @@ async fn test_middleware_allows_multiple_content_types() {
 
     let app = Router::new()
         .route("/tests/v1/flexible", post(test_handler))
-        .layer(axum::middleware::from_fn(move |req, next| {
-            mime_validation_middleware(validation_map.clone(), req, next)
-        }));
+        .layer(axum::middleware::from_fn_with_state(
+            validation_map,
+            mime_validation_middleware,
+        ));
 
     // Test: application/json should work
     let request = Request::builder()

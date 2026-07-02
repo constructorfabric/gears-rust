@@ -232,6 +232,7 @@ verbose_file_reads = "deny"
 # libs
 toolkit = { package = "cf-gears-toolkit", version = "0.6.13", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.8", path = "libs/toolkit-http" }
+toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.1.0", path = "libs/toolkit-http-middleware" }
 toolkit-auth = { package = "cf-gears-toolkit-auth", version = "0.7.2", path = "libs/toolkit-auth" }
 toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "0.7.4", path = "libs/toolkit-canonical-errors" }
 toolkit-canonical-errors-macro = { package = "cf-gears-toolkit-canonical-errors-macro", version = "0.6.1", path = "libs/toolkit-canonical-errors-macro" }

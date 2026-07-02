@@ -11,7 +11,7 @@ use axum::{
 use serde_json::json;
 use tower::util::ServiceExt; // for `oneshot`
 
-use api_gateway::middleware::request_id::{MakeReqId, XRequestId, header};
+use toolkit_http_middleware::request_id::{MakeReqId, XRequestId, header};
 
 #[tokio::test]
 async fn generates_request_id_when_missing() {
@@ -107,7 +107,7 @@ fn test_app() -> Router {
     Router::new()
         .merge(routes)
         .layer(from_fn(
-            api_gateway::middleware::request_id::push_req_id_to_extensions,
+            toolkit_http_middleware::request_id::push_req_id_to_extensions,
         ))
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
         .layer(SetRequestIdLayer::new(x_request_id, MakeReqId))

@@ -14,7 +14,8 @@ use axum::{body::Body, extract::ConnectInfo, middleware::Next, response::Respons
 use bytes::Bytes;
 use http_body::Frame;
 
-use super::request_id::XRequestId;
+use crate::common::{TRACEPARENT, parse_trace_id};
+use crate::request_id::XRequestId;
 
 /// Middleware that emits a structured access log line for every HTTP request.
 ///
@@ -57,9 +58,9 @@ pub async fn access_log_middleware(req: axum::extract::Request, next: Next) -> R
 
     let trace_id = req
         .headers()
-        .get(toolkit_http::otel::TRACEPARENT)
+        .get(TRACEPARENT)
         .and_then(|v| v.to_str().ok())
-        .and_then(toolkit_http::otel::parse_trace_id)
+        .and_then(parse_trace_id)
         .unwrap_or_default();
 
     let (remote_addr, remote_addr_ip, remote_addr_port) = req

@@ -1,15 +1,25 @@
+//! `X-Request-Id` generation and propagation.
+//!
+//! [`MakeReqId`] generates a fresh id for requests that arrive without one;
+//! [`push_req_id_to_extensions`] copies the (incoming or generated) id into
+//! request extensions as [`XRequestId`] so handlers can read it, and records it
+//! on the current tracing span.
+
 use axum::http::{HeaderName, Request};
 use axum::{body::Body, middleware::Next, response::Response};
 use tower_http::request_id::{MakeRequestId, RequestId};
 
+/// The request id carried in request extensions for handler access.
 #[derive(Clone, Debug)]
 pub struct XRequestId(pub String);
 
+/// The `x-request-id` header name.
 #[must_use]
 pub fn header() -> HeaderName {
     HeaderName::from_static("x-request-id")
 }
 
+/// [`MakeRequestId`] implementation that mints a fresh id per request.
 #[derive(Clone, Default)]
 pub struct MakeReqId;
 
