@@ -298,6 +298,20 @@ gears:
       vendor: "constructorfabric"
       priority: 100
 
+  file-storage:
+    # file-storage is compiled into the shared e2e example-server (via
+    # config/e2e-features.txt) and initializes on every boot, so every e2e
+    # config that runs this binary must configure its database — even suites
+    # like this RG+AuthZ chain that do not exercise file-storage themselves.
+    database:
+      server: "sqlite_users"
+      file: "file_storage.db"
+    config:
+      sidecar_base_url: "http://localhost:8099"
+      storage_root: "./.file-storage-data"
+      # Fixed Ed25519 seed (32-byte base64url) for deterministic signed URLs.
+      signing_key_seed: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
   account-management:
     database:
       server: "sqlite_users"
