@@ -14,6 +14,13 @@ decision-makers: gears-rust admin-panel working group
 >
 > **Open (pending reviewer):** the metadata transport — a config file, `x-cf-admin-*` OpenAPI vendor extensions emitted per-gear via `OperationBuilder` (leaning; keeps metadata next to the API), or a dedicated descriptor endpoint. The descriptor shape defined for the v0 registry is already forward-compatible with all three. No-regret work (runtime OpenAPI discovery + registry shrink) proceeds now regardless of the chosen transport.
 
+> **Revision (2026-07-02) — transport resolved by splitting metadata by concern.**
+> Re-examining what the aggregated `/cf/openapi.json` actually expresses closed the "open" question above without a new backend mechanism. Discovery is split by the *nature* of each fact:
+> 1. **API-intrinsic facts → derived from OpenAPI.** Field names/types/`required`/`readOnly` (component schemas), CRUD verb mapping, **custom actions** (e.g. `POST …/suspend`, `…/unsuspend` are first-class operations), and **tenant-scope** (the `{tenant_id}` path parameter marks a tenant-scoped route) are all present in the spec and read at runtime.
+> 2. **Presentation-only facts → a small panel-side config.** List columns, labels, grouping/ordering, confirm/safety level, action button labels, and irregular-list hints (e.g. tenants list via `/children`, conversion state via `PATCH {status}`) are *UX concerns, not API contract*. Encoding them in OpenAPI vendor extensions would leak presentation into the API layer, so they live in a panel-side config instead — the equivalent of Django's `admin.py` registration, **not** copied panel code.
+>
+> **Consequence:** the SPA becomes fully generic — **no per-project TypeScript and no framework changes.** The hardcoded in-app `registry.ts` is dropped: its API-intrinsic content comes from the spec, its presentation content moves to config. The `x-cf-admin-*` vendor-extension idea (Option-B transport) is **not required** and is retained only as a later optimization should a genuinely API-intrinsic fact appear that the spec cannot yet carry. This supersedes the "leaning toward vendor extensions" note above. Distribution (pre-built artifact + thin Rust loader, later extracted to a dedicated `constructorfabric/` repo) is tracked separately in [ADR-0001](0001-cpt-admin-panel-adr-placement-and-delivery.md).
+
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)
