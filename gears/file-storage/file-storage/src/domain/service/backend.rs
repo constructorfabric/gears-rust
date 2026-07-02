@@ -1,4 +1,4 @@
-//! Backend migration and backend discovery endpoints.
+//! Backend migration, backend discovery, and `DataPlanePort` implementation.
 
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -6,13 +6,15 @@ use uuid::Uuid;
 use crate::domain::audit::AuditOperation;
 use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
+use crate::domain::ports::DataPlanePort;
 use crate::domain::service::FileService;
 use crate::infra::backend::BackendCapabilities;
+use crate::infra::backend::BackendRegistry;
 use crate::infra::storage::Store;
 
-impl FileService {
-    // ── backend migration (P2-M4) ─────────────────────────────────────────────
+// ── backend migration (P2-M4) ──────────────────────────────────────────────────
 
+impl FileService {
     /// Relocate a non-versioned file's content from one backend to another
     /// without changing its identity (`file_id`, ownership, metadata, content
     /// hash).
@@ -126,5 +128,41 @@ impl FileService {
     pub fn get_backend(&self, id: &str) -> Result<(String, BackendCapabilities), DomainError> {
         let b = self.backends.get(id)?;
         Ok((b.id().to_owned(), b.capabilities()))
+    }
+}
+
+// ── DataPlanePort implementation ──────────────────────────────────────────────
+
+#[async_trait::async_trait]
+impl DataPlanePort for FileService {
+    fn backends(&self) -> &BackendRegistry {
+        &self.backends
+    }
+
+    async fn authorize_write(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+    ) -> Result<(), DomainError> {
+        FileService::authorize_write(self, ctx, file_id).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<file_storage_sdk::FileVersion>, DomainError> {
+        FileService::get_version(self, file_id, version_id).await
+    }
+
+    async fn finalize_upload(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        size: i64,
+        hash_value: Vec<u8>,
+    ) -> Result<(), DomainError> {
+        FileService::finalize_upload(self, ctx, file_id, version_id, size, hash_value).await
     }
 }

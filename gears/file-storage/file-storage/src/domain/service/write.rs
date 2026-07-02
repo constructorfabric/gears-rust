@@ -1,10 +1,12 @@
-//! Upload finalization, authorization preflight, and the bind CAS.
+//! Write-path operations: finalize upload, bind (CAS), metadata update, and ownership transfer.
+
+use std::collections::HashMap;
 
 use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use file_storage_sdk::File;
+use file_storage_sdk::{CustomMetadataPatch, File};
 
 use crate::domain::audit::AuditOperation;
 use crate::domain::authz::actions;
@@ -12,6 +14,7 @@ use crate::domain::error::DomainError;
 use crate::domain::etag;
 use crate::domain::policy::PolicyResolver;
 use crate::domain::service::{FileService, VersionRef};
+use crate::infra::external_clients::UsageDelta;
 use crate::infra::signed_url::{Op, UploadConstraints};
 
 impl FileService {
@@ -205,7 +208,7 @@ impl FileService {
     }
 
     /// Issue a signed download URL for a version (shared helper used by
-    /// `versioning.rs`). Visibility is `pub(super)` so only sibling modules use it.
+    /// `read_ops.rs`). Visibility is `pub(super)` so only sibling modules use it.
     pub(super) fn build_download_url(
         &self,
         file_id: Uuid,
@@ -223,5 +226,187 @@ impl FileService {
             },
             UploadConstraints::default(),
         )
+    }
+
+    // ── metadata update ────────────────────────────────────────────────────────
+
+    /// `PATCH /files/{id}`: JSON-merge-patch the custom metadata and bump
+    /// `meta_version`, optionally guarded by `If-Match-Metadata`.
+    ///
+    /// @cpt-cf-file-storage-fr-audit-trail
+    pub async fn update_metadata(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        patch: CustomMetadataPatch,
+        expected_meta_version: Option<i64>,
+    ) -> Result<File, DomainError> {
+        let prefetch = Self::tenant_scope(ctx);
+        let file = self.store.require_file(&prefetch, file_id).await?;
+        let scope = self
+            .authorizer
+            .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
+            .await?;
+
+        // @cpt-cf-file-storage-fr-metadata-limits
+        // Compute what the resulting metadata will look like after this patch,
+        // then validate against the effective policy.
+        let policy = self
+            .get_effective_policy_internal(ctx.subject_tenant_id(), file.owner_id)
+            .await?;
+        let existing = self.store.list_metadata(file_id).await?;
+        // Build a map from existing entries and apply the patch (merge semantics).
+        let mut merged: HashMap<String, String> =
+            existing.into_iter().map(|e| (e.key, e.value)).collect();
+        for (key, value) in &patch.entries {
+            match value {
+                Some(v) => {
+                    merged.insert(key.clone(), v.clone());
+                }
+                None => {
+                    merged.remove(key);
+                }
+            }
+        }
+        let result_pairs: Vec<(String, String)> = merged.into_iter().collect();
+        PolicyResolver::check_metadata_limits(&policy, &result_pairs)?;
+
+        // @cpt-cf-file-storage-fr-audit-trail
+        let audit = Self::audit_ok(
+            ctx,
+            Some(file_id),
+            AuditOperation::PatchMetadata,
+            serde_json::json!({ "expected_meta_version": expected_meta_version }),
+        );
+
+        // Apply the meta-version CAS and the patch in ONE transaction. The CAS
+        // runs first, so a stale `expected_meta_version` aborts before any row
+        // is touched and the rollback guarantees no partial metadata change is
+        // committed (the optimistic-concurrency guard cannot be bypassed). The
+        // per-key delete-then-insert upsert is also covered by the rollback, so
+        // a failed insert can never leave a key permanently removed.
+        let now = OffsetDateTime::now_utc();
+        let bumped = self
+            .store
+            .patch_metadata_atomic(&scope, file_id, expected_meta_version, patch, now, audit)
+            .await?;
+        if !bumped {
+            return Err(DomainError::precondition_failed(
+                "metadata revision changed concurrently (If-Match-Metadata)",
+            ));
+        }
+        self.store.require_file(&scope, file_id).await
+    }
+
+    // ── ownership transfer (P2-M5) ────────────────────────────────────────────
+
+    /// `POST /files/{id}/transfer`: transfer ownership of a file to a new owner.
+    ///
+    /// The new owner's `owner_kind` and `owner_id` replace the current values.
+    /// An audit row (`TransferOwnership`) and a file event (`file.owner_transferred`)
+    /// are enqueued in the same transaction as the update.
+    ///
+    /// @cpt-cf-file-storage-fr-ownership-transfer
+    /// @cpt-cf-file-storage-fr-usage-reporting
+    /// @cpt-cf-file-storage-fr-file-events
+    /// @cpt-cf-file-storage-fr-audit-trail
+    pub async fn transfer_ownership(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        new_owner_kind: file_storage_sdk::OwnerKind,
+        new_owner_id: Uuid,
+    ) -> Result<File, DomainError> {
+        let prefetch = Self::tenant_scope(ctx);
+        let file = self.store.require_file(&prefetch, file_id).await?;
+        let scope = self
+            .authorizer
+            .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
+            .await?;
+
+        let now = OffsetDateTime::now_utc();
+        let tenant_id = file.tenant_id;
+        let old_owner_id = file.owner_id;
+        let new_owner_kind_str = new_owner_kind.as_str().to_owned();
+
+        // @cpt-cf-file-storage-fr-audit-trail
+        let audit = Self::audit_ok(
+            ctx,
+            Some(file_id),
+            AuditOperation::TransferOwnership,
+            serde_json::json!({
+                "from_owner_kind": file.owner_kind.as_str(),
+                "from_owner_id": old_owner_id,
+                "to_owner_kind": new_owner_kind_str,
+                "to_owner_id": new_owner_id,
+            }),
+        );
+
+        // @cpt-cf-file-storage-fr-file-events
+        let event = Some(Self::make_file_event(
+            tenant_id,
+            new_owner_id,
+            file_id,
+            "file.owner_transferred",
+            serde_json::json!({
+                "from_owner_kind": file.owner_kind.as_str(),
+                "from_owner_id": old_owner_id,
+                "to_owner_kind": new_owner_kind_str,
+                "to_owner_id": new_owner_id,
+            }),
+        ));
+
+        let updated = self
+            .store
+            .transfer_ownership_atomic(
+                &scope,
+                file_id,
+                &new_owner_kind_str,
+                new_owner_id,
+                now,
+                audit,
+                event,
+            )
+            .await?;
+
+        if !updated {
+            return Err(DomainError::file_not_found(file_id));
+        }
+
+        // @cpt-cf-file-storage-fr-usage-reporting
+        // Debit old owner, credit new owner. Bytes are unchanged.
+        let total_bytes: i64 = self
+            .store
+            .list_versions(file_id)
+            .await?
+            .iter()
+            .filter(|v| v.status == file_storage_sdk::VersionStatus::Available)
+            .map(|v| v.size)
+            .sum();
+        self.report_usage(UsageDelta {
+            tenant_id,
+            owner_id: old_owner_id,
+            bytes_delta: -total_bytes,
+            file_count_delta: -1,
+        });
+        self.report_usage(UsageDelta {
+            tenant_id,
+            owner_id: new_owner_id,
+            bytes_delta: total_bytes,
+            file_count_delta: 1,
+        });
+
+        self.store.require_file(&scope, file_id).await
+    }
+
+    /// Delete a backend blob, logging (not failing) on error. A failed delete
+    /// degrades to an orphan reconciled by the P2 cleanup engine.
+    pub(super) async fn best_effort_blob_delete(&self, backend_id: &str, path: &str) {
+        let Ok(backend) = self.backends.get(backend_id) else {
+            return;
+        };
+        if let Err(err) = backend.delete(path).await {
+            tracing::warn!(?err, path, "best-effort backend delete failed");
+        }
     }
 }

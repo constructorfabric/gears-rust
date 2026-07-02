@@ -7,37 +7,18 @@
 //! Content bytes never flow through this service — they move via
 //! [`crate::domain::data_plane::DataPlaneService`].
 //!
-//! ## Accepted Henry-Kafura hub (do not fragment further)
-//!
-//! This is a **top-level orchestrator**: high fan-out is its job — every core
-//! file flow legitimately coordinates persistence ([`Store`]), byte storage
-//! (backends), URL signing, authorization, external-service clients (quota,
-//! usage), events, and the policy/etag domain rules. Its fan-in is fixed at
-//! three control-plane entry points (REST handlers, route registration, and
-//! gear wiring); the data plane accesses it through the narrow [`DataPlanePort`]
-//! ISP port, so it carries no fan-in edge to this file.
-//!
-//! The self-contained bounded contexts have already been extracted into their
-//! own service types — see [`crate::domain::multipart_service::MultipartService`].
-//! Extracting *more* does not lower total coupling: each new service still
-//! depends on the shared [`Store`] facade, which merely moves the Henry-Kafura
-//! mass onto `store.rs` (its fan-in grows by one per service). The remaining
-//! core is irreducible by the metric's own definition of a legitimate hub, so it
-//! is deliberately left whole rather than split into artificial micro-services.
-//!
 //! ## Module layout (path-split to stay ≤ 600 SLOC per file)
 //!
 //! The impl block is spread across sibling files; shared types and the struct
 //! definition live here:
-//! - `create.rs`    — create_file + presign_version
-//! - `finalize.rs`  — authorize_write + finalize_upload + bind
-//! - `read.rs`      — get_file, get_file_with_metadata, list_files
-//! - `update.rs`    — update_metadata
-//! - `delete.rs`    — delete_file + delete_file_inner + delete_version
-//! - `versioning.rs`— download_url + list_versions + restore_version
-//! - `transfer.rs`  — transfer_ownership + best_effort_blob_delete
-//! - `migration.rs` — migrate_backend + list_backends + get_backend
-//! - `data_plane_port.rs` — DataPlanePort trait impl
+//! - `create.rs`   — create_file, presign_version, policy/quota helpers
+//! - `write.rs`    — authorize_write, finalize_upload, bind, update_metadata,
+//!   transfer_ownership, best_effort_blob_delete
+//! - `read_ops.rs` — get_file, get_file_with_metadata, list_files, get_version,
+//!   download_url, list_versions, restore_version,
+//!   delete_file, delete_file_inner, delete_version
+//! - `backend.rs`  — migrate_backend, list_backends, get_backend,
+//!   DataPlanePort trait impl
 
 // Domain terms (ETag, If-Match, FileStorage, GET/PUT) recur throughout the docs.
 #![allow(clippy::doc_markdown)]
@@ -56,15 +37,10 @@ use crate::infra::external_clients::{QuotaClient, UsageDelta, UsageReporter};
 use crate::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 use crate::infra::storage::Store;
 
+mod backend;
 mod create;
-mod data_plane_port;
-mod delete;
-mod finalize;
-mod migration;
-mod read;
-mod transfer;
-mod update;
-mod versioning;
+mod read_ops;
+mod write;
 
 /// Service-level configuration distilled from [`crate::config::FileStorageConfig`].
 #[allow(unknown_lints, de0309_must_have_domain_model)]
