@@ -80,6 +80,7 @@ Explicit pub/sub messaging is excluded. The event broker gear provides reliable 
 | `cpt-cf-clst-adr-capability-typing-and-profile-resolution` (ADR-007) | Per-primitive capability typing — `*Capability` enums replace bundled `CapabilityClass`; consequences: `ClusterProfile` typed marker, fluent resolver, capability-mismatch fails startup |
 | `cpt-cf-clst-adr-sd-state-is-intent-not-health` (ADR-008) | Service discovery: `state` is gear-declared serving intent (`Enabled`/`Disabled`), NOT a health observation; cluster does not own liveness probing |
 | `cpt-cf-clst-adr-leader-election-backend-safety` (ADR-009) | Per-backend correctness analysis for SDK-default leader election (and lock) under failure; constructor pair `new` (rejects `EventuallyConsistent`) + `new_allow_weak_consistency` (opt-in with warning); promotes the r2 deep-dive to decision-of-record |
+| `cpt-cf-clst-adr-cache-scan-prefix-for-polyfill` (ADR-010) | Cache `scan_prefix` enumeration added to the frozen cache contract so the SDK `PollingPrefixWatch` polyfill can enumerate keys under a prefix without a native prefix-watch backend |
 
 #### NFR Allocation
 
@@ -90,6 +91,57 @@ Explicit pub/sub messaging is excluded. The event broker gear provides reliable 
 | No serde in contract types | SDK crate | Dylint layer rules enforce no serde in trait definitions | `make check` (dylint lints) |
 | Watch event delivery — at-most-once with per-key ordering and lifecycle signals | All backends | Union-type events (`*WatchEvent`) carry `Lagged{dropped}`, `Reset`, `Closed(err)` so consumers recover from missed events explicitly | Smoke tests across all three watches verifying each variant is observable |
 | Backend trait dyn-compatibility | SDK crate | Compile-time assertions (`fn _assert_dyn_compat(_: Arc<dyn _Backend>) {}`) per trait | Build fails if dyn-compat is broken |
+
+#### Functional Requirements Coverage
+
+Each functional requirement from the PRD maps to the SDK surface and design section that satisfies it.
+
+| Requirement | Design Response |
+|-------------|-----------------|
+| `cpt-cf-clst-fr-cache-storage` | `ClusterCacheV1` facade over `ClusterCacheBackend`; versioned key-value entries (§3.2, §3.3) |
+| `cpt-cf-clst-fr-cache-atomic` | Version-based compare-and-set on `ClusterCacheBackend` (§2.1 CAS-as-universal, §3.3) |
+| `cpt-cf-clst-fr-cache-ttl` | TTL-bounded entries with backend-side expiry (§3.3 `ClusterCacheV1`) |
+| `cpt-cf-clst-fr-cache-watch` | Key- and prefix-scoped `CacheWatchEvent` stream (§3.9 Watch Event Shape) |
+| `cpt-cf-clst-fr-leader-elect` | `LeaderElectionV1` with single-leader guarantee bound to `Linearizable` cache (§3.3, §3.10) |
+| `cpt-cf-clst-fr-leader-config` | Configurable lease/renew timing on the leader resolver (§3.3, §3.7) |
+| `cpt-cf-clst-fr-leader-observability` | Watch-based `LeaderWatchEvent` status model (§3.9) |
+| `cpt-cf-clst-fr-leader-resign` | Graceful step-down on handle drop / shutdown sequence (§3.13 Shutdown Sequence) |
+| `cpt-cf-clst-fr-leader-advisory` | Advisory semantics documented on the facade contract (§3.3, §4.1) |
+| `cpt-cf-clst-fr-lock-acquire` | `DistributedLockV1` acquire-or-fail and acquire-with-wait (§3.3) |
+| `cpt-cf-clst-fr-lock-release` | Explicit async release with TTL safety net; no-op `Drop` (§2.2 no-remote-in-critical-section, §3.3) |
+| `cpt-cf-clst-fr-lock-no-remote` | Dylint rule forbidding remote I/O inside lock critical sections (§2.2, §3.10) |
+| `cpt-cf-clst-fr-sd-register` | `ServiceDiscoveryV1` instance registration with metadata (§3.3) |
+| `cpt-cf-clst-fr-sd-discover` | State- and metadata-filtered instance listing (§3.3) |
+| `cpt-cf-clst-fr-sd-watch` | Topology `ServiceDiscoveryWatchEvent` with lifecycle signals (§3.9) |
+| `cpt-cf-clst-fr-sd-state` | Gear-declared serving intent (`Enabled`/`Disabled`), not health (§3.3, ADR-008) |
+| `cpt-cf-clst-fr-routing-cache-only-plugin` | SDK default backends derive all four primitives from `ClusterCacheBackend` (§2.1, §3.11) |
+| `cpt-cf-clst-fr-validation-typed-profile` | `ClusterProfile` typed marker resolved via the fluent resolver (§3.6 Resolution Pattern, ADR-007) |
+| `cpt-cf-clst-fr-validation-capability-declarations` | Per-primitive `*Capability` requirement enums on the resolver (§3.10 Capability Validation) |
+| `cpt-cf-clst-fr-validation-honest-declaration` | Plugin-declared `*Features` characteristic structs (§3.10) |
+| `cpt-cf-clst-fr-validation-startup-fail` | Capability mismatch fails resolution at startup, not production (§3.10) |
+| `cpt-cf-clst-fr-watch-lifecycle-signals` | Union `*WatchEvent` carrying `Lagged`/`Reset`/`Closed` (§3.9, ADR-003) |
+| `cpt-cf-clst-fr-watch-auto-restart` | SDK auto-restart combinator (§3.9 Watch Event Shape) / `PollingPrefixWatch` (§3.12 Polyfill) |
+| `cpt-cf-clst-fr-namespacing-scoped` | Per-primitive `scoped()` sub-namespacing helpers (§3.8 Per-primitive Scoping) |
+| `cpt-cf-clst-fr-namespacing-sd-metadata-unscoped` | Service-discovery metadata kept outside the scope prefix (§3.8) |
+| `cpt-cf-clst-fr-routing-omit-default` | `ClusterHandle` wiring auto-fills unbound primitives with SDK defaults over the cache (§3.7 Lifecycle, §3.11) |
+| `cpt-cf-clst-fr-lifecycle-owner` | Single owner: the cluster gear crate's `ClusterHandle` start/stop sequence (§3.7, §3.13) |
+| `cpt-cf-clst-fr-shutdown-revoke` | `ClusterHandle::stop` revokes leadership (`Status(Lost)` then `Closed(Shutdown)`) before completing (§3.13 Shutdown Sequence) |
+| `cpt-cf-clst-fr-shutdown-ttl-cleanup` | `ClusterHandle::stop` performs no remote cleanup; resources lapse via backend TTL (§3.13 Shutdown Sequence) |
+
+#### Non-Functional Requirements Coverage
+
+Each non-functional requirement from the PRD maps to its design response and verification approach (see §1.2 NFR Allocation for the cross-cutting allocation view).
+
+| Requirement | Design Response |
+|-------------|-----------------|
+| `cpt-cf-clst-nfr-leader-guarantee` | Single-leader contract bound to `Linearizable` cache; weak-consistency requires explicit opt-in (§3.10, ADR-009) |
+| `cpt-cf-clst-nfr-bounded-critical-section` | Async + timeouts plus dylint no-remote-I/O rule bound the critical section (§2.2, §3.10) |
+| `cpt-cf-clst-nfr-watch-delivery` | At-most-once, per-key-ordered delivery with explicit `Lagged`/`Reset`/`Closed` recovery (§3.9, ADR-003) |
+| `cpt-cf-clst-nfr-observability` | Versioned spans/metrics/log-event naming contract; cardinality rule (§3.10, ADR-004) |
+| `cpt-cf-clst-nfr-capability-validation` | Capability requirements validated at resolution/startup (§3.10) |
+| `cpt-cf-clst-nfr-cross-backend-stability` | Backend trait contract gives stable cross-backend behavior; per-backend smoke/integration tests (§3.2, §4.1) |
+| `cpt-cf-clst-nfr-error-retryability` | Programmatic error classification exposes retryability on the facade error types (§3.3) |
+| `cpt-cf-clst-nfr-plugin-stability` | Per-primitive `*V1` versioning isolates plugin contract changes (§2.1 facade-plus-backend-trait, ADR-005) |
 
 ### 1.3 Architecture Layers
 
@@ -126,7 +178,8 @@ Explicit pub/sub messaging is excluded. The event broker gear provides reliable 
 
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
-| SDK | Public-API facade structs (`*V1`), backend traits (`*Backend`), per-primitive resolver builders, `ClusterProfile` marker trait, `*Capability` requirement enums, `*Features` characteristic structs, shared types, SDK default backend implementations, per-primitive `scoped()` helpers, `PollingPrefixWatch` polyfill, `register_*_backend` / `deregister_*_backend` helpers | Rust crate (`cf-cluster-sdk`) |
+| SDK | Public-API facade structs (`*V1`), backend traits (`*Backend`), per-primitive resolver builders, `ClusterProfile` marker trait, `*Capability` requirement enums, `*Features` characteristic structs, shared types, per-primitive `scoped()` helpers, `PollingPrefixWatch` polyfill, `register_*_backend` / `deregister_*_backend` helpers | Rust crate (`cf-cluster-sdk`) |
+| Cluster gear | SDK default backend implementations (`CasBasedLeaderElectionBackend`, `CasBasedDistributedLockBackend`, `CacheBasedServiceDiscoveryBackend`), `ShutdownRevoke` seam, wiring lifecycle (`ClusterHandle`) | Rust crate (`cf-gears-cluster`) |
 | Wiring (follow-up) | Operator YAML parsing, plugin orchestration, per-primitive ClientHub registration, builder/handle exposed to parent host gear | Rust crate (`cf-cluster`) |
 | Plugins (follow-up) | Backend-specific primitive implementations exposed as builder/handle pairs | Rust crates per backend |
 | External | Persistence, coordination, cluster state | PostgreSQL, K8s API server, Redis, NATS, etcd |
@@ -137,37 +190,37 @@ Explicit pub/sub messaging is excluded. The event broker gear provides reliable 
 
 #### Cache CAS as Universal Building Block
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-principle-cas-universal`
+- [x] `p1` - **ID**: `cpt-cf-clst-principle-cas-universal`
 
 `ClusterCacheBackend` with version-based CAS is the foundational primitive. Leader election, distributed locks, and service discovery can all be built on top of cache CAS + watch. The SDK ships default backend implementations of all three using only cache operations. This means a minimal plugin needs to implement only `ClusterCacheBackend` to get all four primitives (the wiring crate auto-wraps the cache backend in the SDK defaults when a primitive is omitted in operator config). Native overrides improve performance but are never required.
 
 #### Per-primitive Routing as Operator Config
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-principle-per-primitive-routing`
+- [x] `p1` - **ID**: `cpt-cf-clst-principle-per-primitive-routing`
 
 Each primitive routes independently to the best backend for the job. The wiring crate's `ClusterWiring::builder(...).build_and_start()` reads each profile's per-primitive config and registers the corresponding `Arc<dyn _Backend>` in ClientHub under the profile scope. Mixed backends within one profile (Redis cache + K8s Lease for leader election) are the common case, supported directly by the per-primitive registration model. There is no runtime compositor object — registration is per-primitive and the wiring crate is a thin iterator over operator config.
 
 #### Facade-plus-Backend-Trait Pattern
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-principle-facade-plus-backend-trait`
+- [x] `p1` - **ID**: `cpt-cf-clst-principle-facade-plus-backend-trait`
 
 There is no root `Cluster` trait. Each primitive is split into a public-API facade struct (`ClusterCacheV1`) and a plugin-facing backend trait (`ClusterCacheBackend`). Consumers hold the facade — a cheap-clone Arc-backed struct with inherent async methods. Plugins implement the backend trait. This keeps consumers off the `dyn` surface, lets the public API evolve independently of the plugin contract, and gives consumers a clean fluent resolver entry point: `ClusterCacheV1::resolver(hub).profile(P).require(...).resolve()`. Per-primitive versioning (`*V1`, `*V2`) allows incompatible primitive changes to coexist via separate `TypeKey`/ClientHub registration.
 
 #### Lightweight Notifications, Not Messaging
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-principle-lightweight-notifications`
+- [x] `p1` - **ID**: `cpt-cf-clst-principle-lightweight-notifications`
 
 Cache watch events carry only the key and event type (`Changed`, `Deleted`, `Expired`) — no value payload. Consumers call `cache.get(key)` for the current value. This avoids stale-value issues, maps cleanly to all backends (Redis keyspace notifications carry no value, Postgres NOTIFY has 8KB limit), and keeps events fixed-size. Reliable messaging belongs in the event broker.
 
 #### Version-Based Optimistic Concurrency
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-principle-version-based-cas`
+- [x] `p1` - **ID**: `cpt-cf-clst-principle-version-based-cas`
 
 `compare_and_swap` takes an `expected_version: u64` obtained from a prior `get()`, not an expected byte value. `get()` returns `CacheEntry { value, version }`. This maps natively to all backends: `resourceVersion` (K8s), `revision` (NATS), `mod_revision` (etcd), `BIGSERIAL` (Postgres), Lua counter (Redis), `AtomicU64` (in-process). Value-based CAS would require racy get-compare-put loops on revision-based backends.
 
 #### Watch Union Shape Across All Three Watches
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-principle-watch-union-shape`
+- [x] `p1` - **ID**: `cpt-cf-clst-principle-watch-union-shape`
 
 All three watch event types (`CacheWatchEvent`, `LeaderWatchEvent`, `ServiceWatchEvent`) follow the same union shape: `{value-variant, Lagged{dropped}, Reset, Closed(err)}`. Infallible at the type level — there is no `Result`-returning `changed()` method on any watch. Terminal errors arrive via `Closed(err)`. Transient backend errors (`ConnectionLost`, `Timeout`, `ResourceExhausted`) are retried internally by the watch's background task and do not surface as events. ADR-003 captures the rationale and applies to all three watches.
 
@@ -175,19 +228,19 @@ All three watch event types (`CacheWatchEvent`, `LeaderWatchEvent`, `ServiceWatc
 
 #### No Serde in Contract Types
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-constraint-no-serde`
+- [x] `p1` - **ID**: `cpt-cf-clst-constraint-no-serde`
 
 The `cf-cluster-sdk` crate MUST NOT depend on serde. Serialization concerns belong in plugin implementations. Enforced by dylint lints in the workspace.
 
 #### No Remote I/O in Cluster Critical Sections
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-constraint-no-remote-in-critical-section`
+- [x] `p1` - **ID**: `cpt-cf-clst-constraint-no-remote-in-critical-section`
 
 Code protected by a `LockGuard` MUST NOT make additional remote calls. Remote effects MUST occur before `try_lock` or after `release`, never between them. Together with async + timeouts, this eliminates the Kleppmann fencing scenario at the architectural level. Enforced by a workspace dylint rule scoped to the four cluster backend traits within `try_lock`/`release` scopes; DB-tx enforcement is a follow-up rule extension once the wiring crate and consumer migrations land. See ADR-002.
 
 #### Backend Trait Dyn-Compatibility
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-constraint-dyn-compat`
+- [x] `p1` - **ID**: `cpt-cf-clst-constraint-dyn-compat`
 
 All four backend traits MUST be dyn-compatible. The SDK includes compile-time assertions per trait so any future change that breaks dyn-compatibility fails the build. No `Self: Sized` bounds on async trait methods; no GATs.
 
@@ -201,7 +254,7 @@ All four backend traits MUST be dyn-compatible. The SDK includes compile-time as
 | `LeaderElectionV1` | Public-API facade struct over `Arc<dyn LeaderElectionBackend>`. Inherent async: `elect`, `elect_with_config`. Inherent sync: `resolver(hub)`, `scoped(prefix)`. |
 | `DistributedLockV1` | Public-API facade struct over `Arc<dyn DistributedLockBackend>`. Inherent async: `try_lock`, `lock`. Inherent sync: `resolver(hub)`, `scoped(prefix)`. |
 | `ServiceDiscoveryV1` | Public-API facade struct over `Arc<dyn ServiceDiscoveryBackend>`. Inherent async: `register`, `discover`, `watch`. Inherent sync: `resolver(hub)`, `scoped(prefix)`. |
-| `ClusterCacheBackend` | Plugin-facing async trait. Methods: `consistency()`, `features()`, `get`, `put`, `delete`, `contains`, `put_if_absent`, `compare_and_swap`, `watch`, `watch_prefix`. |
+| `ClusterCacheBackend` | Plugin-facing async trait. Methods: `consistency()`, `features()`, `get`, `put`, `delete`, `contains`, `put_if_absent`, `compare_and_swap`, `compare_and_delete`, `watch`, `watch_prefix`. `compare_and_delete` is backend-only — not surfaced on `ClusterCacheV1`. |
 | `LeaderElectionBackend` | Plugin-facing async trait. Methods: `features() -> LeaderElectionFeatures`, `elect`, `elect_with_config`. |
 | `DistributedLockBackend` | Plugin-facing async trait. Methods: `features() -> LockFeatures`, `try_lock`, `lock`. |
 | `ServiceDiscoveryBackend` | Plugin-facing async trait. Methods: `features() -> ServiceDiscoveryFeatures`, `register`, `discover`, `watch`. |
@@ -224,20 +277,20 @@ All four backend traits MUST be dyn-compatible. The SDK includes compile-time as
 | `LeaderWatchEvent` | Watch union: `Status(LeaderStatus)`, `Lagged { dropped: u64 }`, `Reset`, `Closed(ClusterError)`. |
 | `LeaderWatch` | Handle into an ongoing election. `async fn changed() -> LeaderWatchEvent`; `fn status() -> LeaderStatus`; `fn is_leader() -> bool`; `async fn resign(self) -> Result<()>`. `Drop` is a no-op (no I/O in `Drop`). |
 | `ElectionConfig` | `{ ttl: Duration (default 30s), max_missed_renewals: u8 (default 2) }`. Constructor `new(ttl, max_missed_renewals)` validates both > 0. Derived: `renewal_interval() = ttl / (max_missed_renewals + 1)`. |
-| `LockGuard` | Lock handle. `async fn extend(additional_ttl)`, `async fn release(self)`. `Drop` is a no-op (TTL is the safety net; no I/O in `Drop`). |
+| `LockGuard` | Lock handle. `async fn renew(new_ttl)`, `async fn release(self)`. `Drop` is a no-op (TTL is the safety net; no I/O in `Drop`). |
 | `ServiceRegistration` | `{ name: String, instance_id: Option<String>, address: String, metadata: HashMap<String, String> }`. |
-| `ServiceInstance` | Discovered instance: `{ instance_id, address, metadata, state: InstanceState, registered_at }`. |
+| `ServiceInstance` | Discovered instance: `{ instance_id, address, metadata, state: InstanceState, registered_at: SystemTime }`. `registered_at` is `std::time::SystemTime` (the serde-free std wall-clock type) so every backend reports a consistent contract type. |
 | `InstanceState` | `enum { Enabled, Disabled }`. Gear-declared serving intent. NOT a health observation — liveness comes from heartbeat/TTL renewal. |
-| `ServiceHandle` | Registration handle: `async fn deregister(self)`, `async fn update_metadata(...)`, `async fn set_enabled(bool)`. `Drop` is a no-op (no I/O in `Drop`). |
+| `ServiceHandle` | Registration handle: `async fn deregister(self)`, `async fn update_metadata(...)`, `async fn set_state(InstanceState)`. `Drop` is a no-op (no I/O in `Drop`). |
 | `MetaMatch` | `#[non_exhaustive] enum { Equals(String), OneOf(Vec<String>) }`. Per-key metadata predicate. |
 | `DiscoveryFilter` | `#[non_exhaustive] struct { state: StateFilter, metadata: Vec<(String, MetaMatch)>, ... }`. AND-conjunction across metadata entries. |
 | `StateFilter` | `enum { Enabled, Disabled, Any }`. Default `Enabled` (primary routing). |
-| `TopologyChange` | `Joined(ServiceInstance)`, `Left(instance_id)`, `Updated(ServiceInstance)`. |
+| `TopologyChange` | `Joined(ServiceInstance)`, `Left { instance_id }`, `Updated(ServiceInstance)`. |
 | `ServiceWatchEvent` | Watch union: `Change(TopologyChange)`, `Lagged { dropped: u64 }`, `Reset`, `Closed(ClusterError)`. |
 | `ServiceWatch` | Async receiver yielding `ServiceWatchEvent` items. |
 | `RetryPolicy` | Combinator config: `initial_backoff: Duration`, `max_backoff: Duration`, `jitter_factor: f32` (0.0–1.0), `max_retries: Option<u32>` (None = retry forever). Constructor `default()` returns exponential backoff `1s → 30s`, full jitter (`jitter_factor: 1.0`), no retry cap. |
 | `RestartingWatch<W>` | SDK combinator wrapping a base `*Watch`. Implemented for `W: CacheWatch | LeaderWatch | ServiceWatch`. Consumes `Closed(retryable)` internally per the bound `RetryPolicy`, synthesizes `Reset` to the consumer on each successful resubscribe, propagates `Closed(non-retryable)` and `Closed(Shutdown)` to the consumer unchanged. Constructed via `*Watch::auto_restart(policy)`. Retryability is read from `ProviderErrorKind`: `ConnectionLost`, `Timeout`, `ResourceExhausted` are retryable; `AuthFailure`, `Other` are not. `ClusterError::Shutdown`, `CapabilityNotMet`, and the lock/leader-specific terminal variants are also not retryable. |
-| `ClusterError` | Unified error enum. Variants: `InvalidName { name, reason }`, `InvalidConfig { reason }`, `LockContended { name }`, `LockTimeout { name, waited }`, `LockExpired { name }`, `CasConflict { key, current: Option<CacheEntry> }`, `Unsupported { feature: &'static str }`, `ProfileNotSpecified`, `ProfileNotBound { profile: &'static str }`, `CapabilityNotMet { primitive: &'static str, capability: &'static str, provider: &'static str }`, `Shutdown`, `Provider { kind: ProviderErrorKind, message: String, source: Option<Box<dyn Error + Send + Sync>> }`. **No `NotStarted` variant** — pre-resolution access surfaces as `ProfileNotBound` (the resolver enforces presence at consumer construction time, so resolved facades cannot observe a "not started" state). |
+| `ClusterError` | Unified error enum. Variants: `InvalidName { name, reason }`, `InvalidConfig { reason }`, `LockContended { name }`, `LockTimeout { name, waited }`, `LockExpired { name }`, `CasConflict { key, current: Option<CacheEntry> }`, `Unsupported { feature: &'static str }`, `ProfileNotSpecified`, `ProfileNotBound { profile: &'static str }`, `CapabilityNotMet { primitive: &'static str, capability: &'static str, provider: &'static str }`, `Shutdown`, `Provider { kind: ProviderErrorKind, message: String }`. `ClusterError` derives `Clone` so it can ride the watch-union `Closed(_)` signal to multiple watchers; the provider error chain is therefore flattened into `message` rather than carried as a non-`Clone` boxed `source`. **No `NotStarted` variant** — pre-resolution access surfaces as `ProfileNotBound` (the resolver enforces presence at consumer construction time, so resolved facades cannot observe a "not started" state). |
 | `ProviderErrorKind` | `enum { ConnectionLost, Timeout, AuthFailure, ResourceExhausted, Other }`. Programmatic retryability classification. |
 | `ScopedCacheBackend` (and three siblings) | Internal SDK wrapper struct implementing the corresponding `*Backend` trait by delegating to an inner `Arc<dyn _Backend>` with prefix translation. Returned by `*V1::scoped(prefix)`. |
 | `PollingPrefixWatch` | SDK polyfill: synthesizes `watch_prefix` behavior on backends declaring `features().prefix_watch == false` by periodically listing the prefix and emitting `CacheWatchEvent::Event` diffs (Changed/Deleted). Explicit opt-in; doc comments describe the cost (N gets per interval). |
@@ -265,8 +318,6 @@ All four backend traits MUST be dyn-compatible. The SDK includes compile-time as
 │  │ + SDBackend      │ │ ClusterProfile marker, *Capability,     │  │
 │  └──────────────────┘ │ *Features, ClusterError, shared types   │  │
 │  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ SDK default backends (cas-based LE, lock; cache-based SD)   │   │
-│  ├─────────────────────────────────────────────────────────────┤   │
 │  │ Per-primitive Scoped*Backend wrappers                       │   │
 │  │ PollingPrefixWatch polyfill                                 │   │
 │  │ register_*_backend / deregister_*_backend helpers           │   │
@@ -295,9 +346,9 @@ All four backend traits MUST be dyn-compatible. The SDK includes compile-time as
 
 #### cf-cluster-sdk (this change)
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-component-sdk`
+- [x] `p1` - **ID**: `cpt-cf-clst-component-sdk`
 
-Per-primitive public-API facade structs, plugin-facing backend traits, resolver builders, profile marker, capability and features types, shared types, SDK default backend implementations, scoping wrappers, polyfill, registration/deregistration helpers, name validation utilities. Zero external dependencies beyond `tokio`, `tokio_util`, `async-trait`, and platform crates (`toolkit`, `gts`, `types-registry-sdk`).
+Per-primitive public-API facade structs, plugin-facing backend traits, resolver builders, profile marker, capability and features types, shared types, scoping wrappers, polyfill, registration/deregistration helpers, name validation utilities. Zero external dependencies beyond `tokio`, `tokio_util`, `async-trait`, and platform crates (`toolkit`, `gts`, `types-registry-sdk`). Default backend implementations (`CasBasedLeaderElectionBackend`, `CasBasedDistributedLockBackend`, `CacheBasedServiceDiscoveryBackend`) live in the cluster gear crate, not here.
 
 #### cf-cluster wiring (follow-up change)
 
@@ -331,6 +382,8 @@ Each plugin (Postgres, K8s, Redis, NATS, etcd, standalone) exposes a builder/han
 | `watch_prefix` | `async fn watch_prefix(&self, prefix: &str) -> Result<CacheWatch, ClusterError>` | Yields `CacheWatchEvent` for matching keys. Backends declaring `features().prefix_watch == false` return `Err(Unsupported { feature: "prefix_watch" })`. Callers may polyfill via `PollingPrefixWatch`. |
 | `CacheWatch::auto_restart` | `fn auto_restart(self, policy: RetryPolicy) -> RestartingWatch<CacheWatch>` | Wraps the watch with the SDK auto-restart combinator. See §3.9 for retryability classification and `RetryPolicy` defaults. `LeaderWatch::auto_restart` and `ServiceWatch::auto_restart` follow the same shape. |
 
+> **Backend-trait-only — `compare_and_delete`.** `ClusterCacheBackend` additionally declares `async fn compare_and_delete(&self, key: &str, expected_value: &[u8]) -> Result<bool, ClusterError>`: an atomic value-guarded delete that removes `key` only if its current value equals `expected_value`. A value mismatch or an absent key returns `Ok(false)`, never an error. It is deliberately **not** exposed on `ClusterCacheV1` — the public CAS contract is version-based (`compare_and_swap`), while this is the value/owner-token-guarded counterpart used internally by SDK-default coordination backends (e.g. the leader elector's guarded release, which must survive a key's version resetting to 1 on delete+recreate, where a version guard would alias a successor's fresh claim). The trait's default impl is a best-effort, non-atomic `get`-then-`delete`; backends with an atomic store override it for a genuine compare-and-delete.
+
 #### LeaderElectionV1 — Leader election primitive
 
 | Method | Signature | Contract |
@@ -362,7 +415,7 @@ Three consumer patterns are available, ordered by tolerance for transient dual-l
 | `scoped` | `fn scoped(&self, prefix: &str) -> DistributedLockV1` | Scopes lock names. |
 | `try_lock` | `async fn try_lock(&self, name: &str, ttl: Duration) -> Result<LockGuard, ClusterError>` | Non-blocking. `LockContended { name }` if held. |
 | `lock` | `async fn lock(&self, name: &str, ttl: Duration, timeout: Duration) -> Result<LockGuard, ClusterError>` | Blocking up to `timeout`. `LockTimeout { name, waited }` if not acquired. |
-| `LockGuard::extend` | `async fn extend(&self, additional_ttl: Duration) -> Result<(), ClusterError>` | Extends TTL. `LockExpired { name }` if TTL elapsed. |
+| `LockGuard::renew` | `async fn renew(&self, new_ttl: Duration) -> Result<(), ClusterError>` | Renews the lease (resets the TTL to `new_ttl` from now; does not add to the time left). `LockExpired { name }` if TTL elapsed. |
 | `LockGuard::release` | `async fn release(self) -> Result<(), ClusterError>` | Explicit release. Consumers MUST call this. `Drop` is a no-op (no I/O in `Drop`). |
 
 **Critical-section rule** (see §2 Constraints, ADR-002): Consumers MUST NOT make remote I/O calls inside the critical section between `try_lock` / `lock` and `release`. No fencing tokens — the no-remote-in-critical-section rule eliminates the stale-writer scenario fencing tokens protect against.
@@ -378,7 +431,7 @@ Three consumer patterns are available, ordered by tolerance for transient dual-l
 | `watch` | `async fn watch(&self, name: &str) -> Result<ServiceWatch, ClusterError>` | Yields `ServiceWatchEvent` (`Change(TopologyChange)` / `Lagged` / `Reset` / `Closed`). Watch is unfiltered — consumers apply filters client-side to each `Change` event. |
 | `ServiceHandle::deregister` | `async fn deregister(self) -> Result<(), ClusterError>` | Instance removed; watchers receive `Change(Left)`. |
 | `ServiceHandle::update_metadata` | `async fn update_metadata(&self, m: HashMap<String, String>) -> Result<(), ClusterError>` | Updates metadata; watchers receive `Change(Updated)`. |
-| `ServiceHandle::set_enabled` | `async fn set_enabled(&self, enabled: bool) -> Result<(), ClusterError>` | Flip gear-declared serving intent. Watchers receive `Change(Updated)`. NOT a health observation — liveness is signaled by heartbeat/TTL renewal. |
+| `ServiceHandle::set_state` | `async fn set_state(&self, state: InstanceState) -> Result<(), ClusterError>` | Set gear-declared serving intent. Watchers receive `Change(Updated)`. NOT a health observation — liveness is signaled by heartbeat/TTL renewal. |
 
 ### 3.4 Internal Dependencies
 
@@ -474,11 +527,13 @@ Multiple resolutions of the same primitive on the same profile are cheap (`Arc`-
 
 ### 3.7 Lifecycle Pattern (Builder/Handle)
 
-The cluster wiring crate (`cf-cluster`, follow-up change) is **not** registered as its own `RunnableCapability` in ToolKit. It's a library exposing a builder/handle pair following the outbox pattern. A parent host gear (registered as a `RunnableCapability`) owns the cluster handle inside its own `start`/`stop`.
+> **Amendment (2026-06-16): collapsed to one gear crate.** As designed (this is follow-up work, not delivered in the SDK-only change that freezes this contract), the wiring library and the host gear are **the same crate** (`cf-gears-cluster`, gear name `cluster`), matching the platform's universal one-gear-per-domain layout (`<gear>-sdk` + `<gear>` + plugins). The crate will both (a) register the `cluster` gear — a `RunnableCapability` whose `start` builds the wiring from operator config and whose `stop` owns teardown — and (b) exports the builder/handle (`ClusterWiring`, `ClusterHandle`, `ClusterWiring::from_config`, `ProviderRegistry`) as `pub` library API, so a consumer gear may still embed the wiring directly without depending on the `cluster` gear. The separate non-gear wiring crate + separate host gear described below was rejected because it introduced a third core crate no other gear has; the genuinely reusable surface is `cluster-sdk` (already its own crate). The substance below holds — a `RunnableCapability` owns the handle, plugins remain builder/handle libraries composed by `ClusterHandle::stop()`, backends register under `cluster:{profile}` — only the crate boundary changed. The `ClusterCacheProvider` trait (a plugin implements it to build its cache backend from config options) lives in `cluster-sdk`, so plugins depend on the SDK only.
+
+The `cluster` gear (`cf-gears-cluster`) is the single `RunnableCapability` that owns the cluster handle across its lifecycle; the same crate also exposes the wiring as a builder/handle pair (the outbox-style library API) for a consumer gear that prefers to embed it directly. Either way one `RunnableCapability` owns the `ClusterHandle` inside its own `start`/`stop`:
 
 ```rust
-// In the parent host gear's RunnableCapability impl (follow-up):
-impl RunnableCapability for HostGear {
+// In the cluster gear's RunnableCapability impl (or a consumer gear embedding the wiring):
+impl RunnableCapability for ClusterGear {
     async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
         let cluster_handle = ClusterWiring::builder(&self.config.cluster, &self.hub)
             .build_and_start()
@@ -523,7 +578,7 @@ Each public-API facade exposes `pub fn scoped(&self, prefix: &str) -> Self` retu
 | `ClusterCacheV1` | `key` on `get`/`put`/`delete`/`contains`/`put_if_absent`/`compare_and_swap`/`watch`; `prefix` on `watch_prefix` | `CacheEvent::{Changed,Deleted,Expired}{key}` — strip prefix on the way back to the consumer | (none — cache has only keys) |
 | `LeaderElectionV1` | `name` on `elect`/`elect_with_config` | n/a — `LeaderWatch` events don't carry names; the consumer already holds the watch handle | (none — election has only a name) |
 | `DistributedLockV1` | `name` on `try_lock`/`lock` | n/a — `LockGuard` is opaque, consumer doesn't see backend names | (none — lock has only a name) |
-| `ServiceDiscoveryV1` | `name` field of `ServiceRegistration` on `register`; `name` argument on `discover`/`watch`. Returned `ServiceInstance.name` is stripped back. | `ServiceWatchEvent::Change(TopologyChange::Joined/Updated/Left { instance })` — `instance.name` is stripped | `ServiceRegistration::metadata` (keys and values), `DiscoveryFilter::metadata` predicates, `ServiceInstance::metadata`. Metadata is an attribute namespace per-instance; coordination namespacing uses `name`. |
+| `ServiceDiscoveryV1` | `name` field of `ServiceRegistration` on `register`; `name` argument on `discover`/`watch` | n/a — `ServiceInstance` carries no service name (the consumer already discovered by `name`) and `ServiceWatchEvent` change payloads carry the instance, not the service name, so there is no read-path strip | `ServiceRegistration::metadata` (keys and values), `DiscoveryFilter::metadata` predicates, `ServiceInstance::metadata`. Metadata is an attribute namespace per-instance; coordination namespacing uses `name`. |
 
 **Examples**:
 
@@ -631,14 +686,14 @@ fn validate_cache_capabilities(
                 return Err(ClusterError::CapabilityNotMet {
                     primitive: "ClusterCacheV1",
                     capability: "Linearizable",
-                    provider: std::any::type_name_of_val(backend),
+                    provider: backend.provider_name(),
                 });
             }
             CacheCapability::PrefixWatch if !backend.features().prefix_watch => {
                 return Err(ClusterError::CapabilityNotMet {
                     primitive: "ClusterCacheV1",
                     capability: "PrefixWatch",
-                    provider: std::any::type_name_of_val(backend),
+                    provider: backend.provider_name(),
                 });
             }
             _ => {}
@@ -648,17 +703,19 @@ fn validate_cache_capabilities(
 }
 ```
 
-Same shape for `validate_leader_election_capabilities`, `validate_lock_capabilities`, `validate_service_discovery_capabilities`. The `provider` field uses `std::any::type_name_of_val` to give the operator a concrete diagnostic name for the bound backend.
+Same shape for `validate_leader_election_capabilities`, `validate_lock_capabilities`, `validate_service_discovery_capabilities`. The `provider` field uses the backend's `provider_name()` method — a provided trait method that resolves `std::any::type_name::<Self>()` through the vtable — to give the operator a concrete diagnostic name for the bound backend. (`std::any::type_name_of_val` applied to a `&dyn ClusterCacheBackend` would yield only the trait-object name, never the concrete backend, because it is monomorphized on the static type.)
 
 **Why per-primitive (not bundled `CapabilityClass`)**: the prior bundled `CapabilityClass { Standalone, Durable, InMemory, Coordination }` collapsed three orthogonal axes (topology, persistence, consistency) into one fuzzy ordering. Per-primitive `*Capability` enums are type-safe (a cache resolver cannot accept `MetadataFiltering`) and grounded in concrete backend characteristic checks rather than coarse tier claims.
 
 ### 3.11 SDK Default Backends
 
-The SDK ships three default backend implementations built on `Arc<dyn ClusterCacheBackend>`:
+> **Implementation location:** The three default backend implementations live in the **cluster gear** (`cf-gears-cluster`), not in the SDK. Consumer gears never import them directly; only the cluster gear's wiring layer instantiates them. The SDK retains only the backend *traits* and facades that consumers depend on.
+
+The cluster gear ships three default backend implementations built on `Arc<dyn ClusterCacheBackend>`:
 
 - `CasBasedLeaderElectionBackend` — `put_if_absent(election_key, node_id, ttl)` for candidacy, `watch(election_key)` for status changes, background renewal task at `ttl / (max_missed_renewals + 1)`, TTL expiry → `Status(Lost)` followed by auto-reenroll. `features()` returns `LeaderElectionFeatures { linearizable: cache.consistency() == Linearizable }` — derives from the underlying cache's consistency.
 - `CasBasedDistributedLockBackend` — `put_if_absent(lock_key, holder_id, ttl)` for `try_lock`, `watch(lock_key)` to notify blocked waiters on release, background TTL reaper. Release via delete-if-still-holder using CAS (a foreign holder cannot release another's lock). No fencing tokens (the no-remote-in-critical-section rule eliminates the stale-writer scenario). `features()` returns `LockFeatures { linearizable: cache.consistency() == Linearizable }`.
-- `CacheBasedServiceDiscoveryBackend` — `put(svc/{name}/{instance_id}, metadata, ttl)` for registration, `watch_prefix(svc/{name}/)` for topology change events, background TTL renewal for heartbeat. Metadata filtering is client-side; `features()` returns `ServiceDiscoveryFeatures { metadata_pushdown: false }`.
+- `CacheBasedServiceDiscoveryBackend` — `put(svc/{name}/{instance_id}, metadata, ttl)` for registration, `watch_prefix(svc/{name}/)` for topology change events, background TTL renewal for heartbeat. The `svc/` prefix keeps service-discovery keys in their own namespace, collision-free against the `election/` and `lock/` prefixes the other default backends use. Metadata filtering is client-side; `features()` returns `ServiceDiscoveryFeatures { metadata_pushdown: false }`.
 
 **Constructor pair per default backend**:
 - `new(cache: Arc<dyn ClusterCacheBackend>) -> Result<Self, ClusterError>` — returns `Err(ClusterError::InvalidConfig)` if `cache.consistency() == EventuallyConsistent`. Default-safe.
@@ -698,11 +755,13 @@ PollingPrefixWatch::spawn(
 
 Periodically lists keys under the prefix, diffs against the previous list, and emits `CacheWatchEvent::Event(CacheEvent::Changed | Deleted)` for observed changes. Cost: N `get` calls per interval, no millisecond-level precision. Doc comments explicitly warn about the cost and recommend routing to a backend with native prefix watch at scale. Drop on the watch stops the polling task.
 
+Enumeration is provided by `ClusterCacheBackend::scan_prefix(prefix) -> Vec<String>`, a defaulted (returns `Unsupported`) additive extension to the cache contract so existing backends keep compiling and opt in by override (see ADR-010). The polyfill lists keys via `scan_prefix`, then issues one `get` per key to read its version for change detection (the `N + 1` round-trips above); a `scan_prefix` error closes the synthesized watch with a terminal `Closed`. Because the polyfill emits full backend keys like a native `watch_prefix`, `ScopedCacheBackend` strips the scope prefix from them on the read path, so scoping composes with the polyfill.
+
 ### 3.13 Interactions & Sequences
 
 #### Per-primitive Resolution
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-seq-per-primitive-resolution`
+- [x] `p1` - **ID**: `cpt-cf-clst-seq-per-primitive-resolution`
 
 ```
   Consumer Gear                    SDK                         ClientHub
@@ -773,24 +832,28 @@ Periodically lists keys under the prefix, diffs against the previous list, and e
        │ ───────────────>│                    │                        │
        │                 │ handle.stop()      │                        │
        │                 │ ──────────────────>│                        │
+       │                 │                    │ revoke: deliver        │
+       │                 │                    │  Status(Lost) to leaders│
+       │                 │                    │ ──────────────────────>│ Status(Lost)
+       │                 │                    │ revoke: Closed(Shutdown)│
+       │                 │                    │  to leader/lock/SD      │
+       │                 │                    │ ──────────────────────>│ Closed(Shutdown)
+       │                 │                    │                        │
        │                 │                    │ deregister all backends│
        │                 │                    │  from ClientHub         │
        │                 │                    │                        │
-       │                 │                    │ deliver Status(Lost)   │
-       │                 │                    │  to active leaders     │
-       │                 │                    │ ──────────────────────>│ Status(Lost)
-       │                 │                    │ deliver Closed(Shutdown│
-       │                 │                    │  to all watches        │
+       │                 │                    │ stop hooks: plugin      │
+       │                 │                    │  cache.shutdown() →     │
        │                 │                    │ ──────────────────────>│ Closed(Shutdown)
-       │                 │                    │                        │
-       │                 │                    │ cancel plugin tokens   │
-       │                 │                    │ join plugin tasks      │
+       │                 │                    │  cancel sweeper, drop   │
        │                 │                    │                        │
        │                 │ Ok                 │                        │
        │                 │ <──────────────────│                        │
        │ Ok              │                    │                        │
        │ <───────────────│                    │                        │
 ```
+
+**Implementation status (this change).** The lifecycle owner is the cluster gear crate itself (host collapsed in); `ClusterHandle::stop()` lives there, not in a separate wiring crate. The implementation now matches the sequence diagram above. It revokes in-flight coordination **first** for every wiring-created default backend: the leader-election backend latches `Status(Lost)` then `Closed(ClusterError::Shutdown)` to active leaders (awaiting those tasks); an in-flight blocking `lock()` waiter returns `Err(ClusterError::Shutdown)` (distinct from `LockTimeout`); and each active service-discovery watch receives an explicit `Closed(ClusterError::Shutdown)` (awaiting the translator tasks). It then deregisters backends from the `ClientHub` and runs the plugin stop hooks in reverse-start order. Active **cache** watches now receive an explicit `Closed(ClusterError::Shutdown)` too — delivered via the standalone plugin's stop hook (`StandaloneCache::shutdown`), which closes every watcher before the sweeper stops and the cache is dropped. That cache-watch close lands one phase after the leader/lock/SD revocation but still within `stop()` (the chosen simplest path). No remote release is performed; held claims, locks, and registrations lapse via TTL (`cpt-cf-clst-fr-shutdown-ttl-cleanup`).
 
 ### 3.14 Database schemas & tables
 
@@ -802,7 +865,7 @@ Per-backend storage layout (e.g., the Postgres plugin's `cluster_cache` and `clu
 
 Cluster is an in-process Rust library SDK; it has no deployment topology of its own. The SDK is consumed by other gears in the same process; the `ClusterHandle` lifecycle is owned by a parent host gear's `RunnableCapability::start`/`stop` (see §3.7).
 
-The deployment shape that matters operationally is the **profile × backend** matrix mapped onto the parent host gear's deployment. §4.2 Recommended Deployment Combinations enumerates the supported shapes (single-instance dev/test, multi-instance non-K8s, K8s-low-throughput, K8s + Redis production, Redis-only). Each shape is realized by the parent host gear's deployment (Kubernetes pod, systemd unit, Docker container) plus the per-primitive backend bindings declared in operator YAML and instantiated by the wiring crate (`cf-cluster`, follow-up).
+The deployment shape that matters operationally is the **profile × backend** matrix mapped onto the parent host gear's deployment. §4.2 Recommended Deployment Combinations enumerates the supported shapes (single-instance dev/test, multi-instance non-K8s, K8s-low-throughput, K8s + Redis production, Redis-only). Each shape is realized by the parent host gear's deployment (Kubernetes pod, systemd unit, Docker container) plus the backend bindings declared in operator YAML and instantiated by the lifecycle wiring in the `cf-gears-cluster` gear crate. Today the wiring instantiates the cache provider and auto-fills the other three primitives with the SDK defaults; binding a native non-cache backend per primitive is rejected at config time pending the routing follow-up (`cpt-cf-clst-fr-routing-per-primitive`).
 
 Cross-cluster / geo-distributed coordination is out of scope (§4.2 Out of Scope in PRD).
 
