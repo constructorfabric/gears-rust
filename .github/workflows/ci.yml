@@ -543,77 +543,6 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}  # Uncomment if required for private repos
 
-  dylint:
-    name: Dylint Tests
-    needs: changes
-    if: >-
-      !cancelled()
-      && (needs.changes.result != 'success'
-      || needs.changes.outputs.dylint == 'true'
-      || needs.changes.outputs.rust == 'true'
-      || needs.changes.outputs.ci == 'true'
-      || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust nightly toolchain
-        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
-          components: llvm-tools-preview,rustc-dev
-
-      # Override rust-toolchain.toml (which pins stable) for all cargo
-      # commands in this job.
-      - name: Pin nightly for all cargo commands
-        run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
-
-      - name: Set Rust nightly for Dylint temp builds
-        run: rustup override set ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }} --path /tmp
-
-      - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          cache-bin: false
-          cache-targets: false
-          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-dylint
-
-      # NOTE: sccache is intentionally omitted here. Dylint compiles lint
-      # crates that link against rustc-dev via dylint-link; wrapping the
-      # compiler with RUSTC_WRAPPER=sccache can break this toolchain.
-
-      - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
-        with:
-          tool: nextest
-
-      - name: Install cargo-dylint and dylint-link from source
-        run: cargo install --locked cargo-dylint dylint-link
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Run dylint tests
-        env:
-          RUSTFLAGS: "-C debuginfo=0"
-        run: make dylint-test
-
-      - name: Run dylint on all crates
-        run: make dylint
-
   shear:
     name: Unused Deps (cargo-shear)
     needs: changes
@@ -653,6 +582,7 @@ jobs:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
           components: llvm-tools-preview,rustc-dev
 
+<<<<<<< HEAD
       # Override rust-toolchain.toml (which pins stable) for all cargo
       # commands in this job.
       - name: Pin nightly for all cargo commands
@@ -681,10 +611,12 @@ jobs:
       - name: Install dylint-link from source
         run: cargo install --locked dylint-link
 
+=======
+>>>>>>> e7e6a70b (Remove dylint from CI)
       - name: Install cargo-shear
         uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
           tool: cargo-shear@1.13.1
 
-      - name: cargo shear (workspace root + tools/dylint_lints)
+      - name: cargo shear (workspace root)
         run: make shear
