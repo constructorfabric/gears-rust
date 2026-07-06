@@ -566,7 +566,7 @@ Generated `error_code` values: `NOTIFICATION_NOT_FOUND`, `DELIVERY_UNAVAILABLE`,
 
 **Rationale**: The name IS the operational contract. A developer reading `fn process(backend: &dyn NotificationBackend)` knows immediately: this can timeout, this can fail independently, this needs retry logic, this cannot participate in my transaction. No need to open another file, check a configuration, or read documentation. The naming convention eliminates an entire class of architectural misunderstandings.
 
-**Enforcement**: Currently by convention. Future work may add a Dylint lint that rejects traits with incorrect suffixes or transport projections on Extension/Embedded types.
+**Enforcement**: Currently by convention. Future work may add an architecture lint (via `cargo gears lint`) that rejects traits with incorrect suffixes or transport projections on Extension/Embedded types.
 
 ## 4. Crate Structure
 

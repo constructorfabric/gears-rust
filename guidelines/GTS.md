@@ -1175,7 +1175,7 @@ Types that **must not be extended**. No derived types are allowed.
 6. **DB storage**: base fields in columns, extension data in `JSONB` or `TEXT`
 7. **Error types**: use GTS identifiers as RFC 9457 `type` URIs for machine-readable error classification
 8. **Access control**: structure identifiers so that wildcard policies can grant/revoke access at the vendor, package, or namespace level
-9. **Dylint enforcement**: GTS-specific lints validate identifier correctness and prevent unsupported patterns at compile time
+9. **Architecture lint enforcement**: GTS-specific lints (via `cargo gears lint`) validate identifier correctness and prevent unsupported patterns at compile time
 10. **Constants as GTS instances**: discriminator fields and string constants that select behavior, routing, or authorization should be GTS well-known instances — not raw strings or Rust enums (see [section 6.6](#66-gts-well-known-instances-for-constants-and-discriminator-values))
 11. **Rust naming**: in new code prefer `type_id`/`TYPE_ID`/`GtsTypeId` naming; treat `schema_id` names as deprecated compatibility aliases. The `schema_id = "..."` macro attribute produces a compile-time deprecation warning — use `type_id = "..."` (or `type_id = gts_id!("...")`) instead
 16. **GTS identifier literals**: use `gts_id!("<suffix>")` for all GTS identifier string literals in Rust code — the `gts.` prefix is prepended at compile time from the configurable `GTS_ID_PREFIX`. Use `gts_uri!("<suffix>")` for URI-form identifiers (`gts://`). Both macros are re-exported from `toolkit_gts`. The same `gts_id!("...")` form is accepted inside `type_id`/`id`/`"id"` arguments of `#[gts_type_schema]`, `gts_instance!`, and `gts_instance_raw!` — always write the suffix without the `gts.` prefix

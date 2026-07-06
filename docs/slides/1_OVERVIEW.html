@@ -85,7 +85,7 @@ and <strong>where to run them</strong> — from edge devices to Kubernetes clust
 <h2 id="key-defining-characteristics">Key defining characteristics</h2>
 <ol>
 <li><strong>Secure by default (defense-in-depth)</strong> — security is structural, not opt-in, validated at build time.</li>
-<li><strong>Architecture enforced at compile time</strong> - use custom lint rules via <code>dylint</code></li>
+<li><strong>Architecture enforced at compile time</strong> - use custom lint rules via <code>cargo gears lint</code></li>
 <li><strong>Three-tier gears hierarchy</strong> — toolkit, System gears, Service gears.</li>
 <li><strong>Composable libraries, vendor-controlled deployment</strong> — own API + DB, SDK facades local vs. remote.</li>
 <li><strong>Local-first shift-left development</strong> - run and test everything locally, LLM-friendly</li>
@@ -115,7 +115,7 @@ The platform owns a <strong>linear security data-path</strong>:</p>
 <h2 id="principle-2--architecture-enforced-at-compile-time">Principle 2 — Architecture enforced at compile time</h2>
 <p>Custom static analysis is a <strong>core architectural mechanism</strong>, not a coding aid.</p>
 <ul>
-<li><code>tools/dylint_lints/</code> — a dedicated Dylint suite that checks:
+<li>Architecture lints (in <code>cargo-gears</code> CLI) — a dedicated <code>cargo gears lint</code> suite that checks:
 <ul>
 <li>contract-layer purity, DTO placement &amp; schema derives</li>
 <li>domain-layer isolation, direct-SQL restrictions</li>
@@ -126,13 +126,13 @@ The platform owns a <strong>linear security data-path</strong>:</p>
 <li>Runs alongside Clippy + CI → <strong>violations fail fast, before review or runtime</strong></li>
 </ul>
 <blockquote>
-<p>&quot;Shift-left&quot;: architecture that lives in markdown decays; Dylint makes it executable.<br />
+<p>&quot;Shift-left&quot;: architecture that lives in markdown decays; `cargo gears lint` makes it executable.<br />
 GTS* = Global Type System identifers like <code>gts.cf.core.events.v1~a.b.c.d.v1~</code></p>
 </blockquote>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="11" data-paginate="true" data-theme="rose-pine-moon" lang="en-US" data-marpit-pagination="11" style="--paginate:true;--theme:rose-pine-moon;" data-marpit-pagination-total="60">
-<h2 id="dylint--compile-time-architecture-validation">Dylint — compile-time architecture validation</h2>
-<p>Repository-specific lints in <code>tools/dylint_lints/</code> make the design <strong>executable</strong> — not just documented - code won't compile in case of violation:</p>
+<h2 id="`cargo gears lint`--compile-time-architecture-validation">`cargo gears lint` — compile-time architecture validation</h2>
+<p>Repository-specific lints in <code>tools/architecture lints (in `cargo-gears` CLI)</code> make the design <strong>executable</strong> — not just documented - code won't compile in case of violation:</p>
 <ul>
 <li><strong>Domain-layer isolation</strong> — no infra imports (<code>sqlx</code>, <code>sea_orm</code>, ...) in <code>domain/</code></li>
 <li><strong>Direct-SQL restriction</strong> — raw SQL only in migration infrastructure</li>
@@ -144,7 +144,7 @@ GTS* = Global Type System identifers like <code>gts.cf.core.events.v1~a.b.c.d.v1
 <li>...</li>
 </ul>
 <blockquote>
-<p>Runs Dylint in CI → architecture violations <strong>fail the build</strong> before review or runtime.</p>
+<p>Runs `cargo gears lint` in CI → architecture violations <strong>fail the build</strong> before review or runtime.</p>
 </blockquote>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="12" data-paginate="true" data-theme="rose-pine-moon" lang="en-US" data-marpit-pagination="12" style="--paginate:true;--theme:rose-pine-moon;" data-marpit-pagination-total="60">
@@ -233,7 +233,7 @@ register as scoped <code>ClientHub</code> clients keyed by GTS instance ID</li>
 <h2 id="engineering-principles-how-we-work">Engineering principles (how we work)</h2>
 <ul>
 <li><strong>Spec-Driven Development</strong> — PRD → Design &amp; ADR → Feature <em>before</em> code</li>
-<li><strong>Code validation</strong> — custom Dylints + Clippy + tests + fuzzing + audits in CI</li>
+<li><strong>Code validation</strong> — custom architecture lints + Clippy + tests + fuzzing + audits in CI</li>
 <li><strong>Quality First</strong> — 90%+ coverage target across unit / integration / E2E / perf / security</li>
 <li><strong>Core in Rust</strong> — compile-time safety + deep static analysis</li>
 <li><strong>Monorepo</strong> — atomic refactors, consistent tooling, realistic local E2E</li>
@@ -249,7 +249,7 @@ correctness, and maintainability matter more than raw implementation speed.</p>
 <ul>
 <li><strong>Compile-time safety</strong> — eliminates broad classes of memory &amp; concurrency bugs</li>
 <li><strong>Great fit for reusable platform code</strong> — predictable perf, explicit interfaces</li>
-<li><strong>Static analysis as architecture</strong> — Clippy + custom Dylints enforce rules at build</li>
+<li><strong>Static analysis as architecture</strong> — Clippy + custom architecture lints enforce rules at build</li>
 <li><strong>Operational efficiency</strong> — low footprint → realistic local/edge runs &amp; E2E</li>
 <li><strong>AI-friendly</strong> - great compiler and linters assistant to catch problems early</li>
 <li><strong>Universal language</strong> — cloud/on-prem/edge, kernel + even frontend, mobile</li>
@@ -287,7 +287,7 @@ correctness, and maintainability matter more than raw implementation speed.</p>
 │  └─ &lt;service&gt;/    # Business/domain &amp; GenAI gears (mini-chat, file-parser, ...)
 ├─ apps/            # Executable apps composing gears (example server)
 ├─ examples/        # Reference gears (users-info, oop-gears, fips-probe)
-├─ tools/           # Dylints, CI scripts, fuzz targets
+├─ tools/           # CI scripts, fuzz targets
 └─ docs/            # Manifest, gears registry, toolkit_unified_system, arch, security
 </code></pre>
 </section>
@@ -539,7 +539,7 @@ Core Platform Integration · Core Platform Services.</em> See <code>docs/GEARS.m
 <li><strong><code>SecurityContext</code> propagation</strong> — explicit data, no thread-local magic</li>
 <li><strong>Outbound boundary</strong> — <code>oagw</code> centralizes egress policy + credential injection</li>
 <li><strong>Credential handling</strong> — <code>credstore</code> + <code>secrecy</code>-aware types</li>
-<li><strong>Static &amp; CI gates</strong> — Clippy, Dylints, <code>cargo-deny</code>, CodeQL, fuzzing, Scorecard/Snyk/Aikido</li>
+<li><strong>Static &amp; CI gates</strong> — Clippy, architecture lints, <code>cargo-deny</code>, CodeQL, fuzzing, Scorecard/Snyk/Aikido</li>
 </ul>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="44" data-paginate="true" data-theme="rose-pine-moon" lang="en-US" data-marpit-pagination="44" style="--paginate:true;--theme:rose-pine-moon;" data-marpit-pagination-total="60">
@@ -582,7 +582,7 @@ without modifying core code.</p>
 <li><code>gts.cf.core.events.event.v1~</code> style IDs as a <strong>platform contract surface</strong></li>
 <li>GTS <strong>JSON Schemas generated directly from Rust types</strong> → registered in Types Registry</li>
 <li>The non-HTTP counterpart to OpenAPI: describes <strong>plugin specs, events, permissions</strong></li>
-<li>GTS-specific <strong>Dylints</strong> validate identifier correctness</li>
+<li>GTS-specific <strong>architecture lints</strong> validate identifier correctness</li>
 </ul>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="46" data-paginate="true" data-theme="rose-pine-moon" lang="en-US" data-marpit-pagination="46" style="--paginate:true;--theme:rose-pine-moon;" data-marpit-pagination-total="60">
@@ -618,7 +618,7 @@ without modifying core code.</p>
 <li><strong>Type-safe REST</strong> — <code>OperationBuilder</code> prevents half-wired routes at compile time</li>
 <li><strong>OpenAPI auto-generated</strong> from the same route declarations that run the service</li>
 <li><strong><code>GET /cw/docs</code></strong> live Swagger UI on the example server</li>
-<li><strong>Architectural Dylints</strong> enforce design rules and patterns at build time</li>
+<li><strong>Architectural architecture lints</strong> enforce design rules and patterns at build time</li>
 <li><strong>Rich docs</strong>: <code>docs/toolkit_unified_system/</code> (13 topic files) + per-gear specs</li>
 </ul>
 </section>
@@ -743,7 +743,7 @@ make fuzz            <span class="hljs-comment"># fuzz smoke tests (30s/target)<
 <ol>
 <li><strong>XaaS-friendly</strong> - built-in multi-tenancy, licensing, usage, etc</li>
 <li><strong>Security by architecture</strong> — AuthN/AuthZ, tenancy, scoped DB access, FIPS 140-3</li>
-<li><strong>Compile-time governance</strong> — linters and Dylints detect violations before runtime</li>
+<li><strong>Compile-time governance</strong> — linters and architecture lints detect violations before runtime</li>
 <li><strong>Composable gear model</strong> — single code - multiple builds and deployments</li>
 <li><strong>Shift-left productivity</strong> — all-in-one gears process for local build and test</li>
 <li><strong>Extensible by design</strong> — custom API data types, plugins, serverless gears</li>

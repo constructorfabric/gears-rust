@@ -33,7 +33,7 @@ See also:
 
 **Engineering principles:**
 - **Spec-Driven Development**: [Specification templates](docs/spec-templates/README.md) (PRD, Design, ADR, Feature) define what gets built *before* code is written. Every gear is well documented.
-- **Shift Left**: Custom [dylint](tools/dylint_lints/) architectural lints enforce design rules at compile time, alongside Clippy, [tests](#testing), fuzzing, and security audits in CI
+- **Shift Left**: Custom architecture lints (via `cargo gears lint`) enforce design rules at compile time, alongside Clippy, [tests](#testing), fuzzing, and security audits in CI
 - **Quality First**: 90%+ test coverage target with unit, integration, E2E, performance, and security testing
 - **Core in Rust**: Compile-time safety, deep static analysis including project-specific lints, so more issues are prevented before review/runtime
 - **Monorepo**: All the core gears and contracts in one place for atomic refactors, consistent tooling/CI, and realistic local build + E2E testing
@@ -145,7 +145,7 @@ See [TOOLKIT UNIFIED SYSTEM](docs/toolkit_unified_system/README.md) and [TOOLKIT
 
 Gears apply defense-in-depth security across the entire development lifecycle — from Rust's compile-time safety guarantees and custom architectural lints, through compile-time tenant isolation and PDP/PEP authorization enforcement, to continuous fuzzing, dependency auditing, and automated security scanning in CI.
 
-See **[Security Overview](docs/security/SECURITY.md)** for the full breakdown, including: Secure ORM with compile-time tenant scoping, authentication/authorization architecture (NIST SP 800-162 PDP/PEP model), 90+ Clippy deny-level rules, custom dylint architectural lints, cargo-deny advisory checks, ClusterFuzzLite continuous fuzzing, CodeQL/Scorecard/Snyk/Aikido scanners, and AI-powered PR review bots.
+See **[Security Overview](docs/security/SECURITY.md)** for the full breakdown, including: Secure ORM with compile-time tenant scoping, authentication/authorization architecture (NIST SP 800-162 PDP/PEP model), 90+ Clippy deny-level rules, custom architecture lints (via `cargo gears lint`), cargo-deny advisory checks, ClusterFuzzLite continuous fuzzing, CodeQL/Scorecard/Snyk/Aikido scanners, and AI-powered PR review bots.
 
 ## FIPS 140-3 support
 

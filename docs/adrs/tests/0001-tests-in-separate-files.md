@@ -5,7 +5,7 @@ date: 2026-04-15
 decision-makers: Constructor Fabric Steering Committee
 ---
 
-# Enforce test code in separate files via dylint lint DE1101
+# Enforce test code in separate files via architecture lint DE1101
 
 **ID**: `cpt-cf-adr-tests-in-separate-files`
 
@@ -30,24 +30,24 @@ Rust modules in the gears-rust monorepo contain inline `#[cfg(test)] mod tests {
 ## Considered Options
 
 * Keep inline tests (Rust Book default)
-* Separate test files with a dylint lint
+* Separate test files with a architecture lint
 * Integration tests only (`tests/` directory)
 
 ## Decision Outcome
 
-Chosen option: "Separate test files with a dylint lint", because it is the only option that provides automatic enforcement, supports incremental migration, and preserves the ability to test `pub(crate)` internals (via `#[path]` module reference which compiles as part of the crate).
+Chosen option: "Separate test files with a architecture lint", because it is the only option that provides automatic enforcement, supports incremental migration, and preserves the ability to test `pub(crate)` internals (via `#[path]` module reference which compiles as part of the crate).
 
 ### Consequences
 
 * All new gears must follow the `{stem}_tests.rs` companion file convention from day one.
-* Existing modules are migrated incrementally by removing entries from `excluded_paths` in `dylint.toml`.
+* Existing modules are migrated incrementally by removing entries from `excluded_paths` in the lint configuration in `Gears.toml`.
 * The `extract_tests.py` migration script must be maintained alongside the lint.
 * Developers unfamiliar with the convention will see a clear lint error message explaining what to do.
-* CI pipeline adds ~15 seconds for the dylint check.
+* CI pipeline adds ~15 seconds for the `cargo gears lint` check.
 
 ### Confirmation
 
-Compliance is confirmed automatically: CI runs `cargo dylint` which includes lint DE1101. Any inline test code exceeding the threshold or violating the companion file guard produces a build error. The `excluded_paths` list in `dylint.toml` tracks modules not yet migrated.
+Compliance is confirmed automatically: CI runs `cargo gears lint` which includes lint DE1101. Any inline test code exceeding the threshold or violating the companion file guard produces a build error. The `excluded_paths` list in the lint configuration in `Gears.toml` tracks modules not yet migrated.
 
 ## Pros and Cons of the Options
 
@@ -63,9 +63,9 @@ Follow the standard Rust convention: `#[cfg(test)] mod tests { ... }` inline in 
 * Bad, because PRs mix production and test changes in the same diff.
 * Bad, because no automatic enforcement — relies on code review.
 
-### Separate test files with a dylint lint
+### Separate test files with a architecture lint
 
-Enforce `*_tests.rs` companion files via a custom dylint lint (DE1101). The lint denies inline test blocks exceeding `max_inline_test_lines` (default: 100), denies any inline test when a companion file exists, and validates `#[path]` attributes.
+Enforce `*_tests.rs` companion files via a custom architecture lint (DE1101). The lint denies inline test blocks exceeding `max_inline_test_lines` (default: 100), denies any inline test when a companion file exists, and validates `#[path]` attributes.
 
 * Good, because production files contain only production code.
 * Good, because test files are instantly identifiable by naming convention (`*_tests.rs`).
@@ -76,7 +76,7 @@ Enforce `*_tests.rs` companion files via a custom dylint lint (DE1101). The lint
 * Good, because incremental migration via `excluded_paths` — modules are migrated one by one.
 * Good, because smaller files reduce LLM context window usage — agents process production logic without loading test code.
 * Bad, because it deviates from Rust Book convention — may surprise Rust developers.
-* Bad, because it requires tooling (dylint lint + migration script).
+* Bad, because it requires tooling (architecture lint + migration script).
 * Bad, because navigation between production and test files requires one extra step.
 
 ### Integration tests only (`tests/` directory)
@@ -92,7 +92,7 @@ Move all tests to the `tests/` directory as integration tests.
 ## Configuration
 
 ```toml
-# dylint.toml
+# the lint configuration in `Gears.toml`
 [de1101_tests_in_separate_files]
 max_inline_test_lines = 100
 excluded_paths = [
@@ -126,11 +126,11 @@ mod handler_tests;
 ### Migration path
 
 1. Run `extract_tests.py <directory>` to automatically split inline tests into companion files.
-2. Remove the module from `excluded_paths` in `dylint.toml`.
+2. Remove the module from `excluded_paths` in the lint configuration in `Gears.toml`.
 3. CI enforces the convention going forward.
 
 ## References
 
 - [Rust Book ch11-03: Test Organization](https://doc.rust-lang.org/book/ch11-03-test-organization.html)
-- [DE1101 lint README](../../../tools/dylint_lints/de11_testing/de1101_tests_in_separate_files/README.md)
+- Architecture lint DE1101 (via `cargo gears lint`)
 - [Unit & Integration Testing Guide](../../toolkit_unified_system/12_unit_testing.md)

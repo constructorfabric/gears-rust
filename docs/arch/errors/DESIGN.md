@@ -187,7 +187,7 @@ Every canonical category has a GTS identifier assigned before any code is writte
 
 Any error that does not match a canonical category is mapped to `internal` with a trace ID. No error escapes the system without a canonical category.
 
-> **Note**: Full enforcement of this principle (catching panics, unhandled rejections, and unknown error types in middleware) depends on the error middleware catch-all capability, which is out of scope for the current phase (see PRD §4.2). In the current phase, the principle is upheld by compile-time enforcement (typed enum, Dylint rules) and the single `From<CanonicalError> for Problem` conversion path.
+> **Note**: Full enforcement of this principle (catching panics, unhandled rejections, and unknown error types in middleware) depends on the error middleware catch-all capability, which is out of scope for the current phase (see PRD §4.2). In the current phase, the principle is upheld by compile-time enforcement (typed enum, Architecture lint rules) and the single `From<CanonicalError> for Problem` conversion path.
 
 ### 2.2 Constraints
 
@@ -312,9 +312,9 @@ async fn get_user(Path(id): Path<String>) -> Result<Json<User>, CanonicalError> 
 │  │ #[resource_error]    │ macro                 │
 │  └──────────────────────┘                       │
 ├─────────────────────────────────────────────────┤
-│  dylint_lints/                                  │
+│  architecture lints (via `cargo gears lint`)                                │
 │  ┌─────────────────┐                            │
-│  │ Dylint Rules    │ compile-time lint           │
+│  │ Architecture Lint Rules     │ compile-time lint           │
 │  └─────────────────┘                            │
 └─────────────────────────────────────────────────┘
 ```
@@ -404,13 +404,13 @@ The `#[resource_error("gts.cf.core.users.user.v1~")] struct UserResourceError;` 
 
 The macro is a code generator. It does not add new categories or context types. It does not perform any runtime logic beyond delegation to `CanonicalError` constructors.
 
-#### Dylint Rules
+#### Architecture Lint Rules
 
-- [ ] `p1` - **ID**: `cpt-cf-errors-component-dylint-rules`
+- [ ] `p1` - **ID**: `cpt-cf-errors-component-architecture-lint-rules`
 
 **Responsibility scope**:
 
-A set of Dylint lint rules (located in `dylint_lints/`) that enforce canonical error construction patterns at compile time. The rules detect and reject code that bypasses the canonical error system — e.g., constructing `Problem` directly, returning raw HTTP error responses, or using legacy error patterns (`Problem::new()`, `ErrDef`, `declare_errors!`, `ErrorCode`).
+A set of architecture lint rules (via `cargo gears lint`) that enforce canonical error construction patterns at compile time. The rules detect and reject code that bypasses the canonical error system — e.g., constructing `Problem` directly, returning raw HTTP error responses, or using legacy error patterns (`Problem::new()`, `ErrDef`, `declare_errors!`, `ErrorCode`).
 
 **Rules**:
 1. **No direct `Problem` construction** — all `Problem` instances must originate from `CanonicalError` via the `From` impl
@@ -419,7 +419,7 @@ A set of Dylint lint rules (located in `dylint_lints/`) that enforce canonical e
 
 **Responsibility boundaries**:
 
-Dylint rules are static analysis only. They do not modify code, do not run at runtime, and do not define new error categories or context types.
+Architecture lint rules are static analysis only. They do not modify code, do not run at runtime, and do not define new error categories or context types.
 
 ##### Related components (by ID)
 
@@ -740,7 +740,7 @@ Not applicable. Errors are transient in-memory values. No persistent storage.
 
 | Tier | When | Mechanism | What It Catches |
 |------|------|-----------|-----------------|
-| 1. Compile-time | `cargo build` | Typed enum variants, exhaustive `match`, `#[resource_error]` macro, `GtsSchema` const, Dylint lint rules (`dylint_lints/`), `#[non_exhaustive]` on enum + variants, `pub(crate)` internal constructors | Wrong context type, missing match arm, GTS typos, direct `Problem` construction, legacy error patterns, direct variant construction, bypassing builder API |
+| 1. Compile-time | `cargo build` | Typed enum variants, exhaustive `match`, `#[resource_error]` macro, `GtsSchema` const, architecture lint rules (via `cargo gears lint`), `#[non_exhaustive]` on enum + variants, `pub(crate)` internal constructors | Wrong context type, missing match arm, GTS typos, direct `Problem` construction, legacy error patterns, direct variant construction, bypassing builder API |
 | 2. Test-time | `cargo test` | Showcase tests with `assert_eq!` on full Problem JSON per category; JSON Schema equality assertions per context type | Field renames, default message changes, status code changes, schema drift |
 | 3. CI-time | PR merge gate | `cargo-semver-checks` on `cf-gears-toolkit-errors`; schema file diffing; snapshot CI gate | Removed types, changed signatures, schema evolution |
 | 4. Design-time | Architecture | Single `Problem` conversion point; dedicated context constructors; `GtsSchema` generates schemas from types | Ad-hoc JSON construction, missing required fields, schema/code divergence |

@@ -86,7 +86,7 @@ Constructor Gears deliberately does **not**:
 ## Key defining characteristics
 
 1. **Secure by default (defense-in-depth)** — security is structural, not opt-in, validated at build time.
-2. **Architecture enforced at compile time** - use custom lint rules via `dylint`
+2. **Architecture enforced at compile time** - use custom lint rules via `cargo gears lint`
 3. **Three-tier gears hierarchy** — toolkit, System gears, Service gears.
 4. **Composable libraries, vendor-controlled deployment** — own API + DB, SDK facades local vs. remote.
 5. **Local-first shift-left development** - run and test everything locally, LLM-friendly
@@ -120,21 +120,21 @@ The platform owns a **linear security data-path**:
 
 Custom static analysis is a **core architectural mechanism**, not a coding aid.
 
-- `tools/dylint_lints/` — a dedicated Dylint suite that checks:
+- Architecture lints (in `cargo-gears` CLI) — a dedicated `cargo gears lint` suite that checks:
   - contract-layer purity, DTO placement & schema derives
   - domain-layer isolation, direct-SQL restrictions
   - versioned REST paths, mandatory `OperationBuilder` metadata
   - OData extension usage, GTS* identifier correctness
 - Runs alongside Clippy + CI → **violations fail fast, before review or runtime**
 
-> "Shift-left": architecture that lives in markdown decays; Dylint makes it executable.
+> "Shift-left": architecture that lives in markdown decays; `cargo gears lint` makes it executable.
 > GTS* = Global Type System identifers like `gts.cf.core.events.v1~a.b.c.d.v1~`
 
 ---
 
-## Dylint — compile-time architecture validation
+## `cargo gears lint` — compile-time architecture validation
 
-Repository-specific lints in `tools/dylint_lints/` make the design **executable** — not just documented - code won't compile in case of violation:
+Repository-specific architecture lints (via `cargo gears lint`) make the design **executable** — not just documented - code won't compile in case of violation:
 
 - **Domain-layer isolation** — no infra imports (`sqlx`, `sea_orm`, ...) in `domain/`
 - **Direct-SQL restriction** — raw SQL only in migration infrastructure
@@ -145,7 +145,7 @@ Repository-specific lints in `tools/dylint_lints/` make the design **executable*
 - **GTS identifier correctness** — valid IDs; no `schema_for!` on GTS structs
 - ...
 
-> Runs Dylint in CI → architecture violations **fail the build** before review or runtime.
+> Runs `cargo gears lint` in CI → architecture violations **fail the build** before review or runtime.
 
 ---
 
@@ -216,7 +216,7 @@ Every backbone concern is a **regular, replaceable gear** with its own SDK:
 ## Engineering principles (how we work)
 
 - **Spec-Driven Development** — PRD → Design & ADR → Feature *before* code
-- **Code validation** — custom Dylints + Clippy + tests + fuzzing + audits in CI
+- **Code validation** — custom architecture lints + Clippy + tests + fuzzing + audits in CI
 - **Quality First** — 90%+ coverage target across unit / integration / E2E / perf / security
 - **Core in Rust** — compile-time safety + deep static analysis
 - **Monorepo** — atomic refactors, consistent tooling, realistic local E2E
@@ -236,7 +236,7 @@ correctness, and maintainability matter more than raw implementation speed.
 
 - **Compile-time safety** — eliminates broad classes of memory & concurrency bugs
 - **Great fit for reusable platform code** — predictable perf, explicit interfaces
-- **Static analysis as architecture** — Clippy + custom Dylints enforce rules at build
+- **Static analysis as architecture** — Clippy + custom architecture lints enforce rules at build
 - **Operational efficiency** — low footprint → realistic local/edge runs & E2E
 - **AI-friendly** - great compiler and linters assistant to catch problems early
 - **Universal language** — cloud/on-prem/edge, kernel + even frontend, mobile
@@ -277,7 +277,7 @@ cyberware-rust/
 │  └─ <service>/    # Business/domain & GenAI gears (mini-chat, file-parser, ...)
 ├─ apps/            # Executable apps composing gears (example server)
 ├─ examples/        # Reference gears (users-info, oop-gears, fips-probe)
-├─ tools/           # Dylints, CI scripts, fuzz targets
+├─ tools/           # CI scripts, fuzz targets
 └─ docs/            # Manifest, gears registry, toolkit_unified_system, arch, security
 ```
 
@@ -533,7 +533,7 @@ Gateway middleware order:
 - **`SecurityContext` propagation** — explicit data, no thread-local magic
 - **Outbound boundary** — `oagw` centralizes egress policy + credential injection
 - **Credential handling** — `credstore` + `secrecy`-aware types
-- **Static & CI gates** — Clippy, Dylints, `cargo-deny`, CodeQL, fuzzing, Scorecard/Snyk/Aikido
+- **Static & CI gates** — Clippy, architecture lints, `cargo-deny`, CodeQL, fuzzing, Scorecard/Snyk/Aikido
 
 ---
 
@@ -562,7 +562,7 @@ without modifying core code.
 - `gts.cf.core.events.event.v1~` style IDs as a **platform contract surface**
 - GTS **JSON Schemas generated directly from Rust types** → registered in Types Registry
 - The non-HTTP counterpart to OpenAPI: describes **plugin specs, events, permissions**
-- GTS-specific **Dylints** validate identifier correctness
+- GTS-specific **architecture lints** validate identifier correctness
 
 ---
 
@@ -601,7 +601,7 @@ One platform-wide error vocabulary, aligned with the **16 gRPC categories**:
 - **Type-safe REST** — `OperationBuilder` prevents half-wired routes at compile time
 - **OpenAPI auto-generated** from the same route declarations that run the service
 - **`GET /cw/docs`** live Swagger UI on the example server
-- **Architectural Dylints** enforce design rules and patterns at build time
+- **Architectural architecture lints** enforce design rules and patterns at build time
 - **Rich docs**: `docs/toolkit_unified_system/` (13 topic files) + per-gear specs
 
 ---
@@ -733,7 +733,7 @@ On **Windows** (no `make`): `python tools/scripts/ci.py check`
 
 1. **XaaS-friendly** - built-in multi-tenancy, licensing, usage, etc
 2. **Security by architecture** — AuthN/AuthZ, tenancy, scoped DB access, FIPS 140-3
-3. **Compile-time governance** — linters and Dylints detect violations before runtime
+3. **Compile-time governance** — linters and architecture lints detect violations before runtime
 4. **Composable gear model** — single code - multiple builds and deployments
 5. **Shift-left productivity** — all-in-one gears process for local build and test
 6. **Extensible by design** — custom API data types, plugins, serverless gears

@@ -89,7 +89,7 @@ Create files in this order (each layer builds on the previous):
 
 1. `cargo build -p <gear-crate>` — must compile
 2. `cargo clippy -p <gear-crate>` — no warnings
-3. `make dylint` — architecture lints pass
+3. `cargo gears lint` — architecture lints pass
 4. `cargo test -p <gear-crate>` — tests pass
 
 ## Workflow: Edit an existing gear
