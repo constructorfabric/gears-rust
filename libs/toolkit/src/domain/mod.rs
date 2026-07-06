@@ -43,7 +43,7 @@
 //! clear error messages at macro expansion time, similar to how `#[api_dto]` validates
 //! its arguments.
 //!
-//! Additional enforcement is provided by Dylint lints:
+//! Additional enforcement is provided by `cargo gears lint` rules:
 //! - `DE0301`: Prohibits infrastructure imports in domain layer
 //! - `DE0308`: Prohibits HTTP types in domain layer
 

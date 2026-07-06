@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_allowed_infra_in_domain_layer() {
-        // "infra::Repo" is now allowed (architectural decision left to dylint)
+        // "infra::Repo" is now allowed (architectural decision left to `cargo gears lint`)
         let input: DeriveInput = parse_quote! {
             pub struct GoodModel {
                 pub repo: infra::Repo,
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn test_allowed_api_in_domain_layer() {
-        // "api::Handler" is now allowed (architectural decision left to dylint)
+        // "api::Handler" is now allowed (architectural decision left to `cargo gears lint`)
         let input: DeriveInput = parse_quote! {
             pub struct GoodModel {
                 pub handler: api::Handler,

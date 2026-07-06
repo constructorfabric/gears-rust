@@ -1,6 +1,6 @@
 //! Tests for [`super::GtsTenantTypeChecker`].
 //!
-//! Extracted into a companion file per dylint `DE1101` (inline test
+//! Extracted into a companion file per `cargo gears lint` rule `DE1101` (inline test
 //! blocks > 100 lines must move out of the production source file).
 //! The fakes here are local to the checker's unit tests; the
 //! cross-gear `SlowRegistry` used by service-level integration
