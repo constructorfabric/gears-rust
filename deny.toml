@@ -79,10 +79,10 @@ exceptions = [
   #   2. CF/Gears's document parsing is incidental to the platform's core value
   #      proposition; it is NOT a product sold primarily as a document-parsing service
   #      competing with kreuzberg.
-  #   3. The pin `=4.9.8` prevents silent upgrades; any future version bump must be
-  #      reviewed for license changes. 4.9.8 reviewed: still Elastic-2.0, no change.
+  #   3. The pin `=4.9.9` prevents silent upgrades; any future version bump must be
+  #      reviewed for license changes. 4.9.9 reviewed: still Elastic-2.0, no change.
   # Reviewer sign-off required before removing or modifying this exception.
-  { name = "kreuzberg", version = "=4.9.8", allow = ["Elastic-2.0"] },
+  { name = "kreuzberg", version = "=4.9.9", allow = ["Elastic-2.0"] },
   # aws-lc-fips-sys vendors AWS-LC-FIPS sources carrying an OpenSSL license term
   # as part of the upstream license expression. We do not allow OpenSSL globally,
   # so keep this exception pinned to the reviewed crate release only.
