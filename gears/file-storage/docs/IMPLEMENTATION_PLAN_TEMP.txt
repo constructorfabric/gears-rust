@@ -3529,3 +3529,100 @@ only has to happen once against the final schema rather than twice.
 
 
 ---
+
+## EXECUTION LOG — remediation run (2026-07-06/07)
+
+> Appended after executing this plan. Branch: `feat/file-storage-p2-remediation`
+> (cut from `main` after P2 merge #4170; P2 is fully in `main`). Each step was
+> implemented as an isolated agent with build/clippy/test verification between
+> steps. Four DCO-signed commits, one per tier. Working tree clean.
+>
+> NOTE: the Cargo package is `cf-gears-file-storage` (+ `-sdk`), not
+> `file-storage` — every `-p file-storage` command in this plan must use
+> `-p cf-gears-file-storage`.
+
+### Commits (branch `feat/file-storage-p2-remediation`, off `main`)
+- `eb8b293f9` — Tier 0 (11/11): correctness & security showstoppers
+- `cd36794f6` — Tier 1 (11 of 14): production-readiness (blocked items excluded)
+- `f8d53f095` — Tier 2 (13/13): correctness hardening
+- `b66ff2573` — Tier 3 (11/11): documentation reconciliation
+- Total: 77 files, +11025 / -669. Full gear suite green (119 lib + integration +
+  sdk), `cargo fmt --check` + `cargo clippy --all-targets -D warnings` clean,
+  sidecar builds, OpenAPI (`docs/api/api.json`) regenerated via `make openapi`.
+
+### DONE — Tier 0 (all)
+0.7, 0.9, 0.10, 0.11, 0.1, 0.4, 0.8, 0.3, 0.6, 0.5, 0.2.
+Migrations added: `m20260706_000001_idempotency_subject_id` (0.10).
+
+### DONE — Tier 1 (cleanly-implementable subset)
+1.1, 1.2(a), 1.2(b), 1.3, 1.4(sweep half), 1.5, 1.6, 1.8, 1.9, 1.10(option b), 1.11.
+
+### DONE — Tier 2 (all)
+2.1 … 2.13. Migrations added: `m20260706_000002_idempotency_request_hash` (2.1),
+`m20260706_000003_policies_unique_scope` (2.4). New guardrail:
+`tests/error_mapping_test.rs` (exhaustive DomainError→status; adding a variant
+without a row is a compile error). `2.4` used the transaction + partial-unique-index
+backstop (not raw ON CONFLICT) to avoid bypassing SecureORM scope validation.
+
+### DONE — Tier 3 (all)
+3.1 … 3.11. New `docs/operations.md`; `docs/migration.sql` synced; api.md /
+DESIGN.md / ADR-0003 / ADR-0004 / multipart-coordinator.md / README.md /
+DECOMPOSITION.md reconciled to the shipped code. New `DomainError::RetentionRuleNotFound`
+(3.10). InactivityRetention re-documented as "not modified" (3.11).
+
+### NOT DONE — blocked, needs a team decision / external dependency
+- **1.7 — S3 backend**: external-SDK security review + S3 crate choice + heavy new
+  dependency. Not started. Unblocks 0.2's native multipart and 1.2(b)/1.7.4 streaming.
+- **1.4 — quota half**: no `QuotaClient` SDK crate exists in the workspace.
+  `gear.rs`'s `None, // quota_client` left as-is.
+- **1.12 — usage accounting symmetry**: coupled with wiring `usage_reporter` off
+  `None` (usage-collector-sdk exists) — needs a wiring decision; do in one change.
+
+### NOT DONE — Tier 4 (4.1–4.11): deferred/P3 by design
+Deliverable is a tracking ticket per item, not code — not filed by this run.
+
+### DEFERRED sub-parts inside completed tiers (flagged in commits/code)
+- **E2E tests** across Tier 0–3: skipped (need `FS_E2E_BINARY` / running server /
+  `E2E_AUTH_TOKEN_USER_B`). Unit coverage added everywhere; each plan step lists
+  the specific E2E case to add when the harness/env exists.
+- 0.1: streaming read-back on finalize; retiring client-driven finalize (option 1,
+  internal-auth) — the returned upload token is still plaintext to the client.
+- 1.6: `/readyz` (needs a cheap backend-readiness hook or 1.7.2's registry).
+- 1.8: control-plane per-route latency uses api-gateway's existing http_metrics
+  (not duplicated); backend-error metric hooked only at the clearest points.
+- 1.10: option (a) ingress MIME-sniff (Claims `declared_mime` + sidecar stream
+  sniff); multipart-complete path does not validate MIME.
+- 1.11: real MIME + ETag threading into the download (GET) token/claims (currently
+  `application/octet-stream`, no ETag).
+- 2.2: `VersionRepo::get` direct predicate landed (the "unreliable secure layer"
+  claim did not reproduce); internal full-version-set callers keep an explicit
+  unbounded path (`i64::MAX` limit).
+- 2.7: the stronger `content_id → file_versions(version_id)` FK
+  (`ON DELETE RESTRICT`) — needs cross-backend verification (circular composite FK);
+  predicate guard shipped instead.
+- 2.8: `sweep_abandoned_pending` selects the pending version by age only, not by
+  multipart-session state — it can still delete an active session's backing version
+  (pre-existing; 2.8 only stopped the new FK-cascade file deletion). Worth a
+  dedicated item.
+- 2.12: principal-existence validation of the transfer target + a privileged
+  transfer action (both need account-management SDK / 0.7 admin-scope decision);
+  minimal fix shipped (reject nil UUID; cross-tenant already structurally impossible).
+- 3.3: multipart `complete` richer contract (200 `{version_id, content_hash, size}`,
+  `If-Match`/412, 409-with-missing-parts) — code enhancements, doc marks as tracked.
+- 3.4: `GET /files/{id}/multipart/{upload_id}` (introspect/resume) — ship-or-defer
+  team decision; documented as a gap.
+- 3.6: five per-feature FEATURE docs (policy-engine, retention-cleanup, audit-trail,
+  ownership-transfer, backend-migration) — minimal scope-correction done instead
+  (compliance-weight recommendation to author them).
+
+### Design 🛑 to confirm with the team before merge
+- 0.7/0.5/0.9/0.11: `actions::ADMIN_POLICY` is a new gear-local action authorized
+  via the existing `file_storage.file` resource type — confirm no platform-wide
+  admin scope already exists.
+- 2.5: routes corrected 412→400 because `FailedPrecondition→400` is the platform's
+  canonical convention (confirmed against account-management). If 412 is required,
+  that's a `toolkit-canonical-errors` change (cross-cutting), not local.
+
+### Process left
+- Push Tier 1–3 to update PR #4184 (per instruction, only Tier 0 was pushed).
+- Delete this file once the work is split into tracked tickets/PRs.

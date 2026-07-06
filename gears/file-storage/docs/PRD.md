@@ -535,6 +535,11 @@ exhaustion for the platform. Quota checks must cover all storage-consuming opera
 prevent quota bypass through versioned overwrites.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
+**Implementation status (P2, dated 2026-07-07)**: not met yet; the requirement remains open. Storage quota is
+**not enforced in any deployment today** — the Quota Enforcement service this depends on does not exist yet.
+`file-storage` has built its side and is ready to consume the check once that service ships. Technical detail in
+[DESIGN.md](./DESIGN.md) (`quota-adapter`) and [operations.md](./operations.md).
+
 ### 5.5 Metadata
 
 #### Rich Metadata Storage
@@ -1186,6 +1191,9 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 **Protocol/Format**: Synchronous per-owner quota check requests before storage-consuming operations
 (per `cpt-cf-file-storage-fr-storage-quota`)
 **Compatibility**: Contract follows platform quota enforcement protocol; changes require coordinated release.
+
+**Implementation status (P2, dated 2026-07-07)**: not satisfied yet — the Quota Enforcement counterparty does not
+exist, so this contract is not exercised in any deployment. `file-storage`'s side is ready. See [DESIGN.md](./DESIGN.md).
 
 #### EventBroker Contract
 

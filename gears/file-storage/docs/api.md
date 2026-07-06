@@ -179,7 +179,7 @@ Notes:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `declared_mime` | `string` | yes | MIME type of the file being uploaded (e.g. `video/mp4`). Validated against the effective allowed-types policy. |
-| `declared_size` | `uint64` | yes | Total file size in bytes. The control plane validates this against the effective policy size limit and storage quota at initiate time — exactly like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any bytes are transferred. `400` if it exceeds the policy size limit; `429` if it would exceed the storage quota. |
+| `declared_size` | `uint64` | yes | Total file size in bytes. The control plane validates this against the effective policy size limit and storage quota at initiate time — exactly like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any bytes are transferred. `400` if it exceeds the policy size limit; `429` if it would exceed the storage quota. **Implementation status (P2, dated 2026-07-07)**: the `429` quota path only fires when a `QuotaClient` is configured — none is, in any deployment today (`gear.rs`'s `quota_client: None`, Tier 1 item 1.4) — so callers will not currently observe quota rejections; see [operations.md](./operations.md#storage-quota-not-enforced). |
 
 **`P2-1` initiate response** (`application/json`) — the server-computed plan:
 
@@ -484,7 +484,10 @@ X-FS-Meta-<key>: <value>                               # one header per custom m
   unparseable `Range` is **not** a `416` — it is ignored and the full body is served with `200`.
 - `429 Too Many Requests` — the `max_conns` claim for this `(file_id, op)` is exceeded (sidecar, P2); or the
   control-plane storage quota would be exceeded on `create_file`/`presign_version`/multipart `initiate`
-  (`QuotaExceeded`).
+  (`QuotaExceeded`). **Implementation status (P2, dated 2026-07-07)**: the `QuotaExceeded` case is only reachable
+  when a `QuotaClient` is wired. None is, in any deployment today — `gear.rs` always passes `quota_client: None`
+  (Tier 1 item 1.4), so `check_quota`/`check_quota_bytes` are a permissive no-op and this specific `429` cause
+  cannot currently occur. See [operations.md](./operations.md#storage-quota-not-enforced).
 
 Removed from this table (no corresponding code path found — verified by grepping the gear's `src/` for the status
 code and for any `DomainError` variant that could map to it): `422 Unprocessable Entity` (previously claimed for

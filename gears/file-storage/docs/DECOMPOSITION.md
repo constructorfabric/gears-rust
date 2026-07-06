@@ -73,13 +73,18 @@ lifecycle events, not yet drained to the platform EventBroker — Tier 4 item 4.
 - **Out of scope**:
   - Single-shot upload path (owned by P1 foundation)
   - File download, listing, metadata update, or delete (owned by P1 foundation)
-  - Storage quota ledger management (quota is read and enforced here; ledger updates owned by P1 foundation)
+  - Storage quota ledger management (quota is read and *checked* here via the `QuotaClient` port — see
+    implementation-status note below; the check itself is currently a no-op because no client is wired; ledger
+    updates owned by P1 foundation)
 
 - **Requirements Covered**:
 
   - [ ] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
   - [ ] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-storage-quota`
+  - [ ] `p2` - `cpt-cf-file-storage-fr-storage-quota` — **implementation status (P2, dated 2026-07-07)**: the
+    `check_quota_bytes` call site exists in `multipart_service.rs`, but `gear.rs` wires `quota_client: None`
+    (Tier 1 item 1.4), so no quota is actually enforced on multipart initiate today — permissive/fail-open, blocked
+    on a Quota Enforcement SDK crate (`gears/system/quota-enforcement/` is docs-only)
 
 - **Design Principles Covered**:
 

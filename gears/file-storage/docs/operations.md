@@ -15,6 +15,7 @@ pass — see the file/line pointers in each entry.
 - [Sidecar config: `FS_SIDECAR_*` environment variables](#sidecar-config-fs_sidecar_-environment-variables)
 - [The background cleanup sweep](#the-background-cleanup-sweep)
 - [Idempotent-create semantics](#idempotent-create-semantics)
+- [Storage quota (not enforced)](#storage-quota-not-enforced)
 - [The `SignatureProvider` / `SignatureVerifier` abstraction](#the-signatureprovider--signatureverifier-abstraction)
 
 <!-- /toc -->
@@ -215,6 +216,24 @@ by two checks (both must pass, added across two separate remediations):
   request the caller never actually made.
 
 See `docs/migration.sql`'s `idempotency_keys` table and `docs/api.md`'s `409` summary for the wire-level contract.
+
+## Storage quota (not enforced)
+
+**Implementation status (P2, dated 2026-07-07).** `FileService` and `MultipartService` both accept an optional
+`quota_client: Option<Arc<dyn QuotaClient>>` and call `check_quota` / `check_quota_bytes`
+(`src/domain/service/create.rs`, `src/domain/multipart_service.rs`) before every storage-increasing operation
+(`create_file`, `presign_version`, multipart initiate) — see the `QuotaClient` trait in
+`src/infra/external_clients.rs`. That consumer-side port is designed to fail **closed**: if a wired client's
+`check_storage_quota` call returns an error, the error propagates and the request is denied (see
+`tests/enforce_test.rs`).
+
+There is no config knob for this in the table above because there is nothing to configure yet — `gear.rs`
+unconditionally constructs both services with `quota_client: None` (`TODO(P2)`, Tier 1 item 1.4). When `None`,
+`check_quota`/`check_quota_bytes` short-circuit to `Ok(())`. **This means storage quota is not enforced in any
+deployment today**: the effective behavior is permissive / fail-**open**, not the fail-closed behavior the port
+was designed for. No `QuotaClient` implementation exists to wire in — the Quota Enforcement gear
+(`gears/system/quota-enforcement/`) is docs-only (PRD/DESIGN/ADRs, no Rust crate, no SDK). **Operators must not
+assume any storage limit is in effect** until this is wired.
 
 ## The `SignatureProvider` / `SignatureVerifier` abstraction
 

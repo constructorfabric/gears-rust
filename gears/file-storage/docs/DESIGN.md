@@ -768,6 +768,15 @@ intended decomposition. Their detailed designs live in P2/P3 FEATURE artifacts (
 | `audit-publisher`                                     | P2    | Transactional outbox writer + async worker that drains to the platform audit sink                                        | PRD `cpt-cf-file-storage-fr-audit-trail`                                                       |
 | `event-publisher`                                     | P2    | EventBroker emitter for upload/update/delete events, gated by owner policy                                               | PRD `cpt-cf-file-storage-fr-file-events`                                                       |
 | `quota-adapter`                                       | P2    | Synchronous quota check before storage-consuming operations; usage reports asynchronously                                | PRD `cpt-cf-file-storage-fr-storage-quota`, `…fr-usage-reporting`                              |
+
+> **Implementation status (P2, dated 2026-07-07).** The quota half of `quota-adapter` is consumer-scaffolding only:
+> `file-storage` defines the `QuotaClient` port and calls it (fail-closed on client error) from every
+> storage-increasing operation, but `gear.rs` wires `quota_client: None` (Tier 1 item 1.4) — no client is
+> configured in any deployment, so the check is a permissive/fail-**open** no-op today. Blocked on a Quota
+> Enforcement SDK crate; `gears/system/quota-enforcement/` is docs-only (no Rust crate). The usage-reporting half is
+> further along — a `usage-collector-sdk` crate exists — though `usage_reporter` is also still `None` pending
+> integration (P2 1.12). See [../README.md](../README.md)'s Implementation status section and
+> [operations.md](./operations.md)'s "Storage quota (not enforced)" for detail.
 | `serverless-adapter`                                  | P2    | Subscribes to owner-deletion events; invokes the configured Serverless Runtime workflow per owner                        | PRD `cpt-cf-file-storage-fr-owner-deletion`                                                    |
 | `backend-migrator`                                    | P2    | Relocates a version's bytes between backends (cost-tier moves, deprecation, residency, rebalancing, DR) without rotating `file_id`/`version_id`; updates the version's `backend_id` after a verified copy | PRD `cpt-cf-file-storage-fr-backend-migration`                                                 |
 | `encryption-adapter`                                  | P3    | Manages server-side encryption parameters and key handles per backend                                                    | PRD `cpt-cf-file-storage-fr-file-encryption`                                                   |
@@ -1556,6 +1565,11 @@ statelessness invariant holds. The size claim stays **optional**: absent a baked
 limits apply (an active quota constrains an upload only when the control plane chooses to bake the ceiling). Closing the
 aggregate-owner-quota gap across many concurrent presigns — reserve-at-presign / commit-at-bind / release-on-expiry — is
 a **P2 control-plane** concern, detailed in the P2 `cpt-cf-file-storage-fr-storage-quota` FEATURE.
+
+**Implementation status (P2, dated 2026-07-07)**: this whole paragraph describes intended behavior once quota is
+active. As of this branch, the basic per-request quota check itself is not active either — no `QuotaClient` is
+wired (`gear.rs`'s `quota_client: None`) — so no `max_size` is ever derived from a remaining quota today; see
+[operations.md](./operations.md)'s "Storage quota (not enforced)" section.
 
 **Token opacity (recap).** Only the control plane (minter) and the sidecar (verifier) know the token's claim-set and
 crypto; everyone else forwards it as opaque bytes and never parses it, so the format may evolve without touching

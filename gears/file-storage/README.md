@@ -88,9 +88,20 @@ Built on top of P1, the following shipped:
   `POST /files/{id}/multipart` is rejected against the real default topology. See
   [docs/features/multipart-coordinator.md](docs/features/multipart-coordinator.md) for the tracked gap and current
   vs. intended `complete` contract.
+- **Storage quota — consumer scaffolding only, not enforced.** `check_quota`/`check_quota_bytes` gate every
+  storage-increasing operation (`create_file`, `presign_version`, multipart initiate) via the `QuotaClient` port
+  (`src/infra/external_clients.rs`), and are designed to fail **closed** once a real client is wired (a client
+  error is propagated and denies the request — see `tests/enforce_test.rs`). **But `gear.rs` always constructs both
+  services with `quota_client: None`** (`TODO(P2)`, Tier 1 item 1.4), and `None` makes the check a no-op
+  (`Ok(())`) — so **storage quota is not enforced in any deployment today**; the effective default is permissive /
+  fail-**open**, the opposite of the fail-closed design intent. This is blocked on a Quota Enforcement SDK crate,
+  which does not exist yet: `gears/system/quota-enforcement/` is docs-only (PRD/DESIGN/ADRs, no Rust crate).
+  Contrast with usage reporting, which is further along — a `usage-collector-sdk` crate exists (P2 1.12), even
+  though `usage_reporter` is also still wired as `None` pending its own integration work.
 
-**Not yet implemented**: sharing (shareable links), WebDAV, quota enforcement wiring (Tier 1 item 1.4), and the S3
-backend (Tier 1 item 1.7) — all still declared in the PRD/DESIGN but absent from the code as of this branch.
+**Not yet implemented**: sharing (shareable links), WebDAV, quota enforcement wiring (Tier 1 item 1.4, see the P2
+storage-quota status above), and the S3 backend (Tier 1 item 1.7) — all still declared in the PRD/DESIGN but absent
+from the code as of this branch.
 
 ### Run
 

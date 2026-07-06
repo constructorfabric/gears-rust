@@ -57,6 +57,14 @@ This feature supersedes the interim P2-M3 client-driven implementation in which 
 
 > **Caveat (P2 0.2 — current backend support)**: `LocalFsBackend.multipart_native == false` (it advertises `range_native: true` only), so today `POST /files/{id}/multipart` returns `422 multipart_not_supported` against the real default topology (`local-fs` as the default backend). Multipart uploads only work when a `multipart_native` backend is configured as the default: today that means the non-durable `InMemoryBackend` (dev/test only — see item 0.5), and going forward the S3 backend (Tier 1 item 1.7). A true offset-write `LocalFsBackend` implementation is intentionally deferred until 1.7, since it requires widening `StorageBackend::upload_part` to carry `offset`/`part_size` — the same trait-signature change 1.7.4 (S3 streaming) already plans to make.
 
+> **Caveat (P2, dated 2026-07-07 — quota implementation status)**: `initiate`'s `check_quota_bytes` call
+> (`multipart_service.rs`) is real and fail-closed when a `QuotaClient` is wired, but `gear.rs` always constructs
+> `MultipartService` with `quota_client: None` (Tier 1 item 1.4). No client is wired in any deployment today, so
+> the quota check is a permissive/fail-**open** no-op — the `declared_size exceeds available storage quota` error
+> scenario below and the quota DoD line further down are exercised only by unit tests that inject a mock
+> `QuotaClient` (`tests/enforce_test.rs`), not by any real deployment. Blocked on a Quota Enforcement SDK crate;
+> `gears/system/quota-enforcement/` is docs-only. See `../operations.md#storage-quota-not-enforced`.
+
 
 
 ### 1.3 Actors
@@ -387,6 +395,11 @@ The system **MUST** add `version_id uuid NOT NULL`, `declared_size bigint NOT NU
   `content_id` is untouched, and it does **not** accept `If-Match`/`412` today (both are tracked follow-ups)
 - [x] `DELETE .../multipart/{upload_id}` marks the session aborted, deletes part rows and the pending version, and aborts the backend handle for multipart_native backends
 - [x] Initiating a multipart upload with declared_size exceeding the effective size-limit policy returns 413; exceeding storage quota returns 507; unsupported MIME returns 415
+  (**quota implementation status, P2, dated 2026-07-07**: this `[x]` is exercised only by `tests/enforce_test.rs`
+  injecting a mock `QuotaClient` — no real deployment has one wired, `gear.rs`'s `quota_client: None`, Tier 1 item
+  1.4 — so this rejection path does not fire in production today; see `../operations.md#storage-quota-not-enforced`.
+  Separately, `../api.md` notes the status code was corrected to `429` in a later doc pass; the `507` here is stale
+  and out of scope for this note)
 - [x] multipart_uploads rows carry version_id, declared_size, and part_size columns (migration m20260701_000002_multipart_plan_columns)
 - [x] Against the real default topology (`local-fs`, not `multipart_native`), `POST /files/{id}/multipart` is rejected
   (see the caveat in §1.2) -- multipart is only functional today against a `multipart_native` backend
