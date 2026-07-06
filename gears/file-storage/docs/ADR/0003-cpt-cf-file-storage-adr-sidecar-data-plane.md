@@ -79,14 +79,26 @@ planes:
 * **Data plane** — the **sidecar**. It has its own domain and URL and is the only component that
   moves user bytes. It is connected to N storage backends and validates the signed-URL signature
   (and a platform token only when the signed URL carries a token-claim predicate — see DESIGN §3.2).
-  **P1 path (explicit):** the sidecar reaches the control plane **over the FS SDK in s2s REST mode**
-  (its own app-token plus an on-behalf-of `<user>` claim) to pre-register and bind a version — it
-  holds **no** direct database connection and is a thin, stateless byte-mover. This trades a little
-  per-op latency (an extra control round-trip at pre-register/bind) for a clean security/failure
-  boundary: the data plane never gets DB credentials and cannot mutate metadata except through the
-  control plane's authorized operations. The alternative **direct-DB** mode — the sidecar as a full
-  FileStorage instance over the shared metadata DB (lower latency, no control round-trip) — is
-  **deferred to P2** as a co-located-deployment optimization, behind the same FS SDK interface.
+  **Shipped path (P2):** the sidecar reaches the control plane over a **plain, token-authenticated
+  HTTP callback** — `POST .../versions/{version_id}/finalize` after a successful `PUT`, and
+  `POST .../multipart/{upload_id}/parts/{n}/report` after a successful part write — both authorized
+  solely by the **same signed `fs-token`** that authorized the original operation. There is no FS SDK
+  s2s call, no app-token, and no on-behalf-of delegation: the control plane treats a verified token as
+  full authorization for that one `(file_id, version_id)` operation. The sidecar holds **no** direct
+  database connection and is a thin, stateless byte-mover. It never binds a version as the file's
+  current content — `bind` (the CAS swap of `content_id`) is a separate, later request the **client**
+  issues directly to the control plane. This trades a little per-op latency (the finalize round-trip)
+  for a clean security/failure boundary: the data plane never gets DB credentials and cannot mutate
+  metadata except through the control plane's own, independently-verifying handlers. The alternative
+  **direct-DB** mode — the sidecar as a full FileStorage instance over the shared metadata DB (lower
+  latency, no control round-trip) — remains a deferred, unscheduled co-located-deployment optimization.
+  > **Implementation note (P2).** An earlier P1 draft of this ADR described the sidecar reaching the
+  > control plane over the FS SDK in s2s REST mode, using its own app-token plus an on-behalf-of
+  > `<user>` claim, to pre-register *and auto-bind* a version. That delegation model was never
+  > implemented. What shipped instead is the plain token-authenticated finalize/report-part callback
+  > described above, plus a client-driven `bind` step that never runs automatically. Pre-registration
+  > also happens earlier than originally drafted: the control plane pre-registers the `pending` version
+  > itself, in the same request that returns the signed PUT URL, not in a later sidecar-initiated call.
 
 The critical difference from the direct-to-backend model the prior proxy-all design rejected: **the signed URL points
 at our own sidecar, never at the raw backend.** Therefore every property the prior proxy-all design protected is
@@ -98,8 +110,11 @@ retained — they simply move into the sidecar, which is platform-controlled inf
   the sidecar, with no per-flow carve-outs;
 * a single client protocol independent of backend.
 
-Every operation is therefore **at least two HTTP requests**: a control request (obtain a signed
-URL) plus one or more data requests against the sidecar.
+A **read** is therefore two HTTP requests: a control request (obtain a signed GET URL) plus a data
+request against the sidecar. A **write** is more: **presign (control) → `PUT` (data) → finalize
+(data→control, a token-authenticated callback) → `bind` (control)** — three control-plane touches and
+one data-plane touch, not the two-request model this ADR originally described (see the Implementation
+note above).
 
 Signed URLs are **Ed25519, stateless** (S3-presigned-style): the control plane signs with a private
 key and is the **sole minter**; the sidecar verifies with the public key and can never forge a URL.
@@ -120,8 +135,9 @@ platform auth module's token revocation, not the URL layer.
   DESIGN.md "bandwidth escape hatch" stops being a thought experiment and becomes the architecture.
 * `cpt-cf-file-storage-fr-rest-api` is restated: the control-plane REST surface carries metadata and
   signed URLs only; **content endpoints live on the sidecar**, addressed by signed URL.
-* Content I/O becomes a two-request dance (presign + transfer), reflected in every upload/download
-  sequence (`cpt-cf-file-storage-seq-*`). Upload uses an **immutable-blob + pointer** model:
+* Content I/O becomes a multi-request sequence, reflected in every upload/download sequence
+  (`cpt-cf-file-storage-seq-*`): reads are presign + transfer; writes are presign → `PUT` → finalize
+  (data→control callback) → `bind` (see the Implementation note above). Upload uses an **immutable-blob + pointer** model:
   content is written to an immutable backend object `/{file_id}/{version_id}`; the file's current
   content is a DB pointer (`content_id`) swapped under optimistic CAS — see DESIGN §4.x and
   `cpt-cf-file-storage-fr-upload-file`. A new version is a new object plus a pointer swap; backend
@@ -132,9 +148,11 @@ platform auth module's token revocation, not the URL layer.
 * `cpt-cf-file-storage-fr-range-requests` are served by the sidecar; a single signed download URL
   serves many `Range` requests (random access) because the `Range` header is not part of the
   signature.
-* The sidecar acts on the control plane under its **own app-token plus an on-behalf-of `<user>`**
-  claim; authorization for metadata writes (e.g. version bind) is decided against the delegated
-  user (`cpt-cf-file-storage-fr-authorization`).
+* The sidecar's finalize/report-part callbacks to the control plane are authorized solely by the same
+  signed `fs-token` that authorized the original operation — **not** by an app-token / on-behalf-of
+  delegated identity (see the Implementation note above). The sidecar never performs the `bind`
+  (version) write itself; that remains a client-issued, user-authorized control-plane request
+  (`cpt-cf-file-storage-fr-authorization`).
 * A new signed-URL contract (`cpt-cf-file-storage-fr-signed-urls`) and the constraint model become
   part of the public surface; the response-header set the sidecar must echo verbatim is baked into
   the signed URL.
@@ -184,9 +202,11 @@ Implementation verified via:
   request slot held for the duration of a transfer
 * Good, because the immutable-blob + pointer model makes versioning backend-agnostic and makes
   conflict retries cheap (re-bind a `version_id`, never re-upload bytes)
-* Bad, because every operation is at least two HTTP requests (presign + transfer)
+* Bad, because a read is at least two HTTP requests (presign + transfer) and a write is more
+  (presign → `PUT` → finalize callback → `bind`)
 * Bad, because it introduces signed-URL machinery (signing, verification, key distribution, the
-  constraint model) and a delegation path (sidecar acting on-behalf-of the user)
+  constraint model) and a token-authenticated callback path (the sidecar's finalize/report-part calls
+  back to the control plane)
 * Bad, because there are now two deployable units (control plane + sidecar) and a shared metadata DB
   contract between them
 
@@ -213,8 +233,9 @@ This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-file-storage-fr-rest-api` — control REST carries metadata + signed URLs only; content lives on the sidecar
 * `cpt-cf-file-storage-fr-signed-urls` — new: the Ed25519 stateless signed-URL contract and constraint model
-* `cpt-cf-file-storage-fr-upload-file` / `cpt-cf-file-storage-fr-download-file` — two-request presign + transfer; immutable-blob + pointer model
+* `cpt-cf-file-storage-fr-upload-file` / `cpt-cf-file-storage-fr-download-file` — presign + transfer (download: two requests; upload: presign → `PUT` → finalize → `bind`); immutable-blob + pointer model
 * `cpt-cf-file-storage-fr-range-requests` — served by the sidecar; one signed URL, many ranges
 * `cpt-cf-file-storage-fr-usage-reporting`, `cpt-cf-file-storage-fr-content-type-validation`, `cpt-cf-file-storage-fr-read-audit` — reallocated to the sidecar, still 100% coverage
 * `cpt-cf-file-storage-nfr-bandwidth`, `cpt-cf-file-storage-nfr-scalability` — the bandwidth dimension is confined to the independently-scaled sidecar
-* `cpt-cf-file-storage-fr-authorization` — sidecar acts under app-token + on-behalf-of user (delegation)
+* `cpt-cf-file-storage-fr-authorization` — the sidecar's finalize/report-part callbacks are authorized solely by the
+  signed `fs-token` (no app-token / on-behalf-of delegation); `bind` remains a client-issued, user-authorized request

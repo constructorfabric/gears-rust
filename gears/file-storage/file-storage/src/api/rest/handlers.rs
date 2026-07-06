@@ -394,7 +394,7 @@ pub async fn delete_retention_rule(
     if removed {
         Ok(no_content().into_response())
     } else {
-        Err(DomainError::file_not_found(rule_id).into())
+        Err(DomainError::retention_rule_not_found(rule_id).into())
     }
 }
 

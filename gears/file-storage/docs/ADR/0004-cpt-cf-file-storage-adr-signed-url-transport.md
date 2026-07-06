@@ -13,6 +13,7 @@ date: 2026-06-20
 - [Decision Outcome](#decision-outcome)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
+  - [Implementation note (P2, 2026-07)](#implementation-note-p2-2026-07)
 - [Token Opacity Contract](#token-opacity-contract)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [Encoding: opaque token (chosen) vs discrete fields (rejected)](#encoding-opaque-token-chosen-vs-discrete-fields-rejected)
@@ -136,6 +137,33 @@ the dual-envelope (query + header) and the asymmetric, sidecar-cannot-mint prope
 * Integration tests: the token authorizes via **query** (bare URL, `Range` works) and via **header** (no signing
   material in the URL); a deliberate claim-set / format-version bump verifies end-to-end **without changing any
   intermediary** (browser/CDN/proxy/SDK pass it through unchanged).
+
+### Implementation note (P2, 2026-07)
+
+The P2 implementation (`src/infra/signed_url/mod.rs:9-12`) does **not** use PASETO `v4.public`. It ships a bespoke,
+codec-equivalent format instead: `base64url(json(claims)).base64url(ed25519_signature)` — the JSON claim-set and an
+Ed25519 signature over its serialized bytes, each base64url-encoded and joined with a `.`. There is **no `kid` field**
+anywhere in the token (no footer, no key-id claim); the sidecar is configured with a single static public key and
+cannot select among multiple keys.
+
+This is an **accepted interim measure**, not a silent deviation: the token remains opaque per the Token Opacity
+Contract below (only control and sidecar parse it), it is signed with Ed25519 exactly as this ADR specifies, and the
+control plane remains the sole minter with the sidecar verify-only — every property this ADR actually cares about
+(atomicity, opacity, asymmetric sign/verify, evolvability) holds. What differs is only the concrete codec (bespoke vs.
+the PASETO `v4.public` wire format) and the absence of `kid`-based key rotation. Migrating the codec to a literal
+PASETO `v4.public` library, and adding a `kid`/key-rotation story, is tracked as Tier 4 item 4.9 in the P2 remediation
+plan (`docs/IMPLEMENTATION_PLAN_TEMP.txt`).
+
+**This does not relax the FIPS posture above.** Restating it for this codec: the bespoke format still signs with
+Ed25519 through the in-house `SignatureProvider`/`SignatureVerifier` abstraction (`Ed25519Provider`), not a hard-wired
+crate call, so it satisfies the *replaceability* requirement — but Ed25519 approval under FIPS 186-5 still requires
+the signing/verifying primitive to run inside a **FIPS-validated cryptographic module**, and the current
+`Ed25519Provider` is a generic (non-validated) implementation. Concretely, per the binding rule above: this bespoke
+codec, exactly like the PASETO path it stands in for, **MUST NOT** be used in any FIPS-constrained deployment until
+the provider behind it is swapped for a FIPS-validated module (or a FIPS-approved alternative such as ECDSA P-256 over
+a validated module) — which, because the codec is opaque and evolvable, requires no change to the token format, the
+claim-set, or the rest of this design, only to the provider implementation (and, for the PASETO migration itself, to
+the codec module tracked under Tier 4 item 4.9).
 
 ## Token Opacity Contract
 

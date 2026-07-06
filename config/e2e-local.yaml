@@ -400,7 +400,7 @@ gears:
       storage_root: "./.file-storage-data"
       # Use a fixed Ed25519 seed so signed-URL tokens survive a server restart
       # and the sidecar can be pre-configured with the matching public key.
-      # Value is a 32-byte base64url-encoded seed (44 chars without padding).
+      # Value is a 32-byte base64url-encoded seed (43 chars without padding).
       # SHARED with the sidecar via FS_SIDECAR_PUBLIC_KEY (lifecycle conftest).
       signing_key_seed: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
       # Shared-server e2e run — no non-deterministic background activity.

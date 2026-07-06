@@ -43,6 +43,10 @@
 --     `(file_id, version_id)` PK below; this keeps version updates/deletes keyed
 --     off a single PK column. The `is_current` <-> `files.content_id` invariant
 --     (see the column comment) is maintained ATOMICALLY by the bind transaction.
+--
+--   * This file is a design reference kept in sync by hand; the executable
+--     migrations are the SeaORM files under src/infra/storage/migrations/.
+--     Do not run this SQL directly.
 -- =============================================================================
 
 
@@ -203,28 +207,13 @@ COMMENT ON TABLE file_storage.files_custom_metadata IS
 -- P2 — Multipart Upload, Versioning, Idempotency, Outboxes, Policies, Retention
 -- =============================================================================
 
--- P2 hash-policy widening ----------------------------------------------------
--- Drops the P1 lock on SHA-256 and widens the allow-list to BLAKE3 + XXH3
--- per ADR-0002, on file_versions (where the hash lives). The hash_value length
--- CHECK is also widened to admit algorithm-appropriate digest sizes.
-
-ALTER TABLE file_storage.file_versions
-    DROP CONSTRAINT file_versions_hash_algorithm_check;
-
-ALTER TABLE file_storage.file_versions
-    ADD CONSTRAINT file_versions_hash_algorithm_check
-        CHECK (hash_algorithm IN ('SHA-256', 'BLAKE3', 'XXH3'));
-
-ALTER TABLE file_storage.file_versions
-    DROP CONSTRAINT file_versions_hash_value_check;
-
-ALTER TABLE file_storage.file_versions
-    ADD CONSTRAINT file_versions_hash_value_check
-        CHECK (
-            (hash_algorithm = 'SHA-256' AND octet_length(hash_value) = 32)
-         OR (hash_algorithm = 'BLAKE3'  AND octet_length(hash_value) = 32)
-         OR (hash_algorithm = 'XXH3'    AND octet_length(hash_value) = 8)
-        );
+-- P2 hash-policy widening (NOT IMPLEMENTED) ----------------------------------
+-- The P1 `file_versions.hash_algorithm` CHECK stays locked to 'SHA-256' in P2
+-- as actually shipped (ADR-0002); the BLAKE3/XXH3 allow-list widening
+-- described here in earlier drafts of this file was never implemented and has
+-- been removed to avoid drifting ahead of the real schema. See Tier 4 item
+-- 4.6 ("BLAKE3 alignment") in IMPLEMENTATION_PLAN_TEMP.txt for the pending
+-- team decision on whether/when to pick this up.
 
 
 -- Table: file_storage.multipart_uploads --------------------------------------
@@ -237,6 +226,10 @@ CREATE TABLE file_storage.multipart_uploads (
     file_id          uuid         NOT NULL
                                   REFERENCES file_storage.files (file_id) ON DELETE CASCADE,
 
+    -- The pending file_versions row this session will finalize into (the
+    -- version is pre-registered at initiate time, alongside this row).
+    version_id       uuid         NOT NULL,
+
     -- Backend-side handle (e.g., S3 UploadId) — opaque to FileStorage.
     backend_upload_handle  text   NOT NULL,
 
@@ -248,6 +241,13 @@ CREATE TABLE file_storage.multipart_uploads (
     -- the first uploaded part).
     declared_mime    text         NOT NULL,
     mime_validated   boolean      NOT NULL  DEFAULT false,
+
+    -- Server-authoritative plan parameters (multipart-coordinator, P2-M3):
+    -- persisted so the plan (parts/offsets) can be reconstituted for resume
+    -- without a separate per-plan table. `declared_size` also lets `complete`
+    -- verify actual-vs-declared without re-summing parts.
+    declared_size    bigint       NOT NULL  DEFAULT 0,
+    part_size        bigint       NOT NULL  DEFAULT 0,
 
     -- TTL for abandoned uploads. The reaper marks expired in-flight uploads
     -- as 'aborted' and asks the backend to abort, freeing storage.
@@ -270,8 +270,9 @@ CREATE TABLE file_storage.multipart_upload_parts (
     part_number      int          NOT NULL  CHECK (part_number > 0),
     -- ETag-shaped per-part identifier returned by the backend on PutPart.
     backend_etag     text         NOT NULL,
-    -- Per-part hash (intermediate; needed for BLAKE3 tree-mode finalization
-    -- and for SHA-256 / XXH3 streaming-pass).
+    -- Per-part hash. Currently SHA-256 (matches file_versions.hash_algorithm);
+    -- BLAKE3 subtree hashing was the original design intent but is deferred
+    -- (Tier 4 item 4.6, "BLAKE3 alignment").
     part_hash        bytea        NOT NULL,
     size             bigint       NOT NULL  CHECK (size >= 0),
     uploaded_at      timestamptz  NOT NULL  DEFAULT now(),
@@ -282,7 +283,9 @@ CREATE TABLE file_storage.multipart_upload_parts (
 
 -- NOTE: file_versions is a P1 table (see the P1 section above) — FileStorage-level
 -- versioning works on any backend via distinct objects /{file_id}/{version_id}.
--- P2 only widens its hash CHECK (above). There is no separate P2 version table.
+-- There is no separate P2 version table; its hash_algorithm CHECK is
+-- unchanged from P1 (SHA-256 only — see the "P2 hash-policy widening" note
+-- above).
 
 
 -- Table: file_storage.idempotency_keys ---------------------------------------
@@ -302,9 +305,29 @@ CREATE TABLE file_storage.idempotency_keys (
                                 REFERENCES file_storage.files (file_id) ON DELETE CASCADE,
 
     -- Stored response envelope so retries return the original 201 body.
-    response_status smallint    NOT NULL,
-    response_body   jsonb       NOT NULL,
+    -- `response_body` is a serialized JSON string (text), not jsonb — it is
+    -- deserialized back into the response DTO on replay, never queried.
+    response_status int         NOT NULL,
+    response_body   text        NOT NULL,
     response_etag   text        NOT NULL,
+
+    -- P2 remediation 0.10: the authenticated subject that created this key.
+    -- Not part of the PK (the composite key below is unchanged); the domain
+    -- layer fetches by the composite key and then verifies
+    -- `record.subject_id == ctx.subject_id()`, treating a mismatch as
+    -- Forbidden rather than silently falling through to a fresh create.
+    -- Pre-migration rows are backfilled with the nil UUID, which can never
+    -- match a real subject.
+    subject_id     uuid         NOT NULL  DEFAULT '00000000-0000-0000-0000-000000000000',
+
+    -- P2 remediation 2.1: SHA-256 over a canonicalized, length-prefixed
+    -- encoding of the identity-relevant request fields (name, gts_file_type,
+    -- mime_type, custom_metadata) at insert time. A replay recomputes this
+    -- hash from the current request and rejects a mismatch with 409 Conflict
+    -- ("idempotency key reused with a different request body"), instead of
+    -- silently replaying the original ticket. Pre-migration rows default to
+    -- an empty blob, which can never match a freshly computed digest.
+    request_hash   bytea        NOT NULL  DEFAULT '\x',
 
     created_at     timestamptz  NOT NULL  DEFAULT now(),
     expires_at     timestamptz  NOT NULL,
@@ -347,6 +370,7 @@ CREATE INDEX audit_outbox_unpublished_idx
 CREATE TABLE file_storage.events_outbox (
     event_id        uuid         PRIMARY KEY  DEFAULT gen_random_uuid(),
     tenant_id       uuid         NOT NULL,
+    owner_id        uuid         NOT NULL,
     file_id         uuid         NOT NULL,
     event_type      text         NOT NULL,        -- 'file.created' | 'file.content_replaced' | 'file.metadata_updated' | 'file.deleted'
     payload         jsonb        NOT NULL,
@@ -386,6 +410,22 @@ CREATE TABLE file_storage.policies (
 CREATE INDEX policies_scope_idx
     ON file_storage.policies (tenant_id, scope, scope_owner_id);
 
+-- P2 remediation 2.4: two partial unique indexes (not one plain composite
+-- unique index) close the upsert delete-then-insert race. Postgres (and
+-- SQLite) treat every NULL as distinct for uniqueness, so a single
+-- `UNIQUE (tenant_id, scope, scope_owner_id)` index would dedupe user-scope
+-- rows but silently allow unlimited tenant-scope rows (scope_owner_id IS
+-- NULL) for the same tenant. `PolicyRepo::upsert`'s delete+insert pair is
+-- also wrapped in an explicit DB transaction; these indexes are the backstop
+-- for the remaining no-existing-row race (two concurrent first-time upserts).
+CREATE UNIQUE INDEX policies_user_scope_unique_idx
+    ON file_storage.policies (tenant_id, scope, scope_owner_id)
+    WHERE scope_owner_id IS NOT NULL;
+
+CREATE UNIQUE INDEX policies_tenant_scope_unique_idx
+    ON file_storage.policies (tenant_id, scope)
+    WHERE scope_owner_id IS NULL;
+
 
 -- Table: file_storage.retention_rules ----------------------------------------
 -- Tenant/user retention rules. Background worker evaluates against
@@ -400,11 +440,18 @@ CREATE TABLE file_storage.retention_rules (
     -- Rule body: age-based, inactivity-based, custom-metadata-based.
     body             jsonb        NOT NULL,
 
-    created_at       timestamptz  NOT NULL  DEFAULT now()
+    created_at       timestamptz  NOT NULL  DEFAULT now(),
+
+    CHECK ((scope = 'tenant' AND scope_target_id IS NULL) OR
+           (scope IN ('user', 'file') AND scope_target_id IS NOT NULL))
 );
 
 CREATE INDEX retention_rules_scope_idx
     ON file_storage.retention_rules (tenant_id, scope, scope_target_id);
+
+CREATE INDEX retention_rules_file_scope_idx
+    ON file_storage.retention_rules (scope_target_id)
+    WHERE scope = 'file';
 
 
 -- =============================================================================

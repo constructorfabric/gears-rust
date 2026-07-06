@@ -1,8 +1,10 @@
 //! Policy domain types and the `PolicyResolver`.
 //!
-//! M1 stores and resolves policy; it does NOT yet enforce it on uploads (that is
-//! M2). The resolver computes the **effective policy = most-restrictive across
-//! tenant + user** per aspect, as required by the PRD:
+//! The resolver computes the **effective policy = most-restrictive across
+//! tenant + user** per aspect, as required by the PRD. Enforcement on uploads
+//! (allowed-MIME check, effective size limit, metadata limits, quota) is
+//! active in `domain/service/create.rs`; this module only stores and resolves
+//! the policy itself.
 //!
 //! @cpt-cf-file-storage-fr-allowed-types-policy
 //! @cpt-cf-file-storage-fr-size-limits-policy
@@ -175,7 +177,13 @@ pub struct AgeRetention {
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InactivityRetention {
-    /// Delete files not accessed (read or written) in this many days.
+    /// Delete files not **modified** in this many days, evaluated against
+    /// `last_modified_at` (bumped only by writes — bind/patch/transfer).
+    /// Downloads do not reset this clock: a file read frequently but never
+    /// rewritten is still eligible for deletion after `inactivity_days`.
+    /// Follow-up: track a `last_accessed_at` timestamp updated on download if
+    /// read-awareness becomes a requirement (needs a throttled/coarse update
+    /// to avoid a hot-path write on every read).
     pub inactivity_days: u32,
 }
 

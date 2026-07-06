@@ -217,7 +217,7 @@ impl PolicyService {
             .store
             .get_retention_rule(&AccessScope::allow_all(), rule_id)
             .await?
-            .ok_or_else(|| DomainError::file_not_found(rule_id))?;
+            .ok_or_else(|| DomainError::retention_rule_not_found(rule_id))?;
         let scope = self
             .authorize_retention_scope(ctx, &rule.scope, rule.scope_target_id)
             .await?;

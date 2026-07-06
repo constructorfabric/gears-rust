@@ -21,7 +21,7 @@ use uuid::Uuid;
 /// belt-and-suspenders check alongside the exhaustive match in
 /// `expected_status`: bumping this without adding both a match arm there and
 /// an instance in `all_variant_instances` fails the test below.
-const EXPECTED_VARIANT_COUNT: usize = 22;
+const EXPECTED_VARIANT_COUNT: usize = 23;
 
 /// The expected HTTP status for every `DomainError` variant, per the
 /// canonical-error taxonomy in `libs/toolkit-canonical-errors/src/error.rs`
@@ -48,6 +48,7 @@ fn expected_status(err: &DomainError) -> u16 {
         DomainError::TokenInvalid { .. } | DomainError::Forbidden => 403,
         DomainError::FileNotFound { .. }
         | DomainError::VersionNotFound { .. }
+        | DomainError::RetentionRuleNotFound { .. }
         | DomainError::MultipartUploadNotFound { .. } => 404,
         DomainError::Conflict { .. }
         | DomainError::MultipartUploadNotInProgress { .. }
@@ -68,6 +69,9 @@ fn all_variant_instances() -> Vec<DomainError> {
         DomainError::VersionNotFound {
             file_id: Uuid::nil(),
             version_id: Uuid::nil(),
+        },
+        DomainError::RetentionRuleNotFound {
+            rule_id: Uuid::nil(),
         },
         DomainError::Database {
             message: "db down".into(),

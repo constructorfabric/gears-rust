@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use sea_orm_migration::MigratorTrait;
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::{AccessScope, SecurityContext};
@@ -445,6 +446,51 @@ async fn delete_retention_rule_foreign_owner_is_denied() {
         .expect("get_retention_rule")
         .expect("rule must still exist");
     assert_eq!(still_there.rule_id, rule.rule_id);
+}
+
+/// `DELETE /retention-rules/{id}` for a `rule_id` that does not exist must
+/// surface `DomainError::RetentionRuleNotFound`, not the file-shaped
+/// `FileNotFound` it used to return (P2 remediation 3.10) — the RFC-9457
+/// payload's resource type/detail must name a retention rule, not a file.
+#[tokio::test]
+async fn delete_missing_retention_rule_returns_retention_not_found() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user = Uuid::now_v7();
+    let missing_rule_id = Uuid::now_v7();
+
+    let result = h
+        .policy_svc
+        .delete_retention_rule(&ctx(tenant, user), missing_rule_id)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(DomainError::RetentionRuleNotFound { rule_id }) if rule_id == missing_rule_id
+        ),
+        "expected RetentionRuleNotFound({missing_rule_id}), got {result:?}"
+    );
+
+    let err = result.expect_err("must be an error");
+    let canonical: CanonicalError = err.into();
+    assert_eq!(canonical.status_code(), 404);
+    assert!(
+        canonical
+            .resource_type()
+            .is_some_and(|t| t.contains("retention_rule")),
+        "resource type must name a retention rule, got {:?}",
+        canonical.resource_type()
+    );
+    assert!(
+        canonical.detail().contains("Retention rule"),
+        "detail must name a retention rule, not a file, got {:?}",
+        canonical.detail()
+    );
+    assert!(
+        !canonical.detail().to_lowercase().starts_with("file "),
+        "detail must not mislabel the resource as a file, got {:?}",
+        canonical.detail()
+    );
 }
 
 // ── semantic validation (P2 remediation 0.11) ───────────────────────────────

@@ -15,6 +15,9 @@ pub enum DomainError {
     #[error("Version not found: {file_id}/{version_id}")]
     VersionNotFound { file_id: Uuid, version_id: Uuid },
 
+    #[error("Retention rule not found: {rule_id}")]
+    RetentionRuleNotFound { rule_id: Uuid },
+
     #[error("Database error: {message}")]
     Database { message: String },
 
@@ -103,6 +106,11 @@ impl DomainError {
             file_id,
             version_id,
         }
+    }
+
+    #[must_use]
+    pub fn retention_rule_not_found(rule_id: Uuid) -> Self {
+        Self::RetentionRuleNotFound { rule_id }
     }
 
     pub fn database(message: impl Into<String>) -> Self {
