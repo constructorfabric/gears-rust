@@ -170,8 +170,8 @@ Success criteria: LLM plugin registers GTS schemas at startup; capabilities are 
 **Steps**:
 1. [ ] - `p1` - Receive `on_message(ctx, &mut stream)` call from Chat Engine with `messages: Message[]` and `CapabilityValue[]` - `inst-om-receive`
 2. [ ] - `p1` - Algorithm: forward to LLM Gateway using `cpt-cf-chat-engine-algo-llm-gateway-plugin-forward-to-gateway` - `inst-om-forward`
-3. [ ] - `p1` - **IF** LLM Gateway returns `context_overflow` error: emit `StreamingErrorEvent` with `error_code: "context_overflow"` to `ResponseStream` - `inst-om-overflow`
-4. [ ] - `p1` - **IF** LLM Gateway stream disconnects mid-response: emit `StreamingErrorEvent` with `error_code: "stream_interrupted"` to client, persist partial response as failed message (`finish_reason: "error"`), log stream interruption details (session_id, message_id, bytes_received, disconnect_reason) - `inst-om-stream-disconnect`
+3. [ ] - `p1` - **IF** LLM Gateway returns `context_overflow` error: emit `StreamingErrorEvent` whose `error` field is prefixed with the `context_overflow:` discriminator (e.g. `error: "context_overflow: <detail>"`) to `ResponseStream` - `inst-om-overflow`
+4. [ ] - `p1` - **IF** LLM Gateway stream disconnects mid-response: emit `StreamingErrorEvent` whose `error` field is prefixed with the `stream_interrupted:` discriminator (e.g. `error: "stream_interrupted: <detail>"`) to client, persist partial response as failed message (`finish_reason: "error"`), log stream interruption details (session_id, message_id, bytes_received, disconnect_reason) - `inst-om-stream-disconnect`
 5. [ ] - `p1` - **RETURN** stream closed - `inst-om-return`
 
 ### On Message Recreate
@@ -189,8 +189,8 @@ Success criteria: LLM plugin registers GTS schemas at startup; capabilities are 
 **Steps**:
 1. [ ] - `p1` - Receive `on_message_recreate(ctx, &mut stream)` call from Chat Engine with `messages: Message[]` and `CapabilityValue[]` - `inst-omr-receive`
 2. [ ] - `p1` - Algorithm: forward to LLM Gateway using `cpt-cf-chat-engine-algo-llm-gateway-plugin-forward-to-gateway` (same algorithm as on_message) - `inst-omr-forward`
-3. [ ] - `p1` - **IF** LLM Gateway returns `context_overflow` error: emit `StreamingErrorEvent` with `error_code: "context_overflow"` to `ResponseStream` - `inst-omr-overflow`
-4. [ ] - `p1` - **IF** LLM Gateway stream disconnects mid-response: emit `StreamingErrorEvent` with `error_code: "stream_interrupted"` to client, persist partial response as failed message (`finish_reason: "error"`), log stream interruption details (session_id, message_id, bytes_received, disconnect_reason) - `inst-omr-stream-disconnect`
+3. [ ] - `p1` - **IF** LLM Gateway returns `context_overflow` error: emit `StreamingErrorEvent` whose `error` field is prefixed with the `context_overflow:` discriminator (e.g. `error: "context_overflow: <detail>"`) to `ResponseStream` - `inst-omr-overflow`
+4. [ ] - `p1` - **IF** LLM Gateway stream disconnects mid-response: emit `StreamingErrorEvent` whose `error` field is prefixed with the `stream_interrupted:` discriminator (e.g. `error: "stream_interrupted: <detail>"`) to client, persist partial response as failed message (`finish_reason: "error"`), log stream interruption details (session_id, message_id, bytes_received, disconnect_reason) - `inst-omr-stream-disconnect`
 5. [ ] - `p1` - **RETURN** stream closed - `inst-omr-return`
 
 ### On Session Summary

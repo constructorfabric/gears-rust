@@ -120,7 +120,7 @@ Success criteria: Summary streaming first-byte under 500ms; retention cleanup pr
 3. [ ] - `p2` - Algorithm: validate session ownership using `cpt-cf-chat-engine-algo-session-lifecycle-validate-ownership` - `inst-gr-ownership`
 4. [ ] - `p2` - DB: load retention_policy from session record - `inst-gr-load-session`
 5. [ ] - `p2` - **IF** session.retention_policy is null: DB: load retention_policy from session type as fallback - `inst-gr-fallback-type`
-6. [ ] - `p2` - **RETURN** 200 (retention_policy: {type, max_age_days?, max_message_count?, soft_delete_retention_days?}) - `inst-gr-return`
+6. [ ] - `p2` - **RETURN** 200 — `retention_policy` is internally tagged on `"type"` and matches the SDK `RetentionPolicy` enum (`chat-engine-sdk::models::RetentionPolicy`). Wire shapes: `{"type": "none"}`, `{"type": "age_based", "max_age_days": N}`, `{"type": "count_based", "max_message_count": N}` — type-specific fields are flattened at the top level, no nested wrapper. Note: `soft_delete_retention_days` (the grace period before hard-delete after a soft-delete) is **not** part of `RetentionPolicy`; it is configured at session-type level and surfaced through the session-deletion flow described in ADR-0021. - `inst-gr-return`
 
 ### Update Retention Policy
 

@@ -1,0 +1,241 @@
+//! RFC-9457 error mapping for the Chat Engine REST surface.
+//!
+//! Phase 14 owns the full `ChatEngineError → CanonicalError → Problem`
+//! pipeline. The canonical error layer (`toolkit::api::canonical_error_middleware`)
+//! converts the [`CanonicalError`] to a wire [`Problem`] and fills
+//! `instance` / `trace_id` after the handler returns; this module is the
+//! single source of truth for the status / problem-type / detail mapping.
+//!
+//! Error matrix:
+//!
+//! | `ChatEngineError` variant                         | HTTP | Canonical category | Notes                                                            |
+//! |---------------------------------------------------|------|--------------------|------------------------------------------------------------------|
+//! | `NotFound { resource, id }`                       | 404  | `NotFound`         | Resource-scoped via [`ChatEngineSessionError`] /…                |
+//! | `Forbidden { reason }`                            | 403  | `PermissionDenied` | `AUTHZ_DENIED` reason marker.                                    |
+//! | `Conflict { reason }`                             | 409  | `AlreadyExists`    | `reason` carried in `resource_name`.                             |
+//! | `BadRequest { reason }`                           | 400  | `InvalidArgument`  | Format-variant message (no field violations array).              |
+//! | `BackendUnavailable { source, retry_after, .. }`  | dyn  | dyn                | Delegates to `PluginError::suggested_status()` + `is_user_facing()`. |
+//! | `Internal { reason, source }`                     | 500  | `Internal`         | Operator detail goes to logs only; wire detail is generic.       |
+//! | `NotImplemented { reason }`                       | 501  | `Unimplemented`    | Endpoint exposed but production backend not yet wired.           |
+//!
+//! `trace_id` is injected by `toolkit::api::canonical_error_middleware`
+//! on the response path — handlers do not construct `Problem` directly.
+//! The unit tests below verify the **CanonicalError → Problem** wire
+//! shape so the contract is grep-auditable.
+//
+// @cpt-cf-chat-engine-api-rest-error:p14
+// @cpt-cf-chat-engine-adr-http-client-protocol:p14
+
+use toolkit_canonical_errors::{CanonicalError, resource_error};
+
+use crate::domain::error::ChatEngineError;
+
+// ---------------------------------------------------------------------------
+// Resource scopes (per RFC-9457 + GTS)
+// ---------------------------------------------------------------------------
+
+/// Session-scoped error type used for not-found / conflict mappings.
+#[resource_error("gts.cf.core.chat_engine.session.v1~")]
+pub struct ChatEngineSessionError;
+
+/// Message-scoped error type.
+#[resource_error("gts.cf.core.chat_engine.message.v1~")]
+pub struct ChatEngineMessageError;
+
+/// Plugin-scoped error type (used by `BackendUnavailable`).
+#[resource_error("gts.cf.core.chat_engine.plugin.v1~")]
+pub struct ChatEnginePluginError;
+
+/// Generic chat-engine resource type used when the inner variant lacks a
+/// more precise scope.
+#[resource_error("gts.cf.core.chat_engine.resource.v1~")]
+pub struct ChatEngineResourceError;
+
+// ---------------------------------------------------------------------------
+// ChatEngineError → CanonicalError
+// ---------------------------------------------------------------------------
+
+impl From<ChatEngineError> for CanonicalError {
+    fn from(err: ChatEngineError) -> Self {
+        match err {
+            ChatEngineError::NotFound { resource, id } => {
+                let detail = format!("{resource} not found: {id}");
+                match resource {
+                    "session" | "shared_session" => ChatEngineSessionError::not_found(detail)
+                        .with_resource(id)
+                        .create(),
+                    "message" | "variant" => ChatEngineMessageError::not_found(detail)
+                        .with_resource(id)
+                        .create(),
+                    _ => ChatEngineResourceError::not_found(detail)
+                        .with_resource(id)
+                        .create(),
+                }
+            }
+
+            ChatEngineError::Forbidden { reason } => {
+                // PermissionDenied carries `reason` only; the human-readable
+                // detail is the canonical category's default. We log the
+                // request-supplied reason for operator triage.
+                tracing::debug!(reason = %reason, "permission denied");
+                ChatEngineSessionError::permission_denied()
+                    .with_reason("AUTHZ_DENIED")
+                    .create()
+            }
+
+            ChatEngineError::Conflict { reason } => {
+                // `already_exists()` is the canonical RFC-9457 mapping for
+                // state-machine / uniqueness conflicts (HTTP 409). The
+                // `reason` is surfaced as `resource_name` so clients have a
+                // stable, machine-readable discriminator.
+                ChatEngineSessionError::already_exists(reason.clone())
+                    .with_resource(reason)
+                    .create()
+            }
+
+            ChatEngineError::BadRequest { reason } => ChatEngineResourceError::invalid_argument()
+                .with_format(reason)
+                .create(),
+
+            ChatEngineError::BackendUnavailable {
+                reason,
+                retry_after,
+                source,
+            } => {
+                // `PluginError` is collapsed into `BackendUnavailable` at
+                // Phase 2's `From<PluginError> for ChatEngineError` boundary;
+                // the typed source isn't preserved on the `BoxError` slot
+                // (which holds the plugin's underlying cause, not the
+                // PluginError itself). We therefore route on the signals
+                // that *are* preserved — `retry_after` + the BoxError
+                // `Display` chain — and apply the
+                // `PluginError::suggested_status()` /
+                // `PluginError::is_user_facing()` policy by reproducing
+                // the same routing matrix here.
+                let _ = source;
+                map_backend_unavailable(reason, retry_after)
+            }
+
+            ChatEngineError::Internal { reason, source } => {
+                tracing::error!(
+                    operator_detail = %reason,
+                    has_source = source.is_some(),
+                    "chat-engine internal error",
+                );
+                // The operator-only `reason` MUST NOT cross the wire — the
+                // canonical `Internal` category emits a generic detail and
+                // the middleware injects `trace_id`.
+                CanonicalError::internal("Internal server error").create()
+            }
+
+            ChatEngineError::NotImplemented { reason } => {
+                // A documented endpoint whose production backend has not
+                // landed (object-storage export, DB-backed search). The
+                // `Unimplemented` category maps to HTTP 501 — an honest
+                // refusal rather than a faked 2xx (RUST-NO-001).
+                ChatEngineResourceError::unimplemented(reason).create()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PluginError-based fallback routing for `BackendUnavailable`
+// ---------------------------------------------------------------------------
+
+fn map_backend_unavailable(
+    reason: String,
+    retry_after: Option<std::time::Duration>,
+) -> CanonicalError {
+    // Classify by signals preserved on the variant. The reason strings are
+    // produced by `From<PluginError> for ChatEngineError` and the
+    // `with_retry_after` / `"backend rate limited"` / `"backend timeout"`
+    // markers are stable identifiers (see Phase 2's `domain::error`).
+    let cls = classify_backend(&reason, retry_after);
+
+    // Operator-only details (transient / timeout) never reach the wire —
+    // we log them with the trace_id added by the canonical middleware.
+    if !cls.user_facing {
+        tracing::warn!(
+            operator_detail = %reason,
+            status = cls.suggested_status,
+            "backend unavailable (operator-only detail redacted from wire)",
+        );
+    }
+
+    match cls.suggested_status {
+        429 => {
+            let mut b = CanonicalError::service_unavailable();
+            if let Some(d) = retry_after {
+                b = b.with_retry_after_seconds(d.as_secs());
+            }
+            b.create()
+        }
+        504 | 408 => CanonicalError::service_unavailable()
+            .with_retry_after_seconds(5)
+            .create(),
+        400 => ChatEnginePluginError::invalid_argument()
+            .with_format(reason)
+            .create(),
+        401 | 403 => {
+            tracing::debug!(reason = %reason, "plugin denied access");
+            ChatEnginePluginError::permission_denied()
+                .with_reason("BACKEND_UNAUTHORIZED")
+                .create()
+        }
+        404 => ChatEnginePluginError::not_found(reason.clone())
+            .with_resource(reason)
+            .create(),
+        _ => {
+            // 500/502/503 and the catch-all all map to ServiceUnavailable;
+            // the upstream `retry_after` (if any) is preserved.
+            let mut b = CanonicalError::service_unavailable();
+            if let Some(d) = retry_after {
+                b = b.with_retry_after_seconds(d.as_secs());
+            } else {
+                b = b.with_retry_after_seconds(5);
+            }
+            b.create()
+        }
+    }
+}
+
+/// Inferred routing class for a `BackendUnavailable` variant. The decision
+/// table mirrors `PluginError::suggested_status` / `is_user_facing` even
+/// though the typed `PluginError` itself isn't preserved across the
+/// `From<PluginError> for ChatEngineError` boundary.
+struct BackendClass {
+    /// HTTP status the underlying `PluginError` would have suggested.
+    suggested_status: u16,
+    /// Whether the inner reason is safe to surface to end users.
+    user_facing: bool,
+}
+
+fn classify_backend(reason: &str, retry_after: Option<std::time::Duration>) -> BackendClass {
+    if retry_after.is_some() || reason.contains("rate limited") {
+        // RateLimited → 429 (user-facing per the SDK matrix)
+        BackendClass {
+            suggested_status: 429,
+            user_facing: true,
+        }
+    } else if reason.contains("timeout") {
+        BackendClass {
+            suggested_status: 504,
+            user_facing: false,
+        }
+    } else {
+        // Anything else is treated as `Transient` → 503, operator-only.
+        BackendClass {
+            suggested_status: 503,
+            user_facing: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — one assertion per branch (status + problem_type)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "error_tests.rs"]
+mod error_tests;

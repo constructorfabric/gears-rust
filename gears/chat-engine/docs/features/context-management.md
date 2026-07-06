@@ -80,7 +80,7 @@ Success criteria: Context payloads are constructed correctly for each strategy; 
 
 **Steps**:
 1. [ ] - `p2` - Algorithm: authenticate request using `cpt-cf-chat-engine-algo-session-lifecycle-authenticate` - `inst-cfg-auth`
-2. [ ] - `p2` - API: PATCH /sessions/{session_id} (body: memory_strategy: {type, config?}) - `inst-cfg-api`
+2. [ ] - `p2` - API: PATCH /sessions/{session_id} (body: `memory_strategy: { "type": "full" | "sliding_window" | "summarized", <type-specific fields> }`; type-specific fields are flattened next to `"type"` — no nested `config` object). Examples: `{"type": "full"}`, `{"type": "sliding_window", "window_size": 10}`, `{"type": "summarized", "recent_messages_to_keep": 5}` - `inst-cfg-api`
 3. [ ] - `p2` - Algorithm: validate session ownership using `cpt-cf-chat-engine-algo-session-lifecycle-validate-ownership` - `inst-cfg-ownership`
 4. [ ] - `p2` - **IF** session.lifecycle_state IN (soft_deleted, hard_deleted) **RETURN** 409 Conflict - `inst-cfg-check-state`
 5. [ ] - `p2` - Algorithm: validate strategy using `cpt-cf-chat-engine-algo-context-management-validate-strategy` - `inst-cfg-validate`
@@ -112,14 +112,14 @@ Success criteria: Context payloads are constructed correctly for each strategy; 
 
 - [ ] `p2` - **ID**: `cpt-cf-chat-engine-algo-context-management-validate-strategy`
 
-**Input**: memory_strategy object (type, config)
+**Input**: memory_strategy object — internally-tagged on `"type"` with type-specific fields flattened at the top level (no nested `config` wrapper). Matches the SDK `MemoryStrategy` enum (`chat-engine-sdk::models::MemoryStrategy`).
 **Output**: Validated strategy or 400 error
 
 **Steps**:
-1. [ ] - `p2` - **IF** type NOT IN ('full', 'sliding_window', 'summarized') **RETURN** 400 Bad Request (unknown strategy type) - `inst-vs-check-type`
-2. [ ] - `p2` - **IF** type == 'sliding_window' AND config.window_size is absent or < 1 **RETURN** 400 Bad Request (window_size required and must be >= 1) - `inst-vs-check-window`
-3. [ ] - `p2` - **IF** type == 'summarized' AND config.recent_messages_to_keep is absent or < 2 **RETURN** 400 Bad Request (recent_messages_to_keep required and must be >= 2) - `inst-vs-check-summarized`
-4. [ ] - `p2` - **IF** type == 'full': no additional config required - `inst-vs-full-noop`
+1. [ ] - `p2` - **IF** `type` NOT IN ('full', 'sliding_window', 'summarized') **RETURN** 400 Bad Request (unknown strategy type) - `inst-vs-check-type`
+2. [ ] - `p2` - **IF** `type` == 'sliding_window' AND top-level `window_size` is absent or < 1 **RETURN** 400 Bad Request (window_size required and must be >= 1) - `inst-vs-check-window`
+3. [ ] - `p2` - **IF** `type` == 'summarized' AND top-level `recent_messages_to_keep` is absent or < 2 **RETURN** 400 Bad Request (recent_messages_to_keep required and must be >= 2) - `inst-vs-check-summarized`
+4. [ ] - `p2` - **IF** `type` == 'full': no additional fields required - `inst-vs-full-noop`
 5. [ ] - `p2` - **RETURN** validated strategy - `inst-vs-return`
 
 ### Extract Active Path
@@ -145,8 +145,8 @@ Success criteria: Context payloads are constructed correctly for each strategy; 
 **Steps**:
 1. [ ] - `p2` - Load memory_strategy from session metadata; default to 'full' if not set - `inst-as-load`
 2. [ ] - `p2` - **IF** strategy.type == 'full': context = all active-path messages + current user message - `inst-as-full`
-3. [ ] - `p2` - **IF** strategy.type == 'sliding_window': context = last N messages from active path (where N = strategy.config.window_size) + current user message - `inst-as-window`
-4. [ ] - `p2` - **IF** strategy.type == 'summarized': context = messages with is_hidden_from_backend=false from active path + current user message (summary messages included, summarized originals excluded by visibility flag); retain the last `config.recent_messages_to_keep` messages from the active path regardless of visibility flags to ensure recent context is always available - `inst-as-summarized`
+3. [ ] - `p2` - **IF** strategy.type == 'sliding_window': context = last N messages from active path (where N = strategy.window_size, read from the flat top-level field) + current user message - `inst-as-window`
+4. [ ] - `p2` - **IF** strategy.type == 'summarized': context = messages with is_hidden_from_backend=false from active path + current user message (summary messages included, summarized originals excluded by visibility flag); retain the last `strategy.recent_messages_to_keep` messages from the active path regardless of visibility flags to ensure recent context is always available - `inst-as-summarized`
 5. [ ] - `p2` - **RETURN** context payload as ordered messages array - `inst-as-return`
 
 ### Handle Context Overflow

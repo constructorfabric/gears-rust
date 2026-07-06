@@ -270,13 +270,13 @@ When the LLM gateway cannot process a request because the conversation history e
 
 ### Trigger: context_overflow Error
 
-The LLM gateway plugin signals context overflow by returning a specific error in the `ResponseStream`:
+The LLM gateway plugin signals context overflow by returning a `StreamingErrorEvent` in the `ResponseStream` whose `error` field carries the `context_overflow` discriminator as a prefix:
 
 ```json
-{"type": "error", "error_code": "context_overflow", "message": "..."}
+{"type": "error", "message_id": "<uuid>", "error": "context_overflow: <human-readable detail>"}
 ```
 
-Chat Engine recognizes `context_overflow` as a recoverable error and initiates the summarization flow instead of propagating the error to the client.
+Chat Engine recognizes the `context_overflow:` prefix as a recoverable error and initiates the summarization flow instead of propagating the error to the client. The same discriminator-prefix convention is used for `stream_interrupted` and other plugin-defined recoverable errors.
 
 ### Summarization Flow
 
