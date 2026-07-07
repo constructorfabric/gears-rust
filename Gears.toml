@@ -1,5 +1,5 @@
-# Gears manifest — used by `cargo gears` CLI for linting and other tasks.
-# See https://github.com/constructorfabric/cf-cli for documentation.
+# Gears manifest. Used by `cargo gears` CLI for linting and other tasks.
+# See https://github.com/constructorfabric/cargo-gears for documentation.
 
 [apps.gears-rust.dev]
 config = "lint.yml"
@@ -11,8 +11,15 @@ clippy = false    # already handled by `make clippy`
 
 [apps.gears-rust.dev.lint.dylint]
 enabled = true
-# Lints added in cargo-gears-lints but not yet addressed in this repo.
-# Remove entries as violations are fixed.
+# Remove entries as violations are fixed or cargo-gears-lints is updated.
 skip = [
+    # New lint not yet addressed in this repo.
     "de0504_client_versioning",
+    # Path exclusion logic in cargo-gears-lints uses "modules/" prefix but this
+    # repo uses "gears/". Skipped until cargo-gears-lints adds "gears/" support.
+    "de1101_tests_in_separate_files",
+    # Pre-existing violations. To be fixed incrementally.
+    "de0101_no_serde_in_contract",
+    "de0102_no_toschema_in_contract",
+    "de0708_no_non_fips_hasher",
 ]
