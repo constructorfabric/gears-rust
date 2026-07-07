@@ -21,6 +21,7 @@ path = "src/lib.rs"
 fips = ["toolkit-http/fips"]
 test-utils = [
     "axum/ws",
+    "credstore-sdk/test-util",
     "toolkit/bootstrap",
     "dep:async-stream",
     "dep:tower",
@@ -94,6 +95,7 @@ rcgen = { workspace = true, optional = true }
 
 [dev-dependencies]
 cf-gears-oagw = { path = ".", features = ["test-utils"] }
+credstore-sdk = { workspace = true, features = ["test-util"] }
 toolkit = { workspace = true, features = ["bootstrap"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }

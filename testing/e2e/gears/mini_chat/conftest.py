@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -453,6 +454,139 @@ def server(test_env):
     import time
     time.sleep(3)
     _db_summary_text = _print_db_summary()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _provision_credstore_secrets(request, server):
+    """Provision the LLM provider secrets through the credstore gateway.
+
+    mini-chat routes LLM calls through OAGW, whose auth plugin resolves the
+    provider ``secret_ref`` (``openai-key`` / ``azure-openai-key``) via the
+    now-stateful credstore gateway. The gateway resolves a secret's metadata
+    from its own DB before reading the value, so the secrets must be created
+    through its API — pre-seeding the static plugin config alone is no longer
+    reachable.
+
+    The mini-chat rig is single-tenant (``single-tenant-tr-plugin``) with
+    ``accept_all`` authn, so a ``tenant``-scoped secret resolves for the S2S
+    context OAGW uses when proxying. Offline mode (default) uses mock values
+    (the mock provider ignores them); online mode uses the real env keys, the
+    same ones ``_patch_mini_chat_config`` would otherwise inject.
+
+    PUT is an idempotent upsert, so reruns are safe.
+    """
+    if request.config.getoption("mode") == "online":
+        secrets = {
+            "openai-key": os.environ.get("OPENAI_API_KEY", ""),
+            "azure-openai-key": os.environ.get("AZURE_OPENAI_API_KEY", ""),
+        }
+    else:
+        secrets = {
+            "openai-key": "mock-key-openai",
+            "azure-openai-key": "mock-key-azure",
+        }
+    headers = {
+        "Authorization": "Bearer mini-chat-e2e",
+        "content-type": "application/json",
+    }
+    # Iterate over a plain tuple of reference names (not `secrets.items()`) so
+    # nothing derived from the secret values flows into log/error messages,
+    # and never echo the response body — it could reflect the secret.
+    provisioned = 0
+    reachable = True
+    for ref in ("openai-key", "azure-openai-key"):
+        value = secrets[ref]
+        if not value:
+            continue  # online mode without that provider's key configured
+        try:
+            # The mini-chat rig serves all routes under the api-gateway
+            # `prefix_path: "/cf"` (same prefix as API_PREFIX above).
+            resp = httpx.put(
+                f"{server}/cf/credstore/v1/secrets/{ref}",
+                headers=headers,
+                json={"value": value, "sharing": "tenant"},
+                timeout=5.0,
+            )
+        except httpx.RequestError:
+            # Any transport-level error (connect/timeout/read-timeout) — keep
+            # provisioning non-fatal and fall through to the `yield`. `break`,
+            # not `return`: a bare return before the `yield` in this generator
+            # fixture raises "did not yield a value" and ERRORs the whole
+            # session (review finding #5). Broadened from `ConnectError` so a
+            # read-timeout against a still-warming server is caught too.
+            reachable = False
+            break
+        if resp.status_code not in (200, 201, 204):
+            msg = f"could not provision credstore secret {ref!r}: HTTP {resp.status_code}"
+            if request.config.getoption("mode") == "offline":
+                # Offline mode is deterministic — a provisioning failure is a real
+                # problem, so fail fast instead of letting tests fail opaquely.
+                raise RuntimeError(f"[e2e] {msg}")
+            print(f"[e2e] WARN: {msg}")
+        else:
+            provisioned += 1
+
+    # mini-chat registers its OAGW provider upstreams at boot, but the stateful
+    # credstore has no secret then, so registration is deferred and retried in
+    # the background once the secret exists (which is exactly what we just did).
+    # Wait for that reconcile to converge so provider-dependent tests don't race
+    # it and see a transient "Upstream not found". Skip the wait when the rig
+    # was unreachable — _await_oagw_upstreams would only time out.
+    if reachable:
+        _await_oagw_upstreams(server, headers, provisioned)
+    yield
+
+
+def _await_oagw_upstreams(server, headers, expected, timeout=60.0):
+    """Best-effort wait until at least ``expected`` OAGW upstreams are live.
+
+    The mini-chat gear retries deferred provider registration on a short cadence
+    after its secret is provisioned; poll ``GET /oagw/v1/upstreams`` (a JSON
+    array) until the provider upstreams appear, then let routes settle. This
+    only *waits* — it never fails the session; the tests' own assertions remain
+    the source of truth.
+
+    ``expected`` is the number of secrets provisioned, used as a proxy for the
+    number of provider upstreams. That holds for this rig (each provider has one
+    distinct ``secret_ref`` and no ``tenant_overrides``); if the config gains
+    tenant overrides or shares a ``secret_ref`` across providers, revisit this
+    count (upstream count would no longer equal secret count).
+
+    Robustness: a persistently non-observable endpoint (e.g. an authz change
+    returning non-200) is detected within a short probe window and we proceed
+    rather than spinning the full timeout; a non-JSON/invalid body is treated
+    as "not ready yet" rather than raising.
+    """
+    if expected == 0:
+        return
+    start = time.monotonic()
+    deadline = start + timeout
+    probe_window = min(10.0, timeout)  # time allowed to observe *any* 200
+    saw_endpoint = False
+    while time.monotonic() < deadline:
+        count = None
+        try:
+            resp = httpx.get(f"{server}/cf/oagw/v1/upstreams", headers=headers, timeout=5.0)
+            if resp.status_code == 200:
+                saw_endpoint = True
+                body = resp.json()
+                if isinstance(body, list):
+                    count = len(body)
+        except (httpx.RequestError, ValueError):
+            pass  # transport error or non-JSON body — treat as "not ready yet"
+
+        if count is not None and count >= expected:
+            # Upstreams are up; give per-provider route registration (which runs
+            # just after each create_upstream) a brief moment to catch up.
+            time.sleep(1.0)
+            return
+        # If the endpoint never became observable within the probe window, it is
+        # likely gated (authz/route); stop waiting and let the tests decide.
+        if not saw_endpoint and time.monotonic() - start >= probe_window:
+            print("[e2e] WARN: OAGW upstreams endpoint not observable; proceeding")
+            return
+        time.sleep(0.5)
+    print(f"[e2e] WARN: OAGW upstreams did not reach >= {expected} within {timeout:.0f}s")
 
 
 @pytest.fixture(scope="session")

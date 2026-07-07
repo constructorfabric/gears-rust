@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use gts::GtsId;
+
 use crate::error::CredStoreError;
 
 /// Re-export from tenant-resolver-sdk for cross-gear type consistency.
@@ -151,7 +153,14 @@ impl fmt::Display for SecretValue {
 }
 
 /// Controls the visibility scope of a stored secret.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// Also part of the GTS trait vocabulary: `SecretTypeTraits::allow_sharing`
+/// lists the modes a secret type permits, so the derived `x-gts-traits-schema`
+/// constrains trait values to this enum (schemars follows the serde
+/// `snake_case` renames).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SharingMode {
     /// Only the owner can access the secret.
@@ -163,12 +172,106 @@ pub enum SharingMode {
     Shared,
 }
 
+/// How a write should treat the secret's expiry.
+///
+/// Modelled as an explicit tri-state rather than `Option` so that "leave the
+/// stored expiry untouched" and "remove the stored expiry" are distinct: with a
+/// plain `Option<OffsetDateTime>`, `None` conflates the two and an ordinary
+/// value rotation (`put`) would silently strip an existing expiry. Expiry is
+/// only permitted for types whose traits are `expirable`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExpiryWrite {
+    /// Keep the currently stored expiry on overwrite; no expiry on create.
+    /// This is the default, so the convenience
+    /// [`CredStoreClientV1::put`](crate::CredStoreClientV1::put) never clears an
+    /// expiry as a side effect of a value rotation.
+    #[default]
+    Preserve,
+    /// Set the expiry to this instant (must be in the future at write time).
+    Set(time::OffsetDateTime),
+    /// Remove any stored expiry.
+    Clear,
+}
+
+impl ExpiryWrite {
+    /// The instant this write introduces as a *new* expiry, if any. Only
+    /// [`Self::Set`] introduces one; [`Self::Preserve`]/[`Self::Clear`] do not,
+    /// so they never trigger expiry validation against the secret's type.
+    #[must_use]
+    pub fn requested(self) -> Option<time::OffsetDateTime> {
+        match self {
+            Self::Set(at) => Some(at),
+            Self::Preserve | Self::Clear => None,
+        }
+    }
+
+    /// Resolve the value to persist against the currently stored expiry
+    /// (`current` — `None` on create). `Preserve` keeps `current`, `Set`
+    /// overrides it, `Clear` drops it.
+    #[must_use]
+    pub fn resolve(self, current: Option<time::OffsetDateTime>) -> Option<time::OffsetDateTime> {
+        match self {
+            Self::Preserve => current,
+            Self::Set(at) => Some(at),
+            Self::Clear => None,
+        }
+    }
+}
+
+/// Optimistic-concurrency precondition for a guarded write or delete — the
+/// in-process equivalent of the REST `If-Match` header. Read the current
+/// generation from a prior [`GetSecretResponse`] (`id` + `version`).
+///
+/// A failed precondition surfaces as [`CredStoreError::Conflict`]; a write with
+/// `None` is unconditional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritePrecondition {
+    /// The target secret must already exist (REST `If-Match: *`).
+    Exists,
+    /// Compare-and-set: the current generation must still be `(id, version)`
+    /// (REST `If-Match: "<id>.<version>"`). `id` is the row UUID — fresh per
+    /// recreated secret — so a validator from an earlier generation never
+    /// matches after a delete/recreate even if the version counters coincide.
+    Matches {
+        /// Row (generation) UUID from the observed [`GetSecretResponse::id`].
+        id: uuid::Uuid,
+        /// Version counter from the observed [`GetSecretResponse::version`].
+        version: i64,
+    },
+}
+
+/// Options for typed writes ([`CredStoreClientV1::put_opts`](crate::CredStoreClientV1::put_opts) /
+/// [`create_opts`](crate::CredStoreClientV1::create_opts)).
+#[derive(Debug, Clone, Default)]
+pub struct WriteOptions {
+    /// Full GTS type id of the secret type (e.g. via
+    /// [`SecretType::gts_id`](crate::SecretType::gts_id) for a built-in, or a
+    /// custom type's id). `None` keeps the existing secret's type on overwrite
+    /// and defaults to the generic type on create. The gear resolves it to the
+    /// type's deterministic UUID and validates existence against the
+    /// types-registry.
+    pub secret_type: Option<GtsId>,
+    /// Expiry write intent — see [`ExpiryWrite`]. Defaults to
+    /// [`ExpiryWrite::Preserve`], so a write that does not mention expiry
+    /// leaves any stored expiry unchanged.
+    pub expires_at: ExpiryWrite,
+    /// Optional optimistic-concurrency guard — see [`WritePrecondition`].
+    /// `None` (default) writes unconditionally.
+    pub precondition: Option<WritePrecondition>,
+}
+
 /// Response returned by [`CredStoreClientV1::get`](crate::CredStoreClientV1::get)
 /// containing the secret value and access metadata.
 #[derive(Debug)]
 pub struct GetSecretResponse {
     /// The decrypted secret value.
     pub value: SecretValue,
+    /// Generation id of the resolved secret — the metadata row's UUID, minted
+    /// fresh for every recreated secret. Combined with `version` it forms the
+    /// gear's strong `ETag` (`"<id>.<version>"`), so a validator from a
+    /// deleted-and-recreated secret's earlier generation can never match the
+    /// current one even when the version counters coincide.
+    pub id: uuid::Uuid,
     /// The tenant that owns this secret (may differ from the requesting tenant
     /// when the secret is inherited via hierarchical resolution).
     pub owner_tenant_id: TenantId,
@@ -177,17 +280,88 @@ pub struct GetSecretResponse {
     /// `true` if the secret was retrieved from an ancestor tenant via
     /// hierarchical resolution, `false` if owned by the requesting tenant.
     pub is_inherited: bool,
-}
-
-/// Metadata returned by plugins alongside the secret value.
-#[derive(Debug)]
-pub struct SecretMetadata {
-    pub value: SecretValue,
-    pub owner_id: OwnerId,
-    pub sharing: SharingMode,
-    pub owner_tenant_id: TenantId,
+    /// Monotonic version of the resolved secret within its generation;
+    /// surfaced as the HTTP `ETag` together with `id`.
+    pub version: i64,
+    /// The secret's full GTS type id, as resolved from the types-registry
+    /// (covers dynamically registered custom types; use
+    /// [`crate::types::SecretType::from_gts_id`] to recover a catalog type
+    /// when needed).
+    pub secret_type: String,
+    /// Expiry instant, when the type is expirable and one was set.
+    pub expires_at: Option<time::OffsetDateTime>,
 }
 
 #[cfg(test)]
-#[path = "models_tests.rs"]
-mod models_tests;
+mod models_tests {
+    use super::*;
+
+    #[test]
+    fn secret_ref_accepts_valid_shapes() {
+        for ok in ["partner-openai-key", "api_key_v2", "ABC123", "ok-key_1"] {
+            assert!(SecretRef::new(ok).is_ok(), "{ok} should be valid");
+        }
+    }
+
+    #[test]
+    fn secret_ref_rejects_invalid_chars_and_empty() {
+        assert!(SecretRef::new("").is_err());
+        for bad in ["has:colon", "my key", "key/path"] {
+            assert!(SecretRef::new(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn secret_ref_length_boundary() {
+        // 255 is the inclusive max; 256 is rejected (boundary both sides).
+        assert!(SecretRef::new("a".repeat(255)).is_ok());
+        assert!(SecretRef::new("a".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn secret_ref_deserialize_validates() {
+        // The custom Deserialize is the real wire path (a raw JSON string must
+        // go through the same validation as `SecretRef::new`).
+        let valid: Result<SecretRef, _> = serde_json::from_str("\"valid-key_1\"");
+        assert_eq!(valid.expect("valid").as_ref(), "valid-key_1");
+        assert!(serde_json::from_str::<SecretRef>("\"my:evil/key\"").is_err());
+        assert!(serde_json::from_str::<SecretRef>("\"\"").is_err());
+        assert!(serde_json::from_str::<SecretRef>(&format!("\"{}\"", "a".repeat(256))).is_err());
+    }
+
+    #[test]
+    fn secret_ref_serde_round_trips() {
+        let r = SecretRef::new("round-trip").expect("valid");
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(json, "\"round-trip\"");
+        let back: SecretRef = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.as_ref(), "round-trip");
+    }
+
+    #[test]
+    fn secret_value_redacts() {
+        let v = SecretValue::from("supersecret");
+        assert_eq!(format!("{v:?}"), "[REDACTED]");
+        assert_eq!(format!("{v}"), "[REDACTED]");
+        assert_eq!(v.as_bytes(), b"supersecret");
+    }
+
+    #[test]
+    fn sharing_mode_default_is_tenant() {
+        assert_eq!(SharingMode::default(), SharingMode::Tenant);
+    }
+
+    #[test]
+    fn sharing_mode_serde_round_trips() {
+        for (mode, expected) in [
+            (SharingMode::Private, "\"private\""),
+            (SharingMode::Tenant, "\"tenant\""),
+            (SharingMode::Shared, "\"shared\""),
+        ] {
+            let json = serde_json::to_string(&mode).expect("serialize");
+            assert_eq!(json, expected);
+            let back: SharingMode = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, mode);
+        }
+    }
+}

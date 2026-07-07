@@ -39,7 +39,7 @@ pub struct SecretConfig {
     ///   `SharingMode::Shared` on the wire but stored in a separate
     ///   global map in the static plugin).
     /// - `Some` with `SharingMode::Shared` → **shared** secret scoped to
-    ///   this tenant, visible to descendants via gateway hierarchy walk-up.
+    ///   this tenant, visible to descendants via gear hierarchy walk-up.
     /// - `Some` with `SharingMode::Tenant` → **tenant** secret, visible
     ///   only within this tenant.
     ///

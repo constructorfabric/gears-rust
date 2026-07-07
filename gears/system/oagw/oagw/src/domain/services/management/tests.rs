@@ -1811,14 +1811,56 @@ async fn bind_rejects_inaccessible_secret_ref() {
         .await
         .unwrap_err();
     match err {
-        DomainError::Validation { detail, .. } => {
+        // A state precondition (retryable by provisioning callers), not a
+        // malformed-argument validation failure.
+        DomainError::SecretRefNotAccessible { detail, .. } => {
             assert!(
                 detail.contains("not accessible"),
                 "expected 'not accessible' error, got: {detail}"
             );
         }
-        _ => panic!("expected Validation error, got: {err:?}"),
+        _ => panic!("expected SecretRefNotAccessible error, got: {err:?}"),
     }
+}
+
+/// A client implementation that reports the not-found surface as an error
+/// (`Err(CredStoreError::NotFound)`) instead of `Ok(None)` — e.g. a resolved
+/// metadata row whose value is still being provisioned — must classify the
+/// same way: a retryable state precondition, not a misconfiguration.
+#[tokio::test]
+async fn bind_maps_not_found_error_to_secret_ref_not_accessible() {
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![TenantId(root), TenantId(child)]);
+    let svc = ControlPlaneServiceImpl::new(
+        Arc::new(InMemoryUpstreamRepo::new()),
+        Arc::new(InMemoryRouteRepo::new()),
+        Arc::new(resolver),
+        allow_all_enforcer(),
+        Arc::new(MockCredStoreClient::erroring_not_found()),
+        Arc::new(SsrfGuard::disabled()),
+    );
+
+    let root_ctx = test_ctx(root);
+    let mut root_req = make_create_upstream_hostname();
+    root_req.auth = Some(AuthConfig {
+        plugin_type: "apikey".into(),
+        sharing: SharingMode::Inherit,
+        config: None,
+    });
+    svc.create_upstream(&root_ctx, root_req).await.unwrap();
+
+    let child_ctx = test_ctx(child);
+    let mut child_req = make_create_upstream_hostname();
+    child_req.auth = Some(auth_with_secret_ref("cred://missing-key"));
+    let err = svc
+        .create_upstream(&child_ctx, child_req)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::SecretRefNotAccessible { .. }),
+        "expected SecretRefNotAccessible, got: {err:?}"
+    );
 }
 
 #[tokio::test]

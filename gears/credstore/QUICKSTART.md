@@ -15,7 +15,7 @@ Stores, retrieves, and deletes secrets scoped to tenants and owners. Secrets are
 
 Full API documentation: <http://127.0.0.1:8087/cf/docs>
 
-The example server uses the gateway prefix `/cf`. This comes from `gearss.api-gateway.config.prefix_path` and is configurable.
+The example server uses the gear prefix `/cf`. This comes from `gears.api-gateway.config.prefix_path` and is configurable.
 
 ## Configuration
 

@@ -1,777 +1,231 @@
-// Created: 2026-04-07 by Constructor Tech
-use super::*;
-use crate::config::SecretConfig;
+// Created: 2026-06-06 — tests for the static credstore in-memory value store.
 use uuid::Uuid;
 
-fn tenant_a() -> Uuid {
-    Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
+use credstore_sdk::{OwnerId, SecretRef, SecretValue, SharingMode, TenantId};
+
+use crate::config::{SecretConfig, StaticCredStorePluginConfig};
+
+use super::Service;
+
+const T1: &str = "00000000-0000-0000-0000-000000000001";
+const T2: &str = "00000000-0000-0000-0000-000000000002";
+const O1: &str = "11111111-0000-0000-0000-000000000001";
+const O2: &str = "22222222-0000-0000-0000-000000000002";
+
+fn tid(s: &str) -> TenantId {
+    TenantId(Uuid::parse_str(s).unwrap())
+}
+fn oid(s: &str) -> OwnerId {
+    OwnerId(Uuid::parse_str(s).unwrap())
+}
+fn sref(s: &str) -> SecretRef {
+    SecretRef::new(s).unwrap()
 }
 
-fn tenant_b() -> Uuid {
-    Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap()
-}
-
-fn owner_a() -> Uuid {
-    Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap()
-}
-
-fn owner_b() -> Uuid {
-    Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap()
-}
-
-fn ctx(tenant_id: Uuid, subject_id: Uuid) -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(subject_id)
-        .subject_tenant_id(tenant_id)
-        .build()
-        .unwrap()
-}
-
-/// Default config: `tenant_a` + `owner_a` → Private secret.
-fn cfg_with_single_secret() -> StaticCredStorePluginConfig {
-    StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: Some(owner_a()),
-            key: "openai_api_key".to_owned(),
-            value: "sk-test-123".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    }
-}
-
-#[test]
-fn from_config_rejects_invalid_secret_ref() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: Some(owner_a()),
-            key: "invalid:key".to_owned(),
-            value: "value".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    let result = Service::from_config(&cfg);
-    assert!(result.is_err());
-}
-
-// --- Private secret lookup ---
-
-#[test]
-fn private_secret_returned_for_matching_tenant_and_owner() {
-    let service = Service::from_config(&cfg_with_single_secret()).unwrap();
-    let key = SecretRef::new("openai_api_key").unwrap();
-
-    let entry = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
-    assert_eq!(entry.value.as_bytes(), b"sk-test-123");
-    assert_eq!(entry.owner_id, OwnerId(owner_a()));
-    assert_eq!(entry.owner_tenant_id, TenantId(tenant_a()));
-    assert_eq!(entry.sharing, SharingMode::Private);
-}
-
-#[test]
-fn private_secret_not_returned_for_different_owner() {
-    let service = Service::from_config(&cfg_with_single_secret()).unwrap();
-    let key = SecretRef::new("openai_api_key").unwrap();
-
-    assert!(service.get(&ctx(tenant_a(), owner_b()), &key).is_none());
-}
-
-#[test]
-fn private_secret_not_returned_for_different_tenant() {
-    let service = Service::from_config(&cfg_with_single_secret()).unwrap();
-    let key = SecretRef::new("openai_api_key").unwrap();
-
-    assert!(service.get(&ctx(tenant_b(), owner_a()), &key).is_none());
-}
-
-#[test]
-fn get_returns_none_for_missing_key() {
-    let service = Service::from_config(&cfg_with_single_secret()).unwrap();
-    let key = SecretRef::new("missing").unwrap();
-
-    assert!(service.get(&ctx(tenant_a(), owner_a()), &key).is_none());
-}
-
-#[test]
-fn from_config_with_empty_secrets_returns_none() {
-    let cfg = StaticCredStorePluginConfig::default();
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("any-key").unwrap();
-    assert!(service.get(&ctx(tenant_a(), owner_a()), &key).is_none());
-}
-
-// --- Tenant secret lookup ---
-
-#[test]
-fn tenant_secret_returned_for_any_subject_in_same_tenant() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: None,
-            key: "team_key".to_owned(),
-            value: "team-val".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("team_key").unwrap();
-
-    let e1 = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
-    assert_eq!(e1.value.as_bytes(), b"team-val");
-    assert_eq!(e1.sharing, SharingMode::Tenant);
-
-    let e2 = service.get(&ctx(tenant_a(), owner_b()), &key).unwrap();
-    assert_eq!(e2.value.as_bytes(), b"team-val");
-
-    assert!(service.get(&ctx(tenant_b(), owner_a()), &key).is_none());
-}
-
-// --- Global secret lookup ---
-
-#[test]
-fn global_secret_returned_for_any_tenant_and_subject() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: None,
-            owner_id: None,
-            key: "global_key".to_owned(),
-            value: "global-val".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("global_key").unwrap();
-
-    let e1 = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
-    assert_eq!(e1.value.as_bytes(), b"global-val");
-    assert_eq!(e1.sharing, SharingMode::Shared);
-
-    let e2 = service.get(&ctx(tenant_b(), owner_b()), &key).unwrap();
-    assert_eq!(e2.value.as_bytes(), b"global-val");
-}
-
-// --- Shared (tenant-scoped) secret lookup ---
-
-#[test]
-fn shared_secret_returned_only_for_owning_tenant() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: None,
-            key: "shared_key".to_owned(),
-            value: "shared-val".to_owned(),
-            sharing: Some(SharingMode::Shared),
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("shared_key").unwrap();
-
-    // Same tenant — accessible
-    let e = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
-    assert_eq!(e.value.as_bytes(), b"shared-val");
-    assert_eq!(e.sharing, SharingMode::Shared);
-    assert_eq!(e.owner_tenant_id, TenantId(tenant_a()));
-
-    // Different tenant — not accessible at plugin level
-    // (gateway walk-up would call the plugin with parent tenant_id)
-    assert!(service.get(&ctx(tenant_b(), owner_a()), &key).is_none());
-}
-
-// --- Lookup precedence: Private > Tenant > Shared > Global ---
-
-#[test]
-fn private_takes_precedence_over_tenant_shared_and_global() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            SecretConfig {
-                tenant_id: None,
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "global-val".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "shared-val".to_owned(),
-                sharing: Some(SharingMode::Shared),
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "tenant-val".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: Some(owner_a()),
-                key: "k".to_owned(),
-                value: "private-val".to_owned(),
-                sharing: None,
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("k").unwrap();
-
-    // owner_a in tenant_a → Private
-    let e = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
-    assert_eq!(e.value.as_bytes(), b"private-val");
-    assert_eq!(e.sharing, SharingMode::Private);
-
-    // owner_b in tenant_a → Tenant (no private match)
-    let e = service.get(&ctx(tenant_a(), owner_b()), &key).unwrap();
-    assert_eq!(e.value.as_bytes(), b"tenant-val");
-    assert_eq!(e.sharing, SharingMode::Tenant);
-
-    // tenant_b → Global (no private, tenant, or shared match)
-    let e = service.get(&ctx(tenant_b(), owner_a()), &key).unwrap();
-    assert_eq!(e.value.as_bytes(), b"global-val");
-    assert_eq!(e.sharing, SharingMode::Shared);
-}
-
-#[test]
-fn tenant_takes_precedence_over_shared_and_global() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            SecretConfig {
-                tenant_id: None,
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "global-val".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "shared-val".to_owned(),
-                sharing: Some(SharingMode::Shared),
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "tenant-val".to_owned(),
-                sharing: None,
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("k").unwrap();
-
-    let e = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
-    assert_eq!(e.value.as_bytes(), b"tenant-val");
-
-    let e = service.get(&ctx(tenant_b(), owner_a()), &key).unwrap();
-    assert_eq!(e.value.as_bytes(), b"global-val");
-}
-
-#[test]
-fn shared_takes_precedence_over_global() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            SecretConfig {
-                tenant_id: None,
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "global-val".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "shared-val".to_owned(),
-                sharing: Some(SharingMode::Shared),
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("k").unwrap();
-
-    // tenant_a has a shared secret → takes precedence over global
-    let e = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
-    assert_eq!(e.value.as_bytes(), b"shared-val");
-    assert_eq!(e.sharing, SharingMode::Shared);
-
-    // tenant_b has no shared secret → falls through to global
-    let e = service.get(&ctx(tenant_b(), owner_a()), &key).unwrap();
-    assert_eq!(e.value.as_bytes(), b"global-val");
-}
-
-// --- Duplicate key validation ---
-
-#[test]
-fn from_config_rejects_duplicate_private_key() {
-    let secret = SecretConfig {
-        tenant_id: Some(tenant_a()),
-        owner_id: Some(owner_a()),
-        key: "dup".to_owned(),
-        value: "v1".to_owned(),
+fn secret(tenant: Option<&str>, owner: Option<&str>, key: &str, value: &str) -> SecretConfig {
+    SecretConfig {
+        tenant_id: tenant.map(|t| Uuid::parse_str(t).unwrap()),
+        owner_id: owner.map(|o| Uuid::parse_str(o).unwrap()),
+        key: key.to_owned(),
+        value: value.to_owned(),
         sharing: None,
-    };
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            secret.clone(),
-            SecretConfig {
-                value: "v2".to_owned(),
-                ..secret
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    match Service::from_config(&cfg) {
-        Ok(_) => panic!("expected error for duplicate private key"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(err.contains("duplicate"), "expected 'duplicate' in: {err}");
-            assert!(err.contains("dup"), "expected key name in: {err}");
-        }
     }
+}
+
+fn cfg(secrets: Vec<SecretConfig>) -> StaticCredStorePluginConfig {
+    StaticCredStorePluginConfig {
+        secrets,
+        ..Default::default()
+    }
+}
+
+fn svc(secrets: Vec<SecretConfig>) -> Service {
+    Service::from_config(&cfg(secrets)).expect("config builds")
+}
+
+#[track_caller]
+fn assert_value(v: Option<SecretValue>, expected: &str) {
+    assert_eq!(
+        v.expect("value present").as_bytes(),
+        expected.as_bytes(),
+        "secret value mismatch"
+    );
+}
+
+#[test]
+fn tenant_class_read() {
+    let s = svc(vec![secret(Some(T1), None, "openai-key", "tenant-val")]);
+
+    assert_value(
+        s.get_value(&tid(T1), &sref("openai-key"), None),
+        "tenant-val",
+    );
+    // Other tenant cannot see it.
+    assert!(s.get_value(&tid(T2), &sref("openai-key"), None).is_none());
+    // Tenant secret is not exposed to the private key class.
+    assert!(
+        s.get_value(&tid(T1), &sref("openai-key"), Some(&oid(O1)))
+            .is_none()
+    );
+}
+
+#[test]
+fn private_class_read_is_owner_scoped() {
+    let s = svc(vec![secret(
+        Some(T1),
+        Some(O1),
+        "openai-key",
+        "private-val",
+    )]);
+
+    assert_value(
+        s.get_value(&tid(T1), &sref("openai-key"), Some(&oid(O1))),
+        "private-val",
+    );
+    // Wrong owner -> miss.
+    assert!(
+        s.get_value(&tid(T1), &sref("openai-key"), Some(&oid(O2)))
+            .is_none()
+    );
+    // Tenant-class read does not see a private secret.
+    assert!(s.get_value(&tid(T1), &sref("openai-key"), None).is_none());
+}
+
+#[test]
+fn global_secret_is_a_tenant_class_fallback() {
+    // No tenant_id -> global (resolved sharing == Shared).
+    let s = svc(vec![secret(None, None, "azure-key", "global-val")]);
+
+    assert_value(
+        s.get_value(&tid(T1), &sref("azure-key"), None),
+        "global-val",
+    );
+    assert_value(
+        s.get_value(&tid(T2), &sref("azure-key"), None),
+        "global-val",
+    );
+    // Not visible to the private key class.
+    assert!(
+        s.get_value(&tid(T1), &sref("azure-key"), Some(&oid(O1)))
+            .is_none()
+    );
+}
+
+#[test]
+fn shared_secret_is_a_tenant_class_fallback() {
+    let mut entry = secret(Some(T1), None, "shared-key", "shared-val");
+    entry.sharing = Some(SharingMode::Shared);
+    let s = svc(vec![entry]);
+
+    assert_value(
+        s.get_value(&tid(T1), &sref("shared-key"), None),
+        "shared-val",
+    );
+    // Scoped to the owning tenant (gear handles hierarchical walk-up).
+    assert!(s.get_value(&tid(T2), &sref("shared-key"), None).is_none());
+}
+
+#[test]
+fn put_then_get_tenant_class() {
+    let s = svc(vec![]);
+    s.put_value(&tid(T1), &sref("k"), SecretValue::from("written"), None);
+    assert_value(s.get_value(&tid(T1), &sref("k"), None), "written");
+}
+
+#[test]
+fn put_then_get_private_class() {
+    let s = svc(vec![]);
+    s.put_value(
+        &tid(T1),
+        &sref("k"),
+        SecretValue::from("owned"),
+        Some(&oid(O1)),
+    );
+    assert_value(s.get_value(&tid(T1), &sref("k"), Some(&oid(O1))), "owned");
+    // Private write is invisible to the tenant class and other owners.
+    assert!(s.get_value(&tid(T1), &sref("k"), None).is_none());
+    assert!(s.get_value(&tid(T1), &sref("k"), Some(&oid(O2))).is_none());
+}
+
+#[test]
+fn put_overwrites_existing_value() {
+    let s = svc(vec![secret(Some(T1), None, "k", "old")]);
+    s.put_value(&tid(T1), &sref("k"), SecretValue::from("new"), None);
+    assert_value(s.get_value(&tid(T1), &sref("k"), None), "new");
+}
+
+#[test]
+fn delete_removes_tenant_value() {
+    let s = svc(vec![secret(Some(T1), None, "k", "v")]);
+    s.delete_value(&tid(T1), &sref("k"), None);
+    assert!(s.get_value(&tid(T1), &sref("k"), None).is_none());
+}
+
+#[test]
+fn delete_removes_private_value_without_touching_tenant_class() {
+    let s = svc(vec![
+        secret(Some(T1), None, "k", "tenant-v"),
+        secret(Some(T1), Some(O1), "k", "private-v"),
+    ]);
+    s.delete_value(&tid(T1), &sref("k"), Some(&oid(O1)));
+    assert!(s.get_value(&tid(T1), &sref("k"), Some(&oid(O1))).is_none());
+    // Tenant-class value under the same key is untouched.
+    assert_value(s.get_value(&tid(T1), &sref("k"), None), "tenant-v");
+}
+
+#[test]
+fn tenant_delete_never_destroys_config_seeded_fallbacks() {
+    // Config-seeded shared/global entries serve *other* tenants too; a
+    // tenant-scoped delete (or a gear reaper retry) must not sweep them.
+    let mut shared_entry = secret(Some(T1), None, "shared-key", "shared-val");
+    shared_entry.sharing = Some(SharingMode::Shared);
+    let s = svc(vec![
+        secret(None, None, "global-key", "global-val"),
+        shared_entry,
+    ]);
+
+    s.delete_value(&tid(T1), &sref("global-key"), None);
+    s.delete_value(&tid(T1), &sref("shared-key"), None);
+
+    assert_value(
+        s.get_value(&tid(T2), &sref("global-key"), None),
+        "global-val",
+    );
+    assert_value(
+        s.get_value(&tid(T1), &sref("shared-key"), None),
+        "shared-val",
+    );
+}
+
+#[test]
+fn delete_missing_is_noop() {
+    let s = svc(vec![]);
+    s.delete_value(&tid(T1), &sref("absent"), None);
+    s.delete_value(&tid(T1), &sref("absent"), Some(&oid(O1)));
+    assert!(s.get_value(&tid(T1), &sref("absent"), None).is_none());
+}
+
+#[test]
+fn from_config_rejects_nil_tenant() {
+    let nil = "00000000-0000-0000-0000-000000000000";
+    let err = Service::from_config(&cfg(vec![secret(Some(nil), None, "k", "v")]))
+        .expect_err("nil tenant rejected");
+    assert!(err.to_string().contains("nil UUID"), "{err}");
 }
 
 #[test]
 fn from_config_rejects_duplicate_tenant_key() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "dup".to_owned(),
-                value: "v1".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "dup".to_owned(),
-                value: "v2".to_owned(),
-                sharing: None,
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    match Service::from_config(&cfg) {
-        Ok(_) => panic!("expected error for duplicate tenant key"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(err.contains("duplicate"), "expected 'duplicate' in: {err}");
-        }
-    }
+    let err = Service::from_config(&cfg(vec![
+        secret(Some(T1), None, "dup", "a"),
+        secret(Some(T1), None, "dup", "b"),
+    ]))
+    .expect_err("duplicate rejected");
+    assert!(err.to_string().contains("duplicate"), "{err}");
 }
 
 #[test]
-fn from_config_rejects_duplicate_global_key() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            SecretConfig {
-                tenant_id: None,
-                owner_id: None,
-                key: "dup".to_owned(),
-                value: "v1".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: None,
-                owner_id: None,
-                key: "dup".to_owned(),
-                value: "v2".to_owned(),
-                sharing: None,
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    match Service::from_config(&cfg) {
-        Ok(_) => panic!("expected error for duplicate global key"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(err.contains("duplicate"), "expected 'duplicate' in: {err}");
-        }
-    }
-}
-
-#[test]
-fn from_config_rejects_duplicate_shared_key() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "dup".to_owned(),
-                value: "v1".to_owned(),
-                sharing: Some(SharingMode::Shared),
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "dup".to_owned(),
-                value: "v2".to_owned(),
-                sharing: Some(SharingMode::Shared),
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    match Service::from_config(&cfg) {
-        Ok(_) => panic!("expected error for duplicate shared key"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(err.contains("duplicate"), "expected 'duplicate' in: {err}");
-        }
-    }
-}
-
-// --- Config validation ---
-
-#[test]
-fn from_config_rejects_non_shared_global_secret() {
-    for mode in [SharingMode::Private, SharingMode::Tenant] {
-        let cfg = StaticCredStorePluginConfig {
-            secrets: vec![SecretConfig {
-                tenant_id: None,
-                owner_id: None,
-                key: "global_key".to_owned(),
-                value: "val".to_owned(),
-                sharing: Some(mode),
-            }],
-            ..StaticCredStorePluginConfig::default()
-        };
-
-        assert!(
-            Service::from_config(&cfg).is_err(),
-            "expected error for global secret with {mode:?} sharing"
-        );
-    }
-}
-
-#[test]
-fn from_config_rejects_private_without_owner_id() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: None,
-            key: "private_key".to_owned(),
-            value: "val".to_owned(),
-            sharing: Some(SharingMode::Private),
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    match Service::from_config(&cfg) {
-        Ok(_) => panic!("expected error for private without owner_id"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(err.contains("requires an explicit owner_id"), "got: {err}");
-        }
-    }
-}
-
-#[test]
-fn from_config_rejects_owner_id_without_tenant_id() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: None,
-            owner_id: Some(owner_a()),
-            key: "bad_key".to_owned(),
-            value: "val".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    match Service::from_config(&cfg) {
-        Ok(_) => panic!("expected error for owner_id without tenant_id"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(
-                err.contains("owner_id cannot be set without tenant_id"),
-                "got: {err}"
-            );
-        }
-    }
-}
-
-#[test]
-fn from_config_rejects_owner_id_for_non_private() {
-    for mode in [SharingMode::Tenant, SharingMode::Shared] {
-        let cfg = StaticCredStorePluginConfig {
-            secrets: vec![SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: Some(owner_a()),
-                key: "bad_key".to_owned(),
-                value: "val".to_owned(),
-                sharing: Some(mode),
-            }],
-            ..StaticCredStorePluginConfig::default()
-        };
-
-        match Service::from_config(&cfg) {
-            Ok(_) => panic!("expected error for owner_id with {mode:?} sharing"),
-            Err(e) => {
-                let err = e.to_string();
-                assert!(
-                    err.contains("owner_id is only valid for private sharing mode"),
-                    "got: {err}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn from_config_accepts_shared_with_tenant_id() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: None,
-            key: "k".to_owned(),
-            value: "v".to_owned(),
-            sharing: Some(SharingMode::Shared),
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("k").unwrap();
-    let e = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
-    assert_eq!(e.sharing, SharingMode::Shared);
-    assert_eq!(e.owner_tenant_id, TenantId(tenant_a()));
-}
-
-#[test]
-fn from_config_rejects_nil_tenant_id() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(Uuid::nil()),
-            owner_id: Some(owner_a()),
-            key: "k".to_owned(),
-            value: "v".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    match Service::from_config(&cfg) {
-        Ok(_) => panic!("expected error for nil tenant_id"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(err.contains("tenant_id must not be nil UUID"), "got: {err}");
-        }
-    }
-}
-
-#[test]
-fn from_config_rejects_nil_owner_id() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: Some(Uuid::nil()),
-            key: "k".to_owned(),
-            value: "v".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    match Service::from_config(&cfg) {
-        Ok(_) => panic!("expected error for nil owner_id"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(err.contains("owner_id must not be nil UUID"), "got: {err}");
-        }
-    }
-}
-
-// --- Sharing mode defaults ---
-
-#[test]
-fn default_sharing_is_shared_for_global() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: None,
-            owner_id: None,
-            key: "g".to_owned(),
-            value: "v".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("g").unwrap();
-    assert_eq!(
-        service
-            .get(&ctx(tenant_a(), owner_a()), &key)
-            .unwrap()
-            .sharing,
-        SharingMode::Shared
-    );
-}
-
-#[test]
-fn default_sharing_is_tenant_for_scoped_without_owner() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: None,
-            key: "t".to_owned(),
-            value: "v".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("t").unwrap();
-    assert_eq!(
-        service
-            .get(&ctx(tenant_a(), owner_a()), &key)
-            .unwrap()
-            .sharing,
-        SharingMode::Tenant
-    );
-}
-
-#[test]
-fn default_sharing_is_private_for_scoped_with_owner() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: Some(owner_a()),
-            key: "p".to_owned(),
-            value: "v".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("p").unwrap();
-    assert_eq!(
-        service
-            .get(&ctx(tenant_a(), owner_a()), &key)
-            .unwrap()
-            .sharing,
-        SharingMode::Private
-    );
-}
-
-#[test]
-fn explicit_sharing_overrides_default() {
-    // tenant_id + no owner_id defaults to Tenant; override to Shared.
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: None,
-            key: "k".to_owned(),
-            value: "v".to_owned(),
-            sharing: Some(SharingMode::Shared),
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("k").unwrap();
-    assert_eq!(
-        service
-            .get(&ctx(tenant_a(), owner_a()), &key)
-            .unwrap()
-            .sharing,
-        SharingMode::Shared
-    );
-}
-
-// --- Same key in different scopes ---
-
-#[test]
-fn allows_same_key_in_different_tenants() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "api_key".to_owned(),
-                value: "val-a".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_b()),
-                owner_id: None,
-                key: "api_key".to_owned(),
-                value: "val-b".to_owned(),
-                sharing: None,
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let key = SecretRef::new("api_key").unwrap();
-
-    assert_eq!(
-        service
-            .get(&ctx(tenant_a(), owner_a()), &key)
-            .unwrap()
-            .value
-            .as_bytes(),
-        b"val-a"
-    );
-    assert_eq!(
-        service
-            .get(&ctx(tenant_b(), owner_a()), &key)
-            .unwrap()
-            .value
-            .as_bytes(),
-        b"val-b"
-    );
-}
-
-#[test]
-fn same_key_across_all_four_scopes() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            SecretConfig {
-                tenant_id: None,
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "global".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "shared".to_owned(),
-                sharing: Some(SharingMode::Shared),
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "tenant".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: Some(owner_a()),
-                key: "k".to_owned(),
-                value: "private".to_owned(),
-                sharing: None,
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    assert!(Service::from_config(&cfg).is_ok());
+fn from_config_rejects_invalid_secret_ref() {
+    let err = Service::from_config(&cfg(vec![secret(Some(T1), None, "bad key!", "v")]))
+        .expect_err("invalid ref rejected");
+    assert!(!err.to_string().is_empty());
 }

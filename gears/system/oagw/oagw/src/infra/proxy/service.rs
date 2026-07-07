@@ -1727,6 +1727,7 @@ fn domain_error_type_name(err: &DomainError) -> &'static str {
         DomainError::PayloadTooLarge { .. } => "PayloadTooLarge",
         DomainError::RateLimitExceeded { .. } => "RateLimitExceeded",
         DomainError::SecretNotFound { .. } => "SecretNotFound",
+        DomainError::SecretRefNotAccessible { .. } => "SecretRefNotAccessible",
         DomainError::DownstreamError { .. } => "DownstreamError",
         DomainError::ProtocolError { .. } => "ProtocolError",
         DomainError::UpstreamDisabled { .. } => "UpstreamDisabled",
@@ -1892,7 +1893,7 @@ mod tests {
             AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
             EvaluationResponseContext, PolicyEnforcer,
         };
-        use credstore_sdk::{CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef};
+        use credstore_sdk::CredStoreClientV1;
         use toolkit_security::SecurityContext;
 
         struct AllowAllAuthZ;
@@ -1912,19 +1913,8 @@ mod tests {
             }
         }
 
-        struct NoopCredStore;
-        #[async_trait]
-        impl CredStoreClientV1 for NoopCredStore {
-            async fn get(
-                &self,
-                _ctx: &SecurityContext,
-                _key: &SecretRef,
-            ) -> Result<Option<GetSecretResponse>, CredStoreError> {
-                Ok(None)
-            }
-        }
-
-        let credstore: Arc<dyn CredStoreClientV1> = Arc::new(NoopCredStore);
+        let credstore: Arc<dyn CredStoreClientV1> =
+            Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty());
         let policy_enforcer = PolicyEnforcer::new(Arc::new(AllowAllAuthZ));
 
         // Minimal CP — never called by select_endpoint().

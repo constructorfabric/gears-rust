@@ -101,6 +101,15 @@ gears:
     config:
       max_field_length: 100
 
+  credstore:
+    database:
+      server: "sqlite_mini_chat"
+      file: "credstore.db"
+    config:
+      # Gateway selects its value-store backend plugin by GTS vendor;
+      # must match static-credstore-plugin (default "constructorfabric").
+      vendor: "constructorfabric"
+
   static-credstore-plugin:
     config:
       secrets:

@@ -23,22 +23,29 @@
   - [4.7 Database schemas & tables](#47-database-schemas--tables)
   - [4.8 Deployment Topology](#48-deployment-topology)
   - [4.9 Technology Stack](#49-technology-stack)
-- [5. Risks / Trade-offs](#5-risks--trade-offs)
-  - [5.1 Architectural Trade-offs](#51-architectural-trade-offs)
-  - [5.2 Security and Performance Risks](#52-security-and-performance-risks)
-- [6. Migration Plan](#6-migration-plan)
-  - [6.1 Schema Migration: Two-Mode to Three-Mode Sharing](#61-schema-migration-two-mode-to-three-mode-sharing)
-  - [6.2 Backward Compatibility](#62-backward-compatibility)
-  - [6.3 Rollback Plan](#63-rollback-plan)
-  - [6.4 Success Criteria](#64-success-criteria)
-- [7. Open Questions](#7-open-questions)
-  - [7.1 From PRD (Cross-Reference)](#71-from-prd-cross-reference)
-  - [7.2 Design-Specific Questions](#72-design-specific-questions)
-- [8. Additional context](#8-additional-context)
+  - [4.10 Value-Fingerprint Fence](#410-value-fingerprint-fence)
+- [5. Secret Types (GTS-Based, Registry-Driven)](#5-secret-types-gts-based-registry-driven)
+  - [5.1 Concept](#51-concept)
+  - [5.2 Type Traits](#52-type-traits)
+  - [5.3 Built-in Type Catalog (Registry Seeds)](#53-built-in-type-catalog-registry-seeds)
+  - [5.4 Enforcement Points](#54-enforcement-points)
+  - [5.5 Storage & API Changes](#55-storage--api-changes)
+- [6. Secret Lifecycle & Sagas](#6-secret-lifecycle--sagas)
+  - [6.1 Status Model](#61-status-model)
+  - [6.2 Provisioning Saga](#62-provisioning-saga)
+  - [6.3 Deprovisioning Saga](#63-deprovisioning-saga)
+  - [6.4 Reaper](#64-reaper)
+- [7. Risks / Trade-offs](#7-risks--trade-offs)
+  - [7.1 Architectural Trade-offs](#71-architectural-trade-offs)
+  - [7.2 Security and Performance Risks](#72-security-and-performance-risks)
+- [8. Migration Plan](#8-migration-plan)
+- [9. Open Questions](#9-open-questions)
+- [10. Additional context](#10-additional-context)
   - [Plugin Registration](#plugin-registration)
   - [Configuration](#configuration)
   - [Error Mapping](#error-mapping)
-- [9. Traceability](#9-traceability)
+  - [Observability](#observability)
+- [11. Traceability](#11-traceability)
 
 <!-- /toc -->
 
@@ -66,21 +73,11 @@ NOT IN THIS DOCUMENT (see other templates):
   ✗ Detailed rationale for decisions → ADR/
   ✗ Step-by-step implementation flows → features/
 
-STANDARDS ALIGNMENT:
-  - IEEE 1016-2009 (Software Design Description)
-  - IEEE 42010 (Architecture Description — viewpoints, views, concerns)
-  - ISO/IEC 15288 / 12207 (Architecture & Design Definition processes)
-
-ARCHITECTURE VIEWS (per IEEE 42010):
-  - Context view: system boundaries and external actors
-  - Functional view: components and their responsibilities
-  - Information view: data models and flows
-  - Deployment view: infrastructure topology
-
 DESIGN LANGUAGE:
   - Be specific and clear; no fluff, bloat, or emoji
   - Reference PRD requirements using `cpt-cf-credstore-fr-{slug}` IDs
-  - Reference ADR documents using `cpt-cf-credstore-adr-{slug}` IDs
+  - Sections marked **Planned** describe target design not yet implemented;
+    everything else describes the shipped implementation.
 =============================================================================
 -->
 
@@ -88,13 +85,13 @@ DESIGN LANGUAGE:
 
 ### 1.1 Architectural Vision
 
-CredStore follows the ToolKit Gateway + Plugins pattern (same architecture as `tenant_resolver`). A gateway gear (`credstore`) exposes a simple public API to platform consumers, enforces authorization policy, and implements hierarchical secret resolution. Backend-specific storage is implemented as plugins that register via the GTS type system and are selected at runtime by configuration.
+CredStore follows the ToolKit Gear + Plugins pattern: a **stateful gear** (`credstore`) owns all secret *metadata* (identity, sharing, ownership, lifecycle status, version) in its own database table, enforces authorization and hierarchical resolution, and exposes the public API; backend **plugins** are pure per-tenant *value stores* selected at runtime by GTS vendor configuration. The backend stores the secret value only — it carries no metadata schema, no sharing semantics, and no policy.
 
-The SDK crate (`credstore-sdk`) defines two trait boundaries: `CredStoreClientV1` for consumers and `CredStorePluginClientV1` for backend implementations. Consumers depend only on the gateway trait and never interact with plugins directly. This decoupling allows runtime backend selection without changing consumer code.
+The SDK crate (`credstore-sdk`) defines two trait boundaries: `CredStoreClientV1` for consumers and `CredStorePluginClientV1` for backend implementations. Consumers depend only on the gear trait and never interact with plugins directly, which allows runtime backend selection without changing consumer code.
 
-The architecture provides simple CRUD operations (get, put, delete) for tenant-scoped secrets. The tenant ID is always derived from SecurityCtx for self-service operations. Authorization is enforced exclusively in the gateway layer. For simple backend plugins (VendorA Credstore, OS keychain), **hierarchical secret resolution** (the walk-up algorithm that searches for secrets across tenant ancestors) is implemented in the Gateway using `tenant_resolver` to query the tenant hierarchy. These plugins are storage adapters providing per-tenant key-value operations with no policy or hierarchical logic.
+Because metadata is local, hierarchical resolution (the walk-up that searches for secrets across tenant ancestors) is a **single indexed SQL query** over the metadata table followed by at most **one** backend read for the winning row. Writes are **compensating sagas** over the metadata row and the backend value, made crash-safe by an explicit lifecycle status and a periodic reaper.
 
-The `credentials_storage` plugin is an exception to this pattern. It is a standalone Rust microservice that implements credential merge/propagation resolution internally (own → inherited → default), along with encrypted credential storage, schema validation, field-level masking, and pluggable tenant key management via a `KeyProvider` abstraction. When this plugin is active, the Gateway delegates merge resolution to the plugin rather than performing the walk-up algorithm itself. The `KeyProvider` supports two modes: local database storage (for development/simple deployments) and external key management service integration (HashiCorp Vault, AWS KMS) for production environments requiring key–data separation. The detailed plugin architecture will be documented in `plugins/credentials-storage/DESIGN.md`.
+Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnforcer`: each operation evaluates an `AccessScope` that is enforced **in SQL** through SecureORM clamps on the metadata table. Tenant isolation is therefore enforced at the data layer, consistent with the rest of the platform.
 
 ### 1.2 Architecture Drivers
 
@@ -102,895 +99,768 @@ The `credentials_storage` plugin is an exception to this pattern. It is a standa
 
 | Requirement | Design Response |
 |-------------|-----------------|
-| `cpt-cf-credstore-fr-put-secret` | Plugin `put` with tenant_id, key, value, sharing → backend storage |
-| `cpt-cf-credstore-fr-get-secret` | Plugin `get` with tenant_id, key, optional owner_id → backend lookup (two-phase: private then tenant/shared) |
-| `cpt-cf-credstore-fr-delete-secret` | Plugin `delete` with tenant_id, key, optional owner_id → backend removal |
-| `cpt-cf-credstore-fr-tenant-scoping` | Gateway extracts tenant_id from SecurityCtx before delegating to plugin |
-| `cpt-cf-credstore-fr-sharing-modes` | `sharing` field in Credstore backend (VendorA); passed through from Gateway API |
-| `cpt-cf-credstore-fr-authz-gateway` | Gateway checks SecurityCtx permissions before any plugin call |
-| `cpt-cf-credstore-fr-rw-separation` | VendorA plugin configures separate RO/RW OAuth2 client credentials |
-| `cpt-cf-credstore-fr-external-key-mgmt` | Credentials Storage plugin supports pluggable `KeyProvider`: local DB storage for dev, external KMS (Vault, AWS KMS) for production key–data separation |
+| `cpt-cf-credstore-fr-put-secret` | Write saga: insert `provisioning` metadata row → plugin `put` (value only) → mark `active`; overwrite path is backend-first, then version bump |
+| `cpt-cf-credstore-fr-get-secret` | Single SQL resolution over the ancestor chain, then one plugin `get` for the winning row |
+| `cpt-cf-credstore-fr-delete-secret` | Deprovisioning saga: mark `deprovisioning` → backend delete → row delete (§6.3) |
+| `cpt-cf-credstore-fr-tenant-scoping` | Gear derives tenant from `SecurityContext.subject_tenant_id()`; own-tenant gate + SecureORM scope clamp |
+| `cpt-cf-credstore-fr-sharing-modes` | `sharing` column in the gear metadata table; partial unique indexes let private and tenant/shared coexist under one reference |
+| `cpt-cf-credstore-fr-authz-pdp` | PDP `AccessScope` per operation (`read`/`write`/`delete` on the secret GTS resource type), enforced in SQL; fail-closed |
+| `cpt-cf-credstore-fr-optimistic-concurrency` | Monotonic `version` column; `GET` returns a strong generation-bound `ETag` (`"<id>.<version>"`, §4.10); `PUT`/`DELETE` honour `If-Match` |
+| `cpt-cf-credstore-fr-secret-types` | GTS-based secret types with enforceable traits (§5) |
+| `cpt-cf-credstore-fr-deprovisioning` | `deprovisioning` status + compensating delete saga swept by the reaper (§6.3) |
 
 #### NFR Allocation
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-credstore-nfr-confidentiality` | Secret values never in logs | Gateway + plugins | `SecretValue` wrapper type with custom `Debug`/`Display` that redacts content; log scrubbing at transport layer | Automated log scan in integration tests |
+| `cpt-cf-credstore-nfr-confidentiality` | Secret values never in logs or caches | SDK + gear + plugins | `SecretValue` wrapper with redacting `Debug`/`Display` and zeroize-on-drop; hand-written redacted `Debug` on REST DTOs; `Cache-Control: no-store` on `GET`; no lossy UTF-8 decode | Unit tests on redaction; code review |
+| `cpt-cf-credstore-nfr-tenant-isolation` | No cross-tenant access outside PDP scope | Gear + repo | Scope clamps in SQL; own-tenant gate with `cross_tenant_denied` metric; barrier-respecting ancestor chain | Repo/service tests incl. barrier and scope cases |
+| `cpt-cf-credstore-nfr-observability` | Operational visibility | Gear | OpenTelemetry metrics: walk-up depth, read outcome, dependency timings, saga rollback/reap counters, inventory gauge | Metrics unit tests |
+
+#### Key ADRs
+
+| ADR ID | Decision Summary |
+|--------|------------------|
+| `cpt-cf-credstore-adr-stateful-gear` | Stateful gear, value-only backend: the gear owns the `credstore_secrets` metadata table (identity, sharing, ownership, lifecycle status, version); the backend plugin stores only the value ([ADR-0001](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md)) |
+| `cpt-cf-credstore-adr-deprovisioning-saga` | Delete is a saga symmetric to provisioning: a `deprovisioning` status holds the unique name until backend cleanup completes; stuck rows are swept by the reaper ([ADR-0002](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md)) |
+| `cpt-cf-credstore-adr-value-fingerprint-fence` | Value-fingerprint fence + generation-bound ETag: the gear stamps `value_fp = HMAC(fence_key, value)` in the same write as `sharing` and verifies it on read (fail-closed 404 on mismatch), and binds the strong ETag to `<row-id>.<version>`; closes the crosswise-PUT cross-tenant disclosure and the recreate ABA lost-update ([ADR-0003](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md)) |
 
 ### 1.3 Architecture Layers
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Consumers (OAGW, gears)                │
-├─────────────────────────────────────────────────────────────┤
-│  credstore-sdk    │ Public API traits, models, errors       │
-├─────────────────────────────────────────────────────────────┤
-│  credstore.       │ Authorization, plugin selection, REST   │
-├─────────────────────────────────────────────────────────────┤
-│  Plugins          │ Backend-specific storage adapters       │
-│  ┌──────────────────────┐  ┌──────────────────────────────┐ │
-│  │ credstore_vendor_a   │  │ os_protected_storage (P2)    │ │
-│  │ (Credstore REST)     │  │ (macOS Keychain / Win DPAPI) │ │
-│  └──────────────────────┘  └──────────────────────────────┘ │
-│  ┌──────────────────────────────────────────────────────────┐│
-│  │ credentials_storage (Rust microservice)                  ││
-│  │ AES-256-GCM encryption, KeyProvider, schema validation   ││
-│  └──────────────────────────────────────────────────────────┘│
-├─────────────────────────────────────────────────────────────┤
-│  External          │ VendorA Credstore, OS keychain         │
-└─────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                Consumers (OAGW, mini-chat, gears)             │
+├───────────────────────────────────────────────────────────────┤
+│  credstore-sdk    │ Public API traits, models, errors, GTS    │
+├───────────────────────────────────────────────────────────────┤
+│  credstore        │ PDP authz, resolution, write sagas, REST, │
+│  (stateful)       │ reaper, metrics — owns credstore_secrets  │
+├───────────────────────────────────────────────────────────────┤
+│  Plugins          │ Pure per-tenant value stores              │
+│  ┌────────────────────────────┐  ┌──────────────────────────┐ │
+│  │ static-credstore-plugin    │  │ production vaults        │ │
+│  │ (in-memory, dev/test)      │  │ (future: external store, │ │
+│  │                            │  │  OS keychain, KMS-backed)│ │
+│  └────────────────────────────┘  └──────────────────────────┘ │
+├───────────────────────────────────────────────────────────────┤
+│  Platform deps    │ authz-resolver (PDP), tenant-resolver,    │
+│                   │ types-registry (GTS), toolkit-db          │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
-| SDK | Public and plugin trait definitions, models, errors | Rust crate (`credstore-sdk`) |
-| Gateway | Authorization enforcement, hierarchical resolution, sharing mode enforcement, plugin resolution, REST API | Rust crate (`credstore`), Axum, tenant_resolver |
-| Plugins | Backend-specific secret storage operations. Simple plugins (VendorA, OS keychain) provide per-tenant CRUD only. The `credentials_storage` plugin handles merge resolution, encryption, and schema validation internally. | Rust crates, HTTP client / OS APIs |
-| External | Secret persistence and encryption (no hierarchical logic) | VendorA Credstore (Go), OS keychain, External Key Service (Vault/KMS) |
+| SDK | Public and plugin trait definitions, models, errors, GTS type declarations | Rust crate (`credstore-sdk`) |
+| Gear | PDP authorization, hierarchical resolution, sharing enforcement, write sagas, lifecycle reaper, plugin selection, REST API | Rust crate (`credstore`), Axum, SeaORM/SecureORM |
+| Plugins | Backend-specific secret **value** storage (per-tenant key-value CRUD; no policy, no hierarchy, no metadata) | Rust crates |
+| Platform | Policy decisions (PDP), tenant hierarchy, plugin discovery | authz-resolver, tenant-resolver, types-registry |
 
 ## 2. Goals / Non-Goals
 
 ### 2.1 Goals
 
-The CredStore design aims to achieve the following objectives:
-
 - Provide secure, hierarchical secret storage for platform gears and tenant administrators
 - Enable flexible sharing modes: `private` (owner-only), `tenant` (tenant-wide, default), `shared` (hierarchical)
 - Support service-to-service secret retrieval (e.g., OAGW retrieving secrets on behalf of customer tenants)
-- Implement authorization and hierarchical resolution in Gateway gear (centralized policy enforcement)
-- Support multiple backend storage options via plugin architecture (VendorA Credstore, OS keychain, Credentials Storage microservice)
-- Support pluggable tenant encryption key management via `KeyProvider` abstraction in the Credentials Storage plugin (local DB for dev, external KMS for production key–data separation)
-- Ensure secret values never appear in logs, error messages, or debug traces
-- Provide simple CRUD operations with clear REST semantics
+- Enforce authorization via the platform PDP with SQL-level scope clamps (real tenant isolation at the data layer)
+- Make writes crash-safe and self-healing (saga + reaper), and reads race-free against half-written secrets
+- Support optimistic concurrency (version / `ETag` / `If-Match`) for lost-update detection
+- Honour platform tenant-isolation barriers during hierarchical resolution
+- Support multiple backend value stores via plugin architecture with GTS-based runtime selection
+- Ensure secret values never appear in logs, error messages, debug traces, or intermediary caches
 - Enable secret shadowing: child tenants can override parent credentials without breaking existing references
+- Classify secrets by GTS-based *secret types* with enforceable traits (§5)
+- Symmetric, crash-safe deletion via a `deprovisioning` saga (§6.3)
 
 ### 2.2 Non-Goals
 
-The following capabilities are explicitly out of scope for v1:
+The following capabilities are explicitly out of scope:
 
-- **Granular ACL beyond hierarchical**: Fine-grained access control (role-based, attribute-based, per-secret ACLs) is out of scope. The three-tier sharing model covers primary use cases. Future enhancement documented in PRD Open Questions.
-- **Secret versioning / history**: Versioned secrets, version rollback, or secret history tracking is out of scope.
-- **Secret rotation automation**: Automatic secret rotation, expiration, or lifecycle management is out of scope.
-- **Direct end-user access**: Unauthenticated or untrusted client access (e.g., browser-based secret retrieval without platform authentication) is out of scope.
-- **Secret templates or composition**: Dynamic secret generation, composition from templates, or secret derivation is out of scope.
-- **Hierarchical resolution in simple backends**: Simple backends (VendorA Credstore, OS keychain) provide per-tenant key-value storage only — all hierarchical walk-up logic, sharing mode enforcement, and policy decisions are in Gateway. The `credentials_storage` plugin is an exception: it implements credential merge resolution internally.
-- **Secret discovery / search**: Listing all secrets, searching by tags, or full-text search across secret values is out of scope for v1.
+- **Granular ACL beyond hierarchical**: fine-grained per-secret ACLs (role- or attribute-based) are out of scope. The three-tier sharing model plus PDP scope covers primary use cases.
+- **Secret value history / rollback**: the `version` column supports optimistic locking only; previous values are not retained.
+- **Secret rotation automation**: automatic rotation is out of scope. (Secret types may carry *advisory* rotation traits, §5.2 — enforcement/automation is future work.)
+- **Direct end-user access**: unauthenticated or untrusted client access is out of scope.
+- **Secret templates or composition**: dynamic secret generation or derivation is out of scope.
+- **Hierarchical resolution in backends**: plugins are pure per-tenant value stores — all hierarchy, sharing, and policy logic lives in the gear.
+- **Secret discovery / search**: listing or searching secrets is out of scope for v1.
+- **MySQL support**: migrations target PostgreSQL and SQLite; MySQL fails fast with a typed error.
 
 ## 3. Principles & Constraints
 
 ### 3.1 Design Principles
 
-#### Authorization in Gateway
+#### Stateful Gear, Value-Only Backend
 
-- [ ] `p1` - **ID**: `cpt-cf-credstore-principle-authz-gateway`
+- [ ] `p1` - **ID**: `cpt-cf-credstore-principle-stateful-gear`
 
-Authorization (permission checks for `Secrets:Read` and `Secrets:Write`) is enforced exclusively in the gateway layer. Simple plugins (VendorA, OS keychain) are "storage adapters" that delegate to backends and MUST NOT implement authorization or policy decisions. This prevents inconsistent behavior across backends.
+The gear owns all secret metadata in its own `credstore_secrets` table; the backend plugin stores the value only, keyed by `(tenant_id, key, key-class)` where the key class is `private-per-owner` (`owner_id = Some`) or `tenant` (`owner_id = None`). This removes any backend metadata-schema prerequisite, eliminates encoded-external-ID collision risk, and makes resolution and authorization a single transactional query.
 
-**Note**: For simple plugins, the Gateway also implements sharing mode enforcement and hierarchical resolution. The `credentials_storage` plugin is a full microservice that handles its own merge resolution, authorization (JWT + Permission Service), and sharing logic internally — in this case the Gateway delegates these responsibilities to the plugin.
+#### Authorization via PDP, Enforced in SQL
 
-#### Stateless Key Mapping
+- [ ] `p1` - **ID**: `cpt-cf-credstore-principle-authz-pdp`
 
-- [ ] `p1` - **ID**: `cpt-cf-credstore-principle-stateless-mapping`
+Every operation evaluates a PDP `AccessScope` for its action (`read`, `write`, `delete`) on the secret resource type (`gts.cf.core.credstore.secret.v1~`) and enforces that scope in SQL through SecureORM clamps on the metadata table. Both read and write paths additionally gate on an explicit own-tenant invariant (`scope_includes_tenant`) and emit a `cross_tenant_denied` metric. Out-of-scope access is fail-closed and surfaces as the canonical 404 (anti-enumeration) or 403. Plugins MUST NOT implement authorization.
 
-The VendorA Credstore plugin uses a deterministic, stateless mapping from `(tenant_id, key, optional owner_id)` to Credstore ExternalID. Private secrets include `owner_id` in the mapping to support per-owner namespacing. No local mapping database is required. This simplifies operations and eliminates a failure mode.
-
-#### Tenant from SecurityCtx
+#### Tenant from SecurityContext
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-principle-tenant-from-ctx`
 
-For self-service operations, the tenant is always derived from `SecurityCtx.tenant_id()`. This reduces API surface, prevents misuse, and aligns with existing platform patterns (consistent with `tenant_resolver`).
+The operating tenant is always derived from `SecurityContext.subject_tenant_id()`, and the owner from `SecurityContext.subject_id()`. This reduces API surface, prevents misuse, and aligns with platform patterns. Service-to-service consumers (OAGW) construct a `SecurityContext` for the target tenant rather than passing tenant parameters.
+
+#### Crash-Safe Writes (Saga + Reaper)
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-principle-write-saga`
+
+A write that spans the metadata table and the backend is a compensating saga with an explicit lifecycle status (§6). Every failure mode either rolls back, self-heals on retry, or is swept by the periodic reaper — a crash can never permanently wedge a reference or leak a readable half-written secret.
 
 ### 3.2 Constraints
-
-#### OAuth2 for Credstore
-
-- [ ] `p1` - **ID**: `cpt-cf-credstore-constraint-oauth2`
-
-All Credstore REST calls require OAuth2 client credentials authentication. Token acquisition and caching are handled by a shared `oauth_token_provider` component.
 
 #### No Secret Logging
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-constraint-no-secret-logging`
 
-Secret values MUST NOT appear in any log output, error messages, or debug traces. The `SecretValue` type implements `Debug` and `Display` with redacted output.
+Secret values MUST NOT appear in any log output, error messages, or debug traces. `SecretValue` implements redacting `Debug`/`Display` and zeroizes on drop; request/response DTOs carry hand-written redacted `Debug`; the `GET` response sets `Cache-Control: no-store`; non-UTF-8 values are rejected with a typed error rather than lossily decoded.
+
+#### Canonical Error Model
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-constraint-canonical-errors`
+
+All trait-boundary and REST errors follow the platform canonical error model ([ADR 0005](../../../docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md)): domain errors map to canonical categories with stable `reason` codes (e.g. `OPTIMISTIC_LOCK_FAILURE`), and the wire strips internal diagnostics.
 
 ## 4. Technical Architecture
 
 ### 4.1 Domain Model
 
-**Technology**: Rust structs
+**Technology**: Rust structs (`#[domain_model]`)
 
 **Core Entities**:
 
 | Entity | Description |
 |--------|-------------|
-| `SecretRef` | Human-readable key identifying a secret (e.g., `partner-openai-key`). **Format**: `[a-zA-Z0-9_-]+`, max 255 chars. Colons prohibited to prevent ExternalID collisions. |
-| `SecretValue` | Opaque byte wrapper for decrypted secret data. Custom `Debug`/`Display` that redacts content. |
-| `SharingMode` | Enum: `Private`, `Tenant` (default), `Shared` — controls access scope within tenant hierarchy |
-| `OwnerId` | UUID identifying the creator (from `SecurityContext.subject_id()`) — used for owner-only access control in `Private` mode |
-| `SecretMetadata` | Struct containing secret value and access control metadata: `{ value: SecretValue, owner_id: OwnerId, sharing: SharingMode, owner_tenant_id: TenantId }` |
+| `SecretRef` | Validated secret reference key (e.g., `partner-openai-key`). **Format**: `[a-zA-Z0-9_-]+`, 1–255 chars; validated on construction and re-validated by a DB `CHECK`. |
+| `SecretValue` | Opaque byte wrapper (`Vec<u8>`) for secret data. Redacting `Debug`/`Display`, zeroize-on-drop, deliberately not `Serialize`/`Deserialize`. |
+| `SharingMode` | Enum: `Private`, `Tenant` (default), `Shared` — controls access scope within the tenant hierarchy. |
+| `OwnerId` | UUID identifying the creator (`SecurityContext.subject_id()`) — access control key for `Private` mode. |
+| `SecretStatus` | Lifecycle status of the metadata row: `Provisioning` (1), `Active` (2), `Deprovisioning` (3) (§6). Only `Active` rows are visible to resolution. |
+| `SecretRow` | Metadata row: `{ id, tenant_id, reference, sharing, owner_id, status, version, value_fp, fp_key_id }`. `value_fp` is the internal value-fingerprint fence (§4.10), never serialized to the wire. |
+| `NewSecret` | Insert shape for the create saga (always carries the fence fingerprint of the value being written). |
+| `WritePrecondition` | Parsed `If-Match`: `Exists` (`*`) or `Version { id, version }` (quoted `"<id>.<version>"`, generation-bound). |
+| `GetSecretResponse` | SDK read result: `{ value, id, owner_tenant_id, sharing, is_inherited, version }`; `(id, version)` is the strong-validator pair. |
+| `SecretType` | Catalog-resolved secret type binding the enforceable traits (§5); immutable per secret. |
 
-**Relationships**:
-- A Secret belongs to exactly one Tenant (via `tenant_id`)
-- A Secret has exactly one Owner (via `owner_id`) — the actor that created it
-- **Uniqueness**: For `tenant` and `shared` modes, `(tenant_id, reference)` is unique — one non-private secret per key per tenant. For `private` mode, `(tenant_id, reference, owner_id)` is unique — each owner can have their own private secret with the same reference. A tenant can simultaneously hold one tenant/shared secret and multiple private secrets (one per owner) under the same reference.
-- `ResolveResult` references the owning tenant (which may differ from the requesting tenant)
+**Relationships & uniqueness**:
 
-**Sharing Mode Access Control**:
-- **`Private`**: Secret metadata includes `owner_id` (populated from `SecurityContext.subject_id()`). Access checks verify `owner_id == current_subject_id` AND tenant match.
-- **`Tenant`**: `owner_id` is stored for audit trail but not enforced during access checks. Any user/service in the owning tenant can access.
-- **`Shared`**: `owner_id` is stored for audit trail. Hierarchical tenant resolution applies (current behavior).
+- A secret belongs to exactly one tenant (`tenant_id`) and has exactly one owner (`owner_id`).
+- For `tenant`/`shared` modes, `(tenant_id, reference)` is unique; for `private` mode, `(tenant_id, reference, owner_id)` is unique. Both are enforced as **partial unique indexes** (§4.7), which lets one private secret per owner and one tenant/shared secret **coexist** under the same reference.
+- The uniqueness indexes ignore `status`, so an in-flight (`provisioning`) row holds the reference; failed sagas are rolled back or reaped to un-wedge it.
+
+**Sharing-mode access control** (evaluated during SQL resolution):
+
+| Mode | Visible to | Inherited by descendants? |
+|------|-----------|---------------------------|
+| `private` | Only where `owner_id` equals the caller's subject id; wins over non-private at the same tenant level | No |
+| `tenant` (default) | Only the owning tenant | No |
+| `shared` | The owning tenant **and** its descendants, bounded by isolation barriers (§4.6) | Yes (barrier-bounded) |
+
+`sharing` is a **visibility** mode (who may read the secret), not a quota/limit that composes as `min(parent, child)`; resolution picks the closest accessible secret up the ancestor chain, which is how a child tenant *shadows* a parent's `shared` secret under the same reference.
 
 ### 4.2 Component Model
 
 ```mermaid
 graph TB
-    Consumer[Consumers<br/>OAGW, Platform Gears]
-    SDK[credstore-sdk<br/>traits + models]
-    GW[credstore<br/>authz + routing]
-    AP[credstore_vendor_a_plugin<br/>Credstore REST]
-    OSP[os_protected_storage<br/>OS Keychain/DPAPI]
-    CSP[credentials_storage<br/>Rust microservice]
-    CS[VendorA Credstore<br/>Go service]
-    OS[OS Keychain]
-    PG[PostgreSQL]
-    KMS[External Key Service<br/>Vault / KMS]
-    TR[tenant_resolver]
-    TReg[types_registry]
+    Consumer[Consumers<br/>OAGW, mini-chat, gears]
+    SDK[credstore-sdk<br/>traits + models + GTS]
+    GW[credstore gear<br/>service / saga / reaper]
+    REPO[(credstore_secrets<br/>SecureORM, Scopable)]
+    SP[static-credstore-plugin<br/>in-memory value store]
+    PDP[authz-resolver<br/>PolicyEnforcer / PDP]
+    TR[tenant-resolver]
+    TReg[types-registry]
 
     Consumer -->|ClientHub| SDK
     SDK --> GW
-    GW -->|plugin resolution| TReg
-    GW -->|scoped ClientHub| AP
-    GW -->|scoped ClientHub| OSP
-    GW -->|scoped ClientHub| CSP
-    AP -->|REST + OAuth2| CS
-    OSP -->|native API| OS
-    CSP -->|SQL| PG
-    CSP -->|mTLS| KMS
-    GW -.->|hierarchy info| TR
+    GW -->|AccessScope, SQL clamps| REPO
+    GW -->|GTS instance query| TReg
+    GW -->|scoped ClientHub| SP
+    GW -->|ancestor chain, cached| TR
+    GW -->|scope evaluation| PDP
 ```
 
 **Components**:
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-component-sdk`
 
-`credstore-sdk` — Trait definitions, models, error types. Interfaces: `CredStoreClientV1`, `CredStorePluginClientV1`.
+`credstore-sdk` — trait definitions (`CredStoreClientV1`, `CredStorePluginClientV1`), models, canonical `CredStoreError`, and the GTS declarations: the plugin spec type (`gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~`) and the secret resource type (`gts.cf.core.credstore.secret.v1~`, exported as `SECRET_RESOURCE_TYPE` — the single source of truth pinned by unit tests).
 
-- [ ] `p1` - **ID**: `cpt-cf-credstore-component-gateway`
+- [ ] `p1` - **ID**: `cpt-cf-credstore-component-gear`
 
-`credstore` — Authorization, hierarchical resolution (walk-up algorithm), sharing mode enforcement, plugin selection, REST endpoints. Interfaces: Axum routes, ClientHub registration, tenant_resolver queries.
+`credstore` — the stateful gear. Layers: `api/rest` (Axum routes, DTOs with redacted `Debug`, `If-Match` parsing), `domain` (service with get/put/ delete sagas, authz scope evaluation, resolver port, metrics port, plugin selector port), `infra` (SecureORM repo, migrations, tenant-resolver adapter with TTL+LRU ancestor cache, GTS plugin selector, OTel metrics, canonical error mapping). Declares `deps = [authz-resolver, tenant-resolver, types-registry]` and capabilities `system, db, rest, stateful`; its lifecycle entry runs the reaper loop (§6.4).
 
-- [ ] `p1` - **ID**: `cpt-cf-credstore-component-vendor-a-plugin`
+- [ ] `p1` - **ID**: `cpt-cf-credstore-component-static-plugin`
 
-`credstore_vendor_a_plugin` — VendorA Credstore REST integration (simple per-tenant CRUD). Interfaces: HTTP client, ExternalID mapping.
+`static-credstore-plugin` — in-memory per-tenant value store for development and testing, optionally seeded from YAML config, writable at runtime. Registers its GTS instance and scoped `CredStorePluginClientV1` in ClientHub.
 
-- [ ] `p2` - **ID**: `cpt-cf-credstore-component-os-protected-storage`
+- [ ] `p2` - **ID**: `cpt-cf-credstore-component-production-backend`
 
-`os_protected_storage` — OS keychain integration (P2) — simple per-tenant CRUD. Interfaces: Platform-native secure storage APIs.
-
-- [ ] `p1` - **ID**: `cpt-cf-credstore-component-credentials-storage`
-
-`credentials_storage` — Standalone Rust microservice providing encrypted credential storage with schema validation, credential definitions, field-level masking, and hierarchical credential propagation (merge resolution). Encryption is handled internally via AES-256-GCM with per-tenant keys managed by a pluggable `KeyProvider` port. Two `KeyProvider` implementations: `DatabaseKeyProvider` (keys in local PostgreSQL, for dev/test) and `ExternalKeyProvider` (keys in external KMS such as HashiCorp Vault or AWS KMS, for production key–data separation). Interfaces: REST API (`/api/credentials-storage/v1/`), JWT authentication, Permission Service integration. Detailed architecture will be documented in `plugins/credentials-storage/DESIGN.md`.
+Production value-store backends (external secret vault, OS keychain, KMS-backed store) — future plugins implementing the same `CredStorePluginClientV1` contract. Not part of the current codebase.
 
 **Interactions**:
-- Consumer → Gateway: via `CredStoreClientV1` trait through ClientHub
-- Gateway → Plugin: via `CredStorePluginClientV1` trait through scoped ClientHub (GTS instance ID)
-- Gateway → tenant_resolver: queries tenant ancestry chain for hierarchical secret resolution walk-up (simple plugins only; `credentials_storage` handles resolution internally)
-- VendorA Plugin → Credstore: HTTP REST with OAuth2 bearer token (simple per-tenant CRUD operations)
-- VendorA Plugin → OAuth provider: token acquisition and caching
-- Credentials Storage Plugin → PostgreSQL: encrypted credential persistence (database-agnostic in future)
-- Credentials Storage Plugin → External Key Service: tenant key management via `KeyProvider` (mTLS, when `ExternalKeyProvider` is active)
+
+- Consumer → Gear: `CredStoreClientV1` via ClientHub (in-process) or REST.
+- Gear → Repo: all metadata reads/writes clamped by the PDP `AccessScope` (SecureORM `Scopable`).
+- Gear → Plugin: `CredStorePluginClientV1` via scoped ClientHub; the plugin is resolved lazily by GTS instance query filtered by the configured `vendor`.
+- Gear → tenant-resolver: ancestor chain (`BarrierMode::Respect`), cached in-process with TTL + LRU eviction.
+- Gear → PDP: `PolicyEnforcer.access_scope_with` per operation; capability advertisement depends on `hierarchy.tenant_closure_colocated` (§4.4).
 
 ### 4.3 API Contracts
 
-- [ ] `p1` - **ID**: `cpt-cf-credstore-interface-vendor-a-rest`
+- [ ] `p1` - **ID**: `cpt-cf-credstore-interface-clienthub`
 
-**Technology**: REST/OpenAPI + Rust traits (ClientHub)
+**Technology**: Rust traits (ClientHub) + REST/OpenAPI
 
 #### ClientHub API (in-process)
 
-`CredStoreClientV1` trait (public API for consumers):
+`CredStoreClientV1` (public consumer API):
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `get` | `(ctx: &SecurityCtx, key: &SecretRef) → Result<Option<GetSecretResponse>>` | Retrieve secret with metadata (value, owner_tenant_id, sharing, is_inherited) |
-| `put` | `(ctx: &SecurityCtx, key: &SecretRef, value: SecretValue, sharing: SharingMode) → Result<()>` | Create or update secret with sharing mode |
-| `delete` | `(ctx: &SecurityCtx, key: &SecretRef) → Result<()>` | Delete own secret |
+| `get` | `(ctx: &SecurityContext, key: &SecretRef) → Result<Option<GetSecretResponse>, CredStoreError>` | Hierarchical read. `Ok(None)` covers both "does not exist" and "inaccessible" (single 404 surface, anti-enumeration). |
+| `put` | `(ctx, key, value: SecretValue, sharing: SharingMode) → Result<(), CredStoreError>` | Upsert within the target sharing class. |
+| `create` | `(ctx, key, value, sharing) → Result<(), CredStoreError>` | Create-only; `Conflict` if a secret of the same sharing class exists (the 409 path behind REST `POST`). |
+| `delete` | `(ctx, key) → Result<(), CredStoreError>` | Delete the caller's own-tenant secret. |
 
-`CredStorePluginClientV1` trait (backend adapter interface):
+`CredStorePluginClientV1` (backend SPI — pure value store):
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `get` | `(ctx: &SecurityCtx, tenant_id: &TenantId, key: &SecretRef, owner_id: Option<&OwnerId>) → Result<Option<SecretMetadata>>` | Get secret from backend. If `owner_id` is `Some`, looks up the private secret for that owner; if `None`, looks up the tenant/shared secret. |
-| `put` | `(ctx: &SecurityCtx, tenant_id: &TenantId, key: &SecretRef, value: SecretValue, sharing: SharingMode, owner_id: OwnerId) → Result<()>` | Store secret in backend. ExternalID is derived from sharing mode and owner_id (see ExternalID Mapping). |
-| `delete` | `(ctx: &SecurityCtx, tenant_id: &TenantId, key: &SecretRef, owner_id: Option<&OwnerId>) → Result<()>` | Delete secret from backend. If `owner_id` is `Some`, deletes the private secret for that owner; if `None`, deletes the tenant/shared secret. |
+| `get` | `(ctx, tenant_id, key, owner_id: Option<&OwnerId>) → Result<Option<SecretValue>, CredStoreError>` | `owner_id = Some` selects the owner's private key class; `None` the tenant key class. Returns the value only. |
+| `put` | `(ctx, tenant_id, key, value, owner_id: Option<&OwnerId>) → Result<(), CredStoreError>` | Store the value for the addressed key class. |
+| `delete` | `(ctx, tenant_id, key, owner_id: Option<&OwnerId>) → Result<(), CredStoreError>` | Delete the value; `NotFound` is treated as success by the gear (idempotent). |
 
-**SecretMetadata structure**:
-```rust
-struct SecretMetadata {
-    value: SecretValue,
-    owner_id: OwnerId,
-    sharing: SharingMode,
-    owner_tenant_id: TenantId,  // Tenant that owns this secret
-}
-```
+**Design rationale**: the plugin returns **no metadata** — sharing, ownership, inheritance, and version all come from the gear's metadata row resolved *before* the backend is touched. This keeps every policy decision in one place and backends trivially simple.
 
-**Design Rationale**: The Plugin must return metadata (owner_id, sharing, owner_tenant_id) so the Gateway can:
-1. Enforce sharing mode rules during hierarchical resolution (tenant vs shared access checks)
-2. Populate response metadata (`is_inherited`, `owner_tenant_id`) for clients
+#### 4.3.1 REST API (Gear)
 
-For `private` secrets, owner match is guaranteed by ExternalID construction (owner_id is baked into the ExternalID), so no additional access check is needed. For `tenant`/`shared` secrets, the Gateway uses the returned metadata to enforce access control.
+Routes are registered under `/credstore/v1` (served behind the platform API gear under its public prefix, e.g. `/cf/credstore/v1/...`). All routes are authenticated; errors use the canonical `Problem` envelope.
 
-#### 4.3.1 REST API (Gateway)
+The machine-readable API is generated from the handlers: the platform-wide OpenAPI document lives at [`docs/api/api.json`](../../../docs/api/api.json) (regenerate with `make openapi`), and a credstore-scoped rendering is at [`openapi.yaml`](./api/openapi.yaml).
 
-| Method | Path | Description | Stability |
-|--------|------|-------------|-----------|
-| `POST` | `/credstore/v1/secrets` | Create secret with sharing mode | stable |
-| `PUT` | `/credstore/v1/secrets/{ref}` | Update secret value and/or sharing mode | stable |
-| `GET` | `/credstore/v1/secrets/{ref}` | Get own secret value | stable |
-| `DELETE` | `/credstore/v1/secrets/{ref}` | Delete own secret | stable |
+| Method | Path | Success | Description |
+|--------|------|---------|-------------|
+| `POST` | `/credstore/v1/secrets` | `201` + `Location` | Create-only; `409` if the same sharing class already holds the reference |
+| `PUT` | `/credstore/v1/secrets/{ref}` | `204` | Upsert; honours `If-Match` |
+| `GET` | `/credstore/v1/secrets/{ref}` | `200` + `ETag`, `Cache-Control: no-store` | Hierarchical read |
+| `DELETE` | `/credstore/v1/secrets/{ref}` | `204` | Delete own secret; honours `If-Match` |
 
-**Create Secret Request:**
+**Create Secret Request (`POST`)**:
 ```json
 {
   "reference": "partner-openai-key",
   "value": "demo-secret-value-123",
-  "sharing": "tenant"
+  "sharing": "tenant",
+  "type": "gts.cf.core.credstore.secret.v1~cf.core.credstore.api_key.v1~"
 }
 ```
 
-**Sharing mode values**: `"private"` (owner-only), `"tenant"` (tenant-wide, default), `"shared"` (hierarchical)
+**Update Secret Request (`PUT`)** — same body without `reference`. `sharing` values: `"private"`, `"tenant"` (default), `"shared"`. `type` (optional): the secret type's **full GTS type id** (§5.5), built-in or custom; defaults to the generic type. `expires_at` (optional, RFC 3339) for expirable types.
 
-**Get Secret Response (200 OK):**
+**Field notes**:
+
+- `reference` is a **caller-chosen opaque label**, not a GTS id — `^[A-Za-z0-9_-]+$`, 1–255 chars. It is deliberately free-form because it is user-facing (a human-picked name such as `partner-openai-key`); requiring a GTS identifier would be too restrictive. Uniqueness is per sharing class within one tenant (§4.7).
+- `value` is carried over REST as a **UTF-8 JSON string**, but is stored as raw **bytes** end-to-end, so binary secrets (e.g. a DER certificate or a raw key) are supported — for secret types whose `utf8_only` trait is `false` (currently `generic`) and via the **SDK/ClientHub**, which carries bytes. Over REST a binary value must be text-encoded by the caller (e.g. PEM, base64). A PEM certificate is UTF-8 text and works on any type; see the `utf8_only` trait (§5.3).
+
+**Get Secret Response (200)**:
 ```json
 {
   "value": "demo-secret-value-456",
   "metadata": {
-    "owner_tenant_id": "partner-acme",
+    "owner_tenant_id": "22222222-2222-2222-2222-222222222222",
     "sharing": "shared",
-    "is_inherited": true
+    "is_inherited": true,
+    "version": 3,
+    "type": "gts.cf.core.credstore.secret.v1~cf.core.credstore.api_key.v1~"
   }
 }
 ```
 
-**Response Metadata Fields**:
-- `owner_tenant_id`: The tenant that owns this secret (may differ from requesting tenant if inherited)
-- `sharing`: The sharing mode (`private`, `tenant`, `shared`)
-- `is_inherited`: `true` if secret was retrieved from an ancestor via hierarchical resolution, `false` if owned by requesting tenant
+- `owner_tenant_id`: tenant that owns the resolved secret (differs from the requesting tenant when inherited)
+- `is_inherited`: `true` when resolved from an ancestor
+- `version`: monotonic per-generation version; the strong `ETag` is the generation-bound pair `"<row-id>.<version>"` (the row UUID is minted fresh for every recreated secret, so validators never repeat across delete+recreate — no ABA lost update)
+- `type`: the secret type's full GTS type id (plus `expires_at` when set)
 
-**Use case**: Child tenants can see that a secret is inherited and can be shadowed by creating their own secret with the same reference.
+**Optimistic concurrency**: `PUT` and `DELETE` accept `If-Match: *` (target must exist) or `If-Match: "<id>.<version>"` (both the generation id and the version must match the current row). The precondition is checked before the backend write *and* re-enforced as a `version = ?` SQL filter on the metadata commit (the id is already the UPDATE key). A mismatch — including a validator minted for an earlier generation of a recreated secret — surfaces as canonical `Aborted` / **409** with reason `OPTIMISTIC_LOCK_FAILURE` (the canonical model has no 412; 409 is the deliberate platform-correct status). A malformed `If-Match` (including a bare quoted version) is a 400; a precondition on a non-existent target is a 409.
 
-**Update Secret Request:**
-```json
-{
-  "value": "updated-demo-value-789",
-  "sharing": "shared"
-}
-```
+**Error Responses**:
 
-**Error Responses:**
-
-| Status | Error Type | Scenario |
-|--------|-----------|----------|
-| 401 | Unauthorized | Invalid or missing token |
-| 403 | AccessDenied | Insufficient permissions (`Secrets:Read` or `Secrets:Write` missing) |
-| 404 | NotFound | Secret not found OR inaccessible (owner mismatch, private/tenant scope mismatch, not in hierarchy). **Security**: Always return 404 for inaccessible secrets to prevent enumeration attacks. |
-| 409 | Conflict | Secret with this reference already exists within the same scope (POST create-only endpoint). Private secrets are scoped per-owner, so different owners never conflict. |
-| 500 | InternalError | Backend or encryption errors |
+| Status | Canonical category | Scenario |
+|--------|--------------------|----------|
+| 400 | `InvalidArgument` | Invalid `reference` format, malformed `If-Match`, unsupported sharing transition (private ↔ tenant/shared) |
+| 401 | `Unauthenticated` | Invalid or missing token |
+| 403 | `AccessDenied` | PDP denies the action, or the caller's scope excludes their own tenant |
+| 404 | `NotFound` | Secret not found **or** inaccessible (anti-enumeration: always 404, never 403, for per-secret access) |
+| 409 | `AlreadyExists` / `Aborted` | `POST` conflict; `If-Match` version conflict (`OPTIMISTIC_LOCK_FAILURE`) |
+| 503 | `ServiceUnavailable` | PDP evaluation failure, types-registry outage / stored secret type unresolvable (§5.4), no storage plugin registered (with stable detail, no `retry_after`), backend outage (with `Retry-After` when hinted) |
+| 500 | `Internal` | Invariant violations, non-UTF-8 stored value on `GET` (binary written via the SDK cannot cross the JSON transport); diagnostic stripped from the wire |
 
 ### 4.4 External Interfaces & Protocols
 
-#### VendorA Credstore REST API
+#### PDP (authz-resolver)
 
-- [ ] `p1` - **ID**: `cpt-cf-credstore-design-interface-vendor_a-rest`
+- [ ] `p1` - **ID**: `cpt-cf-credstore-design-interface-pdp`
 
-**Type**: External System
+**Type**: platform service (in-process client via ClientHub)
 
-**Direction**: outbound
+Every operation calls `PolicyEnforcer.access_scope_with(ctx, resource, action, …)` **once**, with the `owner_tenant_id` PEP property and `action ∈ {read, write, delete}`. The `resource` is always the secret's **full concrete type** — including `generic` (`…secret.v1~cf.core.credstore.generic.v1~`) — so policies can target any type without a separate base-type gate (§5.4). The type is known before the evaluation via a prefetch (post-resolution on read, post-lookup on overwrite/delete, from the requested/default type on create) followed by a types-registry resolution of the stored `secret_type_uuid` to its GTS type id (§5.4); the returned `AccessScope` is enforced in SQL. Enforcement is fail-closed: `Denied`/`CompileFailed` → 403 (404 on read, anti-enumeration), `EvaluationFailed` → 503.
 
-**Data Format**: JSON over HTTP/REST
+**Capability advertisement** (config `hierarchy.tenant_closure_colocated`): when the shared tenant-closure table is co-located with the credstore database, the gear advertises `Capability::TenantHierarchy` and the PDP emits a structured `InTenantSubtree` predicate resolved by a closure subquery. Otherwise (default) the PDP pre-expands the subtree into a flat `In` list the gear enforces with no local closure access (degraded but correct mode). Co-located concretely means credstore and Account Management share one physical database: `tenant_closure` stays owned and migrated by AM, and credstore's DB role only needs `SELECT` on it. Sharing one database is the simplest way to satisfy the actual contract behind the flag — a correct and fresh `tenant_closure` queryable through credstore's own connection. A separate credstore database can enable the same capability when an external mechanism (e.g. logical replication / CDC of the AM-owned table) keeps a local copy populated and consistent: credstore never writes the table and does not track its freshness, so that pipeline owns integrity — closure staleness translates directly into stale subtree-authorization decisions. A standalone credstore database (no such table) is the default-supported deployment.
 
-**Authentication**: OAuth2 client credentials (token acquired via shared `oauth_token_provider`)
+#### Tenant hierarchy (tenant-resolver)
 
-**Endpoints used:**
+- [ ] `p1` - **ID**: `cpt-cf-credstore-design-interface-tenant-resolver`
 
-| Operation | Credstore Endpoint | Notes |
-|-----------|-------------------|-------|
-| Read | `GET /credentials/{external_id}?tenant_id={tid}&include_secret=true` | Returns secret value. 404 → `None` |
-| Write (update) | `PUT /credentials/{external_id}/identity_and_secret?tenant_id={tid}` | Updates secret value. If 404, fall through to create |
-| Write (create) | `POST /credentials?tenant_id={tid}` | Body includes `id=external_id`, `secret=<base64>`, `sharing` field, `owner_id` field |
-| Delete | `DELETE /credentials/{external_id}?tenant_id={tid}` | Removes credential |
+The gear fetches the requesting tenant's ancestor chain (self first, root last) with `BarrierMode::Respect`, so a `shared` secret is **not** inherited across a `self_managed` isolation barrier. The chain carries no caller-specific data and is cached in-process with a TTL (`hierarchy.ancestor_cache_ttl_secs`, default 300 s) and LRU eviction.
 
-**Sharing Mode Field**: The `sharing` field is stored in Credstore backend as metadata. Values: `private` (owner-only), `tenant` (tenant-wide), `shared` (hierarchical). The Gateway reads this field and enforces access control during hierarchical resolution. The Backend provides simple per-tenant storage without hierarchical logic.
+#### Secret-type resolution & plugin discovery (types-registry)
 
-**Owner ID Field**: The `owner_id` field (UUID) is stored in Credstore backend and identifies the creator (from `SecurityContext.subject_id()`). For `private` mode, access checks must verify `owner_id` matches the requesting subject. For `tenant` and `shared` modes, `owner_id` is stored for audit trail but not enforced in access checks.
+- [ ] `p1` - **ID**: `cpt-cf-credstore-design-interface-gts`
 
-**Compatibility Note**: VendorA Credstore backend schema must support:
-1. Three-value `sharing` enum: `private`, `tenant`, `shared`
-2. `owner_id` UUID field for creator identification
-The VendorA Credstore backend must support these fields before deployment. Backend schema/feature implementation is a prerequisite for launching the credstore gear.
+The types-registry is a hard `deps` of the gear (fail-closed `init` when `TypesRegistryClient` is absent from ClientHub) and serves two roles:
 
-**ExternalID Mapping:**
-```
-# Tenant/Shared secrets (one per tenant+key):
-raw         = "{tenant_id}:{key}"
-external_id = base64url_no_pad(raw) + "@secret"
+**Secret-type resolution** (§5): every operation resolves the secret's stored type UUID via `get_type_schema_by_uuid` — one lookup against the registry client's built-in TTL cache; credstore adds no cache of its own, so type re-registrations take effect within the client TTL. The resolver (`GtsSecretTypeResolver`, mirroring AM's `GtsTenantTypeChecker`) verifies the schema descends from the secret base type (`gts.cf.core.credstore.secret.v1~`), merges the chain's effective traits (`x-gts-traits`, leaf wins, base fills defaults), and deserializes them into `SecretTypeTraits`. Failure mapping is fail-closed: an unregistered/non-secret type is `UNKNOWN_SECRET_TYPE` (400) when the caller named it, 503 when it came from a stored row (deregistration is an operational inconsistency, not a caller error); registry outage / timeout (2 s probe) / malformed traits → 503. Calls are recorded on the `types_registry` dependency-health metrics.
 
-# Private secrets (one per tenant+key+owner):
-raw         = "{tenant_id}:{key}:p:{owner_id}"
-external_id = base64url_no_pad(raw) + "@secret"
-```
+**Plugin discovery**: plugins register GTS instances derived from the plugin spec type (`…~cf.core.credstore.plugin.v1~`). The gear lazily queries instances by type-id prefix, filters by the configured `vendor`, picks the highest-priority active instance, and resolves its scoped `CredStorePluginClientV1` from ClientHub. No plugin available surfaces as a non-retryable 503 ("no storage plugin registered").
 
-The plugin derives the ExternalID variant from the `sharing` mode (on `put`) or from the `owner_id` parameter (on `get`/`delete`): `Some(owner_id)` → private variant, `None` → tenant/shared variant.
+#### Sharing-mode transitions
 
-This deterministic, stateless mapping avoids maintaining a local mapping database and achieves idempotent operations.
-
-**Collision Prevention**: SecretRef format is constrained to `[a-zA-Z0-9_-]+` (no colons) to prevent collisions. Tenant_id is a UUID (no colons), owner_id is a UUID (no colons), and colons serve as delimiters. The `:p:` segment distinguishes private ExternalIDs from tenant/shared ones, ensuring each `(tenant_id, key, scope)` tuple maps to a unique ExternalID.
-
-**Compatibility**: Plugin adapts to Credstore API version. ExternalID format must remain stable across versions to avoid breaking lookups.
-
-#### External Key Management Service
-
-- [ ] `p1` - **ID**: `cpt-cf-credstore-design-interface-external-kms`
-
-**Type**: External System
-
-**Direction**: outbound (from Credentials Storage plugin)
-
-**Purpose**: Tenant encryption key storage and lifecycle when `ExternalKeyProvider` is active in the Credentials Storage plugin. Provides key–data separation for production security posture — encryption keys are stored in a separate security domain from encrypted credentials.
-
-**Protocol**: HTTPS/mTLS (Vault HTTP API, AWS KMS API, or custom REST/gRPC)
-
-**Authentication**: Service-specific — Vault token, Kubernetes ServiceAccount, IAM role. Credentials for the key service are injected via Kubernetes Secret and never stored in the application database.
-
-**Error Handling**: Key service unavailability blocks all encrypt/decrypt operations in the Credentials Storage plugin. Readiness probe reflects KMS connectivity. Circuit breaker pattern for key service calls.
-
-**Deployment note**: Required only when the `credentials_storage` plugin is active with `ExternalKeyProvider`. Not applicable to VendorA or OS keychain plugins.
-
-#### Sharing Mode Transitions (Constraints & Plugin Capabilities)
-
-The API exposes `sharing` as a field that can be set on `put` / `update`, but not all "sharing transitions" are equivalent at the storage layer.
-
-Because secret identity differs between private and non-private secrets (via ExternalID mapping), transitions fall into two classes:
-
-- **`tenant` ↔ `shared` (non-private)**: Same ExternalID (`{tenant_id}:{key}`) and can be implemented as an in-place metadata update *if* the backend supports updating `sharing` on an existing record.
-- **`private` ↔ (`tenant`/`shared`)**: Different ExternalIDs (`{tenant_id}:{key}:p:{owner_id}` vs `{tenant_id}:{key}`), so a "conversion" cannot be a single in-place update. A portable implementation requires creating a new record in the target scope and (optionally) deleting the old one; this is not atomic.
-
-This has two practical implications:
-
-- **Plugin/backend capability**: Whether a given backend can support a specific transition (especially private ↔ non-private) is a plugin/backing-store capability and may be restricted in v1.
-- **No implicit migration guarantee**: If a client updates `sharing` across the private/non-private boundary, the system MUST NOT assume an atomic "move". Implementations should document whether they perform a best-effort two-step migrate (create + delete) or instead reject such transitions.
+`tenant ↔ shared` is an in-place metadata update (same unique-index class). `private ↔ (tenant|shared)` crosses key classes; since private and non-private secrets coexist by design, such a "transition" has no atomic meaning and is **rejected** as `UnsupportedTransition` (400) rather than performed non-atomically. Writes always address the row of their own sharing class, so a write of one class never affects the other.
 
 ### 4.5 Service-to-Service Pattern
 
-#### Architecture Pattern
+Two integration patterns share one API:
 
-The CredStore Gateway supports two distinct integration patterns:
+1. **Self-Service**: gears and tenant admins operate on their own tenant; tenant and owner derive from their `SecurityContext`.
+2. **Service-to-Service**: authorized service accounts (OAGW) act on behalf of arbitrary tenants by constructing a `SecurityContext` for the target tenant (S2S client-credentials exchange) and calling the same `get`.
 
-1. **Self-Service Pattern**: Platform gears and tenant admins retrieve secrets for their own tenant. The tenant_id is derived from SecurityCtx.
-2. **Service-to-Service Pattern**: Authorized service accounts (e.g., OAGW) retrieve secrets on behalf of arbitrary tenants by constructing an explicit SecurityCtx with the target tenant_id.
+**Flow (OAGW)**: OAGW builds a `SecurityContext` with the target tenant, calls `get(ctx, key)`; the PDP decides whether that subject may `read` secrets in that tenant's scope; resolution and metadata behave identically to self-service. Audit/metrics record the caller subject and target tenant. OAGW consumes credstore only through the SDK client — there is no separate integration path.
 
-#### Service-to-Service Flow (OAGW Example)
-
-**Actor**: `cpt-cf-credstore-actor-oagw` (Outbound API Gateway)
-
-**Use Case**: OAGW needs to retrieve a partner's shared API key when making an upstream call on behalf of a customer tenant.
-
-**Flow**:
-1. **SecurityCtx Construction**: OAGW constructs a SecurityCtx with:
-   - `tenant_id`: Target tenant (e.g., `customer-123`)
-   - `subject_id`: OAGW service account ID
-   - `permissions`: `Secrets:Read` permission for the service account
-2. **Gateway Invocation**: OAGW calls Gateway's standard `get(ctx, key)` operation (same API as self-service)
-3. **Authorization**: Gateway verifies:
-   - Service account has `Secrets:Read` permission
-   - Service account is authorized to construct SecurityCtx with arbitrary tenant_id (service-level authorization)
-4. **Hierarchical Resolution**: Gateway extracts `tenant_id` from SecurityCtx and performs hierarchical walk-up:
-   - Queries `tenant_resolver` for ancestor chain
-   - Walks up hierarchy calling Plugin `get` at each level
-   - Checks sharing mode and owner_id for access control
-   - Returns first accessible secret
-5. **Response**: Gateway returns secret value and metadata to OAGW
-
-**Key Differences from Self-Service**:
-- **Tenant Derivation**: Explicit tenant_id in SecurityCtx (not derived from authenticated user)
-- **Authorization**: Service account must be authorized for cross-tenant access
-- **Use Case**: Service acts on behalf of another tenant (delegation pattern)
-- **Auditing**: Audit trail must record both service account ID and target tenant_id
-
-**Design Rationale**:
-- **Unified API**: Both patterns use the same Gateway `get` operation (no separate service-to-service endpoint)
-- **Security**: Service authorization is enforced at Gateway layer before hierarchical resolution
-- **Transparency**: Hierarchical resolution is identical for both patterns (implemented in Gateway)
-- **Flexibility**: Service accounts can retrieve secrets for any tenant they're authorized to access
-
-**Implementation Note**: OAGW is a ToolKit gear that uses the standard CredStore SDK client. There is no separate integration path or direct backend access. All operations flow through Gateway→Plugin→Backend.
+**Provisioning note**: with the stateful gear a provider's backend secret may not exist at startup (secrets are created at runtime through the credstore API; there is no startup seed). Consumers that provision infrastructure from secrets at boot (e.g. mini-chat registering OAGW upstreams) treat a failed secret lookup as non-fatal: the affected provider is skipped and remains unavailable until its secret is provisioned.
 
 ### 4.6 Interactions & Sequences
 
-#### Self-Service CRUD (put example)
+#### Hierarchical read
 
-- [ ] `p1` - **ID**: `cpt-cf-credstore-seq-self-service-crud`
+- [ ] `p1` - **ID**: `cpt-cf-credstore-seq-hierarchical-read`
 
 ```mermaid
 sequenceDiagram
-    participant T as Tenant / Gear
+    participant C as Consumer
     participant GW as credstore
+    participant TR as tenant-resolver
+    participant DB as credstore_secrets
+    participant GTS as types-registry
+    participant PDP as authz-resolver
     participant P as Plugin
-    participant B as Backend
 
-    T->>GW: put(ctx, "my-key", value, shared)
-    GW->>GW: Check Secrets:Write permission
-    GW->>GW: Extract tenant_id from SecurityCtx
-    GW->>P: put(tenant_id, "my-key", value, shared)
-    P->>B: Store secret
-    B-->>P: OK
-    P-->>GW: OK
-    GW-->>T: OK
+    C->>GW: get(ctx, key)
+    GW->>TR: ancestor_chain(tenant) [cached, barrier-respecting]
+    TR-->>GW: [self, parent, ..., root]
+    GW->>DB: resolve_for_get(reference, chain, subject) — one query
+    DB-->>GW: winning row (or none → 404, no PDP call)
+    GW->>GTS: get_type_schema_by_uuid(secret_type_uuid) [client TTL cache]
+    GTS-->>GW: type id + effective traits
+    GW->>PDP: access_scope(read, concrete type)
+    PDP-->>GW: AccessScope
+    GW->>DB: scope_includes_tenant(caller tenant)?
+    GW->>P: get(owner_tenant, key, owner?) — value only
+    P-->>GW: SecretValue
+    GW-->>C: value + {owner_tenant_id, sharing, is_inherited, version, type}
 ```
 
-#### Write Flow (VendorA Credstore — upsert)
+**Resolution query semantics** (single indexed query over `idx_credstore_lookup`): filter by `reference`, tenant ∈ ancestor chain, `status = active`, and sharing-class visibility (`private` rows only for the caller's `owner_id`; `tenant` rows only for the requesting tenant; `shared` rows for any chain member). The winner is picked in-process: **closest tenant wins; `private` beats non-private at the same level**. The backend is read once, for the winning row only. Walk-up depth and read outcome (own/inherited/miss) are recorded as metrics.
 
-- [ ] `p1` - **ID**: `cpt-cf-credstore-seq-vendor-a-write`
+**Shadowing**: a child's accessible secret always wins over an ancestor's; an *inaccessible* child secret (e.g. someone else's private) does not block fallback to an ancestor's shared secret.
 
-```mermaid
-sequenceDiagram
-    participant P as credstore_vendor_a_plugin
-    participant CS as VendorA Credstore
+#### Write (create saga) — see §6.2
 
-    P->>CS: PUT /credentials/{ext_id}/identity_and_secret?tenant_id={tid}<br/>Body: {secret, sharing}
-    alt Secret exists
-        CS-->>P: 200 OK (updated)
-    else Secret not found
-        CS-->>P: 404 Not Found
-        P->>CS: POST /credentials?tenant_id={tid}<br/>{id: ext_id, secret: base64(value), sharing}
-        CS-->>P: 201 Created
-    end
-```
+- [ ] `p1` - **ID**: `cpt-cf-credstore-seq-write-saga`
 
-**Key Flows**: Reference use cases from PRD:
-- `cpt-cf-credstore-usecase-create-shared` → Self-Service CRUD (with `sharing: shared`)
-- `cpt-cf-credstore-usecase-crud` → Self-Service CRUD
-- `cpt-cf-credstore-usecase-hierarchical-resolve` → Hierarchical resolution implemented in Gateway gear
+The full step-by-step sequence, failure handling, and the overwrite path are described in §6.2 Provisioning Saga.
 
-**Hierarchical Resolution Implementation**: The Gateway gear implements a two-phase walk-up algorithm:
-1. Extract `tenant_id` and `subject_id` from SecurityCtx
-2. Query `tenant_resolver` to get ancestor chain (child → parent → ... → root)
-3. For each tenant in the chain (starting from requesting tenant), perform two-phase lookup:
-   - **Phase 1 — Private**: Call Plugin `get(ctx, tenant_id, key, Some(subject_id))` to look up a private secret for this owner
-     - If found and `sharing == private`: owner match is guaranteed by ExternalID construction → return secret value
-   - **Phase 2 — Tenant/Shared**: Call Plugin `get(ctx, tenant_id, key, None)` to look up the tenant/shared secret
-     - If found, check `sharing` mode for access control:
-       - **`tenant` mode**: Check `metadata.owner_tenant_id == ctx.tenant_id()`
-       - **`shared` mode**: Allow if requester is descendant or same tenant as owner_tenant_id
-     - If accessible, return secret value + response metadata (owner_tenant_id, sharing, is_inherited)
-   - If neither phase yields an accessible secret, continue to next ancestor
-4. If no accessible secret found in entire chain, return NotFound
-
-**Two-Phase Rationale**: Private secrets are stored under a separate ExternalID (`{tenant_id}:{key}:p:{owner_id}`), so a single `get` call cannot return both private and tenant/shared secrets. The Gateway always tries the caller's private secret first (phase 1), then falls back to the tenant/shared secret (phase 2). This costs at most 2 plugin calls per tenant in the chain.
-
-**Shadowing Semantics**: When the requesting tenant has secrets with the same reference:
-- **Private secret exists for this owner**: Return it immediately (phase 1 hit) — ancestor never checked
-- **No private secret, but tenant/shared secret exists and is accessible**: Return it (phase 2 hit) — ancestor never checked
-- **Neither phase yields an accessible secret**: Continue walk-up to ancestors
-
-**Example**: User B in tenant X requests `key1`:
-- Tenant X has `key1` with `sharing: private, owner_id: UserA` (stored under UserA's ExternalID)
-- User B has no private `key1` in tenant X
-- Tenant X has no tenant/shared `key1`
-- Parent Y has `key1` with `sharing: shared` (accessible to descendants)
-- Result: Phase 1 for X → miss (no private secret for User B). Phase 2 for X → miss (no tenant/shared). Move to parent Y → phase 2 hit → return parent's shared secret.
-
-This allows User B to access the parent's shared credential. Meanwhile, User A in tenant X would get their own private `key1` (phase 1 hit).
+#### Delete (deprovisioning saga) — see §6.3
 
 ### 4.7 Database schemas & tables
 
-The gateway gear has no local database. Secrets are persisted in the external backend (VendorA Credstore or OS keychain). The gateway and the VendorA/OS plugins are stateless.
+The gear owns one table, `credstore_secrets` (migration `m0001_initial_schema`; raw per-backend SQL to preserve `CHECK` and partial-index semantics; PostgreSQL and SQLite; MySQL fails fast):
 
-The `credentials_storage` plugin maintains its own database with tables for schemas, credential definitions, credentials (encrypted), and tenant keys (when `DatabaseKeyProvider` is active). The initial implementation uses PostgreSQL; the storage layer is designed to become database-agnostic in future iterations. The full database schema is specified in the plugin design document (`plugins/credentials-storage/DESIGN.md`, planned).
+```sql
+CREATE TABLE credstore_secrets (
+    id         UUID PRIMARY KEY,
+    tenant_id  UUID NOT NULL,
+    reference  TEXT NOT NULL CHECK (length(reference) BETWEEN 1 AND 255),
+    sharing    SMALLINT NOT NULL CHECK (sharing IN (1,2,3)),  -- private/tenant/shared
+    owner_id   UUID NOT NULL,
+    status     SMALLINT NOT NULL CHECK (status IN (1,2,3)),   -- provisioning/active/deprovisioning
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    version    BIGINT NOT NULL DEFAULT 1,
+    secret_type_uuid UUID NOT NULL DEFAULT '<generic type v5 uuid>', -- deterministic v5 of the GTS type id
+    expires_at TIMESTAMPTZ NULL,                                     -- expirable types only
+    value_fp   BYTEA NULL,      -- value-fingerprint fence: HMAC-SHA256(fence_key, value); internal-only
+    fp_key_id  SMALLINT NULL,   -- fence-key id the fp was computed under (keyring groundwork)
+    CHECK ((value_fp IS NULL) = (fp_key_id IS NULL))  -- NULL only on out-of-band seeded rows
+);
+-- coexistence of a private and a tenant/shared secret under one reference:
+CREATE UNIQUE INDEX uq_credstore_nonprivate ON credstore_secrets (tenant_id, reference)           WHERE sharing <> 1;
+CREATE UNIQUE INDEX uq_credstore_private    ON credstore_secrets (tenant_id, reference, owner_id) WHERE sharing = 1;
+-- walk-up resolution, reaper sweep (all non-active rows), expiry sweep:
+CREATE INDEX idx_credstore_lookup  ON credstore_secrets (reference, tenant_id, status);
+CREATE INDEX idx_credstore_pending ON credstore_secrets (updated_at) WHERE status <> 2;
+CREATE INDEX idx_credstore_expiry  ON credstore_secrets (expires_at) WHERE expires_at IS NOT NULL AND status = 2;
+```
+
+Created by the single `m0001_initial_schema` migration (§8). The table is a `Scopable` SecureORM entity — PDP scope clamps are applied to every query, which is what makes authorization enforceable in SQL.
 
 ### 4.8 Deployment Topology
 
-**Kubernetes Environment:**
+The gear is a gear inside the platform process; it requires a database (PostgreSQL in production, SQLite in dev/e2e) via the platform DB provider, and exactly one registered value-store plugin.
 
 ```mermaid
 graph LR
-    Platform["Platform<br/>(OAGW, gears)"] --> GW["credstore +<br/>vendor_a plugin"]
-    GW --> CS["VendorA Credstore<br/>(Go svc)"]
-    GW --> OAuth["OAuth/OIDC<br/>Provider"]
+    Platform["Platform<br/>(OAGW, mini-chat, gears)"] --> GW["credstore gear<br/>+ value-store plugin"]
+    GW --> DB["PostgreSQL / SQLite<br/>(credstore_secrets)"]
+    GW --> PDP["authz-resolver"]
+    GW --> TR["tenant-resolver"]
 ```
 
-**Credentials Storage Plugin (standalone microservice):**
-
-```mermaid
-graph LR
-    Platform["Platform<br/>(OAGW, gears)"] --> GW["credstore +<br/>credentials_storage plugin"]
-    GW --> CSP["Credentials Storage<br/>(Rust svc)"]
-    CSP --> PG["PostgreSQL<br/>(credentials)"]
-    CSP -->|"mTLS"| KMS["External Key Service<br/>(Vault / KMS)"]
-```
-
-**Desktop/VM Environment (P2):**
-
-```mermaid
-graph LR
-    Platform["Platform<br/>(gears)"] --> GW["credstore +<br/>os_storage plugin"]
-    GW --> OS["OS Keychain<br/>/ DPAPI"]
-```
+Development/testing runs the in-memory `static-credstore-plugin`; production deployments substitute a real vault-backed plugin (future work) with no gear changes.
 
 ### 4.9 Technology Stack
 
 | Layer | Technology | Rationale |
 |-------|------------|-----------|
-| Gateway | Axum (REST), ToolKit gear macro | Platform standard for HTTP services |
-| VendorA Plugin | `toolkit-http` (`HttpClient`) | Platform-standard HTTP client with OAuth2 support |
-| OAuth2 | Shared `oauth_token_provider` component | Centralized token acquisition and caching |
-| OS Plugin (P2) | `keyring` crate or platform-native FFI | Cross-platform OS keychain access |
+| Gear | Axum (REST), `#[toolkit::gear]` with `system, db, rest, stateful` capabilities | Platform standard |
+| Persistence | SeaORM + SecureORM (`Scopable`), raw-SQL migrations | Scope clamps in SQL; partial unique indexes |
+| AuthZ | `authz-resolver-sdk` `PolicyEnforcer` (PDP) | Platform policy plane |
+| Hierarchy | `tenant-resolver-sdk` (`BarrierMode::Respect`) + TTL/LRU cache | Barrier-aware ancestor chains |
+| Discovery & typing | `toolkit-gts` / `types-registry-sdk` | Vendor-based plugin selection; runtime secret-type resolution (uuid → type id + traits) |
+| Observability | OpenTelemetry metrics (typed port) | Operational visibility |
 | Serialization | `serde` | Platform standard |
-| Errors | `thiserror` | Platform standard |
+| Errors | `thiserror` + toolkit canonical errors | Platform standard ([ADR 0005](../../../docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md)) |
 
-## 5. Risks / Trade-offs
+### 4.10 Value-Fingerprint Fence
 
-### 5.1 Architectural Trade-offs
+> Decision: [ADR-0003](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md) (`cpt-cf-credstore-adr-value-fingerprint-fence`). Closes the cross-tenant disclosure of two crosswise concurrent unconditional PUTs and the ABA lost-update of a recreated secret.
 
-#### Hierarchical Resolution in Gateway (for simple plugins)
+A secret is a **dual write**: the value goes to the external value-store backend (`plugin.put`), the metadata (`sharing`, `version`, `expires_at`) to `credstore_secrets`. No transaction spans both stores, so two concurrent last-writer-wins PUTs to the same reference can interleave crosswise and commit one caller's value under the other caller's sharing label — a durable cross-tenant disclosure when the surviving label is `shared`. The platform's coordination primitives deliberately exclude fencing of external effects ([cluster ADR-002](../../system/cluster/docs/ADR/002-async-boundary-no-remote-in-critical-section.md): no fencing tokens, no remote calls in a lock's critical section; `coord` leases likewise), so the fence lives at the application layer, as that ADR prescribes.
 
-**Decision**: Implement hierarchical walk-up algorithm in Gateway gear for simple plugins (VendorA Credstore, OS keychain). The `credentials_storage` plugin handles merge resolution internally.
+**Mechanism.** Each row stores `value_fp = HMAC-SHA256(fence_key, value)` of the value its metadata was written for. Every write stamps it in the same atomic `touch`/insert as `sharing`; every read recomputes it from the value the backend returned and serves the value only when the row agrees, else fails closed as an anti-enumeration miss (404). Because the fingerprint and the sharing label are written by one writer in one UPDATE, a fingerprint match transitively proves the value and the metadata are from the same PUT — a value can never be served under a sharing label a different writer set. Metadata is not hashed into the fingerprint (the atomic write is what binds them).
 
-**Trade-offs**:
-- ✅ **Pro**: Centralized policy enforcement for simple plugins — all sharing mode logic and access control is in one place
-- ✅ **Pro**: Simple backends remain simple — just per-tenant key-value storage, easier to maintain and test
-- ✅ **Pro**: Plugin portability — OS keychain plugin doesn't need to understand hierarchy
-- ✅ **Pro**: Easier to change hierarchy logic without backend changes
-- ❌ **Con**: Multiple backend calls during walk-up (N calls for N-deep hierarchy) — not applicable to `credentials_storage` which resolves internally
-- ❌ **Con**: Gateway must query tenant_resolver for hierarchy information (simple plugins only)
+**Fence key.** Deployment state, not configuration: auto-generated (OS RNG, 32 bytes) and stored in the value-store backend under the reserved entry `(tenant = nil, reference = "cfs-internal-fence-key", owner = None)`. It has no metadata row, so no API path resolves, overwrites, or deletes it (resolution requires a row; external callers always carry a real tenant). All replicas read the one shared entry; on a virgin deployment the first writer generates it (put-then-reread convergence). The service caches it in-process and, on a fingerprint mismatch, performs a one-shot re-read (a replica whose cached key went stale after a key re-creation self-heals before failing closed). Split knowledge: fingerprints live in the gear DB, the key with the values — a DB-only compromise yields HMACs under an unknown key (no offline dictionary attack), and backend compromise yields the plaintexts regardless, so the fence adds no attack surface.
 
-**Mitigation**: Cache tenant hierarchy queries in Gateway; implement early termination on first accessible secret. The `credentials_storage` plugin avoids this overhead by resolving the merge chain in a single service call.
+**Failure semantics** are always fail-closed and self-healing: a half-completed overwrite (backend write committed, metadata `touch` failed, or vice-versa) leaves the row fingerprinting a different value than the backend holds, so reads 404 until a retried PUT lands both; a lost/replaced key makes fenced reads 404 (observable via `fence_verify{outcome="mismatch"}`) and re-PUT re-stamps each secret. No failure mode serves a value under mismatched metadata.
 
-#### Three-Tier Sharing Model (not RBAC/ABAC)
+**Generation-bound validator.** The strong `ETag` is `"<row-id>.<version>"`. The row UUID is minted fresh per created secret, so a validator from a deleted-and-recreated secret's earlier generation never matches the new row even when the restarted version counters coincide (closing the ABA lost-update). `version` stays the per-generation optimistic-lock counter and the row-level CAS still gates on it (the id is already the UPDATE key).
 
-**Decision**: Use simple three-tier sharing modes (private/tenant/shared) instead of granular ACL.
+**Out-of-band seeding.** A row provisioned directly in the DB with `value_fp = NULL` (value placed directly in the backend) is served on trust and its fingerprint backfilled — lazily on first read, or by the reaper's bounded sweep for rows nobody reads (both via a `value_fp IS NULL` CAS that never bumps the version). A re-seed of an existing row must reset `value_fp` to NULL in the same operation. This is the only path that produces a NULL fingerprint; API writes always stamp.
 
-**Trade-offs**:
-- ✅ **Pro**: Simple to understand and reason about
-- ✅ **Pro**: Covers 90% of use cases (owner-only keys, team credentials, hierarchical platform creds)
-- ✅ **Pro**: Easy to implement and test
-- ❌ **Con**: Cannot express complex policies (e.g., "only billing team in tenant can access")
-- ❌ **Con**: No role-based access control within tenant
+## 5. Secret Types (GTS-Based, Registry-Driven)
 
-**Mitigation**: Future enhancement for granular ACL is documented in PRD Open Questions.
+> Requirement: `cpt-cf-credstore-fr-secret-types`. Implemented: registry seeds in the SDK + runtime resolution (`SecretTypeResolver`), gear trait enforcement on the resolved traits (incl. the per-type PDP gate), UUID type column in `m0001_initial_schema`.
 
-#### 404 for Inaccessible Secrets (not 403)
+### 5.1 Concept
 
-**Decision**: Return 404 NotFound for all inaccessible secrets (owner-mismatch, private/tenant scope mismatch, not in hierarchy).
+Today every secret is an opaque byte string with identical semantics. The platform, however, stores materially different kinds of secrets (LLM provider API keys consumed by OAGW, OAuth2 client credentials, personal tokens, certificates), and their handling rules differ — most importantly *whether a secret may be shared down the tenant hierarchy at all*.
 
-**Trade-offs**:
-- ✅ **Pro**: Prevents enumeration attacks — attackers cannot probe for secret existence
-- ✅ **Pro**: Simpler client logic — 404 means "not available"
-- ❌ **Con**: Harder to debug — cannot distinguish "doesn't exist" from "no access"
-- ❌ **Con**: Less RESTful (REST semantics prefer 403 for permission denied)
+A **secret type** is a GTS type derived from the credstore secret base type (GTS segments are `vendor.package.namespace.type.vN`, so the derived segment carries the type name directly), e.g. for the built-in types:
 
-**Mitigation**: Audit logs record access attempts for debugging; error messages to admin users can be more detailed.
+```
+gts.cf.core.credstore.secret.v1~cf.core.credstore.<name>.v1~
+```
 
-#### PUT-as-Upsert (not POST create + PUT update)
+Each type declares a set of **traits** — machine-readable behavioral properties the gear enforces uniformly. The **types-registry is the runtime source of truth** (mirroring tenant types in Account Management): the base type `SecretV1` carries the trait vocabulary as its `x-gts-traits-schema` (generated from `SecretTypeTraits`, closed to unknown keys), every registered type derived from it declares its `x-gts-traits` values against that shape, and the gear resolves a type's effective traits from the registry per operation (§5.4). The compiled-in SDK catalog (`credstore_sdk::SECRET_TYPE_CATALOG`) only **seeds** the built-in type schemas through the link-time inventory; unit tests pin the seeds to the catalog descriptors so the two views cannot drift.
 
-**Decision**: Use PUT /secrets/{ref} for create-or-update (idempotent upsert).
+**Adding a type requires no credstore release**: registering a GTS schema that descends from `gts.cf.core.credstore.secret.v1~` (with its `x-gts-traits`) makes the type immediately writable, trait-enforced, and addressable as a PDP resource type — enabling per-type RBAC (e.g., a role that may read `api-key` secrets but not `certificate` secrets) without new authorization machinery.
 
-**Trade-offs**:
-- ✅ **Pro**: Idempotent — clients can retry safely
-- ✅ **Pro**: Simpler client usage — no need to check if secret exists first
-- ✅ **Pro**: Reduces API surface (one endpoint vs two)
-- ❌ **Con**: Less RESTful (POST typically for create, PUT for update)
-- ❌ **Con**: Cannot detect accidental overwrites (no "create only" option)
+The type of a secret is chosen at creation (REST field `type`: the secret type's full GTS type id), defaults to `generic`, and is **immutable** for the lifetime of the secret (rejected with `TYPE_IMMUTABLE`, mirroring the private ↔ non-private rule).
 
-**Mitigation**: POST /secrets endpoint available for explicit create-with-conflict-detection if needed.
+### 5.2 Type Traits
 
-### 5.2 Security and Performance Risks
+| Trait | Type | Semantics (gear-enforced unless noted) |
+|-------|------|-------------------------------------------|
+| `allow_sharing` | list of `SharingMode` | Sharing modes permitted for secrets of this type. A `put`/`create` with a mode outside the list is rejected (400, `SHARING_NOT_ALLOWED_FOR_TYPE`) — including a disallowed mode change on update. The traits schema constrains entries to the `SharingMode` enum, so a typo fails at registration. |
+| `value_schema` | embedded JSON Schema (optional) | Structural validation of the (JSON) value on write (400, `VALUE_SCHEMA_VIOLATION`); violation details never echo the value. Absent ⇒ opaque value. Carried in `x-gts-traits` like every other trait; the validator is compiled per write (schemas are dynamic; the registry client caches the resolution). A registered schema that fails to compile is a broken registration → 503, not 400. |
+| `max_size_bytes` | integer (optional) | Upper bound on value size (400, `VALUE_TOO_LARGE`); absent ⇒ platform default only. |
+| `expirable` | bool | Whether secrets of this type may carry `expires_at` (else 400, `EXPIRY_NOT_SUPPORTED_FOR_TYPE`; a past expiry is `EXPIRY_IN_THE_PAST`); expired secrets resolve as 404 (read-time SQL filter) and are moved into the deprovisioning saga by the reaper (§6.4). |
+| `rotation_period_secs` | integer (optional, advisory) | Recommended rotation cadence; metadata-only — rotation automation stays a non-goal. |
+| `utf8_only` | bool | Whether the value must be valid UTF-8 (400, `VALUE_NOT_UTF8`; only `generic` currently allows binary, reachable via the SDK). |
 
-#### Risk: Secret Values Leaked Through Logs
+Trait values resolve through the GTS chain merge (`effective_traits`): leaf-declared values win, ancestors fill the rest — the base type declares generic values for every trait, so a derived type only states what it restricts. Traits are enforced in the gear domain layer at well-defined points (§5.4); plugins remain trait-agnostic value stores.
 
-**Impact**: Critical security incident, compliance violations, potential credential theft
+### 5.3 Built-in Type Catalog (Registry Seeds)
 
-**Mitigation**:
-- `SecretValue` type with redacted `Debug`/`Display` implementation
-- Code review enforcement
-- Log scrubbing at transport layer
-- Automated log scanning in integration tests
-- NFR requirement (`cpt-cf-credstore-nfr-confidentiality`)
+Built-in types seeded into the registry by the SDK (REST name → derived GTS segment uses `_`, e.g. `api-key` → `…~cf.core.credstore.api_key.v1~`):
 
-**Likelihood**: Medium | **Impact**: Critical | **Priority**: P1
+| Type | `allow_sharing` | `value_schema` | Notes |
+|------|-----------------|----------------|-------|
+| `generic` | private, tenant, shared | — | Default; fully backward-compatible with existing secrets (binary allowed). |
+| `api-key` | private, tenant, shared | — | Third-party provider keys (OpenAI etc.) — the core hierarchical-sharing use case (OAGW). |
+| `personal-token` | **private only** | — ; `expirable` | Personal access tokens; the flagship `allow_sharing` restriction — can never be shared tenant-wide or inherited. |
+| `oauth2-client` | tenant, shared | `{client_id, client_secret, [token_url, scopes]}` | Structured; consumed by OAGW OAuth2 client-credentials auth. |
+| `basic-auth` | private, tenant, shared | `{username, password}` | Structured HTTP basic credentials. |
+| `bearer-token` | private, tenant | — ; `expirable` | Short-lived tokens; expiry enforced on read. |
+| `certificate` | tenant, shared | — ; `expirable`, `rotation_period_secs` = 90 d advisory | TLS material; `not_after` maps to `expires_at`. Format (PEM) checks deferred. |
+| `ssh-key` | private, tenant | — | Deploy/automation keys. Format checks deferred. |
+| `webhook-hmac` | tenant, shared | — | Webhook signing secrets shared with descendant integrations. |
+| `connection-string` | tenant | — ; `max_size_bytes` = 4 KiB | DSNs; tenant-local by policy (contain embedded endpoints/credentials). |
 
-#### Risk: Hierarchy Walk-up Performance at Deep Nesting
+Adding a **built-in** type (shipped with the platform, with a short REST name) = adding a catalog entry + its seed registration in the SDK (one release). Adding a **custom** type = registering a GTS schema derived from the secret base type — no release; the type is addressed by its full GTS id on the API. The enforcement code changes only when a new *trait* is introduced.
 
-**Impact**: Increased latency for secret resolution in deeply nested tenant hierarchies (10+ levels)
+### 5.4 Enforcement Points
 
-**Mitigation**:
-- Early termination: stop walk-up on first accessible secret
-- Cache tenant hierarchy queries from tenant_resolver
-- Monitor resolution depth and latency metrics
-- Consider future optimization: backend-side hierarchy resolution if performance becomes critical
+1. **Type resolution** (every operation): the type UUID — from the stored row (read/overwrite/delete prefetch) or from the request (create; default `generic`) — is resolved through `SecretTypeResolver` against the types-registry: envelope check (must descend from `gts.cf.core.credstore.secret.v1~`) + effective-traits merge (§4.4). Unknown/non-secret type: `UNKNOWN_SECRET_TYPE` (400) on create, 503 for a stored row; registry outage/timeout/malformed traits: 503. No credstore-side cache — the registry client's TTL cache bounds both latency and staleness.
+2. **Create / put**: validate `sharing ∈ allow_sharing`, value against the `value_schema` trait (compiled per write), size against `max_size_bytes`, UTF-8 against `utf8_only`, and the expiry gate — all on the **resolved traits**, before any side effect. Violations → 400 (`InvalidArgument`) with the stable per-trait reason (§5.2).
+3. **Update**: type immutable (`TYPE_IMMUTABLE` when an explicit differing `type` is sent — compared by UUID; absent `type` inherits the row's); the new value/sharing/expiry re-validated against the resolved traits. A PUT is a whole-value replace: omitting `expires_at` clears a stored expiry.
+4. **Read**: rows with `expires_at <= now` are filtered out in the resolution SQL (404); `type` (and `expires_at`, when set) are returned in response metadata.
+5. **Authorization**: a **single** PDP evaluation per operation targets the secret's **full concrete GTS type** — including `generic` — as returned by the type resolution (step 1). Its `AccessScope` is enforced in SQL and its gate must include the **caller's** tenant (hierarchical visibility of inherited/shared secrets is decided by the resolver, not the PDP). Denial surfaces as the anti-enumeration 404 on read and 403 on write/delete; a PDP outage is 503. Every type (incl. `generic` and custom types) reaches the PDP, so a per-type policy can be added with no credstore change. On read the PDP is consulted only for a secret that resolves (a missing secret is a 404 without a PDP or registry call).
+6. **Reaper**: each tick first flips expired `active` rows into the ordinary deprovisioning saga (`mark_expired_deprovisioning`), which then cleans the backend value and releases the reference via the pending sweep (§6.4). The reaper never resolves types — sweeping is type-agnostic.
+
+### 5.5 Storage & API Changes
+
+- `credstore_secrets` carries `secret_type_uuid UUID NOT NULL DEFAULT '<generic v5 uuid>'` — the deterministic v5 UUID of the type's GTS id (`GtsID::to_uuid`, pinned as `credstore_sdk::GENERIC_TYPE_UUID_STR`), like AM's `tenants.tenant_type_uuid` — and `expires_at TIMESTAMPTZ NULL`, plus the partial expiry-sweep index (§4.7, §8). The stored UUID is opaque to the storage layer; only the type resolution interprets it.
+- REST: optional `type` (the secret type's full GTS type id) and `expires_at` (RFC 3339) on `POST`/`PUT`; `GET` metadata returns `type` (the resolved full GTS type id) and `expires_at`.
+- SDK: `CredStoreClientV1` gains `put_opts`/`create_opts` taking `WriteOptions { secret_type: Option<GtsId>, expires_at, precondition }` — the gear resolves the `GtsId` to the type's deterministic UUID; `put`/`create` are provided methods delegating with defaults (source-compatible). `GetSecretResponse.secret_type` is the resolved full GTS type id.
+- Plugin SPI: **unchanged** — types are a metadata/policy concern.
+
+## 6. Secret Lifecycle & Sagas
+
+### 6.1 Status Model
+
+```
+                 create saga                     delete saga
+  ┌──────────────┐  plugin.put OK  ┌────────┐  mark deprovisioning  ┌────────────────┐
+  │ provisioning ├────────────────►│ active ├──────────────────────►│ deprovisioning │
+  └──────┬───────┘                 └────────┘                       └───────┬────────┘
+         │ backend failure → rollback (row deleted)                         │ plugin.delete OK
+         │ stuck → reaped                                                   │ → row deleted
+         ▼                                                                  ▼ stuck → reaped
+       (gone)                                                             (gone)
+```
+
+| Status | smallint | Visible to resolution | Holds unique index | Swept by reaper |
+|--------|----------|----------------------|--------------------|-----------------|
+| `provisioning` | 1 | no | yes | yes (after `provisioning_timeout_secs`) |
+| `active` | 2 | **yes** | yes | no |
+| `deprovisioning` | 3 | no | yes | yes (after `deprovisioning_timeout_secs`) |
+
+Only `active` rows are returned by `resolve_for_get`; a secret therefore becomes visible atomically at saga commit and invisible atomically at delete start.
+
+### 6.2 Provisioning Saga
+
+Sequence ID: `cpt-cf-credstore-seq-write-saga` (declared in §4.6).
+
+**Create path** (no row of the target sharing class exists):
+
+1. Fail fast if no plugin is available (before any metadata side effect).
+2. `INSERT` row with `status = provisioning` (scope-clamped).
+3. `plugin.put(tenant, key, value, owner-class)`.
+4. `UPDATE status = active` (`mark_active`).
+
+**Failure handling**:
+
+- Step 3 fails → **compensate**: best-effort delete of the provisioning row (metric `provisioning_rollback`); a failed cleanup defers to the reaper. The reference is never permanently wedged.
+- Step 4 fails → the backend value exists but the row stays `provisioning`: never readable; a client retry overwrites it; otherwise reaped — and the reaper issues a best-effort `plugin.delete` for every row it reaps (§6.4), so the orphaned backend value is reconciled rather than leaked.
+- **Create race** (unique-index conflict on step 2): a create-only `POST` surfaces 409; a `PUT` retries `find_for_write` up to 3 times with 25 ms backoff (the winner marks active within ms) and degrades to a retry-safe 409 if the winner appears stuck.
+
+**Overwrite path** (row of the target class exists): the ordering of the backend write vs the version-gated `touch` (version bump + sharing update + fence stamp) depends on the precondition. **Without `If-Match`** (last-writer-wins): backend `plugin.put` first, then `touch` — a plugin failure leaves metadata untouched; a `touch` failure after a committed backend write fails closed (fence mismatch → 404) until the next put retries; a row that vanished concurrently (delete won) is reported as a retryable 409 so the caller re-runs the put. **With `If-Match`** (optimistic concurrency): the version-gated `touch` claims the CAS **before** `plugin.put`, so a losing writer (0-row `touch` → 409) never reaches the backend and cannot clobber the winner's value; a backend failure after the claim fails closed the same way until the caller retries against the new version.
+
+### 6.3 Deprovisioning Saga
+
+> Requirement: `cpt-cf-credstore-fr-deprovisioning`. Status-driven saga symmetric to provisioning (statuses ship in `m0001_initial_schema`); replaced the earlier backend-first delete design.
+
+**Delete path**:
+
+1. `find_own` + version pre-check (`If-Match`), as today.
+2. `UPDATE status = deprovisioning` gated by `version = ?` when a precondition was given. From this instant the secret is invisible to resolution (single-status filter — no read/delete race), while the row keeps holding the partial unique index.
+3. `plugin.delete(tenant, key, owner-class)` — `NotFound` is success (idempotent).
+4. `DELETE` the metadata row.
+
+**Failure handling**:
+
+- Step 3/4 fails → the row stays `deprovisioning`; the caller gets the mapped error (503 for an unavailable backend, 500 for an internal plugin fault) and can retry. A **retry of `DELETE` resumes the saga**: `find_own` sees the `deprovisioning` row and re-runs steps 3–4 (both idempotent). Absent a retry, the reaper completes it.
+- Crash between 2 and 4 → same recovery: reaper or client retry finishes cleanup. No state leaves a readable secret or a permanently held reference.
+
+**Concurrent create during deprovisioning**: the row keeps the unique index until step 4, so a `POST`/`PUT` for the same reference conflicts (409, retryable) until cleanup completes. This is deliberate: releasing the index earlier would let a new secret's backend value be deleted by the old row's lagging step 3 (the backend key is identical). The window is bounded by the reaper cadence.
+
+**Interface impact**: REST/SDK signatures unchanged (`DELETE` stays 204 on success); `SecretStatus` has `Deprovisioning = 3` (status `CHECK` in §4.7); config has `reaper.deprovisioning_timeout_secs` (default 300 s); metric `deprovisioning_reaped` mirrors `provisioning_reaped`.
+
+### 6.4 Reaper
+
+The gear's lifecycle entry (`serve`) runs a cancellable loop on `reaper.tick_secs` (default 60 s; delayed missed-tick behavior). Each tick:
+
+1. **Expiry sweep**: flip expired `active` rows (`expires_at <= now`) into the deprovisioning saga (they already stopped resolving at read time; this cleans the backend value and releases the reference).
+2. **List stale non-active rows** (bounded batch) older than `provisioning_timeout_secs` / `deprovisioning_timeout_secs` (both default 300 s), via the pending partial index.
+3. **Backend reconciliation**: issue a best-effort `plugin.delete` for every stale row (closing the orphaned-value debt of §6.2); `NotFound` counts as success.
+4. **Remove rows**: `provisioning` rows unconditionally (the reference must not stay wedged); `deprovisioning` rows only after a successful backend delete — otherwise the row (and the name it holds) waits for the next tick. Counts → `provisioning_reaped` / `deprovisioning_reaped`.
+5. **Refresh inventory gauges** (row counts per status).
+
+Errors are logged, never propagated — the reaper must survive transient DB or plugin outages.
+
+## 7. Risks / Trade-offs
+
+### 7.1 Architectural Trade-offs
+
+#### Stateful gear (metadata table) vs stateless pass-through
+
+**Decision**: the gear owns metadata; backends store values only.
+
+- ✅ Hierarchical resolution and authorization in one transactional, indexed SQL query — latency independent of hierarchy depth on the metadata side
+- ✅ No backend metadata-schema prerequisite; any dumb value store qualifies as a backend
+- ✅ Sharing/uniqueness rules enforced by partial unique indexes rather than by backend-specific behavior
+- ✅ No encoded-external-ID collision surface
+- ❌ The gear needs a database and migrations (`stateful` capability)
+- ❌ Metadata and backend value can diverge transiently — mitigated by the saga + reaper design (§6) and idempotent retries
+
+#### Authorization via PDP scope in SQL (not permission strings)
+
+**Decision**: PDP `AccessScope` + SecureORM clamps instead of coarse `Secrets:Read`/`Secrets:Write` permission checks.
+
+- ✅ Real tenant-subtree isolation enforced at the data layer, consistent with platform RBAC/PDP
+- ✅ Degraded flat-`In` mode keeps correctness when the tenant closure is not co-located
+- ❌ Every operation pays a PDP evaluation (timed as a dependency metric; 503 on PDP outage — fail-closed)
+
+#### Three-tier sharing model (not RBAC/ABAC per secret)
+
+Unchanged from the original design: simple to reason about, covers the primary use cases; per-secret ACLs remain out of scope. Secret types add a *type-level* restriction axis (`allow_sharing`, §5) without introducing per-secret ACLs.
+
+#### 404 for inaccessible secrets (not 403)
+
+Unchanged: prevents enumeration; per-secret access failures are indistinguishable from absence. 403 is reserved for PDP-level denial of the *operation* (e.g., subject may not `read` at all) and the own-tenant gate.
+
+#### PUT-as-upsert + POST-as-create-only
+
+Unchanged semantics, now with optimistic concurrency: `PUT` is an idempotent upsert honouring `If-Match`; `POST` is create-only with 409 on same-class conflict.
+
+### 7.2 Security and Performance Risks
+
+#### Risk: Secret values leaked through logs or caches
+
+**Mitigation**: `SecretValue` redaction + zeroize; hand-written redacted `Debug` on DTOs; `Cache-Control: no-store`; no lossy UTF-8 decode; code review. **Likelihood**: Medium | **Impact**: Critical | **Priority**: P1
+
+#### Risk: Metadata/backend divergence (saga partial failure)
+
+**Impact**: value-less rows (404 until re-put), orphaned backend values (storage leak, never readable), wedged references behind the unique index.
+
+**Mitigation**: compensating rollback on create; backend-first ordering on overwrite; the deprovisioning saga + reaper backend reconciliation (§6.3, §6.4); configurable timeouts; rollback/reap metrics for operational visibility.
+
+**Likelihood**: Medium | **Impact**: Medium | **Priority**: P1
+
+#### Risk: PDP or tenant-resolver outage
+
+**Impact**: all operations fail (503) — fail-closed by design.
+
+**Mitigation**: ancestor-chain TTL cache absorbs short tenant-resolver blips; dependency latency/outcome metrics; PDP evaluation is per-request with no local policy cache (deliberate: policy freshness over availability).
+
+**Likelihood**: Low | **Impact**: High | **Priority**: P1
+
+#### Risk: Ancestor-chain cache staleness
+
+**Impact**: up to `ancestor_cache_ttl_secs` (300 s) of stale hierarchy — a re-parented tenant may briefly resolve secrets along the old chain.
+
+**Mitigation**: short TTL + LRU; the chain carries no caller-specific data (safe to share across security contexts); PDP scope still clamps every query, so a stale chain can widen *candidate rows* but never *authorized rows*.
 
 **Likelihood**: Low | **Impact**: Medium | **Priority**: P2
 
-#### Risk: Credstore API Changes Break Plugin
+#### Risk: Reference wedged by stuck saga rows
 
-**Impact**: Plugin stops working, secrets become inaccessible, platform outage
+**Impact**: 409 on create for up to the reaper timeout after a crashed write (or delete, once deprovisioning ships).
 
-**Mitigation**:
-- Pin VendorA Credstore API version in plugin
-- Integration tests against Credstore (run in CI)
-- Version compatibility matrix documented
-- Plugin adapts to API changes with feature flags or version detection
+**Mitigation**: bounded create-race retries; rollback-before-reaper on the common failure path; configurable `provisioning_timeout_secs` / `deprovisioning_timeout_secs`; `provisioning_reaped` alerting.
 
-**Likelihood**: Medium | **Impact**: High | **Priority**: P1
+**Likelihood**: Low | **Impact**: Low | **Priority**: P2
 
-#### Risk: ExternalID Encoding Collision
+## 8. Migration Plan
 
-**Impact**: Wrong secret returned, data corruption, security incident
+Schema is managed by SeaORM migrations (raw per-backend SQL, PostgreSQL + SQLite, MySQL fails fast). The stateful gear, the deprovisioning saga, and secret types shipped together — before any deployment of this gear — so the gear starts from one consolidated migration:
 
-**Mitigation**:
-- Deterministic base64url encoding with no-padding
-- SecretRef format validation: `[a-zA-Z0-9_-]+` (no colons)
-- Tenant ID is UUID (no colons)
-- Comprehensive test coverage for edge cases
-- Documented encoding algorithm
+- **`m0001_initial_schema`**: the full `credstore_secrets` table of §4.7 — lifecycle statuses `(1,2,3)`, the monotonic `version`, `secret_type_uuid` (default = the generic type's v5 UUID) + `expires_at`, partial unique indexes, and the lookup / pending-sweep / expiry-sweep indexes.
 
-**Likelihood**: Very Low | **Impact**: Critical | **Priority**: P1
+Future schema changes are additive migrations on top. **Backward compatibility** for clients: untyped writes behave exactly as before (`generic` type, all sharing modes, no expiry). Rollback = revert the gear and run the migration `down`.
 
-#### Risk: External Key Service Unavailability
+## 9. Open Questions
 
-**Impact**: All encrypt/decrypt operations blocked in Credentials Storage plugin; credential reads and writes fail
+1. **Batch retrieval** (from PRD): should `get` support batch retrieval (multiple references in one call) for OAGW efficiency? Design impact: `POST /secrets/batch`; single resolution query already amortizes well.
+2. **Human vs service access** (P2, from PRD): restrict human users to metadata-only for inherited shared secrets while service accounts read values?
+3. **Audit trail** (P2, from PRD): emit structured audit events (actor, tenant, outcome — never values) to a platform audit sink.
+4. **List/metadata endpoint** (P2): a metadata-only list (no values) becomes cheap with local metadata; interacts with the anti-enumeration stance and per-type authorization — needs a dedicated design pass.
 
-**Mitigation**:
-- High-availability key service deployment
-- Readiness probe reflects KMS connectivity
-- Key caching with short TTL for read-path resilience
-- Circuit breaker for key service calls
+(The former "dynamic type descriptors" question is resolved: types are registry-driven per §5, with the fail-closed semantics of §5.4.)
 
-**Likelihood**: Low | **Impact**: Critical | **Priority**: P1
-
-#### Risk: Keys Co-located with Encrypted Data (DatabaseKeyProvider)
-
-**Impact**: Single breach exposes both ciphertext and keys when using `DatabaseKeyProvider`
-
-**Mitigation**:
-- Use `ExternalKeyProvider` in production multi-tenant deployments
-- `DatabaseKeyProvider` restricted to development/test environments by deployment policy
-- Document key–data separation requirement in operational runbooks
-
-**Likelihood**: Medium | **Impact**: Critical | **Priority**: P1
-
-#### Risk: Owner ID Migration for Existing Secrets
-
-**Impact**: Existing secrets without owner_id cannot be accessed in `private` mode
-
-**Mitigation**:
-- Migration script to backfill owner_id for existing secrets (default to tenant admin)
-- Backward compatibility: if owner_id is null, treat as `tenant` mode
-- Phased rollout: new secrets get owner_id, existing secrets migrated gradually
-
-**Likelihood**: High | **Impact**: Medium | **Priority**: P1
-
-## 6. Migration Plan
-
-### 6.1 Schema Migration: Two-Mode to Three-Mode Sharing
-
-**Background**: The current design introduces a three-tier sharing model (`private`/`tenant`/`shared`) replacing the previous two-mode system. The new `private` mode (owner-only) is more restrictive than the old `private` mode (tenant-wide).
-
-**Migration Strategy**:
-
-#### Phase 1: Backend Schema Update (VendorA Credstore)
-
-1. **Add `owner_id` field** to Credstore schema:
-   - Type: UUID
-   - Nullable: YES (for backward compatibility with existing secrets)
-   - Default: NULL
-   - Index: Add index on (tenant_id, owner_id) for owner-based queries
-
-2. **Extend `sharing` enum** from 2 values to 3:
-   - Old values: `private`, `shared`
-   - New values: `private` (owner-only), `tenant` (tenant-wide), `shared` (hierarchical)
-   - Migration: Map old `private` → new `tenant`, old `shared` → new `shared`
-
-3. **Backfill `owner_id` for existing secrets**:
-   - Strategy: Set owner_id to tenant admin or service account for existing secrets
-   - Alternative: Leave owner_id as NULL and treat NULL as `tenant` mode (accessible to all in tenant)
-
-#### Phase 2: Gateway and Plugin Update
-
-1. **Update `credstore_vendor_a_plugin`**:
-   - Update PUT/POST calls to include `owner_id` field
-   - Update GET response parsing to extract `owner_id` from backend
-   - Handle NULL `owner_id` (treat as `tenant` mode)
-
-2. **Update `credstore` Gateway**:
-   - Update hierarchical resolution algorithm to check `owner_id` for `private` mode
-   - Update PUT/POST operations to capture `owner_id` from SecurityContext.subject_id()
-   - Update error handling to return 404 for owner-mismatch
-
-3. **Update `credstore-sdk`**:
-   - Update API contracts to include `owner_id` in SecretMetadata
-   - Update sharing mode enum to three values
-
-#### Phase 3: Client Migration
-
-1. **Inform consumers** about new sharing mode semantics:
-   - Old `private` mode behavior is now `tenant` mode
-   - New `private` mode is owner-only (more restrictive)
-   - Existing secrets with old `private` will be migrated to new `tenant`
-
-2. **Provide migration guide** for consumers to update sharing modes if needed
-
-3. **Backward compatibility**:
-   - Gateway accepts both old and new sharing mode values
-   - API defaults to `tenant` mode if sharing not specified
-
-#### Phase 4: Rollout
-
-1. **Deploy backend schema changes** (VendorA Credstore update)
-2. **Deploy Gateway and Plugin updates** (with backward compatibility)
-3. **Run migration script** to backfill owner_id and update sharing values
-4. **Monitor** for errors and performance issues
-5. **Gradually deprecate** old two-mode sharing values in API (future release)
-
-### 6.2 Backward Compatibility
-
-- **API**: Gateway accepts old sharing mode values and maps them to new values
-- **Defaults**: Secrets created without `owner_id` are treated as `tenant` mode
-- **Clients**: No breaking changes to existing client code (old behavior preserved under new `tenant` mode)
-
-### 6.3 Rollback Plan
-
-If migration fails:
-1. **Revert Gateway and Plugin** to previous version
-2. **Keep backend schema changes** (owner_id and new sharing enum are additive)
-3. **Use feature flag** to disable three-tier sharing mode enforcement
-
-### 6.4 Success Criteria
-
-- ✅ All existing secrets remain accessible after migration
-- ✅ New secrets can be created with all three sharing modes
-- ✅ Owner-only access control works for `private` mode
-- ✅ No performance degradation in hierarchical resolution
-- ✅ Zero downtime during rollout
-
-## 7. Open Questions
-
-This section cross-references open questions from [PRD.md Section 13](./PRD.md#13-open-questions) and adds design-specific questions.
-
-### 7.1 From PRD (Cross-Reference)
-
-All open questions below are documented in detail in PRD.md Section 13 (lines 605-609).
-
-1. **Batch Retrieval**: Should `resolve` support batch retrieval (multiple references in one call) for OAGW efficiency?
-   - **Design Impact**: Would require new API endpoint `POST /secrets/batch` with array of SecretRef inputs
-
-2. **P2/Future - Human vs Service Access**: Should human users be restricted from retrieving raw secret values for inherited shared secrets, while service accounts can?
-   - **Design Impact**: Requires distinguishing human vs service authentication in SecurityCtx; separate authorization rules; metadata-only response for humans
-
-3. **P2/Future - Audit Trails**: All credential operations should leave audit trails (timestamps, actor, tenant, outcome) with tamper-evident storage
-   - **Design Impact**: New audit gear; event emission from Gateway; secure log storage; never log plaintext secret values
-
-4. **P2/Future - Schema Validation**: Should  secrets support JSON schema validation (using GTS)?
-   - **Design Impact**: Schema registry; validation hooks in Gateway put operation; structured secret storage
-
-5. **P2/Future - Compare-and-Swap (CAS)**: Should secret updates support atomic CAS validation?
-   - **Design Impact**: Optional `expected_value` parameter in PUT operation; use VendorA Credstore CAS endpoint
-
-### 7.2 Design-Specific Questions
-
-6. **Plugin Failure Handling**: If a plugin call fails during hierarchical walk-up (e.g., network timeout), should Gateway:
-   - Option A: Fail entire request (fail-fast)
-   - Option B: Continue to next ancestor (best-effort)
-   - Option C: Cache last-known value (eventual consistency)
-   - **Recommendation**: Option A (fail-fast) for consistency; revisit if reliability issues emerge
-
-7. **Tenant Hierarchy Caching**: Should Gateway cache tenant_resolver hierarchy queries?
-   - **Design Impact**: In-memory cache with TTL; invalidation strategy; memory pressure considerations
-   - **Recommendation**: Yes, with 5-minute TTL and LRU eviction
-
-8. **Secret Metadata in List Operation**: Should `GET /secrets` (list all secrets for tenant) include metadata fields (owner_tenant_id, sharing, is_inherited)?
-   - **Design Impact**: Additional plugin calls during list; performance implications
-   - **Recommendation**: P2, list is not in v1 scope
-
-9. **Owner ID for Service Accounts**: For service-to-service operations (e.g., OAGW creating secrets on behalf of tenants), should owner_id be:
-   - Option A: Service account subject_id (OAGW's ID)
-   - Option B: Target tenant admin (impersonation)
-   - **Recommendation**: Option A (service account ID) for audit trail clarity
-
-## 8. Additional context
+## 10. Additional context
 
 ### Plugin Registration
 
-Following the ToolKit plugin pattern (as documented in `docs/TOOLKIT_PLUGINS.md` and exemplified by `tenant_resolver`):
+Following the ToolKit plugin pattern:
 
-1. `credstore` registers the plugin GTS schema during init
-2. Each plugin registers its GTS instance and scoped `CredStorePluginClientV1` in ClientHub
-3. Gateway resolves the active plugin via GTS instance query and vendor configuration
+1. The SDK's `CredStorePluginSpecV1` schema reaches types-registry automatically via the `toolkit-gts` link-time inventory (no per-init registration).
+2. Each plugin registers its GTS instance and its scoped `CredStorePluginClientV1` in ClientHub.
+3. The gear lazily resolves the active plugin: instance query by type-id prefix → filter by configured `vendor` → highest-priority active instance.
 
-**Exactly one storage plugin is active per deployment** (selected by configuration `vendor` field match). For simple plugins (VendorA, OS keychain), the Gateway handles all cross-cutting concerns (authorization, hierarchical resolution, sharing mode enforcement), while the plugins provide simple per-tenant CRUD operations. The `credentials_storage` plugin is a full microservice that handles merge resolution, authorization, and encryption internally — when active, the Gateway delegates these responsibilities to the plugin.
+**Exactly one storage plugin is active per deployment** (vendor match). The gear handles all cross-cutting concerns; plugins are per-tenant value stores only.
 
 **GTS Types:**
-- Schema: `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~`
-- VendorA instance: `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~cf.core.vendor_a.app._.plugin.v1`
-- OS storage instance: `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~cf.core.os_protected.app._.plugin.v1`
-- Credentials Storage instance: `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~cf.core.credentials_storage.app._.plugin.v1`
+- Plugin spec: `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~`
+- Secret resource type: `gts.cf.core.credstore.secret.v1~` (= `SECRET_RESOURCE_TYPE`, the PDP resource type; registered with an empty property set — authorization needs only the type id)
+- Secret types: derived from the secret base type — built-ins `gts.cf.core.credstore.secret.v1~cf.core.credstore.<name>.v1~` (one seed per catalog entry, traits as `x-gts-traits`), plus any custom registered descendant; §5
 
 ### Configuration
 
-**Gateway:**
 ```yaml
 gears:
   credstore:
-    vendor: "vendor_a"  # Selects plugin by matching vendor
+    database:
+      server: "postgres_main"        # platform DB provider reference
+    config:
+      vendor: "virtuozzo"            # selects the value-store plugin by GTS vendor (default: "virtuozzo")
+      hierarchy:
+        ancestor_cache_ttl_secs: 300 # ancestor-chain cache TTL (> 0)
+        tenant_closure_colocated: false  # advertise TenantHierarchy PDP capability (opt-in)
+      reaper:
+        tick_secs: 60                      # reaper cadence (> 0)
+        provisioning_timeout_secs: 300     # stuck-provisioning sweep threshold (> 0)
+        deprovisioning_timeout_secs: 300   # stuck-deprovisioning sweep threshold (> 0)
 ```
 
-**VendorA Plugin:**
-```yaml
-gears:
-  credstore_vendor_a_plugin:
-    vendor: "vendor_a"
-    priority: 100
-    base_url: "https://credstore.internal.example.com"
-    client_id: "credstore-client"
-    client_secret: "${CREDSTORE_CLIENT_SECRET}"
-    # Optional: separate RO/RW credentials
-    # ro_client_id: "credstore-ro"
-    # ro_client_secret: "${CREDSTORE_RO_SECRET}"
-    scopes: ["credstore"]
-    timeout_ms: 5000
-    retry_count: 3
-```
-
-**Credentials Storage Plugin:**
-```yaml
-gears:
-  credentials_storage:
-    vendor: "credentials_storage"
-    priority: 100
-    base_url: "http://credentials-storage.internal:8080"
-    database_url: "${CREDENTIALS_STORAGE_DB_URL}"
-    key_provider: "database"  # "database" or "external"
-    # External key provider settings (when key_provider = "external"):
-    # kms_url: "https://vault.internal:8200"
-    # kms_auth: "${KMS_AUTH_TOKEN}"
-```
+Config is validated at init (`deny_unknown_fields`; non-empty vendor; all periods > 0); an invalid config fails gear startup.
 
 ### Error Mapping
 
-| Backend Response | Plugin Error | Gateway/Consumer Error |
-|-----------------|-------------|----------------------|
-| Credstore 404 | `None` | `NotFound` |
-| Credstore 401/403 | `PermissionError` | `Internal` (credentials misconfigured) |
-| Credstore 5xx | `BackendError` (retryable) | `Internal` |
-| Credstore timeout | `BackendError` (retryable) | `Internal` |
-| OS keychain item not found | `None` | `NotFound` |
-| OS keychain access denied | `PermissionError` | `Internal` |
+Domain → canonical (wire) mapping (`sdk_error_mapping`, pinned by tests):
 
-## 9. Traceability
+| DomainError | Canonical category | HTTP |
+|-------------|--------------------|------|
+| `InvalidSecretRef`, `InvalidPrecondition`, `UnsupportedTransition` | `InvalidArgument` | 400 |
+| `NotFound` | `NotFound` | 404 |
+| `Conflict` | `AlreadyExists` | 409 |
+| `VersionConflict` | `Aborted` (`OPTIMISTIC_LOCK_FAILURE`) | 409 |
+| `AccessDenied` | `AccessDenied` | 403 |
+| `ServiceUnavailable` (incl. "no storage plugin registered") | `ServiceUnavailable` (+ `Retry-After` when hinted) | 503 |
+| `Internal` | `Internal` (diagnostic stripped from the wire) | 500 |
+
+Plugin-layer `CredStoreError`s are normalized by `map_plugin_err`; a plugin returning `UnsupportedTransition` or `InvalidSecretRef` is a contract violation surfaced as `Internal`.
+
+### Observability
+
+Typed OpenTelemetry metrics via `CredStoreMetricsPort`:
+
+- `walkup_depth` — ancestor distance of the winning row
+- `read_outcome` — own / inherited / miss
+- `dependency` — latency + outcome per dependency (PDP evaluate, tenant-resolver chain, types-registry type resolution, plugin get/put/delete)
+- `cross_tenant_denied` — own-tenant gate rejections
+- `provisioning_rollback`, `provisioning_reaped`, `deprovisioning_reaped` — saga health
+- inventory gauge — row counts per status, refreshed by the reaper
+
+## 11. Traceability
 
 - **PRD**: [PRD.md](./PRD.md)
-- **ADRs**: [ADR/](./ADR/)
-- **Features**: [features/](./features/)
-- **Credentials Storage Plugin Design**: `plugins/credentials-storage/DESIGN.md` (planned)
+- **ADRs**: [ADR/](./ADR/) — [ADR-0001 stateful gear](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md), [ADR-0002 deprovisioning saga](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md)
+- **Features**: features/ (planned)

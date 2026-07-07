@@ -208,6 +208,16 @@ pub struct ProviderTenantOverride {
     pub auth_config: Option<HashMap<String, String>>,
 }
 
+impl ProviderTenantOverride {
+    /// Whether this override can yield a distinct per-tenant OAGW upstream.
+    /// Only a `host` or an `upstream_alias` derives a distinct upstream; an
+    /// override with neither is inert (or auth-only) and cannot be registered.
+    #[must_use]
+    pub fn has_distinct_upstream(&self) -> bool {
+        self.host.is_some() || self.upstream_alias.is_some()
+    }
+}
+
 impl ProviderEntry {
     /// Effective host for a given tenant. Returns the tenant override host
     /// if configured, otherwise the root host.
@@ -257,16 +267,18 @@ impl ProviderEntry {
                 ));
             }
 
-            let overrides_auth =
-                tenant_override.auth_plugin_type.is_some() || tenant_override.auth_config.is_some();
-            let has_distinct_upstream =
-                tenant_override.host.is_some() || tenant_override.upstream_alias.is_some();
-
-            if overrides_auth && !has_distinct_upstream {
+            // A tenant override must carry a host or an upstream_alias — that is
+            // the only way to derive a distinct OAGW upstream for the tenant.
+            // Without either, the override is inert (empty) or contradictory
+            // (e.g. auth-only), and registration cannot produce a per-tenant
+            // upstream. Reject it deterministically at boot (fail-fast) rather
+            // than leaving the provider silently unavailable at registration
+            // time (the `Misconfigured` path in `oagw_provisioning` is now only a
+            // defensive fallback for this).
+            if !tenant_override.has_distinct_upstream() {
                 return Err(format!(
-                    "provider '{provider_id}': tenant override '{tid}' overrides auth \
-                     without host or upstream_alias - \
-                     set one to create a distinct upstream"
+                    "provider '{provider_id}': tenant override '{tid}' has neither host nor \
+                     upstream_alias - set one to create a distinct upstream for the tenant"
                 ));
             }
         }
@@ -1056,6 +1068,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_tenant_override_must_have_host_or_alias() {
+        fn base() -> ProviderEntry {
+            ProviderEntry {
+                kind: ProviderKind::OpenAiResponses,
+                upstream_alias: None,
+                host: "api.example.com".to_owned(),
+                port: None,
+                use_http: false,
+                api_path: default_api_path(),
+                auth_plugin_type: None,
+                auth_config: None,
+                storage_backend: None,
+                supports_file_search_filters: true,
+                storage_kind: StorageKind::OpenAi,
+                api_version: None,
+                rag_provider: None,
+                tenant_overrides: HashMap::new(),
+            }
+        }
+        fn ovr(
+            host: Option<&str>,
+            alias: Option<&str>,
+            auth: Option<&str>,
+        ) -> ProviderTenantOverride {
+            ProviderTenantOverride {
+                host: host.map(str::to_owned),
+                upstream_alias: alias.map(str::to_owned),
+                auth_plugin_type: auth.map(str::to_owned),
+                auth_config: None,
+            }
+        }
+        let with_override = |o: ProviderTenantOverride| {
+            let mut e = base();
+            e.tenant_overrides.insert("t".to_owned(), o);
+            e
+        };
+
+        // No overrides, and host- or alias-carrying overrides are valid.
+        base().validate("p").expect("base valid");
+        with_override(ovr(Some("t.example.com"), None, None))
+            .validate("p")
+            .expect("host override valid");
+        with_override(ovr(None, Some("t-alias"), None))
+            .validate("p")
+            .expect("alias override valid");
+
+        // Neither host nor alias → fail-fast at boot, regardless of auth: the
+        // override can never yield a distinct per-tenant upstream.
+        let err = with_override(ovr(None, None, None))
+            .validate("p")
+            .expect_err("empty override rejected");
+        assert!(err.contains("neither host nor"), "got: {err}");
+        with_override(ovr(None, None, Some("apikey")))
+            .validate("p")
+            .expect_err("auth-only override rejected");
+    }
+
+    #[test]
     fn default_config_is_valid() {
         StreamingConfig::default().validate().unwrap();
         EstimationBudgets::default().validate().unwrap();
@@ -1538,7 +1608,7 @@ mod tests {
         };
         let err = entry.validate("azure_openai").unwrap_err();
         assert!(err.contains("tenant-a"));
-        assert!(err.contains("overrides auth"));
+        assert!(err.contains("neither host nor"));
     }
 
     #[test]
@@ -1573,7 +1643,7 @@ mod tests {
         };
         let err = entry.validate("azure_openai").unwrap_err();
         assert!(err.contains("tenant-b"));
-        assert!(err.contains("overrides auth"));
+        assert!(err.contains("neither host nor"));
     }
 
     #[test]

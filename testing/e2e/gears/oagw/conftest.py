@@ -122,3 +122,70 @@ def _check_oagw_reachable():
     except Exception:
         # Timeout or other transient error — still try to run tests.
         pass
+
+
+# ---------------------------------------------------------------------------
+# Provision the secrets the auth-injection tests resolve via `cred://`
+# ---------------------------------------------------------------------------
+
+# Secrets the apikey / oauth2 auth plugins resolve via `cred://<ref>`.
+# Values mirror the historical static-credstore-plugin seed in
+# config/e2e-local.yaml.
+_CREDSTORE_SECRETS = {
+    "openai-key": "sk-test-e2e-fake-key",
+    "test-oauth2-client-id": "test-client-id",
+    "test-oauth2-client-secret": "test-client-secret",
+}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _provision_credstore_secrets(_check_oagw_reachable):
+    """Write the auth-injection secrets through the credstore gateway API.
+
+    The credstore gateway is now stateful: a GET resolves the secret's
+    metadata from the gateway's own database first, then reads the value from
+    the backend plugin. A secret merely pre-seeded in the static plugin config
+    has no gateway metadata row and is therefore unreachable. So we create the
+    secrets via the gateway API (which writes the metadata row *and* the
+    backend value).
+
+    We PUT (upsert -> idempotent) with the same token the proxied requests
+    carry (``E2E_AUTH_TOKEN`` -> tenant ``00000000-df51-...``). Sharing is
+    ``tenant`` so any subject in that tenant resolves the value — this matches
+    the proxied-request context regardless of subject_id (the historical seed
+    used owner-bound ``private``; the gateway lookup does not depend on the
+    OAGW auth-config ``sharing`` label).
+    """
+    base_url = os.getenv("E2E_OAGW_BASE_URL", "http://localhost:8086")
+    token = os.getenv("E2E_AUTH_TOKEN", "e2e-token-tenant-a")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "content-type": "application/json",
+    }
+    # Iterate over a literal tuple of reference names (not the value mapping)
+    # so nothing derived from the secret values flows into log messages.
+    for ref in ("openai-key", "test-oauth2-client-id", "test-oauth2-client-secret"):
+        try:
+            resp = httpx.put(
+                f"{base_url}/credstore/v1/secrets/{ref}",
+                headers=headers,
+                json={"value": _CREDSTORE_SECRETS[ref], "sharing": "tenant"},
+                timeout=5.0,
+            )
+        except httpx.RequestError:
+            # Any transport-level error (connect/timeout/transport) — keep
+            # provisioning non-fatal; the per-test reachability check skips tests.
+            # `break`, not `return`: this is a generator fixture, so a bare
+            # return before the `yield` below raises "did not yield a value"
+            # and ERRORs the whole session instead of letting the per-test skip
+            # take over (review finding #5).
+            break
+        if resp.status_code not in (200, 201, 204):
+            # Don't fail the session; the auth tests skip if the secret is
+            # absent. Log only the ref name and status — never the response
+            # body, which could reflect the secret value.
+            print(
+                f"[e2e] WARN: could not provision credstore secret {ref!r}: "
+                f"HTTP {resp.status_code}"
+            )
+    yield
