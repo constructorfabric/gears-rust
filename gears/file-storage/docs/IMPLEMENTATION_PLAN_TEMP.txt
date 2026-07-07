@@ -1564,6 +1564,8 @@ The two halves are independently actionable; do the sweep-default half regardles
 
 ### 1.7 — No durable/distributed storage backend (S3) despite doc claims
 
+**S3 client decision (see ADR-0005):** primary = rusty-s3 + quick-xml (lightest real-S3-API, reuses existing reqwest 0.13, +11.7% binary); fallback = object_store if rusty-s3 is insufficient (becomes size-competitive once it ships reqwest 0.13). Still gated on the external-SDK security review.
+
 This is the largest item — four sub-items plus a dedicated test strategy. Re-verified: `src/infra/backend/mod.rs:11` does say "S3/GCS/etc. are deferred (they require an external SDK + security review)"; `src/bin/sidecar.rs:95` does hardcode a single `Arc::new(LocalFsBackend::new("local-fs", root))` into `SidecarState.backend` with **no** `BackendRegistry` on the sidecar at all; `Claims` (`src/infra/signed_url/mod.rs:85-92`) does carry `pub backend_id: String` (confirmed line 91) which the sidecar never reads today (`rg -n "claims.backend_id" src/bin/sidecar.rs` → no matches, confirmed).
 
 #### 1.7.1 — `S3Backend: StorageBackend` implementation
@@ -3573,6 +3575,8 @@ DECOMPOSITION.md reconciled to the shipped code. New `DomainError::RetentionRule
 ### NOT DONE — blocked, needs a team decision / external dependency
 - **1.7 — S3 backend**: external-SDK security review + S3 crate choice + heavy new
   dependency. Not started. Unblocks 0.2's native multipart and 1.2(b)/1.7.4 streaming.
+  S3 client selected: **rusty-s3** (primary), **object_store** (fallback) — see ADR-0005;
+  implementation still blocked on the security-review gate + SDK wiring.
 - **1.4 — quota half**: no `QuotaClient` SDK crate exists in the workspace.
   `gear.rs`'s `None, // quota_client` left as-is.
 - **1.12 — usage accounting symmetry**: coupled with wiring `usage_reporter` off

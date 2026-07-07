@@ -157,3 +157,80 @@ fn serde_round_trip_preserves_value() {
     let back: FileStorageConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(back.max_url_ttl_secs, original.max_url_ttl_secs);
 }
+
+#[test]
+fn config_s3_backends_serde_round_trip() {
+    // P2 1.7.3 config wiring: `s3_backends` must serde round-trip faithfully,
+    // and `secret_access_key` must never leak through `FileStorageConfig`'s
+    // (or `S3BackendConfig`'s own) `Debug` output.
+    const SECRET: &str = "super-secret-value-do-not-print-me";
+
+    let original = FileStorageConfig {
+        s3_backends: vec![S3BackendConfig {
+            id: "s3-primary".to_owned(),
+            endpoint: Some("http://127.0.0.1:9000".to_owned()),
+            region: "us-east-1".to_owned(),
+            bucket: "my-bucket".to_owned(),
+            access_key_id: Some("AKIAEXAMPLE".to_owned()),
+            secret_access_key: Some(SECRET.to_owned()),
+            path_style: true,
+        }],
+        ..FileStorageConfig::default()
+    };
+
+    let json = serde_json::to_string(&original).unwrap();
+    let back: FileStorageConfig = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.s3_backends.len(), 1);
+    let entry = &back.s3_backends[0];
+    assert_eq!(entry.id, "s3-primary");
+    assert_eq!(entry.endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+    assert_eq!(entry.region, "us-east-1");
+    assert_eq!(entry.bucket, "my-bucket");
+    assert_eq!(entry.access_key_id.as_deref(), Some("AKIAEXAMPLE"));
+    assert_eq!(entry.secret_access_key.as_deref(), Some(SECRET));
+    assert!(entry.path_style);
+
+    // Redaction proof: the raw secret must not appear anywhere in either
+    // struct's `Debug` output.
+    let cfg_debug = format!("{back:?}");
+    assert!(
+        !cfg_debug.contains(SECRET),
+        "FileStorageConfig's Debug output must never contain the raw secret_access_key: {cfg_debug}"
+    );
+    let entry_debug = format!("{entry:?}");
+    assert!(
+        !entry_debug.contains(SECRET),
+        "S3BackendConfig's Debug output must never contain the raw secret_access_key: {entry_debug}"
+    );
+    assert!(cfg_debug.contains("<redacted>"));
+}
+
+#[test]
+fn config_s3_backends_defaults_to_empty() {
+    let cfg: FileStorageConfig = serde_json::from_str("{}").unwrap();
+    assert!(
+        cfg.s3_backends.is_empty(),
+        "s3_backends must default to empty so existing configs keep parsing"
+    );
+}
+
+#[test]
+fn config_default_backend_id_defaults_to_none() {
+    // P2 1.7 Stage 6: an existing config without `default_backend_id` must
+    // keep parsing and keep `local-fs` as the implicit default (enforced by
+    // `gear.rs::build_backend_registry` falling back to `LOCAL_FS_ID`).
+    let cfg: FileStorageConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(cfg.default_backend_id, None);
+}
+
+#[test]
+fn config_default_backend_id_serde_round_trip() {
+    let original = FileStorageConfig {
+        default_backend_id: Some("s3-primary".to_owned()),
+        ..FileStorageConfig::default()
+    };
+    let json = serde_json::to_string(&original).unwrap();
+    let back: FileStorageConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.default_backend_id.as_deref(), Some("s3-primary"));
+}

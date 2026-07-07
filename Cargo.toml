@@ -400,6 +400,13 @@ http-body = "1"
 reqwest = { version = "0.13", features = ["stream"] }
 rand = "0.10"
 
+# S3 client (file-storage gear only, cpt-cf-file-storage-adr-s3-client-selection) —
+# sign-only request builder; requests are executed via the existing reqwest client.
+rusty-s3 = { version = "0.10", default-features = false }
+# XML response/error parsing for the S3 backend (ADR-0005). Pinned >= 0.41.0: RUSTSEC-2026-0194 and
+# RUSTSEC-2026-0195 (DoS) are fixed only as of this release.
+quick-xml = "0.41"
+
 # Synchronous locks for better performance
 parking_lot = "0.12"
 

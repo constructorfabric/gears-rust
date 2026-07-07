@@ -444,6 +444,7 @@ impl MultipartService {
                     part_number,
                     offset,
                     size,
+                    backend_handle: backend_handle.clone(),
                 },
                 request_id: request_id.clone(),
             };

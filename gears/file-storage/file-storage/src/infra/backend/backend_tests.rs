@@ -15,12 +15,60 @@ fn unique_root() -> std::path::PathBuf {
     p
 }
 
+/// Shared behavioral contract every `StorageBackend` implementation must
+/// satisfy, factored out of what used to be per-backend hand-written
+/// `put/get/delete/exists/get_range` assertions (`in_memory_*`/`local_fs_*`
+/// duplicated the same checks). Covers: put -> get round trip, `get_range`
+/// correctness for both the `Inclusive` and `Suffix` variants (mirroring the
+/// former `default_get_range_slices_content`/`get_range_suffix_returns_tail`
+/// assertions), idempotent `delete`, and `exists` distinguishing
+/// present/missing. Backend-specific behavior (atomicity, tmp-file cleanup,
+/// path-traversal rejection, etc.) stays in each backend's own tests.
+pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
+    // put -> get round trip, and exists() reports present.
+    backend
+        .put("contract/put-get", Bytes::from_static(b"hello, contract"))
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.get("contract/put-get").await.unwrap(),
+        Bytes::from_static(b"hello, contract")
+    );
+    assert!(backend.exists("contract/put-get").await.unwrap());
+
+    // get_range: Inclusive and Suffix variants.
+    backend
+        .put("contract/range", Bytes::from_static(b"0123456789"))
+        .await
+        .unwrap();
+    let slice = backend
+        .get_range("contract/range", ByteRange::Inclusive { start: 2, end: 4 })
+        .await
+        .unwrap();
+    assert_eq!(slice, Bytes::from_static(b"234"));
+    let tail = backend
+        .get_range("contract/range", ByteRange::Suffix { length: 3 })
+        .await
+        .unwrap();
+    assert_eq!(tail, Bytes::from_static(b"789"));
+
+    // delete is idempotent.
+    backend
+        .put("contract/delete", Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    backend.delete("contract/delete").await.unwrap();
+    backend.delete("contract/delete").await.unwrap();
+    assert!(!backend.exists("contract/delete").await.unwrap());
+
+    // exists distinguishes present from missing.
+    assert!(!backend.exists("contract/never-existed").await.unwrap());
+}
+
 #[tokio::test]
-async fn in_memory_put_get_round_trip() {
+async fn in_memory_satisfies_backend_contract() {
     let b = InMemoryBackend::new("mem");
-    b.put("a/b", Bytes::from_static(b"hello")).await.unwrap();
-    assert_eq!(b.get("a/b").await.unwrap(), Bytes::from_static(b"hello"));
-    assert!(b.exists("a/b").await.unwrap());
+    assert_backend_contract(&b).await;
 }
 
 #[tokio::test]
@@ -31,49 +79,10 @@ async fn in_memory_get_missing_errors() {
 }
 
 #[tokio::test]
-async fn delete_is_idempotent() {
-    let b = InMemoryBackend::new("mem");
-    b.put("x", Bytes::from_static(b"y")).await.unwrap();
-    b.delete("x").await.unwrap();
-    // second delete on a now-missing blob still succeeds
-    b.delete("x").await.unwrap();
-    assert!(!b.exists("x").await.unwrap());
-}
-
-#[tokio::test]
-async fn default_get_range_slices_content() {
-    let b = InMemoryBackend::new("mem");
-    b.put("p", Bytes::from_static(b"0123456789")).await.unwrap();
-    let slice = b
-        .get_range("p", ByteRange::Inclusive { start: 2, end: 4 })
-        .await
-        .unwrap();
-    assert_eq!(slice, Bytes::from_static(b"234"));
-}
-
-#[tokio::test]
-async fn get_range_suffix_returns_tail() {
-    let b = InMemoryBackend::new("mem");
-    b.put("p", Bytes::from_static(b"0123456789")).await.unwrap();
-    let slice = b
-        .get_range("p", ByteRange::Suffix { length: 3 })
-        .await
-        .unwrap();
-    assert_eq!(slice, Bytes::from_static(b"789"));
-}
-
-#[tokio::test]
-async fn local_fs_put_get_round_trip() {
+async fn local_fs_satisfies_backend_contract() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
-    b.put("fid/vid", Bytes::from_static(b"bytes"))
-        .await
-        .unwrap();
-    assert_eq!(
-        b.get("fid/vid").await.unwrap(),
-        Bytes::from_static(b"bytes")
-    );
-    assert!(b.exists("fid/vid").await.unwrap());
+    assert_backend_contract(&b).await;
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 

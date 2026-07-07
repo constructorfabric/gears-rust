@@ -105,6 +105,106 @@ pub struct FileStorageConfig {
     /// @cpt-cf-file-storage-fr-backend-config-source
     #[serde(default)]
     pub enable_in_memory_backend: bool,
+
+    /// Zero or more S3-compatible backends to register alongside `local-fs`
+    /// (and `memory` if enabled). Each entry becomes one `S3Backend` in the
+    /// registry, keyed by its own `id`. Empty by default — a deployment opts
+    /// in explicitly.
+    ///
+    /// @cpt-cf-file-storage-adr-s3-client-selection
+    #[serde(default)]
+    pub s3_backends: Vec<S3BackendConfig>,
+
+    /// Backend id `build_backend_registry` designates as the registry's
+    /// default (the backend new `create`/`initiate_multipart` calls write
+    /// to — see `BackendRegistry::default_backend`). `None` (the default)
+    /// keeps `local-fs` as the default, preserving today's behavior for every
+    /// deployment that doesn't set this. Set this to one of `s3_backends`'
+    /// configured ids to make that S3 backend the default instead — e.g. the
+    /// S3 e2e suite (`testing/e2e/gears/file_storage/lifecycle_s3/`) sets
+    /// this so `POST /files` and `POST /files/{id}/multipart` mint upload
+    /// URLs whose `claims.backend_id` names the S3 test-double backend,
+    /// exercising Stage 5's per-request sidecar dispatch end-to-end. The
+    /// configured id must be one of the registry's backends (`local-fs`,
+    /// `memory` if enabled, or an `s3_backends` entry) — `build_backend_registry`
+    /// surfaces an unknown id as a fail-fast gear-init error via
+    /// `BackendRegistry::new`'s own validation, never a panic.
+    #[serde(default)]
+    pub default_backend_id: Option<String>,
+}
+
+/// One S3-compatible backend entry (`FileStorageConfig::s3_backends`).
+///
+/// `Debug` is implemented manually so `secret_access_key` is never printed (a
+/// config dump must not leak the credential), mirroring
+/// `FileStorageConfig`'s own manual `Debug` impl for `signing_key_seed`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3BackendConfig {
+    /// Backend id this entry registers under (must be unique across the
+    /// whole registry, including `local-fs`/`memory` — enforced by
+    /// `BackendRegistry::new`).
+    pub id: String,
+
+    /// S3-compatible HTTP(S) endpoint, e.g. `http://127.0.0.1:9000` for
+    /// `MinIO`/`s3s-fs`. `None` means real AWS S3 — the endpoint is derived
+    /// from `region` (`https://s3.{region}.amazonaws.com`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// AWS region (or the region the S3-compatible endpoint expects for
+    /// `SigV4` signing, e.g. `us-east-1` for most `MinIO`/`s3s-fs` setups).
+    pub region: String,
+
+    /// Target bucket name.
+    pub bucket: String,
+
+    /// Access key id. `None` resolves `AWS_ACCESS_KEY_ID` from the process
+    /// environment at construction time instead of a static config value.
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+
+    /// Secret access key. `None` resolves `AWS_SECRET_ACCESS_KEY` from the
+    /// process environment at construction time instead of a static config
+    /// value. Never printed by `Debug` — see the struct-level doc comment.
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+
+    /// `true` for path-style addressing (`MinIO`/`s3s-fs`-style endpoints),
+    /// `false` for virtual-hosted-style real S3. Defaults to `true` since
+    /// most non-AWS S3-compatible endpoints require it.
+    ///
+    /// NOTE: `S3Backend::new` (Stage 1) always builds its `rusty_s3::Bucket`
+    /// with `UrlStyle::Path` regardless of this flag — path-style addressing
+    /// is also valid against real AWS S3, just not the modern default. This
+    /// field is accepted and round-tripped today as a forward-compatible
+    /// knob; wiring it through to `S3Backend` (adding a virtual-hosted-style
+    /// option) is deferred to a later stage, not part of this config-wiring
+    /// stage.
+    #[serde(default = "default_path_style")]
+    pub path_style: bool,
+}
+
+impl fmt::Debug for S3BackendConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3BackendConfig")
+            .field("id", &self.id)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            // Never print the secret — only whether one is configured.
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("path_style", &self.path_style)
+            .finish()
+    }
+}
+
+fn default_path_style() -> bool {
+    true // most non-AWS S3-compatible endpoints (MinIO, s3s-fs) require it
 }
 
 impl FileStorageConfig {
@@ -157,6 +257,13 @@ impl fmt::Debug for FileStorageConfig {
                 &self.signing_key_seed.as_ref().map(|_| "<redacted>"),
             )
             .field("require_signing_key_seed", &self.require_signing_key_seed)
+            // Safe to print directly: `S3BackendConfig` has its own redacting
+            // `Debug` impl that substitutes `secret_access_key`'s value —
+            // without that, this line would leak the secret through
+            // `FileStorageConfig`'s output even though this struct never
+            // touches the field itself.
+            .field("s3_backends", &self.s3_backends)
+            .field("default_backend_id", &self.default_backend_id)
             .finish()
     }
 }
@@ -177,6 +284,8 @@ impl Default for FileStorageConfig {
             sweep_interval_secs: default_sweep_interval_secs(),
             enable_background_sweep: default_enable_background_sweep(),
             enable_in_memory_backend: false,
+            s3_backends: Vec::new(),
+            default_backend_id: None,
         }
     }
 }

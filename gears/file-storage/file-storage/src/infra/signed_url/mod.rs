@@ -78,6 +78,18 @@ pub struct MultipartClaims {
     /// **Exact** byte length the sidecar will accept for this part.
     /// The sidecar rejects with `413` if `body.len() ≠ size` (FEATURE §4, point 2).
     pub size: u64,
+    /// The backend's own multipart handle (e.g. an S3 `UploadId`), as
+    /// returned by `StorageBackend::initiate_multipart` at plan-mint time.
+    ///
+    /// Empty for backends that don't support native multipart at all (never
+    /// reached in practice: `initiate_multipart_upload` rejects such a
+    /// backend before minting any per-part token) — the sidecar uses an
+    /// empty value as the signal to fall back to the local-fs-style
+    /// offset-object model instead of calling `StorageBackend::upload_part`.
+    /// `#[serde(default)]` keeps verification tolerant of a token minted
+    /// before this field existed.
+    #[serde(default)]
+    pub backend_handle: String,
 }
 
 /// The signed token's claim set (AND-combined; `exp` is mandatory).

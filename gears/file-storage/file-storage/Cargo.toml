@@ -55,6 +55,18 @@ ring = "0.17"
 # HTTP client — used by the sidecar binary to call the control-plane finalize callback.
 reqwest = { workspace = true }
 
+url = { workspace = true }
+# S3 storage backend (ADR-0005). Feature set determined empirically in Stage 0:
+# `aws-lc-rs` reuses the crypto crate already resolved via hyper-rustls/reqwest's TLS
+# stack (no second crypto crate added); `full` is required because rusty-s3 gates its
+# `ListObjectsV2`/`CreateMultipartUpload`/`CompleteMultipartUpload` action *builders*
+# behind that feature (not just their bundled response-parsing types) — see plan.md
+# Risks §2 deviation note. We still parse all S3 XML response bodies ourselves via
+# `quick-xml` per the ADR; rusty-s3's own `instant-xml`-based response types (e.g.
+# `ListObjectsV2Response`) are never used, only its request-signing builders.
+rusty-s3 = { workspace = true, features = ["aws-lc-rs", "full"] }
+quick-xml = { workspace = true }
+
 # Database - SeaORM (driver features come from toolkit-db)
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
@@ -78,3 +90,11 @@ toolkit-macros = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tower = { workspace = true }
+
+# S3 backend test double (Stage 1+): an in-process, filesystem-backed S3-compatible
+# HTTP server. Versions re-verified against crates.io in Stage 0 (matched pair).
+s3s = "0.14.1"
+s3s-fs = "0.14.1"
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["server-auto", "tokio"] }
+tempfile = { workspace = true }

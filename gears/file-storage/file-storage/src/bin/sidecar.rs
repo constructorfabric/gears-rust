@@ -22,6 +22,22 @@
 //!   - `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` — connect timeout (seconds) for the
 //!     same callbacks (default `5`). Together these bound how long a client's upload
 //!     request can be held open by an unreachable or hung control plane (P2 1.5).
+//!   - `FS_SIDECAR_S3_BACKENDS` — P2 1.7.3 config wiring: an optional JSON array of
+//!     `file_storage::config::S3BackendConfig` entries, e.g. a single entry
+//!     `{"id":"s3-primary","endpoint":"http://127.0.0.1:9000","region":"us-east-1",
+//!     "bucket":"my-bucket","access_key_id":"...","secret_access_key":"...","path_style":true}`
+//!     wrapped in a JSON array.
+//!     Unset or empty = no S3 backends. Credentials embedded in this env var are
+//!     acceptable for the sidecar (it is the one component authorized to hold them,
+//!     per ADR-0003's sidecar/control-plane split) but in production this JSON blob
+//!     should be sourced from a secrets manager / mounted file, not a plain process
+//!     env var, where the deployment platform supports it. Each entry is
+//!     validated at startup (a bad endpoint or missing credentials fails the sidecar
+//!     fast) and, alongside the always-present `local-fs` backend, is folded into a
+//!     `BackendRegistry` (`cpt-cf-file-storage` P2 1.7.2 / Stage 5): every request
+//!     resolves its backend per request from the verified token's
+//!     `claims.backend_id`, so a control-plane-registered `S3Backend` is reachable
+//!     by real traffic.
 //!
 //! ## Upload lifecycle
 //!
@@ -54,15 +70,25 @@ use uuid::Uuid;
 
 use file_storage::domain::error::DomainError;
 use file_storage::domain::ports::FileStorageMetricsPort;
-use file_storage::infra::backend::{LocalFsBackend, StorageBackend};
+use file_storage::infra::backend::{BackendRegistry, LocalFsBackend, S3Backend, StorageBackend};
 use file_storage::infra::content::{hash, range};
 use file_storage::infra::metrics::FileStorageMetricsMeter;
-use file_storage::infra::signed_url::{Op, Verifier};
+use file_storage::infra::signed_url::{Claims, Op, Verifier};
+
+/// Id of the local-fs backend, and the sidecar's `BackendRegistry` default id.
+/// The default is never actually consulted by request dispatch (every request
+/// names its backend explicitly via `claims.backend_id`), but
+/// `BackendRegistry::new` requires a valid default id to construct at all.
+const LOCAL_FS_ID: &str = "local-fs";
 
 #[derive(Clone)]
 struct SidecarState {
     verifier: Arc<Verifier>,
-    backend: Arc<dyn StorageBackend>,
+    /// Backends this sidecar can dispatch to, keyed by id. The backend used
+    /// for a given request is resolved *per request* from the verified
+    /// token's `claims.backend_id` (Stage 5 / P2 1.7.2) — never a single
+    /// hardcoded backend.
+    backends: BackendRegistry,
     /// Base URL of the control plane, e.g. `http://localhost:8080`.
     /// Empty string = finalize callback disabled (dev/no-control-plane mode).
     control_base_url: String,
@@ -143,6 +169,42 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!("reqwest client: {e}"))?;
 
+    // `FS_SIDECAR_S3_BACKENDS` (P2 1.7.3 config wiring) — a JSON array of
+    // `S3BackendConfig` entries. Parsed and eagerly constructed here (so a
+    // misconfigured entry, e.g. a bad endpoint URL or missing credentials
+    // with no env fallback, fails sidecar startup fast). Folded into the
+    // `BackendRegistry` below alongside `local-fs`, so entries here are
+    // reachable by traffic via `claims.backend_id` dispatch (Stage 5 / P2
+    // 1.7.2).
+    let s3_backends: Vec<Arc<dyn StorageBackend>> = match std::env::var("FS_SIDECAR_S3_BACKENDS") {
+        Ok(json) if !json.trim().is_empty() => {
+            let entries: Vec<file_storage::config::S3BackendConfig> =
+                serde_json::from_str(&json)
+                    .map_err(|e| anyhow::anyhow!("invalid FS_SIDECAR_S3_BACKENDS: {e}"))?;
+            entries
+                .iter()
+                .map(|entry| {
+                    S3Backend::from_config(entry)
+                        .map(|backend| Arc::new(backend) as Arc<dyn StorageBackend>)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("FS_SIDECAR_S3_BACKENDS: {e}"))?
+        }
+        _ => Vec::new(),
+    };
+    if !s3_backends.is_empty() {
+        tracing::info!(
+            count = s3_backends.len(),
+            "sidecar parsed FS_SIDECAR_S3_BACKENDS \u{2014} registered for claims.backend_id dispatch"
+        );
+    }
+
+    let mut backend_list: Vec<Arc<dyn StorageBackend>> =
+        vec![Arc::new(LocalFsBackend::new(LOCAL_FS_ID, root))];
+    backend_list.extend(s3_backends);
+    let backends = BackendRegistry::new(backend_list, LOCAL_FS_ID)
+        .map_err(|e| anyhow::anyhow!("failed to build sidecar backend registry: {e}"))?;
+
     // P2 1.8 remediation: the sidecar is its own OS process, so it owns its
     // own OTel `Meter` — mirrors the control plane's `meter_with_scope` call
     // in `gear.rs`, scoped under the sidecar's own instrumentation name.
@@ -158,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
             Verifier::from_public_key(public_key)
                 .map_err(|e| anyhow::anyhow!("invalid FS_SIDECAR_PUBLIC_KEY: {e}"))?,
         ),
-        backend: Arc::new(LocalFsBackend::new("local-fs", root)),
+        backends,
         control_base_url,
         http,
         metrics,
@@ -289,12 +351,22 @@ async fn upload(
             .into_response();
     }
 
+    let backend = match state.backends.get(&claims.backend_id) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unknown backend '{}': {e}", claims.backend_id),
+            )
+                .into_response();
+        }
+    };
+
     let byte_stream: futures::stream::BoxStream<'_, std::io::Result<bytes::Bytes>> = Box::pin(
         body.into_data_stream()
             .map(|r| r.map_err(std::io::Error::other)),
     );
-    let (bytes_written, digest) = match state
-        .backend
+    let (bytes_written, digest) = match backend
         .put_stream(&claims.backend_path, byte_stream, claims.upload.max_size)
         .await
     {
@@ -585,6 +657,161 @@ async fn report_part_with_control_plane(
     }
 }
 
+/// Writes one multipart part to `backend`, returning `(body_len, backend_etag,
+/// hash_hex)` on success or an early terminal `Response` on any client/backend
+/// error.
+///
+/// Two write models, chosen by the backend's own capabilities (P2 1.7 Stage 6
+/// fix — see the "Before this fix" note below for why this branch exists):
+/// * `multipart_native` (e.g. `S3Backend`): call the backend's own
+///   `upload_part` against its native multipart session
+///   (`claims.multipart.backend_handle`, minted by `initiate_multipart_upload`
+///   at plan time). `upload_part`'s trait signature takes the whole part as
+///   one `Bytes` — S3's `UploadPart` needs the full body up front to sign and
+///   send in a single request — so the part is buffered here, bounded by the
+///   token's exact `size` claim (the same bound the non-native path enforces
+///   via `put_stream`'s `max_size`), so this never buffers more than one
+///   part's worth of bytes.
+/// * otherwise (e.g. `LocalFsBackend`, which has no native multipart): the
+///   original offset-object model — each part is written as its own backend
+///   object at `{backend_path}.part.{n}` via `put_stream`, and
+///   `complete_multipart_upload`'s local-fs fallback assembles them (§4
+///   "otherwise offset-write into `/{file_id}/{version_id}`").
+///
+/// Before this fix, EVERY backend (including `multipart_native` ones) went
+/// through the offset-object path unconditionally, so a real multipart
+/// session was `initiate_multipart`'d but never actually received any
+/// `UploadPart` calls — `complete_multipart` then failed against the backend
+/// (proven by the P2 1.7 Stage 6 S3 e2e suite,
+/// `testing/e2e/gears/file_storage/lifecycle_s3/`, which is what surfaced
+/// this bug: `CompleteMultipartUpload` 500s against a real S3-compatible
+/// endpoint because none of its parts were ever uploaded).
+async fn write_multipart_part(
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    part_number: u32,
+    body: Body,
+) -> Result<(u64, String, String), Response> {
+    if backend.capabilities().multipart_native {
+        write_multipart_part_native(backend, claims, part_number, body).await
+    } else {
+        write_multipart_part_offset_object(backend, claims, part_number, body).await
+    }
+}
+
+/// `multipart_native` backend write path — see `write_multipart_part`'s doc
+/// comment.
+async fn write_multipart_part_native(
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    part_number: u32,
+    body: Body,
+) -> Result<(u64, String, String), Response> {
+    let max_size = claims.multipart.size;
+    let mut stream = body.into_data_stream();
+    let mut buf = bytes::BytesMut::new();
+    loop {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                if (buf.len() as u64).saturating_add(chunk.len() as u64) > max_size {
+                    return Err((
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!("part body length exceeds token size claim {max_size}"),
+                    )
+                        .into_response());
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Some(Err(e)) => {
+                tracing::error!(error = %e, part_number, "part body stream read failed");
+                return Err((StatusCode::BAD_REQUEST, "body read error").into_response());
+            }
+            None => break,
+        }
+    }
+    let body_len = buf.len() as u64;
+    // FEATURE §4, point 2: reject if body length ≠ size claim. Checked here
+    // (before the backend call) rather than after, since the whole part is
+    // already buffered — no partial native upload to clean up.
+    if body_len != max_size {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("part body length {body_len} does not match token size claim {max_size}"),
+        )
+            .into_response());
+    }
+    match backend
+        .upload_part(
+            &claims.backend_path,
+            &claims.multipart.backend_handle,
+            part_number,
+            buf.freeze(),
+        )
+        .await
+    {
+        Ok((etag, hash)) => Ok((body_len, etag, hex::encode(hash))),
+        Err(e) => {
+            tracing::error!(error = %e, part_number, "backend native upload_part failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response())
+        }
+    }
+}
+
+/// Non-native (offset-object) backend write path — see
+/// `write_multipart_part`'s doc comment.
+async fn write_multipart_part_offset_object(
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    part_number: u32,
+    body: Body,
+) -> Result<(u64, String, String), Response> {
+    let part_path = format!("{}.part.{}", claims.backend_path, part_number);
+    let byte_stream: futures::stream::BoxStream<'_, std::io::Result<bytes::Bytes>> = Box::pin(
+        body.into_data_stream()
+            .map(|r| r.map_err(std::io::Error::other)),
+    );
+    let (body_len, part_hash) = match backend
+        .put_stream(&part_path, byte_stream, Some(claims.multipart.size))
+        .await
+    {
+        Ok(v) => v,
+        Err(DomainError::Validation { .. }) => {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "part body length exceeds token size claim {}",
+                    claims.multipart.size
+                ),
+            )
+                .into_response());
+        }
+        Err(e) => {
+            tracing::error!(error = %e, part_number, "backend part write failed");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response());
+        }
+    };
+
+    // FEATURE §4, point 2: reject if body length ≠ size claim. The
+    // `max_size` guard above only rejects an *oversized* part mid-stream; an
+    // undersized part still streams to completion, so the exact-length check
+    // happens here, now that `body_len` is final. The mismatched part is
+    // removed so a rejected part never lingers as an orphaned backend object.
+    if body_len != claims.multipart.size {
+        drop(backend.delete(&part_path).await);
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "part body length {} does not match token size claim {}",
+                body_len, claims.multipart.size
+            ),
+        )
+            .into_response());
+    }
+
+    let part_etag = hex::encode(part_hash);
+    Ok((body_len, part_etag.clone(), part_etag))
+}
+
 /// `PUT` multipart part: verify `op=multipart_part` token, stream the part
 /// straight to the backend, enforce the exact `size` claim, compute and
 /// return the part hash.
@@ -645,62 +872,25 @@ async fn upload_multipart_part(
             .into_response();
     }
 
-    // Write the part. For a `multipart_native` backend this would call
-    // `upload_part`; the sidecar here uses the streaming `put_stream` into the
-    // versioned path for the local-fs backend (offset-write model, §4
-    // "otherwise offset-write into /{file_id}/{version_id}"). `size` bounds
-    // the stream as `max_size`, so an oversized part is aborted mid-stream —
-    // the enforcement point that closes the oversized-part abuse vector.
-    //
-    // NOTE: a production sidecar would call `backend.upload_part(...)` when the
-    // backend supports native multipart. For the current thin binary (local-fs
-    // only, no S3) we persist each part as a separate object keyed by path + part
-    // and rely on `complete_multipart_upload` to assemble them.
-    let part_path = format!("{}.part.{}", claims.backend_path, part_number);
-    let byte_stream: futures::stream::BoxStream<'_, std::io::Result<bytes::Bytes>> = Box::pin(
-        body.into_data_stream()
-            .map(|r| r.map_err(std::io::Error::other)),
-    );
-    let (body_len, part_hash) = match state
-        .backend
-        .put_stream(&part_path, byte_stream, Some(claims.multipart.size))
-        .await
-    {
-        Ok(v) => v,
-        Err(DomainError::Validation { .. }) => {
+    let backend = match state.backends.get(&claims.backend_id) {
+        Ok(b) => b,
+        Err(e) => {
             return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!(
-                    "part body length exceeds token size claim {}",
-                    claims.multipart.size
-                ),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unknown backend '{}': {e}", claims.backend_id),
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!(error = %e, part_number, "backend part write failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
-        }
     };
 
-    // FEATURE §4, point 2: reject if body length ≠ size claim. The `max_size`
-    // guard above only rejects an *oversized* part mid-stream; an undersized
-    // part still streams to completion, so the exact-length check happens
-    // here, now that `body_len` is final. The mismatched part is removed so
-    // a rejected part never lingers as an orphaned backend object.
-    if body_len != claims.multipart.size {
-        drop(state.backend.delete(&part_path).await);
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "part body length {} does not match token size claim {}",
-                body_len, claims.multipart.size
-            ),
-        )
-            .into_response();
-    }
-
-    let part_etag = hex::encode(part_hash);
+    // Write the part — see `write_multipart_part`'s doc comment for the two
+    // models this dispatches between, and why the branch exists at all (P2
+    // 1.7 Stage 6 fix).
+    let (body_len, backend_etag, hash_hex) =
+        match write_multipart_part(backend.as_ref(), &claims, part_number, body).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
     // P2 1.8 remediation: ingress bytes for this part.
     #[allow(clippy::cast_precision_loss)]
@@ -719,8 +909,8 @@ async fn upload_multipart_part(
         version_id,
         claims.multipart.upload_id,
         part_number,
-        &part_etag,
-        &part_etag,
+        &backend_etag,
+        &hash_hex,
         i64::try_from(body_len).unwrap_or(i64::MAX),
     )
     .await
@@ -731,9 +921,9 @@ async fn upload_multipart_part(
     // Return the part hash and ETag so callers can track per-part integrity.
     let body = serde_json::json!({
         "part_number": part_number,
-        "etag": part_etag,
+        "etag": backend_etag,
         "hash_algorithm": "SHA-256",
-        "hash": part_etag,
+        "hash": hash_hex,
     });
     (StatusCode::OK, axum::Json(body)).into_response()
 }
@@ -789,6 +979,17 @@ async fn download(
             .into_response();
     }
 
+    let backend = match state.backends.get(&claims.backend_id) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unknown backend '{}': {e}", claims.backend_id),
+            )
+                .into_response();
+        }
+    };
+
     let path = &claims.backend_path;
 
     // Resolve existence first, distinctly from any later I/O failure: a
@@ -797,7 +998,7 @@ async fn download(
     // `NotFound` from other I/O errors per backend (see
     // `StorageBackend::exists`'s contract), so anything failing after this
     // point is a genuine backend error, not a missing blob.
-    match state.backend.exists(path).await {
+    match backend.exists(path).await {
         Ok(true) => {}
         Ok(false) => return (StatusCode::NOT_FOUND, "not found").into_response(),
         Err(e) => {
@@ -813,8 +1014,8 @@ async fn download(
         .and_then(range::parse);
 
     match range {
-        Some(r) => download_range(&state, path, r).await,
-        None => download_whole(&state, path).await,
+        Some(r) => download_range(&state, &backend, path, r).await,
+        None => download_whole(&state, &backend, path).await,
     }
 }
 
@@ -823,10 +1024,11 @@ async fn download(
 /// cognitive complexity down.
 async fn download_range(
     state: &SidecarState,
+    backend: &Arc<dyn StorageBackend>,
     path: &str,
     r: file_storage_sdk::ByteRange,
 ) -> Response {
-    let total = match state.backend.size(path).await {
+    let total = match backend.size(path).await {
         Ok(n) => n,
         Err(e) => {
             tracing::error!(error = %e, "backend size lookup failed");
@@ -843,7 +1045,7 @@ async fn download_range(
         );
         return resp;
     };
-    match state.backend.get_range(path, r).await {
+    match backend.get_range(path, r).await {
         Ok(bytes) => {
             // P2 1.8 remediation: egress bytes for this range read.
             #[allow(clippy::cast_precision_loss)]
@@ -874,8 +1076,12 @@ async fn download_range(
 /// Serve a whole-blob `GET` (no `Range` header) once the blob's existence has
 /// already been confirmed by the caller (`download`). Split out of
 /// `download` to keep its cognitive complexity down.
-async fn download_whole(state: &SidecarState, path: &str) -> Response {
-    match state.backend.get(path).await {
+async fn download_whole(
+    state: &SidecarState,
+    backend: &Arc<dyn StorageBackend>,
+    path: &str,
+) -> Response {
+    match backend.get(path).await {
         Ok(bytes) => {
             // P2 1.8 remediation: egress bytes for this whole-blob read.
             #[allow(clippy::cast_precision_loss)]
@@ -912,7 +1118,7 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    use file_storage::infra::backend::{InMemoryBackend, StorageBackend};
+    use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
     use file_storage::infra::metrics::NoopMetrics;
     use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 
@@ -920,9 +1126,14 @@ mod tests {
 
     fn test_state() -> SidecarState {
         let issuer = Issuer::generate(60).expect("issuer generation");
+        let backends = BackendRegistry::new(
+            vec![Arc::new(InMemoryBackend::new("test")) as Arc<dyn StorageBackend>],
+            "test",
+        )
+        .expect("build test backend registry");
         SidecarState {
             verifier: std::sync::Arc::new(issuer.verifier()),
-            backend: std::sync::Arc::new(InMemoryBackend::new("test")),
+            backends,
             control_base_url: String::new(),
             http: reqwest::Client::new(),
             metrics: Arc::new(NoopMetrics),
@@ -1107,9 +1318,14 @@ mod tests {
     fn test_download_state() -> (SidecarState, Issuer, Arc<InMemoryBackend>) {
         let issuer = Issuer::generate(60).expect("issuer generation");
         let backend = Arc::new(InMemoryBackend::new("test"));
+        let backends = BackendRegistry::new(
+            vec![Arc::clone(&backend) as Arc<dyn StorageBackend>],
+            "test",
+        )
+        .expect("build test backend registry");
         let state = SidecarState {
             verifier: Arc::new(issuer.verifier()),
-            backend: backend.clone(),
+            backends,
             control_base_url: String::new(),
             http: reqwest::Client::new(),
             metrics: Arc::new(NoopMetrics),
@@ -1318,5 +1534,302 @@ mod tests {
             !body_text.contains("500"),
             "client-facing body must not leak the raw upstream HTTP status: {body_text}"
         );
+    }
+
+    /// Mint a signed `op = put` upload token for `(file_id, version_id, backend_id, backend_path)`.
+    fn upload_token(
+        issuer: &Issuer,
+        file_id: Uuid,
+        version_id: Uuid,
+        backend_id: &str,
+        backend_path: &str,
+    ) -> String {
+        let claims = Claims {
+            op: Op::Put,
+            file_id,
+            version_id,
+            backend_id: backend_id.to_owned(),
+            backend_path: backend_path.to_owned(),
+            exp: OffsetDateTime::now_utc().unix_timestamp() + 60,
+            upload: UploadConstraints::default(),
+            multipart: MultipartClaims::default(),
+            request_id: "test-request-id".to_owned(),
+        };
+        issuer
+            .issue(claims, OffsetDateTime::now_utc())
+            .expect("issue upload token")
+    }
+
+    /// Mint a signed `op = multipart_part` token.
+    #[allow(clippy::too_many_arguments)]
+    fn multipart_part_token(
+        issuer: &Issuer,
+        file_id: Uuid,
+        version_id: Uuid,
+        backend_id: &str,
+        backend_path: &str,
+        upload_id: Uuid,
+        part_number: u32,
+        offset: u64,
+        size: u64,
+        backend_handle: &str,
+    ) -> String {
+        let claims = Claims {
+            op: Op::MultipartPart,
+            file_id,
+            version_id,
+            backend_id: backend_id.to_owned(),
+            backend_path: backend_path.to_owned(),
+            exp: OffsetDateTime::now_utc().unix_timestamp() + 60,
+            upload: UploadConstraints::default(),
+            multipart: MultipartClaims {
+                upload_id,
+                part_number,
+                offset,
+                size,
+                backend_handle: backend_handle.to_owned(),
+            },
+            request_id: "test-request-id".to_owned(),
+        };
+        issuer
+            .issue(claims, OffsetDateTime::now_utc())
+            .expect("issue multipart part token")
+    }
+
+    /// P2 1.7 Stage 6 regression: `upload_multipart_part` must dispatch to the
+    /// backend's own `upload_part` (native multipart) for a
+    /// `multipart_native` backend, instead of unconditionally falling back to
+    /// the local-fs-style offset-object model. That bug was silent until the
+    /// S3 e2e suite (`testing/e2e/gears/file_storage/lifecycle_s3/`) surfaced
+    /// it: `CompleteMultipartUpload` 500s against a real S3-compatible
+    /// endpoint because no part was ever uploaded via a real `UploadPart`
+    /// call. `InMemoryBackend` is `multipart_native: true` too, so this
+    /// regression is caught here without needing a live S3 test double: if
+    /// `upload_multipart_part` used the offset-object fallback instead, the
+    /// final `complete_multipart` call below would fail (zero real parts
+    /// would exist in the backend's native multipart session).
+    #[tokio::test]
+    async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
+        let issuer = Issuer::generate(60).expect("issuer generation");
+        let backend = Arc::new(InMemoryBackend::new("mem"));
+        let backends =
+            BackendRegistry::new(vec![Arc::clone(&backend) as Arc<dyn StorageBackend>], "mem")
+                .expect("build test backend registry");
+        let state = SidecarState {
+            verifier: Arc::new(issuer.verifier()),
+            backends,
+            control_base_url: String::new(),
+            http: reqwest::Client::new(),
+            metrics: Arc::new(NoopMetrics),
+        };
+
+        let file_id = Uuid::now_v7();
+        let version_id = Uuid::now_v7();
+        let backend_path = format!("/{file_id}/{version_id}");
+        let upload_id = Uuid::now_v7();
+
+        // Mirrors `initiate_multipart_upload` (domain service): call the
+        // backend's own `initiate_multipart` up front and mint each per-part
+        // token with the resulting handle (`MultipartClaims::backend_handle`).
+        let backend_handle = backend
+            .initiate_multipart(&backend_path)
+            .await
+            .expect("initiate native multipart session");
+
+        let part1 = b"first-part-bytes".to_vec();
+        let part2 = b"second-part-payload".to_vec();
+
+        let token1 = multipart_part_token(
+            &issuer,
+            file_id,
+            version_id,
+            "mem",
+            &backend_path,
+            upload_id,
+            1,
+            0,
+            part1.len() as u64,
+            &backend_handle,
+        );
+        let token2 = multipart_part_token(
+            &issuer,
+            file_id,
+            version_id,
+            "mem",
+            &backend_path,
+            upload_id,
+            2,
+            part1.len() as u64,
+            part2.len() as u64,
+            &backend_handle,
+        );
+
+        let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+
+        let resp1 = router
+            .clone()
+            .oneshot(
+                Request::put(format!(
+                    "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token1}"
+                ))
+                .body(Body::from(part1.clone()))
+                .expect("valid request"),
+            )
+            .await
+            .expect("router call succeeds");
+        assert_eq!(resp1.status(), StatusCode::OK, "part 1 PUT must succeed");
+        let resp1_body = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+            .await
+            .expect("read part 1 response body");
+        let resp1_json: serde_json::Value =
+            serde_json::from_slice(&resp1_body).expect("part 1 response is JSON");
+        let etag1 = resp1_json["etag"]
+            .as_str()
+            .expect("part 1 response has an etag")
+            .to_owned();
+
+        let resp2 = router
+            .oneshot(
+                Request::put(format!(
+                    "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/2?fs-token={token2}"
+                ))
+                .body(Body::from(part2.clone()))
+                .expect("valid request"),
+            )
+            .await
+            .expect("router call succeeds");
+        assert_eq!(resp2.status(), StatusCode::OK, "part 2 PUT must succeed");
+        let resp2_body = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .expect("read part 2 response body");
+        let resp2_json: serde_json::Value =
+            serde_json::from_slice(&resp2_body).expect("part 2 response is JSON");
+        let etag2 = resp2_json["etag"]
+            .as_str()
+            .expect("part 2 response has an etag")
+            .to_owned();
+
+        // Complete the native multipart session directly against the
+        // backend (mirrors what `complete_multipart_upload` does
+        // server-side) — this only succeeds if both parts above actually
+        // landed via `upload_part`, proving the dispatch fix.
+        let content_hash = backend
+            .complete_multipart(&backend_path, &backend_handle, &[(1, etag1), (2, etag2)])
+            .await
+            .expect("complete native multipart session - both parts must be real");
+
+        let assembled = backend
+            .get(&backend_path)
+            .await
+            .expect("read assembled object");
+        let mut expected = part1;
+        expected.extend_from_slice(&part2);
+        assert_eq!(
+            &assembled[..],
+            &expected[..],
+            "assembled object must be the exact concatenation of the two parts"
+        );
+        assert_eq!(
+            content_hash,
+            file_storage::infra::content::hash::sha256(&expected),
+            "complete_multipart's returned digest must match the assembled bytes"
+        );
+    }
+
+    /// Stage 5 regression test (P2 1.7.2): the sidecar must dispatch each
+    /// upload to the backend named by the verified token's `claims.backend_id`
+    /// — not always the same hardcoded backend, which was the bug this stage
+    /// fixes (`SidecarState` previously held a single `backend` field, ignored
+    /// by every handler's `claims.backend_id`). Uses two differently-tagged
+    /// in-memory backends so no S3 test double is needed.
+    #[tokio::test]
+    async fn sidecar_resolves_backend_by_claims_backend_id() {
+        let issuer = Issuer::generate(60).expect("issuer generation");
+        let backend_a = Arc::new(InMemoryBackend::new("local-fs"));
+        let backend_b = Arc::new(InMemoryBackend::new("other"));
+        let backends = BackendRegistry::new(
+            vec![
+                Arc::clone(&backend_a) as Arc<dyn StorageBackend>,
+                Arc::clone(&backend_b) as Arc<dyn StorageBackend>,
+            ],
+            "local-fs",
+        )
+        .expect("build two-backend registry");
+        let state = SidecarState {
+            verifier: Arc::new(issuer.verifier()),
+            backends,
+            control_base_url: String::new(),
+            http: reqwest::Client::new(),
+            metrics: Arc::new(NoopMetrics),
+        };
+
+        let file_id_a = Uuid::now_v7();
+        let version_id_a = Uuid::now_v7();
+        let path_a = format!("/{file_id_a}/{version_id_a}");
+        let token_a = upload_token(&issuer, file_id_a, version_id_a, "local-fs", &path_a);
+
+        let file_id_b = Uuid::now_v7();
+        let version_id_b = Uuid::now_v7();
+        let path_b = format!("/{file_id_b}/{version_id_b}");
+        let token_b = upload_token(&issuer, file_id_b, version_id_b, "other", &path_b);
+
+        let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+
+        let response_a = router
+            .clone()
+            .oneshot(
+                Request::put(format!(
+                    "/api/file-storage-data/v1/upload/{file_id_a}/{version_id_a}?fs-token={token_a}"
+                ))
+                .body(Body::from(b"bytes-for-local-fs".to_vec()))
+                .expect("valid request"),
+            )
+            .await
+            .expect("router call succeeds");
+        assert_eq!(response_a.status(), StatusCode::OK);
+
+        let response_b = router
+            .oneshot(
+                Request::put(format!(
+                    "/api/file-storage-data/v1/upload/{file_id_b}/{version_id_b}?fs-token={token_b}"
+                ))
+                .body(Body::from(b"bytes-for-other".to_vec()))
+                .expect("valid request"),
+            )
+            .await
+            .expect("router call succeeds");
+        assert_eq!(response_b.status(), StatusCode::OK);
+
+        // Assert the bytes landed in the backend the TOKEN named, not always
+        // the same one — via each backend's own `list_paths()`/`get()`.
+        let a_paths = backend_a.list_paths().await.expect("list local-fs paths");
+        assert!(
+            a_paths.contains(&path_a),
+            "expected {path_a} in local-fs backend, got {a_paths:?}"
+        );
+        assert!(
+            !a_paths.contains(&path_b),
+            "path_b must not land in local-fs backend, got {a_paths:?}"
+        );
+        let got_a = backend_a
+            .get(&path_a)
+            .await
+            .expect("get from local-fs backend");
+        assert_eq!(&got_a[..], b"bytes-for-local-fs");
+
+        let b_paths = backend_b.list_paths().await.expect("list other paths");
+        assert!(
+            b_paths.contains(&path_b),
+            "expected {path_b} in other backend, got {b_paths:?}"
+        );
+        assert!(
+            !b_paths.contains(&path_a),
+            "path_a must not land in other backend, got {b_paths:?}"
+        );
+        let got_b = backend_b
+            .get(&path_b)
+            .await
+            .expect("get from other backend");
+        assert_eq!(&got_b[..], b"bytes-for-other");
     }
 }

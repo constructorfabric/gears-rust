@@ -8,10 +8,16 @@
 //!
 //! P1 ships two backend *types* (`cpt-cf-file-storage-fr-backend-capabilities`
 //! target "≥2 backends"): a local filesystem backend and an in-memory backend.
-//! S3/GCS/etc. are deferred (they require an external SDK + security review).
+//! P2 adds an `S3Backend` (ADR-0005 `cpt-cf-file-storage-adr-s3-client-selection`)
+//! on top of those two. ADR-0005 remains `status: proposed` until a team
+//! security review runs (its new external HTTP-signing/XML-parsing
+//! dependencies are the trigger) — the code is safe to build and test on a
+//! branch regardless, but merging it to `main` is gated on that review.
+//! GCS/etc. remain deferred beyond that.
 
 mod in_memory;
 mod local_fs;
+mod s3;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -24,6 +30,7 @@ use crate::domain::error::DomainError;
 
 pub use in_memory::InMemoryBackend;
 pub use local_fs::LocalFsBackend;
+pub use s3::S3Backend;
 
 /// Optional features a backend may declare
 /// (`cpt-cf-file-storage-fr-backend-capabilities`). Versioning is **not** here —

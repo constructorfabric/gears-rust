@@ -23,7 +23,9 @@ use crate::domain::policy_service::PolicyService;
 use crate::domain::ports::{CleanupStore, FileStorageMetricsPort, MultipartStore, PolicyStore};
 use crate::domain::service::{FileService, ServiceConfig};
 use crate::infra::authz::PolicyEnforcerAuthorizer;
-use crate::infra::backend::{BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend};
+use crate::infra::backend::{
+    BackendRegistry, InMemoryBackend, LocalFsBackend, S3Backend, StorageBackend,
+};
 use crate::infra::metrics::FileStorageMetricsMeter;
 use crate::infra::signed_url::Issuer;
 use crate::infra::storage::Store;
@@ -253,10 +255,18 @@ impl Gear for FileStorageGear {
 }
 
 /// Builds the backend registry from config: `local-fs` is always present and
-/// is the default; the non-durable `memory` backend only joins when
-/// `cfg.enable_in_memory_backend` is set (dev/test opt-in — see
-/// `FileStorageConfig::enable_in_memory_backend`). Extracted as a free
-/// function so it is unit-testable without a live `GearCtx`.
+/// is the default (unless overridden — see below); the non-durable `memory`
+/// backend only joins when `cfg.enable_in_memory_backend` is set (dev/test
+/// opt-in — see `FileStorageConfig::enable_in_memory_backend`); zero or more
+/// `S3Backend`s join per `cfg.s3_backends` entry (P2 1.7.3 config wiring).
+/// Extracted as a free function so it is unit-testable without a live
+/// `GearCtx`.
+///
+/// `cfg.default_backend_id` (P2 1.7 Stage 6 e2e wiring), when set, overrides
+/// the registry's default backend — e.g. so a deployment/test harness can
+/// make a configured S3 backend the target of new `create`/
+/// `initiate_multipart` calls instead of `local-fs`. An id naming no
+/// configured backend fails fast via `BackendRegistry::new`'s own validation.
 fn build_backend_registry(
     cfg: &FileStorageConfig,
 ) -> Result<BackendRegistry, crate::domain::error::DomainError> {
@@ -266,7 +276,15 @@ fn build_backend_registry(
     if cfg.enable_in_memory_backend {
         backend_list.push(Arc::new(InMemoryBackend::new(MEMORY_ID)));
     }
-    BackendRegistry::new(backend_list, LOCAL_FS_ID)
+    for s3_cfg in &cfg.s3_backends {
+        // `S3Backend::from_config` performs no I/O — a bad endpoint URL or
+        // missing credentials (with no env fallback) surfaces here as a
+        // regular `Err`, failing gear init fast rather than panicking.
+        let s3_backend = S3Backend::from_config(s3_cfg)?;
+        backend_list.push(Arc::new(s3_backend));
+    }
+    let default_id = cfg.default_backend_id.as_deref().unwrap_or(LOCAL_FS_ID);
+    BackendRegistry::new(backend_list, default_id)
 }
 
 impl DatabaseCapability for FileStorageGear {
