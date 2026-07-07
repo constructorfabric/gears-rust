@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.refund_recorded.v1",
+  "title": "Billing Ledger Refund Recorded",
+  "description": "Emitted on every successful refund-phase post (never on replay). Internal identifiers + enum codes + amount + clearing state only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "refund_id": {
+      "type": "string"
+    },
+    "psp_refund_id": {
+      "type": "string"
+    },
+    "entry_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "initiated",
+        "confirmed",
+        "rejected",
+        "voided",
+        "unknown_final"
+      ]
+    },
+    "pattern": {
+      "type": "string",
+      "enum": [
+        "A_UNALLOCATED",
+        "B_RESTORE_AR"
+      ]
+    },
+    "payment_id": {
+      "type": "string"
+    },
+    "amount_minor": {
+      "type": "integer"
+    },
+    "currency": {
+      "type": "string"
+    },
+    "clearing_state": {
+      "type": "string",
+      "enum": [
+        "PENDING",
+        "SETTLED",
+        "REVERSED"
+      ]
+    }
+  },
+  "required": [
+    "tenant_id",
+    "refund_id",
+    "psp_refund_id",
+    "entry_id",
+    "phase",
+    "pattern",
+    "payment_id",
+    "amount_minor",
+    "currency",
+    "clearing_state"
+  ]
+}

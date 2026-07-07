@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.revenue_recognition_reversed.v1",
+  "title": "Billing Ledger Revenue Recognition Reversed",
+  "description": "Emitted on every recognition reversal post (DR REVENUE / CR CONTRACT_LIABILITY; never on replay). Internal identifiers + amount + stream + period only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "schedule_id": {
+      "type": "string"
+    },
+    "segment_no": {
+      "type": "integer"
+    },
+    "period_id": {
+      "type": "string"
+    },
+    "amount_minor": {
+      "type": "integer"
+    },
+    "revenue_stream": {
+      "type": "string"
+    },
+    "currency": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "tenant_id",
+    "schedule_id",
+    "segment_no",
+    "period_id",
+    "amount_minor",
+    "revenue_stream",
+    "currency"
+  ]
+}

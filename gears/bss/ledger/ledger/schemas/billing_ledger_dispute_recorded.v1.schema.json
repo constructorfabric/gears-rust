@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.dispute_recorded.v1",
+  "title": "Billing Ledger Dispute Recorded",
+  "description": "Emitted on every successful chargeback dispute-phase post (opened/won/lost; never on replay). Internal identifiers + enum codes only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "dispute_id": {
+      "type": "string"
+    },
+    "payment_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "cycle": {
+      "type": "integer"
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "OPENED",
+        "WON",
+        "LOST",
+        "PARTIAL"
+      ]
+    },
+    "variant": {
+      "type": "string",
+      "enum": [
+        "CASH_HOLD",
+        "AR_RECLASS"
+      ]
+    }
+  },
+  "required": [
+    "dispute_id",
+    "payment_id",
+    "tenant_id",
+    "cycle",
+    "phase",
+    "variant"
+  ]
+}

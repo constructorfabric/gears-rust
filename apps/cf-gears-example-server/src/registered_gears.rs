@@ -73,3 +73,6 @@ use static_idp_plugin as _;
 
 #[cfg(feature = "account-management")]
 use account_management as _;
+
+#[cfg(feature = "bss-ledger")]
+use bss_ledger as _;

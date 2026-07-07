@@ -102,6 +102,9 @@ members = [
     "gears/chat-engine/chat-engine-sdk",
     "gears/chat-engine/chat-engine",
     "gears/model-registry/model-registry-sdk",
+    "gears/bss/ledger/ledger",
+    "gears/bss/ledger/ledger-sdk",
+    "gears/bss/libs/coord",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
@@ -285,6 +288,12 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.9
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.0", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.3", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.1.0", path = "gears/system/usage-collector/usage-collector-sdk" }
+
+# BSS gears (ported from vhp-core)
+bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk" }
+coord = { path = "gears/bss/libs/coord" }
+# FIPS-validated SHA-256 for the ledger idempotency payload fingerprint.
+aws-lc-rs = "1.17"
 
 # credstore
 credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.1.26", path = "gears/credstore/credstore-sdk" }

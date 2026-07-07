@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.reconciliation_completed.v1",
+  "title": "Billing Ledger Reconciliation Completed",
+  "description": "Emitted on every completed reconciliation check (the ReconciliationFramework finalizes a reconciliation_run: AR_DERIVED, PAYMENTS_PSP, or INVOICE_COMPLETENESS), carrying the check type + variance result. Internal identifiers + check-type code + signed variance + tolerance flag + timestamp only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "period_id": {
+      "type": "string"
+    },
+    "check_type": {
+      "type": "string"
+    },
+    "variance_minor": {
+      "type": "integer"
+    },
+    "within_tolerance": {
+      "type": "boolean"
+    },
+    "at_utc": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "tenant_id",
+    "run_id",
+    "period_id",
+    "check_type",
+    "variance_minor",
+    "within_tolerance",
+    "at_utc"
+  ]
+}

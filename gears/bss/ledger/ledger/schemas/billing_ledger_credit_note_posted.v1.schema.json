@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.credit_note_posted.v1",
+  "title": "Billing Ledger Credit Note Posted",
+  "description": "Emitted on every successful credit-note post (never on replay). Internal identifiers + amount + recognized/deferred split parts only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "credit_note_id": {
+      "type": "string"
+    },
+    "origin_invoice_id": {
+      "type": "string"
+    },
+    "entry_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "currency": {
+      "type": "string"
+    },
+    "amount_minor": {
+      "type": "integer"
+    },
+    "recognized_part_minor": {
+      "type": "integer"
+    },
+    "deferred_part_minor": {
+      "type": "integer"
+    },
+    "posted_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "tenant_id",
+    "credit_note_id",
+    "origin_invoice_id",
+    "entry_id",
+    "currency",
+    "amount_minor",
+    "recognized_part_minor",
+    "deferred_part_minor",
+    "posted_at_utc"
+  ]
+}

@@ -11,6 +11,14 @@ reason = "Ignore 'gears/bss' parent directory — not a module, only a grouping 
 patterns = ["gears/bss"]
 
 [[ignore]]
+reason = "Ignore 'gears/bss/libs' — not a module, only a grouping for shared BSS utility libraries."
+patterns = ["gears/bss/libs"]
+
+[[ignore]]
+reason = "Ignore 'coord' shared utility library (distributed-lease primitive; infrastructure crate, not an SDLC-documented product module — no PRD/DESIGN required, README-documented)."
+patterns = ["gears/bss/libs/coord/*"]
+
+[[ignore]]
 reason = "Ignore authn-resolver root module node while allowing nested plugin docs scopes."
 patterns = ["gears/system/authn-resolver"]
 
