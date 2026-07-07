@@ -1,0 +1,55 @@
+[package]
+name = "coord"
+edition.workspace = true
+license.workspace = true
+description = "Shared BSS coordination primitives — a DB-backed distributed lease (single-active job/run guard), ported from the account-management lease pattern. Works entirely within the existing SecureORM API (unscoped `coord_leases` table via `AccessScope::allow_all()`); no toolkit changes."
+
+[lints]
+workspace = true
+
+[dependencies]
+# SecureORM + entity over both backends (PG prod, SQLite tests). Backend +
+# runtime features unify in through `toolkit-db`, mirroring the ledger gear.
+sea-orm = { workspace = true, features = [
+  "sqlx-postgres",
+  "sqlx-sqlite",
+  "with-chrono",
+  "with-uuid",
+] }
+# The `coord_leases` table migration (consuming gears add it to their Migrator).
+sea-orm-migration = { workspace = true }
+# `Db`, `DbError`, `secure::{DbTx, ScopeError, SecureEntityExt, SecureUpdateExt,
+# TxConfig, secure_insert, is_unique_violation}` + `transaction_with_retry`.
+toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
+# `#[derive(Scopable)]` on the `coord_leases` entity.
+toolkit-db-macros = { workspace = true }
+# `AccessScope::allow_all()` — the unscoped clamp for the coordination table.
+toolkit-security = { workspace = true }
+uuid = { workspace = true }
+# Entity `locked_until: DateTime<Utc>` + worker-clock `Utc::now()` on the
+# acquire INSERT (`clock` feature); all comparisons are DB-clock SQL exprs.
+chrono = { workspace = true, features = ["clock"] }
+thiserror = { workspace = true }
+# `spawn_renewal` heartbeat (`tokio::time::interval`, `tokio::spawn`,
+# `tokio::sync::watch`); `macros`/`rt` for the crate's `#[tokio::test]`s.
+tokio = { workspace = true, features = ["time", "macros", "rt", "sync"] }
+# `CancellationToken` for the renewal-task lifecycle (the dep AM uses).
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+# `#[async_trait]` on the `MigrationTrait` impl.
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# Integration tests drive the real `LeaseManager`/`LeaseGuard`. The SQLite
+# in-crate tests run on an in-memory `Db`; the Postgres fence test
+# (`tests/postgres_fence.rs`) needs a real backend (SSI/snapshot semantics
+# SQLite cannot model) via testcontainers, plus the multi-thread runtime to
+# drive the held ack tx and the peer steal concurrently.
+tokio = { workspace = true, features = [
+  "time",
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+] }
+testcontainers-modules = { workspace = true }

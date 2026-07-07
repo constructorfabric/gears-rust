@@ -265,6 +265,10 @@ gears:
           identity:
             subject_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
             subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            # A real AuthN resolver always sets a subject_type; some gears
+            # (e.g. bss-ledger) require its presence. Additive — gears that do
+            # not check it are unaffected.
+            subject_type: "gts.cf.core.security.subject_user.v1~"
             token_scopes: ["*"]
         # Hierarchy tenant tokens — used by budget allocation e2e tests
         - token: "e2e-token-hierarchy-root"
@@ -363,6 +367,15 @@ gears:
         # see the plugin — the operator then knows to investigate
         # rather than silently shipping a half-wired stack.
         required: true
+
+  bss-ledger:
+    # Gear-specific database (SQLite for E2E, like the other user gears; the
+    # gear ships dual PG/SQLite migrations). No config block needed — the
+    # defaults (events_enabled=false, seller_tenant_types=partner+platform)
+    # are correct for E2E.
+    database:
+      server: "sqlite_users"
+      file: "bss_ledger.db"
 
   simple-user-settings:
     # Gear-specific database configuration

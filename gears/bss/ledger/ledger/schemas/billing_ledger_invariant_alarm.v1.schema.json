@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.invariant_alarm.v1",
+  "title": "Billing Ledger Invariant Alarm",
+  "description": "Emitted out-of-band when a posting attempt trips a ledger invariant. Internal diagnostics only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "category": {
+      "type": "string",
+      "enum": [
+        "IDEMPOTENCY_PAYLOAD_CONFLICT",
+        "NEGATIVE_BALANCE_VIOLATION",
+        "TIE_OUT_VARIANCE",
+        "ENTRY_IMBALANCE",
+        "TAMPER_VERIFY_FAILED",
+        "CHARGEBACK_CASH_NEGATIVE",
+        "AGED_ALLOCATION_QUEUE",
+        "DISPUTE_PHASE_QUEUED",
+        "AGED_UNALLOCATED",
+        "RECOGNITION_DOUBLE_CREDIT",
+        "OVER_RECOGNITION",
+        "RECOGNITION_PERIOD_QUEUED",
+        "CREDIT_NOTE_SPLIT_BLOCKED",
+        "CLAWBACK_UNDERFLOW",
+        "REFUND_QUARANTINED",
+        "REFUND_CLEARING_AGED",
+        "STAGE1_REFUND_ORPHAN",
+        "STUCK_REFUND_CLEARING",
+        "ATTEMPTED_WRITE_OFF",
+        "NEGATIVE_TAX_SUBBALANCE",
+        "FX_SNAPSHOT_MISSING",
+        "FX_SNAPSHOT_STALE_ALLOWED",
+        "FX_SNAPSHOT_STALE_BLOCKED",
+        "RECONCILIATION_VARIANCE",
+        "MISSED_POSTING"
+      ]
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "WARN",
+        "CRITICAL"
+      ]
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "scope": {
+      "type": "string"
+    },
+    "code": {
+      "type": "string"
+    },
+    "detail": {
+      "type": "string"
+    },
+    "affected": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/affected_item"
+      }
+    }
+  },
+  "$defs": {
+    "affected_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "currency": {
+          "type": "string"
+        },
+        "expected_minor": {
+          "type": "integer"
+        },
+        "actual_minor": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "currency",
+        "expected_minor",
+        "actual_minor"
+      ]
+    }
+  },
+  "required": [
+    "category",
+    "severity",
+    "tenant_id",
+    "scope",
+    "code",
+    "detail",
+    "affected"
+  ]
+}

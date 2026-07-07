@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.period_closed.v1",
+  "title": "Billing Ledger Period Closed",
+  "description": "Emitted on every successful fiscal-period close (the two-phase gate passes and the close flips fiscal_period OPEN->CLOSED + period_close->CLOSED in one commit; never on an idempotent re-close). Internal identifiers + period code + actor + timestamp only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "legal_entity_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "period_id": {
+      "type": "string"
+    },
+    "closed_by": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "closed_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "tenant_id",
+    "legal_entity_id",
+    "period_id",
+    "closed_by",
+    "closed_at_utc"
+  ]
+}

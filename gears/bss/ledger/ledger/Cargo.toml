@@ -1,0 +1,121 @@
+[package]
+name = "bss-ledger"
+edition.workspace = true
+license.workspace = true
+description = "BSS Billing Ledger gear: double-entry posting foundation, Postgres persistence in the bss schema"
+
+[lints]
+workspace = true
+
+[features]
+# Exposes the in-memory metrics harness (`infra::metrics::test_harness`) for
+# asserting emitted OTel instruments. Gated so `opentelemetry_sdk` never ships
+# in the release artifact; auto-enabled for `cargo test` via the
+# self-referencing dev-dependency below (RBAC's pattern).
+test-support = ["dep:opentelemetry_sdk"]
+
+[dependencies]
+bss-ledger-sdk = { workspace = true }
+# Shared BSS coordination primitive: the single-active recognition-run lease
+# (`coord_leases` table + `LeaseManager`/`LeaseGuard`); its migration is added to
+# this gear's `Migrator` below.
+coord = { workspace = true }
+
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+# `FutureExt::catch_unwind`: flip a recognition-run row FAILED on a panic (not only
+# on `Err`), so a panicked pass leaves no stuck `RUNNING` row a retry would replay.
+futures = { workspace = true }
+sea-orm = { workspace = true, features = ["sqlx-postgres", "sqlx-sqlite"] }
+sea-orm-migration = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# FIPS-validated SHA-256 for the idempotency payload fingerprint (same
+# provider the platform installs at bootstrap); no non-FIPS hasher.
+aws-lc-rs = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# OTel metrics seam (`infra::metrics`): literal Prometheus names, no-op until an
+# exporter is wired by the host. `metrics` feature only (the pin is
+# `default-features = false`).
+opentelemetry = { workspace = true, features = ["metrics"] }
+# SDK is only needed for the in-memory test harness — gated behind
+# `test-support` via `dep:opentelemetry_sdk` so it never ships in production.
+opentelemetry_sdk = { workspace = true, features = [
+  "metrics",
+  "testing",
+], optional = true }
+
+# `db` enables the `DatabaseCapability` trait (gated behind `toolkit/db`).
+# Set explicitly because this gear's minimal dep set doesn't pull toolkit's
+# default features transitively the way larger gears (rbac) do.
+# `db` enables the `DatabaseCapability` trait; the REST API layer is not
+# feature-gated, so no toolkit feature bump is needed for `rest`.
+toolkit = { workspace = true, features = ["db"] }
+toolkit-db = { workspace = true, features = ["pg", "sqlite", "preview-outbox"] }
+toolkit-db-macros = { workspace = true }
+# Canonical OData list surface: the `FilterField` / `FieldKind` traits, the
+# `OData` query, `Page<T>` (with-utoipa for the `OpenAPI` response schema), and
+# `paginate_odata` (re-exported from `toolkit-db`). Mirrors RBAC's list repos.
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+# TODO(broker): `event-broker-sdk` (transactional-outbox `AsyncProducer` + the
+# `TypedEvent` trait) is not yet in gears-rust; the events surface is parked
+# (see `infra::events::publisher`). Re-add it here when the broker lands.
+# `TypesRegistryClient` + `RegisterResult` to register the event-type GTS
+# schemas at `init()` (the crate RBAC uses for the same purpose). Depend on the
+# SDK contract crate — not the gear implementation — to preserve gear isolation.
+types-registry-sdk = { workspace = true }
+# `tokio::time::interval` drives the `serve` tick-loop; `macros`/`rt` for the
+# loop's `tokio::select!` / `tokio::spawn`.
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
+# `CancellationToken` for the `RunnableCapability` `serve` lifecycle (the dep AM uses).
+tokio-util = { workspace = true }
+# `#[domain_model]` marker on the domain types (enforced by dylint DE0309).
+toolkit-macros = { workspace = true }
+# `SecurityContext` in the in-process `LedgerClientV1` impl.
+toolkit-security = { workspace = true }
+# PEP (`PolicyEnforcer`, `ResourceType`, `AccessRequest`) for the authz gate.
+authz-resolver-sdk = { workspace = true }
+# AM client (`get_tenant` -> tenant_type) for the provisioning seller-type guard
+# (only a tenant whose type owns a billing ledger may be provisioned, §4.12).
+account-management-sdk = { workspace = true }
+# `AuthzPermissionV1` + `gts_instance!` for the permission catalog.
+toolkit-gts = { workspace = true }
+# `gts_instance!`'s expansion references the `gts` crate directly (same as rbac).
+gts = { workspace = true }
+# Required as a direct dep by the `#[resource_error(...)]` macro expansion
+# (see `src/api/rest/error.rs`).
+toolkit-canonical-errors = { workspace = true }
+
+# REST surface (the gear's first): axum router/extractors + utoipa schemas.
+axum = { workspace = true }
+utoipa = { workspace = true }
+# Holds the per-process REST `ApiState` populated in `init()`.
+arc-swap = { workspace = true }
+
+[dev-dependencies]
+# Re-imports the crate under test with `test-support` enabled so the in-file
+# metrics-harness tests (and any integration test) can use
+# `infra::metrics::test_harness`. Cargo unifies the lib-under-test edge with
+# this dev-dep edge into a single `test-support = on` compilation (RBAC idiom).
+bss-ledger = { path = ".", features = ["test-support"] }
+
+toolkit = { workspace = true, features = ["db"] }
+toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
+# Integration tests build canonical `Page` / `ODataQuery` envelopes for the
+# list-endpoint stubs (the lib re-exports these but integration tests need the
+# crate as a direct dev-dep).
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+tokio = { workspace = true }
+# Postgres testcontainers harness; tests reach `testcontainers` items through
+# the `testcontainers_modules::testcontainers` re-export, so the bare
+# `testcontainers` crate is not a direct dep. Raw SQL in tests goes through
+# sea-orm `Statement`, not `sqlx` directly.
+testcontainers-modules = { workspace = true }
+# `tower::ServiceExt` provides `.oneshot(...)` for the REST router tests.
+tower = { workspace = true }
+# TODO(broker): `jsonschema` validated event payloads against their vendored
+# JSON-Schemas in the (now parked) event-schema tests; re-add with the broker.
