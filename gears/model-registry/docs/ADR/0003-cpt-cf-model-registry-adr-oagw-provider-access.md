@@ -5,6 +5,24 @@ date: 2026-02-18
 
 # Route All Provider API Calls Through Outbound API Gateway
 
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [All Calls Through OAGW](#all-calls-through-oagw)
+  - [Direct Calls with Credentials in Model Registry](#direct-calls-with-credentials-in-model-registry)
+  - [Sidecar Proxy per Provider Type](#sidecar-proxy-per-provider-type)
+- [More Information](#more-information)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
 **ID**: `cpt-cf-model-registry-adr-oagw-provider-access`
 
 ## Context and Problem Statement

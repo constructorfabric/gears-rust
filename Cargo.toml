@@ -101,6 +101,7 @@ members = [
     "gears/mini-chat/mini-chat",
     "gears/chat-engine/chat-engine-sdk",
     "gears/chat-engine/chat-engine",
+    "gears/model-registry/model-registry-sdk",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
