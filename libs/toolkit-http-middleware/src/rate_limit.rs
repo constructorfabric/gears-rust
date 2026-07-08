@@ -1,31 +1,66 @@
-use crate::config::ApiGatewayConfig;
+//! Per-route rate limiting and in-flight limiting middleware.
+//!
+//! The [`RateLimiterMap`] (`(method, path)` → token bucket + in-flight
+//! semaphore) is built by the consuming gear from its operation specs and
+//! configuration; this crate owns the runtime type and the request-time
+//! middleware. The rate-limit rejection is rendered under a caller-supplied GTS
+//! `scope`.
+
+use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::sync::Arc;
+
 use anyhow::{Context, Result, anyhow};
 use axum::http::{HeaderValue, Method, header};
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use governor::clock::Clock;
 use governor::middleware::StateInformationMiddleware;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
-use std::collections::HashMap;
-use std::num::NonZeroU32;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use toolkit_canonical_errors::CanonicalError;
 
-use crate::middleware::common;
-use crate::middleware::errors::ApiGatewayGatewayError;
+use crate::common;
+
+/// Deserializable rate-limit parameters (requests/sec, burst capacity, and
+/// max concurrent in-flight requests). Consumers typically use this as the
+/// per-gear fallback applied to routes that declare no explicit limit.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RateLimitConfig {
+    /// Sustained requests per second.
+    pub rps: u32,
+    /// Maximum burst capacity.
+    pub burst: u32,
+    /// Maximum concurrent in-flight requests.
+    pub in_flight: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            rps: 50,
+            burst: 100,
+            in_flight: 64,
+        }
+    }
+}
 
 type RateLimitKey = (Method, String);
 type BucketMap = Arc<HashMap<RateLimitKey, Arc<BucketMapEntry>>>;
 type InflightMap = Arc<HashMap<RateLimitKey, Arc<Semaphore>>>;
 
+/// Per-route rate-limit + in-flight lookup, plus the GTS `scope` under which
+/// rejections are rendered.
 #[derive(Default, Clone)]
 pub struct RateLimiterMap {
     buckets: BucketMap,
     inflight: InflightMap,
+    scope: &'static str,
 }
 
 struct BucketMapEntry {
@@ -35,7 +70,7 @@ struct BucketMapEntry {
 }
 
 impl BucketMapEntry {
-    pub fn new(rps: u32, burst: u32) -> Result<Self> {
+    fn new(rps: u32, burst: u32) -> Result<Self> {
         let bucket = RateLimiter::direct(
             Quota::per_second(NonZeroU32::new(rps).with_context(|| anyhow!("rps is zero"))?)
                 .allow_burst(NonZeroU32::new(burst).with_context(|| anyhow!("burst is zero"))?),
@@ -52,44 +87,44 @@ impl BucketMapEntry {
 }
 
 impl RateLimiterMap {
+    /// Build from `(key, `[`RateLimitConfig`]`)` pairs, rendering rejections under
+    /// `scope`.
+    ///
     /// # Errors
-    /// Returns an error if any rate limit spec is 0.
-    pub fn from_specs(
-        specs: &Vec<toolkit::api::OperationSpec>,
-        cfg: &ApiGatewayConfig,
+    /// Returns an error if any `rps` or `burst` is 0.
+    pub fn from_pairs(
+        scope: &'static str,
+        pairs: impl IntoIterator<Item = (RateLimitKey, RateLimitConfig)>,
     ) -> Result<Self> {
         let mut buckets = HashMap::new();
         let mut inflight = HashMap::new();
-        // TODO: Add support for per-route rate limiting
-        for spec in specs {
-            let (rps, burst, max_in_flight) = spec.rate_limit.as_ref().map_or(
-                (
-                    cfg.defaults.rate_limit.rps,
-                    cfg.defaults.rate_limit.burst,
-                    cfg.defaults.rate_limit.in_flight,
-                ),
-                |r| (r.rps, r.burst, r.in_flight),
-            );
-
-            let key = (spec.method.clone(), spec.path.clone());
+        for (key, cfg) in pairs {
             buckets.insert(
                 key.clone(),
                 Arc::new(
-                    BucketMapEntry::new(rps, burst)
-                        .with_context(|| anyhow!("RateLimit spec invalid {spec:?} invalid"))?,
+                    BucketMapEntry::new(cfg.rps, cfg.burst)
+                        .with_context(|| anyhow!("RateLimit entry invalid for {key:?}"))?,
                 ),
             );
-            inflight.insert(key, Arc::new(Semaphore::new(max_in_flight as usize)));
+            inflight.insert(key, Arc::new(Semaphore::new(cfg.in_flight as usize)));
         }
         Ok(Self {
             buckets: Arc::new(buckets),
             inflight: Arc::new(inflight),
+            scope,
         })
     }
 }
 
 // TODO: Use tower-governor instead of own implementation (upd: https://github.com/benwis/tower-governor/issues/59 )
-pub async fn rate_limit_middleware(map: RateLimiterMap, mut req: Request, next: Next) -> Response {
+/// Rate-limit + in-flight middleware. Emits a canonical `resource_exhausted`
+/// Problem under `scope` when the token bucket is exhausted, and a scope-free
+/// `service_unavailable` when the in-flight limit is reached.
+pub async fn rate_limit_middleware(
+    State(map): State<RateLimiterMap>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let method = req.method().clone();
     // Use MatchedPath extension (set by Axum router) for accurate route matching
     let path = req
@@ -123,7 +158,7 @@ pub async fn rate_limit_middleware(map: RateLimiterMap, mut req: Request, next: 
                 log_rate_limit_exceeded(&key, wait_secs);
                 let policy = bucker_map_entry.policy.clone();
                 let burst = bucker_map_entry.burst.clone();
-                let err = ApiGatewayGatewayError::resource_exhausted("rate limit exceeded")
+                let err = CanonicalError::scoped_resource_exhausted(map.scope)
                     .with_quota_violation("rate_limit", format!("retry_after_seconds={wait_secs}"))
                     .create();
                 let mut response = err.into_response();

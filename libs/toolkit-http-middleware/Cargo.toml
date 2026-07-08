@@ -33,6 +33,32 @@ secrecy = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# request_id middleware: X-Request-Id generation/propagation.
+tower-http = { workspace = true, features = ["request-id"] }
+nanoid = { workspace = true }
+# access_log middleware: byte-counting response body wrapper.
+bytes = { workspace = true }
+http-body = { workspace = true }
+
+# mime/license validation + rate limiting: per-route lookup maps.
+dashmap = { workspace = true }
+# rate_limit middleware: token-bucket + in-flight limiting.
+governor = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+anyhow = { workspace = true }
+# scope_enforcement middleware: glob route matching.
+glob = { workspace = true }
+# MatchitRouteAuthPolicy: per-method route matching for the RouteAuthPolicy impl.
+matchit = { workspace = true }
+# Deserializable config schemas for the config-driven middleware
+# (rate_limit defaults, scope_enforcement rules).
+serde = { workspace = true, features = ["derive"] }
+
+# http_metrics middleware: OpenTelemetry instruments. HTTP server metrics are a
+# baseline capability for every gear serving HTTP, so this is unconditional.
+# When no meter provider is installed the global meter is a no-op (near-zero cost).
+opentelemetry = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }

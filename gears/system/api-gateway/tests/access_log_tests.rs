@@ -22,7 +22,7 @@ use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 use tracing_subscriber::layer::SubscriberExt;
 use uuid::Uuid;
 
-use api_gateway::middleware::request_id::{MakeReqId, header};
+use toolkit_http_middleware::request_id::{MakeReqId, header};
 
 /// Captured access log event fields.
 #[derive(Debug, Default, Clone)]
@@ -80,10 +80,10 @@ fn test_app() -> Router {
         .route("/test", get(handler_ok))
         .route("/error", get(handler_err))
         .layer(from_fn(
-            api_gateway::middleware::access_log::access_log_middleware,
+            toolkit_http_middleware::access_log::access_log_middleware,
         ))
         .layer(from_fn(
-            api_gateway::middleware::request_id::push_req_id_to_extensions,
+            toolkit_http_middleware::request_id::push_req_id_to_extensions,
         ))
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
         .layer(SetRequestIdLayer::new(x_request_id, MakeReqId))

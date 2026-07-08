@@ -13,8 +13,8 @@ use crate::domain::ports::metric_labels::{METHOD_OTHER, key};
 /// Map an HTTP method to a low-cardinality `http.request.method` label value.
 ///
 /// Standard verbs from RFC 9110 are returned verbatim; anything else collapses
-/// to [`METHOD_OTHER`] (`"_OTHER"`), mirroring `api-gateway`'s normalizer
-/// (`gears/system/api-gateway/src/middleware/http_metrics.rs::normalize_method`)
+/// to [`METHOD_OTHER`] (`"_OTHER"`), mirroring the shared normalizer
+/// (`libs/toolkit-http-middleware/src/http_metrics.rs::normalize_method`)
 /// so both gears emit the same `http.request.method` vocabulary.
 ///
 /// Lives in the infra layer because the domain layer must not depend on

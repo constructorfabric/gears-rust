@@ -1,39 +1,50 @@
-use axum::extract::Request;
+//! License (feature-entitlement) validation middleware.
+//!
+//! The [`LicenseRequirementMap`] (`(method, path)` → required feature names) is
+//! built by the consuming gear from its operation specs; this crate owns the
+//! runtime type and the request-time middleware. Rejections are rendered under a
+//! caller-supplied GTS `scope`.
+
+use std::sync::Arc;
+
+use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use http::Method;
-use std::sync::Arc;
-use toolkit::api::OperationSpec;
+use toolkit_canonical_errors::CanonicalError;
 
-use crate::middleware::common;
-use crate::middleware::errors::ApiGatewayRouteError;
+use crate::common;
 
-const BASE_FEATURE: &str = "gts.cf.core.lic.feat.v1~cf.core.global.base.v1";
+/// The always-available base feature; a route requiring only this needs no
+/// additional entitlement.
+pub const BASE_FEATURE: &str = "gts.cf.core.lic.feat.v1~cf.core.global.base.v1";
 
 type LicenseKey = (Method, String);
 
-#[derive(Clone)]
+/// Per-route required-feature lookup, plus the GTS `scope` under which
+/// rejections are rendered.
+#[derive(Clone, Default)]
 pub struct LicenseRequirementMap {
     requirements: Arc<DashMap<LicenseKey, Vec<String>>>,
+    scope: &'static str,
 }
 
 impl LicenseRequirementMap {
+    /// Build the map from `(method, path)` → required feature-name pairs, rendering
+    /// rejections under `scope`.
     #[must_use]
-    pub fn from_specs(specs: &[OperationSpec]) -> Self {
+    pub fn from_pairs(
+        scope: &'static str,
+        pairs: impl IntoIterator<Item = (LicenseKey, Vec<String>)>,
+    ) -> Self {
         let requirements = DashMap::new();
-
-        for spec in specs {
-            if let Some(req) = spec.license_requirement.as_ref() {
-                requirements.insert(
-                    (spec.method.clone(), spec.path.clone()),
-                    req.license_names.clone(),
-                );
-            }
+        for (key, features) in pairs {
+            requirements.insert(key, features);
         }
-
         Self {
             requirements: Arc::new(requirements),
+            scope,
         }
     }
 
@@ -44,8 +55,11 @@ impl LicenseRequirementMap {
     }
 }
 
+/// License validation middleware. Rejects with a canonical `permission_denied`
+/// Problem (`reason` = `LICENSE_FEATURE_REQUIRED`) under `scope` when the route
+/// requires a non-base feature.
 pub async fn license_validation_middleware(
-    map: LicenseRequirementMap,
+    State(map): State<LicenseRequirementMap>,
     req: Request,
     next: Next,
 ) -> Response {
@@ -68,7 +82,7 @@ pub async fn license_validation_middleware(
         // `instance` / `trace_id` are filled by the canonical error
         // middleware (`toolkit::api::canonical_error_middleware`) on the way
         // out — this middleware sits inside its layer.
-        return ApiGatewayRouteError::permission_denied()
+        return CanonicalError::scoped_permission_denied(map.scope)
             .with_reason("LICENSE_FEATURE_REQUIRED")
             .create()
             .into_response();

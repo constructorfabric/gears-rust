@@ -27,7 +27,7 @@ use tower_http::{
 };
 use tracing::debug;
 
-use crate::middleware::errors::ApiGatewayGatewayError;
+use crate::errors::ApiGatewayGatewayError;
 
 /// Map a `tower::timeout` `Elapsed` (or any other unexpected `BoxError`)
 /// into a canonical `application/problem+json` response.
@@ -49,8 +49,8 @@ async fn timeout_to_canonical(err: BoxError) -> axum::response::Response {
 
 use authn_resolver_sdk::AuthNResolverClient;
 
+use crate::authn_adapter::AuthNResolverBearerAdapter;
 use crate::config::ApiGatewayConfig;
-use crate::middleware::auth;
 use toolkit_security::SecurityContext;
 use toolkit_security::constants::{DEFAULT_SUBJECT_ID, DEFAULT_TENANT_ID};
 
@@ -152,49 +152,6 @@ impl ApiGateway {
         Ok(())
     }
 
-    /// Build route policy from operation specs.
-    fn build_route_policy_from_specs(&self) -> Result<auth::GatewayRoutePolicy> {
-        let mut authenticated_routes = std::collections::HashSet::new();
-        let mut public_routes = std::collections::HashSet::new();
-
-        // Always mark built-in health check routes as public
-        public_routes.insert((Method::GET, "/health".to_owned()));
-        public_routes.insert((Method::GET, "/healthz".to_owned()));
-
-        public_routes.insert((Method::GET, "/docs".to_owned()));
-        public_routes.insert((Method::GET, "/openapi.json".to_owned()));
-
-        for spec in &self.openapi_registry.operation_specs {
-            let spec = spec.value();
-
-            let route_key = (spec.method.clone(), spec.path.clone());
-
-            if spec.authenticated {
-                authenticated_routes.insert(route_key.clone());
-            }
-
-            if spec.is_public {
-                public_routes.insert(route_key);
-            }
-        }
-
-        let config = self.get_cached_config();
-        let requirements_count = authenticated_routes.len();
-        let public_routes_count = public_routes.len();
-
-        let route_policy = auth::build_route_policy(&config, authenticated_routes, public_routes)?;
-
-        tracing::info!(
-            auth_disabled = config.auth_disabled,
-            require_auth_by_default = config.require_auth_by_default,
-            requirements_count = requirements_count,
-            public_routes_count = public_routes_count,
-            "Route policy built from operation specs"
-        );
-
-        Ok(route_policy)
-    }
-
     fn normalize_prefix_path(raw: &str) -> Result<String> {
         let trimmed = raw.trim();
         // Collapse consecutive slashes then strip trailing slash(es).
@@ -240,8 +197,18 @@ impl ApiGateway {
         mut router: Router,
         authn_client: Option<Arc<dyn AuthNResolverClient>>,
     ) -> Result<Router> {
+        let config = self.get_cached_config();
+
+        // Collect specs once; used for the route policy + MIME/rate/license maps.
+        let specs: Vec<_> = self
+            .openapi_registry
+            .operation_specs
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+
         // Build route policy once
-        let route_policy = self.build_route_policy_from_specs()?;
+        let route_policy = middleware::build_route_policy_from_specs(&specs, &config)?;
 
         // IMPORTANT: `axum::Router::layer(...)` behaves like Tower layers: the **last** added layer
         // becomes the **outermost** layer and therefore runs **first** on the request path.
@@ -256,26 +223,16 @@ impl ApiGateway {
         // 14) Propagate MatchedPath to response extensions (route_layer — innermost).
         // This copies MatchedPath from the request (populated by Axum route matching)
         // into the response so outer layer() middleware (metrics) can read it.
-        router = router.route_layer(from_fn(middleware::http_metrics::propagate_matched_path));
-
-        let config = self.get_cached_config();
-
-        // Collect specs once; used by MIME validation + rate limiting maps.
-        let specs: Vec<_> = self
-            .openapi_registry
-            .operation_specs
-            .iter()
-            .map(|e| e.value().clone())
-            .collect();
+        router = router.route_layer(from_fn(
+            toolkit_http_middleware::http_metrics::propagate_matched_path,
+        ));
 
         // 12) License validation
-        let license_map = middleware::license_validation::LicenseRequirementMap::from_specs(&specs);
+        let license_map = middleware::build_license_requirement_map(&specs);
 
-        router = router.layer(from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let map = license_map.clone();
-                middleware::license_validation::license_validation_middleware(map, req, next)
-            },
+        router = router.layer(from_fn_with_state(
+            license_map,
+            toolkit_http_middleware::license_validation::license_validation_middleware,
         ));
 
         // 11) Route Policy Enforcement (runs after auth, checks token_scopes against route requirements)
@@ -288,14 +245,10 @@ impl ApiGateway {
                 ));
             }
 
-            let scope_rules = middleware::scope_enforcement::ScopeEnforcementRules::from_config(
-                &config.route_policies,
-            )?;
-            let scope_state =
-                middleware::scope_enforcement::ScopeEnforcementState { rules: scope_rules };
+            let scope_rules = middleware::build_scope_enforcement_rules(&config.route_policies)?;
             router = router.layer(from_fn_with_state(
-                scope_state,
-                middleware::scope_enforcement::scope_enforcement_middleware,
+                scope_rules,
+                toolkit_http_middleware::scope_enforcement::scope_enforcement_middleware,
             ));
         }
 
@@ -322,11 +275,17 @@ impl ApiGateway {
                 },
             ));
         } else if let Some(client) = authn_client {
-            let auth_state = auth::AuthState {
-                authn_client: client,
-                route_policy,
-            };
-            router = router.layer(from_fn_with_state(auth_state, auth::authn_middleware));
+            let adapter = Arc::new(AuthNResolverBearerAdapter::new(client));
+            let policy: Arc<dyn toolkit_http_middleware::RouteAuthPolicy> = Arc::new(route_policy);
+            // The gateway is the edge: it installs a CORS layer, so preflight
+            // requests must bypass auth (see edge-architecture ADR).
+            let auth_state =
+                toolkit_http_middleware::SecurityContextLayerState::new(adapter, policy)
+                    .with_cors_preflight_bypass();
+            router = router.layer(from_fn_with_state(
+                auth_state,
+                toolkit_http_middleware::security_context_middleware::<AuthNResolverBearerAdapter>,
+            ));
         } else {
             return Err(anyhow::anyhow!(
                 "auth is enabled but no AuthN Resolver client is available; \
@@ -338,22 +297,18 @@ impl ApiGateway {
         router = router.layer(from_fn(toolkit::api::error_layer::error_mapping_middleware));
 
         // 10) Per-route rate limiting & in-flight limits
-        let rate_map = middleware::rate_limit::RateLimiterMap::from_specs(&specs, &config)?;
+        let rate_map = middleware::build_rate_limiter_map(&specs, &config)?;
 
-        router = router.layer(from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let map = rate_map.clone();
-                middleware::rate_limit::rate_limit_middleware(map, req, next)
-            },
+        router = router.layer(from_fn_with_state(
+            rate_map,
+            toolkit_http_middleware::rate_limit::rate_limit_middleware,
         ));
 
         // 9) MIME type validation
-        let mime_map = middleware::mime_validation::build_mime_validation_map(&specs);
-        router = router.layer(from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let map = mime_map.clone();
-                middleware::mime_validation::mime_validation_middleware(map, req, next)
-            },
+        let mime_map = middleware::build_mime_validation_map(&specs);
+        router = router.layer(from_fn_with_state(
+            mime_map,
+            toolkit_http_middleware::mime_validation::mime_validation_middleware,
         ));
 
         // 8) CORS (must be outer to auth/limits so OPTIONS preflight short-circuits)
@@ -386,20 +341,24 @@ impl ApiGateway {
         router = router.layer(from_fn(toolkit::api::canonical_error_middleware));
 
         // 4) HTTP metrics (layer — captures all middleware responses including auth/rate-limit/timeout)
-        let http_metrics = Arc::new(middleware::http_metrics::HttpMetrics::new(
+        let http_metrics = Arc::new(toolkit_http_middleware::http_metrics::HttpMetrics::new(
             Self::MODULE_NAME,
             &config.metrics.prefix,
         ));
         router = router.layer(from_fn_with_state(
             http_metrics,
-            middleware::http_metrics::http_metrics_middleware,
+            toolkit_http_middleware::http_metrics::http_metrics_middleware,
         ));
 
         // 3.5) Structured access log (runs after push_req_id populates XRequestId extension)
-        router = router.layer(from_fn(middleware::access_log::access_log_middleware));
+        router = router.layer(from_fn(
+            toolkit_http_middleware::access_log::access_log_middleware,
+        ));
 
         // 3) Record request_id into span + extensions (requires span to exist first => must be inner to Trace)
-        router = router.layer(from_fn(middleware::request_id::push_req_id_to_extensions));
+        router = router.layer(from_fn(
+            toolkit_http_middleware::request_id::push_req_id_to_extensions,
+        ));
 
         // 2) Trace (outer to push_req_id_to_extensions)
         router = router.layer({
@@ -409,7 +368,7 @@ impl ApiGateway {
 
             TraceLayer::new_for_http()
                 .make_span_with(move |req: &axum::http::Request<axum::body::Body>| {
-                    let hdr = middleware::request_id::header();
+                    let hdr = toolkit_http_middleware::request_id::header();
                     let rid = req
                         .headers()
                         .get(&hdr)
@@ -459,12 +418,12 @@ impl ApiGateway {
         });
 
         // 1) Request ID handling (outermost)
-        let x_request_id = crate::middleware::request_id::header();
+        let x_request_id = toolkit_http_middleware::request_id::header();
         // If missing, generate x-request-id first; then propagate it to the response.
         router = router.layer(PropagateRequestIdLayer::new(x_request_id.clone()));
         router = router.layer(SetRequestIdLayer::new(
             x_request_id,
-            crate::middleware::request_id::MakeReqId,
+            toolkit_http_middleware::request_id::MakeReqId,
         ));
 
         Ok(router)

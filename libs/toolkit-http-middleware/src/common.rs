@@ -1,3 +1,12 @@
+//! Shared, transport-agnostic helpers for the server-side middleware.
+//!
+//! - [`BearerChallenge`] / [`append_bearer_challenge`] — RFC 6750 §3
+//!   `WWW-Authenticate: Bearer` challenge rendering, attached to `401`/`403`
+//!   rejections so clients receive a standards-compliant challenge.
+//! - [`resolve_path`] — normalises the matched request path by stripping any
+//!   `NestedPath` prefix so route policies match the gear-local path regardless
+//!   of where the router was nested (e.g. under a gateway `prefix_path`).
+
 use axum::extract::Request;
 use axum::response::Response;
 use http::HeaderValue;
@@ -41,6 +50,30 @@ pub fn append_bearer_challenge(response: &mut Response, challenge: BearerChallen
     );
 }
 
+/// W3C Trace Context header name (`traceparent`).
+///
+/// Duplicated (deliberately, as a 4-line stable-format helper) from
+/// `toolkit_http::otel` so this server-side crate need not depend on the heavy
+/// outbound HTTP client stack (hyper/rustls) just to read a trace id.
+pub const TRACEPARENT: &str = "traceparent";
+
+/// Parse the trace id from a W3C `traceparent` header value.
+///
+/// Format: `00-{trace_id}-{span_id}-{flags}`. Returns `None` for any value that
+/// isn't a supported (`00`) version with the expected field count.
+#[must_use]
+pub fn parse_trace_id(traceparent: &str) -> Option<String> {
+    let parts: Vec<&str> = traceparent.split('-').collect();
+    if parts.len() >= 4 && parts[0] == "00" {
+        Some(parts[1].to_owned())
+    } else {
+        None
+    }
+}
+
+/// Resolve the gear-local request path from a matched path, stripping any
+/// `NestedPath` prefix so route policies match regardless of nesting.
+#[must_use]
 pub fn resolve_path(req: &Request, matched_path: &str) -> String {
     req.extensions()
         .get::<axum::extract::NestedPath>()

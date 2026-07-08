@@ -7,7 +7,6 @@
 //! -> timeout -> body limit -> CORS -> MIME validation -> rate limit -> error mapping -> auth -> router
 //!
 use anyhow::Result;
-use api_gateway::middleware::request_id::XRequestId;
 use axum::{
     Router,
     body::Body,
@@ -21,6 +20,7 @@ use toolkit::{
     Gear, api::OperationBuilder, config::ConfigProvider, context::GearCtx,
     contracts::ApiGatewayCapability,
 };
+use toolkit_http_middleware::request_id::XRequestId;
 use tower::ServiceExt;
 use uuid::Uuid;
 
