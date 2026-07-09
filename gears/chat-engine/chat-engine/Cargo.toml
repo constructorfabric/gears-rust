@@ -57,6 +57,8 @@ reqwest = { workspace = true, features = ["json"] }
 bytes = { workspace = true }
 url = { workspace = true }
 
+authz-resolver-sdk = { workspace = true }
+
 toolkit = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
 toolkit-db-macros = { workspace = true }

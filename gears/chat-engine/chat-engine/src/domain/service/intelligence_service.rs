@@ -79,6 +79,8 @@ use crate::domain::ports::MessageRepo;
 use crate::domain::ports::SessionRepo;
 use crate::domain::ports::SessionTypeRepo;
 use crate::domain::retention::RetentionPolicy;
+use authz_resolver_sdk::pep::PolicyEnforcer;
+
 use crate::domain::service::plugin_service::PluginService;
 use crate::domain::service::session_service::Identity;
 use crate::domain::session::{Session, get_retention_policy, set_retention_policy};
@@ -185,6 +187,7 @@ pub struct IntelligenceService {
     /// the round-robin from the beginning (the sweep is idempotent, so this
     /// only delays tail coverage). Shared across `Clone`s via the `Arc`.
     retention_cursor: Arc<Mutex<HashMap<String, Uuid>>>,
+    enforcer: PolicyEnforcer,
 }
 
 /// Default per-tick session cap when the service is constructed
@@ -203,6 +206,7 @@ impl IntelligenceService {
         session_types: Arc<dyn SessionTypeRepo>,
         messages: Arc<dyn MessageRepo>,
         plugins: PluginService,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
@@ -214,6 +218,7 @@ impl IntelligenceService {
             retention_max_sessions_per_tick: DEFAULT_RETENTION_MAX_SESSIONS_PER_TICK,
             retention_max_deletes_per_session: DEFAULT_RETENTION_MAX_DELETES_PER_SESSION,
             retention_cursor: Arc::new(Mutex::new(HashMap::new())),
+            enforcer,
         }
     }
 
