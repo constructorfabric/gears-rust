@@ -840,7 +840,7 @@ impl SessionService {
 /// `SecurityContext`; this helper just carries the opaque tenant/user strings
 /// plugins expect. Anonymous contexts (nil subject/tenant) are rejected with
 /// `Forbidden`.
-fn identity_from_ctx(ctx: &SecurityContext) -> Result<Identity> {
+pub(crate) fn identity_from_ctx(ctx: &SecurityContext) -> Result<Identity> {
     let tenant = ctx.subject_tenant_id();
     let user = ctx.subject_id();
     if tenant.is_nil() || user.is_nil() {

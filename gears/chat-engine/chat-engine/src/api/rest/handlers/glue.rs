@@ -63,7 +63,6 @@ pub async fn send_message_in_session(
     Path(session_id): Path<Uuid>,
     Json(body): Json<SendMessageRequestDto>,
 ) -> Result<Response> {
-    let identity = identity_from_ctx(&ctx)?;
     let req = SendMessageRequest {
         session_id,
         parts: parts_into_sdk(body.parts),
@@ -72,7 +71,7 @@ pub async fn send_message_in_session(
         capabilities: capabilities_into_sdk(body.capabilities),
     };
     let cancel = CancellationToken::new();
-    let stream = svc.send_message(req, identity, cancel).await?;
+    let stream = svc.send_message(req, &ctx, cancel).await?;
     Ok(sse_delta_stream_response(stream))
 }
 
@@ -84,9 +83,8 @@ pub async fn list_messages(
     Path(session_id): Path<Uuid>,
     Query(query): Query<ListMessagesQuery>,
 ) -> Result<Json<MessageListDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let messages = svc
-        .list_active_messages(&identity, session_id, query.parent_message_id)
+        .list_active_messages(&ctx, session_id, query.parent_message_id)
         .await?;
     Ok(Json(MessageListDto {
         items: messages.into_iter().map(MessageDto::from).collect(),
@@ -100,8 +98,7 @@ pub async fn get_message(
     Extension(svc): Extension<Arc<MessageService>>,
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<MessageDto>> {
-    let identity = identity_from_ctx(&ctx)?;
-    let message = svc.resolve_owned_message(&identity, message_id).await?;
+    let message = svc.resolve_owned_message(&ctx, message_id).await?;
     Ok(Json(MessageDto::from(message)))
 }
 
@@ -126,8 +123,7 @@ pub async fn resume_message_stream(
     Path(message_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    let identity = identity_from_ctx(&ctx)?;
-    svc.resolve_owned_message(&identity, message_id).await?;
+    svc.resolve_owned_message(&ctx, message_id).await?;
 
     let from_seq = parse_last_event_id(&headers);
     // Reader-only token: cancelling it stops polling on disconnect; the driver
@@ -160,7 +156,7 @@ pub async fn recreate_message(
 ) -> Result<Response> {
     let identity = identity_from_ctx(&ctx)?;
     let session_id = messages
-        .resolve_owned_message(&identity, message_id)
+        .resolve_owned_message(&ctx, message_id)
         .await?
         .session_id;
     let cancel = CancellationToken::new();
@@ -186,7 +182,7 @@ pub async fn list_variants(
 ) -> Result<Json<VariantListDto>> {
     let identity = identity_from_ctx(&ctx)?;
     let session_id = messages
-        .resolve_owned_message(&identity, message_id)
+        .resolve_owned_message(&ctx, message_id)
         .await?
         .session_id;
     let listing = variants
@@ -216,7 +212,7 @@ pub async fn set_reaction(
         ChatEngineError::bad_request(format!("unknown reaction kind: {}", body.kind))
     })?;
     let session_id = messages
-        .resolve_owned_message(&identity, message_id)
+        .resolve_owned_message(&ctx, message_id)
         .await?
         .session_id;
 

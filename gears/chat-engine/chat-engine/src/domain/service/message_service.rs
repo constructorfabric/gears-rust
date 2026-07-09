@@ -69,10 +69,12 @@ use crate::domain::ports::StreamEventBuffer;
 use crate::domain::ports::{
     FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage, PartCitations,
 };
+use crate::domain::authz::{actions, resource_types};
 use crate::domain::service::plugin_service::PluginService;
-use authz_resolver_sdk::pep::PolicyEnforcer;
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer};
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 
-use crate::domain::service::session_service::{Identity, redact_session};
+use crate::domain::service::session_service::{Identity, identity_from_ctx, redact_session};
 use crate::domain::service::webhook::{NoopWebhookEmitter, WebhookEmitter, WebhookEvent};
 use crate::domain::session::Session;
 use crate::domain::stream_delta::DeltaProjector;
@@ -286,19 +288,22 @@ impl MessageService {
     /// owning `session_id` for session-scoped delegation.
     pub async fn resolve_owned_message(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         message_id: Uuid,
     ) -> Result<Message> {
-        let message = self
-            .messages
-            .find_message_by_id(message_id)
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        // @cpt-cf-chat-engine-interface-pep
+        // MESSAGE read: the PDP returns owner constraints; the scoped lookup
+        // then both authorizes (denied → 403 via `?`) and resolves the row.
+        // A 0-row scoped result hides existence from out-of-scope callers (404).
+        let scope = self
+            .enforcer
+            .access_scope(ctx, &resource_types::MESSAGE, actions::READ, Some(message_id))
+            .await?;
+        self.messages
+            .find_message_by_id_scoped(&scope, message_id)
             .await?
-            .ok_or_else(|| ChatEngineError::not_found("message", message_id))?;
-        self.sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, message.session_id)
-            .await?
-            .ok_or_else(|| ChatEngineError::not_found("message", message_id))?;
-        Ok(message)
+            .ok_or_else(|| ChatEngineError::not_found("message", message_id))
     }
 
     /// List the active, visible conversation path of a session in
@@ -306,15 +311,20 @@ impl MessageService {
     /// supplied, only the direct replies under that node are returned.
     pub async fn list_active_messages(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         parent_message_id: Option<Uuid>,
     ) -> Result<Vec<Message>> {
-        self.sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
-            .await?
-            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
-        let messages = self.messages.fetch_active_history(session_id, None).await?;
+        // @cpt-cf-chat-engine-seq-authz-list
+        // @cpt-cf-chat-engine-interface-pep
+        let scope = self
+            .enforcer
+            .access_scope(ctx, &resource_types::MESSAGE, actions::LIST, None)
+            .await?;
+        let messages = self
+            .messages
+            .fetch_active_history_scoped(&scope, session_id, None)
+            .await?;
         Ok(match parent_message_id {
             Some(pid) => messages
                 .into_iter()
@@ -339,10 +349,10 @@ impl MessageService {
     /// started; mid-stream failures stay on the wire and never produce an
     /// HTTP error.
     #[instrument(
-        skip(self, req, identity, cancel),
+        skip(self, req, ctx, cancel),
         fields(
             session_id = %req.session_id,
-            user_id = %identity.user_id,
+            user_id = %ctx.subject_id(),
             request_id,
             assistant_message_id,
         ),
@@ -350,11 +360,22 @@ impl MessageService {
     pub async fn send_message(
         &self,
         req: SendMessageRequest,
-        identity: Identity,
+        ctx: &SecurityContext,
         cancel: CancellationToken,
     ) -> Result<SendMessageStream> {
-        // ---- 1. Validate request (auth/ownership + payload). ----
-        let validated = self.validate_request(&req, &identity).await?;
+        // Opaque tenant/user strings for plugin-call construction only; the
+        // authorization boundary is the enforcer below.
+        let identity = identity_from_ctx(ctx)?;
+
+        // ---- 1. Authorize at parent-session granularity + validate payload. ----
+        // A message send mutates the conversation, so it is gated as a SESSION
+        // update; the child rows inherit the session's owner pair.
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        // @cpt-cf-chat-engine-interface-pep
+        let (session, _session_scope) = self
+            .authorize_session(ctx, req.session_id, actions::UPDATE)
+            .await?;
+        let validated = self.validate_request(&req, &session).await?;
 
         // ---- 2. Atomic user-msg + assistant-stub insert. ----
         let InsertedPair {
@@ -745,17 +766,18 @@ impl MessageService {
     /// the new value (no session-state restart required).
     pub async fn update_memory_strategy(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         strategy: MemoryStrategy,
     ) -> Result<Session> {
         validate_memory_strategy(&strategy)?;
 
-        let row = self
-            .sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
-            .await?
-            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+        // memory_strategy lives in session.metadata, so this is a SESSION update.
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        // @cpt-cf-chat-engine-interface-pep
+        let (row, scope) = self
+            .authorize_session(ctx, session_id, actions::UPDATE)
+            .await?;
 
         let state = row.lifecycle_state;
         if matches!(
@@ -772,12 +794,7 @@ impl MessageService {
 
         let updated = self
             .sessions
-            .update_metadata(
-                &identity.tenant_id,
-                &identity.user_id,
-                session_id,
-                Some(meta),
-            )
+            .update_metadata_scoped(&scope, session_id, Some(meta))
             .await?;
 
         // Strip reserved metadata + clear the share token before handing
@@ -983,49 +1000,41 @@ impl MessageService {
     /// - [`ChatEngineError::Internal`] / [`ChatEngineError::BadRequest`]
     ///   — propagated from the underlying repo or identity construction.
     #[instrument(
-        skip(self, identity),
+        skip(self, ctx),
         fields(
             session_id = %session_id,
             message_id = %message_id,
-            user_id = %identity.user_id,
+            user_id = %ctx.subject_id(),
             deleted_count,
         ),
     )]
     pub async fn delete_message_cascade(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<DeleteOutcome> {
-        // 1. Resolve the session via `check_session_scope` — this is the
-        //    only API that exposes "session exists but in a different
-        //    tenant" (→ 403) without ever returning the foreign row. The
-        //    repo never hands out cross-scope data; we only see the row
-        //    when ownership matches.
-        use crate::domain::ports::SessionScopeCheck;
-        match self
-            .sessions
-            .check_session_scope(&identity.tenant_id, &identity.user_id, session_id)
-            .await?
-        {
-            SessionScopeCheck::Owned(_) => {}
-            SessionScopeCheck::WrongTenant => {
-                return Err(ChatEngineError::forbidden(
-                    "session belongs to a different tenant",
-                ));
-            }
-            // WrongUser folds to NotFound per ADR-0021 anti-enumeration.
-            SessionScopeCheck::WrongUser | SessionScopeCheck::NotFound => {
-                return Err(ChatEngineError::not_found("session", session_id));
-            }
-        }
+        // Opaque tenant/user strings for the post-commit webhook only.
+        let identity = identity_from_ctx(ctx)?;
 
-        // 2. Resolve the target message scoped to `session_id`. A miss
-        //    folds to 404 — this also covers the idempotent re-delete
-        //    case (the previous call already removed the subtree).
+        // 1. MESSAGE delete decision. The PDP returns owner constraints; a
+        //    denied decision fails closed to 403 via `?`. The compiled scope
+        //    then bounds every read/delete below to the caller's owned rows,
+        //    so a foreign or cross-scope target simply resolves to 0 rows (404)
+        //    — anti-enumeration (ADR-0021) without a separate scope probe.
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        // @cpt-cf-chat-engine-interface-pep
+        let scope = self
+            .enforcer
+            .access_scope(ctx, &resource_types::MESSAGE, actions::DELETE, Some(message_id))
+            .await?;
+
+        // 2. Resolve the target message scoped to `session_id` under the PDP
+        //    scope. A miss folds to 404 — this also covers the idempotent
+        //    re-delete case (the previous call already removed the subtree).
         let target = self
             .messages
-            .find_message_in_session(session_id, message_id)
+            .find_message_in_session_scoped(&scope, session_id, message_id)
             .await?
             .ok_or_else(|| ChatEngineError::not_found("message", message_id))?;
 
@@ -1045,7 +1054,7 @@ impl MessageService {
         //    the same transaction.
         let deleted_count = self
             .messages
-            .delete_message_subtree(session_id, message_id)
+            .delete_message_subtree_scoped(&scope, session_id, message_id)
             .await?;
 
         // Concurrent re-delete: if a parallel request removed the subtree
@@ -1101,14 +1110,55 @@ impl MessageService {
     // Internal helpers
     // -----------------------------------------------------------------
 
+    /// Trusted prefetch of a session by id, then the PDP decision for `action`.
+    /// Mirrors `SessionService::authorize_session_op`: returns the prefetched
+    /// row (source of the owner pair passed to the PDP as ABAC input) plus the
+    /// compiled scope. A denied / unreachable / uncompilable PDP decision fails
+    /// closed to `Forbidden` via the `?`-converted `EnforcerError`
+    /// (DESIGN §3.5.5).
+    // @cpt-cf-chat-engine-seq-authz-point-op
+    async fn authorize_session(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+        action: &str,
+    ) -> Result<(Session, AccessScope)> {
+        // Trusted prefetch — Phase 7 renames this `allow_all()` to a named
+        // bypass wrapper.
+        let prefetch = self
+            .sessions
+            .find_by_id_scoped(&AccessScope::allow_all(), session_id)
+            .await?
+            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+
+        // @cpt-cf-chat-engine-interface-pep
+        let scope = self
+            .enforcer
+            .access_scope_with(
+                ctx,
+                &resource_types::SESSION,
+                action,
+                Some(session_id),
+                &AccessRequest::new()
+                    .resource_property(
+                        pep_properties::OWNER_TENANT_ID,
+                        prefetch.tenant_id.as_str(),
+                    )
+                    .resource_property(pep_properties::OWNER_ID, prefetch.user_id.as_str())
+                    .require_constraints(false),
+            )
+            .await?;
+        Ok((prefetch, scope))
+    }
+
     /// Authentication, ownership, lifecycle, and payload validation.
     /// Returns the resolved session-type fields the streaming pipeline
     /// needs (`session_type_id`, `plugin_instance_id`).
-    #[instrument(skip(self, req, identity), fields(session_id = %req.session_id))]
+    #[instrument(skip(self, req, session), fields(session_id = %req.session_id))]
     async fn validate_request(
         &self,
         req: &SendMessageRequest,
-        identity: &Identity,
+        session: &Session,
     ) -> Result<ValidatedRequest> {
         if req.parts.is_empty() {
             return Err(ChatEngineError::bad_request(
@@ -1116,13 +1166,8 @@ impl MessageService {
             ));
         }
 
-        // Ownership scoping happens inside `find_by_id` — cross-tenant
-        // misses fold to 404 (anti-enumeration, ADR-0021).
-        let session = self
-            .sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, req.session_id)
-            .await?
-            .ok_or_else(|| ChatEngineError::not_found("session", req.session_id))?;
+        // Ownership is already enforced by the caller's parent-session PDP
+        // decision (`authorize_session`); `session` is the authorized row.
 
         // Lifecycle state must allow new messages — only Active does.
         let state = session.lifecycle_state;

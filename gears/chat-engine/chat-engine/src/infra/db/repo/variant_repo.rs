@@ -80,11 +80,11 @@ impl VariantRepo for SeaVariantRepo {
         user_id: Option<String>,
     ) -> Result<(Uuid, i32, Uuid)> {
         use crate::infra::db::entity::message as message_entity;
-        use crate::infra::db::repo::message_repo::insert_message_parts;
+        use crate::infra::db::repo::message_repo::{insert_message_parts, message_owner_pair};
         use crate::infra::db::{
             VARIANT_INDEX_MAX_RETRIES, compute_next_variant_index, is_variant_unique_violation,
         };
-        use sea_orm::ActiveValue::{NotSet, Set};
+        use sea_orm::ActiveValue::Set;
 
         // SELECT MAX(variant_index)+1 and the matching INSERT run in the
         // SAME SERIALIZABLE transaction, with the whole pair retried under
@@ -118,12 +118,16 @@ impl VariantRepo for SeaVariantRepo {
                             compute_next_variant_index(tx, session_id, Some(parent_message_id))
                                 .await?;
                         let scope = AccessScope::allow_all();
+                        // Branch rows inherit the parent message's owner pair
+                        // (the `messages` secure scope columns), derived
+                        // in-transaction. @cpt-cf-chat-engine-interface-pep
+                        let (owner_tenant_id, owner_id) =
+                            message_owner_pair(tx, parent_message_id).await?;
                         let user_active = message_entity::ActiveModel {
                             message_id: Set(user_message_id),
                             session_id: Set(session_id),
-                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-                            owner_tenant_id: NotSet,
-                            owner_id: NotSet,
+                            owner_tenant_id: Set(owner_tenant_id),
+                            owner_id: Set(owner_id),
                             // Owning tenant (denormalized) + branching author,
                             // both from the JWT identity at the service layer.
                             tenant_id: Set(user_tenant),
@@ -142,9 +146,8 @@ impl VariantRepo for SeaVariantRepo {
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(assistant_message_id),
                             session_id: Set(session_id),
-                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-                            owner_tenant_id: NotSet,
-                            owner_id: NotSet,
+                            owner_tenant_id: Set(owner_tenant_id),
+                            owner_id: Set(owner_id),
                             // Inherits the owning tenant; no human author.
                             tenant_id: Set(assistant_tenant),
                             user_id: Set(None),
@@ -165,7 +168,15 @@ impl VariantRepo for SeaVariantRepo {
                             .exec(tx)
                             .await?;
                         // Persist the branch user message body as ordered parts.
-                        insert_message_parts(tx, &scope, user_message_id, &parts_attempt).await?;
+                        insert_message_parts(
+                            tx,
+                            &scope,
+                            user_message_id,
+                            &parts_attempt,
+                            owner_tenant_id,
+                            owner_id,
+                        )
+                        .await?;
                         message_entity::Entity::insert(assistant_active)
                             .secure()
                             .scope_unchecked(&scope)?
