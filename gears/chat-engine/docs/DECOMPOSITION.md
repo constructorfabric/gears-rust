@@ -19,6 +19,7 @@ Updated:  2026-03-06 by Constructor Tech
   - [2.8 Message Search 🔄 LOW](#28-message-search--low)
   - [2.9 Plugin System Infrastructure 🔄 HIGH](#29-plugin-system-infrastructure--high)
   - [2.10 LLM Gateway Plugin 🔄 HIGH](#210-llm-gateway-plugin--high)
+  - [2.11 Authorization (PDP/PEP + SecureORM) 🔄 HIGH](#211-authorization-pdppep--secureorm--high)
 - [3. Deliberate Omissions](#3-deliberate-omissions)
 - [4. Feature Dependencies](#4-feature-dependencies)
 
@@ -26,19 +27,20 @@ Updated:  2026-03-06 by Constructor Tech
 
 ## 1. Overview
 
-The Chat Engine design is decomposed into 10 features organized around functional cohesion. The decomposition follows a strict dependency order: session infrastructure enables plugin system and message processing, which enable all higher-level capabilities.
+The Chat Engine design is decomposed into 11 features organized around functional cohesion. The decomposition follows a strict dependency order: session infrastructure enables plugin system and message processing, which enable all higher-level capabilities; authorization is layered as a cross-cutting PEP feature over the sessions/messages/reactions resources once those exist.
 
 **Decomposition Strategy**:
 
-- Features grouped by domain cohesion: session lifecycle, plugin system, message core, tree operations, context window, session intelligence, reactions, export, search, and LLM gateway plugin
+- Features grouped by domain cohesion: session lifecycle, plugin system, message core, tree operations, context window, session intelligence, reactions, export, search, LLM gateway plugin, and authorization
 - Dependencies minimize coupling — each feature is fully implementable given its declared dependencies
 - `cpt-cf-chat-engine-component-message-processing` is intentionally shared by features 03–05 because those features extend the message processing pipeline with distinct, independently testable capabilities (tree traversal, context selection, and summarization routing); each sharing is documented in the feature's Scope and Out of Scope sections
-- 100% coverage of all 8 DESIGN components, 15 sequences, 7 domain entities, 5 DB tables, 4 principles, and 2 constraints verified
+- 100% coverage of all DESIGN components, sequences, domain entities, DB tables, principles, and constraints verified, including the reworked §3.5 authorization elements (`cpt-cf-chat-engine-adr-authz-pep-secureorm` / `ADR/0028`)
 - NFR `nfr-backend-isolation` is shared between Feature 2.2 (Message Processing) and Feature 2.9 (Plugin System): Feature 2.9 defines the plugin trait abstraction, while Feature 2.2 invokes plugins through that trait.
 - Feature 2.10 (LLM Gateway Plugin) shares FRs `fr-send-message`, `fr-schema-extensibility`, `fr-session-summary`, `fr-context-overflow`, and `fr-conversation-memory` with other features because it implements the concrete plugin backend for these capabilities.
 - `cpt-cf-chat-engine-component-webhook-integration` is shared by Features 2.2, 2.9, and 2.10: Feature 2.9 (Plugin System) defines the webhook trait, Feature 2.2 (Message Processing) invokes plugins through it, and Feature 2.10 (LLM Gateway Plugin) implements a concrete plugin.
+- Feature 2.11 (Authorization) is a dedicated, cross-cutting PEP feature owning **all** §3.5 authorization design elements. It is a full PEP over the sessions/messages/reactions resources and depends on those tables/services existing; `nfr-authentication` is shared with Feature 2.1 (which owns AuthN + `SecurityContext` injection) while Feature 2.11 owns the AuthZ (PDP/PEP) half. `fr-share-session` is shared with Feature 2.7 (which owns the share route/entity) while Feature 2.11 owns the share-token read authorization boundary (`cpt-cf-chat-engine-seq-authz-shared-read`).
 
-Feature numbering reflects logical grouping, not implementation order. Recommended implementation sequence: 2.1 → 2.2 → 2.9 → 2.3 → 2.4 → 2.6 → 2.5 → 2.7 → 2.8 → 2.10.
+Feature numbering reflects logical grouping, not implementation order. Recommended implementation sequence: 2.1 → 2.2 → 2.9 → 2.3 → 2.4 → 2.6 → 2.5 → 2.7 → 2.8 → 2.10 → 2.11 (authorization is layered after the sessions/messages/reactions resources and their pipeline writes exist; its internal steps A→B→C→{D, F}→E→G are strictly ordered).
 
 
 ## 2. Entries
@@ -698,6 +700,94 @@ Feature numbering reflects logical grouping, not implementation order. Recommend
   - None (uses `cpt-cf-chat-engine-dbtable-plugin-configs` owned by feature-plugin-system; GTS schemas registered at runtime)
 
 
+### 2.11 Authorization (PDP/PEP + SecureORM) 🔄 HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-feature-authorization`
+
+- **Type**: Core
+- **Phases**: Ordered multi-step implementation (steps A–G below; foundation step A blocks all others)
+
+- **Purpose**: Turn Chat Engine into a full Policy Enforcement Point (PEP) over the platform PDP/PEP + SecureORM model. Every sensitive database access is gated by a PDP decision compiled into an `AccessScope` and enforced by `SecureConn` as a SQL predicate against a denormalized owner pair `(owner_tenant_id, owner_id)` carried on every scoped row. Replaces the interim `AccessScope::allow_all()` + manual `(tenant, user)` filtering with query-level authorization, a fail-closed error surface, and an enumerated bypass registry for trusted-internal and capability-URL paths. This feature realizes the accepted authorization decision `ADR/0028-authz-pep-secureorm-uuid-migration.md` across the sessions, messages, and reactions resources plus their child tables.
+
+- **Depends On**: `cpt-cf-chat-engine-feature-session-lifecycle`, `cpt-cf-chat-engine-feature-message-processing`, `cpt-cf-chat-engine-feature-message-reactions`, `cpt-cf-chat-engine-feature-plugin-system`, `cpt-cf-chat-engine-feature-message-variants`, `cpt-cf-chat-engine-feature-session-intelligence`, `cpt-cf-chat-engine-feature-session-export`, `cpt-cf-chat-engine-feature-message-search`
+
+- **Scope** (implementation steps are strictly ordered; A is the foundation):
+  - **A. Owner-column migration (foundation, blocks B–G)**: single engine-aware forward migration `m20260417_000006_authz_owner_columns` — cast `sessions.tenant_id`/`user_id` text→UUID guarded by a pre-check that aborts on NULL or non-castable rows; add `owner_tenant_id`/`owner_id` UUID columns to `messages`, `message_parts`, `message_reactions`, `file_citations`, `link_citations`, `link_references`; backfill the owner pair from the parent-session chain (abort on orphans / nullable-tenant failure); set `NOT NULL` and add indexes on `owner_tenant_id` and `(owner_tenant_id, owner_id)`
+  - **B. Scopable entity updates (depends on A)**: lift `#[secure(unrestricted)]` on the scoped entities (session, message, reaction) and their scoped children; declare per-resource `supported_properties`; the `sessions` `Scopable` derive advertises PEP property names `owner_tenant_id`/`owner_id` and maps them onto the physical `tenant_id`/`user_id` columns; child tables resolve onto identically-named physical columns; global tables (`session_types`, `plugin_configs`, `stream_events`) stay `#[secure(unrestricted)]`
+  - **C. PolicyEnforcer wiring (depends on B)**: declare `deps = ["authz-resolver"]` on the gear; resolve `dyn AuthZResolverClient` from `ClientHub` at init; construct a single `PolicyEnforcer` Arc-cloned into every domain service as an `enforcer` field; define `ResourceType` consts with GTS type ids `gts.cf.core.chat_engine.<resource>.v1~`
+  - **D. Per-service PEP enforcement (depends on C)**: replace `AccessScope::allow_all()` + manual `(tenant, user)` filters with `access_scope` / `access_scope_with` across Session, Message, Reaction, Variant, Search, Export, and Intelligence services; two-step owner-pair prefetch for point ops (read/update/delete); map `EnforcerError` → `ChatEngineError` (`Denied` → 403, point-op scope-miss → 404, `CompileFailed`/`EvaluationFailed` → 403 fail-closed)
+  - **E. Bypass registry (depends on D)**: named `internal_write_scope()` wrapper with `// AUTHZ-BYPASS: <reason>` markers at each enumerated site — internal pipeline writes (`finalize_assistant`, `insert_summary_message`, `insert_assistant_variant_stub`) derive the owner pair from the authorized parent in the same transaction; scheduled retention cross-tenant op and `list_tenants_with_active_sessions` (not HTTP-exposed); `find_by_share_token` capability-URL read (404 anti-enumeration) on the `.public()` route; `find_by_session_id_unscoped` internal-pipeline-only parent read
+  - **F. `session_type` permission gate (depends on C)**: PDP decision-gate (`require_constraints=false`) on `session_type` create/update/delete mutations (`Denied` → 403); `session_type` reads stay `.authenticated()`-only with no PDP call
+  - **G. Authorization tests (depends on D, E, F)**: PDP-deny parity per resource (sessions/messages/reactions) with `DenyAllAuthZResolver`; migration test (cast + backfill + `NOT NULL` + child inherits owner); share-token 200/404; retention op not HTTP-exposed; denormalization-invariant inheritance
+
+- **Out of scope**:
+  - Authentication / bearer-token validation and `SecurityContext` injection (AuthN is unchanged and already wired via Session Lifecycle; see `cpt-cf-chat-engine-nfr-authentication`)
+  - Zero-downtime / expand-contract migration variant (deferred to a separate ADR — OQ2)
+  - Cross-tenant session transfer (owner pair is immutable — OQ3)
+  - The optional `allow_all()` lint (possible future hardening — OQ4)
+  - Business logic of the enforced operations (owned by the respective feature: Session Lifecycle, Message Processing, Message Variants, Context Management, Session Intelligence, Message Reactions, Session Export, Message Search)
+
+- **Requirements Covered**:
+
+  - [ ] `p1` - `cpt-cf-chat-engine-nfr-authentication`
+  - [ ] `p3` - `cpt-cf-chat-engine-fr-share-session`
+
+- **Design Principles Covered**:
+
+  - [ ] `p1` - `cpt-cf-chat-engine-principle-owner-denorm-invariant`
+
+- **Design Constraints Covered**:
+
+  - [ ] `p1` - `cpt-cf-chat-engine-constraint-fail-closed-authz`
+  - [ ] `p1` - `cpt-cf-chat-engine-constraint-no-allow-all-outside-registry`
+
+- **Domain Model Entities**:
+  - Session (owner pair)
+  - Message (owner pair)
+  - MessageReaction (owner pair)
+  - AccessScope / PolicyEnforcer (PEP)
+
+- **Design Entities**:
+
+  - None (owner-pair columns extend existing entities; see Data)
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-chat-engine-component-policy-enforcer`
+
+- **Interfaces**:
+
+  - [ ] `p1` - `cpt-cf-chat-engine-interface-pep`
+
+- **Design Elements**:
+
+  - [ ] `p1` - `cpt-cf-chat-engine-design-auth-model`
+  - [ ] `p1` - `cpt-cf-chat-engine-design-authz-bypass-registry`
+
+- **API**:
+  - No new public API — authorization is enforced transparently across existing routes; the only authorization-specific route surface is the pre-existing `.public()` `POST /sessions/shared/{token}` capability-URL read (owned by Session Export & Sharing) and the `session_type` mutation routes (owned by Session Lifecycle), both now PDP-gated
+
+- **Sequences**:
+
+  - [ ] `p1` - `cpt-cf-chat-engine-seq-authz-list`
+  - [ ] `p1` - `cpt-cf-chat-engine-seq-authz-point-op`
+  - [ ] `p2` - `cpt-cf-chat-engine-seq-authz-shared-read`
+  - [ ] `p1` - `cpt-cf-chat-engine-seq-authz-internal-write`
+
+- **Data**:
+
+  - [ ] `p1` - `cpt-cf-chat-engine-dbtable-authz-owner-columns`
+
+- **Definition of Done**:
+  - Migration `m20260417_000006_authz_owner_columns` casts and backfills the owner pair with the NULL/non-castable pre-check guard; all scoped child rows inherit the parent session's owner pair; `NOT NULL` + indexes applied (step A)
+  - No production code path uses `AccessScope::allow_all()` except through `internal_write_scope()` at a registry-listed site carrying `// AUTHZ-BYPASS` + `@cpt` markers (steps D, E)
+  - Every sensitive session/message/reaction access obtains its scope from the single shared `PolicyEnforcer`; point ops use the two-step prefetch (steps C, D)
+  - Fail-closed surface verified: `Denied`/`CompileFailed`/`EvaluationFailed` → 403, point-op scope-miss → 404, PDP unavailability never leaks 503/500 (step D)
+  - `session_type` mutations gated by a PDP decision; `session_type` reads stay `.authenticated()`-only with no PDP call (step F)
+  - Share-token read returns 200 on valid/active/non-revoked token and 404 otherwise (anti-enumeration), with no PDP call (step E)
+  - Tests green for PDP-deny parity, migration cast+backfill+NOT NULL+child inheritance, share-token 200/404, retention op not HTTP-exposed, and the denormalization invariant (step G)
+
+
 ---
 
 ## 3. Deliberate Omissions
@@ -707,6 +797,7 @@ The following items are intentionally excluded from this decomposition cycle:
 - **Monitoring & Alerting infrastructure** — deferred to Gears middleware-level observability; Chat Engine emits metrics and structured logs but does not own dashboards or alert rules.
 - **Client SDK** — client-side libraries are out of scope for the backend decomposition; API contracts defined in DESIGN.md are sufficient for client teams.
 - **Admin UI / Management Console** — session type registration and retention policy configuration are API-only in this cycle.
+- **FEATURE artifact for 2.11 Authorization** — the per-feature FEATURE spec (`features/authorization.md`) is not yet authored; Feature 2.11 is currently specified at decomposition level only (scope steps A–G, coverage, and definition of done). The heading is intentionally unlinked until that FEATURE artifact is created.
 
 ---
 
@@ -726,6 +817,17 @@ cpt-cf-chat-engine-feature-session-lifecycle
     │       ├─→ cpt-cf-chat-engine-feature-message-reactions
     │       └─→ cpt-cf-chat-engine-feature-message-search
     └─→ cpt-cf-chat-engine-feature-session-export
+
+cpt-cf-chat-engine-feature-session-lifecycle
+cpt-cf-chat-engine-feature-message-processing
+cpt-cf-chat-engine-feature-message-reactions
+cpt-cf-chat-engine-feature-plugin-system
+cpt-cf-chat-engine-feature-message-variants
+cpt-cf-chat-engine-feature-session-intelligence
+cpt-cf-chat-engine-feature-session-export
+cpt-cf-chat-engine-feature-message-search
+    └──(all eight)──→ cpt-cf-chat-engine-feature-authorization
+                         [A migration] → [B scopable] → [C enforcer] → {[D per-service PEP], [F session-type gate]} → [E bypass registry] → [G tests]
 ```
 
 **Dependency Rationale**:
@@ -744,3 +846,8 @@ cpt-cf-chat-engine-feature-session-lifecycle
 - Features `message-variants`, `context-management`, `message-reactions`, and `message-search` are independent of each other and can be developed in parallel once `message-processing` is complete. Feature `session-intelligence` also requires `message-processing` but additionally depends on `message-reactions` (for `seq-delete-message-cascade` used in retention enforcement), so it can only start after both are complete.
 - Feature `llm-gateway-plugin` can be developed once `plugin-system` is complete; it is independent of message-level features.
 - Feature `session-export` is independent of all message-level and plugin features and can be developed in parallel with them.
+- `cpt-cf-chat-engine-feature-authorization` requires `cpt-cf-chat-engine-feature-session-lifecycle`, `cpt-cf-chat-engine-feature-message-processing`, and `cpt-cf-chat-engine-feature-message-reactions`: the owner-column migration (step A) casts `sessions.tenant_id`/`user_id` and backfills the owner pair onto the `messages`, `message_parts`, `message_reactions`, `file_citations`, `link_citations`, and `link_references` tables, so those tables must exist; the per-service PEP enforcement (step D) replaces the interim `allow_all()` + manual filters across the Session, Message, and Reaction services.
+- `cpt-cf-chat-engine-feature-authorization` requires `cpt-cf-chat-engine-feature-plugin-system`: the trusted-internal pipeline writes in the bypass registry (step E — `finalize_assistant`, `insert_summary_message`, `insert_assistant_variant_stub`) are the plugin-driven write sites whose owner pair is derived from the authorized parent session in the same transaction; the `session_type` permission gate (step F) applies to session-type mutations that reference plugin configuration.
+- `cpt-cf-chat-engine-feature-authorization` also requires `cpt-cf-chat-engine-feature-message-variants`, `cpt-cf-chat-engine-feature-session-intelligence`, `cpt-cf-chat-engine-feature-session-export`, and `cpt-cf-chat-engine-feature-message-search`: step D retrofits PEP enforcement (`access_scope` / `access_scope_with`) into the Variant, Intelligence, Export, and Search service implementations, so those services must exist before their sensitive reads/writes can be gated.
+- The authorization feature's internal steps are strictly ordered: **A** (migration) is the foundation and blocks **B–G**; **B** (Scopable entities) precedes **C** (PolicyEnforcer wiring, which needs per-resource `supported_properties`); **C** unblocks both **D** (per-service PEP enforcement) and **F** (`session_type` permission gate), which may proceed in parallel; **E** (bypass registry) depends on **D**; **G** (tests) trails **D**, **E**, and **F**.
+- `cpt-cf-chat-engine-feature-authorization` shares `nfr-authentication` with `cpt-cf-chat-engine-feature-session-lifecycle` (which owns AuthN + `SecurityContext` injection; this feature owns the AuthZ/PDP-PEP half) and `fr-share-session` with `cpt-cf-chat-engine-feature-session-export` (which owns the share route and `ShareToken` entity; this feature owns the share-token read authorization boundary via `cpt-cf-chat-engine-seq-authz-shared-read`). These are documented shared coverage, not orphan or duplicate ownership.

@@ -17,11 +17,19 @@ Updated:  2026-06-23 by Constructor Tech
   - [3.2 Architecture Overview](#32-architecture-overview)
   - [3.2.1 Component Model](#321-component-model)
   - [3.3 API Contracts](#33-api-contracts)
-  - [3.3.1 Internal Dependencies](#331-internal-dependencies)
-  - [3.3.2 External Dependencies](#332-external-dependencies)
   - [3.4 Interactions & Sequences](#34-interactions--sequences)
   - [3.4.1 Database schemas & tables](#341-database-schemas--tables)
   - [3.5 Authorization Model](#35-authorization-model)
+  - [3.5.1 Ownership boundaries](#351-ownership-boundaries)
+  - [3.5.2 PEP wiring](#352-pep-wiring)
+  - [3.5.3 Public PEP call surface (per resource)](#353-public-pep-call-surface-per-resource)
+  - [3.5.4 Per-operation flow](#354-per-operation-flow)
+  - [3.5.5 Fail-closed error surface](#355-fail-closed-error-surface)
+  - [3.5.6 Session-type permission model](#356-session-type-permission-model)
+  - [3.5.7 Trusted-internal writes and the bypass registry](#357-trusted-internal-writes-and-the-bypass-registry)
+  - [3.5.8 Shared-read (capability-URL) security boundary](#358-shared-read-capability-url-security-boundary)
+  - [3.5.9 Migration impact](#359-migration-impact)
+  - [3.5.10 Observability & testability](#3510-observability--testability)
   - [3.6 Data Protection](#36-data-protection)
   - [3.7 Data Consistency](#37-data-consistency)
   - [3.8 Observability](#38-observability)
@@ -92,7 +100,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-nfr-scalability` | Horizontal scaling; database sharding by tenant_id; connection pool per instance |
 | `cpt-cf-chat-engine-nfr-data-persistence` | Database transactions wrap message writes; acknowledge client only after commit confirmation |
 | `cpt-cf-chat-engine-nfr-streaming` | SSE delta stream; buffering disabled; per-message `seq` for ordering/resume; plugin events projected to the client with minimal latency |
-| `cpt-cf-chat-engine-nfr-authentication` | JWT-based authentication; client_id, user_id, tenant_id claim extraction; session ownership validated by user_id; tenant isolation enforced by tenant_id on every request |
+| `cpt-cf-chat-engine-nfr-authentication` | JWT-based authentication; client_id, user_id, tenant_id claim extraction → `SecurityContext`; authorization via `PolicyEnforcer` (PDP) compiling `AccessScope` enforced by `SecureConn` at the SQL layer; owner pair `(owner_tenant_id, owner_id)` on every scoped row; fail-closed (see `cpt-cf-chat-engine-design-auth-model`) |
 | `cpt-cf-chat-engine-nfr-data-integrity` | Database foreign key constraints on parent_message_id; unique constraint on (session_id, parent_message_id, variant_index) |
 | `cpt-cf-chat-engine-nfr-backend-isolation` | Error isolation per backend plugin; plugins own their own resilience (retry, circuit breaker, timeout); Chat Engine isolates plugin failures from other sessions |
 | `cpt-cf-chat-engine-nfr-file-size` | File size validation delegated to storage service; Chat Engine validates URL format and accessibility |
@@ -134,6 +142,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-adr-session-deletion-strategy` | Soft delete as default with automatic hard delete after retention period |
 | `cpt-cf-chat-engine-adr-plugin-backend-integration` | Internal plugin trait for backend integration |
 | `cpt-cf-chat-engine-adr-llm-gateway-plugin` | LLM gateway plugin with schema extensions |
+| `cpt-cf-chat-engine-adr-authz-pep-secureorm` | Full PEP (PDP/PEP) + SecureORM with denormalized owner columns; String→UUID owner-column migration (`ADR/0028-authz-pep-secureorm-uuid-migration.md`) |
 
 #### NFR Allocation
 
@@ -145,7 +154,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-nfr-streaming` | SSE delta protocol | `start`/`delta`/`complete`/`error` events over `text/event-stream` with backpressure; resume via `Last-Event-ID` |
 | `cpt-cf-chat-engine-nfr-data-integrity` | ACID transactions | All state mutations wrapped in database transactions; message tree immutability enforced |
 | `cpt-cf-chat-engine-nfr-data-persistence` | PostgreSQL with WAL | Write-ahead logging ensures durability; client acknowledged only after commit confirmation |
-| `cpt-cf-chat-engine-nfr-authentication` | JWT validation middleware | Bearer token validation on every request; user_id, tenant_id, client_id claim extraction |
+| `cpt-cf-chat-engine-nfr-authentication` | JWT validation middleware + PDP/PEP authorization | Bearer token validation on every request produces a `SecurityContext`; a `PolicyEnforcer` (PEP) then obtains PDP decisions compiled into `AccessScope` and enforced by `SecureConn` at the SQL layer (owner-pair scoping, fail-closed) — see `cpt-cf-chat-engine-design-auth-model` |
 | `cpt-cf-chat-engine-nfr-backend-isolation` | Plugin trait abstraction | Each plugin owns its resilience (retry, circuit breaker, timeout); failures isolated per session type |
 | `cpt-cf-chat-engine-nfr-file-size` | File Storage Service delegation | File size validation delegated to external File Storage Service; Chat Engine validates URL format only |
 | `cpt-cf-chat-engine-nfr-search` | PostgreSQL tsvector/GIN indexes | Full-text search with inverted indexes on `message_parts` text content (`idx_message_parts_text_fts`); cursor-based pagination |
@@ -217,7 +226,17 @@ All plugin responses are streamed by default to minimize time-to-first-byte. Plu
 Chat Engine does not process, analyze, or transform message content. All business logic (content moderation, language detection, sentiment analysis) belongs in backend plugins. Chat Engine only routes, persists, and manages message trees.
 <!-- fdd-id-content -->
 
-When principles conflict, the following priority applies (highest first): (1) Immutable Message Tree (data integrity), (2) Backend Plugin Authority (extensibility), (3) Stream Everything (responsiveness), (4) Zero Business Logic in Routing (scalability).
+#### Principle: Immutable Owner-Pair Denormalization
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-principle-owner-denorm-invariant`
+
+<!-- fdd-id-content -->
+**ADRs**: `cpt-cf-chat-engine-adr-authz-pep-secureorm`
+
+Every scoped resource carries its own authorization owner pair `(owner_tenant_id, owner_id)` — the session owner tenant and session owner user — on its own row, so `SecureConn` compiles authorization predicates against columns local to the row (no joins, no service-side gating). The invariant: the session's owner pair is set at session create and is **immutable** thereafter; children (messages, parts, citations, references, reactions) copy the owner pair from their parent session at insert. There is no cascade update and no re-parenting, consistent with `cpt-cf-chat-engine-principle-immutable-tree`. This immutability is what makes the point-op prefetch TOCTOU-safe (the row cannot leave scope between prefetch and write) and is covered by a dedicated test (`cpt-cf-chat-engine-design-testing-arch`).
+<!-- fdd-id-content -->
+
+When principles conflict, the following priority applies (highest first): (1) Immutable Message Tree (data integrity), (2) Immutable Owner-Pair Denormalization (authorization integrity), (3) Backend Plugin Authority (extensibility), (4) Stream Everything (responsiveness), (5) Zero Business Logic in Routing (scalability).
 
 ### 2.2 Constraints
 
@@ -239,6 +258,26 @@ Chat Engine does not store file content. Clients must upload files to File Stora
 **ADRs**: `cpt-cf-chat-engine-adr-stateless-scaling`
 
 All Chat Engine instances share a single database cluster. No local caching of session state or messages. This ensures consistency but limits scalability to database write throughput.
+<!-- fdd-id-content -->
+
+#### Constraint: Fail-Closed Authorization
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-constraint-fail-closed-authz`
+
+<!-- fdd-id-content -->
+**ADRs**: `cpt-cf-chat-engine-adr-authz-pep-secureorm`
+
+Every sensitive database access MUST be covered by a PDP decision via `PolicyEnforcer`, and the absence of a positive decision is a denial. A denied decision, missing/unknown/empty constraints (`CompileFailed`), and an unreachable/invalid PDP (`EvaluationFailed`) all fail closed. Chat Engine maps all of these — including PDP unavailability — to **403 Forbidden**, never 503/500, so PDP availability cannot leak to clients; point ops out of scope return **404** to hide resource existence (see `cpt-cf-chat-engine-design-auth-model`). The only PDP-free sensitive path is the subject-less `.public()` share-token read (§3.5.8).
+<!-- fdd-id-content -->
+
+#### Constraint: No `allow_all` Outside the Bypass Registry
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-constraint-no-allow-all-outside-registry`
+
+<!-- fdd-id-content -->
+**ADRs**: `cpt-cf-chat-engine-adr-authz-pep-secureorm`
+
+Production code MUST NOT call `AccessScope::allow_all()` directly (bare) anywhere outside `domain/authz/bypass.rs`. Every non-PDP database access instead goes through one of a small family of **named scope wrappers** defined in that one module, each carrying a `// AUTHZ-BYPASS: <reason>` marker and a `@cpt` traceability comment: `internal_write_scope()` (pipeline writes; owner pair derived from the authorized parent in the same transaction), `capability_read_scope()` (share-token resolution on the `.public()` route), `system_read_scope()` (scheduled cross-tenant ops/reads — retention, tenant enumeration, parent-session lookup — none HTTP-exposed), and `unrestricted_table_scope()` (repositories of globally non-tenant tables `session_types`, `plugin_configs`, `stream_events`, which §3.5.1 excludes from PDP scoping). The wrapper family means the "no bare `allow_all()`" rule is checkable across **every** repository access, not only the tenant-scoped ones. The bypass registry (`cpt-cf-chat-engine-design-authz-bypass-registry`) enumerates the tenant-sensitive wrapper sites; unrestricted-table repositories are covered categorically by `unrestricted_table_scope()`. An optional lint may enforce the no-bare-`allow_all()` rule (OQ4 in §4).
 <!-- fdd-id-content -->
 
 ## 3. Technical Architecture
@@ -377,6 +416,7 @@ Session entity (session_id, tenant_id, user_id, client_id?, session_type_id?, en
 - `session_type_id` is `Optional`: `None` for sessions whose session type has not yet been configured (e.g. created during admin bootstrap).
 - `share_token` is `Optional`: present only while sharing is active. Bearer secret — redacted from `Debug`/log output (`<redacted>`); never write it to logs, tracing spans, or test fixtures.
 - `tenant_id` and `user_id` are SDK newtypes (`TenantId`, `UserId`) that reject the empty string at construction time — an empty value would silently scope queries to no/all rows and is treated as a latent authorization bug.
+- For authorization, `tenant_id`/`user_id` are the session's **owner pair** (`owner_tenant_id` = `tenant_id`, `owner_id` = `user_id`). They are stored as `UUID` columns (post-migration `cpt-cf-chat-engine-dbtable-authz-owner-columns`) and drive `SecureORM` scoping. The pair is **immutable** after create (`cpt-cf-chat-engine-principle-owner-denorm-invariant`).
 - `metadata` is opaque client-defined JSON, but Chat Engine reserves the keys `memory_strategy`, `retention_policy`, and `share_expires_at` for its own use — clients **MUST NOT** write them. The SDK persists per-session `MemoryStrategy`, `RetentionPolicy`, and share-link expiry under these reserved keys.
 
 ##### Message
@@ -392,6 +432,7 @@ Serde deserialization defaults (defined in the SDK on `chat-engine-sdk::models::
 - `tenant_id` is `Optional` (`Option<TenantId>`): the owning tenant, denormalized from the parent session so message-scoped queries (cross-session search, message-level retention, reactions) and sharding by `tenant_id` do not require a join to `sessions`. When set, it always equals the parent session's `tenant_id`. `None` only for legacy rows persisted before the column existed (not yet backfilled) — see `cpt-cf-chat-engine-nfr-authentication` for the tenant-isolation invariant.
 - `user_id` is `Optional` (`Option<UserId>`): the **author** of this specific message, not the session owner. For `user`-role messages this is the authenticated user (from the JWT `user_id` claim) who sent it; for `assistant`- and `system`-role messages it is `None` (machine-generated, no human author). This enables author attribution in multi-user and shared sessions (`cpt-cf-chat-engine-fr-share-session`), where messages on a branch may originate from a different user than the session owner.
 - Both reuse the SDK newtypes (`TenantId`, `UserId`) which reject the empty string at construction time; an empty value would silently scope queries to no/all rows and is treated as a latent authorization bug. Like `parent_message_id`, both are immutable once set (`cpt-cf-chat-engine-principle-immutable-tree`).
+- Authorization scoping is **separate** from these attribution fields. A message carries the session **owner pair** `(owner_tenant_id, owner_id)` copied from its parent session at insert (post-migration `cpt-cf-chat-engine-dbtable-authz-owner-columns`); those columns — not `user_id` (author) — are the `SecureORM` scoping keys. `owner_tenant_id` always equals the session `tenant_id`; the message-level `tenant_id` denormalization above coincides with it. See `cpt-cf-chat-engine-principle-owner-denorm-invariant` and `cpt-cf-chat-engine-design-auth-model`.
 
 ##### SessionType
 
@@ -484,7 +525,7 @@ Citations and references attach to a single `text` [`MessagePart`](#messagepart)
 
 - [x] `p2` - **ID**: `cpt-cf-chat-engine-design-entity-message-reaction`
 
-Reaction record (message_id, user_id, reaction_type, created_at, updated_at)
+Reaction record (message_id, user_id, owner_tenant_id, owner_id, reaction_type, created_at, updated_at). `user_id` is the **reactor** (attribution); the session **owner pair** `(owner_tenant_id, owner_id)` is backfilled from reaction→message→session and is the `SecureORM` scoping key (post-migration `cpt-cf-chat-engine-dbtable-authz-owner-columns`, `cpt-cf-chat-engine-principle-owner-denorm-invariant`).
 - **ReactionType** - Enum: like, dislike, none
 - **MessageReactionRequest** - HTTP request (reaction_type: ReactionType)
 - **MessageReactionResponse** - HTTP response (message_id, reaction_type, applied: boolean)
@@ -726,6 +767,29 @@ Full-text search across messages: session-scoped and cross-session search, ranki
 
 Per-user per-message reactions with UPSERT semantics. Fire-and-forget plugin notification. Cascade delete on message removal. **ADRs**: `cpt-cf-chat-engine-adr-message-reactions`.
 
+#### Policy Enforcer (PEP)
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-component-policy-enforcer`
+
+##### Why this component exists
+
+Turns the authenticated `SecurityContext` into query-level authorization. It is the single PEP through which every sensitive database access is gated, so the scoping logic lives in one place rather than being re-implemented per service.
+
+##### Responsibility scope
+
+Owns construction of the `PolicyEnforcer` (built once in module init from `ctx.client_hub().get::<dyn AuthZResolverClient>()`, Arc-cloned into each domain service), the per-resource `ResourceType` descriptors and action constants (§3.5.3), the PDP call surface (`access_scope` / `access_scope_with`), constraint→`AccessScope` compilation, and `EnforcerError`→`ChatEngineError` fail-closed mapping (§3.5.5). Also owns the `internal_write_scope()` wrapper and the bypass registry (§3.5.7).
+
+##### Responsibility boundaries
+
+Does not decide policy (that is the AuthZ Resolver PDP), does not authenticate (that is the gateway AuthN middleware), and does not itself execute SQL (that is `SecureConn`). It never exposes PDP internals to clients.
+
+##### Related components (by ID)
+
+- `cpt-cf-chat-engine-component-session-management` — consumes the enforcer for session CRUD
+- `cpt-cf-chat-engine-component-message-processing` — consumes the enforcer for message ops
+- `cpt-cf-chat-engine-component-message-reactions` — consumes the enforcer for reaction ops
+- `cpt-cf-chat-engine-actor-database` — enforcement is applied at the SQL layer via `SecureConn`
+
 ### 3.3 API Contracts
 
 See [`api/README.md`](api/README.md) for comprehensive protocol documentation.
@@ -768,8 +832,24 @@ For complete endpoint definitions, request/response schemas, and examples, see t
 
 **Streaming**: Plugin writes chunks/parts to `ResponseStream`; Chat Engine projects them into `start`/`delta`/`complete`/`error` events and emits them to the client over SSE (`cpt-cf-chat-engine-design-streaming-protocol`)
 
+#### 3.3.3 Authorization PEP Interface (Chat Engine → AuthZ Resolver)
 
-### 3.3.1 Internal Dependencies
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-interface-pep`
+
+**Interface**: `PolicyEnforcer` over `dyn AuthZResolverClient` (`authz-resolver-sdk`, `toolkit-security`). Consumed in-process; the `SecurityContext` is propagated on every call.
+
+**Call surface** (contract-level, not code):
+- `access_scope(ctx, resource_type, action, resource_id) -> Result<AccessScope, EnforcerError>` — constraints required (LIST and similar).
+- `access_scope_with(ctx, resource_type, action, resource_id, access_request) -> Result<AccessScope, EnforcerError>` — per-call overrides: prefetched resource properties (`owner_tenant_id`, `owner_id`), `require_constraints(false)` for point-op fast path, tenant-context overrides.
+
+**Resource types & actions**: per §3.5.3 (`session`, `message`, `reaction`, `session_type`); actions `list`/`create`/`read`/`update`/`delete`.
+
+**Result usage**: `AccessScope` is passed to `SecureConn` (`find`/`find_by_id`/`insert`/`update_with_ctx`/`update_many`/`delete_many`), which compiles it to a SQL `WHERE` clause against the entity's `Scopable` columns; `AccessScope::is_unconstrained()` enables the point-op fast path.
+
+**Error contract**: `EnforcerError::{Denied, CompileFailed, EvaluationFailed}` → `ChatEngineError::{Forbidden(403) | NotFound(404 for 0-row point ops)}`, fail-closed (§3.5.5). PDP internals are never returned to the client.
+
+
+#### 3.3.4 Internal Dependencies
 
 Chat Engine depends on the following internal gears at runtime.
 
@@ -777,8 +857,9 @@ Chat Engine depends on the following internal gears at runtime.
 |-------------------|----------------|---------|
 | Plugin Registry | Internal registry | Resolve `ChatEngineBackendPlugin` implementations by `plugin_instance_id` at startup and on session type configuration |
 | Backend Plugin gears | `dyn ChatEngineBackendPlugin` (chat-engine-sdk) | Internal trait implementations that process messages, provide capabilities, and generate summaries |
+| AuthZ Resolver (`authz-resolver`) | `dyn AuthZResolverClient` via `PolicyEnforcer` (authz-resolver-sdk) | PDP for authorization decisions + query constraints; resolved from `ClientHub` at init, declared as `deps = ["authz-resolver"]` (`cpt-cf-chat-engine-component-policy-enforcer`) |
 
-### 3.3.2 External Dependencies
+#### 3.3.5 External Dependencies
 
 | Dependency | Interface | Purpose |
 |------------|-----------|---------|
@@ -1251,6 +1332,125 @@ sequenceDiagram
 2. Database CASCADE DELETE automatically removes all reactions
 3. No orphaned reactions remain in database
 
+#### S16: Authorized LIST (PEP scope → SQL)
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-seq-authz-list`
+**Use Case**: Tenant-scoped listing of sessions/messages/reactions
+**Actors**: `cpt-cf-chat-engine-actor-client`
+**Realizes**: `cpt-cf-chat-engine-design-auth-model` (§3.5.4), `cpt-cf-chat-engine-nfr-authentication`
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant CE as Chat Engine (PEP)
+    participant AZ as AuthZ Resolver (PDP)
+    participant DB as Database
+
+    C->>CE: LIST (SecurityContext)
+    CE->>AZ: access_scope(action=list, resource_type)
+    alt decision=false / unreachable / no constraints
+        AZ-->>CE: Denied / EvaluationFailed / CompileFailed
+        CE-->>C: 403 Forbidden (fail-closed)
+    else decision=true + constraints
+        AZ-->>CE: constraints
+        CE->>CE: compile → AccessScope
+        CE->>DB: SecureConn WHERE (owner-pair scope) LIMIT
+        DB-->>CE: filtered page
+        CE-->>C: page (possibly empty)
+    end
+```
+
+**Description**: LIST requires constraints; the compiled owner-pair scope is applied as a SQL `WHERE` before `LIMIT`, so pagination and counts stay correct. Any deny/failure fails closed to 403.
+
+#### S17: Authorized point op (two-step prefetch)
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-seq-authz-point-op`
+**Use Case**: GET/DELETE a single session/message
+**Actors**: `cpt-cf-chat-engine-actor-client`
+**Realizes**: `cpt-cf-chat-engine-design-auth-model` (§3.5.4)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant CE as Chat Engine (PEP)
+    participant AZ as AuthZ Resolver (PDP)
+    participant DB as Database
+
+    C->>CE: GET/DELETE {id} (SecurityContext)
+    CE->>DB: prefetch row (trusted read) → owner pair
+    alt row missing
+        DB-->>CE: 0 rows
+        CE-->>C: 404 Not Found
+    else row found
+        DB-->>CE: owner_tenant_id, owner_id
+        CE->>AZ: access_scope_with(action, id, owner props, require_constraints=false)
+        alt Denied / failure
+            AZ-->>CE: EnforcerError
+            CE-->>C: 403 Forbidden (fail-closed)
+        else allowed
+            AZ-->>CE: unconstrained OR constraints
+            CE->>DB: SecureConn read/delete WHERE id AND (scope)
+            alt 0 rows (out of scope)
+                DB-->>CE: 0 rows
+                CE-->>C: 404 Not Found (hide existence)
+            else in scope
+                DB-->>CE: row / deleted
+                CE-->>C: 200 / 204
+            end
+        end
+    end
+```
+
+**Description**: The prefetch only supplies the owner pair for a narrow PDP call; the decision is always the PDP call. Owner-pair immutability makes this TOCTOU-safe. Out-of-scope point ops return 404 to hide existence.
+
+#### S18: Shared read (capability URL, no PDP)
+
+- [ ] `p2` - **ID**: `cpt-cf-chat-engine-seq-authz-shared-read`
+**Use Case**: `cpt-cf-chat-engine-fr-share-session`
+**Actors**: `cpt-cf-chat-engine-actor-end-user`
+**Realizes**: `cpt-cf-chat-engine-design-auth-model` (§3.5.8)
+
+```mermaid
+sequenceDiagram
+    participant U as Recipient (no subject)
+    participant CE as Chat Engine (.public route)
+    participant DB as Database
+
+    U->>CE: POST /shared/{share_token}
+    Note over CE: No PolicyEnforcer call (no subject)
+    CE->>DB: find_by_share_token (AUTHZ-BYPASS, capability read)
+    alt no match / revoked / not active
+        DB-->>CE: 0 rows / revoked
+        CE-->>U: 404 Not Found (anti-enumeration)
+    else exact match + active + not revoked
+        DB-->>CE: shared session (read-only projection)
+        CE-->>U: shared session content
+    end
+```
+
+**Description**: Capability-URL model — the subject-less public route resolves by high-entropy revocable token via a registered bypass; any failure returns 404 and the projection excludes other-tenant owner data.
+
+#### S19: Trusted-internal pipeline write (bypass)
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-seq-authz-internal-write`
+**Use Case**: Persisting assistant/summary/variant rows during an already-authorized user op
+**Actors**: `cpt-cf-chat-engine-actor-backend-plugin`
+**Realizes**: `cpt-cf-chat-engine-design-authz-bypass-registry` (§3.5.7)
+
+```mermaid
+sequenceDiagram
+    participant CE as Chat Engine (pipeline)
+    participant DB as Database
+
+    Note over CE: Triggering user op already PEP-authorized
+    CE->>DB: read parent session (same txn) → owner pair
+    CE->>CE: internal_write_scope() (AUTHZ-BYPASS: <reason>)
+    CE->>DB: insert assistant/summary/variant with parent owner pair
+    DB-->>CE: persisted
+```
+
+**Description**: Internal writes bypass the PEP via the named `internal_write_scope()` at a registered site, deriving the owner pair from the parent session in the same transaction (never from an ambient identity), preserving the denormalization invariant.
+
 ### 3.4.1 Database schemas & tables
 
 **Schema location**: `migrations/` (versioned migration files)
@@ -1262,8 +1462,8 @@ sequenceDiagram
 | Column | Type | Description |
 |--------|------|-------------|
 | session_id | UUID PK | Unique session identifier |
-| tenant_id | VARCHAR NOT NULL | Owning tenant identifier (from JWT `tenant_id` claim) |
-| user_id | VARCHAR NOT NULL | Owning user identifier (from JWT `user_id` claim) |
+| tenant_id | UUID NOT NULL | Owning tenant (`owner_tenant_id`); cast text→UUID by `cpt-cf-chat-engine-dbtable-authz-owner-columns`. Immutable. `SecureORM` tenant scoping key |
+| user_id | UUID NOT NULL | Session owner user (`owner_id`); cast text→UUID by the same migration. Immutable. `SecureORM` owner scoping key |
 | client_id | VARCHAR | Calling application identifier (from JWT `client_id` claim) |
 | session_type_id | UUID FK | References session_types |
 | enabled_capabilities | JSONB | Capabilities returned by backend plugin at session creation |
@@ -1281,8 +1481,10 @@ sequenceDiagram
 |--------|------|-------------|
 | message_id | UUID PK | Unique message identifier |
 | session_id | UUID FK | References sessions |
-| tenant_id | VARCHAR NULL | Owning tenant, denormalized from the parent session (from JWT `tenant_id` claim); enables message-scoped queries and sharding without a join. NULL only for un-backfilled legacy rows |
-| user_id | VARCHAR NULL | Author of this message (from JWT `user_id` claim for `user`-role messages); NULL for `assistant`/`system` messages and un-backfilled legacy rows |
+| tenant_id | VARCHAR NULL | Author-side tenant denormalization (legacy); coincides with `owner_tenant_id`. NULL only for un-backfilled legacy rows |
+| user_id | VARCHAR NULL | Author of this message (from JWT `user_id` claim for `user`-role messages); NULL for `assistant`/`system` messages. **Attribution only — not an authz key** |
+| owner_tenant_id | UUID NOT NULL | Session owner tenant, copied from the parent session at insert; `SecureORM` tenant scoping key. Added + backfilled by `cpt-cf-chat-engine-dbtable-authz-owner-columns`. Immutable |
+| owner_id | UUID NOT NULL | Session owner user, copied from the parent session at insert; `SecureORM` owner scoping key. Added + backfilled by the same migration. Immutable |
 | parent_message_id | UUID FK NULL | Parent in message tree (NULL for root) |
 | role | VARCHAR | `user` / `assistant` / `system` |
 | file_ids | UUID[] | File UUID references |
@@ -1306,6 +1508,8 @@ sequenceDiagram
 |--------|------|-------------|
 | id | UUID PK | Unique part identifier |
 | message_id | UUID FK | References messages (CASCADE DELETE) |
+| owner_tenant_id | UUID NOT NULL | Session owner tenant, copied from parent at insert (defense-in-depth tenant scoping); added by `cpt-cf-chat-engine-dbtable-authz-owner-columns`. No per-part PDP call |
+| owner_id | UUID NOT NULL | Session owner user, copied from parent at insert; added by the same migration |
 | type | VARCHAR | `text` / `code` / `images` / `videos` / `links` / `statuses` |
 | content | JSONB | Typed payload; shape determined by `type` (see `cpt-cf-chat-engine-design-entity-message-part`) |
 | number | INT | 0-based ordinal of the part within the message |
@@ -1324,6 +1528,8 @@ Document citations attached to a `text` `message_part` (see `cpt-cf-chat-engine-
 |--------|------|-------------|
 | id | UUID PK | Unique citation identifier |
 | message_part_id | UUID FK | References message_parts (CASCADE DELETE) |
+| owner_tenant_id | UUID NOT NULL | Session owner tenant, copied from parent at insert (defense-in-depth tenant scoping); added by `cpt-cf-chat-engine-dbtable-authz-owner-columns` |
+| owner_id | UUID NOT NULL | Session owner user, copied from parent at insert; added by the same migration |
 | content | JSONB | Full `FileCitation` payload (document_id/name, quote, char offsets, chunk_*, page, timestamp, highlights, reference_type, text_positions, text_position_anchors, meta, citation_id, index) |
 | number | INT | 0-based ordinal within the part (insertion order) |
 
@@ -1337,6 +1543,8 @@ Web-page citations attached to a `text` `message_part` (see `cpt-cf-chat-engine-
 |--------|------|-------------|
 | id | UUID PK | Unique citation identifier |
 | message_part_id | UUID FK | References message_parts (CASCADE DELETE) |
+| owner_tenant_id | UUID NOT NULL | Session owner tenant, copied from parent at insert (defense-in-depth tenant scoping); added by `cpt-cf-chat-engine-dbtable-authz-owner-columns` |
+| owner_id | UUID NOT NULL | Session owner user, copied from parent at insert; added by the same migration |
 | content | JSONB | Full `LinkCitation` payload (url, title, preview_text, favicon_url, quote, char offsets, reference_type, text_positions, citation_id, index) |
 | number | INT | 0-based ordinal within the part (insertion order) |
 
@@ -1350,6 +1558,8 @@ Lightweight URL badges attached to a `text` `message_part` (see `cpt-cf-chat-eng
 |--------|------|-------------|
 | id | UUID PK | Unique reference identifier |
 | message_part_id | UUID FK | References message_parts (CASCADE DELETE) |
+| owner_tenant_id | UUID NOT NULL | Session owner tenant, copied from parent at insert (defense-in-depth tenant scoping); added by `cpt-cf-chat-engine-dbtable-authz-owner-columns` |
+| owner_id | UUID NOT NULL | Session owner user, copied from parent at insert; added by the same migration |
 | content | JSONB | Full `LinkReference` payload (title, url, preview_text, position, preview_highlights, ref_type, ref_meta, idx) |
 | number | INT | 0-based ordinal within the part (insertion order; the `idx` inside `content` carries the positional `[N]` mapping) |
 
@@ -1362,7 +1572,9 @@ Lightweight URL badges attached to a `text` `message_part` (see `cpt-cf-chat-eng
 | Column | Type | Description |
 |--------|------|-------------|
 | message_id | UUID FK | References messages (CASCADE DELETE) |
-| user_id | VARCHAR | Reacting user identifier |
+| user_id | VARCHAR | Reacting user identifier — **attribution only, not an authz key** |
+| owner_tenant_id | UUID NOT NULL | Session owner tenant, backfilled reaction→message→session; `SecureORM` tenant scoping key. Added by `cpt-cf-chat-engine-dbtable-authz-owner-columns` |
+| owner_id | UUID NOT NULL | Session owner user, backfilled reaction→message→session; `SecureORM` owner scoping key. Added by the same migration |
 | reaction_type | VARCHAR | `like` / `dislike` / `none` |
 | created_at | TIMESTAMPTZ | First reaction timestamp |
 | updated_at | TIMESTAMPTZ | Last update timestamp |
@@ -1409,14 +1621,30 @@ Short-TTL resume buffer for the SSE delta stream (default backend of the `Stream
 
 **PK**: (message_id, seq). When the Redis backend is configured instead, this table is unused.
 
+#### Migration: authz owner columns
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-dbtable-authz-owner-columns`
+
+Single engine-aware **forward** migration `m20260417_000006_authz_owner_columns`, run at gear startup (single breaking migration, no dual-write). Enables `SecureORM` owner-pair scoping (§3.5.9). Ordered steps:
+
+1. **Cast** `sessions.tenant_id` / `sessions.user_id` from text → `UUID` (safe — values were persisted from `SecurityContext` UUIDs via `.to_string()`), guarded by a pre-check that **aborts** if any non-castable rows exist. The pre-check **also aborts** if any `sessions.tenant_id IS NULL` or `sessions.user_id IS NULL` rows exist — NULLs cast to NULL (not caught by the non-castable guard) and would violate the `NOT NULL` owner-pair invariant.
+2. **Add** `owner_tenant_id` / `owner_id` `UUID` columns to `messages`, `message_parts`, `message_reactions`, `file_citations`, `link_citations`, `link_references`.
+3. **Backfill** the owner pair from the parent-session chain (message→session; part/citation/reference→message→session; reaction→message→session). **Aborts** on orphan messages or any nullable-tenant backfill failure.
+4. **Set NOT NULL** on all owner columns and **add indexes** on `owner_tenant_id` and the composite `(owner_tenant_id, owner_id)` (list scoping).
+
+Zero-downtime / expand-contract is out of scope here (deferred to a separate ADR — OQ2 in §4).
+
 #### Indexes
 
 | Table | Index | Columns | Type |
 |-------|-------|---------|------|
 | sessions | idx_sessions_tenant_user | (tenant_id, user_id) | btree |
+| sessions | idx_sessions_owner | (tenant_id, user_id) | btree (list scoping; these are the owner pair — the PEP property names `owner_tenant_id`/`owner_id` resolve onto these physical columns) |
 | messages | idx_messages_session_parent | (session_id, parent_message_id) | btree |
 | messages | idx_messages_session_created | (session_id, created_at) | btree |
 | messages | idx_messages_tenant | (tenant_id) | btree (partial: `WHERE tenant_id IS NOT NULL`) |
+| messages | idx_messages_owner | (owner_tenant_id, owner_id) | btree (list scoping) |
+| message_reactions | idx_reactions_owner | (owner_tenant_id, owner_id) | btree (list scoping) |
 | message_parts | idx_message_parts_message | (message_id, number) | btree (covered by UNIQUE) |
 | message_parts | idx_message_parts_text_fts | `lower(content->>'text')` | GIN (tsvector / trigram), partial: `WHERE type = 'text'` |
 | file_citations | idx_file_citations_part | (message_part_id) | btree |
@@ -1427,23 +1655,118 @@ Short-TTL resume buffer for the SSE delta stream (default backend of the `Stream
 
 ### 3.5 Authorization Model
 
-**ID**: `cpt-cf-chat-engine-design-auth-model`
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-design-auth-model`
 
-#### Authentication
+**ADRs**: `cpt-cf-chat-engine-adr-authz-pep-secureorm` (PDP/PEP + SecureORM adoption, owner-column denormalization, UUID migration — accepted; recorded in `ADR/0028-authz-pep-secureorm-uuid-migration.md`)
 
-All client requests require a valid JWT Bearer token in the `Authorization` header. Chat Engine validates JWT signature and expiration, and extracts the `user_id` and `tenant_id` claims to establish request identity and tenant isolation.
+Chat Engine authorization is a **full PEP (Policy Enforcement Point)** built on the platform PDP/PEP + SecureORM model (`docs/arch/authorization/DESIGN.md`, `docs/toolkit_unified_system/06_authn_authz_secure_orm.md`). Authentication (AuthN) is unchanged and already wired: the API Gateway middleware validates the bearer token and injects a `SecurityContext` (`subject_id`, `subject_tenant_id`, `token_scopes`, optional `bearer_token`) into every `.authenticated()` request. This section defines how Chat Engine turns that authenticated identity into **query-level authorization** — every sensitive database access is gated by a PDP decision compiled into an `AccessScope` and enforced by `SecureConn` as a SQL `WHERE` clause.
 
-#### Authorization Rules
+### 3.5.1 Ownership boundaries
 
-| Resource | Operation | Requirement | Validation |
-|----------|-----------|-------------|------------|
-| Session | Create | JWT valid | `user_id` from JWT becomes session owner; `tenant_id` scopes tenant isolation |
-| Session | Read / Delete | JWT + ownership | `user_id` must match session `user_id` within same `tenant_id` |
-| Message | Send | JWT + session ownership | Session must belong to `user_id` within same `tenant_id`; persisted message is stamped with the authoring `user_id` and the session's `tenant_id` |
-| Message | Delete | JWT + ownership | Only the message author may delete — JWT `user_id` must match the message `user_id` (assistant/system messages, which have a NULL `user_id`, are never user-deletable per `cpt-cf-chat-engine-fr-delete-message`) |
-| Message | React | JWT + session access | Session must be accessible to `user_id` within same `tenant_id` |
-| Shared session | Read | Share token | Valid non-expired share token required |
-| Session type | Configure | Admin role | Elevated admin claim in JWT |
+Authorization scopes along the two orthogonal platform dimensions:
+
+- **`owner_tenant_id`** (mandatory isolation key) — the tenant that owns a resource. The PEP MUST always enforce a tenant predicate; it is the hard cross-tenant isolation boundary and is never optional.
+- **`owner_id`** (optional per-subject scoping) — the **session owner user** (the subject who created the session). Enables "my sessions" scoping when the PDP policy chooses to apply it. `owner_id` refers to a subject within `owner_tenant_id`.
+
+Chat Engine scoped resources are `session`, `message`, and `reaction`; each carries the **owner pair** `(owner_tenant_id, owner_id)` on its own row so `SecureConn` compiles predicates against columns local to the row (no joins, no service-side gating).
+
+**Owner pair vs. author.** The owner pair identifies the *session owner*, not the message author. `messages.user_id` (the authoring subject) and `message_reactions.user_id` (the reacting subject) remain **separate** columns and are not authorization keys — they support attribution, not access control. In multi-user and shared sessions the author/reactor may differ from the session owner (`cpt-cf-chat-engine-fr-share-session`).
+
+**Denormalization invariant.** See `cpt-cf-chat-engine-principle-owner-denorm-invariant`: the session owner pair is set at session create and is **immutable**; children (messages, parts, citations, references, reactions) copy the owner pair from their parent session at insert. There is no cascade update and no re-parenting (consistent with `cpt-cf-chat-engine-principle-immutable-tree`).
+
+**Children scoping (defense-in-depth).** `message_parts`, `file_citations`, `link_citations`, and `link_references` also carry the owner columns and are tenant-scoped in SecureConn, but PDP **evaluation** happens only at session/message granularity — there are no per-part PDP calls. These child tables have their own physical `owner_tenant_id`/`owner_id` columns (added by `cpt-cf-chat-engine-dbtable-authz-owner-columns`).
+
+**Scopable column mapping for `sessions`.** `sessions` **keeps** its physical columns `tenant_id`/`user_id` (cast text→UUID by the migration, **not** renamed). The `Scopable` derive advertises the PEP property **names** `owner_tenant_id`/`owner_id` in `supported_properties` while `resolve_property()` maps those names onto the physical `tenant_id`/`user_id` columns — mirroring the `users-info` reference gear's `#[secure(tenant_col="tenant_id", owner_col="user_id")]` mapping. The child tables (messages, message_parts, reactions, citations, references) instead carry physical `owner_tenant_id`/`owner_id` columns directly, so no name mapping is needed for them.
+
+**Owner-id non-null narrowing.** Chat Engine enforces `owner_id NOT NULL` for every session-owned resource: every session is created by an authenticated user, so the owner pair is always fully populated. This is a deliberate narrowing of the root authz model's nullable `owner_id`; it is safe because unauthenticated session creation is out of scope for Chat Engine.
+
+**Global (non-resource) tables.** `session_types`, `plugin_configs`, and `stream_events` have no owner columns and are **not** PDP resources (entities stay `#[secure(unrestricted)]`). Access to `session_type` mutations is gated by a permission decision (§3.5.6), not by SQL constraints.
+
+### 3.5.2 PEP wiring
+
+`deps = ["authz-resolver"]` is declared on the `#[toolkit::gear]` attribute. During module initialization Chat Engine resolves `dyn AuthZResolverClient` from `ctx.client_hub()` and constructs a **single** `PolicyEnforcer`; it is Arc-cloned into every domain service as an `enforcer` field (mirrors the `users-info` reference gear — `cpt-cf-chat-engine-component-policy-enforcer`). No service constructs `AccessScope` manually in production; every scoped operation obtains its scope from the enforcer.
+
+### 3.5.3 Public PEP call surface (per resource)
+
+Each resource type declares the properties the PEP can compile from PDP constraints into SQL (`ResourceType.supported_properties`). The `ResourceType.name` is the canonical GTS type id `gts.cf.core.chat_engine.<resource>.v1~` (exact namespace verified against the gear's GTS registration during implementation — see OQ1 in §4).
+
+| Resource type | GTS type id | `supported_properties` | Actions |
+|---------------|-------------|------------------------|---------|
+| session | `gts.cf.core.chat_engine.session.v1~` | `owner_tenant_id`, `owner_id`, `id` | `list`, `create`, `read`, `update`, `delete` |
+| message | `gts.cf.core.chat_engine.message.v1~` | `owner_tenant_id`, `owner_id` (+ `id` for point ops) | `list`, `create`, `read`, `delete` |
+| reaction | `gts.cf.core.chat_engine.reaction.v1~` | `owner_tenant_id`, `owner_id` (+ `id` for point ops) | `create`, `update`, `delete` |
+| session_type | `gts.cf.core.chat_engine.session_type.v1~` | *(none — decision-gate only)* | `create`, `update`, `delete` |
+
+The enforcer is called via the two SDK entry points (`cpt-cf-chat-engine-interface-pep`):
+- `access_scope(ctx, resource_type, action, resource_id)` — LIST and other constraint-required calls.
+- `access_scope_with(ctx, resource_type, action, resource_id, access_request)` — point ops and CREATE, passing prefetched `owner_tenant_id`/`owner_id` as resource properties and, for point ops, `require_constraints(false)` to allow the `is_unconstrained()` fast path.
+
+**These four are the complete set of PEP resource types.** Services that operate on already-scoped data — variant, search, export, and intelligence — do **not** introduce new resource types. They enforce over the `session`/`message`/`reaction` types of the rows they touch: variant recreation authorizes `message` `create`/`read` on the parent session; search authorizes `message`/`session` `list`; export authorizes `session` `read`; summary/intelligence authorizes `session`/`message` `read`/`create`. The `ResourceType` constants are therefore `SESSION`, `MESSAGE`, `REACTION`, and `SESSION_TYPE` only; secondary services reuse them.
+
+Predicates the PEP compiles map onto the platform `ScopeFilter` variants (`Eq`, `In`, `InGroup`, `InGroupSubtree`, `InTenantSubtree`) against the entity's `owner_tenant_id` / `owner_id` / `id` columns via the `Scopable` derive. `supported_properties` above always advertises the PEP property names `owner_tenant_id`/`owner_id`; for `sessions` the derive resolves those names onto the physical `tenant_id`/`user_id` columns (see §3.5.1 "Scopable column mapping for `sessions`"), while the child tables resolve them onto identically-named physical columns.
+
+### 3.5.4 Per-operation flow
+
+| Operation | Flow | 0-rows result |
+|-----------|------|---------------|
+| LIST (sessions / messages / reactions) | `access_scope(action=list)` → `SecureConn` applies scope as `WHERE` before `LIMIT` | empty page |
+| CREATE (session) | `access_scope_with(action=create, owner_tenant_id=ctx.subject_tenant_id, owner_id=ctx.subject_id)`; SecureConn `INSERT` validated against scope; owner pair stamped on the new row | n/a |
+| CREATE (message / reaction) | authorized at the **parent** granularity (send/react on the parent session/message); child rows inherit the parent's owner pair | n/a |
+| GET (point op: session / message) | **two-step prefetch**: read row with a trusted prefetch scope to extract its `owner_tenant_id`/`owner_id`, then `access_scope_with(action=read, require_constraints=false)`; if unconstrained return the prefetched row, else scoped re-read | **404** (hide existence) |
+| UPDATE session (PATCH metadata, session-type switch) | **two-step prefetch** for the owner pair, then `access_scope_with(action=update, require_constraints=false)`; the mutation runs as a scoped `update_with_ctx` under the resulting scope | **404** (hide existence) |
+| DELETE (point op: session / message) | **two-step prefetch** for the owner pair, then `access_scope_with(action=delete, require_constraints=false)`; the delete runs as a scoped `delete_many` with `WHERE (scope)` — TOCTOU-safe because the owner pair is immutable, so the row cannot leave scope between prefetch and delete | **404** (hide existence) |
+
+The two-step prefetch uses the same trusted-internal read path as internal writes (§3.5.7) purely to obtain the owner pair; the authorization decision is always the subsequent PDP call. Because the owner pair is immutable, the prefetch value is stable and there is no TOCTOU window.
+
+### 3.5.5 Fail-closed error surface
+
+Chat Engine maps `EnforcerError` (and 0-row point-op outcomes) onto `ChatEngineError`:
+
+| Condition | Mapping | Client status |
+|-----------|---------|---------------|
+| `EnforcerError::Denied` — type-level deny (LIST/CREATE/UPDATE/DELETE, or READ where the type is not permitted) | `ChatEngineError::Forbidden` | **403** |
+| Point op where the resource exists but is out of the caller's scope (scoped query returns 0 rows) | `ChatEngineError::NotFound` | **404** (hide existence) |
+| `EnforcerError::CompileFailed` — missing/unknown/empty constraints | `ChatEngineError::Forbidden` | **403** (fail-closed) |
+| `EnforcerError::EvaluationFailed` — PDP unreachable, timeout, or invalid response | `ChatEngineError::Forbidden` | **403** (fail-closed) |
+
+Chat Engine deliberately maps **`EvaluationFailed` to 403, not 503/500**: PDP availability MUST NOT leak to the client, and the absence of a decision is treated as deny. The underlying infrastructure cause is logged/traced internally (never in the client response). This is the gear-local hardening of the platform fail-closed rule (`cpt-cf-chat-engine-constraint-fail-closed-authz`).
+
+### 3.5.6 Session-type permission model
+
+`session_type` create/update/delete are authorized by a **PDP permission decision** (a non-resource `access_scope_with(require_constraints=false)` call), not a hardcoded token-scope. `EnforcerError::Denied` → 403. The `session_types` entity stays `#[secure(unrestricted)]`; authorization is a decision gate, not a SQL constraint. Session-type **reads** (`list`/`get`) remain `.authenticated()`-only with no PDP call (public catalog within the tenant).
+
+### 3.5.7 Trusted-internal writes and the bypass registry
+
+Every database access that is not gated by a PDP decision goes through a **named scope wrapper** in `domain/authz/bypass.rs` — never a bare `AccessScope::allow_all()`. The wrapper family is: `internal_write_scope()`, `capability_read_scope()`, `system_read_scope()`, and `unrestricted_table_scope()`. Each call site carries a `// AUTHZ-BYPASS: <reason>` marker plus a `@cpt` traceability comment. Bare `allow_all()` outside this module is forbidden (`cpt-cf-chat-engine-constraint-no-allow-all-outside-registry`; optional lint — OQ4 in §4). Internal writes MUST derive the owner pair by reading the parent session/message **in the same transaction** — never from an ambient/system identity — preserving the denormalization invariant.
+
+The **tenant-sensitive** wrapper sites (internal writes, capability reads, and system cross-tenant ops/reads) are enumerated individually in the registry below. Repositories of the globally non-tenant tables `session_types`, `plugin_configs`, and `stream_events` — which §3.5.1 and §3.5.3 exclude from PDP scoping — are **not** individually enumerated; they use `unrestricted_table_scope()` categorically (a named, greppable stand-in for the previous bare `allow_all()` on those repos). This reconciles the small tenant-sensitive registry with the many benign unrestricted-table accesses so the no-bare-`allow_all()` rule is satisfiable repo-wide.
+
+**Bypass registry**
+
+- [ ] `p1` - **ID**: `cpt-cf-chat-engine-design-authz-bypass-registry`
+
+| Bypass site | Class | Justification | HTTP-exposed? |
+|-------------|-------|---------------|---------------|
+| `finalize_assistant` | internal pipeline write | Triggering user op (`send_message`) is already PEP-authorized; stamps owner pair from the authorized parent session | No (write within an authorized send) |
+| `insert_summary_message` | internal pipeline write | Triggered by an authorized summary op; owner pair from parent session | No |
+| `insert_assistant_variant_stub` | internal pipeline write | Triggered by authorized `recreate`; owner pair from parent session | No |
+| `run_retention_cleanup_all_tenants` | system cross-tenant op | Scheduled retention across tenants; no subject | **No** (not on any route; test-verified) |
+| `list_tenants_with_active_sessions` | system cross-tenant read | Retention/enumeration support | **No** (test-verified) |
+| `find_by_session_id_unscoped` | system read | Internal pipeline: reads parent session by session_id without tenant filter within an authorized transaction; NOT for share-token resolution; forbidden from tenant-scoped user handlers | No (internal pipeline only) |
+| `find_by_share_token` | capability read | Share-token (capability-URL) resolution; miss/revoked → 404 | Only via the `.public()` share route |
+
+### 3.5.8 Shared-read (capability-URL) security boundary
+
+Shared read is a **capability-URL** model. The `.public()` `POST /shared/{share_token}` route has **no subject** and therefore does **not** call `PolicyEnforcer`. It resolves the session by `share_token` via `find_by_share_token` (a registered bypass), enforcing: exact token match **AND** active lifecycle **AND** not revoked. Any failure → **404** (anti-enumeration; never distinguishes "wrong token" from "revoked"). The share is **read-only**; the token is a high-entropy, revocable secret (revoked via `update_share_token`). The response projection excludes other-tenant owner data beyond the shared session content. This is the only sensitive read path without a PDP call, and it is justified precisely because there is no authenticated subject to evaluate against.
+
+### 3.5.9 Migration impact
+
+Adopting SecureORM requires UUID owner columns. A single engine-aware forward migration `m20260417_000006_authz_owner_columns` (`cpt-cf-chat-engine-dbtable-authz-owner-columns`) runs at gear startup (single forward breaking migration; no dual-write). It: (1) casts `sessions.tenant_id`/`user_id` from text → UUID (safe: values were written from `SecurityContext` UUIDs via `.to_string()`), guarded by a pre-check that aborts if any non-castable rows exist **or if any `sessions.tenant_id IS NULL` / `sessions.user_id IS NULL` rows exist** (NULLs cast to NULL and would violate the `NOT NULL` owner-pair invariant); (2) adds `owner_tenant_id`/`owner_id` UUID columns to `messages`, `message_parts`, `message_reactions`, `file_citations`, `link_citations`, `link_references`; (3) backfills the owner pair from the parent-session chain (aborting on orphan messages / nullable-tenant backfill failure); (4) sets `NOT NULL` and adds indexes on `owner_tenant_id` and `(owner_tenant_id, owner_id)` for list scoping. Zero-downtime / expand-contract is explicitly deferred to a separate ADR (OQ2 in §4).
+
+### 3.5.10 Observability & testability
+
+- **Observability**: EnforcerError causes are logged/traced with `trace_id` but never surfaced to clients (§3.8); bypass sites are traceable via their `@cpt` markers.
+- **Testability**: PDP-deny paths are covered with mock resolvers (`DenyAllAuthZResolver`) and scoped-allow fixtures (`ctx_allow_tenants`) mirroring the reference gear; the denormalization invariant and each bypass site (especially the non-HTTP system ops) are covered by dedicated tests (`cpt-cf-chat-engine-design-testing-arch`).
 
 #### Inter-Service Authentication
 
@@ -1513,7 +1836,7 @@ All mutating endpoints accept an optional `Idempotency-Key` header. The server l
 
 #### Structured Logging
 
-All request handling emits structured log events with the following fields: `trace_id`, `user_id`, `tenant_id`, `session_id`, `operation`, `duration_ms`, `status`. Message content and personal data are never logged.
+All request handling emits structured log events with the following fields: `trace_id`, `user_id`, `tenant_id`, `session_id`, `operation`, `duration_ms`, `status`. Message content and personal data are never logged. Authorization denials and PDP-evaluation failures (`EnforcerError`) are logged/traced internally with their infrastructure cause; the client only ever sees the fail-closed status (403/404) and never PDP internals or availability (`cpt-cf-chat-engine-constraint-fail-closed-authz`). The `bearer_token` is never logged.
 
 #### Metrics
 
@@ -1547,6 +1870,46 @@ All request handling emits structured log events with the following fields: `tra
 Test isolation: each test case uses independent database state (transaction rollback or dedicated schema). Backend plugins are replaced by configurable mock implementations of `ChatEngineBackendPlugin`. Coverage targets: 90%+ for domain layer, 100% endpoint coverage including error paths and all authorization boundaries.
 
 ## 4. Additional Context
+
+#### Context: Authorization Open Questions
+
+**ID**: `cpt-cf-chat-engine-design-context-authz-open-questions`
+
+<!-- fdd-id-content -->
+**ADRs**: `cpt-cf-chat-engine-adr-authz-pep-secureorm`
+
+Non-blocking open questions recorded for the authorization design (§3.5):
+
+- **OQ1 — GTS namespace**: The exact GTS namespace for the `ResourceType` ids (`gts.cf.core.chat_engine.<resource>.v1~`) is verified against the gear's GTS registration during implementation.
+- **OQ2 — Zero-downtime migration**: The `m20260417_000006_authz_owner_columns` migration is a single forward breaking migration; a zero-downtime / expand-contract variant (if production requires it) is deferred to a separate ADR.
+- **OQ3 — Cross-tenant session transfer**: Moving a session between tenants is out of scope (the owner pair is immutable); if ever required it is a separate ADR.
+- **OQ4 — Bypass lint**: An optional lint to forbid `AccessScope::allow_all()` outside the bypass registry (`cpt-cf-chat-engine-constraint-no-allow-all-outside-registry`) is a possible future hardening.
+<!-- fdd-id-content -->
+
+#### Context: Authorization Traceability
+
+**ID**: `cpt-cf-chat-engine-design-context-authz-traceability`
+
+<!-- fdd-id-content -->
+Traceability for the authorization design elements added in §3.5 (anchor decision: `cpt-cf-chat-engine-adr-authz-pep-secureorm`, recorded as `ADR/0028-authz-pep-secureorm-uuid-migration.md`). PRD anchors: `cpt-cf-chat-engine-nfr-authentication` (tenant-isolation / ownership invariant) and `cpt-cf-chat-engine-fr-share-session` (share-token read boundary, traced by `cpt-cf-chat-engine-seq-authz-shared-read`).
+
+| Design element (new ID) | Traces to (PRD / ADR) | Code `@cpt` markers |
+|-------------------------|-----------------------|---------------------|
+| `cpt-cf-chat-engine-design-auth-model` (reworked) | `cpt-cf-chat-engine-nfr-authentication`, `cpt-cf-chat-engine-adr-authz-pep-secureorm` | `@cpt` module-registration, api-rest-routes, api-rest-handlers, sessions-handler, domain-error |
+| `cpt-cf-chat-engine-principle-owner-denorm-invariant` | `cpt-cf-chat-engine-adr-authz-pep-secureorm` | `@cpt` dbtable-sessions, dbtable-messages, dbtable-reactions, dbtable-message-parts, dbtable-file-citations, dbtable-link-citations, dbtable-link-references |
+| `cpt-cf-chat-engine-constraint-fail-closed-authz` | `cpt-cf-chat-engine-nfr-authentication`, `cpt-cf-chat-engine-adr-authz-pep-secureorm` | `@cpt` domain-error |
+| `cpt-cf-chat-engine-constraint-no-allow-all-outside-registry` | `cpt-cf-chat-engine-adr-authz-pep-secureorm` | `@cpt` session-repo, message-repo, reaction-repo (`// AUTHZ-BYPASS` sites) |
+| `cpt-cf-chat-engine-component-policy-enforcer` | `cpt-cf-chat-engine-adr-authz-pep-secureorm` | `@cpt` module-registration, module-lifecycle |
+| `cpt-cf-chat-engine-interface-pep` | `cpt-cf-chat-engine-adr-authz-pep-secureorm` | `@cpt` session-service, message-service, reaction-service |
+| `cpt-cf-chat-engine-design-authz-bypass-registry` | `cpt-cf-chat-engine-adr-authz-pep-secureorm` | `@cpt` session-repo, message-repo (`find_by_session_id_unscoped`, `find_by_share_token`, retention/list-tenants ops) |
+| `cpt-cf-chat-engine-seq-authz-list` | `cpt-cf-chat-engine-nfr-authentication` | `@cpt` session-service, session-repo |
+| `cpt-cf-chat-engine-seq-authz-point-op` | `cpt-cf-chat-engine-nfr-authentication` | `@cpt` session-service, message-repo |
+| `cpt-cf-chat-engine-seq-authz-shared-read` | `cpt-cf-chat-engine-fr-share-session` | `@cpt` api-rest-routes, session-repo |
+| `cpt-cf-chat-engine-seq-authz-internal-write` | `cpt-cf-chat-engine-adr-authz-pep-secureorm` | `@cpt` message-repo (`finalize_assistant`, `insert_summary_message`, `insert_assistant_variant_stub`) |
+| `cpt-cf-chat-engine-dbtable-authz-owner-columns` | `cpt-cf-chat-engine-adr-authz-pep-secureorm` | `@cpt` dbtable-sessions, dbtable-messages, dbtable-reactions, dbtable-message-parts, dbtable-file-citations, dbtable-link-citations, dbtable-link-references |
+
+> `PolicyEnforcer` (PEP) enforcement lives at the **service layer** (`session-service`, `message-service`, `reaction-service`): services obtain the `AccessScope` from the enforcer and pass it to the repositories, which consume the compiled scope via `SecureConn`. Repositories do not call the enforcer themselves — there is no session-repo enforcer call.
+<!-- fdd-id-content -->
 
 #### Context: Message Tree Traversal
 
