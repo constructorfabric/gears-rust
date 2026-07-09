@@ -5,6 +5,7 @@ pub(crate) mod m20260417_000002_create_messages_table;
 pub(crate) mod m20260417_000003_create_plugin_configs_table;
 pub(crate) mod m20260417_000004_create_message_reactions_table;
 pub(crate) mod m20260417_000005_create_messages_fts_index;
+pub(crate) mod m20260417_000006_authz_owner_columns;
 
 pub use m20260417_000002_create_messages_table::{UQ_VARIANT_INDEX, UQ_VARIANT_INDEX_ROOT};
 pub use m20260417_000005_create_messages_fts_index::MESSAGES_FTS_INDEX;
@@ -20,6 +21,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260417_000003_create_plugin_configs_table::Migration),
             Box::new(m20260417_000004_create_message_reactions_table::Migration),
             Box::new(m20260417_000005_create_messages_fts_index::Migration),
+            Box::new(m20260417_000006_authz_owner_columns::Migration),
         ]
     }
 }
