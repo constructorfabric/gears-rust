@@ -14,6 +14,7 @@ use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use chat_engine_sdk::models::{
@@ -610,6 +611,127 @@ pub trait SessionRepo: Send + Sync {
         let _ = (tenant_id, user_id, session_id, share_token, metadata);
         Err(ChatEngineError::internal(
             "update_share_token not implemented for this repository",
+        ))
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 4 (PEP) — PDP-scoped surface.
+    //
+    // These accept a PDP-derived [`AccessScope`] instead of a manual
+    // `(tenant_id, user_id)` owner filter; the scope carries the tenant /
+    // owner constraints and the concrete impl applies them via SecureORM.
+    // `SessionService` calls these; the legacy `(tenant_id, user_id)` methods
+    // above stay until the secondary services migrate in their own phases.
+    // Default impls fail closed so unrelated mocks compile without change.
+    // ---------------------------------------------------------------------
+
+    /// Insert a new session under a PDP-derived scope (CREATE).
+    // @cpt-cf-chat-engine-interface-pep
+    async fn insert_scoped(
+        &self,
+        scope: &AccessScope,
+        new: NewSession,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, new);
+        Err(ChatEngineError::internal(
+            "insert_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Scoped read by `session_id` under a PDP-derived scope. `HardDeleted`
+    /// rows are treated as absent.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn find_by_id_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+    ) -> Result<Option<Session>, ChatEngineError> {
+        let _ = (scope, session_id);
+        Err(ChatEngineError::internal(
+            "find_by_id_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Cursor/OData-paginated list under a PDP-derived scope.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn list_scoped(
+        &self,
+        scope: &AccessScope,
+        query: &ODataQuery,
+    ) -> Result<Page<Session>, ChatEngineError> {
+        let _ = (scope, query);
+        Err(ChatEngineError::internal(
+            "list_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Replace the session metadata JSONB under a PDP-derived scope.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn update_metadata_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        metadata: Option<JsonValue>,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, session_id, metadata);
+        Err(ChatEngineError::internal(
+            "update_metadata_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Replace the enabled-capabilities JSONB under a PDP-derived scope.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn update_capabilities_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        capabilities: Option<JsonValue>,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, session_id, capabilities);
+        Err(ChatEngineError::internal(
+            "update_capabilities_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Transition the lifecycle state under a PDP-derived scope. Restoring to
+    /// `Active` clears the soft-delete bookkeeping columns.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn update_lifecycle_state_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        new_state: LifecycleState,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, session_id, new_state);
+        Err(ChatEngineError::internal(
+            "update_lifecycle_state_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Soft-delete under a PDP-derived scope.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn soft_delete_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        retention_days: i64,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, session_id, retention_days);
+        Err(ChatEngineError::internal(
+            "soft_delete_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Return the `scheduled_hard_delete_at` timestamp for a scoped session.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn scheduled_hard_delete_at_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+    ) -> Result<Option<OffsetDateTime>, ChatEngineError> {
+        let _ = (scope, session_id);
+        Err(ChatEngineError::internal(
+            "scheduled_hard_delete_at_scoped not implemented for this repository",
         ))
     }
 }

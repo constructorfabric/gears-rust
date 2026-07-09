@@ -84,11 +84,10 @@ pub async fn create_session(
     Json(body): Json<CreateSessionBody>,
 ) -> Result<impl IntoResponse> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    let identity = identity_from_ctx(&ctx)?;
 
     let session = svc
         .create_session(
-            &identity,
+            &ctx,
             CreateSessionRequest {
                 session_type_id: body.session_type_id,
                 metadata: body.metadata,
@@ -105,8 +104,7 @@ pub async fn list_sessions(
     Extension(svc): Extension<Arc<SessionService>>,
     OData(query): OData,
 ) -> Result<JsonPage<chat_engine_sdk::models::Session>> {
-    let identity = identity_from_ctx(&ctx)?;
-    let page = svc.list_sessions(&identity, &query).await?;
+    let page = svc.list_sessions(&ctx, &query).await?;
     Ok(Json(page))
 }
 
@@ -116,8 +114,7 @@ pub async fn get_session(
     Extension(svc): Extension<Arc<SessionService>>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<chat_engine_sdk::models::Session>> {
-    let identity = identity_from_ctx(&ctx)?;
-    let session = svc.get_session(&identity, session_id).await?;
+    let session = svc.get_session(&ctx, session_id).await?;
     Ok(Json(session))
 }
 
@@ -134,14 +131,12 @@ pub async fn patch_session(
             "request must supply at least one of `metadata` or `enabled_capabilities`",
         ));
     }
-    let identity = identity_from_ctx(&ctx)?;
-
     let mut latest: Option<chat_engine_sdk::models::Session> = None;
     if let Some(metadata) = body.metadata {
-        latest = Some(svc.update_metadata(&identity, session_id, metadata).await?);
+        latest = Some(svc.update_metadata(&ctx, session_id, metadata).await?);
     }
     if let Some(caps) = body.enabled_capabilities {
-        latest = Some(svc.update_capabilities(&identity, session_id, caps).await?);
+        latest = Some(svc.update_capabilities(&ctx, session_id, caps).await?);
     }
 
     // At least one branch ran (guarded above), so `latest` is `Some`; map the
@@ -158,9 +153,8 @@ pub async fn delete_session(
     Path(session_id): Path<Uuid>,
     Query(query): Query<DeleteSessionQuery>,
 ) -> Result<axum::response::Response> {
-    let identity = identity_from_ctx(&ctx)?;
     let hard = query.hard.unwrap_or(false);
-    let outcome = svc.delete_session(&identity, session_id, hard).await?;
+    let outcome = svc.delete_session(&ctx, session_id, hard).await?;
     match outcome {
         SessionDeleteOutcome::Soft { session } => {
             Ok((StatusCode::OK, Json(session)).into_response())
@@ -175,8 +169,7 @@ pub async fn archive_session(
     Extension(svc): Extension<Arc<SessionService>>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<chat_engine_sdk::models::Session>> {
-    let identity = identity_from_ctx(&ctx)?;
-    let session = svc.archive_session(&identity, session_id).await?;
+    let session = svc.archive_session(&ctx, session_id).await?;
     Ok(Json(session))
 }
 
@@ -186,8 +179,7 @@ pub async fn restore_session(
     Extension(svc): Extension<Arc<SessionService>>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<chat_engine_sdk::models::Session>> {
-    let identity = identity_from_ctx(&ctx)?;
-    let session = svc.restore_session(&identity, session_id).await?;
+    let session = svc.restore_session(&ctx, session_id).await?;
     Ok(Json(session))
 }
 
