@@ -84,7 +84,7 @@ impl VariantRepo for SeaVariantRepo {
         use crate::infra::db::{
             VARIANT_INDEX_MAX_RETRIES, compute_next_variant_index, is_variant_unique_violation,
         };
-        use sea_orm::ActiveValue::Set;
+        use sea_orm::ActiveValue::{NotSet, Set};
 
         // SELECT MAX(variant_index)+1 and the matching INSERT run in the
         // SAME SERIALIZABLE transaction, with the whole pair retried under
@@ -121,6 +121,9 @@ impl VariantRepo for SeaVariantRepo {
                         let user_active = message_entity::ActiveModel {
                             message_id: Set(user_message_id),
                             session_id: Set(session_id),
+                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+                            owner_tenant_id: NotSet,
+                            owner_id: NotSet,
                             // Owning tenant (denormalized) + branching author,
                             // both from the JWT identity at the service layer.
                             tenant_id: Set(user_tenant),
@@ -139,6 +142,9 @@ impl VariantRepo for SeaVariantRepo {
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(assistant_message_id),
                             session_id: Set(session_id),
+                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+                            owner_tenant_id: NotSet,
+                            owner_id: NotSet,
                             // Inherits the owning tenant; no human author.
                             tenant_id: Set(assistant_tenant),
                             user_id: Set(None),

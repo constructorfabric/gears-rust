@@ -1,4 +1,4 @@
-// @cpt-cf-chat-engine-dbtable-messages:p1
+// @cpt-cf-chat-engine-dbtable-messages:p2
 // @cpt-cf-chat-engine-adr-message-tree-structure:p1
 
 use sea_orm::entity::prelude::*;
@@ -16,20 +16,16 @@ use crate::infra::db::migrations::{UQ_VARIANT_INDEX, UQ_VARIANT_INDEX_ROOT};
 /// HTTP `409 Conflict` (see DESIGN §3.7 "Variant Index Concurrency").
 pub const VARIANT_INDEX_MAX_RETRIES: u32 = 3;
 
-// Tenant / user scoping for messages stays enforced via the owning
-// `sessions` row, which the repo joins on per request. The denormalized
-// `tenant_id` column below is nullable (un-backfilled legacy rows hold
-// NULL) and `user_id` is the message *author*, not an ownership key, so
-// neither is a safe authority for row scoping yet — the entity stays
-// `unrestricted` and scoping remains the explicit session join.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "messages")]
-#[secure(unrestricted)]
+#[secure(tenant_col = "owner_tenant_id", owner_col = "owner_id", resource_col = "message_id", no_type)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub message_id: Uuid,
     pub session_id: Uuid,
+    pub owner_tenant_id: Uuid,
+    pub owner_id: Uuid,
     /// Owning tenant, denormalized from the parent session. NULL only for
     /// un-backfilled legacy rows.
     pub tenant_id: Option<String>,
