@@ -1,0 +1,38 @@
+[package]
+name = "cf-gears-toolkit-http-middleware"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ToolKit server-side HTTP middleware (two-plane auth) and request extractors"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "cf-gears-toolkit"]
+categories = ["web-programming"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "toolkit_http_middleware"
+
+[lints]
+workspace = true
+
+[dependencies]
+# SecurityContext + authenticator traits (transport-agnostic). Owns
+# `SecurityContext`, the `BearerAuthenticator` / `InternalAuthenticator` traits,
+# and the shared `INTERNAL_TOKEN_HEADER` constant.
+toolkit-security = { workspace = true }
+# Canonical (AIP-193 / RFC 9457) error rendering for middleware rejections.
+# `axum` feature provides `IntoResponse for CanonicalError` (problem+json).
+toolkit-canonical-errors = { workspace = true, features = ["axum"] }
+
+axum = { workspace = true }
+http = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }

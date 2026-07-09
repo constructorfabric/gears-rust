@@ -194,22 +194,31 @@ pub async fn authn_middleware(
 
     match requirement {
         AuthRequirement::None => {
+            log_auth_skipped(req.method(), path.as_str());
             req.extensions_mut().insert(SecurityContext::anonymous());
             next.run(req).await
         }
         AuthRequirement::Required => {
             let Some(token) = extract_bearer_token(req.headers()) else {
-                let err = CanonicalError::unauthenticated()
-                    .with_reason("MISSING_BEARER")
-                    .create();
+                log_missing_bearer(req.method(), path.as_str());
                 // `instance` / `trace_id` are filled by the canonical
                 // error middleware (`toolkit::api::canonical_error_middleware`)
                 // on the way out — this middleware sits inside its layer.
-                return err.into_response();
+                let mut response = CanonicalError::unauthenticated()
+                    .with_reason("MISSING_BEARER")
+                    .create()
+                    .into_response();
+                // No bearer credentials were presented (RFC 6750 §3).
+                common::append_bearer_challenge(
+                    &mut response,
+                    common::BearerChallenge::NoCredentials,
+                );
+                return response;
             };
 
             match state.authn_client.authenticate(token).await {
                 Ok(result) => {
+                    log_auth_succeeded(req.method(), path.as_str(), &result.security_context);
                     req.extensions_mut().insert(result.security_context);
                     next.run(req).await
                 }
@@ -219,6 +228,23 @@ pub async fn authn_middleware(
     }
 }
 
+fn log_auth_skipped(method: &Method, path: &str) {
+    tracing::debug!(method = %method, path, "authentication skipped: public route");
+}
+
+fn log_missing_bearer(method: &Method, path: &str) {
+    tracing::debug!(method = %method, path, "authentication failed: missing bearer token");
+}
+
+fn log_auth_succeeded(method: &Method, path: &str, security_context: &SecurityContext) {
+    tracing::debug!(
+        method = %method,
+        path,
+        subject_id = %security_context.subject_id(),
+        "authentication succeeded"
+    );
+}
+
 /// Convert `AuthNResolverError` to a canonical Problem Details response.
 ///
 /// `instance` / `trace_id` are filled by the canonical error middleware
@@ -226,20 +252,28 @@ pub async fn authn_middleware(
 /// middleware sits inside its layer.
 fn authn_error_to_response(err: &AuthNResolverError) -> axum::response::Response {
     log_authn_error(err);
-    let canonical = match err {
-        AuthNResolverError::Unauthorized(_) => CanonicalError::unauthenticated()
-            .with_reason("AUTHN_FAILED")
-            .create(),
+    match err {
+        AuthNResolverError::Unauthorized(_) => {
+            // A token was presented but rejected (RFC 6750 §3).
+            let mut response = CanonicalError::unauthenticated()
+                .with_reason("AUTHN_FAILED")
+                .create()
+                .into_response();
+            common::append_bearer_challenge(&mut response, common::BearerChallenge::InvalidToken);
+            response
+        }
         AuthNResolverError::NoPluginAvailable | AuthNResolverError::ServiceUnavailable(_) => {
             CanonicalError::service_unavailable()
                 .with_retry_after_seconds(5)
                 .create()
+                .into_response()
         }
         AuthNResolverError::TokenAcquisitionFailed(_) | AuthNResolverError::Internal(_) => {
-            CanonicalError::internal("authentication infrastructure failure").create()
+            CanonicalError::internal("authentication infrastructure failure")
+                .create()
+                .into_response()
         }
-    };
-    canonical.into_response()
+    }
 }
 
 /// Log authentication errors at appropriate levels.

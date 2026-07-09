@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-authn-resolver-sdk"
-version = "0.3.17"
+version = "0.3.18"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -21,14 +21,12 @@ workspace = true
 async-trait = { workspace = true }
 secrecy = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 
 # GTS types
 gts = { workspace = true }
-gts-macros = { workspace = true }
 toolkit-gts = { workspace = true }
 
 # ToolKit dependencies

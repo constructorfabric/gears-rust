@@ -10,9 +10,11 @@
 -- be run as a single migration unit when its phase ships:
 --
 --   * P1 — initial release; everything required for the P1 scope in PRD.md
---          and DESIGN.md (auth-required CRUD, content
---          and metadata revisions, SHA-256 hash, content-state machine,
---          backend pointer; one-table custom metadata)
+--          and DESIGN.md (control-plane metadata CRUD; files = identity +
+--          content_id pointer + meta_version; file_versions = immutable
+--          versions with SHA-256 hash, pending/available status, backend
+--          pointer; one-table custom metadata). Content moves over signed
+--          URLs against the sidecar (ADR-0003); no content in the control DB.
 --
 --   * P2 — multipart upload, versioning, idempotency, audit and event
 --          outboxes, policies, retention rules
@@ -25,6 +27,22 @@
 --   202xxxxxxxxx_file_storage_p2_versioning.sql
 --   ... etc
 -- This combined file lists the DDL in dependency order within each phase.
+--
+-- Implementation note (P1 gear migration):
+--   * This file is the CANONICAL Postgres schema (the `file_storage` schema is
+--     the production target). The SeaORM migration the gear actually runs
+--     (gears/file-storage/file-storage/src/infra/storage/migrations/) uses
+--     UNQUALIFIED (flat) table names — `files`, `file_versions`,
+--     `files_custom_metadata` — on BOTH Postgres and SQLite, because a SeaORM
+--     entity has a static `table_name` and SQLite has no schemas, so a
+--     per-backend schema qualifier cannot be expressed in the entity. Behaviour
+--     is identical; adopting the `file_storage` schema on Postgres is a deferred,
+--     entity-attribute-only change.
+--   * In the entity layer `version_id` is the SOLE primary key of file_versions
+--     (it is a globally unique uuid), while the table keeps the composite
+--     `(file_id, version_id)` PK below; this keeps version updates/deletes keyed
+--     off a single PK column. The `is_current` <-> `files.content_id` invariant
+--     (see the column comment) is maintained ATOMICALLY by the bind transaction.
 -- =============================================================================
 
 
@@ -46,12 +64,13 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- Table: file_storage.files --------------------------------------------------
 -- @cpt-cf-file-storage-dbtable-files
 
+-- The file row is the stable logical identity. It holds NO bytes and NO
+-- per-content fields (mime/size/hash/backend) — those live on the current
+-- file_versions row pointed at by content_id. See ADR-0003 (sidecar data plane).
 CREATE TABLE file_storage.files (
     file_id                 uuid         PRIMARY KEY  DEFAULT gen_random_uuid(),
 
-    -- Tenant boundary. Immutable after creation. Enforced at the service
-    -- layer; the DB-level immutability is a CHECK on UPDATE handled in the
-    -- application-side trigger or repository code.
+    -- Tenant boundary. Immutable after creation (enforced at the service layer).
     tenant_id               uuid         NOT NULL,
 
     -- Ownership principal.
@@ -61,59 +80,29 @@ CREATE TABLE file_storage.files (
 
     -- Display + classification.
     name                    text         NOT NULL,
-    mime_type               text         NOT NULL,
     gts_file_type           text         NOT NULL,
 
-    -- Size in bytes. 0 is permitted (empty file).
-    size                    bigint       NOT NULL  CHECK (size >= 0),
+    -- Content pointer: the version_id currently bound as the file's live
+    -- content. NULL until the first bind. The content-only ETag is derived
+    -- from (file_id, content_id). FK is logical (the version is in
+    -- file_versions, which also FKs back to files); enforced at the service
+    -- layer by the bind CAS, not as a DB constraint, to avoid the cycle.
+    content_id              uuid,
 
-    -- Revision counters.
-    --   content_revision   set on content writes. P1 `POST /files` (create)
-    --                      inserts the row with content_revision = 1 (the
-    --                      first content write); a content-replacing PATCH
-    --                      bumps it; (P2) multipart complete and versioning
-    --                      writes bump it. The DEFAULT 0 baseline applies only
-    --                      to the P2 'pending' row that is created before any
-    --                      content arrives (multipart pre-completion); P1 never
-    --                      persists a content_revision = 0 row. ETag is derived
-    --                      from (file_id, content_revision).
-    --   metadata_revision  bumped on every successful write — content or
-    --                      metadata-only.
-    content_revision        bigint       NOT NULL  DEFAULT 0
-                                         CHECK (content_revision >= 0),
-    metadata_revision       bigint       NOT NULL  DEFAULT 0
-                                         CHECK (metadata_revision >= 0),
-
-    -- Content hash. P1 allow-list is locked to SHA-256 per ADR-0002. The
-    -- CHECK is widened in the P2 hash-policy migration.
-    hash_algorithm          text         NOT NULL  DEFAULT 'SHA-256'
-                                         CHECK (hash_algorithm = 'SHA-256'),
-    -- 32 bytes for SHA-256; widened to up to 64 in P2 when BLAKE3 lands.
-    hash_value              bytea        NOT NULL  CHECK (octet_length(hash_value) = 32),
-
-    -- Content lifecycle state. In P1 every file lands directly in
-    -- 'available'; 'pending' exists for forward-compatibility with the
-    -- P2 multipart flow where files are created without content.
-    content_state           text         NOT NULL  DEFAULT 'available'
-                                         CHECK (content_state IN ('pending', 'available')),
-
-    -- Backend pointer. `backend_id` references the BackendConfig loaded from
-    -- TOML in P1 (or from `storage_backends_runtime` in P3). `backend_path`
-    -- is an opaque per-driver path; format is not parsed by FileStorage.
-    backend_id              text         NOT NULL,
-    backend_path            text         NOT NULL,
+    -- Monotonic counter bumped on metadata-only writes; backs If-Match-Metadata.
+    meta_version            bigint       NOT NULL  DEFAULT 0
+                                         CHECK (meta_version >= 0),
 
     -- Audit timestamps.
     created_at              timestamptz  NOT NULL  DEFAULT now(),
     last_modified_at        timestamptz  NOT NULL  DEFAULT now()
 );
 
-COMMENT ON TABLE  file_storage.files                          IS 'FileStorage primary file row. One row per logical file (independent of backend versions).';
-COMMENT ON COLUMN file_storage.files.tenant_id                IS 'Tenant boundary; immutable after creation.';
-COMMENT ON COLUMN file_storage.files.owner_kind               IS 'Owner principal kind: user (platform user) or app (Gear).';
-COMMENT ON COLUMN file_storage.files.content_revision         IS 'Monotonic counter; bumped only on content writes. Backs the ETag derivation.';
-COMMENT ON COLUMN file_storage.files.metadata_revision        IS 'Monotonic counter; bumped on every successful write (content or metadata).';
-COMMENT ON COLUMN file_storage.files.content_state            IS 'pending = created without content (P2 multipart pre-completion); available = content present.';
+COMMENT ON TABLE  file_storage.files                IS 'FileStorage logical file: identity + current content pointer. Holds no bytes.';
+COMMENT ON COLUMN file_storage.files.tenant_id      IS 'Tenant boundary; immutable after creation.';
+COMMENT ON COLUMN file_storage.files.owner_kind     IS 'Owner principal kind: user (platform user) or app (Gear).';
+COMMENT ON COLUMN file_storage.files.content_id     IS 'version_id of the current content version; NULL until first bind. Backs the ETag.';
+COMMENT ON COLUMN file_storage.files.meta_version   IS 'Monotonic counter; bumped on metadata-only writes. Backs If-Match-Metadata.';
 
 -- Indexes on files -----------------------------------------------------------
 
@@ -126,10 +115,71 @@ CREATE INDEX files_owner_listing_idx
 CREATE INDEX files_tenant_gts_idx
     ON file_storage.files (tenant_id, gts_file_type);
 
--- Recovery / debugging index on backend pointer (e.g., "which files live on
--- backend X?"). Not on the hot path.
-CREATE INDEX files_backend_idx
-    ON file_storage.files (backend_id);
+
+-- Table: file_storage.file_versions ------------------------------------------
+-- @cpt-cf-file-storage-dbtable-file-versions
+-- One row per immutable content version. The backend object lives at
+-- /{file_id}/{version_id} and is never mutated. Versioning is FileStorage-level
+-- (works on any backend); the current version is files.content_id. No automatic
+-- cleanup in P1 (versions accumulate; the P2 cleanup engine prunes by retention).
+
+CREATE TABLE file_storage.file_versions (
+    file_id          uuid         NOT NULL
+                                  REFERENCES file_storage.files (file_id) ON DELETE CASCADE,
+    version_id       uuid         NOT NULL  DEFAULT gen_random_uuid(),
+
+    -- Per-version content properties.
+    mime_type        text         NOT NULL,
+    size             bigint       NOT NULL  CHECK (size >= 0),  -- 0 permitted (empty file)
+
+    -- Content hash. P1 allow-list locked to SHA-256 per ADR-0002; widened in P2.
+    hash_algorithm   text         NOT NULL  DEFAULT 'SHA-256'
+                                  CHECK (hash_algorithm = 'SHA-256'),
+    hash_value       bytea        NOT NULL  CHECK (octet_length(hash_value) = 32),
+
+    -- Lifecycle: 'pending' from pre-register until bind, then 'available'.
+    status           text         NOT NULL  DEFAULT 'pending'
+                                  CHECK (status IN ('pending', 'available')),
+    -- True for the file's current version. This is a denormalization of
+    -- files.content_id, kept deliberately: it backs the unique partial index
+    -- below (cheap "is there a current version" / one-current-per-file
+    -- enforcement) and the version-listing `is_current` flag without a join.
+    -- INVARIANT: is_current = true on exactly the row whose version_id equals
+    -- files.content_id. The bind operation MUST maintain it ATOMICALLY (single
+    -- transaction): swap files.content_id (CAS on If-Match), clear the old
+    -- current (is_current = false), set the new current (is_current = true).
+    -- See cpt-cf-file-storage-fr-upload-file; split-brain (two currents, or a
+    -- current that disagrees with content_id) is prevented by the transaction
+    -- plus the unique partial index, and is covered by bind tests.
+    is_current       boolean      NOT NULL  DEFAULT false,
+
+    -- Backend pointer (immutable per version). backend_id references the
+    -- BackendConfig (TOML in P1 / storage_backends_runtime in P3); backend_path
+    -- is an opaque per-driver path, /{file_id}/{version_id} by convention.
+    backend_id       text         NOT NULL,
+    backend_path     text         NOT NULL,
+
+    created_at       timestamptz  NOT NULL  DEFAULT now(),
+
+    PRIMARY KEY (file_id, version_id)
+);
+
+COMMENT ON TABLE file_storage.file_versions IS
+    'Immutable content versions. Backend object /{file_id}/{version_id} is never mutated; a content write is a new version + a pointer swap (files.content_id).';
+
+-- At most one current version per file.
+CREATE UNIQUE INDEX file_versions_current_idx
+    ON file_storage.file_versions (file_id)
+    WHERE is_current = true;
+
+-- Supports cleanup of abandoned pre-registered versions (P2 cleanup engine).
+CREATE INDEX file_versions_pending_idx
+    ON file_storage.file_versions (created_at)
+    WHERE status = 'pending';
+
+-- Recovery / debugging index on backend pointer ("which versions live on backend X?").
+CREATE INDEX file_versions_backend_idx
+    ON file_storage.file_versions (backend_id);
 
 
 -- Table: file_storage.files_custom_metadata ----------------------------------
@@ -155,21 +205,21 @@ COMMENT ON TABLE file_storage.files_custom_metadata IS
 
 -- P2 hash-policy widening ----------------------------------------------------
 -- Drops the P1 lock on SHA-256 and widens the allow-list to BLAKE3 + XXH3
--- per ADR-0002. The hash_value length CHECK is also widened to admit
--- algorithm-appropriate digest sizes.
+-- per ADR-0002, on file_versions (where the hash lives). The hash_value length
+-- CHECK is also widened to admit algorithm-appropriate digest sizes.
 
-ALTER TABLE file_storage.files
-    DROP CONSTRAINT files_hash_algorithm_check;
+ALTER TABLE file_storage.file_versions
+    DROP CONSTRAINT file_versions_hash_algorithm_check;
 
-ALTER TABLE file_storage.files
-    ADD CONSTRAINT files_hash_algorithm_check
+ALTER TABLE file_storage.file_versions
+    ADD CONSTRAINT file_versions_hash_algorithm_check
         CHECK (hash_algorithm IN ('SHA-256', 'BLAKE3', 'XXH3'));
 
-ALTER TABLE file_storage.files
-    DROP CONSTRAINT files_hash_value_check;
+ALTER TABLE file_storage.file_versions
+    DROP CONSTRAINT file_versions_hash_value_check;
 
-ALTER TABLE file_storage.files
-    ADD CONSTRAINT files_hash_value_check
+ALTER TABLE file_storage.file_versions
+    ADD CONSTRAINT file_versions_hash_value_check
         CHECK (
             (hash_algorithm = 'SHA-256' AND octet_length(hash_value) = 32)
          OR (hash_algorithm = 'BLAKE3'  AND octet_length(hash_value) = 32)
@@ -178,8 +228,8 @@ ALTER TABLE file_storage.files
 
 
 -- Table: file_storage.multipart_uploads --------------------------------------
--- In-flight multipart upload sessions. Created on POST /files/multipart
--- (initiation also creates the pending `files` row), one row per upload
+-- In-flight multipart upload sessions. Created on multipart initiate
+-- (which also pre-registers the pending file_versions row), one row per upload
 -- session. Parts go into multipart_upload_parts.
 
 CREATE TABLE file_storage.multipart_uploads (
@@ -230,42 +280,9 @@ CREATE TABLE file_storage.multipart_upload_parts (
 );
 
 
--- Table: file_storage.file_versions ------------------------------------------
--- Per-file backend version pointers. Populated only on backends that declare
--- versioning_native = true. Soft-delete is a row with soft_deleted_at set
--- (the previous current row remains accessible by version_id).
-
-CREATE TABLE file_storage.file_versions (
-    file_id           uuid         NOT NULL
-                                   REFERENCES file_storage.files (file_id) ON DELETE CASCADE,
-    -- Opaque, backend-assigned. Format MUST NOT be parsed.
-    version_id        text         NOT NULL,
-
-    -- Snapshot of file properties at version creation time.
-    size              bigint       NOT NULL  CHECK (size >= 0),
-    hash_algorithm    text         NOT NULL,
-    hash_value        bytea        NOT NULL,
-    content_revision  bigint       NOT NULL,
-
-    -- True when this is the file's current version.
-    is_current        boolean      NOT NULL  DEFAULT false,
-    -- Set to the soft-delete time when this version is logically deleted but
-    -- still recoverable via restore. Permanent delete removes the row.
-    soft_deleted_at   timestamptz,
-
-    created_at        timestamptz  NOT NULL  DEFAULT now(),
-
-    PRIMARY KEY (file_id, version_id)
-);
-
--- One current version per file.
-CREATE UNIQUE INDEX file_versions_current_idx
-    ON file_storage.file_versions (file_id)
-    WHERE is_current = true;
-
-CREATE INDEX file_versions_soft_deleted_idx
-    ON file_storage.file_versions (file_id)
-    WHERE soft_deleted_at IS NOT NULL;
+-- NOTE: file_versions is a P1 table (see the P1 section above) — FileStorage-level
+-- versioning works on any backend via distinct objects /{file_id}/{version_id}.
+-- P2 only widens its hash CHECK (above). There is no separate P2 version table.
 
 
 -- Table: file_storage.idempotency_keys ---------------------------------------
@@ -413,8 +430,9 @@ CREATE TABLE file_storage.storage_backends_runtime (
     credentials_blob bytea,
     credentials_kms_key_id text,
 
-    -- Capabilities (versioning_native, multipart_native, encryption_native,
-    -- range_native) serialized as JSON. Loaded into BackendCapabilities
+    -- Capabilities (multipart_native, encryption_native, range_native;
+    -- no versioning_native — versioning is FileStorage-level) serialized as
+    -- JSON. Loaded into BackendCapabilities
     -- struct at registry build time.
     capabilities     jsonb        NOT NULL,
     hash_policy      jsonb        NOT NULL,        -- HashPolicy (default_algorithm, allowed_algorithms, selection_rules)
@@ -433,18 +451,18 @@ CREATE INDEX storage_backends_runtime_enabled_idx
     WHERE enabled = true;
 
 
--- P3 file-row extensions for encryption --------------------------------------
--- Per-file encryption metadata for server-side encryption with backend-managed
--- or customer-provided keys. Populated only when the writing backend
--- declares encryption_native = true and the operative policy enables
--- encryption.
+-- P3 version-row extensions for encryption -----------------------------------
+-- Per-version encryption metadata for server-side encryption with backend-managed
+-- or customer-provided keys. Lives on file_versions (encryption is a property of
+-- the stored object). Populated only when the writing backend declares
+-- encryption_native = true and the operative policy enables encryption.
 
-ALTER TABLE file_storage.files
+ALTER TABLE file_storage.file_versions
     ADD COLUMN encryption_scheme  text,
     ADD COLUMN encryption_kms_key_id text,
     ADD COLUMN encryption_metadata jsonb;
 
-COMMENT ON COLUMN file_storage.files.encryption_scheme IS
+COMMENT ON COLUMN file_storage.file_versions.encryption_scheme IS
     'P3: name of the server-side encryption scheme applied (e.g., AES256-GCM-SSE-S3, AES256-GCM-SSE-KMS). NULL when the backend did not encrypt.';
-COMMENT ON COLUMN file_storage.files.encryption_kms_key_id IS
+COMMENT ON COLUMN file_storage.file_versions.encryption_kms_key_id IS
     'P3: key identifier in the platform KMS / secret store, when SSE-KMS is used.';

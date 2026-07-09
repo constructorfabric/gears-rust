@@ -855,6 +855,7 @@ components:
         - status
         - self_managed
         - depth
+        - child_count
         - created_at
         - updated_at
       properties:
@@ -882,6 +883,16 @@ components:
         depth:
           type: integer
           minimum: 0
+        child_count:
+          type: integer
+          minimum: 0
+          description: |
+            Number of direct children visible to the caller, resolved at
+            read time. Scope-filtered (direct children behind a
+            self-managed barrier the caller cannot penetrate are not
+            counted); excludes AM-internal `provisioning` rows; includes
+            soft-`deleted` children. `0` for a leaf. Derived field — not
+            available in `$filter` / `$orderby`.
         created_at:
           type: string
           format: date-time

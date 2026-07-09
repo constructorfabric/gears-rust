@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit"
-version = "0.6.12"
+version = "0.6.13"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -17,6 +17,11 @@ name = "toolkit"
 
 [lints]
 workspace = true
+
+# Pulled in only to trigger Cargo feature unification (rustls/hyper-rustls
+# `fips`); never referenced in code by design.
+[package.metadata.cargo-shear]
+ignored = ["rustls-fips-shim"]
 
 [features]
 # Enable the runner and the runtime integration by default.
@@ -116,11 +121,9 @@ utoipa = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde-saphyr = { workspace = true, optional = true }
-schemars = { workspace = true, features = ["derive"] }
 
 # GTS support
 gts = { workspace = true }
-gts-macros = { workspace = true }
 toolkit-gts = { workspace = true }
 
 # Performance / lock-free structures
@@ -169,10 +172,9 @@ rustls-cng-crypto = { workspace = true, optional = true }
 [dev-dependencies]
 tower = { workspace = true }
 trybuild = { workspace = true }
-httpmock = { workspace = true }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
+serial_test = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 tracing-subscriber = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
-tokio-metrics = { workspace = true }

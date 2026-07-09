@@ -8,7 +8,7 @@
 //! against the supplied field values — adapting the
 //! `cf-resource-group::domain::validation::validate_metadata_via_gts`
 //! pattern to AM's needs with one deliberate divergence: AM maps a
-//! non-not-found `TypesRegistryError` to
+//! non-not-found `CanonicalError` to
 //! [`DomainError::ServiceUnavailable`] (HTTP 503) rather than
 //! `DomainError::validation` (HTTP 400). A registry outage is an
 //! infrastructure event, not a payload problem, and the 503 envelope
@@ -55,14 +55,13 @@
 //!   1 AND 255)` constraint is the last-line guard and bootstrap
 //!   must succeed before the catalog is seeded.
 //!
-//! Failures fall into four categories:
-//! * `validate_new_user_payload_via_gts` +
-//!   `TypesRegistryError::GtsTypeSchemaNotFound` →
+//! Failures fall into four categories (the types-registry client returns
+//! [`CanonicalError`](toolkit_canonical_errors::CanonicalError) per ADR 0005):
+//! * `validate_new_user_payload_via_gts` + `CanonicalError::NotFound` →
 //!   [`DomainError::ServiceUnavailable`] (fail-closed, see above).
-//! * `validate_tenant_name_via_gts` +
-//!   `TypesRegistryError::GtsTypeSchemaNotFound` → `Ok(())`
+//! * `validate_tenant_name_via_gts` + `CanonicalError::NotFound` → `Ok(())`
 //!   (DB CHECK + bootstrap-before-catalog ordering).
-//! * Other `TypesRegistryError` (transport / availability) →
+//! * Any other `CanonicalError` (transport / availability) →
 //!   [`DomainError::ServiceUnavailable`] for both helpers.
 //! * Schema returned but `jsonschema::validator_for` rejects it →
 //!   [`DomainError::Internal`] (catalog drift — operator action
@@ -80,7 +79,8 @@
 
 use account_management_sdk::IdpNewUser;
 use serde_json::Value;
-use types_registry_sdk::{TypesRegistryClient, TypesRegistryError};
+use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::TypesRegistryClient;
 
 use crate::domain::error::DomainError;
 
@@ -199,7 +199,7 @@ async fn lookup_effective_properties(
 ) -> Result<Option<std::collections::BTreeMap<String, Value>>, DomainError> {
     match types_registry.get_type_schema(type_id).await {
         Ok(schema) => Ok(Some(schema.effective_properties())),
-        Err(TypesRegistryError::GtsTypeSchemaNotFound(_)) => Ok(None),
+        Err(CanonicalError::NotFound { .. }) => Ok(None),
         Err(err) => Err(DomainError::service_unavailable(format!(
             "GTS type schema lookup failed for `{type_id}`: {err}"
         ))),

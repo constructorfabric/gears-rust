@@ -5,6 +5,7 @@
 
 extern crate rustc_ast;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::Item;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use std::cell::RefCell;
@@ -159,35 +160,46 @@ impl EarlyLintPass for De1101TestsInSeparateFiles {
         for violation in violations {
             match violation {
                 TestViolation::InlineTestCode => {
-                    cx.span_lint(DE1101_TESTS_IN_SEPARATE_FILES, item.span, |diag| {
-                        diag.primary_message(
-                            "test code must be moved to a separate test file (DE1101)",
-                        );
-                        diag.help(format!(
-                            "move the test into `tests/*.rs` or an out-of-line `*_tests.rs` module (inline test block exceeds {} lines)",
-                            self.max_inline_test_lines,
-                        ));
-                    });
+                    span_lint_and_then(
+                        cx,
+                        DE1101_TESTS_IN_SEPARATE_FILES,
+                        item.span,
+                        "test code must be moved to a separate test file (DE1101)",
+                        |diag| {
+                            diag.help(format!(
+                                "move the test into `tests/*.rs` or an out-of-line `*_tests.rs` module (inline test block exceeds {} lines)",
+                                self.max_inline_test_lines,
+                            ));
+                        },
+                    );
                 }
                 TestViolation::InlineTestCodeWithCompanion => {
-                    cx.span_lint(DE1101_TESTS_IN_SEPARATE_FILES, item.span, |diag| {
-                        diag.primary_message(
-                            "test code must not be added back to a file that already has a companion test file (DE1101)",
-                        );
-                        diag.help(
-                            "a `*_tests.rs` companion file already exists; add tests there instead",
-                        );
-                    });
+                    span_lint_and_then(
+                        cx,
+                        DE1101_TESTS_IN_SEPARATE_FILES,
+                        item.span,
+                        "test code must not be added back to a file that already has a companion test file (DE1101)",
+                        |diag| {
+                            diag.help(
+                                "a `*_tests.rs` companion file already exists; add tests there instead",
+                            );
+                        },
+                    );
                 }
                 TestViolation::WrongPathAttr { expected, actual } => {
-                    cx.span_lint(DE1101_TESTS_IN_SEPARATE_FILES, item.span, |diag| {
-                        diag.primary_message(format!(
+                    span_lint_and_then(
+                        cx,
+                        DE1101_TESTS_IN_SEPARATE_FILES,
+                        item.span,
+                        format!(
                             "test module path `{actual}.rs` must reference `{expected}.rs` to match the source file (DE1101)",
-                        ));
-                        diag.help(format!(
-                            "use `#[path = \"{expected}.rs\"]` or remove `#[path]`"
-                        ));
-                    });
+                        ),
+                        |diag| {
+                            diag.help(format!(
+                                "use `#[path = \"{expected}.rs\"]` or remove `#[path]`"
+                            ));
+                        },
+                    );
                 }
             }
         }

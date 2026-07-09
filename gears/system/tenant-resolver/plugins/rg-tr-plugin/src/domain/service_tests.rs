@@ -6,7 +6,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use resource_group_sdk::TENANT_RG_TYPE_PATH;
 use resource_group_sdk::api::ResourceGroupReadHierarchy;
-use resource_group_sdk::error::ResourceGroupError;
 use resource_group_sdk::models::{
     GroupHierarchy, GroupHierarchyWithDepth, ResourceGroup, ResourceGroupMembership,
     ResourceGroupWithDepth,
@@ -15,6 +14,7 @@ use tenant_resolver_sdk::{
     BarrierMode, GetAncestorsOptions, GetDescendantsOptions, GetTenantsOptions, IsAncestorOptions,
     TenantId, TenantResolverError, TenantResolverPluginClient, TenantStatus,
 };
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::ast::{CompareOperator, Expr, Value};
 use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::SecurityContext;
@@ -76,7 +76,7 @@ impl ResourceGroupReadHierarchy for MockRgHierarchy {
         _ctx: &SecurityContext,
         group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         // Precedence: if per-id dispatch is configured, honor it strictly —
         // unknown ids return an empty page (simulates "group not found").
         // Otherwise fall back to the flat list. Real RG returns the subtree
@@ -104,7 +104,7 @@ impl ResourceGroupReadHierarchy for MockRgHierarchy {
         _ctx: &SecurityContext,
         group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         // See `get_group_descendants` for precedence rules.
         let items = if self.ancestors_by_id.is_empty() {
             self.ancestors.clone()
@@ -128,7 +128,7 @@ impl ResourceGroupReadHierarchy for MockRgHierarchy {
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroup>, CanonicalError> {
         // Flatten every `ResourceGroupWithDepth` known to the mock (ancestors
         // + descendants + per-id dispatches) into `ResourceGroup` entries,
         // deduplicated by id, then apply the `OData $filter` predicate so
@@ -180,7 +180,7 @@ impl ResourceGroupReadHierarchy for MockRgHierarchy {
         &self,
         _ctx: &SecurityContext,
         _id: Uuid,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unimplemented!("MockRgHierarchy models hierarchy reads only")
     }
 
@@ -188,7 +188,7 @@ impl ResourceGroupReadHierarchy for MockRgHierarchy {
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
         unimplemented!("MockRgHierarchy models hierarchy reads only")
     }
 }
@@ -774,8 +774,8 @@ async fn rg_error_propagates() {
             _ctx: &SecurityContext,
             _group_id: Uuid,
             _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
-            Err(ResourceGroupError::internal())
+        ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
+            Err(CanonicalError::internal("rg backend error").create())
         }
 
         async fn get_group_ancestors(
@@ -783,32 +783,32 @@ async fn rg_error_propagates() {
             _ctx: &SecurityContext,
             _group_id: Uuid,
             _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
-            Err(ResourceGroupError::internal())
+        ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
+            Err(CanonicalError::internal("rg backend error").create())
         }
 
         async fn list_groups(
             &self,
             _ctx: &SecurityContext,
             _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
-            Err(ResourceGroupError::internal())
+        ) -> Result<Page<ResourceGroup>, CanonicalError> {
+            Err(CanonicalError::internal("rg backend error").create())
         }
 
         async fn get_group(
             &self,
             _ctx: &SecurityContext,
             _id: Uuid,
-        ) -> Result<ResourceGroup, ResourceGroupError> {
-            Err(ResourceGroupError::internal())
+        ) -> Result<ResourceGroup, CanonicalError> {
+            Err(CanonicalError::internal("rg backend error").create())
         }
 
         async fn list_memberships(
             &self,
             _ctx: &SecurityContext,
             _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
-            Err(ResourceGroupError::internal())
+        ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
+            Err(CanonicalError::internal("rg backend error").create())
         }
     }
 

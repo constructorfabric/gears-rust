@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-types-registry-sdk"
-version = "0.2.3"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -26,6 +26,15 @@ default = []
 test-util = []
 
 [dependencies]
+# Per ADR 0005 the `TypesRegistryClient` trait boundary is `CanonicalError`;
+# the SDK ships `TypesRegistryError` as an opt-in `From<CanonicalError>`
+# projection (see src/error.rs). The single AIP-193 ladder
+# (`From<DomainError> for CanonicalError`) lives in the impl crate's
+# `api::rest::error`; this SDK depends on the canonical-errors crate to
+# project that envelope into the typed view (and to construct the in-process
+# `InvalidArgument` errors its client-side `try_new` constructors emit).
+toolkit-canonical-errors = { workspace = true }
+
 # Core dependencies for API trait
 async-trait = { workspace = true }
 thiserror = { workspace = true }

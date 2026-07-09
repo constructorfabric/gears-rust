@@ -82,6 +82,15 @@ fn invalid_audience_maps_to_unauthorized() {
 }
 
 #[test]
+fn invalid_token_type_maps_to_unauthorized() {
+    let mapped: AuthNResolverError = AuthNError::InvalidTokenType.into();
+    assert!(matches!(
+        mapped,
+        AuthNResolverError::Unauthorized(msg) if msg == "invalid token type"
+    ));
+}
+
+#[test]
 fn idp_unreachable_maps_to_service_unavailable() {
     let mapped: AuthNResolverError = AuthNError::IdpUnreachable.into();
     assert!(matches!(
@@ -106,6 +115,7 @@ fn non_idp_errors_are_not_idp_failure() {
     assert!(!AuthNError::KidNotFound.is_idp_failure());
     assert!(!AuthNError::UnsupportedAlgorithm.is_idp_failure());
     assert!(!AuthNError::InvalidAudience.is_idp_failure());
+    assert!(!AuthNError::InvalidTokenType.is_idp_failure());
     assert!(!AuthNError::TokenEndpointUnsuccessfulStatus(401).is_idp_failure());
     assert!(!AuthNError::TokenResponseParseFailed.is_idp_failure());
     assert!(!AuthNError::TokenEndpointNotConfigured.is_idp_failure());

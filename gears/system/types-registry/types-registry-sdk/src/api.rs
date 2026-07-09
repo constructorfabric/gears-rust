@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use toolkit_canonical_errors::CanonicalError;
 use uuid::Uuid;
 
-use crate::error::TypesRegistryError;
 use crate::models::{GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery};
 
 /// Public API trait for the `types-registry` gear.
@@ -22,6 +22,20 @@ use crate::models::{GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, T
 ///
 /// GTS type-schemas and instances are global resources (not tenant-scoped),
 /// so no security context is required for these operations.
+///
+/// # Error envelope
+///
+/// Per [ADR 0005][adr] every fallible method returns
+/// `Result<_, CanonicalError>`, and every per-item `Result` returned inside a
+/// map or [`RegisterResult`] carries `CanonicalError` too. The single
+/// authoritative AIP-193 ladder (`From<DomainError> for CanonicalError`) lives
+/// in the impl crate's `api::rest::error`; this trait surfaces that envelope
+/// unchanged. Consumers may propagate it, or opt into the typed
+/// [`TypesRegistryError`](crate::TypesRegistryError) projection
+/// (`From<CanonicalError>`) for flat dispatch — see its gear docs for the
+/// dispatch table and the three integration patterns.
+///
+/// [adr]: https://github.com/constructorfabric/gears-rust/blob/main/docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md
 #[async_trait]
 pub trait TypesRegistryClient: Send + Sync {
     // ------------------------------------------------------------------
@@ -46,7 +60,7 @@ pub trait TypesRegistryClient: Send + Sync {
     async fn register(
         &self,
         entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError>;
+    ) -> Result<Vec<RegisterResult>, CanonicalError>;
 
     // ------------------------------------------------------------------
     // Type-schema operations (internal — no tenant scoping).
@@ -56,10 +70,13 @@ pub trait TypesRegistryClient: Send + Sync {
     ///
     /// Each input value must have a GTS id ending with `~`. Inputs whose
     /// identifier does not match the type-schema kind are returned as
-    /// per-item `RegisterResult::Err` with `InvalidGtsTypeId`. In ready
-    /// phase, items whose chain parent is not yet registered fail with
-    /// `ParentTypeSchemaNotRegistered` (callers may register the parent
-    /// then retry the failed item).
+    /// per-item `RegisterResult::Err` carrying an `InvalidArgument`
+    /// canonical error (project to
+    /// [`TypesRegistryError::Validation`](crate::TypesRegistryError::Validation)).
+    /// In ready phase, items whose chain parent is not yet registered fail with
+    /// a `FailedPrecondition` (project to
+    /// [`TypesRegistryError::ParentNotRegistered`](crate::TypesRegistryError::ParentNotRegistered)
+    /// — callers may register the parent then retry the failed item).
     ///
     /// # Errors
     ///
@@ -67,40 +84,39 @@ pub trait TypesRegistryClient: Send + Sync {
     async fn register_type_schemas(
         &self,
         type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError>;
+    ) -> Result<Vec<RegisterResult>, CanonicalError>;
 
     /// Retrieve a registered GTS type-schema by its type id.
     ///
     /// # Errors
     ///
-    /// * `GtsTypeSchemaNotFound` — no type-schema with this id is registered.
-    /// * `InvalidGtsTypeId` — id format is invalid, kind-mismatched, or
-    ///   resolves to a non-type-schema entity.
-    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, TypesRegistryError>;
+    /// * `NotFound` — no type-schema with this id is registered.
+    /// * `InvalidArgument` (reason `INVALID_GTS_ID`) — id format is invalid,
+    ///   kind-mismatched, or resolves to a non-type-schema entity.
+    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError>;
 
     /// Retrieve a registered GTS type-schema by its deterministic UUID v5.
     ///
     /// # Errors
     ///
-    /// * `GtsTypeSchemaNotFound` — no type-schema is registered with this UUID
-    ///   (also returned when the UUID exists but points to an instance).
+    /// * `NotFound` — no type-schema is registered with this UUID (also
+    ///   returned when the UUID exists but points to an instance).
     async fn get_type_schema_by_uuid(
         &self,
         type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, TypesRegistryError>;
+    ) -> Result<GtsTypeSchema, CanonicalError>;
 
     /// Retrieve multiple type-schemas by id in one call.
     ///
     /// Returns a map keyed by the input ids; each value is a per-item
-    /// `Result` carrying either the resolved schema or the per-item error
-    /// ([`GtsTypeSchemaNotFound`](TypesRegistryError::GtsTypeSchemaNotFound),
-    /// [`InvalidGtsTypeId`](TypesRegistryError::InvalidGtsTypeId), …).
-    /// Duplicate ids in the input collapse to a single entry. The map
-    /// always has a value for every distinct input id.
+    /// `Result` carrying either the resolved schema or the per-item
+    /// `CanonicalError` (`NotFound`, or `InvalidArgument` with reason
+    /// `INVALID_GTS_ID`, …). Duplicate ids in the input collapse to a single
+    /// entry. The map always has a value for every distinct input id.
     async fn get_type_schemas(
         &self,
         type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, TypesRegistryError>>;
+    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>>;
 
     /// Retrieve multiple type-schemas by deterministic UUID v5 in one call.
     ///
@@ -110,13 +126,13 @@ pub trait TypesRegistryClient: Send + Sync {
     async fn get_type_schemas_by_uuid(
         &self,
         type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, TypesRegistryError>>;
+    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>>;
 
     /// List registered GTS type-schemas matching the query.
     async fn list_type_schemas(
         &self,
         query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, TypesRegistryError>;
+    ) -> Result<Vec<GtsTypeSchema>, CanonicalError>;
 
     // ------------------------------------------------------------------
     // Instance operations (internal — no tenant scoping).
@@ -126,9 +142,11 @@ pub trait TypesRegistryClient: Send + Sync {
     ///
     /// Each input value must have a GTS id that does NOT end with `~`. Inputs
     /// whose identifier does not match the instance kind are returned as
-    /// per-item `RegisterResult::Err` with `InvalidGtsInstanceId`. In ready
-    /// phase, items whose declaring type-schema is not yet registered fail
-    /// with `ParentTypeSchemaNotRegistered`.
+    /// per-item `RegisterResult::Err` carrying an `InvalidArgument` canonical
+    /// error (reason `INVALID_GTS_ID`). In ready phase, items whose declaring
+    /// type-schema is not yet registered fail with a `FailedPrecondition`
+    /// (project to
+    /// [`TypesRegistryError::ParentNotRegistered`](crate::TypesRegistryError::ParentNotRegistered)).
     ///
     /// # Errors
     ///
@@ -136,36 +154,36 @@ pub trait TypesRegistryClient: Send + Sync {
     async fn register_instances(
         &self,
         instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError>;
+    ) -> Result<Vec<RegisterResult>, CanonicalError>;
 
     /// Retrieve a registered GTS instance by its instance id.
     ///
     /// # Errors
     ///
-    /// * `GtsInstanceNotFound` — no instance with this id is registered.
-    /// * `InvalidGtsInstanceId` — id format is invalid, kind-mismatched, or
-    ///   resolves to a non-instance entity.
-    async fn get_instance(&self, id: &str) -> Result<GtsInstance, TypesRegistryError>;
+    /// * `NotFound` — no instance with this id is registered.
+    /// * `InvalidArgument` (reason `INVALID_GTS_ID`) — id format is invalid,
+    ///   kind-mismatched, or resolves to a non-instance entity.
+    async fn get_instance(&self, id: &str) -> Result<GtsInstance, CanonicalError>;
 
     /// Retrieve a registered GTS instance by its deterministic UUID v5.
     ///
     /// # Errors
     ///
-    /// * `GtsInstanceNotFound` — no instance is registered with this UUID
-    ///   (also returned when the UUID exists but points to a type-schema).
-    async fn get_instance_by_uuid(&self, uuid: Uuid) -> Result<GtsInstance, TypesRegistryError>;
+    /// * `NotFound` — no instance is registered with this UUID (also returned
+    ///   when the UUID exists but points to a type-schema).
+    async fn get_instance_by_uuid(&self, uuid: Uuid) -> Result<GtsInstance, CanonicalError>;
 
     /// Retrieve multiple instances by id in one call.
     ///
     /// Returns a map keyed by the input ids; each value is a per-item
     /// `Result` carrying either the resolved instance or the per-item
-    /// error ([`GtsInstanceNotFound`](TypesRegistryError::GtsInstanceNotFound),
-    /// [`InvalidGtsInstanceId`](TypesRegistryError::InvalidGtsInstanceId),
-    /// …). Duplicate ids in the input collapse to a single entry.
+    /// `CanonicalError` (`NotFound`, or `InvalidArgument` with reason
+    /// `INVALID_GTS_ID`, …). Duplicate ids in the input collapse to a single
+    /// entry.
     async fn get_instances(
         &self,
         ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, TypesRegistryError>>;
+    ) -> HashMap<String, Result<GtsInstance, CanonicalError>>;
 
     /// Retrieve multiple instances by deterministic UUID v5 in one call.
     ///
@@ -175,11 +193,11 @@ pub trait TypesRegistryClient: Send + Sync {
     async fn get_instances_by_uuid(
         &self,
         uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, TypesRegistryError>>;
+    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>>;
 
     /// List registered GTS instances matching the query.
     async fn list_instances(
         &self,
         query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, TypesRegistryError>;
+    ) -> Result<Vec<GtsInstance>, CanonicalError>;
 }

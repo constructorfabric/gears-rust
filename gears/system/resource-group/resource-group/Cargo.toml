@@ -21,12 +21,11 @@ odata = []
 
 [dependencies]
 # SDK - public API, models, and errors
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.1.5", path = "../resource-group-sdk", features = ["odata"] }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.0", path = "../resource-group-sdk", features = ["odata"] }
 
 # Core dependencies
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
 
@@ -70,7 +69,14 @@ toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-macros = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 tower = { workspace = true }
 http-body-util = { workspace = true }
+# Enable the SDK `test-util` feature so integration-test fakes can build the
+# canonical-error envelopes via `types_registry_sdk::testing`.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+# Declared directly so the integration-test fakes that name
+# `toolkit_canonical_errors::CanonicalError` don't rely on it being pulled in
+# transitively via the normal (`[dependencies]`) build graph.
+toolkit-canonical-errors = { workspace = true }

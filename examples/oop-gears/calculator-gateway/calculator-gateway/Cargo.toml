@@ -13,7 +13,6 @@ calculator-sdk = { path = "../../calculator/calculator-sdk" }
 
 # ToolKit
 toolkit = { workspace = true }
-toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 
@@ -36,6 +35,3 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }

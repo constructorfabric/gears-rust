@@ -17,8 +17,8 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.1.25", path = "../../credstore-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.2.3", path = "../../../system/types-registry/types-registry-sdk" }
+credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.1.26", path = "../../credstore-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.0", path = "../../../system/types-registry/types-registry-sdk" }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
@@ -36,7 +36,6 @@ anyhow = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
-serde_json = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

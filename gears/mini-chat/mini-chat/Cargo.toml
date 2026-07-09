@@ -27,7 +27,7 @@ k8s = ["dep:kube", "dep:k8s-openapi"]
 mini-chat-sdk = { workspace = true }
 
 # AuthN resolver for S2S client credentials exchange
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.17", path = "../../system/authn-resolver/authn-resolver-sdk" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.18", path = "../../system/authn-resolver/authn-resolver-sdk" }
 
 # AuthZ resolver for authorization (PEP flow)
 authz-resolver-sdk = { workspace = true }
@@ -48,7 +48,6 @@ inventory = { workspace = true }
 
 # Streaming / async utilities
 tokio-util = { workspace = true }
-pin-project-lite = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 regex = { workspace = true }
@@ -98,7 +97,6 @@ toolkit-db-macros = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
-toolkit-utils = { workspace = true }
 heck = { workspace = true }
 secrecy = { workspace = true }
 # k8s leader election (optional, behind k8s feature)
@@ -109,8 +107,5 @@ k8s-openapi = { workspace = true, features = ["latest"], optional = true }
 chrono = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
-# End-to-end test of permission registration goes through a real
-# TypesRegistryService instance seeded from the canonical inventory.
-types-registry = { workspace = true }
 
 

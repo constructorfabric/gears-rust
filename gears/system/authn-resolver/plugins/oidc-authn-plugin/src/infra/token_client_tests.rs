@@ -24,6 +24,9 @@ fn make_issuer_trust(issuer: String) -> IssuerTrustConfig {
     IssuerTrustConfig::from_inputs_allowing_insecure_http_for_tests([TrustedIssuerInput {
         entry: TrustedIssuerEntry::Issuer(issuer),
         discovery_url: None,
+        expected_audience: Vec::new(),
+        jose_typ: None,
+        clock_skew_leeway_secs: None,
     }])
     .expect("test issuer trust should build")
 }

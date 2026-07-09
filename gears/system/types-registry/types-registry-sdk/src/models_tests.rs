@@ -11,6 +11,23 @@
 
 use super::*;
 use serde_json::json;
+use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
+
+/// `try_new` now returns `CanonicalError`; the legacy `is_invalid_gts_*`
+/// predicates are gone. The kind distinction collapsed at the canonical
+/// boundary (ADR 0005), so both former variants are one `InvalidArgument`
+/// with reason `INVALID_GTS_ID`.
+fn is_invalid_gts_id(err: &CanonicalError) -> bool {
+    matches!(
+        err,
+        CanonicalError::InvalidArgument {
+            ctx: InvalidArgument::FieldViolations { field_violations },
+            ..
+        } if field_violations
+            .iter()
+            .any(|v| v.reason == crate::field::INVALID_GTS_ID)
+    )
+}
 
 fn make_type_schema(
     type_id: &str,
@@ -70,7 +87,7 @@ fn test_type_schema_rejects_instance_id() {
         None,
     )
     .unwrap_err();
-    assert!(err.is_invalid_gts_type_id());
+    assert!(is_invalid_gts_id(&err));
 }
 
 #[test]
@@ -90,7 +107,7 @@ fn test_type_schema_rejects_mismatched_parent() {
         Some(wrong_parent),
     )
     .unwrap_err();
-    assert!(err.is_invalid_gts_type_id());
+    assert!(is_invalid_gts_id(&err));
 }
 
 #[test]
@@ -99,7 +116,7 @@ fn test_type_schema_rejects_root_with_parent() {
     let stray_parent = Arc::new(make_type_schema(BASE_ID, json!({}), None));
     let err = GtsTypeSchema::try_new(GtsTypeId::new(BASE_ID), json!({}), None, Some(stray_parent))
         .unwrap_err();
-    assert!(err.is_invalid_gts_type_id());
+    assert!(is_invalid_gts_id(&err));
 }
 
 #[test]
@@ -109,7 +126,7 @@ fn test_type_schema_rejects_derived_without_parent() {
     // reject this and force the caller to pass the chain.
     let err =
         GtsTypeSchema::try_new(GtsTypeId::new(DERIVED_ID), json!({}), None, None).unwrap_err();
-    assert!(err.is_invalid_gts_type_id());
+    assert!(is_invalid_gts_id(&err));
 }
 
 #[test]
@@ -724,7 +741,7 @@ fn test_instance_try_new_rejects_mismatched_type_schema() {
         type_schema,
     )
     .unwrap_err();
-    assert!(err.is_invalid_gts_instance_id());
+    assert!(is_invalid_gts_id(&err));
 }
 
 #[test]
@@ -741,7 +758,7 @@ fn test_instance_rejects_type_id() {
         type_schema,
     )
     .unwrap_err();
-    assert!(err.is_invalid_gts_instance_id());
+    assert!(is_invalid_gts_id(&err));
 }
 
 #[test]

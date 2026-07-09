@@ -1,4 +1,4 @@
-use toolkit_macros::gear;
+use toolkit::gear;
 use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 

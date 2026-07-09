@@ -3,6 +3,13 @@
 This document defines the test strategy, coverage requirements, and CI enforcement for
 Gears.  It is the single source of truth for "what must be tested and how."
 
+Gears promotes a **shift-left**, green-build-oriented development model: contributors
+should be able to run the vast majority of checks on a local development machine before
+opening a pull request.  This is practical because the codebase has a low memory and CPU footprint with help of Rust, fast and deterministic local test execution, and a packaging model where many gear combinations can be exercised through a small number of binaries rather than a large distributed deployment.
+
+The unified `Makefile` and `tools/scripts/ci.py` entry points mirror CI behavior locally, so unit tests, most integration tests, linting, safety checks, coverage, and most E2E validation can usually be reproduced before the code ever reaches GitHub Actions. CI still remains the source of truth for cross-platform validation, scheduled suites, specialized lanes such as FIPS, and final merge protection, but contributors are expected to arrive with a locally green
+build whenever feasible.
+
 ---
 
 ## 1. Test Pyramid
@@ -11,9 +18,11 @@ Gears.  It is the single source of truth for "what must be tested and how."
 |-------|-------|---------|--------------|------------|
 | **Unit** | Single function / struct / gear in isolation | `cargo test --workspace` | none (always compiled) | Every PR (`ci.yml` — `test` job, all OS) |
 | **Integration** | Cross-crate or DB-backed logic (SQLite, Postgres, MySQL) | `cargo test -p <pkg> --features integration` | `#[cfg(feature = "integration")]` | Every PR (`ci.yml` — `integration` job, Ubuntu) |
-| **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
+| **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-e2e-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
 | **Fuzz** | Parser / validator robustness against arbitrary input | `cargo-fuzz` (libFuzzer) | nightly toolchain | PRs + nightly (`clusterfuzzlite.yml`) |
 | **Static analysis** | Architectural rules, unsafe code, dependency licenses | clippy, dylint, cargo-deny, cargo-kani, cargo-geiger | varies | Every PR (`ci.yml` — `test`, `security`, `dylint` jobs) |
+
+Additional testing categories such as performance (#4054), upgrade / migration (#4117), and long-haul (#4118) or soak testing are expected to be added over time, but they are not yet implemented or enforced as part of the current project test matrix.
 
 ```bash
 make check                  # full quality gate (fmt + clippy + test + security)
@@ -44,7 +53,7 @@ make all                   # full pipeline (build + check + test-sqlite + e2e-lo
 ### 2.1 Threshold
 
 The project-wide **line-coverage threshold is 80 %**.  The threshold is enforced in
-`scripts/coverage.py` (`COVERAGE_THRESHOLD`) and printed as a warning when any gear
+`tools/scripts/coverage.py` (`COVERAGE_THRESHOLD`) and printed as a warning when any gear
 or library falls below it.
 
 ### 2.2 Coverage modes
@@ -133,7 +142,7 @@ plus macro UI tests on every PR (Ubuntu only).
 
 ## 5. End-to-End (E2E) Tests
 
-E2E tests exercise the full HTTP surface of `cf-gears-server` using Python (pytest +
+E2E tests exercise the full HTTP surface of the gears testing server using Python (pytest +
 httpx).
 
 ### 5.1 Expectations
@@ -153,9 +162,20 @@ httpx).
 
 The `e2e.yml` workflow runs:
 - **On PRs to `main`**: full E2E suite (local mode).
-- **Nightly (02:00 UTC)**: full E2E suite.  Failures auto-create a GitHub issue
-  assigned to the last commit author.
+- **Nightly**: full E2E suite. Failures auto-create a GitHub issue assigned to the last commit author.
 - **Manual dispatch**: smoke or full, selectable.
+- **Specialized lanes**: the same workflow also runs the mini-chat E2E suite and the
+  RG + AuthZ end-to-end chain tests.
+
+Other quality-related GitHub Actions under `.github/workflows` complement the E2E
+workflow:
+- **`ci.yml`** runs the main cross-platform quality gates: linting, unit tests,
+  integration tests, FIPS verification, coverage, security checks, Dylint, and Cypilot
+  validation.
+- **`fmt.yml`** runs dedicated Rust formatting validation.
+- **`docs.yml`** checks Markdown links for documentation changes.
+- **`gts-validation.yml`** validates GTS identifiers in documentation and schema files.
+- **`codeql.yml`** performs security and quality-oriented code scanning.
 
 ### 5.4 Writing E2E tests
 
@@ -202,46 +222,52 @@ See [`fuzz/README.md`](../tools/fuzz/README.md) for corpus management and crash 
 
 ---
 
-## 7. Static Analysis & Safety
+## 7. CI / Development Commands
 
-| Tool | Purpose | Command | CI job |
-|------|---------|---------|--------|
-| **clippy** | Lint for correctness and performance | `make clippy` | `test` |
-| **rustfmt** | Formatting enforcement | `make fmt` | `test` |
-| **dylint** | Project-specific architectural lints (layer separation, DTO placement) | `make dylint` | `dylint` |
-| **cargo-deny** | License compliance, advisories, banned crates | `make deny` | `security` |
-| **cargo-kani** | Formal verification of unsafe code and invariants | `make kani` | `test` (via `safety`) |
-| **cargo-geiger** | Audit of `unsafe` usage in dependencies | `make geiger` | manual |
-
----
-
-## 8. CI / Development Commands
-
-Gears uses a unified, cross-platform Python CI script (`scripts/ci.py`).
+Gears uses a unified, cross-platform Python CI script (`tools/scripts/ci.py`).
 This is the **primary entry point on Windows** where `make` is not available.
 Requires Python 3.9+.
 
-### 8.1 Cross-platform commands (`scripts/ci.py`)
+### 7.1 Cross-platform commands (`tools/scripts/ci.py`)
 
 ```bash
-python scripts/ci.py all            # build + full check suite + e2e
-python scripts/ci.py check          # fmt, clippy, test, audit, deny
-python scripts/ci.py fmt            # check formatting
-python scripts/ci.py fmt --fix      # auto-format code
-python scripts/ci.py clippy         # run linter
-python scripts/ci.py clippy --fix   # attempt to fix warnings
-python scripts/ci.py dylint         # custom project compliance lints
-python scripts/ci.py audit          # security audit
-python scripts/ci.py deny           # license & dependency checks
-python scripts/ci.py e2e-local      # build server + run E2E tests locally
-python scripts/ci.py e2e-local --smoke  # E2E smoke subset only
-python scripts/ci.py e2e-docker     # E2E in Docker
-python scripts/ci.py fuzz-build     # build fuzz targets
-python scripts/ci.py fuzz --seconds 60  # fuzz smoke run
-python scripts/ci.py fuzz-run fuzz_odata_filter --seconds 300  # single target
+python tools/scripts/ci.py all            # build + full check suite + e2e
+python tools/scripts/ci.py check          # fmt, clippy, test, audit, deny
+python tools/scripts/ci.py fmt            # check formatting
+python tools/scripts/ci.py fmt --fix      # auto-format code
+python tools/scripts/ci.py clippy         # run linter
+python tools/scripts/ci.py clippy --fix   # attempt to fix warnings
+python tools/scripts/ci.py dylint         # custom project compliance lints
+python tools/scripts/ci.py audit          # security audit
+python tools/scripts/ci.py deny           # license & dependency checks
+python tools/scripts/ci.py e2e-local      # build server + run E2E tests locally
+python tools/scripts/ci.py e2e-local --smoke  # E2E smoke subset only
+python tools/scripts/ci.py e2e-docker     # E2E in Docker
+python tools/scripts/ci.py fuzz-build     # build fuzz targets
+python tools/scripts/ci.py fuzz --seconds 60  # fuzz smoke run
+python tools/scripts/ci.py fuzz-run fuzz_odata_filter --seconds 300  # single target
 ```
 
-### 8.2 Makefile shortcuts (Unix / Linux / macOS)
+> On Windows, invoke these helpers with `python` (the `python3` alias is
+> frequently absent).
+
+Code coverage is produced by a separate script, `coverage.py`:
+
+```bash
+python tools/scripts/coverage.py unit       # unit-test coverage
+python tools/scripts/coverage.py e2e-local  # e2e-local coverage
+python tools/scripts/coverage.py combined   # unit + e2e-local (== make coverage)
+```
+
+Prerequisites (install once; `make setup` handles these on supported hosts):
+
+```bash
+pip install -r testing/e2e/requirements.txt   # pytest + httpx (e2e tests)
+pip install -r testing/requirements.txt        # PyYAML + requests (coverage.py)
+cargo install cargo-llvm-cov                    # coverage backend (works on Windows too)
+```
+
+### 7.2 Makefile shortcuts (Unix / Linux / macOS)
 
 The `Makefile` wraps the same operations for convenience:
 
@@ -258,26 +284,72 @@ make kani       # Kani formal verification (optional)
 make safety     # clippy + kani + lint + dylint
 ```
 
----
-
-## 9. CI Pipeline Summary
+## 7.3 CI Pipeline Summary
 
 ```
 PR opened / updated
   ├── ci.yml
   │     ├── test          — fmt + clippy + unit tests (Ubuntu, macOS, Windows)
   │     ├── integration   — DB integration tests (Ubuntu)
+  │     ├── test-fips     — FIPS verification / platform-specific FIPS test lanes
   │     ├── security      — cargo-deny
   │     ├── coverage      — cargo-llvm-cov → Codecov upload
-  │     └── dylint        — custom architectural lints
+  │     ├── dylint        — custom architectural lints
+  │     └── cypilot       — artifact / specification validation
   │
+  ├── fmt.yml             — dedicated cargo fmt validation for Rust changes
+  ├── docs.yml            — Markdown link checking for docs changes
+  ├── gts-validation.yml  — GTS identifier validation for docs / schema changes
   └── e2e.yml (PRs to main only)
-        └── e2e           — full E2E suite (local mode)
+        └── e2e           — full E2E suite (local mode), plus mini-chat and TR/AuthZ E2E lanes
+
+Additional quality workflows
+  ├── codeql.yml          — security and quality code scanning
+  ├── pr-governance.yml   — review-governance automation
+  └── pr-reviewer-check.yml — reviewer assignment hygiene
 
 Nightly (schedule)
-  ├── e2e.yml             — full E2E (auto-creates issue on failure)
-  └── clusterfuzzlite     — fuzz testing
+  ├── e2e.yml              — full E2E + specialized E2E lanes (auto-creates issue on failure)
+  ├── clusterfuzzlite      — fuzz testing
+  ├── codeql.yml           — scheduled code scanning
+  ├── pr-governance.yml    — governance / follow-up automation
+  └── pr-reviewer-check.yml — reviewer assignment checks
 ```
+
+---
+
+## 8. Dylint
+
+`Dylint` is the main project-specific lint layer. Unlike generic linting tools such as
+`clippy`, it enforces Gears-specific architectural and repository rules: layer
+separation, DTO placement, REST conventions, security-sensitive patterns, documentation
+constraints, and GTS-related validation.
+
+Useful local commands include:
+
+```bash
+make dylint        # run custom lints across the workspace
+make dylint-list   # list available Dylint lints
+make dylint-test   # run lint UI / golden tests
+make gts-docs      # validate GTS identifiers in docs and schema files
+```
+
+The CI `dylint` job both tests the lint crates themselves and applies the lints to the
+workspace. For the current lint catalog and development notes, see
+[`tools/dylint_lints/README.md`](../tools/dylint_lints/README.md).
+
+---
+
+## 9. Static Analysis & Safety
+
+| Tool | Purpose | Command | CI job |
+|------|---------|---------|--------|
+| **clippy** | Lint for correctness and performance | `make clippy` | `test` |
+| **rustfmt** | Formatting enforcement | `make fmt` | `test` |
+| **dylint** | Project-specific architectural lints (layer separation, DTO placement) | `make dylint` | `dylint` |
+| **cargo-deny** | License compliance, advisories, banned crates | `make deny` | `security` |
+| **cargo-kani** | Formal verification of unsafe code and invariants | `make kani` | `test` (via `safety`) |
+| **cargo-geiger** | Audit of `unsafe` usage in dependencies | `make geiger` | manual |
 
 ---
 
@@ -300,5 +372,6 @@ Before opening a PR, verify:
 - [CONTRIBUTING.md](../CONTRIBUTING.md) — development workflow, commit conventions, PR process
 - [testing/e2e/README.md](../testing/e2e/README.md) — E2E test guide, fixtures, advanced usage
 - [fuzz/README.md](../tools/fuzz/README.md) — fuzz target reference, corpus management
+- [tools/dylint_lints/README.md](../tools/dylint_lints/README.md) — Dylint lint catalog, commands, and development notes
 - [guidelines/SECURITY.md](../guidelines/SECURITY.md) — secure coding practices
 - [docs/QUICKSTART_GUIDE.md](./QUICKSTART_GUIDE.md) — getting started with the project

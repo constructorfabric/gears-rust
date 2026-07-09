@@ -11,7 +11,6 @@ use authn_resolver_sdk::ClientCredentialsRequest;
 use dashmap::DashMap;
 use secrecy::ExposeSecret;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::config::{IssuerTrustConfig, RetryPolicyConfig, S2sConfig};
@@ -211,13 +210,23 @@ impl TokenClient {
     }
 
     fn credential_fingerprint(secret: &str) -> String {
-        let digest = Sha256::digest(secret.as_bytes());
-        hex::encode(digest)
+        /// FNV-1a 64-bit — deterministic non-cryptographic fingerprint for cache busting.
+        fn fnv1a_64(bytes: &[u8]) -> u64 {
+            const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+            const PRIME: u64 = 0x0000_0100_0000_01B3;
+            let mut hash = BASIS;
+            for &b in bytes {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(PRIME);
+            }
+            hash
+        }
+        format!("{:016x}", fnv1a_64(secret.as_bytes()))
     }
 
     fn build_cache_key(client_id: &str, normalized_scopes: &str, fingerprint: &str) -> String {
         format!(
-            "client_id:{}:{client_id}|scopes:{}:{normalized_scopes}|secret_sha256:{fingerprint}",
+            "client_id:{}:{client_id}|scopes:{}:{normalized_scopes}|secret_fnv1a:{fingerprint}",
             client_id.len(),
             normalized_scopes.len()
         )

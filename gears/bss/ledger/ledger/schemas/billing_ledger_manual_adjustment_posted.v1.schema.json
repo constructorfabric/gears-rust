@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.manual_adjustment_posted.v1",
+  "title": "Billing Ledger Manual Adjustment Posted",
+  "description": "Emitted on every successful governed manual-adjustment post (never on replay). Internal identifiers + enum codes + amount only; no PII (actor_ref is an internal subject uuid, not a name).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "adjustment_id": {
+      "type": "string"
+    },
+    "entry_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "action": {
+      "type": "string"
+    },
+    "reason_code": {
+      "type": "string"
+    },
+    "actor_ref": {
+      "type": "string"
+    },
+    "amount_minor": {
+      "type": "integer"
+    },
+    "currency": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "tenant_id",
+    "adjustment_id",
+    "entry_id",
+    "action",
+    "reason_code",
+    "actor_ref",
+    "amount_minor",
+    "currency"
+  ]
+}

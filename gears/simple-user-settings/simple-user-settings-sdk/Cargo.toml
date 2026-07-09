@@ -20,7 +20,6 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 uuid = { workspace = true }
-time = { workspace = true }
 
 toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true }

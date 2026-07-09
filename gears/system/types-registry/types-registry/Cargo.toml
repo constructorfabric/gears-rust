@@ -20,7 +20,7 @@ doctest = false
 
 [dependencies]
 # SDK - public API, models, and errors
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.2.3", path = "../types-registry-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.0", path = "../types-registry-sdk" }
 
 # GTS types (from git dependency)
 gts = { workspace = true }
@@ -38,7 +38,7 @@ axum = { workspace = true, features = ["macros"] }
 uuid = { workspace = true, features = ["v5"] }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
-lru = "0.16"
+lru = "0.17"
 
 # Local dependencies
 toolkit = { workspace = true }

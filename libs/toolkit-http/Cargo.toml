@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-http"
-version = "0.6.7"
+version = "0.6.8"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -17,6 +17,11 @@ name = "toolkit_http"
 
 [lints]
 workspace = true
+
+# Pulled in only to trigger Cargo feature unification (rustls/hyper-rustls
+# `fips`); never referenced in code by design.
+[package.metadata.cargo-shear]
+ignored = ["rustls-fips-shim"]
 
 [features]
 default = []
@@ -49,6 +54,15 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# SecurityContext propagation. `toolkit-security` is transport-agnostic and owns
+# both `SecurityContext` and the `BearerAuthenticator` trait, so it can be the
+# only auth dependency here. Do NOT add authn-resolver-sdk: it would pull the
+# whole ToolKit framework into this transport crate and invert the layering —
+# the concrete AuthNResolverClient is adapted to BearerAuthenticator at the
+# gear/bootstrap layer instead.
+toolkit-security = { workspace = true }
+secrecy = { workspace = true }
 
 # HTTP stack
 hyper = { workspace = true, features = ["client", "http1", "http2"] }
@@ -100,6 +114,6 @@ httpmock = { workspace = true }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-tracing-subscriber = { workspace = true }
 flate2 = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

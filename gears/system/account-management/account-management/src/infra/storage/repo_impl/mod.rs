@@ -19,6 +19,7 @@ pub use conversion::ConversionRepoImpl;
 pub use hierarchy_read::TenantHierarchyReadAdapter;
 pub use metadata::MetadataRepoImpl;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -199,6 +200,14 @@ impl TenantRepo for TenantRepoImpl {
         filter: ChildCountFilter,
     ) -> Result<u64, DomainError> {
         reads::count_children(self, scope, parent_id, filter).await
+    }
+
+    async fn count_children_grouped(
+        &self,
+        scope: &AccessScope,
+        parent_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, u64>, DomainError> {
+        reads::count_children_grouped(self, scope, parent_ids).await
     }
 
     async fn count_tenants_by_status(

@@ -198,6 +198,25 @@ pub fn is_in_sdk_crate(cx: &rustc_lint::EarlyContext<'_>, span: Span) -> bool {
     file_path.contains("-sdk/") || file_path.contains("-sdk\\") || is_temp_path(&file_path)
 }
 
+/// Check if span is within the allow-list for non-FIPS hasher imports (DE0708).
+///
+/// Entries are confined `sha2` call sites approved per `SECURITY.md §9`:
+/// - `gears/file-storage/file-storage/src/infra/content/hash.rs` — the single
+///   SHA-256 site in file-storage, used for content addressing/integrity
+///   (`expected_hash`, version identity) and the opaque ETag, **not** for
+///   signatures. The signed-URL signing primitive lives behind its own
+///   provider abstraction (ADR-0004), not here.
+///
+/// Add entries here only for legitimate non-cryptographic or FIPS-validated
+/// usage, with a corresponding `SECURITY.md §9` disclaimer.
+pub fn is_in_hasher_allow_list(source_map: &SourceMap, span: Span) -> bool {
+    check_span_path(
+        source_map,
+        span,
+        "gears/file-storage/file-storage/src/infra/content/hash.rs",
+    ) || check_span_path(source_map, span, "file-storage/src/infra/content/hash.rs")
+}
+
 /// Check if span is within libs/toolkit-db/ - the internal sqlx wrapper library
 /// This path is excluded from sqlx restrictions as it provides the abstraction layer
 pub fn is_in_toolkit_db_path(source_map: &SourceMap, span: Span) -> bool {
@@ -465,7 +484,7 @@ pub fn is_utoipa_trait(segments: &[&str], trait_name: &str) -> bool {
 /// - `use foo::*` -> `["foo"]`
 pub fn use_tree_to_strings(tree: &UseTree) -> Vec<String> {
     match &tree.kind {
-        UseTreeKind::Simple(..) | UseTreeKind::Glob => {
+        UseTreeKind::Simple(..) | UseTreeKind::Glob(_) => {
             vec![
                 tree.prefix
                     .segments

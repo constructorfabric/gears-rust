@@ -1,0 +1,23 @@
+name: Notify docs site
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/web-docs/**']
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Trigger docs sync
+        run: |
+          gh api repos/constructorfabric/gears-rust-web-docs/dispatches \
+            -f event_type=docs-sync \
+            -f "client_payload[sha]=$GITHUB_SHA"
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}

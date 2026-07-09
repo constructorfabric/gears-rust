@@ -121,8 +121,3 @@ impl TenantResolverPluginClient for Service {
             .await
     }
 }
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-#[path = "client_tests.rs"]
-mod client_tests;

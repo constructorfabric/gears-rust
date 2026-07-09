@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use toolkit_macros::domain_model;
-use types_registry_sdk::TypesRegistryError;
 
 /// A structured validation error with typed fields.
 #[domain_model]
@@ -46,10 +45,14 @@ impl std::fmt::Display for ValidationError {
 ///
 /// This enum is intentionally **kind-agnostic** — the storage layer doesn't
 /// know whether a string identifies a type-schema or an instance, it just
-/// stores and retrieves entities by their GTS ID. The kind context is added
-/// at the SDK boundary by the local client, which knows what kind the caller
-/// asked for and converts via [`Self::into_sdk_for_type_schema`] /
-/// [`Self::into_sdk_for_instance`].
+/// stores and retrieves entities by their GTS ID. Per [ADR 0005][adr] this
+/// enum is mapped to the platform [`CanonicalError`] by the single
+/// `From<DomainError> for CanonicalError` ladder in `crate::api::rest::error`;
+/// both the REST boundary and the in-process `TypesRegistryLocalClient` route
+/// through that one ladder.
+///
+/// [`CanonicalError`]: toolkit_canonical_errors::CanonicalError
+/// [adr]: https://github.com/constructorfabric/gears-rust/blob/main/docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md
 #[domain_model]
 #[derive(Error, Debug)]
 pub enum DomainError {
@@ -67,6 +70,24 @@ pub enum DomainError {
     /// An entity with the same GTS ID already exists.
     #[error("Entity already exists: {0}")]
     AlreadyExists(String),
+
+    /// A batch-register item could not be registered because its required
+    /// parent type-schema is not yet registered. Produced only by the
+    /// in-process `TypesRegistryLocalClient` parent pre-check (never by the
+    /// kind-agnostic service), and surfaced only as a per-item
+    /// `RegisterResult::Err` — it is unreachable from REST handlers. Maps to a
+    /// `FailedPrecondition` (wire `type` `PARENT_NOT_REGISTERED`) that carries
+    /// `parent_type_id` / `dependent_id` losslessly; see
+    /// `crate::api::rest::error`.
+    #[error(
+        "Cannot register {dependent_id}: required type-schema {parent_type_id} is not registered"
+    )]
+    ParentTypeSchemaNotRegistered {
+        /// The parent type-schema id that must be registered first.
+        parent_type_id: String,
+        /// The id of the entity whose registration failed.
+        dependent_id: String,
+    },
 
     /// The list/query parameters are syntactically invalid (e.g. an
     /// out-of-spec wildcard pattern). Distinct from `InvalidGtsId`, which
@@ -89,18 +110,6 @@ pub enum DomainError {
     /// An internal error occurred.
     #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
-}
-
-/// Indicates which kind of entity the caller was looking up, so kind-agnostic
-/// `DomainError`s can be lifted into kind-specific [`TypesRegistryError`]
-/// variants at the SDK boundary.
-#[domain_model]
-#[derive(Debug, Clone, Copy)]
-pub enum SdkErrorKind {
-    /// The caller asked for a type-schema.
-    TypeSchema,
-    /// The caller asked for an instance.
-    Instance,
 }
 
 /// Identifies which surface a `NotFound` lookup used. Carried inside
@@ -175,62 +184,6 @@ impl DomainError {
             _ => None,
         }
     }
-
-    /// Converts to [`TypesRegistryError`] under the assumption that the caller
-    /// was looking up a **type-schema**.
-    ///
-    /// `NotFound` becomes `GtsTypeSchemaNotFound`; `InvalidGtsId` becomes
-    /// `InvalidGtsTypeId`; the rest map straight.
-    #[must_use]
-    pub fn into_sdk_for_type_schema(self) -> TypesRegistryError {
-        self.into_sdk(SdkErrorKind::TypeSchema)
-    }
-
-    /// Converts to [`TypesRegistryError`] under the assumption that the caller
-    /// was looking up an **instance**.
-    ///
-    /// `NotFound` becomes `GtsInstanceNotFound`; `InvalidGtsId` becomes
-    /// `InvalidGtsInstanceId`; the rest map straight.
-    #[must_use]
-    pub fn into_sdk_for_instance(self) -> TypesRegistryError {
-        self.into_sdk(SdkErrorKind::Instance)
-    }
-
-    fn into_sdk(self, kind: SdkErrorKind) -> TypesRegistryError {
-        match (self, kind) {
-            (Self::InvalidGtsId(msg), SdkErrorKind::TypeSchema) => {
-                TypesRegistryError::invalid_gts_type_id(msg)
-            }
-            (Self::InvalidGtsId(msg), SdkErrorKind::Instance) => {
-                TypesRegistryError::invalid_gts_instance_id(msg)
-            }
-            (Self::NotFound { target, .. }, SdkErrorKind::TypeSchema) => {
-                TypesRegistryError::gts_type_schema_not_found(target)
-            }
-            (Self::NotFound { target, .. }, SdkErrorKind::Instance) => {
-                TypesRegistryError::gts_instance_not_found(target)
-            }
-            (Self::AlreadyExists(id), _) => TypesRegistryError::already_exists(id),
-            (Self::InvalidQuery(msg), _) => TypesRegistryError::invalid_query(msg),
-            (Self::ValidationFailed(msg), _) => TypesRegistryError::validation_failed(msg),
-            (Self::NotInReadyMode, _) => TypesRegistryError::service_unavailable(
-                "types registry is still initializing",
-                std::time::Duration::from_secs(1),
-            ),
-            (Self::ReadyCommitFailed(errors), _) => {
-                let error_strings: Vec<String> = errors
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect();
-                TypesRegistryError::validation_failed(format!(
-                    "Ready commit failed with {} errors: {}",
-                    errors.len(),
-                    error_strings.join("; ")
-                ))
-            }
-            (Self::Internal(e), _) => TypesRegistryError::internal(e.to_string()),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -265,72 +218,6 @@ mod tests {
 
         let err = DomainError::validation_failed("schema invalid");
         assert!(matches!(err, DomainError::ValidationFailed(_)));
-    }
-
-    #[test]
-    fn test_domain_to_sdk_error_conversion_for_type_schema() {
-        let sdk_err =
-            DomainError::not_found_by_id("gts.cf.core.events.test.v1~").into_sdk_for_type_schema();
-        assert!(sdk_err.is_gts_type_schema_not_found());
-
-        // UUID-keyed not-found also surfaces as `GtsTypeSchemaNotFound` —
-        // the SDK error doesn't model the lookup kind, only the kind of
-        // the entity the caller was after. The lookup-kind distinction
-        // matters only for REST rendering.
-        let sdk_err = DomainError::not_found_by_uuid(uuid::Uuid::nil()).into_sdk_for_type_schema();
-        assert!(sdk_err.is_gts_type_schema_not_found());
-
-        let sdk_err = DomainError::invalid_gts_id("bad format").into_sdk_for_type_schema();
-        assert!(sdk_err.is_invalid_gts_type_id());
-
-        let sdk_err =
-            DomainError::already_exists("gts.cf.core.events.test.v1~").into_sdk_for_type_schema();
-        assert!(sdk_err.is_already_exists());
-
-        let sdk_err = DomainError::validation_failed("bad schema").into_sdk_for_type_schema();
-        assert!(sdk_err.is_validation_failed());
-    }
-
-    #[test]
-    fn test_domain_to_sdk_error_conversion_for_instance() {
-        let sdk_err =
-            DomainError::not_found_by_id("gts.cf.core.events.test.v1~cf.core.instances.u1.v1")
-                .into_sdk_for_instance();
-        assert!(sdk_err.is_gts_instance_not_found());
-
-        let sdk_err = DomainError::invalid_gts_id("no chain prefix").into_sdk_for_instance();
-        assert!(sdk_err.is_invalid_gts_instance_id());
-    }
-
-    #[test]
-    fn test_domain_to_sdk_error_not_in_ready_mode() {
-        let sdk_err = DomainError::NotInReadyMode.into_sdk_for_type_schema();
-        assert!(sdk_err.is_service_unavailable());
-    }
-
-    #[test]
-    fn test_domain_to_sdk_error_ready_commit_failed() {
-        let errors = vec![
-            ValidationError::new("gts.test1~", "error1"),
-            ValidationError::new("gts.test2~", "error2"),
-        ];
-        let sdk_err = DomainError::ReadyCommitFailed(errors).into_sdk_for_type_schema();
-        assert!(sdk_err.is_validation_failed());
-    }
-
-    #[test]
-    fn test_domain_to_sdk_error_internal() {
-        let sdk_err =
-            DomainError::Internal(anyhow::anyhow!("test error")).into_sdk_for_type_schema();
-        assert!(matches!(sdk_err, TypesRegistryError::Internal(_)));
-    }
-
-    #[test]
-    fn test_domain_to_sdk_error_invalid_query() {
-        let sdk_err = DomainError::invalid_query("bad pattern").into_sdk_for_type_schema();
-        assert!(sdk_err.is_invalid_query());
-        let sdk_err = DomainError::invalid_query("bad pattern").into_sdk_for_instance();
-        assert!(sdk_err.is_invalid_query());
     }
 
     #[test]

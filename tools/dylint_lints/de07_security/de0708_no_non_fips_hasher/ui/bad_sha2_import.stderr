@@ -1,0 +1,12 @@
+error: non-FIPS-validated hasher import detected: `sha2::Digest` (DE0708)
+  --> $DIR/bad_sha2_import.rs:4:1
+   |
+LL | use sha2::{Digest, Sha256};
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: these crates use pure-Rust RustCrypto; add to the DE0708 allow-list if usage is non-cryptographic
+   = note: see docs/security/SECURITY.md §9 for the FIPS dependency policy
+   = note: `#[deny(de0708_no_non_fips_hasher)]` on by default
+
+error: aborting due to 1 previous error
+

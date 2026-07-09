@@ -3,11 +3,13 @@ use toolkit::plugins::ChoosePluginError;
 
 use super::*;
 
-// ── From<TypesRegistryError> ─────────────────────────────────────────────
+// ── From<CanonicalError> ─────────────────────────────────────────────────
 
 #[test]
-fn from_types_registry_error_becomes_internal() {
-    let src = types_registry_sdk::TypesRegistryError::internal("oops");
+fn from_canonical_error_becomes_internal() {
+    // The types-registry trait boundary is now `CanonicalError` (ADR 0005);
+    // credstore folds any such error into its opaque `Internal`.
+    let src = types_registry_sdk::testing::internal("oops");
     let dst = DomainError::from(src);
     assert!(matches!(dst, DomainError::Internal(_)));
 }

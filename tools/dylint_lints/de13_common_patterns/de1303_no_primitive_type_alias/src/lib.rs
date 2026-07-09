@@ -5,9 +5,10 @@
 
 extern crate rustc_ast;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use lint_utils::is_in_contract_module_ast;
 use rustc_ast::{Item, ItemKind, TyKind, VisibilityKind};
-use rustc_lint::{EarlyLintPass, LintContext};
+use rustc_lint::EarlyLintPass;
 
 dylint_linting::declare_early_lint! {
     /// ### What it does
@@ -103,15 +104,20 @@ impl EarlyLintPass for De1303NoPrimitiveTypeAlias {
             return;
         }
 
-        cx.span_lint(DE1303_NO_PRIMITIVE_TYPE_ALIAS, item.span, |diag| {
-            diag.primary_message(format!(
+        span_lint_and_then(
+            cx,
+            DE1303_NO_PRIMITIVE_TYPE_ALIAS,
+            item.span,
+            format!(
                 "`pub type {name} = {backing}` is a transparent alias with no type safety (DE1303)"
-            ));
-            diag.help(format!(
-                "wrap {backing} in a newtype: `pub struct {name}(pub {backing});` or `pub struct {name}({backing});`"
-            ));
-            diag.note("transparent aliases provide no compile-time separation; use a newtype for distinct semantic types");
-        });
+            ),
+            |diag| {
+                diag.help(format!(
+                    "wrap {backing} in a newtype: `pub struct {name}(pub {backing});` or `pub struct {name}({backing});`"
+                ));
+                diag.note("transparent aliases provide no compile-time separation; use a newtype for distinct semantic types");
+            },
+        );
     }
 }
 

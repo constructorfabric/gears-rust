@@ -575,64 +575,110 @@ fn is_serialization_failure_false_for_non_db_errors() {
     assert!(!err.is_serialization_failure());
 }
 
-// ── DomainError -> ResourceGroupError mapping ───────────────────────────
+// ── DomainError -> CanonicalError -> ResourceGroupError projection ──────
+//
+// The SDK trait boundary is `CanonicalError` (ADR 0005); `ResourceGroupError`
+// is the opt-in `From<CanonicalError>` projection. These tests exercise the
+// full domain → canonical → projection path a ClientHub consumer sees.
+
+/// Project a domain error the way a consumer would: through the single
+/// canonical ladder, then into the typed SDK view.
+fn project(err: DomainError) -> resource_group_sdk::ResourceGroupError {
+    resource_group_sdk::ResourceGroupError::from(CanonicalError::from(err))
+}
 
 #[test]
 fn domain_to_sdk_type_not_found() {
     use resource_group_sdk::ResourceGroupError;
-    let domain = DomainError::type_not_found("code");
-    let sdk: ResourceGroupError = domain.into();
-    assert!(sdk.to_string().contains("code"));
+    match project(DomainError::type_not_found("code")) {
+        ResourceGroupError::NotFound { name, .. } => assert_eq!(name, "code"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
 }
 
 #[test]
 fn domain_to_sdk_type_already_exists() {
     use resource_group_sdk::ResourceGroupError;
-    let domain = DomainError::type_already_exists("code");
-    let sdk: ResourceGroupError = domain.into();
-    assert!(sdk.to_string().contains("code"));
+    match project(DomainError::type_already_exists("code")) {
+        ResourceGroupError::AlreadyExists { name, .. } => assert_eq!(name, "code"),
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
 }
 
 #[test]
 fn domain_to_sdk_validation() {
     use resource_group_sdk::ResourceGroupError;
-    let domain = DomainError::validation("msg");
-    let sdk: ResourceGroupError = domain.into();
-    assert!(sdk.to_string().contains("msg") || !sdk.to_string().is_empty());
+    // Generic validation maps to a `Format` InvalidArgument — no field
+    // attribution, message preserved in `detail`.
+    match project(DomainError::validation("msg")) {
+        ResourceGroupError::InvalidArgument { detail, .. } => assert!(detail.contains("msg")),
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+#[test]
+fn domain_to_sdk_invalid_parent_type() {
+    use resource_group_sdk::{ResourceGroupError, field};
+    match project(DomainError::invalid_parent_type("bad parent")) {
+        ResourceGroupError::InvalidArgument { field, reason, .. } => {
+            assert_eq!(field, field::PARENT_TYPE_FIELD);
+            assert_eq!(reason, field::INVALID_PARENT_TYPE);
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
 }
 
 #[test]
 fn domain_to_sdk_group_not_found() {
     use resource_group_sdk::ResourceGroupError;
     let id = uuid::Uuid::now_v7();
-    let domain = DomainError::group_not_found(id);
-    let sdk: ResourceGroupError = domain.into();
-    assert!(sdk.to_string().contains(&id.to_string()));
+    match project(DomainError::group_not_found(id)) {
+        ResourceGroupError::NotFound { name, .. } => assert_eq!(name, id.to_string()),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
 }
 
 #[test]
 fn domain_to_sdk_cycle_detected() {
-    use resource_group_sdk::ResourceGroupError;
-    let domain = DomainError::cycle_detected("cycle");
-    let sdk: ResourceGroupError = domain.into();
-    assert!(!sdk.to_string().is_empty());
+    use resource_group_sdk::{ResourceGroupError, precondition::Subject};
+    // Cycle flattens to FailedPrecondition; the `hierarchy` subject is the
+    // discriminator.
+    match project(DomainError::cycle_detected("cycle")) {
+        ResourceGroupError::FailedPrecondition { subject, .. } => {
+            assert_eq!(subject, Subject::Hierarchy);
+        }
+        other => panic!("expected FailedPrecondition, got {other:?}"),
+    }
+}
+
+#[test]
+fn domain_to_sdk_limit_violation() {
+    use resource_group_sdk::{ResourceGroupError, precondition::Subject};
+    match project(DomainError::limit_violation("limit")) {
+        ResourceGroupError::FailedPrecondition { subject, .. } => {
+            assert_eq!(subject, Subject::Limit);
+        }
+        other => panic!("expected FailedPrecondition, got {other:?}"),
+    }
 }
 
 #[test]
 fn domain_to_sdk_database_maps_to_internal() {
     use resource_group_sdk::ResourceGroupError;
-    let domain = DomainError::database("db error");
-    let sdk: ResourceGroupError = domain.into();
-    // Database errors map to internal (no sensitive info leaked)
-    assert!(sdk.to_string().to_lowercase().contains("internal"));
+    // Database errors map to internal (no sensitive info leaked).
+    assert!(matches!(
+        project(DomainError::database("db error")),
+        ResourceGroupError::Internal { .. }
+    ));
 }
 
 #[test]
 fn domain_to_sdk_membership_not_found() {
     use resource_group_sdk::ResourceGroupError;
-    let domain = DomainError::membership_not_found("key");
-    let sdk: ResourceGroupError = domain.into();
-    assert!(sdk.to_string().contains("key"));
+    match project(DomainError::membership_not_found("key")) {
+        ResourceGroupError::NotFound { name, .. } => assert_eq!(name, "key"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
 }
 
 #[test]
@@ -646,13 +692,17 @@ fn domain_to_problem_membership_not_found_is_404() {
 }
 
 #[test]
-fn domain_to_sdk_access_denied_maps_to_internal() {
-    use resource_group_sdk::ResourceGroupError;
+fn domain_to_sdk_access_denied_maps_to_permission_denied() {
+    use resource_group_sdk::{ResourceGroupError, reason};
     let domain = DomainError::AccessDenied {
         message: "denied".to_owned(),
     };
-    let sdk: ResourceGroupError = domain.into();
-    assert!(sdk.to_string().to_lowercase().contains("denied"));
+    match project(domain) {
+        ResourceGroupError::PermissionDenied { reason, .. } => {
+            assert_eq!(reason, reason::permission::ACCESS_DENIED);
+        }
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
 }
 
 // ── DomainError -> Problem (RFC 9457) mapping ───────────────────────────

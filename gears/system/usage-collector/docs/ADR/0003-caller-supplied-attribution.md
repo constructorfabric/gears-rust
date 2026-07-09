@@ -26,7 +26,7 @@ date: 2026-05-24
 
 ## Context and Problem Statement
 
-Every ingestion record carries an attribution tuple — tenant, resource (id + type), source gear, Metric, and optionally subject — and the core must decide whether these fields are derived from the caller's SecurityContext, supplied by the caller and authorized by the PDP, or partially synthesized by the collector. Platform-level forwarders and parent-tenant-to-subtenant emission scenarios mean the caller's SecurityContext does not always match the emission's logical attribution; PII handling for the subject identifier is owned by the platform identity layer rather than the collector. The decision shapes the ingestion contract, the PDP authorization tuple, and the boundary between the metering substrate and the identity layer.
+Every ingestion record carries an attribution tuple — tenant, resource (id + type), UsageType, and optionally subject — and the core must decide whether these fields are derived from the caller's SecurityContext, supplied by the caller and authorized by the PDP, or partially synthesized by the collector. Platform-level forwarders and parent-tenant-to-subtenant emission scenarios mean the caller's SecurityContext does not always match the emission's logical attribution; PII handling for the subject identifier is owned by the platform identity layer rather than the collector. The decision shapes the ingestion contract, the PDP authorization tuple, and the boundary between the metering substrate and the identity layer. The calling gear's own identity is intrinsic to the SecurityContext at the SDK call boundary and is not part of the caller-supplied attribution tuple — the PDP reads it directly from the resolved SecurityContext.
 
 ## Decision Drivers
 
@@ -39,13 +39,13 @@ Every ingestion record carries an attribution tuple — tenant, resource (id + t
 
 ## Considered Options
 
-- Caller-supplied attribution + PDP authorization — tenant, resource, source gear, and subject are explicit ingestion-contract fields; the PDP authorizes the caller's identity against the supplied tuple before plugin dispatch.
-- Implicit attribution from SecurityContext — the collector derives tenant and subject from the caller's resolved SecurityContext; only resource and Metric remain caller-supplied.
+- Caller-supplied attribution + PDP authorization — tenant, resource, and subject are explicit ingestion-contract fields; the calling gear's identity is read from the resolved SecurityContext; the PDP authorizes the caller against the (ctx-derived caller-gear, supplied tuple) pair before plugin dispatch.
+- Implicit attribution from SecurityContext — the collector derives tenant and subject from the caller's resolved SecurityContext; only resource and UsageType remain caller-supplied.
 - Hybrid attribution — tenant supplied by caller, subject derived from SecurityContext, with a forwarder bypass flag for cross-tenant emission scenarios.
 
 ## Decision Outcome
 
-Chosen option: "Caller-supplied attribution + PDP authorization", because it is the only option that supports platform-level forwarders and parent-to-subtenant emission with a single uniform ingestion path, and it keeps the PII-management responsibility cleanly on the platform identity layer rather than smuggling it into the collector. The ingestion contract carries tenant, resource (id + type), source gear, Metric, and optional subject; the PDP authorizes the caller's SecurityContext against this explicit tuple; the core never derives any attribution field from the caller's identity. Subject IDs remain opaque to the collector throughout ingestion, persistence, and query.
+Chosen option: "Caller-supplied attribution + PDP authorization", because it is the only option that supports platform-level forwarders and parent-to-subtenant emission with a single uniform ingestion path, and it keeps the PII-management responsibility cleanly on the platform identity layer rather than smuggling it into the collector. The ingestion contract carries tenant, resource (id + type), UsageType, and optional subject; the calling gear's identity is intrinsic to the SecurityContext at the SDK call boundary and is not a wire field on the ingestion contract — making it caller-supplied would be either redundant (it must agree with the SecurityContext) or spoofable (the PDP would have to reject any disagreement anyway). The PDP authorizes the caller's SecurityContext (which carries the calling gear's identity) against the supplied tenant/resource/subject tuple; the core never derives tenant, resource, or subject from the caller's identity. Subject IDs remain opaque to the collector throughout ingestion, persistence, and query.
 
 ### Consequences
 
@@ -57,7 +57,7 @@ Chosen option: "Caller-supplied attribution + PDP authorization", because it is 
 
 ### Confirmation
 
-Compliance is confirmed through (a) the OpenAPI contract and SDK trait definitions showing tenant, resource, source gear, Metric, and subject as explicit ingestion fields, (b) authorization tests covering forwarder and parent-to-subtenant emission scenarios with PDP grants and denials, and (c) data-classification review confirming subject and tenant remain opaque strings throughout the ingestion, persistence, and query paths.
+Compliance is confirmed through (a) the OpenAPI contract and SDK trait definitions showing tenant, resource, UsageType, and subject as explicit ingestion fields with the calling gear's identity carried only by SecurityContext (no `source_gear` field on `UsageRecord` or the ingestion projection), (b) authorization tests covering forwarder and parent-to-subtenant emission scenarios with PDP grants and denials that read the caller's gear identity from SecurityContext, and (c) data-classification review confirming subject and tenant remain opaque strings throughout the ingestion, persistence, and query paths.
 
 ## Pros and Cons of the Options
 
@@ -73,9 +73,9 @@ Every attribution field is explicit on the wire; PDP authorizes the caller again
 
 ### Implicit attribution from SecurityContext
 
-Tenant and subject derive from the resolved SecurityContext; only resource and Metric remain caller-supplied.
+Tenant and subject derive from the resolved SecurityContext; only resource and UsageType remain caller-supplied.
 
-- Good, because the wire contract is slimmer and authorization checks read like simple "this SecurityContext + this resource + this Metric".
+- Good, because the wire contract is slimmer and authorization checks read like simple "this SecurityContext + this resource + this UsageType".
 - Bad, because forwarders cannot emit on behalf of another tenant or subject without a separate impersonation path.
 - Bad, because subject derivation forces the collector to know how SecurityContext maps to a subject identifier, which is identity-layer concern.
 - Bad, because parent-to-subtenant emission requires either a second code path or a cross-tenant trust boundary inside the collector — neither acceptable under the no-business-logic and PII constraints.
@@ -91,7 +91,7 @@ Tenant supplied by caller, subject derived from SecurityContext, with a forwarde
 
 ## More Information
 
-Related decisions: `cpt-cf-usage-collector-adr-pdp-centric-authorization` (the gate that authorizes the attribution tuple); `cpt-cf-usage-collector-adr-mandatory-idempotency` (the contract field that makes safe retries possible against this attribution). The §3.7 `usage_records` columns and the §3.2 ingestion path are the structural anchors.
+Related decisions: `cpt-cf-usage-collector-adr-pdp-centric-authorization` (the gate that authorizes the attribution tuple); `cpt-cf-usage-collector-adr-mandatory-idempotency` (the contract field that makes safe retries possible against this attribution). The SPI persist surface (`plugin-spi.md` Method 1 / 2) and the §3.2 ingestion path are the structural anchors.
 
 ## Traceability
 
@@ -105,4 +105,4 @@ This decision directly addresses the following requirements or design elements:
 - `cpt-cf-usage-collector-fr-resource-attribution` — resource id and type as mandatory caller-supplied fields.
 - `cpt-cf-usage-collector-constraint-pii-identity-layer` — opaque identifiers, PII managed by the identity layer.
 - `cpt-cf-usage-collector-principle-pdp-centric-authorization` — pairs with the attribution arm of the authorization principle.
-- `cpt-cf-usage-collector-dbtable-usage-records` — the usage-records columns that materialize the attribution tuple.
+- `cpt-cf-usage-collector-interface-plugin` — the SPI persist surface that materializes the attribution tuple on every persisted record.

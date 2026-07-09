@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
 use types_registry_sdk::RegisterResult;
 use uuid::Uuid;
@@ -87,17 +88,15 @@ impl TypesRegistryService {
                 Ok(registered) => RegisterResult::Ok {
                     gts_id: registered.gts_id,
                 },
-                Err(e) => {
-                    // Best-effort kind detection from the extracted gts_id so
-                    // the SDK error variant matches the input shape. Unknown
-                    // gts_id falls back to the type-schema variant — the kind-
-                    // agnostic `register()` consumer doesn't distinguish them.
-                    let error = match gts_id.as_deref() {
-                        Some(s) if !s.ends_with('~') => e.into_sdk_for_instance(),
-                        _ => e.into_sdk_for_type_schema(),
-                    };
-                    RegisterResult::Err { gts_id, error }
-                }
+                // Per ADR 0005 the per-item error is the canonical envelope;
+                // the former type-schema-vs-instance variant split collapses to
+                // one classification (the kind stays recoverable from the
+                // `gts_id` suffix). Routed through the single
+                // `From<DomainError> for CanonicalError` ladder.
+                Err(e) => RegisterResult::Err {
+                    gts_id,
+                    error: CanonicalError::from(e),
+                },
             };
             results.push(result);
         }

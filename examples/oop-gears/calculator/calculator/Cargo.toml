@@ -24,7 +24,6 @@ calculator-sdk = { path = "../calculator-sdk" }
 # ToolKit dependencies
 toolkit = { workspace = true, features = ["bootstrap"] }
 toolkit-macros = { workspace = true }
-toolkit-security = { workspace = true }
 toolkit-transport-grpc = { workspace = true }
 grpc_hub = { workspace = true }
 

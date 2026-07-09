@@ -1,7 +1,7 @@
 # Code Review Report Template
 
 This file documents the expected format for generated code review reports.
-The `/cypilot-pr-review` workflow produces reports in `.prs/{ID}/review.md` following this structure.
+The `/cf-gears-pr-review` workflow produces reports in `.prs/{ID}/review.md` following this structure.
 
 ---
 
@@ -104,7 +104,7 @@ No reviewer comments found.
 
 ## Notes
 
-- `{placeholders}` are filled by the LLM during the `/cypilot-pr-review` workflow.
+- `{placeholders}` are filled by the LLM during the `/cf-gears-pr-review` workflow.
 - Sections with no findings may use a single "No issues" line.
 - Omit N/A sections entirely for minimal PRs (e.g. docs-only, config-only).
 - The **Reviewer Comment Analysis** section is mandatory — it ensures the

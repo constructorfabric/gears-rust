@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.entry_posted.v1",
+  "title": "Billing Ledger Entry Posted",
+  "description": "Emitted when a balanced ledger entry is freshly posted (never on replay). Internal identifiers only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "entry_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "legal_entity_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "period_id": {
+      "type": "string"
+    },
+    "source_doc_type": {
+      "type": "string"
+    },
+    "source_business_id": {
+      "type": "string"
+    },
+    "posted_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_seq": {
+      "type": "integer"
+    },
+    "lines": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/line_summary"
+      }
+    }
+  },
+  "$defs": {
+    "line_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account_class": {
+          "type": "string"
+        },
+        "side": {
+          "type": "string"
+        },
+        "amount_minor": {
+          "type": "integer"
+        },
+        "currency": {
+          "type": "string"
+        },
+        "currency_scale": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "account_class",
+        "side",
+        "amount_minor",
+        "currency",
+        "currency_scale"
+      ]
+    }
+  },
+  "required": [
+    "entry_id",
+    "tenant_id",
+    "legal_entity_id",
+    "period_id",
+    "source_doc_type",
+    "source_business_id",
+    "posted_at_utc",
+    "created_seq",
+    "lines"
+  ]
+}

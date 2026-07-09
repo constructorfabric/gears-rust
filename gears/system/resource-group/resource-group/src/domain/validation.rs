@@ -156,7 +156,9 @@ pub async fn validate_metadata_via_gts(
     let schema = match types_registry.get_type_schema(type_code).await {
         Ok(schema) => schema,
         // No registered schema for this type -- skip metadata validation.
-        Err(types_registry_sdk::TypesRegistryError::GtsTypeSchemaNotFound(_)) => return Ok(()),
+        // The trait boundary is `CanonicalError` (ADR 0005); a missing schema
+        // surfaces as `NotFound` regardless of entity kind.
+        Err(toolkit_canonical_errors::CanonicalError::NotFound { .. }) => return Ok(()),
         Err(e) => {
             return Err(DomainError::validation(format!(
                 "Failed to resolve GTS type '{type_code}' for metadata validation: {e}"

@@ -41,5 +41,30 @@ gears and users. It replaces ad-hoc per-gear file handling with a centralized, t
 
 - [PRD.md](docs/PRD.md) — Product requirements document
 - [DESIGN.md](docs/DESIGN.md) — Architecture and design
+- [api.md](docs/api.md) — HTTP API reference
 - [ADR/](docs/ADR/) — Architecture decision records
-- [features/](docs/features/) — Feature specifications
+
+## Implementation status (P1)
+
+The **P1 control plane** is implemented and tested. Highlights:
+
+- Two crates: `cf-gears-file-storage-sdk` (public API) + `cf-gears-file-storage` (gear lib + `sidecar` binary).
+- Control-plane REST under `/api/file-storage/v1` (create/presign/bind, download-URL, metadata CRUD, list,
+  versions, storages) — JSON only; content never transits the control plane.
+- Immutable-blob + content-pointer model with optimistic-CAS bind, FileStorage-level versioning, tenant isolation,
+  Authorization-Service per-type checks, conditional requests (ETag / `If-Match` / `If-None-Match`).
+- Pluggable backends (trait + `local-fs` + `in-memory`); Ed25519 signed URLs; SHA-256 + magic-byte content-type
+  validation; HTTP `Range`. Data-plane **sidecar** binary verifies tokens and streams bytes.
+
+P2/P3 features above (sharing, S3/WebDAV facades, policies, audit, multipart, quotas, …) are declared in the
+PRD/DESIGN but not implemented in P1.
+
+### Run
+
+```bash
+cargo build -p cf-gears-file-storage                 # control-plane gear (lib)
+cargo build -p cf-gears-file-storage --bin sidecar   # data-plane sidecar
+cargo test  -p cf-gears-file-storage -p cf-gears-file-storage-sdk
+
+# Sidecar env (P1 static): FS_SIDECAR_ADDR, FS_SIDECAR_PUBLIC_KEY (base64url Ed25519), FS_SIDECAR_BACKEND_ROOT
+```

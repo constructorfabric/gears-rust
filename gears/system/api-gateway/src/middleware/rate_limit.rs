@@ -120,6 +120,7 @@ pub async fn rate_limit_middleware(map: RateLimiterMap, mut req: Request, next: 
             Err(not_until) => {
                 let wait = not_until.wait_time_from(bucker_map_entry.bucket.clock().now());
                 let wait_secs = wait.as_secs();
+                log_rate_limit_exceeded(&key, wait_secs);
                 let policy = bucker_map_entry.policy.clone();
                 let burst = bucker_map_entry.burst.clone();
                 let err = ApiGatewayGatewayError::resource_exhausted("rate limit exceeded")
@@ -143,6 +144,7 @@ pub async fn rate_limit_middleware(map: RateLimiterMap, mut req: Request, next: 
             // Allow request; permit is dropped when response future completes
             return next.run(req).await;
         }
+        log_in_flight_limit_reached(&key);
         let err = CanonicalError::service_unavailable()
             .with_retry_after_seconds(5)
             .create();
@@ -150,4 +152,21 @@ pub async fn rate_limit_middleware(map: RateLimiterMap, mut req: Request, next: 
     }
 
     next.run(req).await
+}
+
+fn log_rate_limit_exceeded(key: &RateLimitKey, retry_after_seconds: u64) {
+    tracing::debug!(
+        method = %key.0,
+        path = %key.1,
+        retry_after_seconds,
+        "rate limit exceeded"
+    );
+}
+
+fn log_in_flight_limit_reached(key: &RateLimitKey) {
+    tracing::debug!(
+        method = %key.0,
+        path = %key.1,
+        "in-flight limit reached: request rejected"
+    );
 }

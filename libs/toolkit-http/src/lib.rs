@@ -4,7 +4,9 @@
 //! HTTP client infrastructure for `ToolKit`
 //!
 //! This crate provides a hyper-based HTTP client with:
-//! - Automatic TLS via rustls (HTTPS only by default)
+//! - Automatic TLS via rustls; transport security is configurable via
+//!   [`TransportSecurity`] — defaults to
+//!   `TlsOnly` (HTTPS-only) under `--features fips`, `AllowInsecureHttp` otherwise
 //! - Connection pooling
 //! - Configurable timeouts
 //! - Automatic retries with exponential backoff
@@ -70,4 +72,5 @@ pub use layers::{
 };
 pub use request::{RequestBuilder, RequestType};
 pub use response::{HttpResponse, LimitedBody, ResponseBody};
+pub use security::{attach_bearer_http, attach_internal_token_http};
 pub use tls::TlsConfigError;

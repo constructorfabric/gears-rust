@@ -20,13 +20,7 @@ toolkit-macros = { workspace = true }
 trybuild = { workspace = true }
 
 # Dependencies needed by UI test cases (that import toolkit traits/types)
-tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-inventory = { workspace = true }
 toolkit = { workspace = true }
-toolkit-security = { workspace = true }
-toolkit-transport-grpc = { workspace = true }
-serde = { workspace = true }
-tonic = { workspace = true }

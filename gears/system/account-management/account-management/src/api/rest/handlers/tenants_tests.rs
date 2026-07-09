@@ -97,6 +97,7 @@ fn sample_active_tenant() -> Tenant {
         parent_id: Some(TenantId(sample_parent_id())),
         self_managed: false,
         depth: 2,
+        child_count: 0,
         created_at: sample_created(),
         updated_at: sample_updated(),
         deleted_at: None,

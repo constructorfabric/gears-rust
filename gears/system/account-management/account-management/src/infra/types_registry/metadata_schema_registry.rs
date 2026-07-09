@@ -30,7 +30,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use gts::{GtsID, GtsTypeId};
 use serde_json::Value;
-use types_registry_sdk::{TypesRegistryClient, TypesRegistryError};
+use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::TypesRegistryClient;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -65,16 +66,16 @@ impl GtsMetadataSchemaRegistry {
     }
 }
 
-/// Map a `TypesRegistryError` onto the appropriate `DomainError` for
+/// Map a `CanonicalError` onto the appropriate `DomainError` for
 /// the schema-registry seam:
 ///
-/// * `GtsTypeSchemaNotFound` → [`DomainError::MetadataEntryNotFound`]
+/// * `CanonicalError::NotFound` → [`DomainError::MetadataEntryNotFound`]
 ///   (HTTP 404 with the unified `resource_type =
 ///   gts.cf.core.am.tenant_metadata.v1~`).
 /// * any other transport / registry error → `ServiceUnavailable`.
-fn map_registry_err(err: TypesRegistryError, schema_token: &str) -> DomainError {
+fn map_registry_err(err: CanonicalError, schema_token: &str) -> DomainError {
     match err {
-        TypesRegistryError::GtsTypeSchemaNotFound(_) => DomainError::MetadataEntryNotFound {
+        CanonicalError::NotFound { .. } => DomainError::MetadataEntryNotFound {
             detail: format!("schema {schema_token} is not registered in the types registry"),
             entry: schema_token.to_owned(),
         },

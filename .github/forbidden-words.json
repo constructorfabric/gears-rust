@@ -1,0 +1,43 @@
+{
+  "excludePaths": [
+    "**/target/**",
+    "**/.git/**",
+    "**/node_modules/**",
+    ".github/forbidden-words.json"
+  ],
+  "rules": [
+    {
+      "pattern": "\\bTODO\\b",
+      "message": "Forgotten TODO in code",
+      "caseSensitive": false,
+      "excludePaths": ["CHANGELOG.md", "**/CHANGELOG.*"]
+    },
+    {
+      "pattern": "\\bFIXME\\b",
+      "message": "Forgotten FIXME in code",
+      "caseSensitive": false
+    },
+    {
+      "pattern": "\\bXXX\\b",
+      "message": "Temporary XXX marker left in code",
+      "caseSensitive": false
+    },
+    {
+      "pattern": "\\#\\[ignore\\]",
+      "message": "Ignored test left in code",
+      "caseSensitive": true,
+      "excludePaths": ["**/tests/**"]
+    },
+    {
+      "pattern": "\\#\\[cyberfabric\\]",
+      "message": "No Cyberfabric here",
+      "caseSensitive": true,
+      "excludePaths": ["**/tests/**"]
+    },
+    {
+      "pattern": "\\b(cyber\\s*fabric|cyber\\s*ware)\\b",
+      "message": "Forbidden term: cyberfabric / cyberware",
+      "caseSensitive": false
+    }
+  ]
+}

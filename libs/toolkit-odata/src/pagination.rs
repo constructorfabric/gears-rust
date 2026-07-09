@@ -2,7 +2,6 @@
 
 use crate::ast;
 use chrono::SecondsFormat;
-use sha2::{Digest, Sha256};
 
 /// Normalize filter AST for consistent hashing
 /// Produces a stable string representation for deterministic hashing
@@ -81,12 +80,24 @@ pub fn normalize_filter_for_hash(expr: &ast::Expr) -> String {
 /// Returns a 16-character hex string (64-bit hash)
 #[must_use]
 pub fn short_filter_hash(expr: Option<&ast::Expr>) -> Option<String> {
+    /// FNV-1a 64-bit hash — deterministic, non-cryptographic fingerprint.
+    ///
+    /// Algorithm is a public specification (Fowler–Noll–Vo) with fixed constants,
+    /// guaranteeing identical output across all Rust versions and platforms.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01B3;
+        let mut hash = BASIS;
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
+
     expr.map(|e| {
         let normalized = normalize_filter_for_hash(e);
-        let mut hasher = Sha256::new();
-        hasher.update(normalized.as_bytes());
-        let bytes = hasher.finalize();
-        hex::encode(&bytes[..8]) // Take first 8 bytes for 64-bit hash
+        format!("{:016x}", fnv1a_64(normalized.as_bytes()))
     })
 }
 

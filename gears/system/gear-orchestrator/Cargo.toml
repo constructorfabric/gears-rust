@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-gear-orchestrator"
-version = "0.1.26"
+version = "0.1.27"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -21,14 +21,12 @@ workspace = true
 cf-gears-system-sdks = { workspace = true, features = ["directory_grpc"] }
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
-parking_lot = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 utoipa = { workspace = true }
 axum = { workspace = true }
 uuid = { workspace = true }
@@ -38,3 +36,4 @@ inventory = { workspace = true }
 tower = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 api_gateway = { path = "../api-gateway", package = "cf-gears-api-gateway" }
+serde_json = { workspace = true }

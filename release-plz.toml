@@ -274,3 +274,8 @@ name = "cf-gears-mini-chat"
 changelog_update = false
 git_release_enable = false
 
+[[package]]
+name = "cf-gears-model-registry-sdk"
+changelog_update = false
+git_release_enable = false
+

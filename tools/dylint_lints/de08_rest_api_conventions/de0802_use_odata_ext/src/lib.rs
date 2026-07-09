@@ -4,8 +4,9 @@
 extern crate rustc_ast;
 extern crate rustc_hir;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_hir::{Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_lint::{LateContext, LateLintPass};
 
 dylint_linting::declare_late_lint! {
     /// ### What it does
@@ -133,16 +134,21 @@ fn check_odata_param<'tcx>(cx: &LateContext<'tcx>, arg: &'tcx Expr<'tcx>, method
         if ODATA_PARAMS.contains(&param_name) {
             let recommended = get_recommended_method(param_name);
 
-            cx.span_lint(DE0802_USE_ODATA_EXT, arg.span, |diag| {
-                diag.primary_message(format!(
+            span_lint_and_then(
+                cx,
+                DE0802_USE_ODATA_EXT,
+                arg.span,
+                format!(
                     "use OperationBuilderODataExt instead of .{}() for OData parameter `{}` (DE0802)",
                     method_name, param_name
-                ));
-                diag.help(format!("use {} instead", recommended));
-                diag.note(
-                    "type-safe OData methods provide compile-time validation and automatic OpenAPI schema generation",
-                );
-            });
+                ),
+                |diag| {
+                    diag.help(format!("use {} instead", recommended));
+                    diag.note(
+                        "type-safe OData methods provide compile-time validation and automatic OpenAPI schema generation",
+                    );
+                },
+            );
         }
     }
 }

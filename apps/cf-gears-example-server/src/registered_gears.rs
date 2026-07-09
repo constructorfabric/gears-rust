@@ -11,6 +11,8 @@ use authz_resolver as _;
 use credstore as _;
 #[cfg(not(feature = "oop-example"))]
 use file_parser as _;
+#[cfg(feature = "file-storage")]
+use file_storage as _;
 use gear_orchestrator as _;
 use grpc_hub as _;
 use nodes_registry as _;
@@ -52,6 +54,9 @@ use mini_chat::infra::plugins::static_audit as _;
 #[cfg(feature = "mini-chat")]
 use mini_chat::infra::plugins::static_model_policy as _;
 
+#[cfg(feature = "chat-engine")]
+use chat_engine as _;
+
 // === Example Features ===
 
 #[cfg(feature = "users-info-example")]
@@ -68,3 +73,6 @@ use static_idp_plugin as _;
 
 #[cfg(feature = "account-management")]
 use account_management as _;
+
+#[cfg(feature = "bss-ledger")]
+use bss_ledger as _;

@@ -13,6 +13,7 @@ from urllib.error import URLError, HTTPError
 sys.path.insert(0, os.path.dirname(__file__))
 
 from lib.platform import (
+    e2e_env_overrides,
     find_binary,
     kill_port_holder,
     popen_new_group,
@@ -156,59 +157,20 @@ def cmd_gts_docs(args):
         sys.exit(result.returncode)
 
 
-def cmd_cypilot_validate(_args):
-    step("Validating cypilot artifacts")
-    cypilot_dir = os.path.join(PROJECT_ROOT, ".cypilot")
-    git_dir = os.path.join(cypilot_dir, ".git")
-    submodule_initialized = (
-        os.path.isdir(git_dir) or os.path.isfile(git_dir)
-    )
-    if not submodule_initialized:
-        print("Initializing .cypilot submodule (first run)")
-        run_cmd(
-            [
-                "git", "submodule", "update",
-                "--init", "--recursive",
-                "--", ".cypilot",
-            ],
-            cwd=PROJECT_ROOT,
-        )
-    else:
-        # Skip update if on a branch checkout
-        result = run_cmd_allow_fail(
-            ["git", "-C", cypilot_dir,
-             "symbolic-ref", "-q", "HEAD"]
-        )
-        if result.returncode == 0:
-            print("Skipping .cypilot update "
-                  "(branch checkout detected)")
-        else:
-            print("Updating .cypilot via git "
-                  "subgear update (detached HEAD)")
-            run_cmd(
-                [
-                    "git", "submodule", "update",
-                    "--init", "--recursive",
-                    "--", ".cypilot",
-                ],
-                cwd=PROJECT_ROOT,
-            )
-    script = os.path.join(
-        cypilot_dir, "skills", "cypilot",
-        "scripts", "cypilot.py",
-    )
-    result = run_cmd_allow_fail([PYTHON, script, "validate"])
+def cmd_cfs_validate(_args):
+    step("Validating CFS artifacts")
+    result = run_cmd_allow_fail(["make", "cfs-validate"])
     if result.returncode == 0:
-        print("OK. cypilot validation PASSED")
+        print("OK. CFS validation PASSED")
     else:
-        print("ERROR: cypilot validation FAILED")
+        print("ERROR: CFS validation FAILED")
         sys.exit(result.returncode)
 
 
 def cmd_check(args):
     step("Running full check suite")
     cmd_fmt(args)
-    cmd_cypilot_validate(args)
+    cmd_cfs_validate(args)
     cmd_clippy(args)
     cmd_test(args)
     cmd_dylint_test(args)
@@ -245,7 +207,10 @@ def _print_log_file(path, label):
     try:
         if "../" in path or "..\\" in path:
             raise Exception("Invalid file path")
-        with open(path) as f:
+        # Logs may contain non-ASCII bytes; force UTF-8 and never let a
+        # decode error mask the server output we are trying to surface
+        # (Python defaults to cp1252 on Windows, which raises on such bytes).
+        with open(path, encoding="utf-8", errors="replace") as f:
             content = f.read()
             if content:
                 print(content, end="" if content.endswith("\n") else "\n")
@@ -272,7 +237,7 @@ def wait_for_health(
                 _print_log_file(output_log, "server stdout")
                 _print_log_file(error_log, "server stderr")
                 print("Fix the error above, rebuild with:")
-                print("  make build")
+                print("  make cargo-build")
                 print("Then re-run: make e2e-local")
                 sys.exit(1)
 
@@ -328,6 +293,8 @@ def cmd_e2e(args):
 
     docker_env_started = False
     server_process = None
+    release_bin = None
+    release_sidecar_bin = None
 
     if args.docker:
         step("Running E2E tests in Docker mode")
@@ -397,11 +364,37 @@ def cmd_e2e(args):
         server_process = None
         print("Starting cf-gears-server for local E2E...")
 
-        # Build all required gears and binaries using project build orchestration
-        step("Building release artifacts for local E2E")
-        run_cmd(["make", "build"])
+        # Build only the release binary required for local execution.
+        # Invoke cargo directly (mirrors the Makefile `cargo-build` target)
+        # instead of shelling out to `make`, which is unavailable on Windows
+        # where this script is the documented entry point.
+        step("Building release binary for local E2E")
+        build_cmd = [
+            "cargo",
+            "build",
+            "--release",
+            "--bin",
+            "cf-gears-example-server",
+        ]
+        e2e_features = read_e2e_features(Path(PROJECT_ROOT))
+        if e2e_features:
+            build_cmd.extend(["--features", e2e_features])
+        run_cmd(build_cmd)
 
-        # Use the release binary produced by build
+        # Also build the file-storage sidecar binary (no feature flags needed —
+        # it is a standalone binary in the cf-gears-file-storage package).
+        step("Building release sidecar binary for local E2E")
+        run_cmd([
+            "cargo",
+            "build",
+            "--release",
+            "-p",
+            "cf-gears-file-storage",
+            "--bin",
+            "sidecar",
+        ])
+
+        # Use the release binary produced by the cargo build above
         release_bin = str(find_binary(
             Path(PROJECT_ROOT) / "target", "release", "cf-gears-example-server"
         ))
@@ -409,8 +402,12 @@ def cmd_e2e(args):
         if not os.path.isfile(release_bin):
             print(f"\nERROR: Release binary not found at: {release_bin}")
             print("Build it first with:")
-            print("  make build")
+            print("  make cargo-build")
             sys.exit(1)
+
+        release_sidecar_bin = str(find_binary(
+            Path(PROJECT_ROOT) / "target", "release", "sidecar"
+        ))
 
         # Create logs directory if it doesn't exist
         logs_dir = os.path.join(PROJECT_ROOT, "testing", "e2e", "logs")
@@ -436,6 +433,11 @@ def cmd_e2e(args):
             # Set RUST_LOG to enable debug logging for types_registry module
             server_env = os.environ.copy()
             server_env["RUST_LOG"] = "types_registry=debug,info"
+            # Apply per-OS server config overrides (e.g. grpc-hub TCP on
+            # Windows, where the config's UDS address is unsupported).
+            # setdefault keeps any explicit user-provided override.
+            for key, value in e2e_env_overrides().items():
+                server_env.setdefault(key, value)
             try:
                 server_process = popen_new_group(
                     server_cmd,
@@ -475,12 +477,27 @@ def cmd_e2e(args):
     env = os.environ.copy()
     env["E2E_BASE_URL"] = base_url
 
+    # Export the release server + sidecar paths so the orchestrator-based
+    # lifecycle suite (testing/e2e/gears/file_storage/lifecycle/) can start
+    # its own private server+sidecar pair.
+    #
+    # NOTE: we deliberately use DEDICATED vars (FS_E2E_BINARY / FS_SIDECAR_BINARY)
+    # rather than the shared E2E_BINARY.  Other gears (e.g. mini-chat) gate their
+    # own suites on E2E_BINARY and expect a scoped invocation (make e2e-mini-chat);
+    # setting E2E_BINARY here would un-skip them under generic e2e-local and they
+    # would fail/time-out without their bespoke fixtures.  The lifecycle conftest
+    # reads FS_E2E_BINARY for the server and FS_SIDECAR_BINARY for the sidecar.
+    if release_bin is not None:
+        env.setdefault("FS_E2E_BINARY", release_bin)
+    if release_sidecar_bin is not None:
+        env.setdefault("FS_SIDECAR_BINARY", release_sidecar_bin)
+
     # Set E2E_DOCKER_MODE flag for the tests to know which mode they're in
     if args.docker:
         env["E2E_DOCKER_MODE"] = "1"
         env.setdefault("E2E_MOCK_UPSTREAM_URL", "http://mock:8080")
 
-    pytest_cmd = [PYTHON, "-m", "pytest", "testing/e2e", "-vv"]
+    pytest_cmd = [PYTHON, "-m", "pytest", "-vv"]
     if args.smoke:
         pytest_cmd.extend(["-m", "smoke"])
     if args.pytest_args:
@@ -489,7 +506,13 @@ def cmd_e2e(args):
         extra_args = args.pytest_args
         if extra_args and extra_args[0] == "--":
             extra_args = extra_args[1:]
-        pytest_cmd.extend(extra_args)
+        if extra_args and not extra_args[0].startswith("-"):
+            pytest_cmd.extend(extra_args)
+        else:
+            pytest_cmd.append("testing/e2e")
+            pytest_cmd.extend(extra_args)
+    else:
+        pytest_cmd.append("testing/e2e")
 
     result = run_cmd_allow_fail(pytest_cmd, env=env)
     exit_code = result.returncode
@@ -916,9 +939,9 @@ def build_parser():
     p_fuzz_clean = subparsers.add_parser("fuzz-clean", help="Clean fuzzing artifacts")
     p_fuzz_clean.set_defaults(func=cmd_fuzz_clean)
 
-    # cypilot-validate
-    p_cypilot = subparsers.add_parser("cypilot-validate", help="Validate cypilot artifacts (specs, code, templates)")
-    p_cypilot.set_defaults(func=cmd_cypilot_validate)
+    # cfs-validate
+    p_cfs = subparsers.add_parser("cfs-validate", help="Validate CFS artifacts (specs, code, templates)")
+    p_cfs.set_defaults(func=cmd_cfs_validate)
 
     # gts-docs
     p_gts_docs = subparsers.add_parser("gts-docs", help="Validate GTS identifiers in .md and .json files (DE0903)")

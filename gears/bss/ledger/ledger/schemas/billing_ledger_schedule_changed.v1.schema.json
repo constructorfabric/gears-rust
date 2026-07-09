@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.schedule_changed.v1",
+  "title": "Billing Ledger Schedule Changed",
+  "description": "Emitted when a recognition schedule is changed or cancelled (superseded by a new version, or cancelled). Internal identifiers + enum codes only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "schedule_id": {
+      "type": "string"
+    },
+    "new_schedule_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "treatment": {
+      "type": "string",
+      "enum": [
+        "prospective",
+        "separate_contract"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ACTIVE",
+        "COMPLETED",
+        "REPLACED",
+        "CANCELLED"
+      ]
+    }
+  },
+  "required": [
+    "tenant_id",
+    "schedule_id",
+    "new_schedule_id",
+    "treatment",
+    "status"
+  ]
+}

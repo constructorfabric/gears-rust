@@ -10,8 +10,38 @@ use crate::infra::InMemoryGtsRepository;
 use gts::GtsConfig;
 use serde_json::json;
 use std::time::Duration;
+use toolkit_canonical_errors::InvalidArgument;
 
 const JSON_SCHEMA_DRAFT_07: &str = "https://json-schema.org/draft-07/schema#";
+
+// The client trait now returns `CanonicalError`; the legacy `is_*` predicates
+// on the SDK error enum are gone. These helpers assert the canonical category
+// the adapter routes each former SDK-error variant to (ADR 0005).
+fn is_invalid_gts_id(err: &CanonicalError) -> bool {
+    matches!(
+        err,
+        CanonicalError::InvalidArgument {
+            ctx: InvalidArgument::FieldViolations { field_violations },
+            ..
+        } if field_violations
+            .iter()
+            .any(|v| v.reason == types_registry_sdk::field::INVALID_GTS_ID)
+    )
+}
+
+fn is_not_found(err: &CanonicalError) -> bool {
+    matches!(err, CanonicalError::NotFound { .. })
+}
+
+fn is_parent_not_registered(err: &CanonicalError) -> bool {
+    matches!(
+        err,
+        CanonicalError::FailedPrecondition { ctx, .. }
+            if ctx.violations.iter().any(|v| {
+                v.type_ == types_registry_sdk::precondition::PARENT_NOT_REGISTERED
+            })
+    )
+}
 
 fn default_config() -> GtsConfig {
     crate::config::TypesRegistryConfig::default().to_gts_config()
@@ -303,7 +333,7 @@ async fn test_get_type_schema_rejects_instance() {
         .get_type_schema("gts.acme.core.events.user.v1~acme.core.instances.u1.v1")
         .await
         .unwrap_err();
-    assert!(err.is_invalid_gts_type_id());
+    assert!(is_invalid_gts_id(&err));
 }
 
 #[tokio::test]
@@ -316,7 +346,7 @@ async fn test_register_type_schemas_rejects_instance_input() {
     let results = client.register_type_schemas(vec![instance]).await.unwrap();
     assert_eq!(results.len(), 1);
     match &results[0] {
-        RegisterResult::Err { error, .. } => assert!(error.is_invalid_gts_type_id()),
+        RegisterResult::Err { error, .. } => assert!(is_invalid_gts_id(error)),
         RegisterResult::Ok { .. } => panic!("expected Err for instance input"),
     }
 }
@@ -367,7 +397,7 @@ async fn test_register_type_schemas_orphan_derived_in_ready_fails() {
     assert_eq!(results.len(), 1);
     match &results[0] {
         RegisterResult::Err { error, .. } => {
-            assert!(error.is_parent_type_schema_not_registered());
+            assert!(is_parent_not_registered(error));
         }
         RegisterResult::Ok { .. } => panic!("expected Err for orphan derived in ready"),
     }
@@ -388,7 +418,7 @@ async fn test_register_instances_orphan_in_ready_fails() {
     assert_eq!(results.len(), 1);
     match &results[0] {
         RegisterResult::Err { error, .. } => {
-            assert!(error.is_parent_type_schema_not_registered());
+            assert!(is_parent_not_registered(error));
         }
         RegisterResult::Ok { .. } => panic!("expected Err for orphan instance in ready"),
     }
@@ -447,7 +477,7 @@ async fn test_get_type_schema_by_uuid() {
         .get_type_schema_by_uuid(Uuid::nil())
         .await
         .unwrap_err();
-    assert!(unknown.is_gts_type_schema_not_found());
+    assert!(is_not_found(&unknown));
 }
 
 #[tokio::test]
@@ -588,36 +618,29 @@ async fn test_get_type_schemas_partial_failures() {
         .get_type_schemas(vec![alpha.to_owned(), missing.to_owned(), gamma.to_owned()])
         .await;
     assert!(results.get(alpha).expect("present").is_ok());
-    assert!(
+    assert!(is_not_found(
         results
             .get(missing)
             .expect("present")
             .as_ref()
             .err()
             .unwrap()
-            .is_gts_type_schema_not_found()
-    );
+    ));
     assert!(results.get(gamma).expect("present").is_ok());
 }
 
 #[tokio::test]
 async fn test_get_type_schemas_kind_mismatch() {
     // An instance-shaped id (no trailing `~`) passed to get_type_schemas
-    // must surface as InvalidGtsTypeId for that single item, not fail
-    // the whole batch.
+    // must surface as an invalid-GTS-id validation error for that single
+    // item, not fail the whole batch.
     let client = create_client();
     let bad = "gts.acme.core.events.user.v1~acme.core.instances.u1.v1";
     let results = client.get_type_schemas(vec![bad.to_owned()]).await;
     assert_eq!(results.len(), 1);
-    assert!(
-        results
-            .get(bad)
-            .expect("present")
-            .as_ref()
-            .err()
-            .unwrap()
-            .is_invalid_gts_type_id()
-    );
+    assert!(is_invalid_gts_id(
+        results.get(bad).expect("present").as_ref().err().unwrap()
+    ));
 }
 
 #[tokio::test]
@@ -705,15 +728,14 @@ async fn test_get_instances_keyed_with_partial_failures() {
         results.get(u2).expect("present").as_ref().expect("ok").id,
         u2
     );
-    assert!(
+    assert!(is_not_found(
         results
             .get(missing)
             .expect("present")
             .as_ref()
             .err()
             .unwrap()
-            .is_gts_instance_not_found()
-    );
+    ));
     assert_eq!(
         results.get(u1).expect("present").as_ref().expect("ok").id,
         u1

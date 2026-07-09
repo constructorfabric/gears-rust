@@ -297,7 +297,13 @@ impl Service {
                     self.rg.get_group_descendants(ctx, group_id, &query).await
                 }
             }
-            .map_err(|e| match e {
+            // Project the raw canonical error through `ResourceGroupError`
+            // so we can match on semantic variants at the error boundary:
+            // a missing group (`NotFound`) becomes `TenantNotFound`, while
+            // every other variant collapses to `Internal`. We match on the
+            // projected `ResourceGroupError` rather than the raw error
+            // because the projection preserves the semantic classification.
+            .map_err(|e| match ResourceGroupError::from(e) {
                 ResourceGroupError::NotFound { .. } => TenantResolverError::TenantNotFound {
                     tenant_id: TenantId(group_id),
                 },

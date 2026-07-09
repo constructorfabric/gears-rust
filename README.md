@@ -14,8 +14,10 @@ Gears span three broad categories:
 - **Serverless** gears for functions, workflows, and event-driven execution;
 - **GenAI** gears for chat, retrieval, prompt orchestration, and related AI capabilities.
 
-See [OVERVIEW](docs/slides/1_OVERVIEW.html) HTML slides explaining the key Consructor Fabric Gears concepts.
-See [GEARS](docs/GEARS.md) for gears overview.
+See also:
+- [WHY_GEARS](docs/WHY_GEARS.md) explaining why to chose Rust/Gears for your XaaS project.
+- [OVERVIEW](docs/slides/1_OVERVIEW.md) HTML slides explaining the key Constructor Fabric Gears concepts.
+- [GEARS](docs/GEARS.md) for gears overview.
 
 **Five defining Gears characteristics:**
 
@@ -147,95 +149,9 @@ See **[Security Overview](docs/security/SECURITY.md)** for the full breakdown, i
 
 ## FIPS 140-3 support
 
-Gears build with `--features fips` route every TLS data-path cryptographic operation through a **FIPS 140-3 validated cryptographic module**, on a single `rustls 0.23` state machine with one of three pluggable backends:
+Built with `--features fips`, Gears route every TLS data-path cryptographic operation through a **CMVP-validated cryptographic module** — AWS-LC FIPS (Linux), Apple corecrypto (macOS), or Microsoft Windows CNG (Windows) — behind a single `rustls 0.23` state machine. Gears are *consumers* of those validated modules, not a CMVP-listed module themselves.
 
-| Target | Validated module | Backend |
-|---|---|---|
-| macOS (any arch) | Apple `corecrypto` User-Space Gear (per-OS-version CMVP cert) | `cf-gears-rustls-corecrypto-provider` over Security.framework + CommonCrypto |
-| Windows (x86_64) | Microsoft Windows CNG (per-OS-version CMVP cert) | `rustls-cng-crypto`'s `fips_provider()` over `bcrypt.dll` + `ncrypt.dll` |
-
-All branches share the same `rustls 0.23` state machine — only the `CryptoProvider` swaps per OS.
-
-### What is enforced on the wire
-
-Built with `--features fips`, the toolkit-http client offers **only** FIPS-Approved algorithms in its `ClientHello`:
-
-| Category | Algorithms |
-|---|---|
-| TLS versions | TLS 1.2, TLS 1.3 (no TLS 1.0/1.1) |
-| TLS 1.3 cipher suites | `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384` |
-| TLS 1.2 cipher suites | `ECDHE_{ECDSA,RSA}_WITH_AES_{128,256}_GCM_SHA{256,384}` (×4) |
-| Key exchange | NIST P-256, P-384 ECDHE |
-| Signatures (verify) | ECDSA P-256/P-384, RSA-PSS, RSA PKCS#1 v1.5 (SHA-256/384/512) |
-| Hash / HMAC / HKDF | SHA-256, SHA-384 |
-| TLS 1.2 Extended Master Secret (RFC 7627) | **required** (`require_ems = true`) per NIST SP 800-52 Rev. 2 §3.5 |
-
-Explicitly **excluded**: ChaCha20-Poly1305, x25519, X25519MLKEM768 / post-quantum hybrids, ED25519, MD5, SHA-1.
-
-### Build & runtime
-
-```sh
-cargo build -p cf-gears-example-server --features fips
-```
-
-This is *"uses FIPS-validated cryptography"* — Gears itself are not on the CMVP Validated Gears list; the validated modules belong to Apple, AWS Labs, and Microsoft.
-
-For the full per-OS detail (algorithm scope, build prerequisites, verification gates, runtime OE-validation, dep-graph policy, what is and is not covered) see **[Security Overview §9](docs/security/SECURITY.md#9-cryptographic-stack--fips-140-3)**. Architecture, ecosystem constraints, alternatives we rejected, and per-OS rationale live in the **[FIPS PRD](docs/security/fips/PRD.md)** and the ADRs in [`docs/security/fips/adrs/`](docs/security/fips/adrs/).
-
-### How to verify a build is FIPS-conformant
-
-```sh
-# Wire-level (offered ClientHello inspected by an external TLS server):
-cargo run -p cf-gears-fips-probe --features fips -- --url https://www.howsmyssl.com/a/check
-
-# Expected: given_cipher_suites contains only AES-GCM suites, given_named_groups
-# contains only secp256r1/secp384r1, post_quantum_key_agreement: false.
-# The probe heuristic prints `[OK] No ChaCha20 in ClientHello cipher_suites`.
-```
-
-```sh
-# Linkage on macOS+fips — should be Apple frameworks only, no aws-lc-fips dylib:
-otool -L target/debug/cf-gears-example-server | grep -E 'aws|crypto|ssl|ring'
-# (Expected: only /System/Library/Frameworks/Security.framework)
-
-# Runtime — corecrypto loaded:
-vmmap <cf-gears-example-server-pid> | grep -E 'corecrypto|Security\.framework'
-```
-
-See [`examples/cf-gears-fips-probe/README.md`](examples/cf-gears-fips-probe/README.md) for the full four-layer verification chain (linkage, runtime, wire-level, cert-validation).
-
-### Build prerequisites
-
-- **macOS + fips**: Xcode Command Line Tools + Rust toolchain. No `cmake` / `perl` / `go` (those used to be required when aws-lc-fips was linked on macOS; the per-target shim eliminates them).
-- **Linux + fips**: C toolchain + `cmake` + `perl` + `go` (required by `aws-lc-fips-sys` build script).
-- **Windows + fips**: MSVC toolchain + Windows SDK only for native Windows builds. No `cmake` / `perl` / `go` — `rustls-cng-crypto` is pure FFI to system DLLs (`bcrypt.dll`, `ncrypt.dll`) with no `build.rs`. Cross-compiling from a Linux/macOS host with `--target x86_64-pc-windows-msvc` needs no extra tooling beyond the standard MSVC sysroot bundled by `rustup target add` and `cargo-xwin` / `lld-link` if linking the binary; the `make check-windows-fips` target only `cargo check`s, so even that is unnecessary.
-
-### System FIPS-mode requirement (Windows)
-
-The Windows CNG FIPS provider only enforces its FIPS-Approved algorithm subset when the operating system itself is in FIPS mode. Gears bootstrap **fails closed** when this is not the case: `toolkit::bootstrap::init_crypto_provider` returns `CryptoProviderError::SystemFipsModeNotEnabled` and the binary refuses to start.
-
-Enable FIPS mode via Group Policy: *Computer Configuration → Windows Settings → Security Settings → Local Policies → Security Options → "System cryptography: Use FIPS compliant algorithms for encryption, hashing, and signing" → Enabled*. Or via the registry:
-
-```powershell
-reg add HKLM\System\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy /v Enabled /t REG_DWORD /d 1 /f
-```
-
-A reboot is required after either change. See <https://learn.microsoft.com/en-us/windows/security/threat-protection/fips-140-validation> for Microsoft's reference documentation on FIPS-mode posture.
-
-### What this does NOT claim
-
-- Gears itself is **not** on the CMVP Validated Gears list. CMVP-listed modules are Apple `corecrypto` (macOS), AWS-LC FIPS Provider (Linux), and Microsoft Windows CNG (Windows); Gears are *consumers*.
-- Neither `rustls-cng-crypto` nor `cf-gears-rustls-corecrypto-provider` is itself CMVP-listed — both are thin wrappers over the CMVP-listed system module they consume (CNG and corecrypto respectively). The chain-of-trust comes from the underlying validated module, not the wrapper crate.
-- The FIPS claim on macOS / Windows is valid only when the running OS version is covered by the Operational Environment of the current CMVP certificate for the system module (`corecrypto` / CNG). Verify per release against <https://csrc.nist.gov/projects/cryptographic-module-validation-program/validated-modules/search>.
-- `rustls-cng-crypto` is a young, single-maintainer crate (first release 2024-12). We pin to `0.1.x` and re-evaluate against `rustls-symcrypt` per release; the choice is documented in [`docs/security/fips/adrs/0003-windows-fips-via-rustls-cng-crypto.md`](docs/security/fips/adrs/0003-windows-fips-via-rustls-cng-crypto.md).
-- TLS protocol-level NIST recommendations (SP 800-52 Rev. 2) beyond EMS — minimum protocol version, certificate hygiene, etc. — are the deployment's responsibility.
-- Server-side TLS termination (inbound HTTPS) is delegated to the reverse proxy and is not part of this FIPS scope.
-
-### Architecture decisions
-
-- [`docs/adrs/toolkit/0004-macos-fips-via-corecrypto-provider.md`](docs/adrs/toolkit/0004-macos-fips-via-corecrypto-provider.md) — why we built a custom rustls `CryptoProvider` over Apple corecrypto rather than using `native-tls` or declaring FIPS Linux-only.
-- [`docs/adrs/toolkit/0005-fips-feature-target-conditional-shim.md`](docs/adrs/toolkit/0005-fips-feature-target-conditional-shim.md) — why a one-`fips`-feature design uses an empty shim crate to encode per-target activation.
-- [`docs/security/fips/adrs/0003-windows-fips-via-rustls-cng-crypto.md`](docs/security/fips/adrs/0003-windows-fips-via-rustls-cng-crypto.md) — why Windows+FIPS routes through `rustls-cng-crypto` today rather than waiting for Microsoft's `rustls-symcrypt` to obtain CMVP validation.
+See **[Security Overview §9 — Cryptographic Stack & FIPS-140-3](docs/security/SECURITY.md#9-cryptographic-stack--fips-140-3)** for algorithm scope, build prerequisites, runtime/verification gates, and the full "what this does and does not claim" breakdown.
 
 ## Configuration
 
@@ -308,17 +224,31 @@ Other tests:
 make test            # unit tests (workspace)
 make test-sqlite     # integration tests (SQLite, no external DB required)
 make e2e-local       # end-to-end tests (builds + starts server automatically)
+make e2e-local E2E_TARGET=testing/e2e/gears/file_parser/  # targeted end-to-end scope
 make e2e-docker      # end-to-end tests (builds + starts server in Docker)
 make coverage-unit   # unit test code coverage
 make fuzz            # fuzz smoke tests (30 s per target)
 ```
 
-On **Windows** (no `make`), use the cross-platform CI script directly:
+On **Windows** (no `make`), use the cross-platform Python scripts directly
+(invoke them with `python`; `python3` is often absent on Windows):
 
 ```bash
 python tools/scripts/ci.py check          # full CI suite
 python tools/scripts/ci.py e2e-local      # end-to-end tests
+python tools/scripts/ci.py e2e-local -- testing/e2e/gears/file_parser/  # targeted end-to-end scope
 python tools/scripts/ci.py fuzz --seconds 60  # fuzz smoke run
+
+python tools/scripts/coverage.py unit      # unit-test code coverage
+python tools/scripts/coverage.py combined  # unit + e2e-local coverage
+```
+
+These scripts need a few prerequisites on Windows:
+
+```bash
+pip install -r testing/e2e/requirements.txt   # pytest + httpx (e2e tests)
+pip install -r testing/requirements.txt        # PyYAML + requests (coverage.py)
+cargo install cargo-llvm-cov                    # coverage backend (or run `make setup`)
 ```
 
 For the complete test strategy, coverage policy, CI pipeline details, and all

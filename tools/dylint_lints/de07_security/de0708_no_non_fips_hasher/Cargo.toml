@@ -1,0 +1,30 @@
+[package]
+name = "de0708_no_non_fips_hasher"
+version = "0.1.0"
+authors = ["Constructor Fabric"]
+description = "Prohibits sha2/sha1/md5 imports outside an explicit allow-list (DE0708)"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "bad_sha2_import"
+path = "ui/bad_sha2_import.rs"
+
+[[example]]
+name = "good_allowed_path"
+path = "ui/good_allowed_path.rs"
+
+[dependencies]
+clippy_utils.workspace = true
+dylint_linting.workspace = true
+lint_utils.workspace = true
+
+[dev-dependencies]
+dylint_testing.workspace = true
+sha2.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true

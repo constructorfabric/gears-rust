@@ -113,6 +113,7 @@ deny = [
 #   { name = "aws-lc-rs",     reason = "non-FIPS aws-lc-rs reaches the binary via rustls's default features; replace with rustls/fips on Linux, dropped via shim on macOS/Windows" },
 #   { name = "chacha20",      reason = "stream cipher; not FIPS-approved; transitive via rand ecosystem" },
 #   { name = "md-5",          reason = "MD5 is not FIPS-approved; transitive via TBD (likely JWT / hash-id helper)" },
+#   { name = "sha2",          reason = "pure-Rust SHA-2 bypasses validated module; no direct usage remains; transitive via sqlx-core, sqlx-postgres, lopdf, rust-embed-utils" },
 #   { name = "sha1",          reason = "SHA-1 not approved for signatures since 2013; transitive via TBD" },
 #   { name = "sha1_smol",     reason = "alias of sha1" },
 #   { name = "blake2",        reason = "BLAKE2 is not FIPS-approved" },

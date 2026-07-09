@@ -244,6 +244,7 @@ fn jwt_claims_to_map_includes_all_populated_fields() {
         tenant_id: Some("tenant-val".to_owned()),
         user_type: Some("type-val".to_owned()),
         scope: Some("scope-val".to_owned()),
+        extra: serde_json::Map::new(),
     };
     let map = super::jwt_claims_to_map(jwt_claims);
     assert_eq!(
@@ -267,6 +268,7 @@ fn jwt_claims_to_map_produces_correct_entries() {
         tenant_id: Some("tenant-abc".to_owned()),
         user_type: None,
         scope: Some("read write".to_owned()),
+        extra: serde_json::Map::new(),
     };
     let map = super::jwt_claims_to_map(jwt_claims);
     assert_eq!(
@@ -301,6 +303,42 @@ fn jwt_claims_to_map_produces_correct_entries() {
     assert!(
         map.get("user_type").is_none(),
         "None fields should be omitted"
+    );
+}
+
+#[test]
+fn non_standard_claims_survive_into_map() {
+    // Cap tokens carry claims under names the struct does not declare
+    // (`subject_tenant`, `scopes`, `context_tenant`). They must be preserved via
+    // `extra` so claim mapping can be configured to read them.
+    let payload = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": "https://core.example/issuers/cap",
+        "exp": 9_999_999_999u64,
+        "subject_tenant": "11111111-1111-1111-1111-111111111111",
+        "scopes": "rms.read rms.write",
+        "context_tenant": "22222222-2222-2222-2222-222222222222"
+    });
+    let jwt_claims: JwtClaims =
+        serde_json::from_value(payload).expect("cap claims should deserialize");
+    let map = super::jwt_claims_to_map(jwt_claims);
+    assert_eq!(
+        map.get("subject_tenant").and_then(|v| v.as_str()),
+        Some("11111111-1111-1111-1111-111111111111"),
+        "non-standard claim must survive the JwtClaims round-trip"
+    );
+    assert_eq!(
+        map.get("scopes").and_then(|v| v.as_str()),
+        Some("rms.read rms.write")
+    );
+    assert_eq!(
+        map.get("context_tenant").and_then(|v| v.as_str()),
+        Some("22222222-2222-2222-2222-222222222222")
+    );
+    // Standard fields still decode into their own slots, not `extra`.
+    assert_eq!(
+        map.get("exp").and_then(serde_json::Value::as_u64),
+        Some(9_999_999_999)
     );
 }
 

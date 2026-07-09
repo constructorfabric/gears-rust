@@ -23,6 +23,9 @@ fn make_regex_trust(patterns: &[&str]) -> IssuerTrustConfig {
         .map(|pattern| TrustedIssuerInput {
             entry: TrustedIssuerEntry::IssuerPattern((*pattern).to_owned()),
             discovery_url: None,
+            expected_audience: Vec::new(),
+            jose_typ: None,
+            clock_skew_leeway_secs: None,
         })
         .collect::<Vec<_>>();
     IssuerTrustConfig::from_inputs(inputs).unwrap()
@@ -163,7 +166,8 @@ fn test_peek_issuer_too_few_segments() {
 }
 
 use crate::test_support::test_fixtures::{
-    TEST_ISSUER, TEST_KID, future_exp, past_exp, sign_jwt, test_jwk_json,
+    TEST_ISSUER, TEST_KID, future_exp, past_exp, sign_jwt, sign_jwt_with_typ, sign_jwt_without_typ,
+    test_jwk_json,
 };
 
 struct TestJwksProvider {
@@ -690,4 +694,360 @@ async fn metrics_increment_for_jwks_refresh_failure() {
         &[],
     );
     assert!(after >= 1, "JWKS refresh failure counter should increase");
+}
+
+// ─── Per-issuer overrides (typ / aud / clock-skew leeway) ───────────────────
+
+/// Second trusted issuer used to verify per-issuer overrides apply only to the
+/// matched issuer. The test JWKS provider ignores the issuer, so tokens for this
+/// issuer verify against the same signing key.
+const OTHER_ISSUER: &str = "https://other.example.com/realms/platform";
+
+/// Build a single-issuer `IssuerTrustConfig` carrying per-issuer overrides.
+fn issuer_input_with_overrides(
+    issuer: &str,
+    expected_audience: &[&str],
+    jose_typ: Option<&str>,
+    clock_skew_leeway_secs: Option<u64>,
+) -> TrustedIssuerInput {
+    TrustedIssuerInput {
+        entry: TrustedIssuerEntry::Issuer(issuer.to_owned()),
+        discovery_url: None,
+        expected_audience: expected_audience
+            .iter()
+            .map(|aud| (*aud).to_owned())
+            .collect(),
+        jose_typ: jose_typ.map(str::to_owned),
+        clock_skew_leeway_secs,
+    }
+}
+
+// (a) Per-issuer `jose_typ` enforcement.
+
+#[tokio::test]
+async fn test_per_issuer_jose_typ_rejects_mismatched_typ() {
+    let (validator, _) = make_validator_with_test_key();
+    let trust = IssuerTrustConfig::from_inputs(vec![issuer_input_with_overrides(
+        TEST_ISSUER,
+        &[],
+        Some("obo+jwt"),
+        None,
+    )])
+    .unwrap();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": future_exp(),
+    });
+    // Issuer pins `obo+jwt`; this token carries `cap+jwt`.
+    let token = sign_jwt_with_typ(&claims, Some(TEST_KID), "cap+jwt");
+
+    let result = validator
+        .validate(&token, &base_jwt_validation_config(), &trust)
+        .await;
+    assert!(
+        matches!(result, Err(AuthNError::InvalidTokenType)),
+        "mismatched JOSE typ should be rejected: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_per_issuer_jose_typ_accepts_matching_typ_case_insensitively() {
+    let (validator, _) = make_validator_with_test_key();
+    let trust = IssuerTrustConfig::from_inputs(vec![issuer_input_with_overrides(
+        TEST_ISSUER,
+        &[],
+        Some("obo+jwt"),
+        None,
+    )])
+    .unwrap();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": future_exp(),
+    });
+    // Case-insensitive match against the configured `obo+jwt`.
+    let token = sign_jwt_with_typ(&claims, Some(TEST_KID), "OBO+JWT");
+
+    let result = validator
+        .validate(&token, &base_jwt_validation_config(), &trust)
+        .await;
+    assert!(
+        result.is_ok(),
+        "matching JOSE typ (case-insensitive) should be accepted: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_no_per_issuer_jose_typ_ignores_typ_header() {
+    // KC-style issuer without a `jose_typ` override: any `typ` is accepted.
+    let (validator, _) = make_validator_with_test_key();
+    let trust = make_trust(&[TEST_ISSUER]);
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": future_exp(),
+    });
+    let token = sign_jwt_with_typ(&claims, Some(TEST_KID), "anything+jwt");
+
+    let result = validator
+        .validate(&token, &base_jwt_validation_config(), &trust)
+        .await;
+    assert!(
+        result.is_ok(),
+        "issuer without jose_typ override must not inspect typ: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_per_issuer_jose_typ_rejects_missing_typ_header() {
+    let (validator, _) = make_validator_with_test_key();
+    let trust = IssuerTrustConfig::from_inputs(vec![issuer_input_with_overrides(
+        TEST_ISSUER,
+        &[],
+        Some("obo+jwt"),
+        None,
+    )])
+    .unwrap();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": future_exp(),
+    });
+    // Issuer pins `obo+jwt`; this token omits the `typ` header entirely.
+    let token = sign_jwt_without_typ(&claims, Some(TEST_KID));
+
+    let result = validator
+        .validate(&token, &base_jwt_validation_config(), &trust)
+        .await;
+    assert!(
+        matches!(result, Err(AuthNError::InvalidTokenType)),
+        "a pinned issuer must reject a token with no typ header: {result:?}"
+    );
+}
+
+// (b) Per-issuer audience override vs global fallback.
+
+#[tokio::test]
+async fn test_per_issuer_audience_override_rejects_global_audience() {
+    let (validator, _) = make_validator_with_test_key();
+    // Global expects `global-api`; the matched issuer overrides to `public-api`.
+    let mut config = jwt_validation_config_with_audience(&["global-api"], true);
+    config.require_audience = true;
+    let trust = IssuerTrustConfig::from_inputs(vec![issuer_input_with_overrides(
+        TEST_ISSUER,
+        &["public-api"],
+        None,
+        None,
+    )])
+    .unwrap();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": future_exp(),
+        "aud": "global-api",
+    });
+    let token = sign_jwt(&claims, Some(TEST_KID));
+
+    let result = validator.validate(&token, &config, &trust).await;
+    assert!(
+        matches!(result, Err(AuthNError::InvalidAudience)),
+        "per-issuer audience override should reject the global audience: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_per_issuer_audience_override_accepts_its_own_audience() {
+    let (validator, _) = make_validator_with_test_key();
+    let config = jwt_validation_config_with_audience(&["global-api"], true);
+    let trust = IssuerTrustConfig::from_inputs(vec![issuer_input_with_overrides(
+        TEST_ISSUER,
+        &["public-api"],
+        None,
+        None,
+    )])
+    .unwrap();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": future_exp(),
+        "aud": "public-api",
+    });
+    let token = sign_jwt(&claims, Some(TEST_KID));
+
+    let result = validator.validate(&token, &config, &trust).await;
+    assert!(
+        result.is_ok(),
+        "per-issuer audience override should accept its own audience: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_issuer_without_audience_override_uses_global_audience() {
+    let (validator, _) = make_validator_with_test_key();
+    let config = jwt_validation_config_with_audience(&["global-api"], true);
+    // First issuer overrides audience; second issuer has no override and must
+    // fall back to the global `global-api`.
+    let trust = IssuerTrustConfig::from_inputs(vec![
+        issuer_input_with_overrides(TEST_ISSUER, &["public-api"], None, None),
+        issuer_input_with_overrides(OTHER_ISSUER, &[], None, None),
+    ])
+    .unwrap();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": OTHER_ISSUER,
+        "exp": future_exp(),
+        "aud": "global-api",
+    });
+    let token = sign_jwt(&claims, Some(TEST_KID));
+
+    let result = validator.validate(&token, &config, &trust).await;
+    assert!(
+        result.is_ok(),
+        "issuer without override should accept the global audience: {result:?}"
+    );
+
+    // And the same issuer rejects the *other* issuer's per-issuer audience.
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": OTHER_ISSUER,
+        "exp": future_exp(),
+        "aud": "public-api",
+    });
+    let token = sign_jwt(&claims, Some(TEST_KID));
+
+    let result = validator.validate(&token, &config, &trust).await;
+    assert!(
+        matches!(result, Err(AuthNError::InvalidAudience)),
+        "issuer without override should reject another issuer's audience: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_per_issuer_audience_requires_aud_even_when_global_flag_off() {
+    let (validator, _) = make_validator_with_test_key();
+    // Global `require_audience` is OFF; the issuer pins its own audience. A token
+    // omitting `aud` must still be rejected (the per-issuer audience binds the
+    // token and must fail closed without relying on the global flag).
+    let config = jwt_validation_config_with_audience(&["public-api"], false);
+    assert!(!config.require_audience);
+    let trust = IssuerTrustConfig::from_inputs(vec![issuer_input_with_overrides(
+        TEST_ISSUER,
+        &["public-api"],
+        None,
+        None,
+    )])
+    .unwrap();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": future_exp(),
+        // No `aud` claim.
+    });
+    let token = sign_jwt(&claims, Some(TEST_KID));
+
+    let result = validator.validate(&token, &config, &trust).await;
+    assert!(
+        matches!(result, Err(AuthNError::MissingClaim(ref c)) if c == "aud"),
+        "per-issuer audience must reject a missing aud even with global require_audience off: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_per_issuer_audience_accepts_array_aud_member() {
+    let (validator, _) = make_validator_with_test_key();
+    let config = jwt_validation_config_with_audience(&["global-api"], false);
+    let trust = IssuerTrustConfig::from_inputs(vec![issuer_input_with_overrides(
+        TEST_ISSUER,
+        &["public-api"],
+        None,
+        None,
+    )])
+    .unwrap();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": future_exp(),
+        // `aud` as an array: one member matches the per-issuer audience.
+        "aud": ["something-else", "public-api"],
+    });
+    let token = sign_jwt(&claims, Some(TEST_KID));
+
+    let result = validator.validate(&token, &config, &trust).await;
+    assert!(
+        result.is_ok(),
+        "per-issuer audience should accept an array aud whose member matches: {result:?}"
+    );
+}
+
+// (c) Per-issuer clock-skew leeway.
+
+#[tokio::test]
+async fn test_per_issuer_leeway_wider_than_global_accepts_future_iat() {
+    let (validator, _) = make_validator_with_test_key();
+    // Global leeway is 60s; per-issuer leeway is widened to 120s.
+    let config = base_jwt_validation_config();
+    assert_eq!(config.clock_skew_leeway_secs, 60);
+    let trust = IssuerTrustConfig::from_inputs(vec![issuer_input_with_overrides(
+        TEST_ISSUER,
+        &[],
+        None,
+        Some(120),
+    )])
+    .unwrap();
+    let now = current_unix_timestamp();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": now + 7200,
+        // Outside the global 60s leeway but inside the per-issuer 120s leeway.
+        "iat": now + 90,
+    });
+    let token = sign_jwt(&claims, Some(TEST_KID));
+
+    let result = validator.validate(&token, &config, &trust).await;
+    assert!(
+        result.is_ok(),
+        "iat within per-issuer (wider) leeway should be accepted: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_per_issuer_leeway_narrower_than_global_rejects_future_iat() {
+    let (validator, _) = make_validator_with_test_key();
+    // Global leeway is 60s; per-issuer leeway is tightened to 10s.
+    let config = base_jwt_validation_config();
+    let trust = IssuerTrustConfig::from_inputs(vec![issuer_input_with_overrides(
+        TEST_ISSUER,
+        &[],
+        None,
+        Some(10),
+    )])
+    .unwrap();
+    let now = current_unix_timestamp();
+
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": now + 7200,
+        // Inside the global 60s leeway but outside the per-issuer 10s leeway.
+        "iat": now + 30,
+    });
+    let token = sign_jwt(&claims, Some(TEST_KID));
+
+    let result = validator.validate(&token, &config, &trust).await;
+    assert!(
+        matches!(result, Err(AuthNError::SignatureInvalid)),
+        "iat outside per-issuer (narrower) leeway should be rejected: {result:?}"
+    );
 }

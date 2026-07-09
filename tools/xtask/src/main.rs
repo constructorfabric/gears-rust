@@ -90,16 +90,17 @@ fn split_debug(args: &[String]) -> ExitCode {
 
 fn split_dsym(bin: &Path) -> bool {
     let bin_s = bin.to_str().unwrap();
+    let bin_local = bin.file_name().and_then(|s| s.to_str()).unwrap_or(bin_s);
     let size_before = file_size(bin);
 
     eprintln!("extracting .dSYM bundle...");
-    if !run(&["dsymutil", bin_s], bin.parent().unwrap()) {
+    if !run(&["dsymutil", bin_local], bin.parent().unwrap()) {
         eprintln!("dsymutil failed — install Xcode command-line tools");
         return false;
     }
 
     eprintln!("stripping binary...");
-    if !run(&["strip", "-u", "-r", bin_s], bin.parent().unwrap()) {
+    if !run(&["strip", "-u", "-r", bin_local], bin.parent().unwrap()) {
         eprintln!("strip failed");
         return false;
     }

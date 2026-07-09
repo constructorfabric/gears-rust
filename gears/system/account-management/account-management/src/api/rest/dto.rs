@@ -296,6 +296,13 @@ pub struct TenantDto {
     pub parent_id: Option<Uuid>,
     pub self_managed: bool,
     pub depth: u32,
+    /// Number of **direct** children visible to the caller, resolved at
+    /// read time: scope-filtered (children behind a self-managed barrier
+    /// the caller cannot penetrate are not counted), excludes
+    /// AM-internal `provisioning` rows, includes soft-`deleted`
+    /// children. `0` for a leaf. Derived field (not a stored column) —
+    /// not available in `$filter` / `$orderby`.
+    pub child_count: u32,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -323,6 +330,7 @@ impl TenantDto {
             parent_id: tenant.parent_id.map(|t| t.0),
             self_managed: tenant.self_managed,
             depth: tenant.depth,
+            child_count: tenant.child_count,
             created_at: tenant.created_at,
             updated_at: tenant.updated_at,
             deleted_at: tenant.deleted_at,

@@ -1,0 +1,112 @@
+---
+title: Gears & composition
+description: What a gear is, the three-tier hierarchy, the SDK facade+backend pattern, and ClientHub.
+sidebar:
+  label: Gears & composition
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## What is a gear?
+
+A **gear** is a vertically-sliced, self-contained capability. Each gear:
+
+- **owns its public API** through an SDK crate (`<name>-sdk`) — transport-agnostic traits,
+  models, and errors;
+- **owns its data** behind a secure ORM layer (no raw connections);
+- **is discovered at link time** and initialized in dependency order by the runtime;
+- **composes** with other gears through the typed `ClientHub` (in-process) or gRPC
+  (out-of-process), behind the same SDK trait;
+- **is extensible** through plugins and the Global Type System.
+
+## The three-tier hierarchy
+
+Gears are organized into exactly three tiers, with a one-way dependency direction:
+
+```text
+Service gears   (gears/)          business capabilities
+      │  depend on
+      ▼
+System gears    (gears/system/)   control plane: gateway, authn/authz, tenancy, …
+      │  depend on
+      ▼
+Toolkit         (libs/)           runtime substrate: REST, DB, security, observability
+```
+
+- **Toolkit** (`libs/`) — the low-level substrate: API middleware, DB access, error
+  definitions, transport, security primitives, observability, and macros.
+- **System gears** (`gears/system/`) — the control plane (API gateway, authn/authz
+  resolvers, tenant resolver, type registry, …). They are ordinary gears, so they can be
+  replaced.
+- **Service gears** (`gears/`) — your business capabilities, built on the platform.
+
+Adding a gear never requires editing a central switchboard — dependency ordering is a
+platform guarantee, not an application convention.
+
+## In-process vs out-of-process
+
+The **same gear** can run two ways, chosen by configuration rather than code:
+
+- **In-process** — the gear is compiled into the host binary and resolved through
+  `ClientHub` as a direct call.
+- **Out-of-process** — the gear runs as its own service; consumers get a gRPC client that
+  implements the very same SDK trait.
+
+This is what lets one codebase deploy as a single node, as multiple processes, or as
+Kubernetes services.
+
+## The SDK pattern: facade + backend trait
+
+Every gear's public API lives in a dedicated **SDK crate** containing only the interface: a
+transport-agnostic trait, models, and error types. The implementation depends on the SDK,
+never the reverse.
+
+```rust
+// users-info-sdk/src/client.rs — the public facade trait (abridged)
+#[async_trait]
+pub trait UsersInfoClientV1: Send + Sync {
+    async fn get_user(&self, ctx: SecurityContext, id: Uuid) -> Result<User, UsersInfoError>;
+    async fn create_user(&self, ctx: SecurityContext, new_user: NewUser) -> Result<User, UsersInfoError>;
+    async fn delete_user(&self, ctx: SecurityContext, id: Uuid) -> Result<(), UsersInfoError>;
+    // …additional methods omitted (the real trait also exposes streaming sub-clients)
+}
+```
+
+Behind that trait the runtime can wire different **backends**:
+
+- an **in-process adapter** that calls the gear's domain service directly, or
+- a **gRPC client** that talks to the gear in another process.
+
+Consumers call the trait and never know which backend they got. The first parameter of
+every method is a `SecurityContext` — identity and tenancy flow as explicit data, not
+thread-local magic.
+
+## ClientHub: how gears find each other
+
+Gears resolve each other's SDK traits through the typed **ClientHub**. A gear registers its
+implementation during `init`, and consumers look it up by trait:
+
+```rust
+// Provider side — register the local adapter under the SDK trait
+ctx.client_hub().register::<dyn UsersInfoClientV1>(Arc::new(local_client));
+
+// Consumer side — resolve and call it
+let users = ctx.client_hub().get::<dyn UsersInfoClientV1>()?;
+let user = users.get_user(ctx, id).await?;
+```
+
+Whether the registered implementation is a local adapter (single process) or a gRPC client
+(out-of-process) is decided by configuration — the calling code is identical.
+
+### Plugins & providers
+
+Some gears accept multiple implementations of an interface keyed by scope (typically a GTS
+instance id) — for example authentication or authorization providers. The main gear selects
+a plugin at runtime; the plugin registers a **scoped** client in `ClientHub`. A "backend" is
+simply one of the implementations behind a facade trait.
+
+<Aside type="tip">
+Build it yourself: the [first-gear walkthrough](../../get-started/your-first-gear/) defines an SDK,
+a backend, and `ClientHub` registration against real code.
+</Aside>

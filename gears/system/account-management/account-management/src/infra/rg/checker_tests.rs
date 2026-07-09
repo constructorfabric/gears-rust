@@ -8,11 +8,11 @@
 
 use super::*;
 use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupError,
-    ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
-    UpdateTypeRequest,
+    CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupMembership,
+    ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
 };
 use std::sync::Mutex;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::Page;
 
 #[allow(
@@ -86,21 +86,21 @@ impl ResourceGroupClient for FakeRgClient {
         &self,
         _ctx: &SecurityContext,
         _request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         unreachable!("not used by RgResourceOwnershipChecker")
     }
     async fn get_type(
         &self,
         _ctx: &SecurityContext,
         _code: &str,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         unreachable!()
     }
     async fn list_types(
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
         unreachable!()
     }
     async fn update_type(
@@ -108,35 +108,31 @@ impl ResourceGroupClient for FakeRgClient {
         _ctx: &SecurityContext,
         _code: &str,
         _request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         unreachable!()
     }
-    async fn delete_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_type(&self, _ctx: &SecurityContext, _code: &str) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn create_group(
         &self,
         _ctx: &SecurityContext,
         _request: CreateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn get_group(
         &self,
         _ctx: &SecurityContext,
         _id: Uuid,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn list_groups(
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroup>, CanonicalError> {
         *self.list_calls.lock().expect("lock") += 1;
         *self.last_filter.lock().expect("lock") = query.filter().cloned();
         let behaviour = self.behaviour.lock().expect("lock").clone();
@@ -150,9 +146,7 @@ impl ResourceGroupClient for FakeRgClient {
                     limit: 1,
                 },
             )),
-            FakeBehaviour::ListErr => {
-                Err(ResourceGroupError::service_unavailable("rg backend down"))
-            }
+            FakeBehaviour::ListErr => Err(CanonicalError::internal("rg backend down").create()),
             FakeBehaviour::ListDelay(delay) => {
                 tokio::time::sleep(delay).await;
                 Ok(Page::empty(1))
@@ -164,14 +158,10 @@ impl ResourceGroupClient for FakeRgClient {
         _ctx: &SecurityContext,
         _id: Uuid,
         _request: UpdateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
-    async fn delete_group(
-        &self,
-        _ctx: &SecurityContext,
-        _id: Uuid,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_group(&self, _ctx: &SecurityContext, _id: Uuid) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn get_group_descendants(
@@ -179,7 +169,7 @@ impl ResourceGroupClient for FakeRgClient {
         _ctx: &SecurityContext,
         _group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         unreachable!()
     }
     async fn get_group_ancestors(
@@ -187,7 +177,7 @@ impl ResourceGroupClient for FakeRgClient {
         _ctx: &SecurityContext,
         _group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         unreachable!()
     }
     async fn add_membership(
@@ -196,7 +186,7 @@ impl ResourceGroupClient for FakeRgClient {
         _group_id: Uuid,
         _resource_type: &str,
         _resource_id: &str,
-    ) -> Result<ResourceGroupMembership, ResourceGroupError> {
+    ) -> Result<ResourceGroupMembership, CanonicalError> {
         unreachable!()
     }
     async fn remove_membership(
@@ -205,14 +195,14 @@ impl ResourceGroupClient for FakeRgClient {
         _group_id: Uuid,
         _resource_type: &str,
         _resource_id: &str,
-    ) -> Result<(), ResourceGroupError> {
+    ) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn list_memberships(
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
         unreachable!("not used by RgResourceOwnershipChecker")
     }
 }

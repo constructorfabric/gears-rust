@@ -1,0 +1,26 @@
+# Constructor Studio project configuration
+
+version = "1.0"
+project_root = ".."
+
+[kits]
+[kits.gears]
+format = "CFS"
+path = ".."
+version = "0.1.0"
+install_mode = "register"
+tool_risk_fingerprint = "3bdcd30d3029ad80e74c76eb0b57d80ad617a51191eb9d9307b2921c65f5dc16"
+
+[kits.gears.source_provenance]
+source_type = "local_path"
+resolver_mode = "register"
+resolution_basis = "local_path"
+effective_source = ".."
+verified = "local"
+freshness = "local"
+
+[install]
+version_source = "project_config"
+runtime_tracking = "ignored"
+agent_tracking = "ignored"
+kit_tracking = "tracked"

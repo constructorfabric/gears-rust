@@ -414,7 +414,7 @@ class PrereqCargo(Prereq):
 class PrereqPython(Prereq):
     def __init__(self):
         super().__init__(
-            name="python3 is installed",
+            name="python3/python is installed",
             remediation=(
                 "Install Python 3 from https://python.org/ "
                 "or using a package manager like Homebrew: "
@@ -423,24 +423,22 @@ class PrereqPython(Prereq):
         )
 
     def check(self):
-        # Check if python3 is installed
-        try:
-            subprocess.check_output(
-                ["python3", "--version"], stderr=subprocess.DEVNULL
-            )
-            return PRECHECK_OK
-        except subprocess.CalledProcessError:
-            logging.error(
-                "python3 is not installed or not working properly"
-            )
-            logging.error(f"Possible remediation: {self.remediation}")
-            return PRECHECK_ERROR
-        except FileNotFoundError:
-            logging.error(
-                "'python3' command not found"
-            )
-            logging.error(f"Possible remediation: {self.remediation}")
-            return PRECHECK_ERROR
+        # `python3` is the canonical name on Linux/macOS, but Windows ships
+        # only `python`. Accept either so the e2e/coverage scripts (which
+        # auto-detect the interpreter) pass this check on Windows too.
+        for exe in ("python3", "python"):
+            try:
+                subprocess.check_output(
+                    [exe, "--version"], stderr=subprocess.DEVNULL
+                )
+                return PRECHECK_OK
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+        logging.error(
+            "no working 'python3' or 'python' interpreter found"
+        )
+        logging.error(f"Possible remediation: {self.remediation}")
+        return PRECHECK_ERROR
 
 
 class PrereqPytest(Prereq):

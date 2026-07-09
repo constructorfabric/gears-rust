@@ -6,7 +6,9 @@
 //!
 //! # Covered engines
 //!
-//! * **`MySQL` / `MariaDB`** — `InnoDB` deadlock (SQLSTATE `40001`).
+//! * **`MySQL` / `MariaDB` / Percona `XtraDB` Cluster** — `InnoDB` deadlock
+//!   (SQLSTATE `40001`) and Galera/wsrep certification conflicts that abort
+//!   the transaction and require a full retry.
 //!   `InnoDB` detects deadlocks instantly and rolls back one transaction.
 //!
 //!   > "Always be prepared to re-issue a transaction if it fails due to
@@ -39,6 +41,14 @@ use sea_orm::{DbBackend, DbErr};
 
 /// `MySQL` deadlock SQLSTATE code.
 const MYSQL_DEADLOCK_SQLSTATE: &str = "40001";
+const MYSQL_DEADLOCK_MSG: &str = "deadlock";
+const MYSQL_WSREP_DEADLOCK_MSG: &str = "wsrep detected deadlock/conflict";
+const MYSQL_WSREP_CERTIFICATION_ERROR_MSG: &str = "transaction failed due to certification error";
+const MYSQL_WSREP_CANNOT_CERTIFY_MSG: &str = "transaction cannot be certified";
+const MYSQL_WSREP_WRITE_SET_CONFLICT_MSG: &str = "write-set conflict";
+const MYSQL_WSREP_CERTIFICATION_FAILURE_MSG: &str =
+    "transaction rolled back due to certification failure";
+const MYSQL_RESTART_MSG: &str = "try restarting transaction";
 
 /// `PostgreSQL` retryable SQLSTATE codes.
 const PG_SERIALIZATION_FAILURE: &str = "40001";
@@ -88,7 +98,15 @@ pub fn is_retryable_contention(backend: DbBackend, err: &DbErr) -> bool {
 }
 
 fn is_mysql_deadlock(msg: &str) -> bool {
+    let msg = msg.to_ascii_lowercase();
     msg.contains(MYSQL_DEADLOCK_SQLSTATE)
+        || msg.contains(MYSQL_DEADLOCK_MSG)
+        || msg.contains(MYSQL_WSREP_DEADLOCK_MSG)
+        || msg.contains(MYSQL_WSREP_CERTIFICATION_ERROR_MSG)
+        || msg.contains(MYSQL_WSREP_CANNOT_CERTIFY_MSG)
+        || msg.contains(MYSQL_WSREP_WRITE_SET_CONFLICT_MSG)
+        || msg.contains(MYSQL_WSREP_CERTIFICATION_FAILURE_MSG)
+        || msg.contains(MYSQL_RESTART_MSG)
 }
 
 fn is_pg_contention(msg: &str) -> bool {
@@ -122,6 +140,33 @@ mod tests {
     #[test]
     fn mysql_deadlock_detected() {
         let err = exec_err("MySqlError { ... SQLSTATE 40001: Deadlock found ... }");
+        assert!(is_retryable_contention(DbBackend::MySql, &err));
+    }
+
+    #[test]
+    fn mysql_wsrep_certification_conflict_detected() {
+        let err =
+            exec_err("MySqlError: WSREP detected deadlock/conflict and aborted the transaction");
+        assert!(is_retryable_contention(DbBackend::MySql, &err));
+    }
+
+    #[test]
+    fn mysql_wsrep_write_set_conflict_detected() {
+        let err = exec_err("MySqlError: WSREP: Transaction failed due to write-set conflict");
+        assert!(is_retryable_contention(DbBackend::MySql, &err));
+    }
+
+    #[test]
+    fn unrelated_mysql_wsrep_message_not_retryable() {
+        let err = exec_err(
+            "MySqlError: WSREP provider failed certification metadata validation permanently",
+        );
+        assert!(!is_retryable_contention(DbBackend::MySql, &err));
+    }
+
+    #[test]
+    fn mysql_restart_transaction_detected() {
+        let err = exec_err("MySqlError: Lock wait timeout exceeded; try restarting transaction");
         assert!(is_retryable_contention(DbBackend::MySql, &err));
     }
 

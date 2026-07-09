@@ -1,0 +1,74 @@
+[package]
+name = "cf-gears-file-storage"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "File Storage gear (control plane): metadata, authorization, versioning, signed URLs"
+
+[lib]
+name = "file_storage"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+# SDK - public API, models, and errors
+cf-gears-file-storage-sdk = { path = "../file-storage-sdk" }
+
+# Authorization Service (PEP) — per-type access decisions
+cf-gears-authz-resolver-sdk = { path = "../../system/authz-resolver/authz-resolver-sdk" }
+
+# Core dependencies
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+inventory = { workspace = true }
+
+# Serde and JSON schema
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
+
+# HTTP and REST
+axum = { workspace = true, features = ["macros"] }
+http = { workspace = true }
+
+# Time / IDs
+time = { workspace = true }
+uuid = { workspace = true }
+
+# Content pipeline + signed URLs
+bytes = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+infer = "0.19"
+ring = "0.17"
+
+# HTTP client — used by the sidecar binary to call the control-plane finalize callback.
+reqwest = { workspace = true }
+
+# Database - SeaORM (driver features come from toolkit-db)
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Local dependencies
+toolkit = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-db-macros = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
+toolkit-macros = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+uuid = { workspace = true }

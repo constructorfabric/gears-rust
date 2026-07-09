@@ -967,7 +967,10 @@ impl Gear for AccountManagementGear {
             // the same ID surfaces immediately.
             for result in &tr_results {
                 if let RegisterResult::Err { error, .. } = result {
-                    if error.is_already_exists() {
+                    if matches!(
+                        error,
+                        toolkit_canonical_errors::CanonicalError::AlreadyExists { .. }
+                    ) {
                         let existing = types_registry
                             .get_instance(tr_instance_id.as_ref())
                             .await

@@ -45,6 +45,8 @@ def generate_help(makefile_path: Path) -> None:
         color_secondary = ""
         color_reset = ""
 
+    name_field_width = 22
+
     try:
         lines = makefile_path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
@@ -73,13 +75,15 @@ def generate_help(makefile_path: Path) -> None:
         # Primary comments (one '#') describe primary targets
         if stripped.startswith("# ") and not stripped.startswith("## "):
             text = stripped[2:].strip()
-            pending = (1, text)
+            if pending is None:
+                pending = (1, text)
             continue
 
         # Secondary comments ("## ") describe secondary targets
         if stripped.startswith("## "):
             text = stripped[3:].strip()
-            pending = (2, text)
+            if pending is None:
+                pending = (2, text)
             continue
 
         # Target lines: name:
@@ -125,12 +129,12 @@ def generate_help(makefile_path: Path) -> None:
 
         for _, name, desc in primaries:
             print(
-                f" {color_primary}* {name:<19}{color_reset} - "
+                f" {color_primary}* {name:<{name_field_width}}{color_reset} - "
                 f"{color_secondary}{desc}{color_reset}"
             )
         for _, name, desc in secondaries:
             print(
-                f"   {color_secondary}{name:<19}{color_reset} - "
+                f"   {color_secondary}{name:<{name_field_width}}{color_reset} - "
                 f"{color_secondary}{desc}{color_reset}"
             )
 

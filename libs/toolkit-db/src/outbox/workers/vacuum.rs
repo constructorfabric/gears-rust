@@ -1,8 +1,11 @@
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+use std::sync::Arc;
+
+use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use super::super::dialect::Dialect;
+use super::super::statements::OutboxStatements;
+use super::super::store::OutboxStore;
 use super::super::taskward::{Directive, WorkerAction};
 use super::super::types::OutboxError;
 use crate::Db;
@@ -39,16 +42,21 @@ pub struct VacuumReport {
 /// The vacuum never kills itself on a transient failure.
 pub struct VacuumTask {
     db: Db,
+    statements: Arc<OutboxStatements>,
     batch_size: usize,
 }
 
 impl VacuumTask {
-    pub fn new(db: Db, batch_size: usize) -> Self {
+    pub fn new(db: Db, statements: Arc<OutboxStatements>, batch_size: usize) -> Self {
         assert!(
             batch_size > 0,
             "vacuum batch_size must be greater than zero"
         );
-        Self { db, batch_size }
+        Self {
+            db,
+            statements,
+            batch_size,
+        }
     }
 }
 
@@ -60,16 +68,16 @@ impl WorkerAction for VacuumTask {
         &mut self,
         cancel: &CancellationToken,
     ) -> Result<Directive<VacuumReport>, OutboxError> {
-        let (backend, dialect) = {
+        let store = {
             let sea_conn = self.db.sea_internal();
-            let b = sea_conn.get_database_backend();
-            (b, Dialect::from(b))
+            debug_assert_eq!(sea_conn.get_database_backend(), self.statements.backend());
+            OutboxStore::new(&self.statements)
         };
 
         let sweep_start = tokio::time::Instant::now();
 
         // Phase 1: Snapshot dirty partitions (errors propagate to bulkhead)
-        let dirty = Self::snapshot_dirty(&self.db, backend, &dialect, cancel).await?;
+        let dirty = Self::snapshot_dirty(&self.db, &store, cancel).await?;
 
         // Phase 2: Drain each partition (per-partition errors logged, not propagated)
         let mut errors = 0u32;
@@ -79,14 +87,7 @@ impl WorkerAction for VacuumTask {
                 break;
             }
             match self
-                .drain_partition(
-                    &self.db,
-                    backend,
-                    &dialect,
-                    *partition_id,
-                    *snapshot_counter,
-                    cancel,
-                )
+                .drain_partition(&self.db, &store, *partition_id, *snapshot_counter, cancel)
                 .await
             {
                 Ok(deleted) => total_deleted += deleted,
@@ -124,14 +125,13 @@ impl VacuumTask {
     async fn drain_partition(
         &self,
         db: &Db,
-        backend: DbBackend,
-        dialect: &Dialect,
+        store: &OutboxStore<'_>,
         partition_id: i64,
         snapshot_counter: i64,
         cancel: &CancellationToken,
     ) -> Result<u64, OutboxError> {
         let deleted = self
-            .vacuum_partition(db, backend, dialect, partition_id, cancel)
+            .vacuum_partition(db, store, partition_id, cancel)
             .await?;
 
         // Only decrement counter if vacuum completed without cancellation.
@@ -140,8 +140,8 @@ impl VacuumTask {
         if !cancel.is_cancelled() {
             let conn = db.sea_internal();
             conn.execute(Statement::from_sql_and_values(
-                backend,
-                dialect.decrement_vacuum_counter(),
+                store.backend(),
+                store.decrement_vacuum_counter(),
                 [snapshot_counter.into(), partition_id.into()],
             ))
             .await?;
@@ -154,8 +154,7 @@ impl VacuumTask {
     /// Returns `(partition_id, counter)` pairs, snapshot taken once per sweep.
     async fn snapshot_dirty(
         db: &Db,
-        backend: DbBackend,
-        dialect: &Dialect,
+        store: &OutboxStore<'_>,
         cancel: &CancellationToken,
     ) -> Result<Vec<(i64, i64)>, OutboxError> {
         let mut dirty = Vec::new();
@@ -170,8 +169,8 @@ impl VacuumTask {
             let page = DIRTY_PAGE_LIMIT;
             let rows = conn
                 .query_all(Statement::from_sql_and_values(
-                    backend,
-                    dialect.fetch_dirty_partitions(),
+                    store.backend(),
+                    store.fetch_dirty_partitions(),
                     [cursor.into(), page.into()],
                 ))
                 .await?;
@@ -209,8 +208,7 @@ impl VacuumTask {
     async fn vacuum_partition(
         &self,
         db: &Db,
-        backend: DbBackend,
-        dialect: &Dialect,
+        store: &OutboxStore<'_>,
         partition_id: i64,
         cancel: &CancellationToken,
     ) -> Result<u64, OutboxError> {
@@ -218,8 +216,8 @@ impl VacuumTask {
         let row = {
             let conn = db.sea_internal();
             conn.query_one(Statement::from_sql_and_values(
-                backend,
-                dialect.read_processor(),
+                store.backend(),
+                store.read_processor(),
                 [partition_id.into()],
             ))
             .await?
@@ -237,7 +235,7 @@ impl VacuumTask {
             return Ok(0);
         }
 
-        let vacuum_sql = dialect.vacuum_cleanup();
+        let vacuum_sql = store.vacuum_cleanup();
         let mut total_deleted: u64 = 0;
 
         // Delete in bounded chunks until drained.
@@ -249,9 +247,8 @@ impl VacuumTask {
 
             let deleted = Self::delete_chunk(
                 db,
-                backend,
-                dialect,
-                &vacuum_sql,
+                store,
+                vacuum_sql,
                 partition_id,
                 processed_seq,
                 i64::try_from(self.batch_size).unwrap_or(i64::MAX),
@@ -272,8 +269,7 @@ impl VacuumTask {
     /// Returns the number of outgoing rows deleted.
     async fn delete_chunk(
         db: &Db,
-        backend: DbBackend,
-        dialect: &Dialect,
+        store: &OutboxStore<'_>,
         vacuum_sql: &super::super::dialect::VacuumSql,
         partition_id: i64,
         processed_seq: i64,
@@ -286,8 +282,8 @@ impl VacuumTask {
 
         let rows = txn
             .query_all(Statement::from_sql_and_values(
-                backend,
-                vacuum_sql.select_outgoing_chunk,
+                store.backend(),
+                &vacuum_sql.select_outgoing_chunk,
                 [partition_id.into(), processed_seq.into(), limit.into()],
             ))
             .await?;
@@ -313,18 +309,26 @@ impl VacuumTask {
 
         // DELETE outgoing rows by ID.
         if !outgoing_ids.is_empty() {
-            let delete_sql = dialect.build_delete_outgoing_batch(outgoing_ids.len());
+            let delete_sql = store.build_delete_outgoing_batch(outgoing_ids.len());
             let values: Vec<sea_orm::Value> = outgoing_ids.iter().map(|&id| id.into()).collect();
-            txn.execute(Statement::from_sql_and_values(backend, &delete_sql, values))
-                .await?;
+            txn.execute(Statement::from_sql_and_values(
+                store.backend(),
+                &delete_sql,
+                values,
+            ))
+            .await?;
         }
 
         // DELETE body rows by ID.
         if !body_ids.is_empty() {
-            let delete_sql = dialect.build_delete_body_batch(body_ids.len());
+            let delete_sql = store.build_delete_body_batch(body_ids.len());
             let values: Vec<sea_orm::Value> = body_ids.iter().map(|&id| id.into()).collect();
-            txn.execute(Statement::from_sql_and_values(backend, &delete_sql, values))
-                .await?;
+            txn.execute(Statement::from_sql_and_values(
+                store.backend(),
+                &delete_sql,
+                values,
+            ))
+            .await?;
         }
 
         txn.commit().await?;

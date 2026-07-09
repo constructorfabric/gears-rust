@@ -40,14 +40,14 @@ _RECTPACK_ALGOS: tuple[Any, ...] = (
 )
 
 _CATEGORY_STYLE: dict[str, tuple[str, str, str]] = {
-    "cypilot": ("rgba(110,60,210,0.06)",  "rgba(110,60,210,0.30)",  "rgba(90,45,190,0.85)"),
+    "cf-studio": ("rgba(110,60,210,0.06)",  "rgba(110,60,210,0.30)",  "rgba(90,45,190,0.85)"),
     "toolkit":  ("rgba(200,100,10,0.06)",  "rgba(200,100,10,0.30)",  "rgba(165,80,5,0.85)"),
     "gears": ("rgba(20,145,60,0.06)",   "rgba(20,145,60,0.30)",   "rgba(10,115,40,0.85)"),
     "other":   ("rgba(100,100,100,0.04)", "rgba(100,100,100,0.20)", "rgba(60,60,60,0.75)"),
 }
 
 _NODE_COLORS: dict[str, dict[str, str]] = {
-    "cypilot": {"background": "#f4eeff", "border": "#7744cc"},
+    "cf-studio": {"background": "#f4eeff", "border": "#7744cc"},
     "toolkit":  {"background": "#fff5e6", "border": "#c07000"},
     "gears": {"background": "#edfff4", "border": "#28a060"},
     "other":   {"background": "#f4f4f4", "border": "#888888"},
@@ -208,7 +208,7 @@ def detect_template_vars(repo: Path) -> dict[str, str]:
             try:
                 data = tomllib.loads(core_toml.read_text(encoding="utf-8"))
                 if "project_root" in data:
-                    vars["cypilot_path"] = candidate.relative_to(repo).as_posix()
+                    vars["cf-studio-path"] = candidate.relative_to(repo).as_posix()
                     break
             except Exception:
                 pass
@@ -2222,7 +2222,7 @@ def render_html(
       <form id="searchForm">
         <input id="searchInput" type="search" placeholder="Filter files..." autocomplete="off" spellcheck="false" />
         <div class="controlField hidden" id="filterDepthField">
-          <input id="filterDepth" type="number" min="0" step="1" value="1" aria-label="Filter depth" />
+          <input id="filterDepth" type="number" min="0" step="1" value="0" aria-label="Filter depth" />
         </div>
       </form>
     </div>
@@ -2477,7 +2477,7 @@ const options = {{
     guidelines: {{ color: {{ background: "#fff8db", border: "#c99a00" }} }},
     documents:  {{ color: {{ background: "#eaf3ff", border: "#3572b0" }} }},
     others:     {{ color: {{ background: "#eeeeee", border: "#777777" }} }},
-    cypilot:    {{ color: {{ background: "#f4eeff", border: "#7744cc" }} }},
+    cf-studio:  {{ color: {{ background: "#f4eeff", border: "#7744cc" }} }},
     toolkit:     {{ color: {{ background: "#fff5e6", border: "#c07000" }} }},
     gears:    {{ color: {{ background: "#edfff4", border: "#28a060" }} }},
     other:      {{ color: {{ background: "#f4f4f4", border: "#888888" }} }},
@@ -2491,6 +2491,7 @@ let previewedNode = null;
 let selectedEdge = null;
 let tooltipIsEdge = false;
 let activeViewNodeIds = new Set(rawNodes.map(node => node.id));
+let activeViewRootIds = new Set();
 let activeViewEdgeIds = new Set(rawEdges.map((edge, index) => edge.id ?? index));
 let activeCategoryIds = new Set();
 let activeBucketIds = new Set();
@@ -2513,6 +2514,42 @@ function globToRegExp(pattern) {{
   return new RegExp("^" + escaped + "$");
 }}
 
+function wildcardToSearchRegExp(pattern) {{
+  let escaped = String(pattern).replaceAll(".", "\\\\.");
+  escaped = escaped.replaceAll("**", "__DOUBLE_STAR__");
+  escaped = escaped.replaceAll("*", ".*");
+  escaped = escaped.replaceAll("?", ".");
+  escaped = escaped.replaceAll("__DOUBLE_STAR__", ".*");
+  return new RegExp(escaped);
+}}
+
+function matchesFilterValue(value, searchTerm, wildcardMatcher, anchoredPrefix = false) {{
+  if (!value) return false;
+  if (wildcardMatcher) return wildcardMatcher.test(value);
+  return anchoredPrefix ? value.startsWith(searchTerm) : value.includes(searchTerm);
+}}
+
+function blendHexColors(hexA, hexB, ratio = 0.5) {{
+  const normalize = hex => String(hex || "").trim();
+  const expandHex = hex => {{
+    const value = normalize(hex).replace(/^#/, "");
+    if (value.length === 3) return value.split("").map(ch => ch + ch).join("");
+    return value;
+  }};
+  const a = expandHex(hexA);
+  const b = expandHex(hexB);
+  if (!/^[0-9a-fA-F]{{6}}$/.test(a) || !/^[0-9a-fA-F]{{6}}$/.test(b)) return hexA;
+  const clamp = value => Math.max(0, Math.min(255, value));
+  const weightA = Math.max(0, Math.min(1, ratio));
+  const weightB = 1 - weightA;
+  const channels = [0, 2, 4].map(offset => {{
+    const left = Number.parseInt(a.slice(offset, offset + 2), 16);
+    const right = Number.parseInt(b.slice(offset, offset + 2), 16);
+    return clamp(Math.round(left * weightA + right * weightB)).toString(16).padStart(2, "0");
+  }});
+  return "#" + channels.join("");
+}}
+
 const compiledViews = controlPlaneViews.map(view => ({{
   ...view,
   startMatchers: (view.start_paths || []).map(globToRegExp),
@@ -2524,7 +2561,7 @@ function fitCurrentView() {{
   let ids;
   if (query) {{
     const directMatches = matchingNodeIds(query);
-    const depth = Math.max(0, Number.parseInt(document.getElementById("filterDepth").value || "1", 10) || 0);
+    const depth = Math.max(0, Number.parseInt(document.getElementById("filterDepth").value || "0", 10) || 0);
     ids = [...computeFilterExpansion(directMatches, depth)];
   }} else {{
     ids = [...activeViewNodeIds];
@@ -2558,6 +2595,7 @@ function computeActiveSubgraph(viewId, depth) {{
   if (viewId === "all") {{
     return {{
       nodeIds: new Set(rawNodes.map(node => node.id)),
+      rootIds: new Set(),
       edgeIds: new Set(rawEdges.map((edge, index) => edge.id ?? index)),
     }};
   }}
@@ -2567,6 +2605,7 @@ function computeActiveSubgraph(viewId, depth) {{
 
   const roots = rootIdsForView(view);
   const nodeIds = new Set(roots);
+  const rootIds = new Set(roots);
   const edgeIds = new Set();
   const queue = roots.map(id => [id, 0]);
   const seenDepth = new Map(roots.map(id => [id, 0]));
@@ -2585,7 +2624,7 @@ function computeActiveSubgraph(viewId, depth) {{
     }}
   }}
 
-  return {{ nodeIds, edgeIds }};
+  return {{ nodeIds, rootIds, edgeIds }};
 }}
 
 function computeFilterExpansion(matchingIds, depth) {{
@@ -2639,8 +2678,9 @@ function populateViewControls() {{
 function applyViewState({{ fit = false }} = {{}}) {{
   const viewId = viewSelect.value || "all";
   const depth = Math.max(0, Number.parseInt(viewDepth.value || "0", 10) || 0);
-  const {{ nodeIds, edgeIds }} = computeActiveSubgraph(viewId, depth);
+  const {{ nodeIds, rootIds, edgeIds }} = computeActiveSubgraph(viewId, depth);
   activeViewNodeIds = nodeIds;
+  activeViewRootIds = rootIds;
   activeViewEdgeIds = edgeIds;
   refreshActiveBands();
 
@@ -2663,16 +2703,23 @@ function matchingNodeIds(query) {{
   const isPrefix = query.startsWith("./");
   const searchTerm = isPrefix ? query.slice(2) : query;
   if (!searchTerm) return new Set(activeViewNodeIds);
+  const wildcardMatcher = searchTerm.includes("*") || searchTerm.includes("?")
+    ? wildcardToSearchRegExp(searchTerm)
+    : null;
 
   const matches = new Set();
   for (const nodeId of activeViewNodeIds) {{
     const node = nodeById.get(nodeId);
     if (!node) continue;
     if (isPrefix) {{
-      if (node.id.toLowerCase().startsWith(searchTerm)) matches.add(node.id);
+      if (matchesFilterValue(node.id.toLowerCase(), searchTerm, wildcardMatcher, true)) matches.add(node.id);
     }} else {{
-      const haystack = [node.id, node.label].filter(Boolean).join(" ").toLowerCase();
-      if (haystack.includes(searchTerm)) matches.add(node.id);
+      const label = (node.label || "").toLowerCase();
+      const path = node.id.toLowerCase();
+      if (
+        matchesFilterValue(path, searchTerm, wildcardMatcher)
+        || matchesFilterValue(label, searchTerm, wildcardMatcher)
+      ) matches.add(node.id);
     }}
   }}
   return matches;
@@ -2738,7 +2785,7 @@ function updateStyles() {{
   const query = normalized(searchInput.value);
   const directMatches = matchingNodeIds(query);
   const filterActive = query.length > 0;
-  const depth = filterActive ? Math.max(0, Number.parseInt(document.getElementById("filterDepth").value || "1", 10) || 0) : 0;
+  const depth = filterActive ? Math.max(0, Number.parseInt(document.getElementById("filterDepth").value || "0", 10) || 0) : 0;
   const visibleSet = filterActive ? computeFilterExpansion(directMatches, depth) : directMatches;
   const viewModeActive = (viewSelect.value || "all") !== "all";
   let totalLOC = 0;
@@ -2754,6 +2801,13 @@ function updateStyles() {{
     const inView = activeViewNodeIds.has(node.id);
     const isInVisible = visibleSet.has(node.id);
     const isSelected = selection ? selection.connectedNodes.has(node.id) : true;
+    const isDirectMatch = directMatches.has(node.id);
+    const isRootSelection = selectedNode === node.id;
+    const isViewEntryRoot = activeViewRootIds.has(node.id);
+    const hasSelectedStyle = isRootSelection || isViewEntryRoot || (filterActive && isDirectMatch);
+    const baseColor = node.color || {{}};
+    const highlightColor = baseColor.highlight || {{ background: "#fff7cc", border: "#d99a00" }};
+    const selectedBackground = blendHexColors(baseColor.border || highlightColor.border, "#ffffff", 0.5);
     let opacity;
     if (filterActive) {{
       opacity = isInVisible ? 1 : 0.12;
@@ -2763,7 +2817,34 @@ function updateStyles() {{
       opacity = 1;
     }}
     if (viewModeActive && !inView) opacity = Math.min(opacity, 0.12);
-    return {{ id: node.id, hidden: false, opacity }};
+    let color = baseColor;
+    if (filterActive && isInVisible && !isDirectMatch) {{
+      color = {{
+        ...baseColor,
+        background: "#ffffff",
+        highlight: highlightColor,
+      }};
+    }}
+    if (hasSelectedStyle) {{
+      color = {{
+        ...color,
+        border: baseColor.border,
+        background: selectedBackground,
+        highlight: {{
+          ...highlightColor,
+          border: baseColor.border,
+          background: selectedBackground,
+        }},
+      }};
+    }}
+    return {{
+      id: node.id,
+      hidden: false,
+      opacity,
+      color,
+      borderWidth: 1,
+      size: 18,
+    }};
   }}));
 
   const refType = referenceType.value;
@@ -2967,7 +3048,8 @@ function selectNodeById(nodeId) {{
 
   const nodeFilter = "./" + nodeId;
   const query = normalized(searchInput.value);
-  const depth = Math.max(0, parseInt(document.getElementById("filterDepth").value || "1", 10) || 0);
+  const depthInput = document.getElementById("filterDepth");
+  const depth = Math.max(0, parseInt(depthInput.value || "0", 10) || 0);
   const visibleSet = query
     ? computeFilterExpansion(matchingNodeIds(query), depth)
     : new Set(activeViewNodeIds);
@@ -2976,6 +3058,7 @@ function selectNodeById(nodeId) {{
     manualFilter = searchInput.value;
   }}
 
+  depthInput.value = "0";
   searchInput.value = nodeFilter;
   filterFromNodeSelection = true;
   syncFilterDepthVisibility();
@@ -3042,7 +3125,7 @@ function filteredNodeIds() {{
   const query = normalized(searchInput.value);
   const direct = matchingNodeIds(query);
   if (!query) return [...direct];
-  const depth = Math.max(0, Number.parseInt(document.getElementById("filterDepth").value || "1", 10) || 0);
+  const depth = Math.max(0, Number.parseInt(document.getElementById("filterDepth").value || "0", 10) || 0);
   return [...computeFilterExpansion(direct, depth)];
 }}
 

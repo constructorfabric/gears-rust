@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use credstore_sdk::{OwnerId, SecretMetadata, SecretValue, SharingMode, TenantId};
 use toolkit::client_hub::{ClientHub, ClientScope};
-use types_registry_sdk::TypesRegistryError;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
+use types_registry_sdk::testing::{self, MockTypesRegistryClient, make_test_instance};
 
 use super::*;
 use crate::domain::test_support::{MockPlugin, test_ctx};
@@ -80,9 +79,8 @@ async fn get_retries_resolution_on_each_call_when_registry_absent() {
     // Use a failing registry (not an empty hub) so list() is actually invoked and
     // we can assert the call count proves no caching.
     let hub = Arc::new(ClientHub::default());
-    let registry = Arc::new(
-        MockTypesRegistryClient::new().with_list_error(TypesRegistryError::internal("unavailable")),
-    );
+    let registry =
+        Arc::new(MockTypesRegistryClient::new().with_list_error(testing::internal("unavailable")));
     hub.register::<dyn TypesRegistryClient>(registry.clone() as Arc<dyn TypesRegistryClient>);
     let svc = Service::new(hub, "constructorfabric".into());
     let key = SecretRef::new("my-key").unwrap();
@@ -147,9 +145,8 @@ async fn resolve_plugin_returns_invalid_when_content_malformed() {
 #[tokio::test]
 async fn resolve_plugin_returns_internal_when_registry_list_fails() {
     let hub = Arc::new(ClientHub::default());
-    let registry: Arc<dyn TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new().with_list_error(TypesRegistryError::internal("db down")),
-    );
+    let registry: Arc<dyn TypesRegistryClient> =
+        Arc::new(MockTypesRegistryClient::new().with_list_error(testing::internal("db down")));
     hub.register::<dyn TypesRegistryClient>(registry);
 
     let svc = Service::new(hub, "constructorfabric".into());

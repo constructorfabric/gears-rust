@@ -8,10 +8,13 @@ on:
       - 'docs/**'
   workflow_dispatch:
 
-# Cancel previous runs for the same ref to save CI minutes.
+# Concurrency strategy:
+# - On pull_request: group by PR number. New commits cancel the in-flight run.
+# - On push (main/develop): include run_id so pushes never cancel each other,
+#   preventing required CI from silently being dropped.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -310,9 +313,9 @@ jobs:
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
 
-  cypilot:
-    name: Cypilot
-    uses: ./.github/workflows/cypilot.yml
+  cfs:
+    name: CFS
+    uses: ./.github/workflows/cfs.yml
 
   security:
     name: Security (cargo-deny & cargo-audit on Ubuntu)
@@ -343,7 +346,7 @@ jobs:
       contents: read
       id-token: write
     env:
-      RUSTUP_TOOLCHAIN: nightly-2026-01-22
+      RUSTUP_TOOLCHAIN: nightly-2026-04-16
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -393,7 +396,7 @@ jobs:
     name: Dylint Tests
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: nightly-2026-01-22
+      RUSTUP_TOOLCHAIN: nightly-2026-04-16
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -428,3 +431,36 @@ jobs:
 
       - name: Run dylint on all crates
         run: make dylint
+
+  shear:
+    name: Unused Deps (cargo-shear)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-04-16
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: llvm-tools-preview,rustc-dev
+
+      - name: Install dylint-link from source
+        run: cargo install --locked dylint-link
+
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-shear@1.13.1
+
+      - name: cargo shear (workspace root + tools/dylint_lints)
+        run: make shear

@@ -1,0 +1,57 @@
+[package]
+name = "cf-gears-noop-usage-collector-plugin"
+description = "No-op Usage Collector storage backend plugin for development and testing"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "noop_usage_collector_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+usage-collector-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+
+# ToolKit dependencies
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-odata = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Identifiers
+uuid = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Required by toolkit::gear macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+# Async test runner for `#[tokio::test]` over the async SPI trait.
+tokio = { workspace = true }
+
+# UsageRecord fixtures in `create_usage_records` order-preservation test
+# need to construct the full value type — `Decimal` for `value` and
+# `time::OffsetDateTime` for `created_at` — neither of which is re-exported
+# by `usage-collector-sdk`.
+rust_decimal = { workspace = true }
+time = { workspace = true }

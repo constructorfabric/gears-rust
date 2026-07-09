@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-db"
-version = "0.8.3"
+version = "0.8.4"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -101,6 +101,10 @@ required-features = ["sqlite", "preview-outbox"]
 
 [[example]]
 name = "outbox_batch_multi_queue"
+required-features = ["sqlite", "preview-outbox"]
+
+[[example]]
+name = "outbox_custom_prefix"
 required-features = ["sqlite", "preview-outbox"]
 
 [[bench]]

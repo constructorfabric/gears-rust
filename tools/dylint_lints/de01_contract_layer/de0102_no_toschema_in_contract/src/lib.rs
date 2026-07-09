@@ -3,6 +3,7 @@
 
 extern crate rustc_ast;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::{Item, ItemKind};
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 
@@ -68,10 +69,15 @@ impl EarlyLintPass for De0102NoToschemaInContract {
             // Check if this is a utoipa ToSchema
             // Handles: ToSchema, utoipa::ToSchema, ::utoipa::ToSchema
             if lint_utils::is_utoipa_trait(&segments, "ToSchema") {
-                cx.span_lint(DE0102_NO_TOSCHEMA_IN_CONTRACT, attr.span, |diag| {
-                    diag.primary_message("contract type should not derive `ToSchema` (DE0102)");
-                    diag.help("ToSchema is an OpenAPI concern; use DTOs in api/rest/ instead");
-                });
+                span_lint_and_then(
+                    cx,
+                    DE0102_NO_TOSCHEMA_IN_CONTRACT,
+                    attr.span,
+                    "contract type should not derive `ToSchema` (DE0102)",
+                    |diag| {
+                        diag.help("ToSchema is an OpenAPI concern; use DTOs in api/rest/ instead");
+                    },
+                );
             }
         });
     }

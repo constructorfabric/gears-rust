@@ -75,8 +75,9 @@ use account_management_sdk::{
 };
 use serde_json::Value;
 use tenant_resolver_sdk::TenantId;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
-use types_registry_sdk::{TypesRegistryClient, TypesRegistryError};
+use types_registry_sdk::TypesRegistryClient;
 
 use crate::config::AccountManagementConfig;
 use crate::domain::error::DomainError;
@@ -299,7 +300,7 @@ impl<R: TenantRepo> TenantService<R> {
             // counter plus the dedicated `am.tenant.service` warn
             // event below; recovery is a registry restore or a
             // backfill of the missing schema, not a silent fake.
-            Err(TypesRegistryError::GtsTypeSchemaNotFound(_)) => {
+            Err(CanonicalError::NotFound { .. }) => {
                 tracing::warn!(
                     target: "am.tenant.service",
                     tenant_id = %tenant.id,
@@ -366,7 +367,11 @@ impl<R: TenantRepo> TenantService<R> {
     /// `TryFrom<TenantStatus>` so a bypass surfaces as
     /// [`DomainError::Internal`] (HTTP 500) instead of a process
     /// panic.
-    async fn lower_to_tenant(&self, model: TenantModel) -> Result<Tenant, DomainError> {
+    async fn lower_to_tenant(
+        &self,
+        scope: &AccessScope,
+        model: TenantModel,
+    ) -> Result<Tenant, DomainError> {
         let tenant_type = self.resolve_tenant_type(model.tenant_type_uuid).await;
         let status =
             account_management_sdk::TenantStatus::try_from(model.status).map_err(|_| {
@@ -379,6 +384,16 @@ impl<R: TenantRepo> TenantService<R> {
                     cause: None,
                 }
             })?;
+        // Derived public read-shape field: count of direct children
+        // visible to the caller — scope-filtered, excludes Provisioning,
+        // includes Deleted. One indexed grouped COUNT for this single id.
+        let child_count = self
+            .repo
+            .count_children_grouped(scope, &[model.id])
+            .await?
+            .get(&model.id)
+            .copied()
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
         Ok(Tenant {
             id: TenantId(model.id),
             name: model.name,
@@ -387,6 +402,7 @@ impl<R: TenantRepo> TenantService<R> {
             parent_id: model.parent_id.map(TenantId),
             self_managed: model.self_managed,
             depth: model.depth,
+            child_count,
             created_at: model.created_at,
             updated_at: model.updated_at,
             deleted_at: model.deleted_at,
@@ -398,6 +414,7 @@ impl<R: TenantRepo> TenantService<R> {
     /// scales with number of pages, not number of rows.
     async fn lower_to_tenant_page(
         &self,
+        scope: &AccessScope,
         page: Page<TenantModel>,
     ) -> Result<Page<Tenant>, DomainError> {
         let Page { items, page_info } = page;
@@ -422,6 +439,12 @@ impl<R: TenantRepo> TenantService<R> {
             }
         }
 
+        // One grouped COUNT covers the whole page's direct-child tallies
+        // (scope-filtered, excludes Provisioning, includes Deleted) — no
+        // N+1 across rows. Ids absent from the map default to 0.
+        let child_ids: Vec<Uuid> = items.iter().map(|m| m.id).collect();
+        let child_counts = self.repo.count_children_grouped(scope, &child_ids).await?;
+
         let mut mapped: Vec<Tenant> = Vec::with_capacity(items.len());
         for m in items {
             let status =
@@ -443,6 +466,10 @@ impl<R: TenantRepo> TenantService<R> {
                 parent_id: m.parent_id.map(TenantId),
                 self_managed: m.self_managed,
                 depth: m.depth,
+                child_count: child_counts
+                    .get(&m.id)
+                    .copied()
+                    .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
                 created_at: m.created_at,
                 updated_at: m.updated_at,
                 deleted_at: m.deleted_at,
@@ -801,12 +828,14 @@ impl<R: TenantRepo> TenantService<R> {
 
         // Saga step 2 — invoke IdP provider outside any TX.
         // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-idp-tenant-provision:p1:inst-dod-idp-provision-call
+        let parent_ctx = self.load_tenant_context(parent.id).await?;
         let mut req = IdpProvisionTenantRequest::new(
             provisioning_row.id,
             parent.id,
             input.name.clone(),
             input.tenant_type.clone(),
-        );
+        )
+        .with_parent_context((&parent_ctx).into());
         if let Some(meta) = input.provisioning_metadata.clone() {
             req = req.with_metadata(meta);
         }
@@ -1130,7 +1159,12 @@ impl<R: TenantRepo> TenantService<R> {
         // `is_sdk_visible` invariant is safe.
         // tenant_type forwarded verbatim — chain already validated
         // upstream, no need for a registry RTT.
-        let mut info = self.lower_to_tenant(activated).await?;
+        // A freshly created tenant is always a 0-child leaf; `child_count`
+        // resolves to 0 regardless of scope, so the saga's `allow_all`
+        // posture is fine here.
+        let mut info = self
+            .lower_to_tenant(&AccessScope::allow_all(), activated)
+            .await?;
         if info.tenant_type.is_none() {
             // `Tenant.tenant_type` is `Option<String>` per the
             // tenant-resolver-sdk public shape; lower the typed
@@ -1418,7 +1452,7 @@ impl<R: TenantRepo> TenantService<R> {
                 resource: id.to_string(),
             });
         }
-        self.lower_to_tenant(tenant).await
+        self.lower_to_tenant(&scope, tenant).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-tenant-read-scope:p1:inst-dod-read-scope-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-read-tenant:p1:inst-flow-read-service
@@ -1484,7 +1518,11 @@ impl<R: TenantRepo> TenantService<R> {
         // through the repo filter before we lower the page to the
         // public shape (where `Provisioning` is unrepresentable).
         page.items.retain(|r| r.status.is_sdk_visible());
-        self.lower_to_tenant_page(page).await
+        // Pass the original (barrier-respecting) scope, not the
+        // `relaxed` one used for the listing query: a self-managed
+        // child's own subtree stays behind its barrier, so its
+        // `child_count` is scope-filtered to what the caller may see.
+        self.lower_to_tenant_page(&scope, page).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-children-query-paginated:p1:inst-dod-children-query-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-list-children:p1:inst-flow-listch-service
@@ -1598,7 +1636,7 @@ impl<R: TenantRepo> TenantService<R> {
             );
         }
 
-        self.lower_to_tenant(updated).await
+        self.lower_to_tenant(&scope, updated).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-update-mutable-only:p1:inst-dod-update-mutable-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-update-tenant:p1:inst-flow-update-service
@@ -1717,7 +1755,7 @@ impl<R: TenantRepo> TenantService<R> {
                 "am tenant state changed"
             );
         }
-        self.lower_to_tenant(updated).await
+        self.lower_to_tenant(&scope, updated).await
     }
 
     // -----------------------------------------------------------------
@@ -1793,7 +1831,7 @@ impl<R: TenantRepo> TenantService<R> {
         // downstream filters can distinguish first-write events from
         // idempotent retries.
         if matches!(tenant.status, TenantStatus::Deleted) {
-            return self.lower_to_tenant(tenant).await;
+            return self.lower_to_tenant(&scope, tenant).await;
         }
         // 1. Child-rejection guard. `include_deleted = false` excludes
         // ONLY rows in `Deleted` status; `Provisioning`, `Active` and
@@ -1852,7 +1890,7 @@ impl<R: TenantRepo> TenantService<R> {
             retention_secs = self.cfg.retention.default_window_secs,
             "am tenant state changed"
         );
-        self.lower_to_tenant(updated).await
+        self.lower_to_tenant(&scope, updated).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-data-lifecycle:p1:inst-dod-data-lifecycle-soft-delete
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-soft-delete-preconditions:p1:inst-dod-soft-delete-preconditions

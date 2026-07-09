@@ -167,6 +167,8 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Domain concepts are referenced consistently with the canonical domain model (if it exists)
 - [ ] API endpoints/contracts are referenced consistently with the canonical API documentation (if it exists)
 - [ ] Principles compliance documented
+- [ ] Feature-specific deviations from shared platform, security, API, or architecture baselines document the deviation, rationale, and review owner
+- [ ] SDK-first public contracts, domain/API/infrastructure separation, and runtime-owned privileged access are preserved when applicable
 
 ### ARCH-FDESIGN-003: Actor Flow Completeness
 **Severity**: CRITICAL
@@ -387,6 +389,8 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Stack traces hidden from users
 - [ ] Timing attacks mitigated
 - [ ] Rate limiting on security operations documented
+- [ ] Security-sensitive flows preserve tenant, identity, authorization, and security context boundaries
+- [ ] Changes touching secrets, FIPS behavior, privilege boundaries, or registry matching include a review record naming the guardrail or deviation, rationale, owner, and validation performed
 
 ---
 
@@ -659,6 +663,9 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Edge case tests identified
 - [ ] Error path tests identified
 - [ ] Performance test targets identified
+- [ ] Unit/integration tests cover deterministic logic and integration boundaries at the right layer
+- [ ] E2E scenarios cover externally observable integration flows without replacing lower-level deterministic tests
+- [ ] Compile-fail tests are required only for compile-time guarantees such as macro diagnostics, generated code contracts, type-state APIs, or security/type-system invariants
 
 ### TEST-FDESIGN-003: Acceptance Criteria
 **Severity**: HIGH

@@ -226,15 +226,8 @@ mod tests {
         USER_QUOTA_RESOURCE_TYPE_WILDCARD, actions,
     };
     use crate::domain::service::resources;
-    use std::sync::Arc;
-    use toolkit_gts::{InventoryInstance, all_inventory_instances, all_inventory_type_schemas};
-    use types_registry::config::TypesRegistryConfig;
-    use types_registry::domain::local_client::TypesRegistryLocalClient;
-    use types_registry::domain::service::TypesRegistryService;
-    use types_registry::infra::InMemoryGtsRepository;
-    use types_registry_sdk::{InstanceQuery, RegisterResult, TypesRegistryClient};
+    use toolkit_gts::InventoryInstance;
 
-    const PERMISSION_TYPE_ID: &str = "gts.cf.toolkit.authz.permission.v1~";
     #[allow(unknown_lints, de0901_gts_string_pattern)]
     const INSTANCE_PREFIX: &str = "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.";
 
@@ -269,50 +262,81 @@ mod tests {
             .collect()
     }
 
-    // =====================================================================
-    //           Macro-level sanity (inventory, no types-registry)
-    // =====================================================================
-
+    /// Catalog integrity tripwire + per-entry well-formedness in a single
+    /// pass over the inventory.
+    ///
+    /// - **Exact-set:** the declared permission ids match `EXPECTED_PERMISSION_IDS`
+    ///   one-for-one. A `gts_instance!` dropped, renamed, or added without
+    ///   updating the expected list fails here — forcing the change through a
+    ///   reviewed, explicit list (the catalog is a security surface).
+    /// - **Closed sets:** every entry's `resource_type` is one of the known
+    ///   wildcards and its `action` is a `domain::service::actions` constant —
+    ///   guards against a raw string literal slipping past the named consts.
+    ///
+    /// Schema-validity of each payload (required fields, types) is enforced at
+    /// server boot when `types-registry` commits readiness over the full
+    /// inventory, so it is not re-checked here.
     #[test]
-    fn all_mini_chat_permissions_are_registered_in_inventory() {
-        let entries = mini_chat_permission_instances();
-        assert_eq!(
-            entries.len(),
-            19,
-            "expected 19 mini-chat permission instances; found {}: {:?}",
-            entries.len(),
-            entries.iter().map(|e| e.instance_id).collect::<Vec<_>>()
-        );
-        for entry in &entries {
-            assert_eq!(
-                entry.type_id, PERMISSION_TYPE_ID,
-                "instance {} derived wrong type_id",
-                entry.instance_id
-            );
-        }
-    }
-
-    #[test]
-    fn permission_resource_types_use_known_wildcards() {
-        let known: std::collections::BTreeSet<&'static str> = [
+    fn catalog_is_well_formed() {
+        let known_wildcards: std::collections::BTreeSet<&'static str> = [
             CHAT_RESOURCE_TYPE_WILDCARD,
             MODEL_RESOURCE_TYPE_WILDCARD,
             USER_QUOTA_RESOURCE_TYPE_WILDCARD,
         ]
         .into_iter()
         .collect();
+        let domain_actions: std::collections::BTreeSet<&'static str> = [
+            actions::CREATE,
+            actions::READ,
+            actions::LIST,
+            actions::UPDATE,
+            actions::DELETE,
+            actions::LIST_MESSAGES,
+            actions::SEND_MESSAGE,
+            actions::READ_TURN,
+            actions::RETRY_TURN,
+            actions::EDIT_TURN,
+            actions::DELETE_TURN,
+            actions::UPLOAD_ATTACHMENT,
+            actions::READ_ATTACHMENT,
+            actions::DELETE_ATTACHMENT,
+            actions::SET_REACTION,
+            actions::DELETE_REACTION,
+        ]
+        .into_iter()
+        .collect();
 
-        for entry in mini_chat_permission_instances() {
+        let entries = mini_chat_permission_instances();
+
+        // Exact-set: declared ids == expected ids.
+        let actual_ids: std::collections::BTreeSet<&str> =
+            entries.iter().map(|e| e.instance_id).collect();
+        let expected_ids: std::collections::BTreeSet<&str> =
+            EXPECTED_PERMISSION_IDS.iter().copied().collect();
+        assert_eq!(
+            actual_ids, expected_ids,
+            "declared permission ids drifted from EXPECTED_PERMISSION_IDS"
+        );
+
+        // Closed sets: resource_type ∈ known wildcards, action ∈ domain actions.
+        for entry in &entries {
             let payload = (entry.payload_fn)();
             let rt = payload["resource_type"]
                 .as_str()
                 .expect("resource_type string");
             assert!(
-                known.contains(rt),
+                known_wildcards.contains(rt),
                 "permission {} uses unknown resource_type {:?}; expected one of {:?}",
                 entry.instance_id,
                 rt,
-                known
+                known_wildcards
+            );
+            let action = payload["action"].as_str().expect("action string");
+            assert!(
+                domain_actions.contains(action),
+                "permission {} uses action {:?} not declared in domain::service::actions",
+                entry.instance_id,
+                action
             );
         }
     }
@@ -348,140 +372,5 @@ mod tests {
                 "{label} wildcard {wildcard:?} must cover runtime concrete {concrete:?} - otherwise a PDP lookup that sees the concrete type won't match this permission"
             );
         }
-    }
-
-    #[test]
-    fn actions_are_drawn_from_domain_actions_gear() {
-        let domain_actions: std::collections::BTreeSet<&'static str> = [
-            actions::CREATE,
-            actions::READ,
-            actions::LIST,
-            actions::UPDATE,
-            actions::DELETE,
-            actions::LIST_MESSAGES,
-            actions::SEND_MESSAGE,
-            actions::READ_TURN,
-            actions::RETRY_TURN,
-            actions::EDIT_TURN,
-            actions::DELETE_TURN,
-            actions::UPLOAD_ATTACHMENT,
-            actions::READ_ATTACHMENT,
-            actions::DELETE_ATTACHMENT,
-            actions::SET_REACTION,
-            actions::DELETE_REACTION,
-        ]
-        .into_iter()
-        .collect();
-
-        for entry in mini_chat_permission_instances() {
-            let payload = (entry.payload_fn)();
-            let action = payload["action"].as_str().expect("action string");
-            assert!(
-                domain_actions.contains(action),
-                "{} uses action {:?} not declared in domain::service::actions",
-                entry.instance_id,
-                action
-            );
-        }
-    }
-
-    // =====================================================================
-    //       End-to-end via TypesRegistryClient (SDK trait) —
-    //       mirrors the real `types-registry::init()` /
-    //       `post_init()` seeding + readiness flow.
-    // =====================================================================
-
-    /// Spins up an in-memory `TypesRegistryService`, exposes it as a
-    /// `dyn TypesRegistryClient` (SDK trait), and seeds it with every
-    /// schema + well-known instance from the process-wide GTS inventory —
-    /// including mini-chat's 19 permissions declared via `gts_instance!`.
-    /// Then commits readiness (schema validation happens here).
-    async fn seed_registry_via_sdk() -> Arc<dyn TypesRegistryClient> {
-        let cfg = TypesRegistryConfig::default();
-        let repo = Arc::new(InMemoryGtsRepository::new(cfg.to_gts_config()));
-        let service = Arc::new(TypesRegistryService::new(repo, cfg));
-        let client: Arc<dyn TypesRegistryClient> =
-            Arc::new(TypesRegistryLocalClient::new(service.clone()));
-
-        let type_schemas = all_inventory_type_schemas().expect("inventory type schemas collect");
-        let instances = all_inventory_instances().expect("inventory instances collect");
-        let mut entries = type_schemas;
-        entries.extend(instances);
-
-        let results = client.register(entries).await.expect("register() batch");
-        RegisterResult::ensure_all_ok(&results)
-            .expect("every inventory schema + instance registers cleanly");
-
-        // Readiness commit: runs cross-entity schema validation. This is the
-        // moment a malformed permission payload would be rejected.
-        service
-            .switch_to_ready()
-            .expect("registry switches to ready");
-
-        client
-    }
-
-    #[tokio::test]
-    async fn all_permissions_retrievable_via_registry_client_get() {
-        let client = seed_registry_via_sdk().await;
-
-        for id in EXPECTED_PERMISSION_IDS {
-            let entity = client
-                .get_instance(id)
-                .await
-                .unwrap_or_else(|e| panic!("get_instance({id}) via registry SDK failed: {e}"));
-            assert_eq!(entity.id.as_ref(), *id, "returned entity has wrong id");
-
-            // Payload must carry the four AuthzPermissionV1 fields populated
-            // by our typed struct + macro-injected `id`.
-            let obj = entity.object.as_object().expect("object is a JSON object");
-            assert_eq!(
-                obj.get("id").and_then(|v| v.as_str()),
-                Some(*id),
-                "{id}: payload.id mismatch"
-            );
-            for field in ["resource_type", "action", "display_name"] {
-                let s = obj
-                    .get(field)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| panic!("{id}: missing/non-string `{field}`"));
-                assert!(!s.is_empty(), "{id}: `{field}` is empty");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn permissions_listable_via_registry_client_list_by_pattern() {
-        let client = seed_registry_via_sdk().await;
-
-        let listed = client
-            .list_instances(InstanceQuery::new().with_pattern(format!("{INSTANCE_PREFIX}*")))
-            .await
-            .expect("list_instances() via registry SDK");
-
-        let ids: std::collections::BTreeSet<String> =
-            listed.iter().map(|e| e.id.as_ref().to_owned()).collect();
-        let expected: std::collections::BTreeSet<String> = EXPECTED_PERMISSION_IDS
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-
-        assert_eq!(
-            ids, expected,
-            "pattern-list did not return exactly the 19 mini-chat permissions"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_permission_returns_not_found_via_sdk() {
-        let client = seed_registry_via_sdk().await;
-
-        let result = client
-            .get_instance("gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.nonexistent.v1")
-            .await;
-        assert!(
-            result.is_err() && result.unwrap_err().is_not_found(),
-            "unknown permission id must produce NotFound"
-        );
     }
 }

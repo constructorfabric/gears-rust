@@ -14,11 +14,11 @@
 
 ## 1. Overview
 
-This DECOMPOSITION covers the Tenant Resolver Plugin (`tr-plugin`) sub-system, a read-only, in-process query facade that runs inside the parent `account-management` crate and serves barrier-aware hierarchy reads over the parent gear's canonical `(tenants, tenant_closure)` storage. It is a separate SDLC artifact from the parent [account-management DECOMPOSITION](../DECOMPOSITION.md) because the `cf-tr-plugin` namespace is a distinct Cypilot sub-system (see `.cypilot/config/artifacts.toml` children.autodetect block): the tr-plugin owns its own PRD, DESIGN, ADR, and schema under `gears/system/account-management/docs/tr-plugin/`, and per the registry contract must define its own feature IDs in its own DECOMPOSITION file rather than in the parent's.
+This DECOMPOSITION covers the Tenant Resolver Plugin (`tr-plugin`) sub-system, a read-only, in-process query facade that runs inside the parent `account-management` crate and serves barrier-aware hierarchy reads over the parent gear's canonical `(tenants, tenant_closure)` storage. It is a separate SDLC artifact from the parent [account-management DECOMPOSITION](../DECOMPOSITION.md) because the `cf-tr-plugin` namespace is a distinct Constructor Studio sub-system (see `.cf-studio/config/artifacts.toml` `systems.autodetect.children` block): the tr-plugin owns its own PRD, DESIGN, ADR, and schema under `gears/system/account-management/docs/tr-plugin/`, and per the registry contract must define its own feature IDs in its own DECOMPOSITION file rather than in the parent's.
 
 **Scope**: one feature — `tenant-resolver-plugin` — that encapsulates the complete tr-plugin sub-system. The parent DECOMPOSITION references this feature in its §3 Feature Dependencies DAG (as a cross-system edge from `cpt-cf-account-management-feature-tenant-hierarchy-management`) but does not define it.
 
-**Traceability**: this artifact is registered with `traceability = "DOCS-ONLY"` (per the children.artifacts block in `.cypilot/config/artifacts.toml`); downstream FEATURE generation will add code markers.
+**Traceability**: this artifact is registered with `traceability = "DOCS-ONLY"` (per the children.artifacts block in `.cf-studio/config/artifacts.toml`); downstream FEATURE generation will add code markers.
 
 ## 2. Entries
 

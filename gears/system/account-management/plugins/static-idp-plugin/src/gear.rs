@@ -83,7 +83,10 @@ impl Gear for StaticIdpPlugin {
         // owned TR plugin.
         for result in &results {
             if let RegisterResult::Err { error, .. } = result {
-                if error.is_already_exists() {
+                if matches!(
+                    error,
+                    toolkit_canonical_errors::CanonicalError::AlreadyExists { .. }
+                ) {
                     let existing =
                         registry
                             .get_instance(instance_id.as_ref())

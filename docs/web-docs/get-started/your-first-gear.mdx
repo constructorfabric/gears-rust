@@ -1,0 +1,427 @@
+---
+title: Build your first gear
+description: A guided walkthrough of the real users-info gear — SDK, authorization, secure persistence, REST, and runtime wiring.
+sidebar:
+  label: Your first gear
+  order: 3
+---
+
+import { Steps, Aside, LinkCard, CardGrid } from '@astrojs/starlight/components';
+
+This walkthrough follows the **real `users-info` example** in the framework repository
+(`examples/toolkit/users-info/`). It is a complete gear: an SDK, a domain service with
+authorization, secure multi-tenant persistence, a REST surface with OData, and runtime
+wiring. To keep it readable we trace the **User** entity end-to-end; City and Address
+follow the exact same shape in the example.
+
+<Aside type="caution" title="This is real, abridged code">
+Every snippet below is taken from the `users-info` crates, lightly abridged (marked
+`// …`) to keep the focus on the User path. The canonical, compiling source is the
+example itself — read it alongside this page.
+</Aside>
+
+## Anatomy of a gear
+
+A gear is two crates — the **SDK** (its public surface) and the **implementation** —
+plus a thin **server** crate that composes gears into a runnable binary:
+
+```text
+examples/toolkit/users-info/
+├─ users-info-sdk/        # public contract: trait, models, errors, OData schema
+├─ users-info/            # the gear: domain, infra (DB), REST api, gear wiring
+└─ users-info-server/     # registers gears + boots the runtime
+```
+
+Inside the gear crate, layers are kept strictly separated (DDD-light): `domain/`
+(business logic) never imports `api/` or raw infrastructure; `api/rest/` adapts HTTP;
+`infra/storage/` holds SeaORM entities, repositories, and migrations.
+
+## Steps
+
+<Steps>
+
+1.  ### Define the SDK — the public contract
+
+    The SDK crate holds only transport-agnostic types: the facade trait, models, the
+    canonical error alias, and the OData filter schema. Consumers depend on this, never on
+    the implementation.
+
+    ```rust title="users-info-sdk/src/client.rs"
+    #[async_trait]
+    pub trait UsersInfoClientV1: Send + Sync {
+        async fn get_user(&self, ctx: SecurityContext, id: Uuid) -> Result<User, UsersInfoError>;
+        async fn create_user(&self, ctx: SecurityContext, new_user: NewUser) -> Result<User, UsersInfoError>;
+        async fn update_user(&self, ctx: SecurityContext, req: UpdateUserRequest) -> Result<User, UsersInfoError>;
+        async fn delete_user(&self, ctx: SecurityContext, id: Uuid) -> Result<(), UsersInfoError>;
+        // …also exposes streaming sub-clients: users()/cities()/addresses()
+    }
+    ```
+
+    ```rust title="users-info-sdk/src/models.rs"
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct User {
+        pub id: Uuid,
+        pub tenant_id: Uuid,
+        pub email: String,
+        pub display_name: String,
+        pub created_at: OffsetDateTime,
+        pub updated_at: OffsetDateTime,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NewUser {
+        pub id: Option<Uuid>,
+        pub tenant_id: Uuid,
+        pub email: String,
+        pub display_name: String,
+    }
+    ```
+
+    Errors reuse the framework's canonical error type — there is no bespoke error enum on
+    the wire:
+
+    ```rust title="users-info-sdk/src/lib.rs"
+    pub use toolkit_canonical_errors::CanonicalError as UsersInfoError;
+    ```
+
+    Filterable fields for list endpoints are declared once, in the SDK, with the
+    `ODataFilterable` derive:
+
+    ```rust title="users-info-sdk/src/odata/users.rs"
+    #[derive(ODataFilterable)]
+    pub struct UserQuery {
+        #[odata(filter(kind = "Uuid"))]
+        pub id: Uuid,
+        #[odata(filter(kind = "String"))]
+        pub email: String,
+        #[odata(filter(kind = "DateTimeUtc"))]
+        pub created_at: OffsetDateTime,
+    }
+    // generated enum, aliased for ergonomics:
+    pub use UserQueryFilterField as UserFilterField;
+    ```
+
+2.  ### Write the domain service — business logic + authorization
+
+    The domain service owns business rules and is where **authorization** happens. Each
+    method asks the `PolicyEnforcer` (PEP) for an `AccessScope`, then passes that scope to
+    the repository — the database can only ever return rows the policy allows.
+
+    Resource types and actions are declared once:
+
+    ```rust title="users-info/src/domain/service/mod.rs"
+    pub const USER: ResourceType = ResourceType::from_static(
+        "users_info.user",
+        &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+    );
+
+    pub mod actions {
+        pub const GET: &str = "get";
+        pub const LIST: &str = "list";
+        pub const CREATE: &str = "create";
+        pub const UPDATE: &str = "update";
+        pub const DELETE: &str = "delete";
+    }
+    ```
+
+    Creating a user — note `access_scope_with(...)` returns the scope that the repository
+    insert is validated against:
+
+    ```rust title="users-info/src/domain/service/users.rs"
+    pub async fn create_user(&self, ctx: &SecurityContext, new_user: NewUser)
+        -> Result<User, DomainError>
+    {
+        self.validate_new_user(&new_user)?;
+        let conn = self.db.conn().map_err(DomainError::from)?;
+
+        let id = new_user.id.unwrap_or_else(Uuid::now_v7);
+
+        // PEP → PDP → row-level constraints compiled into an AccessScope
+        let scope = self.policy_enforcer
+            .access_scope_with(
+                ctx,
+                &resources::USER,
+                actions::CREATE,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, new_user.tenant_id),
+            )
+            .await?;
+
+        let now = OffsetDateTime::now_utc();
+        let user = User { id, tenant_id: new_user.tenant_id, email: new_user.email,
+                          display_name: new_user.display_name, created_at: now, updated_at: now };
+
+        // …email/id uniqueness checks omitted…
+        let created = self.repo.create(&conn, &scope, user).await?;
+        self.events.publish(&UserDomainEvent::Created { id: created.id, at: created.created_at });
+        Ok(created)
+    }
+    ```
+
+    Listing uses the simpler `access_scope(...)` and hands the OData query straight to the
+    repository:
+
+    ```rust title="users-info/src/domain/service/users.rs"
+    pub async fn list_users_page(&self, ctx: &SecurityContext, query: &ODataQuery)
+        -> Result<Page<User>, DomainError>
+    {
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        let scope = self.policy_enforcer
+            .access_scope(ctx, &resources::USER, actions::LIST, None)
+            .await?;
+        self.repo.list_page(&conn, &scope, query).await
+    }
+    ```
+
+3.  ### Persist securely — entity, migration, repository
+
+    The SeaORM entity opts into row-level security with `#[derive(Scopable)]`, declaring
+    which columns map to the tenant and resource dimensions:
+
+    ```rust title="users-info/src/infra/storage/entity/user.rs"
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "users")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub tenant_id: Uuid,
+        pub email: String,
+        pub display_name: String,
+        pub created_at: OffsetDateTime,
+        pub updated_at: OffsetDateTime,
+    }
+    ```
+
+    The gear owns its migrations; the runtime executes them:
+
+    ```rust title="users-info/src/infra/storage/migrations/mod.rs"
+    pub struct Migrator;
+
+    #[async_trait::async_trait]
+    impl MigratorTrait for Migrator {
+        fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+            vec![Box::new(m20260111_000001_initial::Migration), /* … */]
+        }
+    }
+    ```
+
+    The repository never touches a raw connection. Every query goes through `.secure()` +
+    `.scope_with(scope)`, and inserts use `secure_insert` — the `AccessScope` becomes SQL
+    `WHERE`/validation:
+
+    ```rust title="users-info/src/infra/storage/users_sea_repo.rs"
+    async fn get<C: DBRunner>(&self, conn: &C, scope: &AccessScope, id: Uuid)
+        -> Result<Option<User>, DomainError>
+    {
+        let found = UserEntity::find()
+            .filter(Expr::col(Column::Id).eq(id))
+            .secure().scope_with(scope)      // ← tenant/row-level scoping
+            .one(conn).await.map_err(db_err)?;
+        Ok(found.map(Into::into))
+    }
+
+    async fn create<C: DBRunner>(&self, conn: &C, scope: &AccessScope, user: User)
+        -> Result<User, DomainError>
+    {
+        let m = UserAM { id: Set(user.id), tenant_id: Set(user.tenant_id), /* … */ };
+        secure_insert::<UserEntity>(m, scope, conn).await.map_err(db_err)?;
+        Ok(user)
+    }
+
+    async fn list_page<C: DBRunner>(&self, conn: &C, scope: &AccessScope, query: &ODataQuery)
+        -> Result<Page<User>, DomainError>
+    {
+        let base = UserEntity::find().secure().scope_with(scope);
+        paginate_odata::<UserFilterField, UserODataMapper, _, _, _, _>(
+            base, conn, query, ("id", SortDir::Desc), self.limit_cfg, Into::into,
+        ).await.map_err(db_err)
+    }
+    ```
+
+4.  ### Expose REST — DTOs, routes, handlers
+
+    REST DTOs live in the API layer (never in the SDK) and use the `api_dto` macro for
+    serde + OpenAPI schema:
+
+    ```rust title="users-info/src/api/rest/dto.rs"
+    #[toolkit_macros::api_dto(request, response)]
+    pub struct UserDto { pub id: Uuid, pub tenant_id: Uuid, pub email: String, /* … */ }
+
+    #[toolkit_macros::api_dto(request)]
+    pub struct CreateUserReq { pub id: Option<Uuid>, pub tenant_id: Uuid, pub email: String, pub display_name: String }
+
+    impl From<User> for UserDto { /* … */ }
+    impl From<CreateUserReq> for NewUser { /* … */ }
+    ```
+
+    Routes are declared with `OperationBuilder` — one declaration yields the route, auth
+    posture, response schema, error responses, OData support, and the OpenAPI entry:
+
+    ```rust title="users-info/src/api/rest/routes/users.rs"
+    OperationBuilder::get("/users-info/v1/users")
+        .operation_id("users_info.list_users")
+        .authenticated()
+        .handler(handlers::list_users)
+        .json_response_with_schema::<toolkit_odata::Page<dto::UserDto>>(
+            openapi, http::StatusCode::OK, "Paginated list of users")
+        .with_odata_filter::<UserFilterField>()
+        .with_odata_select()
+        .with_odata_orderby::<UserFilterField>()
+        .error_400(openapi).error_500(openapi)
+        .register(router, openapi);
+    ```
+
+    Handlers stay thin: extract the `SecurityContext` and services, call the domain, return
+    a typed response. The `OData` extractor parses `$filter`/`$select`/`$orderby`:
+
+    ```rust title="users-info/src/api/rest/handlers/users.rs"
+    pub async fn list_users(
+        Extension(ctx): Extension<SecurityContext>,
+        Extension(svc): Extension<Arc<ConcreteAppServices>>,
+        OData(query): OData,
+    ) -> ApiResult<JsonPage<serde_json::Value>> {
+        let page = svc.users.list_users_page(&ctx, &query).await?;
+        let page = page.map_items(UserDto::from);
+        Ok(Json(page_to_projected_json(&page, query.selected_fields())))
+    }
+    ```
+
+    Domain errors map to canonical (RFC-9457) problems at the boundary:
+
+    ```rust title="users-info/src/api/rest/error.rs"
+    impl From<DomainError> for CanonicalError {
+        fn from(e: DomainError) -> Self {
+            match &e {
+                DomainError::UserNotFound { id } =>
+                    UserResourceError::not_found(format!("User {id} not found"))
+                        .with_resource(id.to_string()).create(),
+                DomainError::Forbidden =>
+                    UserResourceError::permission_denied().with_reason("ACCESS_DENIED").create(),
+                // …one arm per domain error…
+                _ => CanonicalError::internal("An internal error occurred").create(),
+            }
+        }
+    }
+    ```
+
+5.  ### Bridge the SDK — the local client adapter
+
+    The in-process backend implements the SDK trait by delegating to the domain service and
+    converting `DomainError` → `UsersInfoError`:
+
+    ```rust title="users-info/src/domain/local_client/client.rs"
+    #[async_trait]
+    impl UsersInfoClientV1 for UsersInfoLocalClient {
+        async fn create_user(&self, ctx: SecurityContext, new_user: NewUser)
+            -> Result<User, UsersInfoError>
+        {
+            self.services.users.create_user(&ctx, new_user).await.map_err(UsersInfoError::from)
+        }
+        // …one delegating method per trait method…
+    }
+    ```
+
+6.  ### Wire the gear
+
+    The `#[toolkit::gear]` attribute declares the name, dependencies, and capabilities.
+    `init` builds the services and **registers the local client in `ClientHub`** under the
+    SDK trait; the capability traits supply migrations and routes:
+
+    ```rust title="users-info/src/gear.rs"
+    #[toolkit::gear(name = "users-info", deps = ["authz-resolver"], capabilities = [db, rest])]
+    pub struct UsersInfo { service: OnceLock<Arc<ConcreteAppServices>>, /* … */ }
+
+    #[async_trait]
+    impl Gear for UsersInfo {
+        async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+            let db = Arc::new(ctx.db_required()?);
+            let authz = ctx.client_hub().get::<dyn AuthZResolverClient>()?;
+            let services = Arc::new(AppServices::new(/* repos, db, authz, … */));
+            self.service.set(services.clone()).ok();
+
+            let local = UsersInfoLocalClient::new(services);
+            ctx.client_hub().register::<dyn UsersInfoClientV1>(Arc::new(local));
+            Ok(())
+        }
+    }
+
+    impl DatabaseCapability for UsersInfo {
+        fn migrations(&self) -> Vec<Box<dyn MigrationTrait>> {
+            crate::infra::storage::migrations::Migrator::migrations()
+        }
+    }
+
+    impl RestApiCapability for UsersInfo {
+        fn register_rest(&self, _ctx: &GearCtx, router: axum::Router, openapi: &dyn OpenApiRegistry)
+            -> anyhow::Result<axum::Router>
+        {
+            Ok(routes::register_routes(router, openapi, self.service.get().unwrap().clone()))
+        }
+    }
+    ```
+
+7.  ### Compose and run
+
+    The server crate lists the gears to link (system gears + plugins + your gear); the
+    runtime discovers them via `inventory`, orders them by dependency, and boots:
+
+    ```rust title="users-info-server/src/registered_gears.rs"
+    // System gears
+    use api_gateway as _;
+    use authn_resolver as _;
+    use authz_resolver as _;
+    use tenant_resolver as _;
+    use types_registry as _;
+    // Static plugins for standalone operation
+    use single_tenant_tr_plugin as _;
+    use static_authn_plugin as _;
+    use static_authz_plugin as _;
+    // Target gear
+    use users_info as _;
+    ```
+
+    ```rust title="users-info-server/src/main.rs"
+    #[tokio::main]
+    async fn main() -> Result<()> {
+        let cli = Cli::parse();
+        let mut config = AppConfig::load_or_default(cli.config.as_ref())?;
+        config.apply_cli_overrides(cli.verbose);
+        run_server(config).await
+    }
+    ```
+
+    Run it (see [Install & run](../)) and call your endpoint:
+
+    ```sh
+    make example
+    curl -s "http://127.0.0.1:8087/cf/users-info/v1/users?\$orderby=created_at desc" | python3 -m json.tool
+    ```
+
+</Steps>
+
+## Calling your gear from another gear
+
+Because the gear registered itself under `UsersInfoClientV1`, any other gear resolves it
+through `ClientHub` — no HTTP, just the trait:
+
+```rust
+let users = ctx.client_hub().get::<dyn UsersInfoClientV1>()?;
+let user = users.get_user(ctx.clone(), id).await?;
+```
+
+If `users-info` later runs in its own process, this code is unchanged — configuration
+decides whether `ClientHub` returns the local adapter or a gRPC client.
+
+## Where to go next
+
+<CardGrid>
+  <LinkCard title="Authorization" href="../../guides/authorization/" description="The PolicyEnforcer → AccessScope flow in depth." />
+  <LinkCard title="Database patterns" href="../../guides/database/" description="SecureConn, Scopable, transactions, and migrations." />
+  <LinkCard title="Pagination & filtering" href="../../guides/odata/" description="OData $filter / $orderby / $select and cursor pages." />
+  <LinkCard title="Out-of-process gears" href="../../guides/out-of-process/" description="Expose the same SDK over gRPC, selected by config." />
+</CardGrid>
+
+The full `users-info` example adds City and Address entities, streaming sub-clients, and
+server-sent events — all following the same patterns shown here.

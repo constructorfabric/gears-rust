@@ -4,16 +4,21 @@
 //! enabled subset of the plugin-supported RS256 and ES256 algorithms.
 //!
 //! Validation order:
-//! 1. Decode and parse the JWT header (extract `kid` and `alg`).
+//! 1. Decode and parse the JWT header (extract `kid`, `alg`, and `typ`).
 //! 2. Reject unsupported/disallowed algorithms.
-//! 3. Verify `iss` against the `trusted_issuers` list.
-//! 4. Look up the signing key by `kid` in the JWKS cache.
+//! 3. Verify `iss` against the `trusted_issuers` list and resolve the matched
+//!    issuer's per-issuer overrides (audience, JOSE `typ`, clock-skew leeway).
+//! 4. When the matched issuer pins a JOSE `typ`, require the header `typ` to
+//!    match it (case-insensitive).
+//! 5. Look up the signing key by `kid` in the JWKS cache.
 //!    - On miss: force-refresh from Oidc.
 //!    - If still missing after refresh: return `Unauthorized`.
-//! 5. Verify the JWT signature and decode claims.
-//! 6. Validate `exp` (rejected if expired).
-//! 7. Validate optional `iat` (rejected if issued too far in the future).
-//! 8. Optionally validate `aud`.
+//! 6. Verify the JWT signature and decode claims (leeway = per-issuer override
+//!    when present, else global).
+//! 7. Validate `exp` (rejected if expired).
+//! 8. Validate optional `iat` (rejected if issued too far in the future).
+//! 9. Validate `aud` against the per-issuer audience when set, else the global
+//!    audience.
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -27,12 +32,13 @@ use toolkit_macros::domain_model;
 use tracing::{debug, warn};
 use url::Url;
 
-use crate::config::{IssuerTrustConfig, JwtValidationConfig, MatcherCompiled};
+use crate::config::{IssuerTrustConfig, JwtValidationConfig, MatcherCompiled, ResolvedIssuer};
 use crate::domain::error::AuthNError;
 use crate::domain::metrics::{
     AuthNMetrics, TOKEN_REJECTION_REASON_EXPIRED, TOKEN_REJECTION_REASON_INVALID_AUDIENCE,
     TOKEN_REJECTION_REASON_INVALID_IAT, TOKEN_REJECTION_REASON_INVALID_SIG,
-    TOKEN_REJECTION_REASON_MISSING_AUDIENCE, TOKEN_REJECTION_REASON_UNTRUSTED_ISSUER,
+    TOKEN_REJECTION_REASON_INVALID_TYP, TOKEN_REJECTION_REASON_MISSING_AUDIENCE,
+    TOKEN_REJECTION_REASON_UNTRUSTED_ISSUER,
 };
 use crate::domain::ports::JwksProvider;
 
@@ -67,6 +73,11 @@ pub struct JwtClaims {
     /// Scopes (space-separated).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Any non-standard claims, preserved verbatim so claim mapping can be
+    /// configured to read them by name (e.g. cap tokens' `subject_tenant`,
+    /// `scopes`). An empty map serializes to nothing.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// JWT validator backed by a domain JWKS provider port.
@@ -104,6 +115,7 @@ impl JwtValidator {
     /// - [`AuthNError::SignatureInvalid`]: cannot decode/verify token
     /// - [`AuthNError::UnsupportedAlgorithm`]: `alg` not enabled by configuration
     /// - [`AuthNError::UntrustedIssuer`]: `iss` not in `trusted_issuers`
+    /// - [`AuthNError::InvalidTokenType`]: JOSE `typ` does not match the issuer's pinned type
     /// - [`AuthNError::KidNotFound`]: key not in JWKS after force-refresh
     /// - [`AuthNError::SignatureInvalid`]: signature verification failed
     /// - [`AuthNError::TokenExpired`]: `exp` is in the past
@@ -139,31 +151,49 @@ impl JwtValidator {
         // validated post-signature via `Validation::set_issuer` (defense-in-depth).
         let issuer = Self::peek_issuer(token)?;
 
-        // Step 4: Check issuer is trusted (uses IssuerTrustConfig for exact or regex matching)
-        let discovery_base = self.validate_issuer(&issuer, issuer_trust)?;
+        // Step 4: Check issuer is trusted (uses IssuerTrustConfig for exact or
+        // regex matching) and resolve its per-issuer validation overrides.
+        let resolved = self.validate_issuer(&issuer, issuer_trust)?;
+
+        // Step 4b: Enforce the issuer's JOSE `typ` requirement, if pinned.
+        self.validate_jose_typ(&header, &resolved)?;
+
+        // Effective per-issuer overrides (fall back to global where unset).
+        let leeway = resolved
+            .clock_skew_leeway_secs
+            .unwrap_or(config.clock_skew_leeway_secs);
+        let expected_audience = if resolved.expected_audience.is_empty() {
+            config.expected_audience.as_slice()
+        } else {
+            resolved.expected_audience.as_slice()
+        };
 
         // Step 5: Get the kid (may be absent for single-key issuers)
         let kid = header.kid.clone();
 
         // Step 6: Resolve the signing key, with force-refresh on miss
         let decoding_key = self
-            .resolve_decoding_key(&issuer, &discovery_base, kid.as_deref(), alg)
+            .resolve_decoding_key(&issuer, &resolved.discovery_base, kid.as_deref(), alg)
             .await?;
 
         // Step 7: Build validation rules and decode + verify the token
         let mut validation = Validation::new(alg);
         validation.validate_nbf = true;
-        validation.leeway = config.clock_skew_leeway_secs;
+        validation.leeway = leeway;
 
         // Issuer validation (defense-in-depth: re-verified post-signature)
         validation.set_issuer(&[issuer.as_str()]);
 
         // Audience matching is handled after signature verification so `*`
         // patterns can be matched with the compiled config regexes. Missing
-        // `aud` is controlled separately by `require_audience`.
+        // `aud` presence is enforced here.
         validation.validate_aud = false;
 
-        if config.require_audience {
+        // Require an `aud` claim when globally mandated OR when this issuer pins
+        // its own audience: a per-issuer `expected_audience` must fail closed on
+        // a missing `aud` (it binds tokens to a specific audience, e.g. an
+        // adapter GTS-id) rather than silently depend on the global flag.
+        if config.require_audience || !resolved.expected_audience.is_empty() {
             validation.set_required_spec_claims(&["aud"]);
         }
 
@@ -199,7 +229,7 @@ impl JwtValidator {
         let claims = token_data.claims;
 
         if let Some(iat) = claims.iat
-            && iat > current_unix_timestamp().saturating_add(config.clock_skew_leeway_secs)
+            && iat > current_unix_timestamp().saturating_add(leeway)
         {
             self.metrics
                 .increment_token_rejected(TOKEN_REJECTION_REASON_INVALID_IAT);
@@ -208,8 +238,8 @@ impl JwtValidator {
         }
 
         if let Some(aud) = &claims.aud
-            && !config.expected_audience.is_empty()
-            && !audience_matches(&config.expected_audience, aud)
+            && !expected_audience.is_empty()
+            && !audience_matches(expected_audience, aud)
         {
             self.metrics
                 .increment_token_rejected(TOKEN_REJECTION_REASON_INVALID_AUDIENCE);
@@ -268,19 +298,48 @@ impl JwtValidator {
 
     /// Validate the issuer against the trusted issuers configuration.
     ///
-    /// Delegates to [`IssuerTrustConfig::is_trusted`] which handles both
-    /// exact (literal string) and regex (auto-anchored) matching modes.
+    /// Delegates to [`IssuerTrustConfig::resolve_issuer`] which handles both
+    /// exact (literal string) and regex (auto-anchored) matching modes, and
+    /// returns the matched issuer's per-issuer validation overrides.
     fn validate_issuer(
         &self,
         issuer: &str,
         issuer_trust: &IssuerTrustConfig,
-    ) -> Result<Url, AuthNError> {
-        if let Some(discovery_base) = issuer_trust.resolve(issuer) {
-            Ok(discovery_base)
+    ) -> Result<ResolvedIssuer, AuthNError> {
+        if let Some(resolved) = issuer_trust.resolve_issuer(issuer) {
+            Ok(resolved)
         } else {
             self.metrics
                 .increment_token_rejected(TOKEN_REJECTION_REASON_UNTRUSTED_ISSUER);
             Err(AuthNError::UntrustedIssuer)
+        }
+    }
+
+    /// Enforce the matched issuer's JOSE `typ` requirement, if any.
+    ///
+    /// When the issuer pins a `jose_typ`, the token's `typ` header must match it
+    /// case-insensitively. Issuers without an override do not inspect `typ`.
+    fn validate_jose_typ(
+        &self,
+        header: &Header,
+        resolved: &ResolvedIssuer,
+    ) -> Result<(), AuthNError> {
+        let Some(expected_typ) = resolved.jose_typ.as_deref() else {
+            return Ok(());
+        };
+
+        // `expected_typ` is stored lowercased; compare the header case-insensitively.
+        let matches = header
+            .typ
+            .as_deref()
+            .is_some_and(|typ| typ.eq_ignore_ascii_case(expected_typ));
+
+        if matches {
+            Ok(())
+        } else {
+            self.metrics
+                .increment_token_rejected(TOKEN_REJECTION_REASON_INVALID_TYP);
+            Err(AuthNError::InvalidTokenType)
         }
     }
 

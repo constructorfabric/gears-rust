@@ -847,7 +847,10 @@ impl<R: TenantRepo> BootstrapService<R> {
         {
             Ok(Ok(entity)) => entity,
             Ok(Err(err)) => {
-                if err.is_not_found() {
+                if matches!(
+                    err,
+                    toolkit_canonical_errors::CanonicalError::NotFound { .. }
+                ) {
                     emit_metric(
                         AM_BOOTSTRAP_LIFECYCLE,
                         MetricKind::Counter,

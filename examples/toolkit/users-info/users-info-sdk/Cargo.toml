@@ -12,13 +12,7 @@ workspace = true
 
 [features]
 default = ["odata"]
-odata = [
-    "dep:toolkit-odata-macros",
-    "dep:futures",
-    "dep:futures-core",
-    "dep:toolkit-sdk",
-    "dep:toolkit-odata",
-]
+odata = ["dep:toolkit-odata-macros", "dep:futures-core", "dep:toolkit-sdk", "dep:toolkit-odata"]
 
 [dependencies]
 # Core dependencies for API trait
@@ -34,7 +28,6 @@ toolkit-odata-macros = { workspace = true, optional = true }
 
 # Streaming support
 futures-core = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
 
 # Security context for API methods
 toolkit-security = { workspace = true }
@@ -44,6 +37,3 @@ toolkit-sdk = { workspace = true, optional = true }
 
 # OData support for pagination
 toolkit-odata = { workspace = true, optional = true }
-
-[dev-dependencies]
-tokio = { workspace = true }

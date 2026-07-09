@@ -76,6 +76,31 @@ pub fn sign_jwt(claims: &serde_json::Value, kid: Option<&str>) -> String {
     encode(&header, claims, &key_material().encoding_key).unwrap_or_default()
 }
 
+/// Sign a JWT with the test RS256 private key, setting the JOSE `typ` header.
+///
+/// Used to exercise per-issuer `typ` enforcement (e.g. `obo+jwt` vs `cap+jwt`).
+#[must_use]
+pub fn sign_jwt_with_typ(claims: &serde_json::Value, kid: Option<&str>, typ: &str) -> String {
+    use jsonwebtoken::{Header, encode};
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = kid.map(str::to_owned);
+    header.typ = Some(typ.to_owned());
+    encode(&header, claims, &key_material().encoding_key).unwrap_or_default()
+}
+
+/// Sign a JWT with the test RS256 private key and NO JOSE `typ` header.
+///
+/// Used to exercise per-issuer `typ` enforcement against a token that omits the
+/// `typ` header entirely (must fail closed when the issuer pins a `typ`).
+#[must_use]
+pub fn sign_jwt_without_typ(claims: &serde_json::Value, kid: Option<&str>) -> String {
+    use jsonwebtoken::{Header, encode};
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = kid.map(str::to_owned);
+    header.typ = None;
+    encode(&header, claims, &key_material().encoding_key).unwrap_or_default()
+}
+
 /// Build a [`Claims`] map from a JSON object.
 ///
 /// Common helper shared across unit and integration tests to avoid duplicating

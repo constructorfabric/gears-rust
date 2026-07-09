@@ -1,6 +1,7 @@
 //! REST error mapping for the Types Registry gear.
 
 use toolkit_canonical_errors::{CanonicalError, resource_error};
+use types_registry_sdk::{field, precondition};
 
 use crate::domain::error::DomainError;
 
@@ -11,7 +12,7 @@ impl From<DomainError> for CanonicalError {
     fn from(e: DomainError) -> Self {
         match e {
             DomainError::InvalidGtsId(msg) => TypeRegistryError::invalid_argument()
-                .with_field_violation("gts_id", msg, "INVALID_GTS_ID")
+                .with_field_violation(field::GTS_ID_FIELD, msg, field::INVALID_GTS_ID)
                 .create(),
             DomainError::NotFound { kind, target } => {
                 TypeRegistryError::not_found(format!("No entity with {kind}: {target}"))
@@ -23,11 +24,32 @@ impl From<DomainError> for CanonicalError {
             ))
             .with_resource(id)
             .create(),
+            // Adapter-only (in-process) batch-register disposition — never
+            // reaches a REST handler. Carries `parent_type_id` / `dependent_id`
+            // losslessly so the SDK projects it back to
+            // `TypesRegistryError::ParentNotRegistered`: dependent → resource,
+            // parent → violation subject, message → violation description.
+            DomainError::ParentTypeSchemaNotRegistered {
+                parent_type_id,
+                dependent_id,
+            } => {
+                let detail = format!(
+                    "Cannot register {dependent_id}: required type-schema {parent_type_id} is not registered"
+                );
+                TypeRegistryError::failed_precondition()
+                    .with_resource(dependent_id)
+                    .with_precondition_violation(
+                        parent_type_id,
+                        detail,
+                        precondition::PARENT_NOT_REGISTERED,
+                    )
+                    .create()
+            }
             DomainError::InvalidQuery(msg) => TypeRegistryError::invalid_argument()
-                .with_field_violation("query", msg, "INVALID_QUERY")
+                .with_field_violation(field::QUERY_FIELD, msg, field::INVALID_QUERY)
                 .create(),
             DomainError::ValidationFailed(msg) => TypeRegistryError::invalid_argument()
-                .with_field_violation("entity", msg, "VALIDATION_FAILED")
+                .with_field_violation(field::ENTITY_FIELD, msg, field::VALIDATION_FAILED)
                 .create(),
             DomainError::NotInReadyMode => CanonicalError::service_unavailable().create(),
             DomainError::ReadyCommitFailed(errors) => {

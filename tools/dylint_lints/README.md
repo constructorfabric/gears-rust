@@ -44,6 +44,7 @@ make gts-docs-test       # Run unit tests for GTS validator
 ### Security (DE07xx)
 - ✅ DE0706: No Direct SQLx
 - ✅ DE0707: Drop Zeroize (sensitive types)
+- ✅ DE0708: No Non-FIPS Hasher Imports (sha2/sha1/md5 outside allow-list)
 
 ### REST Conventions (DE08xx)
 - ✅ DE0801: API Endpoint Must Have Version

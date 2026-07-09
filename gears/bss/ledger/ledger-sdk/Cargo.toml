@@ -1,0 +1,24 @@
+[package]
+name = "bss-ledger-sdk"
+edition.workspace = true
+license.workspace = true
+description = "BSS Billing Ledger SDK: infrastructure-free contract for ClientHub consumers"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+# `chrono` provides `NaiveDate` in the posting/close value types; no serde
+# feature — this contract crate carries no `#[derive(Serialize/Deserialize)]`
+# (the gear's REST DTOs own serde and map onto these types).
+chrono = { workspace = true }
+thiserror = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+# Canonical OData query + `Page` envelope for the list endpoints. Infra-free
+# (no sea-orm): the gear binds the `FilterField`→column mapping internally, the
+# SDK only carries the parsed `ODataQuery` and the `Page<T>` result. Mirrors how
+# the platform list surfaces (RBAC/AM/RG) thread `toolkit_odata` through.
+toolkit-odata = { workspace = true }
+toolkit-security = { workspace = true }
+uuid = { workspace = true }

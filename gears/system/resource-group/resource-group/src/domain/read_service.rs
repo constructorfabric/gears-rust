@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use resource_group_sdk::ResourceGroupReadHierarchy;
-use resource_group_sdk::error::ResourceGroupError;
 use resource_group_sdk::models::{ResourceGroup, ResourceGroupMembership, ResourceGroupWithDepth};
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -94,7 +94,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         _ctx: &SecurityContext,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-3a
         // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-5
         // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-2
@@ -109,7 +109,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         self.group_service
             .get_group_descendants_unscoped(group_id, query)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
         // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-5
         // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-4
         // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-3
@@ -123,7 +123,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         _ctx: &SecurityContext,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         // Bypass AuthZ — use unscoped method (AccessScope::allow_all).
         // Tenant-resolver plugin needs full ancestor visibility regardless
         // of caller's tenant scope. Confirmed: TR plugins ignore SecurityContext
@@ -131,14 +131,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         self.group_service
             .get_group_ancestors_unscoped(group_id, query)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn list_groups(
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroup>, CanonicalError> {
         // Bypass AuthZ — same rationale as the hierarchy reads above.
         // Used by the tenant-resolver RG plugin's batch `get_tenants` path,
         // which queries `id in (…)` over tenant-typed groups regardless of
@@ -146,35 +146,35 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         self.group_service
             .list_groups_unscoped(query)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn get_group(
         &self,
         _ctx: &SecurityContext,
         id: Uuid,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         // Bypass AuthZ — an in-process PDP consumes this for scope-existence
         // checks while acting as the PDP, so it cannot re-enter the enforcer.
         // The consumer reads the group and compares `tenant_id` itself.
         self.group_service
             .get_group_unscoped(id)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn list_memberships(
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
         // Bypass AuthZ — an in-process PDP resolves a subject's group
         // memberships while acting as the PDP; re-entering the enforcer would
         // recurse. The caller supplies the subject/tenant OData filter.
         self.membership_service
             .list_memberships_unscoped(query)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 }
 // @cpt-end:cpt-cf-resource-group-dod-integration-auth-read-service:p1:inst-full

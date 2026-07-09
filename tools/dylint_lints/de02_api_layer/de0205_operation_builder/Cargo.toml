@@ -28,7 +28,6 @@ lint_utils.workspace = true
 
 [dev-dependencies]
 dylint_testing.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
 toolkit = { workspace = true }
 
 [package.metadata.rust-analyzer]

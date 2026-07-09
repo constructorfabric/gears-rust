@@ -21,8 +21,7 @@ authn-resolver-sdk = {
     path = "../../authn-resolver-sdk"
 }
 types-registry-sdk = {
-    package = "cf-gears-types-registry-sdk",
-    version = "0.2",
+    package = "cf-gears-types-registry-sdk", version = "0.3",
     path = "../../../types-registry/types-registry-sdk"
 }
 
@@ -80,8 +79,6 @@ base64.workspace = true
 
 # Secret string type for S2S client credentials
 secrecy.workspace = true
-sha2.workspace = true
-hex.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

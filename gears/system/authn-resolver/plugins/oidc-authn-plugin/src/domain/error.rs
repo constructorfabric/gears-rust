@@ -52,6 +52,10 @@ pub enum AuthNError {
     #[error("invalid audience")]
     InvalidAudience,
 
+    /// The JOSE `typ` header does not match the issuer's required token type.
+    #[error("invalid token type")]
+    InvalidTokenType,
+
     /// Oidc (or OIDC Discovery / JWKS endpoint) is unreachable.
     #[error("identity provider unreachable")]
     IdpUnreachable,
@@ -91,7 +95,8 @@ impl From<AuthNError> for AuthNResolverError {
             | AuthNError::InvalidSubject
             | AuthNError::KidNotFound
             | AuthNError::UnsupportedAlgorithm
-            | AuthNError::InvalidAudience => AuthNResolverError::Unauthorized(format!("{value}")),
+            | AuthNError::InvalidAudience
+            | AuthNError::InvalidTokenType => AuthNResolverError::Unauthorized(format!("{value}")),
             AuthNError::IdpUnreachable => {
                 AuthNResolverError::ServiceUnavailable(format!("{value}"))
             }

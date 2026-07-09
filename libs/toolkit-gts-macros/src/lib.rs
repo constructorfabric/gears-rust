@@ -175,7 +175,7 @@ fn expand_gts_type_schema(attr: &TokenStream2, input: &ItemStruct) -> syn::Resul
     };
 
     Ok(quote! {
-        #[::gts_macros::struct_to_gts_schema(#attr)]
+        #[#crate_path::__private::upstream_struct_to_gts_schema(#attr)]
         #input
 
         #crate_path::inventory::submit! {

@@ -26,6 +26,3 @@ tracing = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }

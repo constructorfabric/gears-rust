@@ -4,14 +4,14 @@
 //! Pin the documented failure-mode arms (mirrors the production
 //! gear doc on `gts_validation.rs`):
 //!
-//! 1. Schema not registered (`TypesRegistryError::GtsTypeSchemaNotFound`):
+//! 1. Schema not registered (`CanonicalError::NotFound`):
 //!    * `validate_new_user_payload_via_gts` →
 //!      `DomainError::ServiceUnavailable` (fail-closed — no
 //!      AM-side storage gate for users, so the boundary helper
 //!      MUST be authoritative on `format` / `pattern` rules).
 //!    * `validate_tenant_name_via_gts` → `Ok(())` (DB CHECK +
 //!      bootstrap-before-catalog ordering remain authoritative).
-//! 2. Other `TypesRegistryError` (transport / availability) →
+//! 2. Other `CanonicalError` (transport / availability) →
 //!    `DomainError::ServiceUnavailable`.
 //! 3. Schema returned but `jsonschema::validator_for` rejects it
 //!    (catalog drift) → `DomainError::Internal` — schema published
@@ -38,9 +38,10 @@
 use account_management_sdk::IdpNewUser;
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use toolkit_canonical_errors::CanonicalError;
 use types_registry_sdk::testing::MockTypesRegistryClient;
 use types_registry_sdk::{
-    GtsInstance, GtsTypeId, GtsTypeSchema, RegisterResult, TypesRegistryClient, TypesRegistryError,
+    GtsInstance, GtsTypeId, GtsTypeSchema, RegisterResult, TypesRegistryClient,
 };
 use uuid::Uuid;
 
@@ -94,7 +95,7 @@ fn tenant_schema_with_name_max(max_chars: usize) -> GtsTypeSchema {
 /// Registry stub: every read returns `ServiceUnavailable`. Used to
 /// pin the transport-error arm of the GTS-validation helper without
 /// reaching for the heavier `MockTypesRegistryClient` (which always
-/// returns `GtsTypeSchemaNotFound` for unknown ids and offers no
+/// returns `CanonicalError::NotFound` for unknown ids and offers no
 /// inject-error seam).
 ///
 /// Methods that the helper does not exercise return empty / not-found
@@ -103,82 +104,82 @@ fn tenant_schema_with_name_max(max_chars: usize) -> GtsTypeSchema {
 #[derive(Debug, Default)]
 struct UnavailableRegistry;
 
-fn unavailable() -> TypesRegistryError {
-    TypesRegistryError::ServiceUnavailable {
-        message: "registry transport down (test stub)".to_owned(),
-        retry_after: std::time::Duration::from_secs(0),
-    }
+fn unavailable() -> CanonicalError {
+    // Model the scenario under test directly: a temporarily unavailable
+    // registry. The production helper short-circuits only `NotFound` and
+    // routes every other canonical category (this one included) to its
+    // `ServiceUnavailable` arm.
+    CanonicalError::service_unavailable()
+        .with_detail("registry transport down (test stub)")
+        .create()
 }
 
 #[async_trait]
 impl TypesRegistryClient for UnavailableRegistry {
-    async fn register(
-        &self,
-        _entities: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+    async fn register(&self, _entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
         Err(unavailable())
     }
     async fn register_type_schemas(
         &self,
         _schemas: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
         Err(unavailable())
     }
-    async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, TypesRegistryError> {
+    async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
         Err(unavailable())
     }
     async fn get_type_schema_by_uuid(
         &self,
         _type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, TypesRegistryError> {
+    ) -> Result<GtsTypeSchema, CanonicalError> {
         Err(unavailable())
     }
     async fn get_type_schemas(
         &self,
         _ids: Vec<String>,
-    ) -> std::collections::HashMap<String, Result<GtsTypeSchema, TypesRegistryError>> {
+    ) -> std::collections::HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
         std::collections::HashMap::new()
     }
     async fn get_type_schemas_by_uuid(
         &self,
         _ids: Vec<Uuid>,
-    ) -> std::collections::HashMap<Uuid, Result<GtsTypeSchema, TypesRegistryError>> {
+    ) -> std::collections::HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
         std::collections::HashMap::new()
     }
     async fn list_type_schemas(
         &self,
         _query: types_registry_sdk::TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, TypesRegistryError> {
+    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
         Ok(Vec::new())
     }
     async fn register_instances(
         &self,
         _instances: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
         Err(unavailable())
     }
-    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, TypesRegistryError> {
+    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
         Err(unavailable())
     }
-    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, TypesRegistryError> {
+    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
         Err(unavailable())
     }
     async fn get_instances(
         &self,
         _ids: Vec<String>,
-    ) -> std::collections::HashMap<String, Result<GtsInstance, TypesRegistryError>> {
+    ) -> std::collections::HashMap<String, Result<GtsInstance, CanonicalError>> {
         std::collections::HashMap::new()
     }
     async fn get_instances_by_uuid(
         &self,
         _ids: Vec<Uuid>,
-    ) -> std::collections::HashMap<Uuid, Result<GtsInstance, TypesRegistryError>> {
+    ) -> std::collections::HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
         std::collections::HashMap::new()
     }
     async fn list_instances(
         &self,
         _query: types_registry_sdk::InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, TypesRegistryError> {
+    ) -> Result<Vec<GtsInstance>, CanonicalError> {
         Ok(Vec::new())
     }
 }

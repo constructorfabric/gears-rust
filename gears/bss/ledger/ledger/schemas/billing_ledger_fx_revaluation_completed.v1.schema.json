@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.fx_revaluation_completed.v1",
+  "title": "Billing Ledger FX Revaluation Completed",
+  "description": "Emitted on every successful unrealized-revaluation post (one functional-only FX_UNREALIZED entry per moved (period, scope, payer); never on replay). Internal identifiers + scope code + signed functional amount + grain count only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "entry_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "period_id": {
+      "type": "string"
+    },
+    "scope": {
+      "type": "string"
+    },
+    "payer_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "functional_currency": {
+      "type": "string"
+    },
+    "fx_unrealized_minor": {
+      "type": "integer"
+    },
+    "grains_moved": {
+      "type": "integer"
+    },
+    "posted_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "tenant_id",
+    "entry_id",
+    "period_id",
+    "scope",
+    "payer_id",
+    "functional_currency",
+    "fx_unrealized_minor",
+    "grains_moved",
+    "posted_at_utc"
+  ]
+}

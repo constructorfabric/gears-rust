@@ -4,8 +4,9 @@
 extern crate rustc_ast;
 extern crate rustc_span;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::{Item, ItemKind};
-use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
+use rustc_lint::{EarlyContext, EarlyLintPass};
 use rustc_span::Span;
 
 dylint_linting::declare_early_lint! {
@@ -116,14 +117,19 @@ fn emit_lint(
         format!("{trait_name}Client")
     };
 
-    cx.span_lint(DE0503_PLUGIN_CLIENT_SUFFIX, span, |diag| {
-        diag.primary_message(format!(
+    span_lint_and_then(
+        cx,
+        DE0503_PLUGIN_CLIENT_SUFFIX,
+        span,
+        format!(
             "plugin client trait `{trait_name}` should use `*{suggested_suffix}` suffix, not `*{wrong_suffix}` (DE0503)"
-        ));
-        diag.help(format!(
-            "rename trait to `{suggestion}` to follow plugin client naming conventions"
-        ));
-    });
+        ),
+        |diag| {
+            diag.help(format!(
+                "rename trait to `{suggestion}` to follow plugin client naming conventions"
+            ));
+        },
+    );
 }
 
 #[cfg(test)]

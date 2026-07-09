@@ -54,6 +54,7 @@ pub use toolkit_gts_macros::{gts_instance, gts_instance_raw, gts_type_schema};
 pub mod __private {
     pub use ::gts_macros::{
         gts_instance as upstream_gts_instance, gts_instance_raw as upstream_gts_instance_raw,
+        struct_to_gts_schema as upstream_struct_to_gts_schema,
     };
 }
 

@@ -14,10 +14,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupClient, ResourceGroupError,
+    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupClient,
     ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
     UpdateTypeRequest,
 };
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -44,21 +45,21 @@ impl ResourceGroupClient for SlowRgClient {
         &self,
         _ctx: &SecurityContext,
         _request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         unreachable!()
     }
     async fn get_type(
         &self,
         _ctx: &SecurityContext,
         _code: &str,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         unreachable!()
     }
     async fn list_types(
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
         unreachable!()
     }
     async fn update_type(
@@ -66,35 +67,31 @@ impl ResourceGroupClient for SlowRgClient {
         _ctx: &SecurityContext,
         _code: &str,
         _request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         unreachable!()
     }
-    async fn delete_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_type(&self, _ctx: &SecurityContext, _code: &str) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn create_group(
         &self,
         _ctx: &SecurityContext,
         _request: CreateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn get_group(
         &self,
         _ctx: &SecurityContext,
         _id: Uuid,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn list_groups(
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroup>, CanonicalError> {
         tokio::time::sleep(self.delay).await;
         Ok(Page::empty(1))
     }
@@ -103,14 +100,10 @@ impl ResourceGroupClient for SlowRgClient {
         _ctx: &SecurityContext,
         _id: Uuid,
         _request: UpdateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
-    async fn delete_group(
-        &self,
-        _ctx: &SecurityContext,
-        _id: Uuid,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_group(&self, _ctx: &SecurityContext, _id: Uuid) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn get_group_descendants(
@@ -118,7 +111,7 @@ impl ResourceGroupClient for SlowRgClient {
         _ctx: &SecurityContext,
         _group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         unreachable!()
     }
     async fn get_group_ancestors(
@@ -126,7 +119,7 @@ impl ResourceGroupClient for SlowRgClient {
         _ctx: &SecurityContext,
         _group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         unreachable!()
     }
     async fn add_membership(
@@ -135,7 +128,7 @@ impl ResourceGroupClient for SlowRgClient {
         _group_id: Uuid,
         _resource_type: &str,
         _resource_id: &str,
-    ) -> Result<ResourceGroupMembership, ResourceGroupError> {
+    ) -> Result<ResourceGroupMembership, CanonicalError> {
         unreachable!()
     }
     async fn remove_membership(
@@ -144,14 +137,14 @@ impl ResourceGroupClient for SlowRgClient {
         _group_id: Uuid,
         _resource_type: &str,
         _resource_id: &str,
-    ) -> Result<(), ResourceGroupError> {
+    ) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn list_memberships(
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
         unreachable!()
     }
 }

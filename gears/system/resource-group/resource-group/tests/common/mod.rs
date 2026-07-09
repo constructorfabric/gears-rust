@@ -43,7 +43,7 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
     async fn register(
         &self,
         _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, types_registry_sdk::TypesRegistryError>
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
     {
         Ok(vec![])
     }
@@ -51,7 +51,7 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
     async fn register_type_schemas(
         &self,
         _type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, types_registry_sdk::TypesRegistryError>
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
     {
         Ok(vec![])
     }
@@ -59,19 +59,17 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
     async fn get_type_schema(
         &self,
         type_id: &str,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, types_registry_sdk::TypesRegistryError> {
-        Err(types_registry_sdk::TypesRegistryError::gts_type_schema_not_found(type_id))
+    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
+        Err(types_registry_sdk::testing::not_found(type_id))
     }
 
     async fn get_type_schema_by_uuid(
         &self,
         type_uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, types_registry_sdk::TypesRegistryError> {
-        Err(
-            types_registry_sdk::TypesRegistryError::gts_type_schema_not_found(
-                type_uuid.to_string(),
-            ),
-        )
+    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
+        Err(types_registry_sdk::testing::not_found(
+            type_uuid.to_string(),
+        ))
     }
 
     async fn get_type_schemas(
@@ -79,12 +77,12 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
         type_ids: Vec<String>,
     ) -> std::collections::HashMap<
         String,
-        Result<types_registry_sdk::GtsTypeSchema, types_registry_sdk::TypesRegistryError>,
+        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
     > {
         type_ids
             .into_iter()
             .map(|id| {
-                let err = types_registry_sdk::TypesRegistryError::gts_type_schema_not_found(&id);
+                let err = types_registry_sdk::testing::not_found(&id);
                 (id, Err(err))
             })
             .collect()
@@ -95,14 +93,12 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
         type_uuids: Vec<Uuid>,
     ) -> std::collections::HashMap<
         Uuid,
-        Result<types_registry_sdk::GtsTypeSchema, types_registry_sdk::TypesRegistryError>,
+        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
     > {
         type_uuids
             .into_iter()
             .map(|uuid| {
-                let err = types_registry_sdk::TypesRegistryError::gts_type_schema_not_found(
-                    uuid.to_string(),
-                );
+                let err = types_registry_sdk::testing::not_found(uuid.to_string());
                 (uuid, Err(err))
             })
             .collect()
@@ -111,7 +107,7 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
     async fn list_type_schemas(
         &self,
         _query: types_registry_sdk::TypeSchemaQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, types_registry_sdk::TypesRegistryError>
+    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, toolkit_canonical_errors::CanonicalError>
     {
         Ok(vec![])
     }
@@ -119,7 +115,7 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
     async fn register_instances(
         &self,
         _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, types_registry_sdk::TypesRegistryError>
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
     {
         Ok(vec![])
     }
@@ -127,15 +123,15 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
     async fn get_instance(
         &self,
         id: &str,
-    ) -> Result<types_registry_sdk::GtsInstance, types_registry_sdk::TypesRegistryError> {
-        Err(types_registry_sdk::TypesRegistryError::gts_instance_not_found(id))
+    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
+        Err(types_registry_sdk::testing::not_found(id))
     }
 
     async fn get_instance_by_uuid(
         &self,
         uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsInstance, types_registry_sdk::TypesRegistryError> {
-        Err(types_registry_sdk::TypesRegistryError::gts_instance_not_found(uuid.to_string()))
+    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
+        Err(types_registry_sdk::testing::not_found(uuid.to_string()))
     }
 
     async fn get_instances(
@@ -143,11 +139,11 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
         ids: Vec<String>,
     ) -> std::collections::HashMap<
         String,
-        Result<types_registry_sdk::GtsInstance, types_registry_sdk::TypesRegistryError>,
+        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
     > {
         ids.into_iter()
             .map(|id| {
-                let err = types_registry_sdk::TypesRegistryError::gts_instance_not_found(&id);
+                let err = types_registry_sdk::testing::not_found(&id);
                 (id, Err(err))
             })
             .collect()
@@ -158,14 +154,12 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
         uuids: Vec<Uuid>,
     ) -> std::collections::HashMap<
         Uuid,
-        Result<types_registry_sdk::GtsInstance, types_registry_sdk::TypesRegistryError>,
+        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
     > {
         uuids
             .into_iter()
             .map(|uuid| {
-                let err = types_registry_sdk::TypesRegistryError::gts_instance_not_found(
-                    uuid.to_string(),
-                );
+                let err = types_registry_sdk::testing::not_found(uuid.to_string());
                 (uuid, Err(err))
             })
             .collect()
@@ -174,7 +168,8 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
     async fn list_instances(
         &self,
         _query: types_registry_sdk::InstanceQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsInstance>, types_registry_sdk::TypesRegistryError> {
+    ) -> Result<Vec<types_registry_sdk::GtsInstance>, toolkit_canonical_errors::CanonicalError>
+    {
         Ok(vec![])
     }
 }

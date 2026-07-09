@@ -26,9 +26,9 @@ use tenant_resolver_sdk::{
     TenantId, TenantResolverError, TenantResolverPluginClient, TenantStatus as SdkStatus,
 };
 use time::OffsetDateTime;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use types_registry_sdk::TypesRegistryClient;
-use types_registry_sdk::error::TypesRegistryError;
 use types_registry_sdk::models::{
     GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
 };
@@ -54,7 +54,7 @@ const DELETED: TenantStatus = TenantStatus::Deleted;
 const TEST_TYPE_ID: &str = "gts.cf.core.test.tenant.v1~";
 
 /// Dual-mode stub: when `fail=false` it returns a fixed `GtsTypeSchema` for
-/// any UUID; when `fail=true` every lookup returns `GtsTypeSchemaNotFound`.
+/// any UUID; when `fail=true` every lookup returns `CanonicalError::NotFound`.
 struct TestRegistry {
     fail: bool,
 }
@@ -74,9 +74,9 @@ impl TypesRegistryClient for TestRegistry {
     async fn get_type_schema_by_uuid(
         &self,
         _uuid: Uuid,
-    ) -> std::result::Result<GtsTypeSchema, TypesRegistryError> {
+    ) -> std::result::Result<GtsTypeSchema, CanonicalError> {
         if self.fail {
-            Err(TypesRegistryError::gts_type_schema_not_found("test"))
+            Err(types_registry_sdk::testing::not_found("test"))
         } else {
             Ok(make_test_type_schema(TEST_TYPE_ID))
         }
@@ -85,12 +85,12 @@ impl TypesRegistryClient for TestRegistry {
     async fn get_type_schemas_by_uuid(
         &self,
         uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, std::result::Result<GtsTypeSchema, TypesRegistryError>> {
+    ) -> HashMap<Uuid, std::result::Result<GtsTypeSchema, CanonicalError>> {
         uuids
             .into_iter()
             .map(|u| {
                 let res = if self.fail {
-                    Err(TypesRegistryError::gts_type_schema_not_found("test"))
+                    Err(types_registry_sdk::testing::not_found("test"))
                 } else {
                     Ok(make_test_type_schema(TEST_TYPE_ID))
                 };
@@ -102,74 +102,71 @@ impl TypesRegistryClient for TestRegistry {
     async fn register(
         &self,
         _: Vec<serde_json::Value>,
-    ) -> std::result::Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> std::result::Result<Vec<RegisterResult>, CanonicalError> {
         unimplemented!("tr_plugin does not call register")
     }
 
     async fn register_type_schemas(
         &self,
         _: Vec<serde_json::Value>,
-    ) -> std::result::Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> std::result::Result<Vec<RegisterResult>, CanonicalError> {
         unimplemented!("tr_plugin does not call register_type_schemas")
     }
 
-    async fn get_type_schema(
-        &self,
-        _: &str,
-    ) -> std::result::Result<GtsTypeSchema, TypesRegistryError> {
+    async fn get_type_schema(&self, _: &str) -> std::result::Result<GtsTypeSchema, CanonicalError> {
         unimplemented!("tr_plugin does not call get_type_schema by string id")
     }
 
     async fn get_type_schemas(
         &self,
         _: Vec<String>,
-    ) -> HashMap<String, std::result::Result<GtsTypeSchema, TypesRegistryError>> {
+    ) -> HashMap<String, std::result::Result<GtsTypeSchema, CanonicalError>> {
         unimplemented!("tr_plugin does not call get_type_schemas by string ids")
     }
 
     async fn list_type_schemas(
         &self,
         _: TypeSchemaQuery,
-    ) -> std::result::Result<Vec<GtsTypeSchema>, TypesRegistryError> {
+    ) -> std::result::Result<Vec<GtsTypeSchema>, CanonicalError> {
         unimplemented!("tr_plugin does not call list_type_schemas")
     }
 
     async fn register_instances(
         &self,
         _: Vec<serde_json::Value>,
-    ) -> std::result::Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> std::result::Result<Vec<RegisterResult>, CanonicalError> {
         unimplemented!("tr_plugin does not call register_instances")
     }
 
-    async fn get_instance(&self, _: &str) -> std::result::Result<GtsInstance, TypesRegistryError> {
+    async fn get_instance(&self, _: &str) -> std::result::Result<GtsInstance, CanonicalError> {
         unimplemented!("tr_plugin does not call get_instance")
     }
 
     async fn get_instance_by_uuid(
         &self,
         _: Uuid,
-    ) -> std::result::Result<GtsInstance, TypesRegistryError> {
+    ) -> std::result::Result<GtsInstance, CanonicalError> {
         unimplemented!("tr_plugin does not call get_instance_by_uuid")
     }
 
     async fn get_instances(
         &self,
         _: Vec<String>,
-    ) -> HashMap<String, std::result::Result<GtsInstance, TypesRegistryError>> {
+    ) -> HashMap<String, std::result::Result<GtsInstance, CanonicalError>> {
         unimplemented!("tr_plugin does not call get_instances")
     }
 
     async fn get_instances_by_uuid(
         &self,
         _: Vec<Uuid>,
-    ) -> HashMap<Uuid, std::result::Result<GtsInstance, TypesRegistryError>> {
+    ) -> HashMap<Uuid, std::result::Result<GtsInstance, CanonicalError>> {
         unimplemented!("tr_plugin does not call get_instances_by_uuid")
     }
 
     async fn list_instances(
         &self,
         _: InstanceQuery,
-    ) -> std::result::Result<Vec<GtsInstance>, TypesRegistryError> {
+    ) -> std::result::Result<Vec<GtsInstance>, CanonicalError> {
         unimplemented!("tr_plugin does not call list_instances")
     }
 }

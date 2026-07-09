@@ -19,9 +19,9 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.8", path = "../../tenant-resolver-sdk" }
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.1.5", path = "../../../resource-group/resource-group-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.2.3", path = "../../../types-registry/types-registry-sdk" }
+tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.9", path = "../../tenant-resolver-sdk" }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.0", path = "../../../resource-group/resource-group-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.0", path = "../../../types-registry/types-registry-sdk" }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
@@ -31,7 +31,6 @@ toolkit-odata = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }
-futures = { workspace = true }
 
 # Data structures
 uuid = { workspace = true }
@@ -51,3 +50,7 @@ inventory = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+# Test fakes synthesize the `CanonicalError` envelope the RG trait now
+# returns (ADR 0005). Production code only projects it via the SDK's
+# `ResourceGroupError::from`, so this is dev-only.
+toolkit-canonical-errors = { workspace = true }

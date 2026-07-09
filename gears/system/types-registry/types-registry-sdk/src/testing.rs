@@ -21,15 +21,51 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use toolkit_canonical_errors::CanonicalError;
 use uuid::Uuid;
 
 use crate::api::TypesRegistryClient;
-use crate::error::TypesRegistryError;
+use crate::field;
+use crate::gts::TypeResource;
 use crate::models::{
     GtsInstance, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
     is_type_schema_id,
 };
-use gts::GtsInstanceId;
+use gts::{GtsID, GtsInstanceId};
+
+/// Builds the `InvalidArgument` canonical error the registry returns for a
+/// malformed / kind-mismatched GTS id (reason [`field::INVALID_GTS_ID`]),
+/// matching the real client's classification.
+///
+/// Exposed so consumer test fakes that implement [`TypesRegistryClient`] can
+/// synthesize the same canonical envelopes the real client emits.
+#[must_use]
+pub fn invalid_gts_id(message: impl Into<String>) -> CanonicalError {
+    TypeResource::invalid_argument()
+        .with_field_violation(field::GTS_ID_FIELD, message, field::INVALID_GTS_ID)
+        .create()
+}
+
+/// Builds the `NotFound` canonical error the registry returns for an
+/// unregistered id / UUID, tagged with the types-registry resource type.
+///
+/// Exposed for consumer test fakes (see [`invalid_gts_id`]).
+#[must_use]
+pub fn not_found(id: impl Into<String>) -> CanonicalError {
+    let id = id.into();
+    TypeResource::not_found(format!("no entity registered: {id}"))
+        .with_resource(id)
+        .create()
+}
+
+/// Builds the opaque `Internal` canonical error the registry returns for an
+/// infrastructure failure.
+///
+/// Exposed for consumer test fakes (see [`invalid_gts_id`]).
+#[must_use]
+pub fn internal(message: impl Into<String>) -> CanonicalError {
+    CanonicalError::internal(message).create()
+}
 
 /// Stateful in-memory implementation of [`TypesRegistryClient`] for tests.
 ///
@@ -49,7 +85,7 @@ use gts::GtsInstanceId;
 pub struct MockTypesRegistryClient {
     type_schemas: Vec<GtsTypeSchema>,
     instances: Vec<GtsInstance>,
-    list_error: Option<TypesRegistryError>,
+    list_error: Option<CanonicalError>,
     received_type_schema_queries: Mutex<Vec<TypeSchemaQuery>>,
     received_instance_queries: Mutex<Vec<InstanceQuery>>,
 }
@@ -78,7 +114,7 @@ impl MockTypesRegistryClient {
     /// Configures the registry so that every `list_*` call fails with the
     /// given error. Useful for testing error-propagation paths.
     #[must_use]
-    pub fn with_list_error(mut self, err: TypesRegistryError) -> Self {
+    pub fn with_list_error(mut self, err: CanonicalError) -> Self {
         self.list_error = Some(err);
         self
     }
@@ -125,10 +161,7 @@ impl MockTypesRegistryClient {
 
 #[async_trait]
 impl TypesRegistryClient for MockTypesRegistryClient {
-    async fn register(
-        &self,
-        entities: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+    async fn register(&self, entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
         assert!(
             entities.is_empty(),
             "MockTypesRegistryClient::register is not implemented; \
@@ -140,7 +173,7 @@ impl TypesRegistryClient for MockTypesRegistryClient {
     async fn register_type_schemas(
         &self,
         type_schemas: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
         assert!(
             type_schemas.is_empty(),
             "MockTypesRegistryClient::register_type_schemas is not implemented; \
@@ -149,34 +182,33 @@ impl TypesRegistryClient for MockTypesRegistryClient {
         Ok(vec![])
     }
 
-    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, TypesRegistryError> {
+    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
         if !is_type_schema_id(type_id) {
-            return Err(TypesRegistryError::invalid_gts_type_id(format!(
-                "{type_id} does not end with `~`",
-            )));
+            return Err(invalid_gts_id(format!("{type_id} does not end with `~`")));
         }
+        GtsID::new(type_id).map_err(|e| invalid_gts_id(format!("{e}")))?;
         self.type_schemas
             .iter()
             .find(|s| s.type_id == type_id)
             .cloned()
-            .ok_or_else(|| TypesRegistryError::gts_type_schema_not_found(type_id))
+            .ok_or_else(|| not_found(type_id))
     }
 
     async fn get_type_schema_by_uuid(
         &self,
         type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, TypesRegistryError> {
+    ) -> Result<GtsTypeSchema, CanonicalError> {
         self.type_schemas
             .iter()
             .find(|s| s.type_uuid == type_uuid)
             .cloned()
-            .ok_or_else(|| TypesRegistryError::gts_type_schema_not_found(type_uuid.to_string()))
+            .ok_or_else(|| not_found(type_uuid.to_string()))
     }
 
     async fn get_type_schemas(
         &self,
         type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, TypesRegistryError>> {
+    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
         let mut out = HashMap::with_capacity(type_ids.len());
         for id in type_ids {
             let res = self.get_type_schema(&id).await;
@@ -188,7 +220,7 @@ impl TypesRegistryClient for MockTypesRegistryClient {
     async fn get_type_schemas_by_uuid(
         &self,
         type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, TypesRegistryError>> {
+    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
         let mut out = HashMap::with_capacity(type_uuids.len());
         for uuid in type_uuids {
             let res = self.get_type_schema_by_uuid(uuid).await;
@@ -200,7 +232,7 @@ impl TypesRegistryClient for MockTypesRegistryClient {
     async fn list_type_schemas(
         &self,
         query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, TypesRegistryError> {
+    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
         self.received_type_schema_queries
             .lock()
             .expect("MockTypesRegistryClient: type-schema query log poisoned")
@@ -214,7 +246,7 @@ impl TypesRegistryClient for MockTypesRegistryClient {
     async fn register_instances(
         &self,
         instances: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
         assert!(
             instances.is_empty(),
             "MockTypesRegistryClient::register_instances is not implemented; \
@@ -223,31 +255,32 @@ impl TypesRegistryClient for MockTypesRegistryClient {
         Ok(vec![])
     }
 
-    async fn get_instance(&self, id: &str) -> Result<GtsInstance, TypesRegistryError> {
+    async fn get_instance(&self, id: &str) -> Result<GtsInstance, CanonicalError> {
         if is_type_schema_id(id) {
-            return Err(TypesRegistryError::invalid_gts_instance_id(format!(
+            return Err(invalid_gts_id(format!(
                 "{id} ends with `~` (looks like a type-schema id)",
             )));
         }
+        GtsID::new(id).map_err(|e| invalid_gts_id(format!("{e}")))?;
         self.instances
             .iter()
             .find(|e| e.id == id)
             .cloned()
-            .ok_or_else(|| TypesRegistryError::gts_instance_not_found(id))
+            .ok_or_else(|| not_found(id))
     }
 
-    async fn get_instance_by_uuid(&self, uuid: Uuid) -> Result<GtsInstance, TypesRegistryError> {
+    async fn get_instance_by_uuid(&self, uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
         self.instances
             .iter()
             .find(|e| e.uuid == uuid)
             .cloned()
-            .ok_or_else(|| TypesRegistryError::gts_instance_not_found(uuid.to_string()))
+            .ok_or_else(|| not_found(uuid.to_string()))
     }
 
     async fn get_instances(
         &self,
         ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, TypesRegistryError>> {
+    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
         let mut out = HashMap::with_capacity(ids.len());
         for id in ids {
             let res = self.get_instance(&id).await;
@@ -259,7 +292,7 @@ impl TypesRegistryClient for MockTypesRegistryClient {
     async fn get_instances_by_uuid(
         &self,
         uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, TypesRegistryError>> {
+    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
         let mut out = HashMap::with_capacity(uuids.len());
         for uuid in uuids {
             let res = self.get_instance_by_uuid(uuid).await;
@@ -271,7 +304,7 @@ impl TypesRegistryClient for MockTypesRegistryClient {
     async fn list_instances(
         &self,
         query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, TypesRegistryError> {
+    ) -> Result<Vec<GtsInstance>, CanonicalError> {
         self.received_instance_queries
             .lock()
             .expect("MockTypesRegistryClient: instance query log poisoned")

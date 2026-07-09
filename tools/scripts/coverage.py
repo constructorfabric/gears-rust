@@ -22,6 +22,7 @@ import yaml
 # Import prereq gear for environment validation
 from lib.prereq import check_environment_ready
 from lib.platform import (
+    e2e_env_overrides,
     find_binary,
     popen_new_group,
     read_e2e_features,
@@ -696,6 +697,11 @@ def check_port_available(port):
 
 
 def get_llvm_cov_env():
+    # `show-env --sh` emits POSIX `export KEY='value'` lines. Values are
+    # single-quoted, so parsing with shlex(posix=True) preserves Windows
+    # backslash paths verbatim (single quotes are literal in POSIX) -- this
+    # parser is therefore cross-platform; do not switch to a backslash-aware
+    # mode that would corrupt these paths.
     result = run_cmd_capture(
         ["cargo", "llvm-cov", "show-env", "--sh"],
         cwd=PROJECT_ROOT,
@@ -778,6 +784,12 @@ def start_instrumented_server(config_file, output_dir, port=None):
     target_dir = PROJECT_ROOT / "target" / "llvm-cov-target"
     env2["CARGO_TARGET_DIR"] = str(target_dir)
     env2["LLVM_PROFILE_FILE"] = str(target_dir / "cf-gears-%p-%m.profraw")
+
+    # Apply per-OS server config overrides (e.g. grpc-hub TCP on Windows,
+    # where the config's UDS address is unsupported). setdefault keeps any
+    # explicit user-provided override.
+    for key, value in e2e_env_overrides().items():
+        env2.setdefault(key, value)
 
     build_instrumented_server(env2, target_dir)
 

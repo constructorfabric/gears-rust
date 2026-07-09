@@ -777,8 +777,8 @@ impl TypeProvisioningService for TypeProvisioningServiceImpl {
 #[cfg(test)]
 mod tests {
     use types_registry_sdk::{
-        GtsInstance, TypesRegistryError,
-        testing::{MockTypesRegistryClient, make_test_instance},
+        GtsInstance,
+        testing::{MockTypesRegistryClient, internal, make_test_instance},
     };
 
     use super::*;
@@ -890,10 +890,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_upstreams_propagates_registry_error() {
-        let registry = Arc::new(
-            MockTypesRegistryClient::new()
-                .with_list_error(TypesRegistryError::internal("connection lost")),
-        );
+        let registry =
+            Arc::new(MockTypesRegistryClient::new().with_list_error(internal("connection lost")));
         let svc = TypeProvisioningServiceImpl::new(registry);
 
         let result = svc.list_upstreams().await;
@@ -963,9 +961,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_routes_propagates_registry_error() {
-        let registry = Arc::new(
-            MockTypesRegistryClient::new().with_list_error(TypesRegistryError::internal("timeout")),
-        );
+        let registry =
+            Arc::new(MockTypesRegistryClient::new().with_list_error(internal("timeout")));
         let svc = TypeProvisioningServiceImpl::new(registry);
 
         let result = svc.list_routes().await;

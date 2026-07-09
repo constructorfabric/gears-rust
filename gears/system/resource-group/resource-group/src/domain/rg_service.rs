@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use resource_group_sdk::ResourceGroupClient;
-use resource_group_sdk::error::ResourceGroupError;
 use resource_group_sdk::models::{
     CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupMembership,
     ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
 };
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -64,33 +64,33 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         &self,
         _ctx: &SecurityContext,
         request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         self.type_service
             .create_type(request)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn get_type(
         &self,
         _ctx: &SecurityContext,
         code: &str,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         self.type_service
             .get_type(code)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn list_types(
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
         self.type_service
             .list_types(query)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn update_type(
@@ -98,22 +98,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         _ctx: &SecurityContext,
         code: &str,
         request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         self.type_service
             .update_type(code, request)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
-    async fn delete_type(
-        &self,
-        _ctx: &SecurityContext,
-        code: &str,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_type(&self, _ctx: &SecurityContext, code: &str) -> Result<(), CanonicalError> {
         self.type_service
             .delete_type(code)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     // -- Group lifecycle --
@@ -122,34 +118,34 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         &self,
         ctx: &SecurityContext,
         request: CreateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         let tenant_id = ctx.subject_tenant_id();
         self.group_service
             .create_group(ctx, request, tenant_id)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn get_group(
         &self,
         ctx: &SecurityContext,
         id: Uuid,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         self.group_service
             .get_group(ctx, id)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn list_groups(
         &self,
         ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroup>, CanonicalError> {
         self.group_service
             .list_groups(ctx, query)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn update_group(
@@ -157,31 +153,27 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         ctx: &SecurityContext,
         id: Uuid,
         request: UpdateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         self.group_service
             .update_group(ctx, id, request)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
-    async fn delete_group(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_group(&self, ctx: &SecurityContext, id: Uuid) -> Result<(), CanonicalError> {
         // Non-cascade variant: surface `ConflictActiveReferences` to the
         // caller; cascade goes through `delete_group_cascade` below.
         self.group_service
             .delete_group(ctx, id, false)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn delete_group_cascade(
         &self,
         ctx: &SecurityContext,
         id: Uuid,
-    ) -> Result<(), ResourceGroupError> {
+    ) -> Result<(), CanonicalError> {
         // Cascade variant: forwards to `delete_group_inner` with
         // `force=true`, which atomically removes the entire subtree,
         // membership rows, and closure rows under a SERIALIZABLE
@@ -189,7 +181,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         self.group_service
             .delete_group(ctx, id, true)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn get_group_descendants(
@@ -197,11 +189,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         ctx: &SecurityContext,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         self.group_service
             .get_group_descendants(ctx, group_id, query)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn get_group_ancestors(
@@ -209,11 +201,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         ctx: &SecurityContext,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         self.group_service
             .get_group_ancestors(ctx, group_id, query)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     // -- Membership lifecycle --
@@ -224,11 +216,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         group_id: Uuid,
         resource_type: &str,
         resource_id: &str,
-    ) -> Result<ResourceGroupMembership, ResourceGroupError> {
+    ) -> Result<ResourceGroupMembership, CanonicalError> {
         self.membership_service
             .add_membership(ctx, group_id, resource_type, resource_id)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn remove_membership(
@@ -237,21 +229,21 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         group_id: Uuid,
         resource_type: &str,
         resource_id: &str,
-    ) -> Result<(), ResourceGroupError> {
+    ) -> Result<(), CanonicalError> {
         self.membership_service
             .remove_membership(ctx, group_id, resource_type, resource_id)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 
     async fn list_memberships(
         &self,
         ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
         self.membership_service
             .list_memberships(ctx, query)
             .await
-            .map_err(ResourceGroupError::from)
+            .map_err(CanonicalError::from)
     }
 }

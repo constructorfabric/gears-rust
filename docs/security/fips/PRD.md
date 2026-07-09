@@ -49,7 +49,7 @@ the ADRs in [`adrs/`](adrs/).
 
 | Term        | Definition                                                                                                                                                            |
 |-------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| CMVP        | Cryptographic Gear Validation Program (NIST) — the validation regime that produces FIPS 140-3 certificates.                                                         |
+| CMVP        | Cryptographic Module Validation Program (NIST) — the validation regime that produces FIPS 140-3 certificates.                                                         |
 | OE          | Operational Environment — the specific OS version + hardware combination listed on a CMVP certificate. A binary running outside the OE has no valid FIPS claim.       |
 | CAVS        | Cryptographic Algorithm Validation System — NIST's per-algorithm test program. CAVS validation is one prerequisite for the composite CMVP module certification.       |
 | corecrypto  | Apple's user-space cryptographic module, CMVP-validated per macOS release. Accessed via `Security.framework` / `CommonCrypto`.                                        |
@@ -93,7 +93,7 @@ the ADRs in [`adrs/`](adrs/).
 
 ### 2.2 System Actors
 
-#### CMVP Gear (Apple corecrypto / AWS-LC FIPS / Windows CNG)
+#### CMVP Module (Apple corecrypto / AWS-LC FIPS / Windows CNG)
 
 **ID**: `cpt-toolkit-fips-actor-cmvp-module`
 
@@ -150,7 +150,7 @@ engineering.
 
 ### 4.2 Out of Scope
 
-- **Gears themselves on the CMVP Validated Gears list.** Gears are consumers of validated modules; the validated
+- **Gears themselves on the CMVP Validated Modules list.** Gears are consumers of validated modules; the validated
   modules are Apple corecrypto, AWS-LC FIPS Provider, and Microsoft Windows CNG.
 - **Non-TLS crypto in the binary.** JWT signature validation (`jsonwebtoken`) uses `ring` / non-FIPS
   `aws-lc-rs`. `ring`, non-FIPS `aws-lc-rs`, and `chacha20` are linked into the macOS+fips binary via transitive deps
@@ -400,12 +400,12 @@ TLS state machine. Only the crypto-primitive backend behind a `cfg` branch MUST 
 
 #### CMVP-validated module ABI
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-contract-cmvp-gear-abi`
+- [ ] `p1` - **ID**: `cpt-toolkit-fips-contract-cmvp-module-abi`
 
 - **Direction**: required from external system.
 - **Protocol/Format**: Apple `Security.framework` / `CommonCrypto` (macOS), `bcrypt.dll` / `ncrypt.dll` (Windows),
   AWS-LC C ABI (Linux).
-- **Compatibility**: Each gear's ABI is stable per OS major version; Apple, Microsoft, and AWS Labs publish a new CMVP
+- **Compatibility**: Each module's ABI is stable per OS major version; Apple, Microsoft, and AWS Labs publish a new CMVP
   cert per OS major release. The Gears code adapts via the per-target `CryptoProvider` integration; binary
   compatibility is maintained by re-linking against the OS-supplied module at run time.
 
@@ -549,7 +549,7 @@ TLS state machine. Only the crypto-primitive backend behind a `cfg` branch MUST 
 | `rustls-cng-crypto` is a single-maintainer young crate; upstream may stagnate                | Windows FIPS posture loses upstream maintenance                                                              | Caret-pin to `0.1.x`; migration path to `rustls-symcrypt` documented in [ADR 0003](adrs/0003-windows-fips-via-rustls-cng-crypto.md) as a trigger-based switch |
 | Apple SDK silently changes RSA-PSS salt-length default                                       | TLS 1.3 interop breaks with RFC-compliant peers; FIPS-claim becomes ambiguous                                | Cross-impl regression test `rsa_pss_apple_salt_length_matches_rfc8017` runs on every CI build                                                                 |
 | Transitive dep pulls a banned Phase A crate into a future PR                                 | Build-time FIPS regression                                                                                   | `make fips-policy` is a required CI gate via `make security`; pre-merge `cargo-deny` rejection                                                                |
-| Non-TLS crypto paths (JWT, password hashing) drift further from the validated gear surface | Audit finding: "FIPS claim is not what it says on the tin"                                                   | Phase B of `deny-fips.toml` tracks each non-validated crypto crate currently in graph; TODO-7 tracks the broader audit                                        |
+| Non-TLS crypto paths (JWT, password hashing) drift further from the validated module surface | Audit finding: "FIPS claim is not what it says on the tin"                                                   | Phase B of `deny-fips.toml` tracks each non-validated crypto crate currently in graph; TODO-7 tracks the broader audit                                        |
 | OE-validation cert table goes stale                                                          | Production deployments accept an OS version that has dropped out of the cert's OE                            | Release-checklist explicitly searches the CMVP database per release; TODO-6 tracks automation                                                                 |
 
 ## 13. Open Questions

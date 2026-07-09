@@ -4,7 +4,6 @@
 //! Domain error types for the resource-group gear.
 
 use authz_resolver_sdk::pep::EnforcerError;
-use resource_group_sdk::ResourceGroupError;
 use thiserror::Error;
 
 /// Domain-specific errors for the resource-group gear.
@@ -205,43 +204,12 @@ impl DomainError {
     }
 }
 
-/// Convert domain errors to SDK errors for public API consumption.
-impl From<DomainError> for ResourceGroupError {
-    fn from(e: DomainError) -> Self {
-        match e {
-            DomainError::TypeNotFound { code } => ResourceGroupError::not_found(code),
-            DomainError::TypeAlreadyExists { code } => {
-                ResourceGroupError::type_already_exists(code)
-            }
-            DomainError::Validation { message } => ResourceGroupError::validation(message),
-            DomainError::InvalidParentType { message } => {
-                ResourceGroupError::invalid_parent_type(message)
-            }
-            DomainError::CycleDetected { message } => ResourceGroupError::cycle_detected(message),
-            DomainError::LimitViolation { message } => ResourceGroupError::limit_violation(message),
-            DomainError::AllowedParentTypesViolation { message } => {
-                ResourceGroupError::allowed_parent_types_violation(message)
-            }
-            DomainError::ConflictActiveReferences { message } => {
-                ResourceGroupError::conflict_active_references(message)
-            }
-            DomainError::Conflict { message }
-            | DomainError::DuplicateMembership { message, .. } => {
-                ResourceGroupError::conflict(message)
-            }
-            DomainError::TenantRootAlreadyExists { detail, .. } => {
-                ResourceGroupError::conflict(detail)
-            }
-            DomainError::GroupNotFound { id } => ResourceGroupError::not_found(id.to_string()),
-            DomainError::MembershipNotFound { key } => ResourceGroupError::not_found(key),
-            DomainError::TenantIncompatibility { message } => {
-                ResourceGroupError::tenant_incompatibility(message)
-            }
-            DomainError::AccessDenied { .. } => ResourceGroupError::access_denied(),
-            DomainError::Database(_) | DomainError::InternalError => ResourceGroupError::internal(),
-        }
-    }
-}
+// The SDK-facing `From<DomainError> for ResourceGroupError` ladder was
+// removed per ADR 0005: the SDK trait boundary is now `CanonicalError`,
+// and `ResourceGroupError` is an opt-in `From<CanonicalError>` projection
+// in the SDK crate. The single authoritative AIP-193 classification is
+// the `From<DomainError> for CanonicalError` ladder in
+// `crate::api::rest::error`.
 
 impl From<sea_orm::DbErr> for DomainError {
     fn from(e: sea_orm::DbErr) -> Self {

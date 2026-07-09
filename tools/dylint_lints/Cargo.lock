@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-system-sdk-directory"
-version = "0.1.35"
+version = "0.1.37"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -545,14 +545,14 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-system-sdks"
-version = "0.1.35"
+version = "0.1.37"
 dependencies = [
  "cf-gears-system-sdk-directory",
 ]
 
 [[package]]
 name = "cf-gears-toolkit"
-version = "0.6.10"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -571,7 +571,6 @@ dependencies = [
  "futures-core",
  "futures-util",
  "gts",
- "gts-macros",
  "http",
  "inventory",
  "nix 0.31.2",
@@ -580,7 +579,6 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "rustls",
- "schemars",
  "sea-orm-migration",
  "serde",
  "serde_json",
@@ -599,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-canonical-errors"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "axum 0.8.9",
  "cf-gears-toolkit-canonical-errors-macro",
@@ -623,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-db"
-version = "0.8.2"
+version = "0.8.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -653,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-db-macros"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "heck 0.5.0",
  "proc-macro-error2",
@@ -664,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-gts"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "cf-gears-toolkit-gts-macros",
@@ -678,9 +676,8 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-gts-macros"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
- "gts-macros",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -689,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-macros"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -700,27 +697,23 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-odata"
-version = "0.8.0"
+version = "0.8.2"
 dependencies = [
  "base64",
  "bigdecimal",
  "cf-gears-toolkit-canonical-errors",
  "chrono",
  "chrono-tz",
- "hex",
- "http",
  "peg",
  "serde",
  "serde_json",
- "sha2",
  "thiserror 2.0.18",
- "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-toolkit-sdk"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
@@ -730,9 +723,8 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-security"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
- "anyhow",
  "postcard",
  "secrecy",
  "serde",
@@ -787,8 +779,8 @@ dependencies = [
 
 [[package]]
 name = "clippy_utils"
-version = "0.1.95"
-source = "git+https://github.com/rust-lang/rust-clippy?rev=54482290b5f32e6c6b57cc9e0a17153f432b0036#54482290b5f32e6c6b57cc9e0a17153f432b0036"
+version = "0.1.97"
+source = "git+https://github.com/rust-lang/rust-clippy?rev=f6d310692116e9a527ce6d0b3526c965d9c5d7b9#f6d310692116e9a527ce6d0b3526c965d9c5d7b9"
 dependencies = [
  "arrayvec",
  "itertools 0.12.1",
@@ -1081,7 +1073,6 @@ dependencies = [
  "dylint_linting",
  "dylint_testing",
  "lint_utils",
- "tokio",
 ]
 
 [[package]]
@@ -1167,6 +1158,17 @@ dependencies = [
  "dylint_linting",
  "dylint_testing",
  "lint_utils",
+]
+
+[[package]]
+name = "de0708_no_non_fips_hasher"
+version = "0.1.0"
+dependencies = [
+ "clippy_utils",
+ "dylint_linting",
+ "dylint_testing",
+ "lint_utils",
+ "sha2",
 ]
 
 [[package]]
@@ -1413,9 +1415,9 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dylint"
-version = "5.0.0"
+version = "6.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa9a937bab540c0c8cdcbd650a572e6899ef2b6ffbc277d61bd2ae8d17c0edce"
+checksum = "c738fb72ea7d248df2995a31b3698beb63d0f1f9ca5a5dc0188c4b64cd0e86e4"
 dependencies = [
  "anstyle",
  "anyhow",
@@ -1431,9 +1433,9 @@ dependencies = [
 
 [[package]]
 name = "dylint_internal"
-version = "5.0.0"
+version = "6.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e11f358a59510be7fa5c4f412729fabbe31a3587a342e4241a6a72020a2a0c5"
+checksum = "9796d3441d7894cbaf4992640799efffc1661978f0cc1266ec788c32254fdfb3"
 dependencies = [
  "anstyle",
  "anyhow",
@@ -1441,10 +1443,8 @@ dependencies = [
  "cargo_metadata",
  "git2",
  "home",
- "if_chain",
  "log",
  "regex",
- "rustversion",
  "serde",
  "tar",
  "thiserror 2.0.18",
@@ -1453,9 +1453,9 @@ dependencies = [
 
 [[package]]
 name = "dylint_linting"
-version = "5.0.0"
+version = "6.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4588b33aafbd472a6468ad1521d74094faa2bbdb53d534c2d24320300ea94135"
+checksum = "c213635b3eaa84f43b9b497377f17d9a8d4feb413bab1d82e03ad1c73e4f6d8c"
 dependencies = [
  "cargo_metadata",
  "dylint_internal",
@@ -1468,9 +1468,9 @@ dependencies = [
 
 [[package]]
 name = "dylint_testing"
-version = "5.0.0"
+version = "6.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdc27f344ddb5488eb16b6e0f8aec889a30fb7e4d135060d336cfa60d1fd671c"
+checksum = "4f5f50ee06be9ebfb5b9538ba0d7bb08adc33e8f31c901e7d398de2a9b1ae290"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -2305,12 +2305,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "if_chain"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
-
-[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2559,10 +2553,6 @@ dependencies = [
 [[package]]
 name = "lint_utils"
 version = "0.1.0"
-dependencies = [
- "clippy_utils",
- "dylint_linting",
-]
 
 [[package]]
 name = "linux-raw-sys"
@@ -4725,26 +4715,17 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "0.9.12+spec-1.1.0"
+version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
 dependencies = [
  "indexmap",
  "serde_core",
  "serde_spanned",
- "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_datetime",
  "toml_parser",
  "toml_writer",
- "winnow 0.7.15",
-]
-
-[[package]]
-name = "toml_datetime"
-version = "0.7.5+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
-dependencies = [
- "serde_core",
+ "winnow",
 ]
 
 [[package]]
@@ -4763,9 +4744,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b59c4d22ed448339746c59b905d24568fcbb3ab65a500494f7b8c3e97739f2b"
 dependencies = [
  "indexmap",
- "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_datetime",
  "toml_parser",
- "winnow 1.0.1",
+ "winnow",
 ]
 
 [[package]]
@@ -4774,7 +4755,7 @@ version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
- "winnow 1.0.1",
+ "winnow",
 ]
 
 [[package]]
@@ -5558,12 +5539,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "winnow"
-version = "0.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 
 [[package]]
 name = "winnow"

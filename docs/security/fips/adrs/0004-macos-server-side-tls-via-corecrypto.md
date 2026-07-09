@@ -14,7 +14,7 @@ decision-makers: Constructor Fabric Steering Committee
 
 ## Background
 
-This ADR **extends** the macOS provider scope decided in [ADR 0001](0001-macos-fips-via-corecrypto-provider.md). The provider was deliberately client-side-only; this ADR adds server-side `KeyProvider` so a `rustls::ServerConfig` works on macOS+FIPS, and brings the algorithm scope into parity with the Windows path. Cross-OS architecture and the dual `default_provider()` / `fips_provider()` factory pattern are documented in the [FIPS PRD](../PRD.md) (see §3 gear-specific environment constraints and §7 public library interfaces).
+This ADR **extends** the macOS provider scope decided in [ADR 0001](0001-macos-fips-via-corecrypto-provider.md). The provider was deliberately client-side-only; this ADR adds server-side `KeyProvider` so a `rustls::ServerConfig` works on macOS+FIPS, and brings the algorithm scope into parity with the Windows path. Cross-OS architecture and the dual `default_provider()` / `fips_provider()` factory pattern are documented in the [FIPS PRD](../PRD.md) (see §3 module-specific environment constraints and §7 public library interfaces).
 
 ## Context and Problem Statement
 

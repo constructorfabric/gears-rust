@@ -51,6 +51,19 @@ pub struct ResourceGroupTypeV1 {
     pub allowed_membership_types: Vec<String>,
 }
 
+/// Canonical GTS resource type for a resource **group** as a resource.
+///
+/// Lands in `CanonicalError::{NotFound,AlreadyExists}.ctx.resource_type`
+/// for every group-attributable error and backs the impl crate's
+/// `#[resource_error("…")]` REST marker. The macro literal there cannot
+/// reference this const (proc-macros can't resolve consts), so the
+/// round-trip tests in [`crate::error`] assert the two stay equal.
+///
+/// Match it against the resource-scoped projection variants
+/// ([`crate::ResourceGroupError::NotFound`] /
+/// [`crate::ResourceGroupError::AlreadyExists`]).
+pub const GROUP_RESOURCE_TYPE: &str = "gts.cf.core.resource_group.group.v1~";
+
 /// GTS type path for the tenant resource-group type.
 ///
 /// Any RG type whose code **starts with** this path is considered a tenant

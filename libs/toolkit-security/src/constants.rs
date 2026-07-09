@@ -22,3 +22,11 @@ pub const DEFAULT_SUBJECT_ID: Uuid = uuid!("11111111-6a88-4768-9dfc-6bcd5187d9ed
 
 /// Default GTS type ID placeholder.
 pub const GTS_DEFAULT_TYPE_ID: Uuid = uuid!("22222222-0000-0000-0000-000000000001");
+
+/// Header (HTTP) / metadata (gRPC) key carrying the platform-plane internal
+/// credential. Always lower-case (canonical for both HTTP/2 and gRPC metadata).
+///
+/// Platform-plane (system) calls use this key — **never** `Authorization`, to
+/// avoid colliding with the tenant-plane user JWT
+/// (`cpt-cf-adr-platform-plane-auth` / `cpt-cf-adr-two-plane-auth`).
+pub const INTERNAL_TOKEN_HEADER: &str = "x-toolkit-internal-token";

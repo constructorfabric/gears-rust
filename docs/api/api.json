@@ -47,6 +47,20 @@
         ],
         "type": "object"
       },
+      "AgeRetentionDto": {
+        "description": "Age-based retention criterion.",
+        "properties": {
+          "max_age_days": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_age_days"
+        ],
+        "type": "object"
+      },
       "AttachmentSummaryDto": {
         "description": "Lightweight attachment metadata embedded in Message responses.",
         "properties": {
@@ -125,6 +139,19 @@
         ],
         "type": "object"
       },
+      "BindReq": {
+        "description": "Request body for `POST /files/{id}/bind`.",
+        "properties": {
+          "version_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version_id"
+        ],
+        "type": "object"
+      },
       "BudgetConfig": {
         "properties": {
           "mode": {
@@ -166,6 +193,26 @@
         },
         "required": [
           "capacity"
+        ],
+        "type": "object"
+      },
+      "CapabilitiesDto": {
+        "description": "Backend capabilities surface for `GET /storages`.",
+        "properties": {
+          "encryption_native": {
+            "type": "boolean"
+          },
+          "multipart_native": {
+            "type": "boolean"
+          },
+          "range_native": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "multipart_native",
+          "encryption_native",
+          "range_native"
         ],
         "type": "object"
       },
@@ -588,6 +635,49 @@
         ],
         "type": "object"
       },
+      "CreateFileReq": {
+        "description": "Request to create a file (`POST /files`).",
+        "properties": {
+          "custom_metadata": {
+            "items": {
+              "$ref": "#/components/schemas/MetadataEntryDto"
+            },
+            "type": "array"
+          },
+          "gts_file_type": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "description": "Optional idempotency key for deduplication of retried requests.\nWithin the same `(owner_kind, owner_id)`, a retry with the same key\nreturns the original response without creating a new file.\n\n@cpt-cf-file-storage-fr-upload-idempotency",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "owner_kind": {
+            "description": "`\"user\"` or `\"app\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner_kind",
+          "owner_id",
+          "name",
+          "gts_file_type",
+          "mime_type"
+        ],
+        "type": "object"
+      },
       "CreateGroupDto": {
         "description": "REST DTO for creating a new resource group.",
         "properties": {
@@ -614,6 +704,31 @@
         "required": [
           "type",
           "name"
+        ],
+        "type": "object"
+      },
+      "CreateRetentionRuleReq": {
+        "description": "Request body to create a retention rule (`POST /retention-rules`).",
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/RetentionRuleBodyDto"
+          },
+          "scope": {
+            "description": "`\"tenant\"`, `\"user\"`, or `\"file\"`.",
+            "type": "string"
+          },
+          "scope_target_id": {
+            "description": "Target id (`user_id` for user scope, `file_id` for file scope; omit for tenant scope).",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "scope",
+          "body"
         ],
         "type": "object"
       },
@@ -894,6 +1009,67 @@
         ],
         "type": "object"
       },
+      "DownloadTicketDto": {
+        "description": "Result of `GET /files/{id}/download-url`.",
+        "properties": {
+          "download_url": {
+            "type": "string"
+          },
+          "etag": {
+            "type": "string"
+          },
+          "version_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "download_url",
+          "etag",
+          "version_id"
+        ],
+        "type": "object"
+      },
+      "EffectivePolicyDto": {
+        "description": "Effective policy response: the most-restrictive combination of tenant ⊕ user.\n\n@cpt-cf-file-storage-usecase-configure-policy",
+        "properties": {
+          "allowed_mime_types": {
+            "description": "Intersection of allowed mime types from all levels (`null` = all types permitted).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "max_bytes": {
+            "description": "Effective global size limit in bytes (`null` = unlimited).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata_limits": {
+            "$ref": "#/components/schemas/MetadataLimitsDto",
+            "description": "Effective metadata limits (most restrictive per field)."
+          },
+          "per_mime_max_bytes": {
+            "description": "Per-mime size overrides (union from all levels, most restrictive per pattern).",
+            "items": {
+              "$ref": "#/components/schemas/MimeSizeOverrideDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "per_mime_max_bytes",
+          "metadata_limits"
+        ],
+        "type": "object"
+      },
       "Endpoint": {
         "properties": {
           "host": {
@@ -928,6 +1104,83 @@
           "message"
         ],
         "type": "object"
+      },
+      "FileDto": {
+        "description": "File metadata response (`GET /files/{id}`, and the body of mutations).",
+        "properties": {
+          "content_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "custom_metadata": {
+            "items": {
+              "$ref": "#/components/schemas/MetadataEntryDto"
+            },
+            "type": "array"
+          },
+          "etag": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "gts_file_type": {
+            "type": "string"
+          },
+          "last_modified_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "meta_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "owner_kind": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file_id",
+          "tenant_id",
+          "owner_kind",
+          "owner_id",
+          "name",
+          "gts_file_type",
+          "meta_version",
+          "created_at",
+          "last_modified_at",
+          "custom_metadata"
+        ],
+        "type": "object"
+      },
+      "FileDtoList": {
+        "description": "List of files (`GET /files`).",
+        "items": {
+          "$ref": "#/components/schemas/FileDto"
+        },
+        "type": "array"
       },
       "FileParserInfoDto": {
         "description": "REST DTO for file parser info response",
@@ -1342,6 +1595,58 @@
         ],
         "type": "object"
       },
+      "InactivityRetentionDto": {
+        "description": "Inactivity-based retention criterion.",
+        "properties": {
+          "inactivity_days": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "inactivity_days"
+        ],
+        "type": "object"
+      },
+      "InitiateMultipartReq": {
+        "description": "Request to initiate a multipart upload (`POST /files/{id}/multipart`).\n\nThe server returns a server-authoritative parts plan with one signed sidecar\nURL per part (FEATURE §3, §4; DESIGN §4.6).\n\n@cpt-cf-file-storage-fr-multipart-upload\n@cpt-cf-file-storage-fr-size-limits-policy\n@cpt-cf-file-storage-fr-storage-quota",
+        "properties": {
+          "concurrency": {
+            "description": "Advisory hint for upload concurrency; does not change the parts plan\n(FEATURE §3).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "declared_mime": {
+            "description": "Declared MIME type for the file content.",
+            "type": "string"
+          },
+          "declared_size": {
+            "description": "Declared total file size in bytes.\n\n**Required** (per DESIGN §4.6 \"server-authoritative\" model). The control\nplane validates this value against the effective policy size limit and the\nstorage quota at initiate time — exactly as single-part upload does — so\nthat an oversized upload is rejected before any bytes are transferred.\n\n@cpt-cf-file-storage-fr-size-limits-policy\n@cpt-cf-file-storage-fr-storage-quota",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "preferred_part_size": {
+            "description": "Client hint for the preferred part size in bytes. The server may override\nit to satisfy the backend's minimum part size requirements (FEATURE §3).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "declared_mime",
+          "declared_size"
+        ],
+        "type": "object"
+      },
       "InlineDto": {
         "description": "REST DTO for inline content",
         "oneOf": [
@@ -1628,6 +1933,113 @@
         ],
         "type": "object"
       },
+      "MetadataEntryDto": {
+        "description": "One custom-metadata key/value pair.",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
+      "MetadataLimitsDto": {
+        "description": "Metadata limits in a policy body.",
+        "properties": {
+          "max_key_len": {
+            "description": "Maximum key length in bytes (`null` = unlimited).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_pairs": {
+            "description": "Maximum number of key-value pairs per file (`null` = unlimited).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_total_bytes": {
+            "description": "Maximum total metadata byte size (`null` = unlimited).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_value_len": {
+            "description": "Maximum value length in bytes (`null` = unlimited).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "MetadataRetentionDto": {
+        "description": "Metadata-value-based retention criterion.",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
+      "MigrateBackendReq": {
+        "description": "Request to migrate a file's content to a different storage backend.\n\n@cpt-cf-file-storage-fr-backend-migration",
+        "properties": {
+          "target_backend_id": {
+            "description": "The id of the target backend to migrate the file's content to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_backend_id"
+        ],
+        "type": "object"
+      },
+      "MimeSizeOverrideDto": {
+        "description": "Per-mime-type size limit override in a policy request/response.",
+        "properties": {
+          "max_bytes": {
+            "description": "Maximum file size in bytes for this mime pattern.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mime": {
+            "description": "MIME type or pattern (e.g. `\"image/*\"`, `\"video/mp4\"`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mime",
+          "max_bytes"
+        ],
+        "type": "object"
+      },
       "ModelDto": {
         "description": "Response DTO for a single model.",
         "properties": {
@@ -1683,6 +2095,84 @@
         },
         "required": [
           "items"
+        ],
+        "type": "object"
+      },
+      "MultipartPartPlanDto": {
+        "description": "One part in the server-authoritative parts plan.\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "properties": {
+          "offset": {
+            "description": "Byte offset of this part within the final assembled object.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "part_number": {
+            "description": "1-based part number (S3 convention).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "size": {
+            "description": "Exact byte length this part's body must be.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upload_url": {
+            "description": "Sidecar signed URL for `PUT`-ing this part's bytes.\nThe URL embeds the exact `size` claim the sidecar enforces.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "part_number",
+          "offset",
+          "size",
+          "upload_url"
+        ],
+        "type": "object"
+      },
+      "MultipartPlanDto": {
+        "description": "Server-authoritative parts plan returned by `POST /files/{id}/multipart`.\n\nThe client `PUT`s each part's bytes to its `upload_url`; the sidecar\nenforces the `size` claim before writing any bytes (FEATURE §4).\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "properties": {
+          "expires_at": {
+            "description": "Expiry of all per-part URLs (RFC 3339).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "part_hash_algorithm": {
+            "description": "Hash algorithm used for per-part hashes (`\"SHA-256\"` in P2).",
+            "type": "string"
+          },
+          "part_size": {
+            "description": "Uniform part size in bytes (the final part may be smaller).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "parts": {
+            "description": "Parts in ascending `part_number` order, each with its signed upload URL.",
+            "items": {
+              "$ref": "#/components/schemas/MultipartPartPlanDto"
+            },
+            "type": "array"
+          },
+          "upload_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id",
+          "version_id",
+          "part_hash_algorithm",
+          "part_size",
+          "parts",
+          "expires_at"
         ],
         "type": "object"
       },
@@ -2645,6 +3135,78 @@
         },
         "type": "object"
       },
+      "PolicyBodyDto": {
+        "description": "Policy body in requests and responses.\n\n@cpt-cf-file-storage-fr-allowed-types-policy\n@cpt-cf-file-storage-fr-size-limits-policy\n@cpt-cf-file-storage-fr-metadata-limits",
+        "properties": {
+          "allowed_mime_types": {
+            "description": "Allowed MIME types for upload (empty = all types permitted at this level).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "enabled_event_types": {
+            "description": "Enabled `EventBroker` event types (empty = none at this level).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "metadata_limits": {
+            "$ref": "#/components/schemas/MetadataLimitsDto",
+            "description": "Metadata limits."
+          },
+          "size_limits": {
+            "$ref": "#/components/schemas/SizeLimitsDto",
+            "description": "Size limits (global + per-mime overrides)."
+          }
+        },
+        "type": "object"
+      },
+      "PolicyDto": {
+        "description": "A stored policy row as returned by `GET /policy`.",
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/PolicyBodyDto"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "policy_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "scope": {
+            "description": "`\"tenant\"` or `\"user\"`.",
+            "type": "string"
+          },
+          "scope_owner_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "policy_id",
+          "tenant_id",
+          "scope",
+          "body",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "Problem": {
         "description": "RFC 9457 problem+json. `context` varies by error category.",
         "properties": {
@@ -3199,6 +3761,88 @@
         },
         "type": "object"
       },
+      "RetentionRuleBodyDto": {
+        "description": "Retention rule body in requests and responses.\n\n@cpt-cf-file-storage-fr-retention-policies",
+        "properties": {
+          "age": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AgeRetentionDto"
+              }
+            ]
+          },
+          "inactivity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/InactivityRetentionDto"
+              }
+            ]
+          },
+          "metadata": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MetadataRetentionDto"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RetentionRuleDto": {
+        "description": "A stored retention rule row.",
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/RetentionRuleBodyDto"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "rule_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "scope": {
+            "description": "`\"tenant\"`, `\"user\"`, or `\"file\"`.",
+            "type": "string"
+          },
+          "scope_target_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id",
+          "tenant_id",
+          "scope",
+          "body",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "RetentionRuleDtoList": {
+        "description": "List of retention rules (`GET /retention-rules`).",
+        "items": {
+          "$ref": "#/components/schemas/RetentionRuleDto"
+        },
+        "type": "array"
+      },
       "RouteResponse": {
         "properties": {
           "cors": {
@@ -3292,6 +3936,32 @@
         ],
         "type": "object"
       },
+      "SetPolicyReq": {
+        "description": "Request body for `PUT /policy`.",
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/PolicyBodyDto",
+            "description": "The policy to store."
+          },
+          "scope": {
+            "description": "`\"tenant\"` or `\"user\"`.",
+            "type": "string"
+          },
+          "scope_owner_id": {
+            "description": "Target owner id (required when `scope = \"user\"`; omit for tenant scope).",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "scope",
+          "body"
+        ],
+        "type": "object"
+      },
       "SetReactionReq": {
         "description": "Request DTO for setting a reaction.",
         "properties": {
@@ -3338,6 +4008,51 @@
           "tenant_id"
         ],
         "type": "object"
+      },
+      "SizeLimitsDto": {
+        "description": "Size limits in a policy body.",
+        "properties": {
+          "max_bytes": {
+            "description": "Global maximum file size in bytes (`null` = unlimited at this level).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "per_mime": {
+            "description": "Per-mime-type overrides.",
+            "items": {
+              "$ref": "#/components/schemas/MimeSizeOverrideDto"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "StorageDto": {
+        "description": "A configured storage backend (`GET /storages`).",
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/CapabilitiesDto"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "capabilities"
+        ],
+        "type": "object"
+      },
+      "StorageDtoList": {
+        "description": "List of configured storage backends (`GET /storages`).",
+        "items": {
+          "$ref": "#/components/schemas/StorageDto"
+        },
+        "type": "array"
       },
       "StreamEvent": {
         "description": "Stream event envelope for the `messages:stream` pipeline.\n\nEach variant maps to a distinct SSE `event:` name and `data:` JSON payload.\nOrdering grammar: `stream_started ping* (delta | tool)* citations? (done | error)`.",
@@ -3667,6 +4382,12 @@
       "TenantDto": {
         "description": "AM-internal projection. Wider than `tenant_resolver_sdk::TenantInfo` for\nadmin/UI consumers (carries lifecycle timestamps + depth).\n\nInternal columns (raw `tenant_type_uuid`, retention/claim columns) never\ncross this boundary. `tenant_type: None` only on a transient registry\nblip — reads do not block on it.",
         "properties": {
+          "child_count": {
+            "description": "Number of **direct** children visible to the caller, resolved at\nread time: scope-filtered (children behind a self-managed barrier\nthe caller cannot penetrate are not counted), excludes\nAM-internal `provisioning` rows, includes soft-`deleted`\nchildren. `0` for a leaf. Derived field (not a stored column) —\nnot available in `$filter` / `$orderby`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -3721,6 +4442,7 @@
           "status",
           "self_managed",
           "depth",
+          "child_count",
           "created_at",
           "updated_at"
         ],
@@ -3831,6 +4553,25 @@
         ],
         "type": "string"
       },
+      "TransferOwnershipReq": {
+        "description": "Request to transfer ownership of a file (`POST /files/{id}/transfer`).\n\n@cpt-cf-file-storage-fr-ownership-transfer",
+        "properties": {
+          "new_owner_id": {
+            "description": "New owner UUID.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "new_owner_kind": {
+            "description": "New owner kind: `\"user\"` or `\"app\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "new_owner_kind",
+          "new_owner_id"
+        ],
+        "type": "object"
+      },
       "TypeDto": {
         "description": "REST DTO for GTS type representation.",
         "properties": {
@@ -3922,6 +4663,25 @@
           "parent_id",
           "metadata"
         ],
+        "type": "object"
+      },
+      "UpdateMetadataReq": {
+        "description": "Request body for `PATCH /files/{id}` (JSON merge patch over custom metadata).",
+        "properties": {
+          "custom_metadata": {
+            "additionalProperties": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "description": "Keys mapped to a value (upsert) or `null` (delete). Absent keys unchanged.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
         "type": "object"
       },
       "UpdateRouteRequest": {
@@ -4127,6 +4887,28 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UploadTicketDto": {
+        "description": "Result of create / presign: identity + the signed upload URL.",
+        "properties": {
+          "file_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "upload_url": {
+            "type": "string"
+          },
+          "version_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file_id",
+          "version_id",
+          "upload_url"
+        ],
         "type": "object"
       },
       "UpstreamResponse": {
@@ -4414,6 +5196,56 @@
             "enabled"
           ],
           "type": "object"
+        },
+        "type": "array"
+      },
+      "VersionDto": {
+        "description": "One content version (`GET /files/{id}/versions`).",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "hash": {
+            "type": "string"
+          },
+          "hash_algorithm": {
+            "type": "string"
+          },
+          "is_current": {
+            "type": "boolean"
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "size": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "version_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version_id",
+          "mime_type",
+          "size",
+          "hash_algorithm",
+          "hash",
+          "status",
+          "is_current",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "VersionDtoList": {
+        "description": "List of file versions (`GET /files/{id}/versions`).",
+        "items": {
+          "$ref": "#/components/schemas/VersionDto"
         },
         "type": "array"
       },
@@ -5719,7 +6551,7 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- id: eq|ne|in\n- status: eq|ne|contains|startswith|endswith|in\n- tenant_type_uuid: eq|ne|in\n- self_managed: eq|ne\n- created_at: eq|ne|gt|ge|lt|le|in\n- updated_at: eq|ne|gt|ge|lt|le|in",
+            "description": "OData v4 filter expression\n- id: eq|ne|in\n- name: eq|ne|contains|startswith|endswith|in\n- status: eq|ne|contains|startswith|endswith|in\n- tenant_type_uuid: eq|ne|in\n- tenant_type: eq|ne|contains|startswith|endswith|in\n- self_managed: eq|ne\n- created_at: eq|ne|gt|ge|lt|le|in\n- updated_at: eq|ne|gt|ge|lt|le|in",
             "in": "query",
             "name": "$filter",
             "required": false,
@@ -5728,7 +6560,7 @@
             }
           },
           {
-            "description": "OData v4 orderby expression\n- id asc\n- id desc\n- status asc\n- status desc\n- tenant_type_uuid asc\n- tenant_type_uuid desc\n- self_managed asc\n- self_managed desc\n- created_at asc\n- created_at desc\n- updated_at asc\n- updated_at desc",
+            "description": "OData v4 orderby expression\n- id asc\n- id desc\n- name asc\n- name desc\n- status asc\n- status desc\n- tenant_type_uuid asc\n- tenant_type_uuid desc\n- tenant_type asc\n- tenant_type desc\n- self_managed asc\n- self_managed desc\n- created_at asc\n- created_at desc\n- updated_at asc\n- updated_at desc",
             "in": "query",
             "name": "$orderby",
             "required": false,
@@ -5854,11 +6686,27 @@
               "ne",
               "in"
             ],
+            "name": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
             "self_managed": [
               "eq",
               "ne"
             ],
             "status": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "tenant_type": [
               "eq",
               "ne",
               "contains",
@@ -5886,10 +6734,14 @@
           "allowedFields": [
             "id asc",
             "id desc",
+            "name asc",
+            "name desc",
             "status asc",
             "status desc",
             "tenant_type_uuid asc",
             "tenant_type_uuid desc",
+            "tenant_type asc",
+            "tenant_type desc",
             "self_managed asc",
             "self_managed desc",
             "created_at asc",
@@ -7942,6 +8794,2057 @@
         "summary": "Deprovision a user from a tenant",
         "tags": [
           "Tenant Users"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files": {
+      "get": {
+        "operationId": "file_storage.list_files",
+        "parameters": [
+          {
+            "description": "'user' or 'app'",
+            "in": "query",
+            "name": "owner_kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Owner UUID",
+            "in": "query",
+            "name": "owner_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Offset",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDtoList"
+                }
+              }
+            },
+            "description": "Files"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List files for an owner (owner_kind + owner_id required)",
+        "tags": [
+          "File Storage"
+        ]
+      },
+      "post": {
+        "operationId": "file_storage.create_file",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFileReq"
+              }
+            }
+          },
+          "description": "File metadata",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadTicketDto"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a file and presign its first content upload",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{file_id}/versions/{version_id}/finalize": {
+      "post": {
+        "description": "Called by the sidecar after a successful PUT to mark the version `available`. Authorized by the signed upload token (fs-token) — no user JWT required.",
+        "operationId": "file_storage.finalize_version",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Version UUID",
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Version finalized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Finalize a pending version (token-authenticated, sidecar s2s callback)",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}": {
+      "delete": {
+        "description": "If-Match (content ETag or \"*\") is required; 412 on mismatch or when absent.",
+        "operationId": "file_storage.delete_file",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a file and all its versions",
+        "tags": [
+          "File Storage"
+        ]
+      },
+      "get": {
+        "operationId": "file_storage.get_file",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDto"
+                }
+              }
+            },
+            "description": "File metadata"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get file metadata (supports If-None-Match -> 304)",
+        "tags": [
+          "File Storage"
+        ]
+      },
+      "patch": {
+        "operationId": "file_storage.update_metadata",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMetadataReq"
+              }
+            }
+          },
+          "description": "Metadata merge patch",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDto"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update custom metadata (JSON merge patch)",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}/bind": {
+      "post": {
+        "description": "If-Match carries the current content ETag; 412 on conflict.",
+        "operationId": "file_storage.bind",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindReq"
+              }
+            }
+          },
+          "description": "Version to bind",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDto"
+                }
+              }
+            },
+            "description": "Bound"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Bind/rebind the content pointer under optimistic CAS",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}/download-url": {
+      "get": {
+        "operationId": "file_storage.download_url",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Pin a specific version",
+            "in": "query",
+            "name": "version_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DownloadTicketDto"
+                }
+              }
+            },
+            "description": "Signed URL"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Issue a signed download URL (pins current content or ?version_id)",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}/migrate": {
+      "post": {
+        "description": "Non-versioned files only. Preserves identity and verifies content hash before committing the new backend binding.",
+        "operationId": "file_storage.migrate_backend",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateBackendReq"
+              }
+            }
+          },
+          "description": "Migration request",
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Migrated"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Migrate file content to a different storage backend",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}/multipart": {
+      "post": {
+        "description": "Returns the exact parts plan (sizes, offsets) plus one signed sidecar URL per part. The client PUTs bytes directly to the sidecar; the control plane never carries content bytes (ADR-0003, DESIGN §4.6).",
+        "operationId": "file_storage.initiate_multipart",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InitiateMultipartReq"
+              }
+            }
+          },
+          "description": "Multipart initiation",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MultipartPlanDto"
+                }
+              }
+            },
+            "description": "Server-authoritative parts plan"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Initiate a server-authoritative multipart upload and get the parts plan",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}/multipart/{upload_id}": {
+      "delete": {
+        "operationId": "file_storage.abort_multipart",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Upload session UUID",
+            "in": "path",
+            "name": "upload_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Aborted"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Abort a multipart upload and discard all parts",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}/multipart/{upload_id}/complete": {
+      "post": {
+        "operationId": "file_storage.complete_multipart",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Upload session UUID",
+            "in": "path",
+            "name": "upload_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Completed"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Finalize a multipart upload (assemble all parts)",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}/transfer": {
+      "post": {
+        "description": "Atomically replaces owner_kind + owner_id and records an audit row. A file.owner_transferred event is enqueued in the same transaction.",
+        "operationId": "file_storage.transfer_ownership",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransferOwnershipReq"
+              }
+            }
+          },
+          "description": "Transfer ownership request",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDto"
+                }
+              }
+            },
+            "description": "Updated file"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Transfer ownership of a file to a new owner",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}/versions": {
+      "get": {
+        "operationId": "file_storage.list_versions",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionDtoList"
+                }
+              }
+            },
+            "description": "Versions"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List all versions of a file",
+        "tags": [
+          "File Storage"
+        ]
+      },
+      "post": {
+        "operationId": "file_storage.presign_version",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadTicketDto"
+                }
+              }
+            },
+            "description": "Presigned"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Presign a new content version upload",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/files/{id}/versions/{version_id}": {
+      "delete": {
+        "operationId": "file_storage.delete_version",
+        "parameters": [
+          {
+            "description": "File UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Version UUID",
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a single version",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/policy": {
+      "get": {
+        "operationId": "file_storage.get_policy",
+        "parameters": [
+          {
+            "description": "'tenant' or 'user'",
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "User UUID (required for user scope)",
+            "in": "query",
+            "name": "scope_owner_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            },
+            "description": "Policy"
+          },
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No policy configured for this scope"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get the stored policy for a scope (tenant or user)",
+        "tags": [
+          "File Storage"
+        ]
+      },
+      "put": {
+        "operationId": "file_storage.set_policy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPolicyReq"
+              }
+            }
+          },
+          "description": "Policy configuration",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            },
+            "description": "Stored policy"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Set (upsert) the policy for a scope",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/policy/effective": {
+      "get": {
+        "operationId": "file_storage.get_effective_policy",
+        "parameters": [
+          {
+            "description": "User UUID to include in effective resolution",
+            "in": "query",
+            "name": "user_owner_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectivePolicyDto"
+                }
+              }
+            },
+            "description": "Effective policy"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get effective policy (most-restrictive across tenant + user levels)",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/retention-rules": {
+      "get": {
+        "operationId": "file_storage.list_retention_rules",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionRuleDtoList"
+                }
+              }
+            },
+            "description": "Retention rules"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List all retention rules for the caller's tenant",
+        "tags": [
+          "File Storage"
+        ]
+      },
+      "post": {
+        "operationId": "file_storage.create_retention_rule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRetentionRuleReq"
+              }
+            }
+          },
+          "description": "Retention rule",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionRuleDto"
+                }
+              }
+            },
+            "description": "Created retention rule"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a retention rule",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/retention-rules/{rule_id}": {
+      "delete": {
+        "operationId": "file_storage.delete_retention_rule",
+        "parameters": [
+          {
+            "description": "Retention rule UUID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a retention rule",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/storages": {
+      "get": {
+        "operationId": "file_storage.list_storages",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageDtoList"
+                }
+              }
+            },
+            "description": "Backends"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List configured storage backends and capabilities",
+        "tags": [
+          "File Storage"
+        ]
+      }
+    },
+    "/api/file-storage/v1/storages/{id}": {
+      "get": {
+        "operationId": "file_storage.get_storage",
+        "parameters": [
+          {
+            "description": "Backend id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageDto"
+                }
+              }
+            },
+            "description": "Backend"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get one storage backend",
+        "tags": [
+          "File Storage"
         ]
       }
     },

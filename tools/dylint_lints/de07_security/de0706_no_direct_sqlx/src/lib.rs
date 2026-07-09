@@ -3,6 +3,7 @@
 
 extern crate rustc_ast;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use lint_utils::{
     is_in_cf_gears_server_path, is_in_contract_module_ast, is_in_toolkit_db_path,
     use_tree_to_strings,
@@ -79,13 +80,16 @@ fn check_type_for_sqlx(cx: &rustc_lint::EarlyContext<'_>, ty: &Ty) {
                 .join("::");
 
             if is_sqlx_path(&path_str) {
-                cx.span_lint(DE0706_NO_DIRECT_SQLX, ty.span, |diag| {
-                    diag.primary_message(format!(
-                        "direct sqlx type usage detected: `{path_str}` (DE0706)"
-                    ));
-                    diag.help("use Sea-ORM EntityTrait or SecORM abstractions instead");
-                    diag.note("sqlx bypasses security enforcement and architectural patterns");
-                });
+                span_lint_and_then(
+                    cx,
+                    DE0706_NO_DIRECT_SQLX,
+                    ty.span,
+                    format!("direct sqlx type usage detected: `{path_str}` (DE0706)"),
+                    |diag| {
+                        diag.help("use Sea-ORM EntityTrait or SecORM abstractions instead");
+                        diag.note("sqlx bypasses security enforcement and architectural patterns");
+                    },
+                );
                 return;
             }
 
@@ -131,15 +135,18 @@ fn check_type_for_sqlx(cx: &rustc_lint::EarlyContext<'_>, ty: &Ty) {
                         .join("::");
 
                     if is_sqlx_path(&path_str) {
-                        cx.span_lint(DE0706_NO_DIRECT_SQLX, ty.span, |diag| {
-                            diag.primary_message(format!(
-                                "direct sqlx trait usage detected: `{path_str}` (DE0706)"
-                            ));
-                            diag.help("use Sea-ORM EntityTrait or SecORM abstractions instead");
-                            diag.note(
-                                "sqlx bypasses security enforcement and architectural patterns",
-                            );
-                        });
+                        span_lint_and_then(
+                            cx,
+                            DE0706_NO_DIRECT_SQLX,
+                            ty.span,
+                            format!("direct sqlx trait usage detected: `{path_str}` (DE0706)"),
+                            |diag| {
+                                diag.help("use Sea-ORM EntityTrait or SecORM abstractions instead");
+                                diag.note(
+                                    "sqlx bypasses security enforcement and architectural patterns",
+                                );
+                            },
+                        );
                         return;
                     }
                 }
@@ -155,14 +162,16 @@ fn check_use_for_sqlx(cx: &rustc_lint::EarlyContext<'_>, item: &Item) {
     };
 
     if let Some(path_str) = find_sqlx_path(use_tree) {
-        cx.span_lint(DE0706_NO_DIRECT_SQLX, item.span, |diag| {
-            diag.primary_message(format!(
-                "direct sqlx import detected: `{}` (DE0706)",
-                path_str
-            ));
-            diag.help("use Sea-ORM EntityTrait or SecORM abstractions instead");
-            diag.note("sqlx bypasses security enforcement and architectural patterns");
-        });
+        span_lint_and_then(
+            cx,
+            DE0706_NO_DIRECT_SQLX,
+            item.span,
+            format!("direct sqlx import detected: `{}` (DE0706)", path_str),
+            |diag| {
+                diag.help("use Sea-ORM EntityTrait or SecORM abstractions instead");
+                diag.note("sqlx bypasses security enforcement and architectural patterns");
+            },
+        );
     }
 }
 
@@ -197,11 +206,18 @@ impl EarlyLintPass for De0706NoDirectSqlx {
                 };
 
                 if is_sqlx {
-                    cx.span_lint(DE0706_NO_DIRECT_SQLX, item.span, |diag| {
-                        diag.primary_message("extern crate sqlx is prohibited (DE0706)");
-                        diag.help("use Sea-ORM EntityTrait or SecORM abstractions instead");
-                        diag.note("sqlx bypasses security enforcement and architectural patterns");
-                    });
+                    span_lint_and_then(
+                        cx,
+                        DE0706_NO_DIRECT_SQLX,
+                        item.span,
+                        "extern crate sqlx is prohibited (DE0706)",
+                        |diag| {
+                            diag.help("use Sea-ORM EntityTrait or SecORM abstractions instead");
+                            diag.note(
+                                "sqlx bypasses security enforcement and architectural patterns",
+                            );
+                        },
+                    );
                 }
             }
             // Check struct fields for sqlx types

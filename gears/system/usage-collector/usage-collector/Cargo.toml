@@ -1,0 +1,57 @@
+[package]
+name = "cf-gears-usage-collector"
+description = "usage-collector gateway module"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["api-bindings"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "usage_collector"
+
+[lints]
+workspace = true
+
+[dependencies]
+usage-collector-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
+utoipa = { workspace = true, features = ["time", "decimal"] }
+rust_decimal = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-security = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+# Link-time GTS permission catalog (`src/gts/permissions.rs`): declares
+# AuthzPermissionV1 instances into the toolkit-gts inventory that
+# types-registry aggregates at boot.
+toolkit-gts = { workspace = true }
+# Direct dep needed because `gts_instance!` expansions reference
+# `::gts::*` paths (the compile-time `<S as GtsSchema>::SCHEMA_ID` prefix
+# asserts). Without this the proc-macro emits `::gts::…` identifiers that
+# cannot be resolved.
+gts = { workspace = true }
+inventory = { workspace = true }
+
+[dev-dependencies]
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+tokio-util = { workspace = true }

@@ -37,9 +37,9 @@ pub enum DomainError {
 mod error_froms {
     use super::DomainError;
 
-    impl From<types_registry_sdk::TypesRegistryError> for DomainError {
-        fn from(e: types_registry_sdk::TypesRegistryError) -> Self {
-            Self::Internal(e.to_string())
+    impl From<toolkit_canonical_errors::CanonicalError> for DomainError {
+        fn from(e: toolkit_canonical_errors::CanonicalError) -> Self {
+            Self::Internal(e.diagnostic().map_or_else(|| e.to_string(), str::to_owned))
         }
     }
 

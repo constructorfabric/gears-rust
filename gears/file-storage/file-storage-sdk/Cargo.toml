@@ -1,0 +1,25 @@
+[package]
+name = "cf-gears-file-storage-sdk"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for file-storage gear: API trait, types, and error definitions"
+
+[lib]
+name = "file_storage_sdk"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+# Core dependencies for the public API trait + models
+uuid = { workspace = true }
+time = { workspace = true }
+
+# Canonical error envelope (re-exported as `FileStorageError`)
+toolkit-canonical-errors = { workspace = true }

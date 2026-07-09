@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.entry_reversed.v1",
+  "title": "Billing Ledger Entry Reversed",
+  "description": "Emitted when a balanced ledger entry is reversed via the explicit reversal path (never on replay, never for a mapping-correction). Internal identifiers plus the audit reason only; no PII, no amounts.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "entry_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "reverses_entry_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "reason": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "entry_id",
+    "reverses_entry_id",
+    "tenant_id",
+    "reason"
+  ]
+}

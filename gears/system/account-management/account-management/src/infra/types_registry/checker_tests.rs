@@ -64,13 +64,13 @@ fn envelope() -> Arc<GtsTypeSchema> {
 /// `get_type_schemas_by_uuid` and (transitively, via timeout)
 /// nothing else; the rest are `unreachable!()`.
 struct FakeRegistry {
-    schemas: Mutex<HashMap<Uuid, Result<GtsTypeSchema, TypesRegistryError>>>,
+    schemas: Mutex<HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>>>,
     delay: Mutex<Option<Duration>>,
     calls: Mutex<u32>,
 }
 
 impl FakeRegistry {
-    fn new(entries: Vec<(Uuid, Result<GtsTypeSchema, TypesRegistryError>)>) -> Self {
+    fn new(entries: Vec<(Uuid, Result<GtsTypeSchema, CanonicalError>)>) -> Self {
         Self {
             schemas: Mutex::new(entries.into_iter().collect()),
             delay: Mutex::new(None),
@@ -89,34 +89,34 @@ impl TypesRegistryClient for FakeRegistry {
     async fn register(
         &self,
         _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
         unreachable!()
     }
     async fn register_type_schemas(
         &self,
         _type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
         unreachable!()
     }
-    async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, TypesRegistryError> {
+    async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
         unreachable!()
     }
     async fn get_type_schema_by_uuid(
         &self,
         _type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, TypesRegistryError> {
+    ) -> Result<GtsTypeSchema, CanonicalError> {
         unreachable!("checker uses the batch variant")
     }
     async fn get_type_schemas(
         &self,
         _type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, TypesRegistryError>> {
+    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
         unreachable!()
     }
     async fn get_type_schemas_by_uuid(
         &self,
         type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, TypesRegistryError>> {
+    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
         *self.calls.lock().expect("lock") += 1;
         let delay = *self.delay.lock().expect("lock");
         if let Some(d) = delay {
@@ -125,9 +125,10 @@ impl TypesRegistryClient for FakeRegistry {
         let map = self.schemas.lock().expect("lock");
         let mut out = HashMap::new();
         for u in type_uuids {
-            let entry = map.get(&u).cloned().unwrap_or_else(|| {
-                Err(TypesRegistryError::gts_type_schema_not_found(u.to_string()))
-            });
+            let entry = map
+                .get(&u)
+                .cloned()
+                .unwrap_or_else(|| Err(types_registry_sdk::testing::not_found(u.to_string())));
             out.insert(u, entry);
         }
         out
@@ -135,37 +136,37 @@ impl TypesRegistryClient for FakeRegistry {
     async fn list_type_schemas(
         &self,
         _query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, TypesRegistryError> {
+    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
         unreachable!()
     }
     async fn register_instances(
         &self,
         _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
         unreachable!()
     }
-    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, TypesRegistryError> {
+    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
         unreachable!()
     }
-    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, TypesRegistryError> {
+    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
         unreachable!()
     }
     async fn get_instances(
         &self,
         _ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, TypesRegistryError>> {
+    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
         unreachable!()
     }
     async fn get_instances_by_uuid(
         &self,
         _uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, TypesRegistryError>> {
+    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
         unreachable!()
     }
     async fn list_instances(
         &self,
         _query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, TypesRegistryError> {
+    ) -> Result<Vec<GtsInstance>, CanonicalError> {
         unreachable!()
     }
 }
@@ -503,7 +504,7 @@ async fn rejects_when_allowed_parent_types_is_not_an_array() {
 async fn rejects_when_registry_returns_unrecognised_error_as_service_unavailable() {
     let registry = Arc::new(FakeRegistry::new(vec![(
         Uuid::from_u128(0x1),
-        Err(TypesRegistryError::internal("registry exploded")),
+        Err(types_registry_sdk::testing::internal("registry exploded")),
     )]));
     let checker = GtsTenantTypeChecker::new(registry);
     let err = checker
@@ -520,7 +521,7 @@ async fn rejects_when_registry_probe_times_out() {
     let registry = Arc::new(
         FakeRegistry::new(vec![(
             Uuid::from_u128(0x1),
-            Err(TypesRegistryError::internal("never reaches us")),
+            Err(types_registry_sdk::testing::internal("never reaches us")),
         )])
         .with_delay(Duration::from_millis(50)),
     );

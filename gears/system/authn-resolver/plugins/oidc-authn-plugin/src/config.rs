@@ -305,6 +305,13 @@ struct IssuerRuleCompiled {
     matcher: MatcherCompiled,
     discovery_url: Option<DiscoveryUrlOverride>,
     url_policy: UrlSecurityPolicy,
+    /// Per-issuer compiled audience matchers (empty ⇒ fall back to global).
+    expected_audience: Vec<MatcherCompiled>,
+    /// Required JOSE `typ` header, normalized to lowercase for case-insensitive
+    /// comparison (`None` ⇒ `typ` not checked).
+    jose_typ: Option<String>,
+    /// Per-issuer clock-skew leeway in seconds (`None` ⇒ use global leeway).
+    clock_skew_leeway_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -364,11 +371,45 @@ impl MatcherCompiled {
     }
 }
 
+/// Resolved per-issuer validation context for the first matching trusted-issuer
+/// rule.
+///
+/// Carries the discovery base used to fetch JWKS plus the per-issuer validation
+/// overrides (audience, JOSE `typ`, clock-skew leeway). Empty/`None` overrides
+/// signal that the validator should fall back to the global configuration.
+#[derive(Debug, Clone)]
+pub struct ResolvedIssuer {
+    /// Discovery base URL used to fetch this issuer's JWKS.
+    pub discovery_base: Url,
+    /// Per-issuer audience matchers (empty ⇒ use global `expected_audience`).
+    pub expected_audience: Vec<MatcherCompiled>,
+    /// Required JOSE `typ` header, lowercased (`None` ⇒ `typ` not checked).
+    pub jose_typ: Option<String>,
+    /// Per-issuer clock-skew leeway in seconds (`None` ⇒ use global leeway).
+    pub clock_skew_leeway_secs: Option<u64>,
+}
+
+/// Outcome of evaluating one trusted-issuer rule against a token `iss`.
+///
+/// A matched rule is **terminal** (first match wins): the caller must not fall
+/// through to later rules when a rule matched but its discovery URL is invalid.
+enum IssuerMatch {
+    /// The rule's matcher did not match `iss`.
+    NoMatch,
+    /// The matcher matched, but the discovery URL failed to resolve/validate.
+    MatchedInvalid,
+    /// The matcher matched and produced a usable per-issuer context.
+    Matched(ResolvedIssuer),
+}
+
 impl IssuerRuleCompiled {
     fn from_input(
         TrustedIssuerInput {
             entry,
             discovery_url,
+            expected_audience,
+            jose_typ,
+            clock_skew_leeway_secs,
         }: TrustedIssuerInput,
         index: usize,
         url_policy: UrlSecurityPolicy,
@@ -430,19 +471,53 @@ impl IssuerRuleCompiled {
             })
             .transpose()?;
 
+        let expected_audience = expected_audience
+            .iter()
+            .enumerate()
+            .map(|(audience_index, pattern)| {
+                MatcherCompiled::from_wildcard_pattern(pattern, audience_index)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(|e| {
+                anyhow!(
+                    "invalid `expected_audience` in `trusted_issuers` entry at index {index}: {e}"
+                )
+            })?;
+
+        let jose_typ = jose_typ
+            .map(|value| {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(anyhow!(
+                        "`trusted_issuers` entry at index {index} has an empty `jose_typ`"
+                    ));
+                }
+                Ok(value.to_ascii_lowercase())
+            })
+            .transpose()?;
+
+        if let Some(leeway) = clock_skew_leeway_secs
+            && leeway > 300
+        {
+            return Err(anyhow!(
+                "`trusted_issuers` entry at index {index} `clock_skew_leeway_secs` must be <= 300"
+            ));
+        }
+
         Ok(Self {
             matcher,
             discovery_url,
             url_policy,
+            expected_audience,
+            jose_typ,
+            clock_skew_leeway_secs,
         })
     }
 
-    /// Resolve the discovery URL for `issuer` when this rule matches.
-    fn resolve(&self, issuer: &str) -> Option<Url> {
-        if !self.matcher.is_match(issuer) {
-            return None;
-        }
-
+    /// Resolve the discovery base URL for an already-matched rule. Returns
+    /// `None` when the configured override (or the issuer itself) fails URL
+    /// validation.
+    fn resolve_discovery_base(&self, issuer: &str) -> Option<Url> {
         match &self.discovery_url {
             Some(DiscoveryUrlOverride::Static(url)) => Some(url.clone()),
             Some(DiscoveryUrlOverride::Template(value)) => {
@@ -455,6 +530,24 @@ impl IssuerRuleCompiled {
                 .url_policy
                 .validate_oidc_base(issuer, "resolved OIDC discovery URL")
                 .ok(),
+        }
+    }
+
+    /// Evaluate this rule against `issuer`. A matched rule is terminal: when its
+    /// discovery URL fails validation the result is [`IssuerMatch::MatchedInvalid`]
+    /// so the caller stops instead of falling through to later rules.
+    fn resolve(&self, issuer: &str) -> IssuerMatch {
+        if !self.matcher.is_match(issuer) {
+            return IssuerMatch::NoMatch;
+        }
+        match self.resolve_discovery_base(issuer) {
+            Some(discovery_base) => IssuerMatch::Matched(ResolvedIssuer {
+                discovery_base,
+                expected_audience: self.expected_audience.clone(),
+                jose_typ: self.jose_typ.clone(),
+                clock_skew_leeway_secs: self.clock_skew_leeway_secs,
+            }),
+            None => IssuerMatch::MatchedInvalid,
         }
     }
 }
@@ -529,15 +622,37 @@ impl IssuerTrustConfig {
         Self::from_inputs(issuers.into_iter().map(|issuer| TrustedIssuerInput {
             entry: TrustedIssuerEntry::Issuer(issuer),
             discovery_url: None,
+            expected_audience: Vec::new(),
+            jose_typ: None,
+            clock_skew_leeway_secs: None,
         }))
+    }
+
+    /// Resolve the per-issuer validation context for the first trusted-issuer
+    /// rule matching `issuer`.
+    ///
+    /// Returns the discovery base plus any per-issuer overrides (audience, JOSE
+    /// `typ`, clock-skew leeway).
+    #[must_use]
+    pub fn resolve_issuer(&self, issuer: &str) -> Option<ResolvedIssuer> {
+        // First match wins and is terminal: a rule that matches `issuer` but whose
+        // discovery URL is invalid fails closed (returns `None`) rather than
+        // falling through to a later — possibly more permissive — rule.
+        for rule in std::iter::once(&self.rule).chain(&self.remaining_rules) {
+            match rule.resolve(issuer) {
+                IssuerMatch::NoMatch => {}
+                IssuerMatch::MatchedInvalid => return None,
+                IssuerMatch::Matched(resolved) => return Some(resolved),
+            }
+        }
+        None
     }
 
     /// Resolve the discovery URL for the first trusted-issuer rule matching `issuer`.
     #[must_use]
     pub fn resolve(&self, issuer: &str) -> Option<Url> {
-        std::iter::once(&self.rule)
-            .chain(&self.remaining_rules)
-            .find_map(|rule| rule.resolve(issuer))
+        self.resolve_issuer(issuer)
+            .map(|resolved| resolved.discovery_base)
     }
 
     fn rule_count(&self) -> usize {
@@ -547,7 +662,7 @@ impl IssuerTrustConfig {
     /// Returns `true` if the given issuer string is trusted.
     #[must_use]
     pub fn is_trusted(&self, issuer: &str) -> bool {
-        self.resolve(issuer).is_some()
+        self.resolve_issuer(issuer).is_some()
     }
 }
 
@@ -724,6 +839,26 @@ pub struct TrustedIssuerInput {
     /// When provided, `"{issuer}"` placeholder is replaced with the matched issuer.
     #[serde(default)]
     pub discovery_url: Option<String>,
+    /// Per-issuer audience override applied instead of the global
+    /// `jwt.expected_audience` when non-empty.
+    ///
+    /// When empty, the global `jwt.expected_audience` behavior is used.
+    /// Supports `*` as a substring wildcard (same syntax as the global list).
+    #[serde(default)]
+    pub expected_audience: Vec<String>,
+    /// Required JOSE `typ` header value for tokens from this issuer.
+    ///
+    /// Matched case-insensitively (e.g. `"obo+jwt"`). When `None`, the `typ`
+    /// header is not inspected, preserving default behavior for issuers that do
+    /// not pin a token type.
+    #[serde(default)]
+    pub jose_typ: Option<String>,
+    /// Per-issuer clock-skew leeway in seconds applied instead of the global
+    /// `jwt.clock_skew_leeway` when present.
+    ///
+    /// When `None`, the global leeway is used.
+    #[serde(default)]
+    pub clock_skew_leeway_secs: Option<u64>,
 }
 
 /// Issuer matcher kind for a trusted-issuer entry.
@@ -1033,6 +1168,9 @@ mod issuer_trust_config_tests {
         TrustedIssuerInput {
             entry: TrustedIssuerEntry::Issuer(issuer.to_owned()),
             discovery_url: None,
+            expected_audience: Vec::new(),
+            jose_typ: None,
+            clock_skew_leeway_secs: None,
         }
     }
 
@@ -1040,6 +1178,9 @@ mod issuer_trust_config_tests {
         TrustedIssuerInput {
             entry: TrustedIssuerEntry::IssuerPattern(pattern.to_owned()),
             discovery_url: None,
+            expected_audience: Vec::new(),
+            jose_typ: None,
+            clock_skew_leeway_secs: None,
         }
     }
 
@@ -1123,6 +1264,9 @@ mod issuer_trust_config_tests {
                 r"https://idp\.example\.com/realms/[^/]+".to_owned(),
             ),
             discovery_url: Some("{issuer}".to_owned()),
+            expected_audience: Vec::new(),
+            jose_typ: None,
+            clock_skew_leeway_secs: None,
         }])
         .unwrap();
 
@@ -1140,6 +1284,9 @@ mod issuer_trust_config_tests {
         let trust = IssuerTrustConfig::from_inputs(vec![TrustedIssuerInput {
             entry: TrustedIssuerEntry::Issuer("https://issuer.example.com".to_owned()),
             discovery_url: Some("  https://discovery.example.com  ".to_owned()),
+            expected_audience: Vec::new(),
+            jose_typ: None,
+            clock_skew_leeway_secs: None,
         }])
         .unwrap();
 
@@ -1157,6 +1304,9 @@ mod issuer_trust_config_tests {
         let error = IssuerTrustConfig::from_inputs(vec![TrustedIssuerInput {
             entry: TrustedIssuerEntry::Issuer("https://issuer.example.com".to_owned()),
             discovery_url: Some("   ".to_owned()),
+            expected_audience: Vec::new(),
+            jose_typ: None,
+            clock_skew_leeway_secs: None,
         }])
         .expect_err("blank discovery URL override should fail");
 
@@ -1173,6 +1323,9 @@ mod issuer_trust_config_tests {
         let error = IssuerTrustConfig::from_inputs(vec![TrustedIssuerInput {
             entry: TrustedIssuerEntry::Issuer("http://issuer.example.com".to_owned()),
             discovery_url: None,
+            expected_audience: Vec::new(),
+            jose_typ: None,
+            clock_skew_leeway_secs: None,
         }])
         .expect_err("HTTP issuer should fail under the default URL policy");
 
@@ -1183,11 +1336,136 @@ mod issuer_trust_config_tests {
     }
 
     #[test]
+    fn resolve_issuer_carries_per_issuer_overrides() {
+        let trust = IssuerTrustConfig::from_inputs(vec![TrustedIssuerInput {
+            entry: TrustedIssuerEntry::Issuer("https://issuer.example.com".to_owned()),
+            discovery_url: None,
+            expected_audience: vec!["public-api".to_owned(), "https://*.api".to_owned()],
+            jose_typ: Some("OBO+JWT".to_owned()),
+            clock_skew_leeway_secs: Some(30),
+        }])
+        .unwrap();
+
+        let resolved = trust
+            .resolve_issuer("https://issuer.example.com")
+            .expect("issuer should resolve");
+
+        assert_eq!(resolved.clock_skew_leeway_secs, Some(30));
+        // jose_typ is normalized to lowercase for case-insensitive comparison.
+        assert_eq!(resolved.jose_typ.as_deref(), Some("obo+jwt"));
+        assert_eq!(resolved.expected_audience.len(), 2);
+        assert!(resolved.expected_audience[0].is_match("public-api"));
+        assert!(resolved.expected_audience[1].is_match("https://tenant.api"));
+    }
+
+    #[test]
+    fn resolve_issuer_first_match_is_terminal_when_discovery_invalid() {
+        // Rule 0 matches the issuer but its discovery template resolves to a URL
+        // with a query string (invalid). A later catch-all rule that *would*
+        // resolve must NOT be consulted — first match wins, so resolution fails
+        // closed instead of silently adopting the later rule's policy.
+        let trust = IssuerTrustConfig::from_inputs(vec![
+            TrustedIssuerInput {
+                entry: TrustedIssuerEntry::Issuer("https://issuer.example.com".to_owned()),
+                discovery_url: Some("{issuer}?leak=1".to_owned()),
+                expected_audience: Vec::new(),
+                jose_typ: None,
+                clock_skew_leeway_secs: None,
+            },
+            TrustedIssuerInput {
+                entry: TrustedIssuerEntry::IssuerPattern("^https://.*$".to_owned()),
+                discovery_url: None,
+                expected_audience: Vec::new(),
+                jose_typ: None,
+                clock_skew_leeway_secs: None,
+            },
+        ])
+        .expect("config builds");
+
+        assert!(
+            trust.resolve_issuer("https://issuer.example.com").is_none(),
+            "a matched-but-invalid rule must be terminal, not fall through to later rules"
+        );
+    }
+
+    #[test]
+    fn resolve_issuer_defaults_overrides_to_empty_and_none() {
+        let trust = IssuerTrustConfig::from_inputs(vec![exact_input("https://issuer.example.com")])
+            .unwrap();
+
+        let resolved = trust
+            .resolve_issuer("https://issuer.example.com")
+            .expect("issuer should resolve");
+
+        assert!(resolved.expected_audience.is_empty());
+        assert!(resolved.jose_typ.is_none());
+        assert!(resolved.clock_skew_leeway_secs.is_none());
+    }
+
+    #[test]
+    fn blank_jose_typ_override_fails_fast() {
+        let error = IssuerTrustConfig::from_inputs(vec![TrustedIssuerInput {
+            entry: TrustedIssuerEntry::Issuer("https://issuer.example.com".to_owned()),
+            discovery_url: None,
+            expected_audience: Vec::new(),
+            jose_typ: Some("   ".to_owned()),
+            clock_skew_leeway_secs: None,
+        }])
+        .expect_err("blank jose_typ override should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("`trusted_issuers` entry at index 0 has an empty `jose_typ`"),
+            "error should identify blank jose_typ override: {error}"
+        );
+    }
+
+    #[test]
+    fn excessive_per_issuer_leeway_fails_fast() {
+        let error = IssuerTrustConfig::from_inputs(vec![TrustedIssuerInput {
+            entry: TrustedIssuerEntry::Issuer("https://issuer.example.com".to_owned()),
+            discovery_url: None,
+            expected_audience: Vec::new(),
+            jose_typ: None,
+            clock_skew_leeway_secs: Some(301),
+        }])
+        .expect_err("per-issuer leeway over 300s should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("`clock_skew_leeway_secs` must be <= 300"),
+            "error should identify per-issuer leeway bound: {error}"
+        );
+    }
+
+    #[test]
+    fn invalid_per_issuer_audience_pattern_fails_fast() {
+        let error = IssuerTrustConfig::from_inputs(vec![TrustedIssuerInput {
+            entry: TrustedIssuerEntry::Issuer("https://issuer.example.com".to_owned()),
+            discovery_url: None,
+            expected_audience: vec!["api-**".to_owned()],
+            jose_typ: None,
+            clock_skew_leeway_secs: None,
+        }])
+        .expect_err("invalid per-issuer audience pattern should fail");
+
+        assert!(
+            error.to_string().contains("invalid `expected_audience`"),
+            "error should identify invalid per-issuer audience: {error}"
+        );
+    }
+
+    #[test]
     fn hidden_test_trusted_issuer_builder_allows_http_url() {
         let trust = IssuerTrustConfig::from_inputs_allowing_insecure_http_for_tests(vec![
             TrustedIssuerInput {
                 entry: TrustedIssuerEntry::Issuer("http://issuer.example.com".to_owned()),
                 discovery_url: None,
+                expected_audience: Vec::new(),
+                jose_typ: None,
+                clock_skew_leeway_secs: None,
             },
         ])
         .expect("hidden test builder should allow HTTP issuer URLs");
@@ -1291,6 +1569,53 @@ mod gear_input_tests {
             resolved.custom_ca_certificate_paths,
             vec!["custom-root-ca.pem".to_owned()]
         );
+    }
+
+    #[test]
+    fn gear_config_deserializes_per_issuer_overrides() {
+        let json = r#"{
+            "jwt": {
+                "expected_audience": ["global-api"],
+                "trusted_issuers": [
+                    {
+                        "issuer": "https://obo.example.com",
+                        "expected_audience": ["public-api"],
+                        "jose_typ": "obo+jwt",
+                        "clock_skew_leeway_secs": 30
+                    },
+                    { "issuer": "https://kc.example.com/realms/platform" }
+                ],
+                "claim_mapping": { "subject_tenant_id": "tenant_id", "subject_type": "sub_type" }
+            },
+            "s2s_oauth": {
+                "discovery_url": "https://obo.example.com",
+                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+            }
+        }"#;
+        let config: OidcAuthNGearConfig =
+            serde_json::from_str(json).expect("per-issuer override config should deserialize");
+        let resolved = config
+            .resolve()
+            .expect("per-issuer override config should resolve");
+
+        // OBO issuer carries its own overrides.
+        let obo = resolved
+            .issuer_trust
+            .resolve_issuer("https://obo.example.com")
+            .expect("OBO issuer should resolve");
+        assert_eq!(obo.jose_typ.as_deref(), Some("obo+jwt"));
+        assert_eq!(obo.clock_skew_leeway_secs, Some(30));
+        assert_eq!(obo.expected_audience.len(), 1);
+        assert!(obo.expected_audience[0].is_match("public-api"));
+
+        // KC issuer has no overrides (preserves global behavior).
+        let kc = resolved
+            .issuer_trust
+            .resolve_issuer("https://kc.example.com/realms/platform")
+            .expect("KC issuer should resolve");
+        assert!(kc.jose_typ.is_none());
+        assert!(kc.clock_skew_leeway_secs.is_none());
+        assert!(kc.expected_audience.is_empty());
     }
 
     #[test]

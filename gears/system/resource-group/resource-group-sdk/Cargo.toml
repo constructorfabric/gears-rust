@@ -1,7 +1,7 @@
 # Created: 2026-04-16 by Constructor Tech
 [package]
 name = "cf-gears-resource-group-sdk"
-version = "0.1.5"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -17,12 +17,17 @@ workspace = true
 
 [features]
 default = ["odata"]
-odata = [
-    "dep:toolkit-odata-macros",
-    "dep:toolkit-sdk",
-]
+odata = ["dep:toolkit-odata-macros"]
 
 [dependencies]
+# Per ADR 0005 the trait boundary is `CanonicalError`; the SDK ships
+# `ResourceGroupError` as an opt-in `From<CanonicalError>` projection
+# (see src/error.rs). The single AIP-193 ladder
+# (`From<DomainError> for CanonicalError`) lives in the impl crate's
+# `api::rest::error`; this SDK depends on the canonical-errors crate to
+# project that envelope into the typed view.
+toolkit-canonical-errors = { workspace = true }
+
 # Core dependencies for API trait
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -38,17 +43,11 @@ uuid = { workspace = true }
 # Security context for API methods
 toolkit-security = { workspace = true }
 
-# SDK utilities (typed OData queries)
-toolkit-sdk = { workspace = true, optional = true }
-
 # OData support for pagination and query types (required for API trait)
 toolkit-odata = { workspace = true }
 
 # GTS type system — ID parsing and validation
 gts = { workspace = true }
-
-# GTS macros — struct_to_gts_schema for GTS schema definitions
-gts-macros = { workspace = true }
 
 # ToolKit GTS — #[gts_type_schema(...)] wrapper that also submits to the
 # process-wide inventory consumed by types-registry at startup.
@@ -56,6 +55,3 @@ toolkit-gts = { workspace = true }
 
 # JSON Schema (required by struct_to_gts_schema)
 schemars = { workspace = true }
-
-# ToolKit — PluginV1 for plugin spec base type
-toolkit = { workspace = true }

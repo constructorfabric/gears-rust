@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use gts::{GtsID, GtsIdSegment, GtsInstanceId};
 use serde_json::{Map, Value};
+use toolkit_canonical_errors::CanonicalError;
 
 /// SDK-facing GTS type-schema identifier, re-exported from the `gts` crate.
 ///
@@ -16,7 +17,24 @@ use serde_json::{Map, Value};
 pub use gts::GtsTypeId;
 use uuid::Uuid;
 
-use crate::error::TypesRegistryError;
+use crate::field;
+use crate::gts::TypeResource;
+
+/// Build the in-process `InvalidArgument` canonical error the client-side
+/// `try_new` constructors emit for a malformed / kind-mismatched GTS id.
+///
+/// Mirrors the impl crate's `From<DomainError> for CanonicalError` mapping of
+/// `InvalidGtsId` (field [`field::GTS_ID_FIELD`], reason
+/// [`field::INVALID_GTS_ID`]) so the in-process and REST classifications match.
+/// These constructors never cross a wire boundary (ADR 0005 "Non-Canonical
+/// Methods"); emitting `CanonicalError` keeps the SDK on a single error type
+/// end-to-end (it projects to
+/// [`TypesRegistryError::Validation`](crate::TypesRegistryError::Validation)).
+fn invalid_gts_id_error(message: impl Into<String>) -> CanonicalError {
+    TypeResource::invalid_argument()
+        .with_field_violation(field::GTS_ID_FIELD, message, field::INVALID_GTS_ID)
+        .create()
+}
 
 /// Returns `true` if `s` is shaped like a type-schema GTS id (ends with `~`).
 ///
@@ -100,8 +118,8 @@ impl GtsTypeSchema {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidGtsTypeId`](TypesRegistryError::InvalidGtsTypeId)
-    /// in any of these cases:
+    /// Returns an `InvalidArgument` [`CanonicalError`] (reason
+    /// [`field::INVALID_GTS_ID`]) in any of these cases:
     /// - `type_id` does not end with `~` (looks like an instance id);
     /// - `type_id` does not parse as a valid GTS identifier;
     /// - `parent` is `Some(_)` but its `type_id` does not match the chain
@@ -115,9 +133,9 @@ impl GtsTypeSchema {
         raw_schema: Value,
         description: Option<String>,
         parent: Option<Arc<GtsTypeSchema>>,
-    ) -> Result<Self, TypesRegistryError> {
+    ) -> Result<Self, CanonicalError> {
         if !is_type_schema_id(type_id.as_ref()) {
-            return Err(TypesRegistryError::invalid_gts_type_id(format!(
+            return Err(invalid_gts_id_error(format!(
                 "{type_id} does not end with `~`",
             )));
         }
@@ -126,18 +144,18 @@ impl GtsTypeSchema {
             Self::derive_parent_type_id(type_id.as_ref()),
         ) {
             (Some(parent_schema), Some(expected)) if expected != parent_schema.type_id => {
-                return Err(TypesRegistryError::invalid_gts_type_id(format!(
+                return Err(invalid_gts_id_error(format!(
                     "type-schema {type_id} expects parent {expected}, got {}",
                     parent_schema.type_id,
                 )));
             }
             (Some(_), None) => {
-                return Err(TypesRegistryError::invalid_gts_type_id(format!(
+                return Err(invalid_gts_id_error(format!(
                     "root type-schema {type_id} cannot have a parent",
                 )));
             }
             (None, Some(expected)) => {
-                return Err(TypesRegistryError::invalid_gts_type_id(format!(
+                return Err(invalid_gts_id_error(format!(
                     "derived type-schema {type_id} requires parent {expected}, got None",
                 )));
             }
@@ -145,8 +163,8 @@ impl GtsTypeSchema {
             // (None, None) — root with no parent  →  ok
             _ => {}
         }
-        let parsed = GtsID::new(type_id.as_ref())
-            .map_err(|e| TypesRegistryError::invalid_gts_type_id(format!("{e}")))?;
+        let parsed =
+            GtsID::new(type_id.as_ref()).map_err(|e| invalid_gts_id_error(format!("{e}")))?;
         let type_uuid = parsed.to_uuid();
         let segments = parsed.gts_id_segments;
         let traits = Self::extract_traits(&raw_schema);
@@ -496,8 +514,8 @@ impl GtsInstance {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidGtsInstanceId`](TypesRegistryError::InvalidGtsInstanceId)
-    /// in any of these cases:
+    /// Returns an `InvalidArgument` [`CanonicalError`] (reason
+    /// [`field::INVALID_GTS_ID`]) in any of these cases:
     /// - `id` ends with `~` (looks like a type-schema id);
     /// - `id` contains no `~` at all (no type-schema chain prefix);
     /// - `id` does not parse as a valid GTS identifier;
@@ -507,25 +525,24 @@ impl GtsInstance {
         object: Value,
         description: Option<String>,
         type_schema: Arc<GtsTypeSchema>,
-    ) -> Result<Self, TypesRegistryError> {
+    ) -> Result<Self, CanonicalError> {
         if is_type_schema_id(id.as_ref()) {
-            return Err(TypesRegistryError::invalid_gts_instance_id(format!(
+            return Err(invalid_gts_id_error(format!(
                 "{id} ends with `~` (looks like a type-schema id)",
             )));
         }
         let derived = Self::derive_type_id(id.as_ref()).ok_or_else(|| {
-            TypesRegistryError::invalid_gts_instance_id(format!(
+            invalid_gts_id_error(format!(
                 "instance id {id} has no type-schema chain (no `~`)"
             ))
         })?;
         if derived != type_schema.type_id {
-            return Err(TypesRegistryError::invalid_gts_instance_id(format!(
+            return Err(invalid_gts_id_error(format!(
                 "instance id {id} chain prefix {derived} does not match type-schema {0}",
                 type_schema.type_id
             )));
         }
-        let parsed = GtsID::new(id.as_ref())
-            .map_err(|e| TypesRegistryError::invalid_gts_instance_id(format!("{e}")))?;
+        let parsed = GtsID::new(id.as_ref()).map_err(|e| invalid_gts_id_error(format!("{e}")))?;
         let uuid = parsed.to_uuid();
         let segments = parsed.gts_id_segments;
         Ok(Self {
@@ -585,8 +602,9 @@ pub enum RegisterResult {
     Err {
         /// The GTS ID that was attempted, if it could be extracted from the input.
         gts_id: Option<String>,
-        /// The error that occurred during registration.
-        error: TypesRegistryError,
+        /// The error that occurred during registration. Project to
+        /// [`TypesRegistryError`](crate::TypesRegistryError) for typed dispatch.
+        error: CanonicalError,
     },
 }
 
@@ -603,26 +621,26 @@ impl RegisterResult {
         matches!(self, Self::Err { .. })
     }
 
-    /// Converts to `Result<&str, &TypesRegistryError>` — the success arm
+    /// Converts to `Result<&str, &CanonicalError>` — the success arm
     /// borrows the canonical `gts_id`.
     ///
     /// # Errors
     ///
     /// Returns `Err` with a reference to the error if this is a failed registration.
-    pub fn as_result(&self) -> Result<&str, &TypesRegistryError> {
+    pub fn as_result(&self) -> Result<&str, &CanonicalError> {
         match self {
             Self::Ok { gts_id } => Ok(gts_id),
             Self::Err { error, .. } => Err(error),
         }
     }
 
-    /// Converts into `Result<String, TypesRegistryError>` — the success arm
+    /// Converts into `Result<String, CanonicalError>` — the success arm
     /// owns the canonical `gts_id`.
     ///
     /// # Errors
     ///
     /// Returns `Err` with the error if this is a failed registration.
-    pub fn into_result(self) -> Result<String, TypesRegistryError> {
+    pub fn into_result(self) -> Result<String, CanonicalError> {
         match self {
             Self::Ok { gts_id } => Ok(gts_id),
             Self::Err { error, .. } => Err(error),
@@ -640,7 +658,7 @@ impl RegisterResult {
 
     /// Returns the error if failed, `None` otherwise.
     #[must_use]
-    pub fn err(self) -> Option<TypesRegistryError> {
+    pub fn err(self) -> Option<CanonicalError> {
         match self {
             Self::Ok { .. } => None,
             Self::Err { error, .. } => Some(error),
@@ -651,8 +669,8 @@ impl RegisterResult {
     ///
     /// # Errors
     ///
-    /// Returns the first `TypesRegistryError` encountered in `results`.
-    pub fn ensure_all_ok(results: &[Self]) -> Result<(), TypesRegistryError> {
+    /// Returns the first `CanonicalError` encountered in `results`.
+    pub fn ensure_all_ok(results: &[Self]) -> Result<(), CanonicalError> {
         for result in results {
             if let Self::Err { error, .. } = result {
                 return Err(error.clone());

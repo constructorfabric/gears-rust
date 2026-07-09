@@ -4,6 +4,7 @@
 extern crate rustc_ast;
 extern crate rustc_span;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::{
     AttrKind, Attribute, ExprKind, Item, ItemKind, MacCall, VisibilityKind, visit, visit::Visitor,
 };
@@ -132,15 +133,17 @@ impl<'a, 'cx> ForbiddenMacroVisitor<'a, 'cx> {
             return;
         }
 
-        self.cx
-            .span_lint(DE1301_NO_PRINT_MACROS, mac_call.span(), |diag| {
-                diag.primary_message(format!(
-                    "macro `{name}!` is forbidden in production code (DE1301)"
-                ));
+        span_lint_and_then(
+            self.cx,
+            DE1301_NO_PRINT_MACROS,
+            mac_call.span(),
+            format!("macro `{name}!` is forbidden in production code (DE1301)"),
+            |diag| {
                 diag.help(
                     "use `tracing`/`log` for observability, or return the value and handle it at the boundary",
                 );
-            });
+            },
+        );
     }
 }
 

@@ -4,6 +4,7 @@
 extern crate rustc_ast;
 extern crate rustc_span;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use gts::{GtsIdSegment, GtsOps};
 use lint_utils::{filename_str, is_temp_path};
 use rustc_ast::token::LitKind;
@@ -71,10 +72,7 @@ impl EarlyLintPass for De0901GtsStringPattern {
         // Extract both the item name and the initializer expression from const/static items.
         // Note: `Item` has no top-level `ident`; it lives inside `ConstItem` / `StaticItem`.
         let (item_name, init_expr): (&str, Option<&Expr>) = match &item.kind {
-            ItemKind::Const(ci) => (
-                ci.ident.name.as_str(),
-                ci.rhs.as_ref().map(|rhs| rhs.expr()),
-            ),
+            ItemKind::Const(ci) => (ci.ident.name.as_str(), ci.rhs_kind.expr()),
             ItemKind::Static(si) => (si.ident.name.as_str(), si.expr.as_deref()),
             _ => return,
         };
@@ -91,13 +89,16 @@ impl EarlyLintPass for De0901GtsStringPattern {
         // Validate the wildcard GTS pattern itself before skip-listing.
         let result = GtsOps::parse_id(s);
         if !result.ok {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, item.span, |diag| {
-                diag.primary_message(format!(
-                    "invalid GTS wildcard pattern in `{item_name}`: '{s}' (DE0901)"
-                ));
-                diag.note(result.error);
-                diag.help("Example: gts.cf.core.srr.resource.v1~*");
-            });
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                item.span,
+                format!("invalid GTS wildcard pattern in `{item_name}`: '{s}' (DE0901)"),
+                |diag| {
+                    diag.note(result.error);
+                    diag.help("Example: gts.cf.core.srr.resource.v1~*");
+                },
+            );
             // Still skip-list so check_expr doesn't double-report the literal.
             SKIP_SPANS.with(|spans| {
                 collect_nested_spans(init, &mut spans.borrow_mut());
@@ -108,17 +109,22 @@ impl EarlyLintPass for De0901GtsStringPattern {
         self.check_vendors_in_parse_result(cx, item.span, s, &result);
 
         if !item_name.ends_with("_WILDCARD") {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, item.span, |diag| {
-                diag.primary_message(format!(
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                item.span,
+                format!(
                     "GTS wildcard string in `const`/`static` `{item_name}` must have a name ending with `_WILDCARD` (DE0901)"
-                ));
-                diag.note(format!(
-                    "found wildcard GTS pattern `{s}` stored in `{item_name}`"
-                ));
-                diag.help(format!(
-                    "rename to `{item_name}_WILDCARD` or use a non-wildcard value"
-                ));
-            });
+                ),
+                |diag| {
+                    diag.note(format!(
+                        "found wildcard GTS pattern `{s}` stored in `{item_name}`"
+                    ));
+                    diag.help(format!(
+                        "rename to `{item_name}_WILDCARD` or use a non-wildcard value"
+                    ));
+                },
+            );
         }
 
         // Skip-list the span so check_expr doesn't re-flag (or double-report) the literal.
@@ -503,11 +509,16 @@ impl De0901GtsStringPattern {
 
         // Wildcards are NOT allowed in schema_id
         if s.contains('*') {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                diag.primary_message(format!("wildcards are not allowed in schema_id: '{}' (DE0901)", s));
-                diag.note("Wildcards (*) are only allowed in permission strings, not in schema_id attributes");
-                diag.help("Use concrete type names in schema_id");
-            });
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!("wildcards are not allowed in schema_id: '{}' (DE0901)", s),
+                |diag| {
+                    diag.note("Wildcards (*) are only allowed in permission strings, not in schema_id attributes");
+                    diag.help("Use concrete type names in schema_id");
+                },
+            );
             return;
         }
 
@@ -515,24 +526,34 @@ impl De0901GtsStringPattern {
         let result = GtsOps::parse_id(s);
 
         if !result.ok {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                diag.primary_message(format!("invalid GTS schema_id: '{}' (DE0901)", s));
-                diag.note(result.error);
-                diag.help("Example: gts.cf.core.events.type.v1~");
-            });
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!("invalid GTS schema_id: '{}' (DE0901)", s),
+                |diag| {
+                    diag.note(result.error);
+                    diag.help("Example: gts.cf.core.events.type.v1~");
+                },
+            );
             return;
         }
 
         // Ensure it's actually a schema (type), not an instance
         if result.is_type != Some(true) {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                diag.primary_message(format!(
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!(
                     "schema_id must be a type schema, not an instance: '{}' (DE0901)",
                     s
-                ));
-                diag.note("schema_id must end with '~' to indicate it's a type schema");
-                diag.help("Example: gts.cf.core.events.type.v1~");
-            });
+                ),
+                |diag| {
+                    diag.note("schema_id must end with '~' to indicate it's a type schema");
+                    diag.help("Example: gts.cf.core.events.type.v1~");
+                },
+            );
         } else {
             self.check_vendors_in_parse_result(cx, span, s, &result);
         }
@@ -546,46 +567,63 @@ impl De0901GtsStringPattern {
         // If the input contains delimiters for chained ids / permission strings,
         // it is not a single segment.
         if s.contains('~') || s.contains(':') {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                diag.primary_message(format!(
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!(
                     "gts_make_instance_id expects a single GTS segment, got: '{}' (DE0901)",
                     s
-                ));
-                diag.help("Example: vendor.package.sku.abc.v1");
-            });
+                ),
+                |diag| {
+                    diag.help("Example: vendor.package.sku.abc.v1");
+                },
+            );
             return;
         }
 
         if s.contains('*') {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                diag.primary_message(format!(
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!(
                     "wildcards are not allowed in instance id segments: '{}' (DE0901)",
                     s
-                ));
-                diag.help("Example: vendor.package.sku.abc.v1");
-            });
+                ),
+                |diag| {
+                    diag.help("Example: vendor.package.sku.abc.v1");
+                },
+            );
             return;
         }
 
         match GtsIdSegment::new(0, 0, s) {
             Err(e) => {
-                cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                    diag.primary_message(format!("invalid GTS segment: '{}' (DE0901)", s));
-                    diag.note(e.to_string());
-                    diag.help("Example: vendor.package.sku.abc.v1");
-                });
+                span_lint_and_then(
+                    cx,
+                    DE0901_GTS_STRING_PATTERN,
+                    span,
+                    format!("invalid GTS segment: '{}' (DE0901)", s),
+                    |diag| {
+                        diag.note(e.to_string());
+                        diag.help("Example: vendor.package.sku.abc.v1");
+                    },
+                );
             }
             Ok(seg) if !allowed_vendors(cx, span).contains(&seg.vendor.as_str()) => {
-                cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                    diag.primary_message(format!(
-                        "invalid GTS vendor in segment: '{}' (DE0901)",
-                        s
-                    ));
-                    diag.note(format!(
-                        "found vendor '{}', allowed vendors are 'cf' and 'example'",
-                        seg.vendor
-                    ));
-                });
+                span_lint_and_then(
+                    cx,
+                    DE0901_GTS_STRING_PATTERN,
+                    span,
+                    format!("invalid GTS vendor in segment: '{}' (DE0901)", s),
+                    |diag| {
+                        diag.note(format!(
+                            "found vendor '{}', allowed vendors are 'cf' and 'example'",
+                            seg.vendor
+                        ));
+                    },
+                );
             }
             Ok(_) => {}
         }
@@ -604,16 +642,18 @@ impl De0901GtsStringPattern {
             {
                 continue;
             }
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                diag.primary_message(format!(
-                    "invalid GTS vendor in segment #{idx}: '{}' (DE0901)",
-                    s
-                ));
-                diag.note(format!(
-                    "found vendor '{}', allowed vendors are 'cf' and 'example'",
-                    seg.vendor
-                ));
-            });
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!("invalid GTS vendor in segment #{idx}: '{}' (DE0901)", s),
+                |diag| {
+                    diag.note(format!(
+                        "found vendor '{}', allowed vendors are 'cf' and 'example'",
+                        seg.vendor
+                    ));
+                },
+            );
             break;
         }
     }
@@ -623,21 +663,34 @@ impl De0901GtsStringPattern {
 
         // Wildcards are NOT allowed in regular GTS strings (only in permission strings)
         if s.contains('*') {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                diag.primary_message(format!("invalid GTS string (wildcards not allowed): '{}' (DE0901)", s));
-                diag.note("Wildcards (*) are only allowed in permission strings, not in regular GTS identifiers");
-                diag.help("Use concrete type names");
-            });
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!(
+                    "invalid GTS string (wildcards not allowed): '{}' (DE0901)",
+                    s
+                ),
+                |diag| {
+                    diag.note("Wildcards (*) are only allowed in permission strings, not in regular GTS identifiers");
+                    diag.help("Use concrete type names");
+                },
+            );
             return;
         }
 
         let result = GtsOps::parse_id(s);
 
         if !result.ok {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                diag.primary_message(format!("invalid GTS string: '{}' (DE0901)", s));
-                diag.note(result.error);
-            });
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!("invalid GTS string: '{}' (DE0901)", s),
+                |diag| {
+                    diag.note(result.error);
+                },
+            );
         } else {
             self.check_vendors_in_parse_result(cx, span, s, &result);
         }
@@ -655,10 +708,15 @@ impl De0901GtsStringPattern {
         let result = GtsOps::parse_id(s);
 
         if !result.ok {
-            cx.span_lint(DE0901_GTS_STRING_PATTERN, span, |diag| {
-                diag.primary_message(format!("invalid GTS string: '{}' (DE0901)", s));
-                diag.note(result.error);
-            });
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!("invalid GTS string: '{}' (DE0901)", s),
+                |diag| {
+                    diag.note(result.error);
+                },
+            );
         } else {
             self.check_vendors_in_parse_result(cx, span, s, &result);
         }

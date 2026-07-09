@@ -79,7 +79,7 @@ pub fn stream_from_events(events: Vec<StreamingEvent>) -> PluginStream {
     stream::iter(events.into_iter().map(Ok)).boxed()
 }
 
-#[allow(clippy::gear_name_repetitions)]
+#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone)]
 pub struct SessionPluginCtx {
     pub session_type_id: Uuid,
@@ -97,7 +97,7 @@ pub struct SessionPluginCtx {
 /// The summary surfaces `len` and a per-role count so observability is
 /// preserved without leaking text. `call_ctx` keeps its own redaction (see
 /// `PluginCallContext::Debug`).
-#[allow(clippy::gear_name_repetitions)]
+#[allow(clippy::module_name_repetitions)]
 #[derive(Clone)]
 pub struct MessagePluginCtx {
     pub session_id: Uuid,
@@ -141,7 +141,7 @@ impl std::fmt::Debug for MessagePluginCtx {
 /// secrets (API keys, webhook auth, credentials) that must never hit logs.
 /// Wrappers `SessionPluginCtx` / `MessagePluginCtx` derive `Debug` and
 /// transitively inherit this redaction.
-#[allow(clippy::gear_name_repetitions)]
+#[allow(clippy::module_name_repetitions)]
 #[derive(Clone)]
 pub struct PluginCallContext {
     /// Correlation ID for this plugin invocation. Used for log correlation and
@@ -303,7 +303,11 @@ mod plugin_call_context_tests {
     #[test]
     fn remaining_is_zero_when_deadline_already_elapsed() {
         let mut ctx = make_ctx();
-        ctx.deadline = Some(Instant::now() - Duration::from_secs(1));
+        ctx.deadline = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("monotonic clock is at least 1s past its reference"),
+        );
         // Elapsed deadlines must be Some(ZERO), not None — the latter would
         // be indistinguishable from "no deadline set" and let plugins
         // silently extend their budget via `.unwrap_or(default)`.
@@ -317,10 +321,7 @@ mod plugin_call_context_tests {
         // Race-tolerant: anything <= 0 is Some(ZERO); a tiny positive value
         // is also acceptable but should be sub-millisecond.
         let r = ctx.remaining().expect("deadline is set");
-        assert!(
-            r <= Duration::from_millis(1),
-            "expected ~ZERO, got {r:?}"
-        );
+        assert!(r <= Duration::from_millis(1), "expected ~ZERO, got {r:?}");
     }
 }
 
@@ -336,11 +337,18 @@ mod message_plugin_ctx_debug_tests {
         Message {
             message_id: Uuid::nil(),
             session_id: Uuid::nil(),
+            tenant_id: None,
+            user_id: None,
             parent_message_id: None,
             variant_index: 0,
             is_active: true,
             role,
-            content: serde_json::json!({ "text": secret_text }),
+            parts: vec![crate::models::MessagePart::text(
+                Uuid::nil(),
+                Uuid::nil(),
+                0,
+                secret_text,
+            )],
             file_ids: vec![],
             metadata: None,
             is_complete: true,
@@ -420,27 +428,57 @@ mod message_plugin_ctx_debug_tests {
     }
 }
 
+/// What a session lifecycle hook returns: the capability set plus optional
+/// metadata the plugin wants persisted onto the session.
+///
+/// Returned by [`ChatEngineBackendPlugin::on_session_created`],
+/// [`on_session_updated`](ChatEngineBackendPlugin::on_session_updated), and
+/// [`on_session_type_configured`](ChatEngineBackendPlugin::on_session_type_configured).
+/// For the session-bound hooks (`on_session_created` / `on_session_updated`)
+/// Chat Engine merges `metadata` into `Session.metadata`. For
+/// `on_session_type_configured` there is no session, so `metadata` is ignored.
+#[derive(Debug, Clone, Default)]
+pub struct SessionPluginResponse {
+    /// Capabilities to expose — stored as `Session.enabled_capabilities`
+    /// (session hooks) or `SessionType.available_capabilities` (type hook).
+    pub capabilities: Vec<Capability>,
+    /// Optional metadata merged into the owning session's `metadata` (object
+    /// merge; plugin keys override existing same-name keys). `None` leaves the
+    /// session metadata untouched.
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl From<Vec<Capability>> for SessionPluginResponse {
+    /// Ergonomic conversion for plugins that only resolve capabilities.
+    fn from(capabilities: Vec<Capability>) -> Self {
+        Self {
+            capabilities,
+            metadata: None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ChatEngineBackendPlugin: Send + Sync {
     async fn on_session_type_configured(
         &self,
         _ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
-        Ok(vec![])
+    ) -> Result<SessionPluginResponse, PluginError> {
+        Ok(SessionPluginResponse::default())
     }
 
     async fn on_session_created(
         &self,
         _ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
-        Ok(vec![])
+    ) -> Result<SessionPluginResponse, PluginError> {
+        Ok(SessionPluginResponse::default())
     }
 
     async fn on_session_updated(
         &self,
         _ctx: SessionPluginCtx,
-    ) -> Result<Vec<Capability>, PluginError> {
-        Ok(vec![])
+    ) -> Result<SessionPluginResponse, PluginError> {
+        Ok(SessionPluginResponse::default())
     }
 
     /// Process a new user message and stream response events back.
@@ -452,10 +490,7 @@ pub trait ChatEngineBackendPlugin: Send + Sync {
     /// The returned [`PluginStream`] must be `'static` — it cannot borrow from
     /// `&self`. See [`PluginStream`]'s docs for the idiomatic way to detach
     /// captured state (clone fields out, or hold `self` in an `Arc`).
-    async fn on_message(
-        &self,
-        _ctx: MessagePluginCtx,
-    ) -> Result<PluginStream, PluginError> {
+    async fn on_message(&self, _ctx: MessagePluginCtx) -> Result<PluginStream, PluginError> {
         Ok(empty_stream())
     }
 

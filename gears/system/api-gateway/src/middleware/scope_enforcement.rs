@@ -218,10 +218,13 @@ pub async fn scope_enforcement_middleware(
             // `instance` / `trace_id` are filled by the canonical error
             // middleware (`toolkit::api::canonical_error_middleware`) on the
             // way out — this middleware sits inside its layer.
-            return CanonicalError::unauthenticated()
+            let mut response = CanonicalError::unauthenticated()
                 .with_reason("AUTH_REQUIRED")
                 .create()
                 .into_response();
+            // No credentials reached this protected route (RFC 6750 §3).
+            common::append_bearer_challenge(&mut response, common::BearerChallenge::NoCredentials);
+            return response;
         }
         return next.run(req).await;
     };
@@ -234,7 +237,10 @@ pub async fn scope_enforcement_middleware(
         // `instance` / `trace_id` are filled by the canonical error
         // middleware (`toolkit::api::canonical_error_middleware`) on the
         // way out — this middleware sits inside its layer.
-        return canonical.into_response();
+        let mut response = canonical.into_response();
+        // A valid token reached here but lacked the required scope (RFC 6750 §3.1).
+        common::append_bearer_challenge(&mut response, common::BearerChallenge::InsufficientScope);
+        return response;
     }
 
     next.run(req).await

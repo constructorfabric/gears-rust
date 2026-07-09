@@ -6,8 +6,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::super::core::Outbox;
-use super::super::dialect::Dialect;
 use super::super::prioritizer::SharedPrioritizer;
+use super::super::store::OutboxStore;
 use super::super::taskward::{Directive, WorkerAction};
 use crate::Db;
 
@@ -21,12 +21,12 @@ struct DirtyPartitionRow {
 /// and by the cold reconciler (poker) loop.
 pub async fn reconcile_dirty(outbox: &Outbox, db: &Db, prioritizer: &SharedPrioritizer) {
     let conn = db.sea_internal();
-    let backend = conn.get_database_backend();
-    let dialect = Dialect::from(backend);
+    debug_assert_eq!(conn.get_database_backend(), outbox.statements().backend());
+    let store = OutboxStore::new(outbox.statements());
 
     let rows = match DirtyPartitionRow::find_by_statement(Statement::from_sql_and_values(
-        backend,
-        dialect.discover_dirty_partitions(),
+        store.backend(),
+        store.discover_dirty_partitions(),
         [],
     ))
     .all(&conn)

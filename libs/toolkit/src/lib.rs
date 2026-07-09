@@ -70,6 +70,10 @@ extern crate self as toolkit;
 pub use anyhow::Result;
 pub use async_trait::async_trait;
 
+// Re-export tokio so `#[gear(...)]`-generated code can reference
+// `::toolkit::tokio::...` without requiring gears to add a direct tokio dep.
+pub use tokio;
+
 // Re-export inventory for user convenience
 pub use inventory;
 

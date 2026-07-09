@@ -10,6 +10,7 @@ Updated:  2026-03-20 by Constructor Tech
   - [1.2 Purpose](#12-purpose)
   - [1.3 Actors](#13-actors)
   - [1.4 References](#14-references)
+  - [1.5 Plugin SDK Contract](#15-plugin-sdk-contract)
 - [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
   - [Register Plugin at Startup](#register-plugin-at-startup)
   - [Resolve Plugin](#resolve-plugin)
@@ -63,7 +64,152 @@ Success criteria: Plugins are registered at startup via ClientHub, resolved by `
 - **PRD**: [PRD.md](../PRD.md)
 - **Design**: [DESIGN.md](../DESIGN.md) -- Component Model (Plugin Integration Gear), plugin_configs table, Plugin API Contract
 - **ADR**: [ADR-0022](../ADR/0022-plugin-backend-integration.md) -- Internal Plugin Interface for Backend Integration
+- **SDK source**: [`chat-engine-sdk`](../../chat-engine-sdk/src) — `lib.rs`, `models.rs`, `plugin.rs`, `error.rs`
 - **Dependencies**: `cpt-cf-chat-engine-feature-session-lifecycle`
+
+### 1.5 Plugin SDK Contract
+
+This section documents the public Rust contract that `ChatEngineBackendPlugin` authors program against. The crate `chat-engine-sdk` is the single source of truth; this section restates it. When in doubt, the SDK source wins.
+
+**Call-context wrappers.** Each trait method receives one of two wrapper structs that bundle the per-call `PluginCallContext` with method-specific identifiers:
+
+- `SessionPluginCtx { session_type_id, session_id: Option<Uuid>, call_ctx }` — passed to lifecycle hooks. `session_id` is `None` exclusively during `on_session_type_configured` (the session does not exist yet); for `on_session_created`, `on_session_updated`, and `on_session_summary` it is always `Some`.
+- `MessagePluginCtx { session_id, message_id, messages, call_ctx }` — passed to `on_message` and `on_message_recreate`. `messages` is the filtered history (excluding `is_hidden_from_backend = true` entries).
+
+#### PluginCallContext
+
+`PluginCallContext` (`chat-engine-sdk::plugin::PluginCallContext`) is attached to every plugin invocation and carries the following fields:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `request_id` | `Uuid` | Correlation ID for this plugin invocation; a fresh UUIDv4 per call (or propagated from upstream). Plugins **MUST** include it in every log line emitted while handling the call. This is the field referred to as `trace_id` elsewhere in the docs — both names denote the same per-call correlation handle. |
+| `tenant_id` | `TenantId` | Tenant that owns the session issuing the call. |
+| `user_id` | `UserId` | End-user behind the call. |
+| `plugin_instance_id` | `String` | GTS plugin instance ID that is handling the call (matches the bound `SessionType.plugin_instance_id`). |
+| `session_type_id` | `Uuid` | Session type the call is scoped to. |
+| `plugin_config` | `Option<serde_json::Value>` | Per-`(plugin_instance_id, session_type_id)` configuration from `plugin_configs`. Opaque to Chat Engine. |
+| `enabled_capabilities` | `Option<Vec<CapabilityValue>>` | Capability values selected by the client for this call. |
+| `deadline` | `Option<Instant>` | Absolute monotonic deadline for this call. Plugins **MUST** bound long-running work (HTTP requests, retries) to remain within this budget. `None` means Chat Engine did not set a deadline. |
+| `cancel` | `tokio_util::sync::CancellationToken` | Cooperative cancellation signal — see below. |
+
+`PluginCallContext::remaining() -> Option<Duration>` has **three distinct states** that callers MUST handle individually:
+
+| Return value | Meaning |
+|--------------|---------|
+| `None` | No deadline was set. The plugin may use its own default budget. |
+| `Some(Duration::ZERO)` | Deadline has already elapsed. The plugin **MUST** abort immediately, typically returning `PluginError::timeout()`. |
+| `Some(d > 0)` | `d` of budget remains. Pass this to `tokio::time::timeout(...)` or `reqwest::Client::timeout(...)`. |
+
+Collapsing "no deadline" and "elapsed" into a single `None` would be a footgun: `.unwrap_or(default_budget)` would let elapsed deadlines silently extend their budget.
+
+`PluginCallContext::is_cancelled() -> bool` is a pre-flight check; for cooperative cancellation use `select!` over `cancel.cancelled()` alongside the plugin's work.
+
+**Sources of cancellation**. Chat Engine cancels the token when:
+1. The client disconnects (HTTP stream closed).
+2. The deadline elapses (Chat Engine bridges `deadline → cancel`).
+3. An explicit `DELETE /streaming` is invoked on the session.
+
+When the signal fires, plugins should return `PluginError::transient("cancelled")` (or `PluginError::timeout()` if cancellation was deadline-driven) and stop emitting events.
+
+**Clone semantics**. Clones of `CancellationToken` share the same cancellation state. Calling `.cancel()` on any clone — including one obtained by cloning the enclosing `PluginCallContext` — cancels every other holder, **including Chat Engine's parent token**. If a plugin fans out concurrent sub-tasks that need independent cancellation, it **MUST** derive child tokens with `CancellationToken::child_token` rather than cloning.
+
+#### PluginStream and the `'static` requirement
+
+Streaming plugin responses are returned as `PluginStream`:
+
+```rust
+pub type PluginStream = BoxStream<'static, Result<StreamingEvent, PluginError>>;
+```
+
+The outer `Result<PluginStream, _>` returned by trait methods represents errors that occur **before** the stream starts (e.g., invalid config, plugin unavailable). Once a stream is returned, individual items may be `Err` to signal mid-stream failures (e.g., upstream disconnect) without aborting the stream.
+
+The `'static` bound is load-bearing: Chat Engine drives the stream to completion **after** the trait method returns, so the stream may not borrow from `&self` — any reference would dangle once the call frame unwinds. The compiler error is a lifetime mismatch pointing inside the `async_stream::stream! { … }` / `futures::stream::unfold(…)` body, **not** at the trait signature. Two idiomatic fixes:
+
+```rust
+// ❌ Captures `&self.config` — won't satisfy `'static`.
+async fn on_message(&self, ctx: MessagePluginCtx)
+    -> Result<PluginStream, PluginError>
+{
+    Ok(async_stream::stream! {
+        let response = self.config.client.send(&ctx.messages).await?;
+        // ...
+    }.boxed())
+}
+
+// ✅ Clone the bits you need out of `self` first.
+async fn on_message(&self, ctx: MessagePluginCtx)
+    -> Result<PluginStream, PluginError>
+{
+    let client = self.config.client.clone();
+    Ok(async_stream::stream! {
+        let response = client.send(&ctx.messages).await?;
+        // ...
+    }.boxed())
+}
+
+// ✅ Or hold the plugin in an `Arc<Self>` and clone the handle.
+let me = Arc::clone(&self);
+Ok(async_stream::stream! { me.do_things(...).await; }.boxed())
+```
+
+For non-streaming responses, the SDK exposes two helpers:
+
+- `chat_engine_sdk::plugin::empty_stream() -> PluginStream` — used when a lifecycle hook has nothing to emit.
+- `chat_engine_sdk::plugin::stream_from_events(events: Vec<StreamingEvent>) -> PluginStream` — collects all events synchronously before returning; sidesteps the `'static` issue entirely for stub or non-streaming implementations.
+
+#### PluginError taxonomy
+
+`chat-engine-sdk::error::PluginError` is the single error type returned by every fallible plugin method. Chat Engine's reaction to each variant is fixed:
+
+| Variant | Suggested HTTP | Retryable | User-facing? | Typical cause |
+|---------|----------------|-----------|--------------|---------------|
+| `Transient` | 503 | yes | no | network blip, upstream 5xx |
+| `RateLimited` | 429 | yes | yes | upstream `Retry-After` / 429 |
+| `Timeout` | 504 | yes | no | request exceeded the deadline |
+| `InvalidInput` | 400 | no | yes | bad request payload, validation failure |
+| `Unauthorized` | 401 | no | yes | auth token missing/expired/insufficient |
+| `NotFound` | 404 | no | yes | model / resource does not exist |
+| `Internal` | 500 | no | no (page on-call) | misconfiguration, plugin bug |
+
+The SDK exposes routing helpers; do not duplicate the table above in code:
+
+- `PluginError::suggested_status() -> u16` — HTTP status to surface.
+- `PluginError::is_retryable() -> bool` — whether Chat Engine should retry (with backoff).
+- `PluginError::is_user_facing() -> bool` — whether the error message is safe to surface to the end user. "User-facing" means the message describes a user mistake; non-user-facing variants may leak operator details and **MUST** be replaced by a generic message at the API boundary.
+- `PluginError::retry_after() -> Option<Duration>` — `Retry-After` hint when the variant carries one (currently only `RateLimited`).
+
+Every variant has paired constructors: `PluginError::transient(msg)` and `PluginError::transient_with(msg, source)` (and the same pattern for `invalid_input`, `unauthorized`, `not_found`, `internal`, `timeout`, `rate_limited`). The `_with` variants attach an upstream `std::error::Error + Send + Sync + 'static` as `#[source]`, preserving the cause chain across the SDK boundary — callers walk it via `Error::source()`.
+
+**RateLimited.retry_after** is `Option<Duration>`. When present, Chat Engine surfaces it as the `Retry-After` HTTP header (or `retry_after_seconds` in the error body for REST clients).
+
+#### Default trait implementations
+
+Every method on `ChatEngineBackendPlugin` except `plugin_instance_id` has a default implementation that returns the empty/no-op result:
+
+| Method | Default body |
+|--------|--------------|
+| `on_session_type_configured` | `Ok(vec![])` — no capabilities declared |
+| `on_session_created` | `Ok(vec![])` |
+| `on_session_updated` | `Ok(vec![])` |
+| `on_message` | `Ok(empty_stream())` |
+| `on_message_recreate` | `Ok(empty_stream())` |
+| `on_session_summary` | `Ok(empty_stream())` |
+| `health_check` | `Ok(HealthStatus::Healthy)` |
+| `plugin_instance_id` | **required — no default** |
+
+Plugins **MUST** implement `plugin_instance_id` and override only the lifecycle and message methods they actually need.
+
+#### Debug-redaction contract
+
+The SDK's `Debug` impls intentionally redact secrets and PII so that plugin logs cannot leak data:
+
+| Type | Redacted field | Surfaced summary |
+|------|----------------|------------------|
+| `Session` | `share_token` | `Some("<redacted>")` / `None` |
+| `PluginCallContext` | `plugin_config` | `Some("<redacted>")` / `None` |
+| `MessagePluginCtx` | `messages` (entire vec) | `"<redacted: N message(s); user=X, assistant=Y, system=Z>"` |
+
+Plugin authors **MUST NOT** add their own `Debug`/`Display` impls (or `tracing` fields) that bypass this redaction — that would defeat the contract. When custom diagnostics are needed, log derived statistics (counts, sizes, durations) rather than payload content. Wrappers `SessionPluginCtx` and `MessagePluginCtx` derive `Debug`, transitively inheriting the redaction from `PluginCallContext`.
 
 ## 2. Actor Flows (CDSL)
 
@@ -221,14 +367,14 @@ Success criteria: Plugins are registered at startup via ClientHub, resolved by `
 
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-dod-plugin-system-trait`
 
-The system **MUST** define the `ChatEngineBackendPlugin` trait in the `chat-engine-sdk` crate with all lifecycle and message methods: `on_session_type_configured`, `on_session_created`, `on_session_updated`, `on_message`, `on_message_recreate`, `on_session_summary`, and `health_check`. Each method receives a typed call context and returns the appropriate result type (`Vec<Capability>`, `ResponseStream`, or `HealthStatus`).
+The system **MUST** define the `ChatEngineBackendPlugin` trait in the `chat-engine-sdk` crate with all lifecycle and message methods: `on_session_type_configured`, `on_session_created`, `on_session_updated`, `on_message`, `on_message_recreate`, `on_session_summary`, and `health_check`. Each method receives a typed call context (`SessionPluginCtx` / `MessagePluginCtx`, both carrying a `PluginCallContext`) and returns the appropriate result type (`Vec<Capability>`, `PluginStream`, or `HealthStatus`). All methods except `plugin_instance_id() -> &str` have default no-op implementations (`Ok(vec![])` / `Ok(empty_stream())` / `Ok(HealthStatus::Healthy)`); plugins override only what they need. See [§1.5 Plugin SDK Contract](#15-plugin-sdk-contract) for the full call-context, stream, error-taxonomy, and Debug-redaction contracts.
 
 **Implements**:
 - `cpt-cf-chat-engine-flow-plugin-system-invoke`
 
 **Touches**:
 - Crate: `chat-engine-sdk`
-- Entities: `ChatEngineBackendPlugin` (trait), `SessionCtx`, `MessageCtx`, `ResponseStream`, `Capability`, `HealthStatus`
+- Entities: `ChatEngineBackendPlugin` (trait), `SessionPluginCtx`, `MessagePluginCtx`, `PluginCallContext`, `PluginStream`, `PluginError`, `Capability`, `CapabilityValue`, `HealthStatus`, `StreamingEvent`
 
 ### Plugin Registry via ClientHub
 
@@ -291,7 +437,15 @@ The system **MUST** ship a first-party `webhook-compat` plugin that implements `
 
 - [ ] `p2` - **ID**: `cpt-cf-chat-engine-dod-plugin-system-health-check`
 
-The system **MUST** support an optional `health_check()` method on `ChatEngineBackendPlugin`. When a session type is configured, the system may call `health_check()` to verify plugin availability. Health check failure is logged as a warning but does not block session type configuration.
+The system **MUST** support an optional `health_check()` method on `ChatEngineBackendPlugin`. When a session type is configured, the system may call `health_check()` to verify plugin availability. The method returns a `HealthStatus` with three possible values:
+
+| Value | Chat Engine reaction |
+|-------|----------------------|
+| `Healthy` | Plugin is fully operational. No action. |
+| `Degraded` | Plugin is reachable but reporting partial degradation. Logged at WARN; session type configuration is **not** blocked. Treated as available for routing — degradation is the plugin's signal that operators should investigate, but traffic still flows. |
+| `Unhealthy` | Plugin is unreachable or reporting failure. Logged at WARN; session type configuration is **not** blocked. Downstream `on_session_*` / `on_message_*` calls are expected to fail with `PluginError::Transient` until the plugin recovers. |
+
+A `health_check()` call that itself returns `Err(PluginError)` is logged as a warning and treated equivalently to `Unhealthy` for routing purposes — it does not block session type configuration. The default implementation in `chat-engine-sdk` returns `Ok(HealthStatus::Healthy)`.
 
 **Implements**:
 - `cpt-cf-chat-engine-algo-plugin-system-validate-availability`

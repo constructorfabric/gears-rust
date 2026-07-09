@@ -1008,12 +1008,16 @@ async fn cleanup_inner(
     let mut removed: usize = 0;
     let mut already_gone: usize = 0;
     for group_id in &groups {
-        match tokio::time::timeout(
+        // The trait boundary is `CanonicalError` (ADR 0005); project the
+        // inner result into the typed SDK view so the `NotFound`
+        // idempotent arm dispatches as before.
+        let outcome = tokio::time::timeout(
             RG_CLEANUP_TIMEOUT,
             rg.remove_membership(sys_ctx, *group_id, USER_RG_TYPE_CODE, &user_id_str),
         )
         .await
-        {
+        .map(|r| r.map_err(ResourceGroupError::from));
+        match outcome {
             Err(_elapsed) => {
                 emit_metric(
                     AM_DEPENDENCY_HEALTH,

@@ -38,6 +38,8 @@ const UNAUTHENTICATED_TYPE: &str =
 const SERVICE_UNAVAILABLE_TYPE: &str =
     "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~";
 const INTERNAL_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~";
+const PERMISSION_DENIED_TYPE: &str =
+    "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~";
 const PROBLEM_JSON: &str = "application/problem+json";
 
 async fn problem_from(response: Response) -> Problem {
@@ -53,6 +55,20 @@ fn content_type(response: &Response) -> &str {
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
+}
+
+/// All `WWW-Authenticate` header values, in order. Empty if none.
+///
+/// Returning every value (rather than the first) lets assertions also catch a
+/// stacked/duplicate challenge, which RFC 7235 permits but the `Bearer` scheme
+/// makes ambiguous to parse.
+fn www_authenticate_all(response: &Response) -> Vec<&str> {
+    response
+        .headers()
+        .get_all(header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect()
 }
 
 /// Test configuration provider
@@ -826,6 +842,56 @@ fn mock_returning_error(err_fn: fn() -> AuthNResolverError) -> MockAuthNResolver
     }
 }
 
+/// Build a mock that accepts a specific token and returns a `SecurityContext`
+/// carrying the given token scopes (for scope-enforcement tests).
+fn mock_accepting_token_with_scopes(
+    valid_token: &'static str,
+    scopes: Vec<String>,
+) -> MockAuthNResolverClient {
+    MockAuthNResolverClient {
+        handler: Arc::new(move |token| {
+            if token == valid_token {
+                Ok(AuthenticationResult {
+                    security_context: SecurityContext::builder()
+                        .subject_id(Uuid::new_v4())
+                        .subject_tenant_id(Uuid::new_v4())
+                        .token_scopes(scopes.clone())
+                        .build()
+                        .unwrap(),
+                })
+            } else {
+                Err(AuthNResolverError::Unauthorized("invalid token".to_owned()))
+            }
+        }),
+    }
+}
+
+/// Create a finalized router with auth **enabled** and route-policy scope
+/// enforcement covering `/tests/v1/api/**` with the given required scopes.
+async fn create_scope_enforced_router(
+    mock: MockAuthNResolverClient,
+    required_scopes: &[&str],
+) -> Router {
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                // Scope enforcement requires auth to be enabled (gear rejects the
+                // combination otherwise); stated explicitly as test precondition.
+                "auth_disabled": false,
+                "route_policies": {
+                    "enabled": true,
+                    "rules": [
+                        { "path": "/tests/v1/api/**", "required_scopes": required_scopes }
+                    ]
+                }
+            }
+        }
+    });
+
+    create_router(config, mock).await
+}
+
 // --- Auth-enabled integration tests ---
 
 #[tokio::test]
@@ -878,6 +944,13 @@ async fn test_missing_token_returns_401() {
         "Missing token should yield 401"
     );
     assert_eq!(content_type(&response), PROBLEM_JSON);
+    // RFC 6750 §3: no credentials were presented, so the challenge carries a
+    // `realm` auth-param but no `error` code. Exactly one challenge — no dup.
+    assert_eq!(
+        www_authenticate_all(&response),
+        [r#"Bearer realm="api""#],
+        "Missing token should emit a single WWW-Authenticate challenge"
+    );
     let problem = problem_from(response).await;
     assert_eq!(problem.problem_type, UNAUTHENTICATED_TYPE);
     assert_eq!(problem.context["reason"], "MISSING_BEARER");
@@ -905,6 +978,13 @@ async fn test_invalid_token_returns_401() {
         "Invalid token should yield 401"
     );
     assert_eq!(content_type(&response), PROBLEM_JSON);
+    // RFC 6750 §3.1: a token was presented but rejected, so the challenge
+    // carries the `invalid_token` error code. Exactly one challenge — no dup.
+    assert_eq!(
+        www_authenticate_all(&response),
+        [r#"Bearer error="invalid_token""#],
+        "Invalid token should emit a single WWW-Authenticate challenge"
+    );
     let problem = problem_from(response).await;
     assert_eq!(problem.problem_type, UNAUTHENTICATED_TYPE);
     assert_eq!(problem.context["reason"], "AUTHN_FAILED");
@@ -932,6 +1012,9 @@ async fn test_no_plugin_available_returns_503() {
         "NoPluginAvailable should yield 503"
     );
     assert_eq!(content_type(&response), PROBLEM_JSON);
+    // A 503 is an infrastructure failure, not a credential rejection, so it
+    // must not carry a bearer challenge.
+    assert!(www_authenticate_all(&response).is_empty());
     let problem = problem_from(response).await;
     assert_eq!(problem.problem_type, SERVICE_UNAVAILABLE_TYPE);
     assert_eq!(problem.context["retry_after_seconds"], 5);
@@ -960,6 +1043,9 @@ async fn test_service_unavailable_returns_503() {
         "ServiceUnavailable should yield 503"
     );
     assert_eq!(content_type(&response), PROBLEM_JSON);
+    // A 503 is an infrastructure failure, not a credential rejection, so it
+    // must not carry a bearer challenge.
+    assert!(www_authenticate_all(&response).is_empty());
     let problem = problem_from(response).await;
     assert_eq!(problem.problem_type, SERVICE_UNAVAILABLE_TYPE);
     assert_eq!(problem.context["retry_after_seconds"], 5);
@@ -987,6 +1073,9 @@ async fn test_internal_error_returns_500() {
         "Internal error should yield 500"
     );
     assert_eq!(content_type(&response), PROBLEM_JSON);
+    // A 500 is an infrastructure failure, not a credential rejection, so it
+    // must not carry a bearer challenge.
+    assert!(www_authenticate_all(&response).is_empty());
     let problem = problem_from(response).await;
     assert_eq!(problem.problem_type, INTERNAL_TYPE);
 }
@@ -1113,4 +1202,65 @@ async fn test_cors_preflight_skips_auth() {
         StatusCode::FORBIDDEN,
         "CORS preflight must not be blocked by auth"
     );
+}
+
+#[tokio::test]
+async fn test_insufficient_scope_returns_403_with_challenge() {
+    // Valid token, but its scopes do not satisfy the route policy.
+    let mock = mock_accepting_token_with_scopes("valid-test-token", vec!["read:other".to_owned()]);
+    let router = create_scope_enforced_router(mock, &["admin"]).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/tests/v1/api/protected")
+                .header(header::AUTHORIZATION, "Bearer valid-test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "Insufficient scope should yield 403"
+    );
+    assert_eq!(content_type(&response), PROBLEM_JSON);
+    // RFC 6750 §3.1: a valid token lacked the required scope, so the challenge
+    // carries the `insufficient_scope` error code. Exactly one challenge — no dup.
+    assert_eq!(
+        www_authenticate_all(&response),
+        [r#"Bearer error="insufficient_scope""#],
+        "Insufficient scope should emit a single WWW-Authenticate challenge"
+    );
+    let problem = problem_from(response).await;
+    assert_eq!(problem.problem_type, PERMISSION_DENIED_TYPE);
+    assert_eq!(problem.context["reason"], "INSUFFICIENT_SCOPES");
+}
+
+#[tokio::test]
+async fn test_wildcard_scope_passes_enforcement() {
+    // First-party apps carry the `["*"]` scope and bypass route-policy checks.
+    let mock = mock_accepting_token_with_scopes("valid-test-token", vec!["*".to_owned()]);
+    let router = create_scope_enforced_router(mock, &["admin"]).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/tests/v1/api/protected")
+                .header(header::AUTHORIZATION, "Bearer valid-test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Wildcard scope should satisfy any route policy"
+    );
+    // A successful response must not carry a bearer challenge.
+    assert!(www_authenticate_all(&response).is_empty());
 }

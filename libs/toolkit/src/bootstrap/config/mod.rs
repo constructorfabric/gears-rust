@@ -303,6 +303,29 @@ pub fn default_logging_config() -> LoggingConfig {
     logging
 }
 
+/// Remap a split, `APP__`-prefixed environment key into a figment config path.
+///
+/// k8s env var names must be `C_IDENTIFIERs` (no dashes), but gear names are
+/// kebab-case. Under the `gears` branch we therefore remap `_` -> `-` in the
+/// gear-name segment only (the one right after `gears`). Nested field names
+/// (e.g. `max_age_days`) and other branches (e.g. `vendor`) are left alone; the
+/// dash form is unaffected since remapping `-` is a no-op.
+///
+/// Safe because gear names are guaranteed kebab-case by `validate_kebab_case`
+/// (`#[toolkit::gear]` macro + `make validate-gear-names`).
+pub(crate) fn remap_gear_env_key(key: &str) -> String {
+    // Lowercase so the match is independent of figment's own (later) lowercasing.
+    let lower = key.to_ascii_lowercase();
+    let mut parts: Vec<&str> = lower.split('.').collect();
+    if parts.first() == Some(&"gears") && parts.len() >= 2 {
+        let gear = parts[1].replace('_', "-");
+        parts[1] = gear.as_str();
+        parts.join(".")
+    } else {
+        lower
+    }
+}
+
 impl AppConfig {
     /// Load configuration with layered loading: defaults → YAML file → environment variables.
     /// Also normalizes `server.home_dir` into an absolute path and creates the directory.
@@ -321,8 +344,12 @@ impl AppConfig {
         let figment = Figment::new()
             .merge(Serialized::defaults(AppConfig::default()))
             .merge(StrictYaml::file(config_path))
-            // Example: APP__SERVER__PORT=8087 maps to server.port
-            .merge(Env::prefixed("APP__").split("__"));
+            // Example: APP__SERVER__PORT=8087 maps to server.port.
+            .merge(
+                Env::prefixed("APP__")
+                    .split("__")
+                    .map(|key| remap_gear_env_key(key.as_str()).into()),
+            );
 
         let mut config: AppConfig = figment
             .extract()
@@ -1304,6 +1331,7 @@ pub fn gear_home(app: &AppConfig, gear_name: &str) -> PathBuf {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use temp_env::with_var;
     use tempfile::tempdir;
@@ -1316,6 +1344,39 @@ mod tests {
     /// Helper: platform default subdirectory name.
     fn default_subdir() -> &'static str {
         ".cf-gears"
+    }
+
+    #[test]
+    fn test_remap_gear_env_key() {
+        // (input, expected) — input keys are the dot-joined segments figment
+        // produces after `split("__")`, before its own lowercasing.
+        let cases = [
+            // Gear-name segment: underscores -> dashes.
+            ("gears.my_gear.port", "gears.my-gear.port"),
+            // Only the gear-name segment is remapped; nested fields keep '_'.
+            ("gears.my_gear.max_age_days", "gears.my-gear.max_age_days"),
+            // Multiple underscores in the gear name are all remapped.
+            ("gears.a_b_c.field", "gears.a-b-c.field"),
+            // Already-kebab gear name is unaffected (remapping '-' is a no-op).
+            ("gears.my-gear.port", "gears.my-gear.port"),
+            // Non-gears branches are left alone.
+            ("vendor.my_vendor.key", "vendor.my_vendor.key"),
+            ("server.home_dir", "server.home_dir"),
+            // `gears` with no gear-name segment is left as-is.
+            ("gears", "gears"),
+            // Uppercase input is lowercased.
+            ("GEARS.MY_GEAR.PORT", "gears.my-gear.port"),
+            // Bare key without dots.
+            ("server", "server"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                remap_gear_env_key(input),
+                expected,
+                "remap_gear_env_key({input:?})"
+            );
+        }
     }
 
     #[test]
@@ -1337,7 +1398,10 @@ mod tests {
         assert!(config.gears.is_empty());
     }
 
+    // `#[serial]`: calls load_layered, which reads the APP__ env layer; serialize
+    // against the env-override tests that mutate process-global APP__* vars.
     #[test]
+    #[serial]
     fn test_load_layered_normalizes_home_dir() {
         let tmp = tempdir().unwrap();
         let cfg_path = tmp.path().join("cfg.yaml");
@@ -1395,7 +1459,10 @@ logging:
         });
     }
 
+    // `#[serial]`: load_layered reads the APP__ env layer, so `gears.is_empty()`
+    // would race with the (also `#[serial]`) env-override tests that set APP__GEARS__*.
     #[test]
+    #[serial]
     fn test_minimal_yaml_config() {
         let tmp = tempdir().unwrap();
         let cfg_path = tmp.path().join("cfg.yaml");
@@ -1467,7 +1534,10 @@ server:
         }
     }
 
+    // `#[serial]`: calls load_layered (reads APP__ env layer) and asserts on the
+    // gears map, which the env-override tests mutate via APP__GEARS__*.
     #[test]
+    #[serial]
     fn test_layered_config_loading_with_gears_dir() {
         let tmp = tempdir().unwrap();
         let cfg_path = tmp.path().join("gears_dir.yaml");
@@ -1515,7 +1585,10 @@ gears:
         assert_eq!(test_gear["setting2"], 42);
     }
 
+    // `#[serial]`: calls load_layered, which reads the APP__ env layer; serialize
+    // against the env-override tests that mutate process-global APP__* vars.
     #[test]
+    #[serial]
     fn test_load_and_init_logging_smoke() {
         // Just verifies structure is acceptable for logging init path.
         let tmp = tempdir().unwrap();
@@ -2869,6 +2942,7 @@ vendor:
     }
 
     #[test]
+    #[serial]
     fn test_vendor_config_env_override() {
         let tmp = tempdir().unwrap();
         let cfg_path = tmp.path().join("cfg.yaml");
@@ -2888,6 +2962,130 @@ vendor:
                 let config = AppConfig::load_layered(&cfg_path).unwrap();
                 let v: TestVendorConfig = config.vendor_config("env_test_vendor").unwrap();
                 assert_eq!(v.api_token, "from_env");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_gear_config_env_override_underscore_gear_name() {
+        // k8s-friendly form: gear name uses underscores in the env var name,
+        // which should be remapped to the kebab-case gear key.
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_gear_env_underscore"
+gears:
+  static-authz-plugin:
+    config:
+      vendor: "from_yaml"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        with_var(
+            "APP__GEARS__STATIC_AUTHZ_PLUGIN__CONFIG__VENDOR",
+            Some("acme"),
+            || {
+                let config = AppConfig::load_layered(&cfg_path).unwrap();
+                let gear = config.gears.get("static-authz-plugin").unwrap();
+                assert_eq!(gear["config"]["vendor"], serde_json::json!("acme"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_gear_config_env_override_dash_gear_name_backcompat() {
+        // Back-compat: the existing dash form must still work.
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_gear_env_dash"
+gears:
+  static-authz-plugin:
+    config:
+      vendor: "from_yaml"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        with_var(
+            "APP__GEARS__static-authz-plugin__CONFIG__VENDOR",
+            Some("acme"),
+            || {
+                let config = AppConfig::load_layered(&cfg_path).unwrap();
+                let gear = config.gears.get("static-authz-plugin").unwrap();
+                assert_eq!(gear["config"]["vendor"], serde_json::json!("acme"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_gear_config_env_override_preserves_field_underscores() {
+        // Underscores in nested config field names must NOT be remapped.
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_gear_env_field"
+gears:
+  static-authz-plugin:
+    config:
+      some_field: "from_yaml"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        with_var(
+            "APP__GEARS__STATIC_AUTHZ_PLUGIN__CONFIG__SOME_FIELD",
+            Some("from_env"),
+            || {
+                let config = AppConfig::load_layered(&cfg_path).unwrap();
+                let gear = config.gears.get("static-authz-plugin").unwrap();
+                assert_eq!(gear["config"]["some_field"], serde_json::json!("from_env"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_vendor_config_env_override_unaffected_by_gear_remap() {
+        // Isolation invariant: the gear-name `_`->`-` remap must NOT touch the
+        // `vendor` branch. The underscore vendor name is the canary — if the
+        // remap leaked, the env override would land under a dashed
+        // `env-test-vendor` key and the underscore lookup would miss it.
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_vendor_unaffected"
+vendor:
+  env_test_vendor:
+    api_token: "from_yaml"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        with_var(
+            "APP__VENDOR__ENV_TEST_VENDOR__API_TOKEN",
+            Some("from_env"),
+            || {
+                let config = AppConfig::load_layered(&cfg_path).unwrap();
+
+                // The override applied to the underscore key, not a remapped one.
+                let v: TestVendorConfig = config.vendor_config("env_test_vendor").unwrap();
+                assert_eq!(v.api_token, "from_env");
+
+                // Distinguishing assertion vs. test_vendor_config_env_override:
+                // no dashed key was synthesized in the vendor branch.
+                assert!(
+                    config.vendor.contains_key("env_test_vendor"),
+                    "underscore vendor key must be preserved"
+                );
+                assert!(
+                    !config.vendor.contains_key("env-test-vendor"),
+                    "gear remap leaked into the vendor branch"
+                );
             },
         );
     }

@@ -1270,6 +1270,25 @@ impl TenantRepo for FakeTenantRepo {
         Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 
+    async fn count_children_grouped(
+        &self,
+        _scope: &AccessScope,
+        parent_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, u64>, DomainError> {
+        let wanted: HashSet<Uuid> = parent_ids.iter().copied().collect();
+        let state = self.state.lock().expect("lock");
+        let mut out: HashMap<Uuid, u64> = HashMap::new();
+        for t in state.tenants.values() {
+            let Some(pid) = t.parent_id else { continue };
+            // Public-surface semantics: scope is ignored by this mock,
+            // `Provisioning` is excluded, `Deleted` is included.
+            if wanted.contains(&pid) && !matches!(t.status, TenantStatus::Provisioning) {
+                *out.entry(pid).or_insert(0) += 1;
+            }
+        }
+        Ok(out)
+    }
+
     async fn count_tenants_by_status(
         &self,
         _scope: &AccessScope,

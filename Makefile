@@ -1,5 +1,10 @@
 CI := 1
 
+# Python interpreter used by helper scripts. Defaults to python3 (Linux/macOS);
+# on Windows, where `python3` is often absent, it falls back to `python`.
+# Override explicitly with `make <target> PYTHON=...` if needed.
+PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null || echo python3)
+
 OPENAPI_URL ?= http://127.0.0.1:8087/cf/openapi.json
 OPENAPI_OUT ?= docs/api/api.json
 
@@ -114,7 +119,7 @@ endef
 
 # Show the help message with list of commands (default target)
 help:
-	@python3 tools/scripts/make_help.py Makefile
+	@$(PYTHON) tools/scripts/make_help.py Makefile
 
 
 # -------- Set up --------
@@ -139,8 +144,10 @@ setup: .setup-stamp
 	cargo install cargo-hack
 	cargo install gts-validator
 	@if echo "$$OS" | grep -iq windows || [ -n "$$COMSPEC" ]; then \
-		echo "WARNING: kani-verifier and cargo-llvm-cov installation skipped on Windows."; \
-		echo "These tools are not supported on Windows. Use WSL2 or Docker to install instead."; \
+		echo "NOTE: kani-verifier is not supported on Windows; skipping (use WSL2/Docker for Kani)."; \
+		echo "Installing cargo-llvm-cov (supported on Windows; needs llvm-tools-preview)..."; \
+		rustup component add llvm-tools-preview; \
+		cargo install cargo-llvm-cov; \
 		if ! command -v nasm >/dev/null 2>&1; then \
 			echo "Installing NASM (required by aws-lc-sys on Windows)..."; \
 			winget install NASM.NASM --accept-source-agreements --accept-package-agreements || \
@@ -170,7 +177,7 @@ fmt:
 
 ## Validate gear folder names follow kebab-case convention
 validate-gear-names:
-	@python3 tools/scripts/validate_gear_names.py
+	@$(PYTHON) tools/scripts/validate_gear_names.py
 
 # -------- Code safety checks --------
 #
@@ -215,7 +222,11 @@ validate-gear-names:
 # |             | - Use 'make dylint-list' to see all available custom lints           |
 # +-------------+----------------------------------------------------------------------+
 
-.PHONY: clippy clippy-deep lychee kani geiger safety lint dylint dylint-list dylint-test gts-docs cypilot-validate cypilot-spec-coverage
+.PHONY: clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage
+
+CFS ?= cfs
+CFS_PIPX_SPEC ?= git+https://github.com/constructorfabric/studio.git
+export PATH := $(HOME)/.local/bin:$(PATH)
 
 # Fast two-pass clippy used in PR CI (target: <5 min with sccache).
 #
@@ -246,18 +257,52 @@ clippy-deep:
 	$(call check_tool,cargo-hack)
 	cargo hack clippy --workspace --all-targets --each-feature $(CLIPPY_FLAGS)
 
-# Check cypilot spec-to-code traceability coverage
-cypilot-spec-coverage:
-	@python3 .cypilot/.core/skills/cypilot/scripts/cypilot.py spec-coverage --min-coverage 80
+# Ensure the Constructor Studio CLI is available even when generated runtime
+# files are ignored locally or absent in a clean checkout.
+cfs-ensure:
+	@if ! command -v $(CFS) >/dev/null 2>&1; then \
+		echo "cfs not found; installing $(CFS_PIPX_SPEC) via pipx"; \
+		if ! command -v pipx >/dev/null 2>&1; then \
+			echo "ERROR: pipx is required before running this target"; \
+			exit 1; \
+		else \
+			pipx install $(CFS_PIPX_SPEC); \
+		fi; \
+	fi
+	@if ! command -v $(CFS) >/dev/null 2>&1; then \
+		echo "ERROR: cfs was installed but is not on PATH"; \
+		exit 1; \
+	fi
 
-# Validate cypilot artifacts (specs, code, templates)
-cypilot-validate:
-	@python3 .cypilot/.core/skills/cypilot/scripts/cypilot.py validate && echo "OK. cypilot validation PASSED" || (echo "ERROR: cypilot validation FAILED"; exit 1)
+# Repair ignored/generated Constructor Studio runtime files before validation.
+cfs-repair: cfs-ensure
+	$(CFS) init --yes
+
+# Check Constructor Studio spec-to-code traceability coverage.
+cfs-spec-coverage: cfs-repair
+	$(CFS) spec-coverage --min-coverage 80
+
+# Validate Constructor Studio artifacts (specs, code, templates).
+cfs-validate: cfs-repair
+	$(CFS) validate && echo "OK. Constructor Studio validation PASSED" || (echo "ERROR: Constructor Studio validation FAILED"; exit 1)
+
+# Validate registered Constructor Studio kits.
+cfs-validate-kits: cfs-repair
+	$(CFS) validate-kits
+
+# Validate the local studio-kit-gears checkout as a kit directory.
+cfs-validate-kit-local: cfs-repair
+	cd studio-kit-gears && $(CFS) validate-kits .
 
 # Run markdown checks with 'lychee'
 lychee:
 	$(call check_tool,lychee)
-	lychee docs examples tools/dylint_lints guidelines
+	lychee --exclude-path 'docs/web-docs' docs examples tools/dylint_lints guidelines
+
+# Preview the documentation website with local docs/web-docs content.
+# Clones the web docs site into .web-docs-preview/ and serves it at localhost:4321.
+docs-preview:
+	@bash tools/scripts/docs-preview.sh
 
 ## The Kani Rust Verifier for checking safety of the code
 kani:
@@ -282,12 +327,13 @@ gts-docs:
 		--vendor cf,vendor,example,fabrikam \
 		--exclude "target/*" \
 		--exclude "docs/api/*" \
+		--exclude "docs/web-docs/*" \
 		--exclude "gears/chat-engine/*" \
 		--exclude "**/helm/*/templates/*" \
 		docs gears libs examples
 
 install-tools:
-	@command -v cargo-nextest >/dev/null 2>&1 || cargo install cargo-nextest
+	@command -v cargo-nextest >/dev/null 2>&1 || cargo install --locked cargo-nextest
 
 ## List all custom project compliance lints (see tools/dylint_lints/README.md)
 dylint-list:
@@ -311,6 +357,12 @@ dylint:
 	$(call check_tool,cargo-dylint)
 	$(call check_tool,dylint-link)
 	cargo dylint --all --workspace
+
+# Check for unused dependencies with cargo-shear.
+shear:
+	$(call check_tool,cargo-shear)
+	cargo +nightly-2026-04-16 shear --expand --deny-warnings
+	cd tools/dylint_lints && cargo shear --expand --deny-warnings
 
 # Run all code safety checks
 safety: clippy kani lint dylint # geiger
@@ -349,17 +401,17 @@ openapi:
 	mkdir -p $$(dirname "$(OPENAPI_OUT)") && \
 	curl -fsS "$(OPENAPI_URL)" -o "$(OPENAPI_OUT)" && \
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \
-	python3 tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
+	$(PYTHON) tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
 	echo "OpenAPI spec saved to $(OPENAPI_OUT)"
 
 ## Generate Markdown files map
 md-fabric:
-	python3 ./tools/scripts/md-fabric.py --out docs/md-fabric/md-fabric.html
+	$(PYTHON) ./tools/scripts/md-fabric.py --out docs/md-fabric/md-fabric.html
 
 ## Build the slides with Marp
 slides:
 	@command -v npx >/dev/null || (echo "npx is required to build slides. Install Node.js or run 'npm install' from the repo root." && exit 1)
-	npx marp docs/slides/1_OVERVIEW.md --theme-set docs/slides/css/slides.css --allow-local-files -o docs/slides/1_OVERVIEW.html
+	npx marp docs/slides/[0-9]*.md --theme-set docs/slides/css/slides.css --allow-local-files
 
 # -------- Development and auto fix --------
 
@@ -509,30 +561,32 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 .PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz
 
+E2E_TARGET ?=
+
 # Run E2E tests in Docker (default)
 e2e: e2e-docker
 
 ## Run E2E tests in Docker environment
 e2e-docker:
-	python3 tools/scripts/ci.py e2e-docker $(E2E_ARGS)
+	$(PYTHON) tools/scripts/ci.py e2e-docker -- $(E2E_TARGET)
 
 ## Run E2E smoke tests in Docker (only tests marked @pytest.mark.smoke)
 e2e-docker-smoke:
-	python3 tools/scripts/ci.py e2e-docker $(E2E_ARGS) -- -m smoke
+	$(PYTHON) tools/scripts/ci.py e2e-docker -- -m smoke $(E2E_TARGET)
 
-# Run E2E tests locally
+# Run E2E tests locally, use `make e2e-local E2E_TARGET=testing/e2e/gears/` to specify target
 e2e-local:
-	python3 tools/scripts/ci.py e2e-local
+	$(PYTHON) tools/scripts/ci.py e2e-local -- $(E2E_TARGET)
 
 ## Run RG + AuthZ barrier E2E tests with tr-authz-plugin going through TR -> RG
 e2e-tr-authz:
-	python3 tools/scripts/ci.py e2e-local \
+	$(PYTHON) tools/scripts/ci.py e2e-local \
 		--config config/e2e-tr-authz.yaml \
 		-- -k "resource_group"
 
 ## Run E2E smoke tests locally (only tests marked @pytest.mark.smoke)
 e2e-local-smoke:
-	python3 tools/scripts/ci.py e2e-local --smoke
+	$(PYTHON) tools/scripts/ci.py e2e-local --smoke
 
 MINI_CHAT_FEATURES = mini-chat,static-authn,static-authz,single-tenant,static-credstore
 MINI_CHAT_K8S_FEATURES = $(MINI_CHAT_FEATURES),k8s
@@ -544,7 +598,7 @@ MINI_CHAT_TAG   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo latest
 e2e-mini-chat:
 	cargo build --bin cf-gears-example-server --features=$(MINI_CHAT_FEATURES)
 	E2E_BINARY=target/debug/cf-gears-example-server \
-		python3 -m pytest testing/e2e/gears/mini_chat/ --mode offline -vv
+		$(PYTHON) -m pytest testing/e2e/gears/mini_chat/ --mode offline -vv
 
 # -------- Code coverage --------
 
@@ -553,21 +607,21 @@ e2e-mini-chat:
 # Generate code coverage report (unit + e2e-local tests)
 coverage:
 	$(call check_tool,cargo-llvm-cov)
-	python3 tools/scripts/coverage.py combined
+	$(PYTHON) tools/scripts/coverage.py combined
 
 # Generate code coverage report (unit tests only)
 coverage-unit:
 	$(call check_tool,cargo-llvm-cov)
-	python3 tools/scripts/coverage.py unit
+	$(PYTHON) tools/scripts/coverage.py unit
 
 ## Ensure needed packages and programs installed for local e2e testing
 check-prereq-e2e-local:
-	python3 tools/scripts/check_local_env.py --mode e2e-local
+	$(PYTHON) tools/scripts/check_local_env.py --mode e2e-local
 
 # Generate code coverage report (e2e-local tests only)
 coverage-e2e-local: check-prereq-e2e-local
 	$(call check_tool,cargo-llvm-cov)
-	python3 tools/scripts/coverage.py e2e-local
+	$(PYTHON) tools/scripts/coverage.py e2e-local
 
 # -------- Fuzzing --------
 
@@ -761,7 +815,7 @@ oop-example:
 	cargo run --bin cf-gears-example-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
-check: .setup-stamp fmt cypilot-validate clippy lychee security dylint-test dylint gts-docs test
+check: .setup-stamp fmt cfs-validate clippy lychee security dylint-test dylint gts-docs test
 
 ci_test: fmt clippy
 

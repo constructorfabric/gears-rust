@@ -3,8 +3,9 @@
 
 extern crate rustc_ast;
 
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::{Item, ItemKind, UseTree, UseTreeKind};
-use rustc_lint::{EarlyLintPass, LintContext};
+use rustc_lint::EarlyLintPass;
 
 use lint_utils::is_in_contract_module_ast;
 
@@ -74,7 +75,7 @@ const HTTP_TYPE_PATTERNS: &[&str] = &[
 
 fn use_tree_to_string(tree: &UseTree) -> String {
     match &tree.kind {
-        UseTreeKind::Simple(..) | UseTreeKind::Glob => tree
+        UseTreeKind::Simple(..) | UseTreeKind::Glob(_) => tree
             .prefix
             .segments
             .iter()
@@ -109,12 +110,17 @@ fn check_use_in_contract(cx: &rustc_lint::EarlyContext<'_>, item: &Item) {
     let path_str = use_tree_to_string(use_tree);
     for pattern in HTTP_TYPE_PATTERNS {
         if path_str.contains(pattern) {
-            cx.span_lint(DE0103_NO_HTTP_TYPES_IN_CONTRACT, item.span, |diag| {
-                diag.primary_message("contract module imports HTTP type (DE0103)");
-                diag.help(
-                    "contract gears should be transport-agnostic; move HTTP types to api/rest/",
-                );
-            });
+            span_lint_and_then(
+                cx,
+                DE0103_NO_HTTP_TYPES_IN_CONTRACT,
+                item.span,
+                "contract module imports HTTP type (DE0103)",
+                |diag| {
+                    diag.help(
+                        "contract gears should be transport-agnostic; move HTTP types to api/rest/",
+                    );
+                },
+            );
             break;
         }
     }

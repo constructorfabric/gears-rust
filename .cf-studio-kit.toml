@@ -1,0 +1,338 @@
+# Local CF/Gears Constructor Studio kit manifest.
+
+manifest_version = "1.0"
+
+[[kits]]
+slug = "gears"
+name = "Gears"
+version = "0.1.0"
+
+[[kits.resources]]
+id = "prd_template"
+kind = "template"
+source = "docs/spec-templates/gears-sdlc/PRD/template.md"
+install_path = "artifacts/PRD/template.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "prd_checklist"
+kind = "checklist"
+source = "docs/checklists/PRD.md"
+install_path = "artifacts/PRD/checklist.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "prd_example"
+kind = "directory"
+source = "docs/spec-templates/gears-sdlc/PRD/examples"
+install_path = "artifacts/PRD/examples"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "adr_template"
+kind = "template"
+source = "docs/spec-templates/gears-sdlc/ADR/template.md"
+install_path = "artifacts/ADR/template.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "adr_checklist"
+kind = "checklist"
+source = "docs/checklists/ADR.md"
+install_path = "artifacts/ADR/checklist.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "adr_example"
+kind = "directory"
+source = "docs/spec-templates/gears-sdlc/ADR/examples"
+install_path = "artifacts/ADR/examples"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "design_template"
+kind = "template"
+source = "docs/spec-templates/gears-sdlc/DESIGN/template.md"
+install_path = "artifacts/DESIGN/template.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "design_checklist"
+kind = "checklist"
+source = "docs/checklists/DESIGN.md"
+install_path = "artifacts/DESIGN/checklist.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "design_example"
+kind = "directory"
+source = "docs/spec-templates/gears-sdlc/DESIGN/examples"
+install_path = "artifacts/DESIGN/examples"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "decomposition_template"
+kind = "template"
+source = "docs/spec-templates/gears-sdlc/DECOMPOSITION/template.md"
+install_path = "artifacts/DECOMPOSITION/template.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "decomposition_checklist"
+kind = "checklist"
+source = "docs/checklists/DECOMPOSITION.md"
+install_path = "artifacts/DECOMPOSITION/checklist.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "decomposition_example"
+kind = "directory"
+source = "docs/spec-templates/gears-sdlc/DECOMPOSITION/examples"
+install_path = "artifacts/DECOMPOSITION/examples"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "feature_template"
+kind = "template"
+source = "docs/spec-templates/gears-sdlc/FEATURE/template.md"
+install_path = "artifacts/FEATURE/template.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "feature_checklist"
+kind = "checklist"
+source = "docs/checklists/FEATURE.md"
+install_path = "artifacts/FEATURE/checklist.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "feature_example"
+kind = "directory"
+source = "docs/spec-templates/gears-sdlc/FEATURE/examples"
+install_path = "artifacts/FEATURE/examples"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "upstream_reqs_template"
+kind = "template"
+source = "docs/spec-templates/gears-sdlc/UPSTREAM_REQS/template.md"
+install_path = "artifacts/UPSTREAM_REQS/template.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "upstream_reqs_checklist"
+kind = "checklist"
+source = "docs/checklists/UPSTREAM_REQS.md"
+install_path = "artifacts/UPSTREAM_REQS/checklist.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "upstream_reqs_example"
+kind = "directory"
+source = "docs/spec-templates/gears-sdlc/UPSTREAM_REQS/examples"
+install_path = "artifacts/UPSTREAM_REQS/examples"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "pr_code_review_template"
+kind = "template"
+source = "studio-kit-gears/artifacts/PR-CODE-REVIEW-TEMPLATE/template.md"
+install_path = "artifacts/PR-CODE-REVIEW-TEMPLATE/template.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "pr_status_report_template"
+kind = "template"
+source = "studio-kit-gears/artifacts/PR-STATUS-REPORT-TEMPLATE/template.md"
+install_path = "artifacts/PR-STATUS-REPORT-TEMPLATE/template.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "codebase_checklist"
+kind = "checklist"
+source = "docs/checklists/CODING.md"
+install_path = "codebase/checklist.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "workflow_doc_prd"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-prd.md"
+install_path = "workflows/doc-prd.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_doc_upstream_reqs"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-upstream-reqs.md"
+install_path = "workflows/doc-upstream-reqs.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_doc_adr"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-adr.md"
+install_path = "workflows/doc-adr.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_doc_design"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-design.md"
+install_path = "workflows/doc-design.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_decompose"
+kind = "skill"
+source = "studio-kit-gears/workflows/decompose.md"
+install_path = "workflows/decompose.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_doc_feature"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-feature.md"
+install_path = "workflows/doc-feature.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_implement"
+kind = "skill"
+source = "studio-kit-gears/workflows/implement.md"
+install_path = "workflows/implement.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_change_impact_analysis"
+kind = "skill"
+source = "studio-kit-gears/workflows/change-impact-analysis.md"
+install_path = "workflows/change-impact-analysis.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_pr_review"
+kind = "skill"
+source = "studio-kit-gears/workflows/pr-review.md"
+install_path = "workflows/pr-review.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_coding"
+kind = "skill"
+source = "studio-kit-gears/workflows/coding.md"
+install_path = "workflows/coding.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_pr_status"
+kind = "skill"
+source = "studio-kit-gears/workflows/pr-status.md"
+install_path = "workflows/pr-status.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "scripts"
+kind = "script"
+source = "studio-kit-gears/scripts"
+install_path = "scripts"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "change_impact_config"
+kind = "script"
+source = "studio-kit-gears/scripts/change-impact-analysis.toml"
+install_path = "scripts/change-impact-analysis.toml"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "agents"
+kind = "rule"
+source = "studio-kit-gears/AGENTS.md"
+install_path = "AGENTS.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "constraints"
+kind = "constraints"
+source = "studio-kit-gears/constraints.toml"
+install_path = "constraints.toml"
+type = "file"
+user_modifiable = true
+
+[kits.resources.artifacts.PRD]
+template = "prd_template"
+checklist = "prd_checklist"
+examples = "prd_example"
+
+[kits.resources.artifacts.ADR]
+template = "adr_template"
+checklist = "adr_checklist"
+examples = "adr_example"
+
+[kits.resources.artifacts.DESIGN]
+template = "design_template"
+checklist = "design_checklist"
+examples = "design_example"
+
+[kits.resources.artifacts.DECOMPOSITION]
+template = "decomposition_template"
+checklist = "decomposition_checklist"
+examples = "decomposition_example"
+
+[kits.resources.artifacts.FEATURE]
+template = "feature_template"
+checklist = "feature_checklist"
+examples = "feature_example"
+
+[kits.resources.artifacts.UPSTREAM_REQS]
+template = "upstream_reqs_template"
+checklist = "upstream_reqs_checklist"
+examples = "upstream_reqs_example"

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.bss.ledger.settlement_returned.v1",
+  "title": "Billing Ledger Settlement Returned",
+  "description": "Emitted on every successful settlement-return post (never on replay). Internal identifiers + enum codes + the returned amount only; no PII.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "payment_id": {
+      "type": "string"
+    },
+    "psp_return_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "amount_minor": {
+      "type": "integer"
+    },
+    "currency": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "payment_id",
+    "psp_return_id",
+    "tenant_id",
+    "amount_minor",
+    "currency"
+  ]
+}

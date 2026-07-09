@@ -186,7 +186,13 @@ async fn cascade_one(
     tenant_id: Uuid,
     group_id: Uuid,
 ) -> Result<bool, HookError> {
-    match tokio::time::timeout(CASCADE_TIMEOUT, client.delete_group_cascade(ctx, group_id)).await {
+    // The trait boundary is `CanonicalError` (ADR 0005); project the
+    // inner result into the typed SDK view so the `NotFound` idempotent
+    // arm below dispatches as before.
+    let outcome = tokio::time::timeout(CASCADE_TIMEOUT, client.delete_group_cascade(ctx, group_id))
+        .await
+        .map(|r| r.map_err(ResourceGroupError::from));
+    match outcome {
         Err(_elapsed) => {
             emit_metric(
                 AM_DEPENDENCY_HEALTH,

@@ -1,4 +1,45 @@
 use axum::extract::Request;
+use axum::response::Response;
+use http::HeaderValue;
+use http::header::WWW_AUTHENTICATE;
+
+/// An RFC 6750 §3 `WWW-Authenticate: Bearer` challenge.
+///
+/// The `Bearer` scheme MUST be followed by at least one auth-param, so there is
+/// deliberately no bare-`Bearer` variant — each variant below carries exactly
+/// the params RFC 6750 prescribes for its situation.
+#[derive(Clone, Copy, Debug)]
+pub enum BearerChallenge {
+    /// A token was presented but rejected — RFC 6750 §3.1 `invalid_token`. Only
+    /// the `error` code is sent; `realm`/`error_description` are omitted so the
+    /// challenge discloses no internal detail.
+    InvalidToken,
+    /// A valid token lacked the required scope — RFC 6750 §3.1
+    /// `insufficient_scope`.
+    InsufficientScope,
+    /// No credentials were presented. §3 says the server SHOULD NOT disclose an
+    /// `error` code in that case, so `realm` is the sole auth-param — it meets
+    /// the "one or more" rule without leaking any detail.
+    NoCredentials,
+}
+
+impl BearerChallenge {
+    fn header_value(self) -> &'static str {
+        match self {
+            Self::InvalidToken => r#"Bearer error="invalid_token""#,
+            Self::InsufficientScope => r#"Bearer error="insufficient_scope""#,
+            Self::NoCredentials => r#"Bearer realm="api""#,
+        }
+    }
+}
+
+/// Append `challenge` to the response as a `WWW-Authenticate` header.
+pub fn append_bearer_challenge(response: &mut Response, challenge: BearerChallenge) {
+    response.headers_mut().append(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static(challenge.header_value()),
+    );
+}
 
 pub fn resolve_path(req: &Request, matched_path: &str) -> String {
     req.extensions()
@@ -29,6 +70,46 @@ fn strip_path_prefix(path: &str, prefix: &str) -> Option<String> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
+
+    fn challenge_header(challenge: BearerChallenge) -> String {
+        let mut response = axum::http::StatusCode::UNAUTHORIZED.into_response();
+        append_bearer_challenge(&mut response, challenge);
+        response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[test]
+    fn error_challenges_carry_their_rfc_error_code() {
+        assert_eq!(
+            challenge_header(BearerChallenge::InvalidToken),
+            r#"Bearer error="invalid_token""#
+        );
+        assert_eq!(
+            challenge_header(BearerChallenge::InsufficientScope),
+            r#"Bearer error="insufficient_scope""#
+        );
+    }
+
+    #[test]
+    fn no_credentials_challenge_omits_error_code() {
+        let value = challenge_header(BearerChallenge::NoCredentials);
+        assert_eq!(value, r#"Bearer realm="api""#);
+        // RFC 6750 §3: when no token was supplied the challenge must not
+        // disclose an `error` code, but still needs an auth-param (`realm`).
+        assert!(
+            !value.contains("error="),
+            "no-credentials challenge leaked an error code"
+        );
+        assert!(
+            value.starts_with("Bearer "),
+            "challenge must carry an auth-param"
+        );
+    }
 
     #[test]
     fn exact_match_returns_root() {

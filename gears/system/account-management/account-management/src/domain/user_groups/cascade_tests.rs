@@ -26,9 +26,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use resource_group_sdk::{
     CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
-    ResourceGroupError, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,
-    UpdateGroupRequest, UpdateTypeRequest,
+    ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
+    UpdateTypeRequest,
 };
+use toolkit_canonical_errors::{CanonicalError, resource_error};
 use toolkit_odata::page::PageInfo;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
@@ -38,10 +39,23 @@ use super::USER_GROUP_TYPE_CODE;
 use super::cascade::build_cascade_cleanup_hook;
 use crate::domain::tenant::hooks::HookError;
 
+// The RG trait boundary is `CanonicalError` (ADR 0005); synthesize the
+// canonical `NotFound` the real RG ladder emits so the cascade hook's
+// `.map_err(ResourceGroupError::from)` idempotent-NotFound dispatch is
+// exercised as in prod.
+#[resource_error("gts.cf.core.resource_group.group.v1~")]
+struct RgErr;
+
+fn rg_not_found(code: &str) -> CanonicalError {
+    RgErr::not_found(format!("'{code}' not found"))
+        .with_resource(code)
+        .create()
+}
+
 // ---- fake client ---------------------------------------------------
 
-type ListGroupsFn = Box<dyn Fn() -> Result<Page<ResourceGroup>, ResourceGroupError> + Send + Sync>;
-type DeleteCascadeFn = Box<dyn Fn(Uuid) -> Result<(), ResourceGroupError> + Send + Sync>;
+type ListGroupsFn = Box<dyn Fn() -> Result<Page<ResourceGroup>, CanonicalError> + Send + Sync>;
+type DeleteCascadeFn = Box<dyn Fn(Uuid) -> Result<(), CanonicalError> + Send + Sync>;
 
 struct FakeCascadeRgClient {
     list_groups_fn: ListGroupsFn,
@@ -65,7 +79,7 @@ impl ResourceGroupClient for FakeCascadeRgClient {
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroup>, CanonicalError> {
         (self.list_groups_fn)()
     }
 
@@ -73,7 +87,7 @@ impl ResourceGroupClient for FakeCascadeRgClient {
         &self,
         _ctx: &SecurityContext,
         id: Uuid,
-    ) -> Result<(), ResourceGroupError> {
+    ) -> Result<(), CanonicalError> {
         self.cascade_calls.fetch_add(1, Ordering::SeqCst);
         (self.delete_cascade_fn)(id)
     }
@@ -84,7 +98,7 @@ impl ResourceGroupClient for FakeCascadeRgClient {
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
         unreachable!("cascade hook no longer drains memberships -- RG cascade handles them")
     }
     async fn remove_membership(
@@ -93,35 +107,31 @@ impl ResourceGroupClient for FakeCascadeRgClient {
         _group_id: Uuid,
         _resource_type: &str,
         _resource_id: &str,
-    ) -> Result<(), ResourceGroupError> {
+    ) -> Result<(), CanonicalError> {
         unreachable!("cascade hook no longer removes memberships -- RG cascade handles them")
     }
-    async fn delete_group(
-        &self,
-        _ctx: &SecurityContext,
-        _id: Uuid,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_group(&self, _ctx: &SecurityContext, _id: Uuid) -> Result<(), CanonicalError> {
         unreachable!("cascade hook only calls delete_group_cascade, not delete_group")
     }
     async fn create_type(
         &self,
         _ctx: &SecurityContext,
         _request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         unreachable!()
     }
     async fn get_type(
         &self,
         _ctx: &SecurityContext,
         _code: &str,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         unreachable!()
     }
     async fn list_types(
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
         unreachable!()
     }
     async fn update_type(
@@ -129,28 +139,24 @@ impl ResourceGroupClient for FakeCascadeRgClient {
         _ctx: &SecurityContext,
         _code: &str,
         _request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         unreachable!()
     }
-    async fn delete_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_type(&self, _ctx: &SecurityContext, _code: &str) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn create_group(
         &self,
         _ctx: &SecurityContext,
         _request: CreateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn get_group(
         &self,
         _ctx: &SecurityContext,
         _id: Uuid,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn update_group(
@@ -158,7 +164,7 @@ impl ResourceGroupClient for FakeCascadeRgClient {
         _ctx: &SecurityContext,
         _id: Uuid,
         _request: UpdateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn get_group_descendants(
@@ -166,7 +172,7 @@ impl ResourceGroupClient for FakeCascadeRgClient {
         _ctx: &SecurityContext,
         _group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         unreachable!()
     }
     async fn get_group_ancestors(
@@ -174,7 +180,7 @@ impl ResourceGroupClient for FakeCascadeRgClient {
         _ctx: &SecurityContext,
         _group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         unreachable!()
     }
     async fn add_membership(
@@ -183,7 +189,7 @@ impl ResourceGroupClient for FakeCascadeRgClient {
         _group_id: Uuid,
         _resource_type: &str,
         _resource_id: &str,
-    ) -> Result<ResourceGroupMembership, ResourceGroupError> {
+    ) -> Result<ResourceGroupMembership, CanonicalError> {
         unreachable!()
     }
 }
@@ -319,7 +325,7 @@ async fn group_not_found_during_cascade_treated_as_already_deleted() {
             let g = g.clone();
             Box::new(move || Ok(groups_page(vec![g.clone()])))
         },
-        delete_cascade_fn: Box::new(|id| Err(ResourceGroupError::not_found(id.to_string()))),
+        delete_cascade_fn: Box::new(|id| Err(rg_not_found(&id.to_string()))),
         cascade_calls: AtomicUsize::new(0),
     };
     let client: Arc<dyn ResourceGroupClient + Send + Sync> = Arc::new(fake);
@@ -331,11 +337,7 @@ async fn group_not_found_during_cascade_treated_as_already_deleted() {
 #[tokio::test]
 async fn list_groups_unavailable_returns_retryable() {
     let fake = FakeCascadeRgClient {
-        list_groups_fn: Box::new(|| {
-            Err(ResourceGroupError::service_unavailable(
-                "connection refused",
-            ))
-        }),
+        list_groups_fn: Box::new(|| Err(CanonicalError::internal("connection refused").create())),
         delete_cascade_fn: Box::new(|_| Ok(())),
         cascade_calls: AtomicUsize::new(0),
     };
@@ -353,7 +355,9 @@ async fn cascade_error_returns_retryable() {
             let g = g.clone();
             Box::new(move || Ok(groups_page(vec![g.clone()])))
         },
-        delete_cascade_fn: Box::new(|_| Err(ResourceGroupError::internal())),
+        delete_cascade_fn: Box::new(
+            |_| Err(CanonicalError::internal("rg internal error").create()),
+        ),
         cascade_calls: AtomicUsize::new(0),
     };
     let client: Arc<dyn ResourceGroupClient + Send + Sync> = Arc::new(fake);

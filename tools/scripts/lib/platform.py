@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -33,6 +34,40 @@ def read_e2e_features(project_root: Path) -> str:
         )
         sys.exit(1)
     return p.read_text(encoding="utf-8").strip()
+
+
+# ---------------------------------------------------------------------------
+# E2E server environment overrides
+# ---------------------------------------------------------------------------
+
+def e2e_env_overrides() -> dict:
+    """Environment overrides required to launch the e2e server on this OS.
+
+    The committed e2e configs (``config/e2e-local.yaml`` etc.) bake in two
+    Unix-only values that the gears reject at startup on Windows:
+
+    * grpc-hub listens on a Unix Domain Socket (``uds:///tmp/...``).
+    * file-parser sandboxes local reads under ``/tmp``.
+
+    Rather than fork the YAML (and change Linux/macOS behaviour, where these
+    values are intentional), we override just those two values via the app's
+    figment env layer (``APP__<SECTION>__<KEY>...``):
+
+    * grpc-hub → ephemeral loopback TCP, which works on every platform; gear
+      clients resolve the bound address in-process through the directory.
+    * file-parser → the OS temp directory, which exists and is writable.
+
+    Returns an empty mapping on non-Windows hosts so Unix runs are untouched.
+    """
+    if not IS_WINDOWS:
+        return {}
+    # Forward slashes: accepted by std::path on Windows and avoid any
+    # backslash-escaping ambiguity when the value flows through config layers.
+    temp_dir = tempfile.gettempdir().replace("\\", "/")
+    return {
+        "APP__GEARS__GRPC-HUB__CONFIG__LISTEN_ADDR": "127.0.0.1:0",
+        "APP__GEARS__FILE-PARSER__CONFIG__ALLOWED_LOCAL_BASE_DIR": temp_dir,
+    }
 
 
 # ---------------------------------------------------------------------------

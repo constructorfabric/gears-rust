@@ -62,6 +62,8 @@ pub const TOKEN_REJECTION_REASON_INVALID_IAT: &str = "invalid_iat";
 pub const TOKEN_REJECTION_REASON_INVALID_SIG: &str = "invalid_sig";
 /// Token rejection reason: tenant claim is malformed.
 pub const TOKEN_REJECTION_REASON_INVALID_TENANT: &str = "invalid_tenant";
+/// Token rejection reason: JOSE `typ` header does not match the issuer's required type.
+pub const TOKEN_REJECTION_REASON_INVALID_TYP: &str = "invalid_typ";
 /// Token rejection reason: required audience is missing.
 pub const TOKEN_REJECTION_REASON_MISSING_AUDIENCE: &str = "missing_audience";
 /// Token rejection reason: tenant claim is missing.

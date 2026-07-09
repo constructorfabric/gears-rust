@@ -1,0 +1,72 @@
+---
+title: Gears
+description: A Rust runtime for composable, secure-by-default platform components.
+template: splash
+tableOfContents: false
+editUrl: false
+hero:
+  title: Build platform gears in Rust
+  tagline: A runtime for composable, secure-by-default platform components — one codebase, many deployment shapes.
+  image:
+    html: |
+      <svg viewBox="0 0 220 220" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <g stroke="var(--gears-accent)" stroke-width="2" opacity="0.9">
+          <circle cx="80" cy="90" r="46"/>
+          <circle cx="80" cy="90" r="16"/>
+          <g stroke-linecap="round">
+            <line x1="80" y1="32" x2="80" y2="44"/>
+            <line x1="80" y1="136" x2="80" y2="148"/>
+            <line x1="22" y1="90" x2="34" y2="90"/>
+            <line x1="126" y1="90" x2="138" y2="90"/>
+            <line x1="39" y1="49" x2="48" y2="58"/>
+            <line x1="112" y1="122" x2="121" y2="131"/>
+            <line x1="121" y1="49" x2="112" y2="58"/>
+            <line x1="48" y1="122" x2="39" y2="131"/>
+          </g>
+        </g>
+        <g stroke="var(--gears-steel)" stroke-width="2" opacity="0.75">
+          <circle cx="156" cy="150" r="30"/>
+          <circle cx="156" cy="150" r="10"/>
+          <g stroke-linecap="round">
+            <line x1="156" y1="112" x2="156" y2="122"/>
+            <line x1="156" y1="178" x2="156" y2="188"/>
+            <line x1="118" y1="150" x2="128" y2="150"/>
+            <line x1="184" y1="150" x2="194" y2="150"/>
+            <line x1="129" y1="123" x2="136" y2="130"/>
+            <line x1="176" y1="170" x2="183" y2="177"/>
+            <line x1="183" y1="123" x2="176" y2="130"/>
+            <line x1="136" y1="170" x2="129" y2="177"/>
+          </g>
+        </g>
+      </svg>
+  actions:
+    - text: Get started
+      link: ./get-started/
+      icon: right-arrow
+      variant: primary
+    - text: Core concepts
+      link: ./concepts/
+      icon: open-book
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <Card title="Build a gear" icon="puzzle">
+    Define an SDK, implement a domain service, and wire it into the runtime.
+    See [Getting Started](./get-started/).
+  </Card>
+  <Card title="Runtime model" icon="setting">
+    Ordered lifecycle phases, explicit dependencies, one runtime across many
+    deployment shapes. See [Concepts](./concepts/).
+  </Card>
+  <Card title="Architecture" icon="seti:default">
+    The three-tier gear hierarchy, gateway, and safety contracts.
+    See [Architecture](./architecture/).
+  </Card>
+  <Card title="Reference" icon="open-book">
+    Crates, gears, traits, configuration, and the canonical error model.
+    See [Reference](./reference/).
+  </Card>
+</CardGrid>

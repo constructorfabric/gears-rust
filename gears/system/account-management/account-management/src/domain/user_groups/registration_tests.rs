@@ -15,7 +15,7 @@
 //!   call (caller never proceeds past a failing step-1).
 //! * Container divergent / missing-membership-type surfaces with the
 //!   tightened `classify_existing` equivalence check.
-//! * `TypeAlreadyExists` race is re-read per-type via `get_type` and
+//! * `AlreadyExists` race is re-read per-type via `get_type` and
 //!   classified against the same spec (no silent swallow).
 //! * Transport errors from `get_type` / `create_type` collapse to
 //!   `ServiceUnavailable` on the first failing step.
@@ -34,10 +34,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupClient, ResourceGroupError,
+    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupClient,
     ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
     UpdateTypeRequest,
 };
+use toolkit_canonical_errors::{CanonicalError, resource_error};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -45,14 +46,33 @@ use uuid::Uuid;
 use super::registration::{RegistrationError, RegistrationOutcome, register_user_group_types};
 use super::{USER_GROUP_TYPE_CODE, USER_MEMBERSHIP_TYPE};
 
+// The RG trait boundary is `CanonicalError` (ADR 0005). These helpers
+// synthesize the canonical errors the real RG ladder emits, so the
+// production code's `.map_err(ResourceGroupError::from)` dispatch
+// (NotFound vs. transport failure) is exercised exactly as in prod.
+#[resource_error("gts.cf.core.resource_group.group.v1~")]
+struct RgErr;
+
+fn rg_not_found(code: &str) -> CanonicalError {
+    RgErr::not_found(format!("'{code}' not found"))
+        .with_resource(code)
+        .create()
+}
+
+fn rg_already_exists(code: &str) -> CanonicalError {
+    RgErr::already_exists(format!("'{code}' already exists"))
+        .with_resource(code)
+        .create()
+}
+
 // ---- fake client ---------------------------------------------------
 
 enum GetTypeBehaviour {
     Return(ResourceGroupType),
     NotFound,
-    Error(ResourceGroupError),
+    Error(CanonicalError),
     /// Sequence: every call advances; out-of-range calls reuse the
-    /// last entry. Used by the `TypeAlreadyExists` race-path tests
+    /// last entry. Used by the `AlreadyExists` race-path tests
     /// where the first `get_type` returns `NotFound` (we believe
     /// the type is absent) and a second call after a peer's race
     /// returns whatever the peer wrote (equivalent or divergent).
@@ -63,7 +83,7 @@ enum GetTypeBehaviour {
 enum CreateTypeBehaviour {
     Ok,
     AlreadyExists,
-    Error(ResourceGroupError),
+    Error(CanonicalError),
 }
 
 struct TypeState {
@@ -103,9 +123,9 @@ impl TypeState {
 
     fn get_type_unavailable() -> Self {
         Self {
-            get_type: GetTypeBehaviour::Error(ResourceGroupError::ServiceUnavailable {
-                message: "connection refused".to_owned(),
-            }),
+            get_type: GetTypeBehaviour::Error(
+                CanonicalError::internal("connection refused").create(),
+            ),
             create_type: CreateTypeBehaviour::Ok,
         }
     }
@@ -113,9 +133,9 @@ impl TypeState {
     fn create_type_unavailable() -> Self {
         Self {
             get_type: GetTypeBehaviour::NotFound,
-            create_type: CreateTypeBehaviour::Error(ResourceGroupError::ServiceUnavailable {
-                message: "connection refused".to_owned(),
-            }),
+            create_type: CreateTypeBehaviour::Error(
+                CanonicalError::internal("connection refused").create(),
+            ),
         }
     }
 }
@@ -224,11 +244,8 @@ impl ResourceGroupClient for FakeRgClient {
         &self,
         _ctx: &SecurityContext,
         code: &str,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
-        fn dispatch(
-            b: &GetTypeBehaviour,
-            code: &str,
-        ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
+        fn dispatch(b: &GetTypeBehaviour, code: &str) -> Result<ResourceGroupType, CanonicalError> {
             match b {
                 GetTypeBehaviour::Return(t) => Ok(t.clone()),
                 GetTypeBehaviour::Error(e) => Err(e.clone()),
@@ -237,21 +254,18 @@ impl ResourceGroupClient for FakeRgClient {
                 // collapsing to `NotFound` keeps the fake observable
                 // rather than panicking inside a test fixture.
                 GetTypeBehaviour::NotFound | GetTypeBehaviour::Sequence(_, _) => {
-                    Err(ResourceGroupError::not_found(code))
+                    Err(rg_not_found(code))
                 }
             }
         }
-        let state = self
-            .states
-            .get(code)
-            .ok_or_else(|| ResourceGroupError::not_found(code))?;
+        let state = self.states.get(code).ok_or_else(|| rg_not_found(code))?;
         match &state.get_type {
             GetTypeBehaviour::Sequence(steps, idx) => {
                 let i = idx.fetch_add(1, Ordering::SeqCst);
                 let step = steps
                     .get(i)
                     .or_else(|| steps.last())
-                    .ok_or_else(|| ResourceGroupError::not_found(code))?;
+                    .ok_or_else(|| rg_not_found(code))?;
                 dispatch(step, code)
             }
             other => dispatch(other, code),
@@ -262,7 +276,7 @@ impl ResourceGroupClient for FakeRgClient {
         &self,
         _ctx: &SecurityContext,
         request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         // Best-effort observability: out-of-band record the order of
         // `create_type` calls. Lock-poison failure aborts the test
         // with a clear cause rather than silently corrupting state.
@@ -273,7 +287,7 @@ impl ResourceGroupClient for FakeRgClient {
         let state = self
             .states
             .get(request.code.as_str())
-            .ok_or_else(|| ResourceGroupError::not_found(&request.code))?;
+            .ok_or_else(|| rg_not_found(&request.code))?;
         match &state.create_type {
             CreateTypeBehaviour::Ok => Ok(ResourceGroupType {
                 code: request.code,
@@ -282,9 +296,7 @@ impl ResourceGroupClient for FakeRgClient {
                 allowed_membership_types: request.allowed_membership_types,
                 metadata_schema: request.metadata_schema,
             }),
-            CreateTypeBehaviour::AlreadyExists => {
-                Err(ResourceGroupError::type_already_exists(&request.code))
-            }
+            CreateTypeBehaviour::AlreadyExists => Err(rg_already_exists(&request.code)),
             CreateTypeBehaviour::Error(e) => Err(e.clone()),
         }
     }
@@ -293,7 +305,7 @@ impl ResourceGroupClient for FakeRgClient {
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
         unreachable!()
     }
     async fn update_type(
@@ -301,7 +313,7 @@ impl ResourceGroupClient for FakeRgClient {
         _ctx: &SecurityContext,
         code: &str,
         request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, ResourceGroupError> {
+    ) -> Result<ResourceGroupType, CanonicalError> {
         self.update_calls
             .lock()
             .expect("update_calls lock not poisoned")
@@ -314,32 +326,28 @@ impl ResourceGroupClient for FakeRgClient {
             metadata_schema: request.metadata_schema,
         })
     }
-    async fn delete_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_type(&self, _ctx: &SecurityContext, _code: &str) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn create_group(
         &self,
         _ctx: &SecurityContext,
         _request: CreateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn get_group(
         &self,
         _ctx: &SecurityContext,
         _id: Uuid,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn list_groups(
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroup>, CanonicalError> {
         unreachable!()
     }
     async fn update_group(
@@ -347,14 +355,10 @@ impl ResourceGroupClient for FakeRgClient {
         _ctx: &SecurityContext,
         _id: Uuid,
         _request: UpdateGroupRequest,
-    ) -> Result<ResourceGroup, ResourceGroupError> {
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
-    async fn delete_group(
-        &self,
-        _ctx: &SecurityContext,
-        _id: Uuid,
-    ) -> Result<(), ResourceGroupError> {
+    async fn delete_group(&self, _ctx: &SecurityContext, _id: Uuid) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn get_group_descendants(
@@ -362,7 +366,7 @@ impl ResourceGroupClient for FakeRgClient {
         _ctx: &SecurityContext,
         _group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         unreachable!()
     }
     async fn get_group_ancestors(
@@ -370,7 +374,7 @@ impl ResourceGroupClient for FakeRgClient {
         _ctx: &SecurityContext,
         _group_id: Uuid,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         unreachable!()
     }
     async fn add_membership(
@@ -379,7 +383,7 @@ impl ResourceGroupClient for FakeRgClient {
         _group_id: Uuid,
         _resource_type: &str,
         _resource_id: &str,
-    ) -> Result<ResourceGroupMembership, ResourceGroupError> {
+    ) -> Result<ResourceGroupMembership, CanonicalError> {
         unreachable!()
     }
     async fn remove_membership(
@@ -388,14 +392,14 @@ impl ResourceGroupClient for FakeRgClient {
         _group_id: Uuid,
         _resource_type: &str,
         _resource_id: &str,
-    ) -> Result<(), ResourceGroupError> {
+    ) -> Result<(), CanonicalError> {
         unreachable!()
     }
     async fn list_memberships(
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+    ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
         unreachable!()
     }
 }
@@ -668,21 +672,21 @@ async fn container_update_type_transport_error_returns_service_unavailable() {
             &self,
             ctx: &SecurityContext,
             code: &str,
-        ) -> Result<ResourceGroupType, ResourceGroupError> {
+        ) -> Result<ResourceGroupType, CanonicalError> {
             self.delegate.get_type(ctx, code).await
         }
         async fn create_type(
             &self,
             ctx: &SecurityContext,
             request: CreateTypeRequest,
-        ) -> Result<ResourceGroupType, ResourceGroupError> {
+        ) -> Result<ResourceGroupType, CanonicalError> {
             self.delegate.create_type(ctx, request).await
         }
         async fn list_types(
             &self,
             ctx: &SecurityContext,
             query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroupType>, CanonicalError> {
             self.delegate.list_types(ctx, query).await
         }
         async fn update_type(
@@ -690,37 +694,35 @@ async fn container_update_type_transport_error_returns_service_unavailable() {
             _ctx: &SecurityContext,
             _code: &str,
             _request: UpdateTypeRequest,
-        ) -> Result<ResourceGroupType, ResourceGroupError> {
-            Err(ResourceGroupError::ServiceUnavailable {
-                message: "connection refused".to_owned(),
-            })
+        ) -> Result<ResourceGroupType, CanonicalError> {
+            Err(CanonicalError::internal("connection refused").create())
         }
         async fn delete_type(
             &self,
             ctx: &SecurityContext,
             code: &str,
-        ) -> Result<(), ResourceGroupError> {
+        ) -> Result<(), CanonicalError> {
             self.delegate.delete_type(ctx, code).await
         }
         async fn create_group(
             &self,
             ctx: &SecurityContext,
             request: CreateGroupRequest,
-        ) -> Result<ResourceGroup, ResourceGroupError> {
+        ) -> Result<ResourceGroup, CanonicalError> {
             self.delegate.create_group(ctx, request).await
         }
         async fn get_group(
             &self,
             ctx: &SecurityContext,
             id: Uuid,
-        ) -> Result<ResourceGroup, ResourceGroupError> {
+        ) -> Result<ResourceGroup, CanonicalError> {
             self.delegate.get_group(ctx, id).await
         }
         async fn list_groups(
             &self,
             ctx: &SecurityContext,
             query: &ODataQuery,
-        ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroup>, CanonicalError> {
             self.delegate.list_groups(ctx, query).await
         }
         async fn update_group(
@@ -728,14 +730,14 @@ async fn container_update_type_transport_error_returns_service_unavailable() {
             ctx: &SecurityContext,
             id: Uuid,
             request: UpdateGroupRequest,
-        ) -> Result<ResourceGroup, ResourceGroupError> {
+        ) -> Result<ResourceGroup, CanonicalError> {
             self.delegate.update_group(ctx, id, request).await
         }
         async fn delete_group(
             &self,
             ctx: &SecurityContext,
             id: Uuid,
-        ) -> Result<(), ResourceGroupError> {
+        ) -> Result<(), CanonicalError> {
             self.delegate.delete_group(ctx, id).await
         }
         async fn get_group_descendants(
@@ -743,7 +745,7 @@ async fn container_update_type_transport_error_returns_service_unavailable() {
             ctx: &SecurityContext,
             id: Uuid,
             query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
             self.delegate.get_group_descendants(ctx, id, query).await
         }
         async fn get_group_ancestors(
@@ -751,7 +753,7 @@ async fn container_update_type_transport_error_returns_service_unavailable() {
             ctx: &SecurityContext,
             id: Uuid,
             query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
             self.delegate.get_group_ancestors(ctx, id, query).await
         }
         async fn add_membership(
@@ -760,7 +762,7 @@ async fn container_update_type_transport_error_returns_service_unavailable() {
             id: Uuid,
             ty: &str,
             rid: &str,
-        ) -> Result<ResourceGroupMembership, ResourceGroupError> {
+        ) -> Result<ResourceGroupMembership, CanonicalError> {
             self.delegate.add_membership(ctx, id, ty, rid).await
         }
         async fn remove_membership(
@@ -769,14 +771,14 @@ async fn container_update_type_transport_error_returns_service_unavailable() {
             id: Uuid,
             ty: &str,
             rid: &str,
-        ) -> Result<(), ResourceGroupError> {
+        ) -> Result<(), CanonicalError> {
             self.delegate.remove_membership(ctx, id, ty, rid).await
         }
         async fn list_memberships(
             &self,
             ctx: &SecurityContext,
             query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
             self.delegate.list_memberships(ctx, query).await
         }
     }

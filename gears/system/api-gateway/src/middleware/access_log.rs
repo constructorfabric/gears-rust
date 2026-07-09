@@ -2,7 +2,7 @@
 //!
 //! Emits one `tracing::info!` event per completed request with the
 //! following fields:
-//! `pid`, `request_id`, `trace_id`, `method`, `uri`, `remote_addr`,
+//! `msg`, `pid`, `request_id`, `trace_id`, `method`, `uri`, `remote_addr`,
 //! `remote_addr_ip`, `remote_addr_port`, `content_length`, `user_agent`,
 //! `duration_ms`, `duration` (µs), `status`, `bytes_sent`.
 

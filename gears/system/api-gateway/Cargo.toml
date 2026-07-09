@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-api-gateway"
-version = "0.2.8"
+version = "0.2.9"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -23,7 +23,7 @@ toolkit = { workspace = true }
 toolkit-http = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.17", path = "../authn-resolver/authn-resolver-sdk" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.18", path = "../authn-resolver/authn-resolver-sdk" }
 toolkit-macros = { workspace = true }
 inventory = { workspace = true }
 anyhow = { workspace = true }
@@ -34,7 +34,6 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
-thiserror = { workspace = true }
 
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
@@ -49,7 +48,6 @@ glob = { workspace = true }
 
 opentelemetry = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
 
 utoipa = { workspace = true }
 http = { workspace = true }
@@ -61,6 +59,7 @@ rust-embed = { workspace = true }
 futures-core = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [features]
 grpc = []

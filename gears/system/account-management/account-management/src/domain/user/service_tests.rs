@@ -1149,26 +1149,40 @@ mod cleanup {
     use async_trait::async_trait;
     use resource_group_sdk::{
         CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
-        ResourceGroupError, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,
-        UpdateGroupRequest, UpdateTypeRequest,
+        ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
+        UpdateTypeRequest,
     };
     use std::sync::Mutex;
+    use toolkit_canonical_errors::{CanonicalError, resource_error};
     use toolkit_odata::{ODataQuery, Page, PageInfo};
     use toolkit_security::SecurityContext;
 
     use crate::domain::user::test_support::FakeUserOutcome;
 
+    // The RG trait boundary is `CanonicalError` (ADR 0005); synthesize the
+    // canonical `NotFound` the real RG ladder emits so the user-cleanup
+    // path's `.map_err(ResourceGroupError::from)` idempotent dispatch is
+    // exercised as in prod.
+    #[resource_error("gts.cf.core.resource_group.group.v1~")]
+    struct RgErr;
+
+    fn rg_not_found(code: &str) -> CanonicalError {
+        RgErr::not_found(format!("'{code}' not found"))
+            .with_resource(code)
+            .create()
+    }
+
     // -- minimal RG fake focused on list_groups + remove_membership --
 
     enum ListBehaviour {
         Pages(Vec<Page<ResourceGroup>>),
-        Error(ResourceGroupError),
+        Error(CanonicalError),
     }
 
     enum RemoveBehaviour {
         Ok,
         NotFound,
-        Error(ResourceGroupError),
+        Error(CanonicalError),
     }
 
     struct FakeMembershipRgClient {
@@ -1217,7 +1231,7 @@ mod cleanup {
             self
         }
 
-        fn with_list_error(error: ResourceGroupError) -> Self {
+        fn with_list_error(error: CanonicalError) -> Self {
             Self {
                 list_behaviour: Mutex::new(ListBehaviour::Error(error)),
                 remove_behaviour: RemoveBehaviour::Ok,
@@ -1241,7 +1255,7 @@ mod cleanup {
             &self,
             _ctx: &SecurityContext,
             _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroup>, CanonicalError> {
             *self.list_calls.lock().expect("lock") += 1;
             let mut behaviour = self.list_behaviour.lock().expect("lock");
             match &mut *behaviour {
@@ -1261,7 +1275,7 @@ mod cleanup {
             group_id: Uuid,
             resource_type: &str,
             resource_id: &str,
-        ) -> Result<(), ResourceGroupError> {
+        ) -> Result<(), CanonicalError> {
             self.removed.lock().expect("lock").push((
                 group_id,
                 resource_type.to_owned(),
@@ -1269,7 +1283,7 @@ mod cleanup {
             ));
             match &self.remove_behaviour {
                 RemoveBehaviour::Ok => Ok(()),
-                RemoveBehaviour::NotFound => Err(ResourceGroupError::not_found("membership")),
+                RemoveBehaviour::NotFound => Err(rg_not_found("membership")),
                 RemoveBehaviour::Error(e) => Err(e.clone()),
             }
         }
@@ -1280,7 +1294,7 @@ mod cleanup {
             &self,
             _ctx: &SecurityContext,
             _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
             unreachable!(
                 "cleanup uses list_groups(tenant) + per-group remove, never list_memberships"
             )
@@ -1289,21 +1303,21 @@ mod cleanup {
             &self,
             _ctx: &SecurityContext,
             _request: CreateTypeRequest,
-        ) -> Result<ResourceGroupType, ResourceGroupError> {
+        ) -> Result<ResourceGroupType, CanonicalError> {
             unreachable!()
         }
         async fn get_type(
             &self,
             _ctx: &SecurityContext,
             _code: &str,
-        ) -> Result<ResourceGroupType, ResourceGroupError> {
+        ) -> Result<ResourceGroupType, CanonicalError> {
             unreachable!()
         }
         async fn list_types(
             &self,
             _ctx: &SecurityContext,
             _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroupType>, CanonicalError> {
             unreachable!()
         }
         async fn update_type(
@@ -1311,28 +1325,28 @@ mod cleanup {
             _ctx: &SecurityContext,
             _code: &str,
             _request: UpdateTypeRequest,
-        ) -> Result<ResourceGroupType, ResourceGroupError> {
+        ) -> Result<ResourceGroupType, CanonicalError> {
             unreachable!()
         }
         async fn delete_type(
             &self,
             _ctx: &SecurityContext,
             _code: &str,
-        ) -> Result<(), ResourceGroupError> {
+        ) -> Result<(), CanonicalError> {
             unreachable!()
         }
         async fn create_group(
             &self,
             _ctx: &SecurityContext,
             _request: CreateGroupRequest,
-        ) -> Result<ResourceGroup, ResourceGroupError> {
+        ) -> Result<ResourceGroup, CanonicalError> {
             unreachable!()
         }
         async fn get_group(
             &self,
             _ctx: &SecurityContext,
             _id: Uuid,
-        ) -> Result<ResourceGroup, ResourceGroupError> {
+        ) -> Result<ResourceGroup, CanonicalError> {
             unreachable!()
         }
         async fn update_group(
@@ -1340,14 +1354,14 @@ mod cleanup {
             _ctx: &SecurityContext,
             _id: Uuid,
             _request: UpdateGroupRequest,
-        ) -> Result<ResourceGroup, ResourceGroupError> {
+        ) -> Result<ResourceGroup, CanonicalError> {
             unreachable!()
         }
         async fn delete_group(
             &self,
             _ctx: &SecurityContext,
             _id: Uuid,
-        ) -> Result<(), ResourceGroupError> {
+        ) -> Result<(), CanonicalError> {
             unreachable!()
         }
         async fn get_group_descendants(
@@ -1355,7 +1369,7 @@ mod cleanup {
             _ctx: &SecurityContext,
             _group_id: Uuid,
             _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
             unreachable!()
         }
         async fn get_group_ancestors(
@@ -1363,7 +1377,7 @@ mod cleanup {
             _ctx: &SecurityContext,
             _group_id: Uuid,
             _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+        ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
             unreachable!()
         }
         async fn add_membership(
@@ -1372,7 +1386,7 @@ mod cleanup {
             _group_id: Uuid,
             _resource_type: &str,
             _resource_id: &str,
-        ) -> Result<ResourceGroupMembership, ResourceGroupError> {
+        ) -> Result<ResourceGroupMembership, CanonicalError> {
             unreachable!()
         }
     }
@@ -1506,9 +1520,7 @@ mod cleanup {
         let idp = Arc::new(FakeIdpUserProvisioner::new());
         idp.set_delete_outcome(FakeUserOutcome::Ok);
         let rg = Arc::new(FakeMembershipRgClient::with_list_error(
-            ResourceGroupError::ServiceUnavailable {
-                message: "connection refused".to_owned(),
-            },
+            CanonicalError::internal("connection refused").create(),
         ));
         let svc = make_service_with_cleanup(tenants, idp, Arc::clone(&rg));
 
@@ -1606,9 +1618,7 @@ mod cleanup {
         let rg = Arc::new(
             FakeMembershipRgClient::with_groups(vec![user_group(group_a, tenant_id)])
                 .with_remove_behaviour(RemoveBehaviour::Error(
-                    ResourceGroupError::ServiceUnavailable {
-                        message: "connection refused".to_owned(),
-                    },
+                    CanonicalError::internal("connection refused").create(),
                 )),
         );
         let svc = make_service_with_cleanup(tenants, idp, Arc::clone(&rg));

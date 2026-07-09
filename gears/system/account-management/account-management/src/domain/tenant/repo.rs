@@ -19,6 +19,7 @@
 //!   status) and rewrites `tenant_closure.descendant_status` atomically
 //!   when `status` changes.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -366,6 +367,21 @@ pub trait TenantRepo: Send + Sync {
         parent_id: Uuid,
         filter: ChildCountFilter,
     ) -> Result<u64, DomainError>;
+
+    /// Direct-child counts for a batch of parent ids, keyed by parent.
+    ///
+    /// Public-surface counterpart to [`count_children`]: **scope-filtered**
+    /// (direct children behind a self-managed barrier the caller cannot
+    /// reach count as `0`) and **excludes `Provisioning`** (no public
+    /// representation) while **including `Deleted`**. One grouped query
+    /// covers the whole batch; parents with no matching child are absent
+    /// from the map (callers default them to `0`). Powers the
+    /// `child_count` field on the public tenant read shape.
+    async fn count_children_grouped(
+        &self,
+        scope: &AccessScope,
+        parent_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, u64>, DomainError>;
 
     /// Count live tenants grouped by `(status, self_managed)` for the
     /// `am_tenants` inventory gauge. Visibility is bounded by `scope`

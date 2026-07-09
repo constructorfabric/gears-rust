@@ -70,13 +70,7 @@ opentelemetry = { workspace = true }
 
 [dev-dependencies]
 tokio-util = { workspace = true }
-tower = { workspace = true, features = ["util"] }
-api_gateway = { package = "cf-gears-api-gateway", path = "../../../../gears/system/api-gateway" }
 serde_json = { workspace = true }
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true, features = ["postgres"] }
+
 # Testing dependencies for tracing verification
-tracing-test = { workspace = true }
-httpmock = { workspace = true }
-tokio-test = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

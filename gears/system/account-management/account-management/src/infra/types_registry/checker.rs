@@ -37,7 +37,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient, TypesRegistryError};
+use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -167,11 +168,11 @@ impl TenantTypeChecker for GtsTenantTypeChecker {
         // batch return that nonetheless contains a per-entry
         // transport-flavored error (or a missing required entry —
         // a broken-client signal) is an `error` for dashboard
-        // purposes; per-entry `GtsTypeSchemaNotFound` is a domain
+        // purposes; per-entry `CanonicalError::NotFound` is a domain
         // condition (`InvalidTenantType`), not a health signal.
         let had_transport_error = requested.iter().any(|u| match map.get(u) {
             None => true,
-            Some(Err(err)) => !matches!(err, TypesRegistryError::GtsTypeSchemaNotFound(_)),
+            Some(Err(err)) => !matches!(err, CanonicalError::NotFound { .. }),
             Some(Ok(_)) => false,
         });
         emit_metric(
@@ -278,10 +279,10 @@ impl TenantTypeChecker for GtsTenantTypeChecker {
 /// * missing entry → `ServiceUnavailable` (the SDK contract guarantees
 ///   one entry per requested UUID; a missing entry indicates a broken
 ///   client implementation, not a domain condition)
-/// * `GtsTypeSchemaNotFound` → `InvalidTenantType`
+/// * `CanonicalError::NotFound` → `InvalidTenantType`
 /// * any other transport/registry error → `ServiceUnavailable`
 ///
-/// `TypesRegistryError` Display is forwarded into the detail unredacted
+/// `CanonicalError` Display is forwarded into the detail unredacted
 /// (no `redact_provider_detail` here). This is intentional: the GTS
 /// Types Registry is a CF-internal sibling gear whose error surface
 /// is curated and safe to expose to the caller, in contrast to the `IdP`
@@ -289,7 +290,7 @@ impl TenantTypeChecker for GtsTenantTypeChecker {
 /// from third-party vendor SDKs and must be redacted before crossing
 /// the AM boundary.
 fn resolve_schema<'a>(
-    entry: Option<&'a Result<GtsTypeSchema, TypesRegistryError>>,
+    entry: Option<&'a Result<GtsTypeSchema, CanonicalError>>,
     uuid: Uuid,
     role: &'static str,
 ) -> Result<&'a GtsTypeSchema, DomainError> {
@@ -298,11 +299,9 @@ fn resolve_schema<'a>(
             "types-registry: {role} uuid {uuid} missing from response"
         ))),
         Some(Ok(schema)) => Ok(schema),
-        Some(Err(TypesRegistryError::GtsTypeSchemaNotFound(_))) => {
-            Err(DomainError::InvalidTenantType {
-                detail: format!("{role} tenant type {uuid} not registered in GTS"),
-            })
-        }
+        Some(Err(CanonicalError::NotFound { .. })) => Err(DomainError::InvalidTenantType {
+            detail: format!("{role} tenant type {uuid} not registered in GTS"),
+        }),
         Some(Err(other)) => Err(DomainError::service_unavailable(format!(
             "types-registry: {other}"
         ))),

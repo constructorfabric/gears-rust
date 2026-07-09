@@ -380,9 +380,10 @@ fn seed_root_at_status(repo: &FakeTenantRepo, status: TenantStatus) {
 fn stub_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use toolkit_canonical_errors::CanonicalError;
     use types_registry_sdk::{
         GtsInstance, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
-        TypesRegistryClient, TypesRegistryError,
+        TypesRegistryClient,
     };
 
     struct Stub;
@@ -392,19 +393,16 @@ fn stub_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
         async fn register(
             &self,
             _entities: Vec<serde_json::Value>,
-        ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+        ) -> Result<Vec<RegisterResult>, CanonicalError> {
             unreachable!()
         }
         async fn register_type_schemas(
             &self,
             _type_schemas: Vec<serde_json::Value>,
-        ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+        ) -> Result<Vec<RegisterResult>, CanonicalError> {
             unreachable!()
         }
-        async fn get_type_schema(
-            &self,
-            type_id: &str,
-        ) -> Result<GtsTypeSchema, TypesRegistryError> {
+        async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
             // Route per-id so the bootstrap-time GTS validation seam
             // does not short-circuit before the IdP retry-loop branch
             // these tests are designed to exercise. The AM tenant
@@ -431,58 +429,55 @@ fn stub_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
         async fn get_type_schema_by_uuid(
             &self,
             _type_uuid: Uuid,
-        ) -> Result<GtsTypeSchema, TypesRegistryError> {
+        ) -> Result<GtsTypeSchema, CanonicalError> {
             unreachable!()
         }
         async fn get_type_schemas(
             &self,
             _type_ids: Vec<String>,
-        ) -> HashMap<String, Result<GtsTypeSchema, TypesRegistryError>> {
+        ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
             unreachable!()
         }
         async fn get_type_schemas_by_uuid(
             &self,
             _type_uuids: Vec<Uuid>,
-        ) -> HashMap<Uuid, Result<GtsTypeSchema, TypesRegistryError>> {
+        ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
             unreachable!()
         }
         async fn list_type_schemas(
             &self,
             _query: TypeSchemaQuery,
-        ) -> Result<Vec<GtsTypeSchema>, TypesRegistryError> {
+        ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
             unreachable!()
         }
         async fn register_instances(
             &self,
             _instances: Vec<serde_json::Value>,
-        ) -> Result<Vec<RegisterResult>, TypesRegistryError> {
+        ) -> Result<Vec<RegisterResult>, CanonicalError> {
             unreachable!()
         }
-        async fn get_instance(&self, _id: &str) -> Result<GtsInstance, TypesRegistryError> {
+        async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
             unreachable!()
         }
-        async fn get_instance_by_uuid(
-            &self,
-            _uuid: Uuid,
-        ) -> Result<GtsInstance, TypesRegistryError> {
+        async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
             unreachable!()
         }
         async fn get_instances(
             &self,
             _ids: Vec<String>,
-        ) -> HashMap<String, Result<GtsInstance, TypesRegistryError>> {
+        ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
             unreachable!()
         }
         async fn get_instances_by_uuid(
             &self,
             _uuids: Vec<Uuid>,
-        ) -> HashMap<Uuid, Result<GtsInstance, TypesRegistryError>> {
+        ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
             unreachable!()
         }
         async fn list_instances(
             &self,
             _query: InstanceQuery,
-        ) -> Result<Vec<GtsInstance>, TypesRegistryError> {
+        ) -> Result<Vec<GtsInstance>, CanonicalError> {
             unreachable!()
         }
     }

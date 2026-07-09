@@ -618,7 +618,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #[::async_trait::async_trait]
                 impl #impl_generics ::toolkit::lifecycle::Runnable for #struct_ident #ty_generics #where_clause {
                     async fn run(self: ::std::sync::Arc<Self>, cancel: ::tokio_util::sync::CancellationToken) -> ::anyhow::Result<()> {
-                        let (_tx, _rx) = ::tokio::sync::oneshot::channel::<()>();
+                        let (_tx, _rx) = ::toolkit::tokio::sync::oneshot::channel::<()>();
                         let ready = ::toolkit::lifecycle::ReadySignal::from_sender(_tx);
                         self.#entry_ident(cancel, ready).await
                     }
@@ -929,7 +929,7 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[async_trait::async_trait]
             impl ::toolkit::lifecycle::Runnable for #ty {
                 async fn run(self: ::std::sync::Arc<Self>, cancel: ::tokio_util::sync::CancellationToken) -> ::anyhow::Result<()> {
-                    let (_tx, _rx) = ::tokio::sync::oneshot::channel::<()>();
+                    let (_tx, _rx) = ::toolkit::tokio::sync::oneshot::channel::<()>();
                     let ready = ::toolkit::lifecycle::ReadySignal::from_sender(_tx);
                     self.#runner_ident(cancel, ready).await
                 }

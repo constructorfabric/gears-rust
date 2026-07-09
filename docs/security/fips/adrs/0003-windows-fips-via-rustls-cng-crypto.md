@@ -33,7 +33,7 @@ Key reasons:
 
 * **Only crate with a CMVP chain-of-trust today.** Thin FFI wrapper over Windows CNG, which Microsoft itself validates per OS release. Chain-of-trust terminates at CNG, the same posture as `cf-gears-rustls-corecrypto-provider` over Apple corecrypto.
 * **Pure FFI, no `build.rs` toolchain.** Links directly against `bcrypt.dll` via `windows-sys`. Cross-compile from Linux/macOS works with `rustup target add x86_64-pc-windows-msvc` (plus `cargo-xwin` on non-Windows hosts for the MSVC sysroot).
-* **Option B (`rustls-symcrypt`) is rejected today** because SymCrypt is not on the CMVP Validated Gears list as of 2026-05. Using it would create the same failure mode we eliminated for macOS in ADR 0001 — a FIPS-mode-flagged binary routing through a non-CMVP-validated module. If/when SymCrypt obtains a CMVP cert, swap is two files (`crypto.rs` + `tls.rs`) plus a workspace dep alias.
+* **Option B (`rustls-symcrypt`) is rejected today** because SymCrypt is not on the CMVP Validated Modules list as of 2026-05. Using it would create the same failure mode we eliminated for macOS in ADR 0001 — a FIPS-mode-flagged binary routing through a non-CMVP-validated module. If/when SymCrypt obtains a CMVP cert, swap is two files (`crypto.rs` + `tls.rs`) plus a workspace dep alias.
 * **Option C is rejected** because cross-OS FIPS is a stated product requirement (PRD §2 F-1, F-4).
 * **Option D is rejected on cost/benefit**: ~1500 LOC of CNG FFI work duplicates what `rustls-cng-crypto` already does, with no audit-trail advantage — CNG itself is the CMVP-validated artifact, the FFI wrapper is reviewable in isolation either way. Reserve for emergency use if upstream is abandoned.
 
@@ -61,7 +61,7 @@ Following the verification gates in [PRD §9](../PRD.md#9-acceptance-criteria):
 * Good: pure FFI (`windows-sys`), no `build.rs` C toolchain on Windows.
 * Good: `fips_provider()` is feature-gated and idiomatically fail-closed (empty provider when FIPS-mode off).
 * Bad: young crate, single maintainer — upstream-stagnation risk, not correctness risk.
-* Bad: not itself on the CMVP Validated Gears list. (Neither is our corecrypto provider; both rely on the OS-native module.)
+* Bad: not itself on the CMVP Validated Modules list. (Neither is our corecrypto provider; both rely on the OS-native module.)
 
 ### Option B — `rustls-symcrypt`
 
@@ -86,7 +86,7 @@ Following the verification gates in [PRD §9](../PRD.md#9-acceptance-criteria):
 ## More Information
 
 * Crate: <https://crates.io/crates/rustls-cng-crypto> / <https://github.com/tofay/rustls-cng-crypto>
-* Microsoft FIPS-mode reference: <https://learn.microsoft.com/en-us/windows/security/threat-protection/fips-140-validation>
+* Microsoft FIPS-mode reference: <https://learn.microsoft.com/en-us/windows/security/security-foundations/certification/fips-140-validation>
 * Wire-level smoke runbook: [`examples/cf-gears-fips-probe/README.md`](../../../../examples/cf-gears-fips-probe/README.md) — "Verify on Windows".
 
 ## Traceability

@@ -14,11 +14,11 @@ pattern  = "*.md"
 id       = ".github"
 pattern  = ".github/**/*.md"
 
-# ── CyPilot ───────────────────────────────────────────────────────────────────
+# ── Constructor Studio ───────────────────────────────────────────────────────
 
 [[categories]]
-id    = "cypilot"
-label = "CyPilot"
+id    = "cf-studio"
+label = "Constructor Studio"
 
 [[categories.buckets]]
 id      = "agents"
@@ -37,20 +37,20 @@ id      = ".codex"
 pattern = ".codex/**/*.md"
 
 [[categories.buckets]]
-id      = "cypilot"
-pattern = ".cypilot/**/*.md"
+id      = "cf-studio"
+pattern = ".cf-studio/**/*.md"
 
 [[categories.buckets]]
-id      = "cypilot-agents"
-pattern = ".cypilot/agents/**/*.md"
+id      = "cf-studio-config"
+pattern = ".cf-studio/config/**/*.md"
 
 [[categories.buckets]]
-id      = "cypilot-core"
-pattern = ".cypilot/.core/**/*.md"
+id      = "cf-studio-core"
+pattern = ".cf-studio/.core/**/*.md"
 
 [[categories.buckets]]
-id      = "cypilot-config"
-pattern = ".cypilot/config/**/*.md"
+id      = "cf-studio-gen"
+pattern = ".cf-studio/.gen/**/*.md"
 
 [[categories.buckets]]
 id      = "windsurf"

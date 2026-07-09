@@ -32,9 +32,12 @@ pub enum DomainError {
 // introduce typed variants) so `.source()` returns the original error, then
 // remove these allows.
 #[allow(unknown_lints, de1302_error_from_to_string)]
-impl From<types_registry_sdk::TypesRegistryError> for DomainError {
-    fn from(e: types_registry_sdk::TypesRegistryError) -> Self {
-        Self::Internal(e.to_string())
+impl From<toolkit_canonical_errors::CanonicalError> for DomainError {
+    fn from(e: toolkit_canonical_errors::CanonicalError) -> Self {
+        // Prefer the in-process diagnostic for `Internal`/`Unknown` (the wire
+        // strips it); other categories carry their message in `detail()` via
+        // `to_string()`.
+        Self::Internal(e.diagnostic().map_or_else(|| e.to_string(), str::to_owned))
     }
 }
 

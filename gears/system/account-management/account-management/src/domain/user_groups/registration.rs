@@ -173,7 +173,7 @@ impl TypeSpec {
 ///
 /// Each step runs the full idempotent algorithm independently
 /// ([`register_one`]): `get_type` → classify-or-create → on
-/// `TypeAlreadyExists` race re-read and classify. A step that lands
+/// `AlreadyExists` race re-read and classify. A step that lands
 /// on `DivergentSchema` aborts the pair; the caller (`gear init`)
 /// surfaces the error and does NOT signal ready.
 ///
@@ -247,7 +247,7 @@ pub async fn register_user_group_types(
 ///
 /// * `get_type` returns the row → classify it.
 /// * `get_type` returns `NotFound` → `create_type` → on success done,
-///   on `TypeAlreadyExists` re-read and classify the peer's row.
+///   on `AlreadyExists` re-read and classify the peer's row.
 /// * `get_type` / `create_type` returns transport failure →
 ///   `ServiceUnavailable`.
 #[allow(
@@ -259,8 +259,14 @@ async fn register_one(
     ctx: &SecurityContext,
     spec: &TypeSpec,
 ) -> Result<RegistrationOutcome, RegistrationError> {
-    // Step 1: query existing type definition.
-    let existing = match client.get_type(ctx, spec.code).await {
+    // Step 1: query existing type definition. The trait boundary is
+    // `CanonicalError` (ADR 0005); project into the typed SDK view to
+    // dispatch on `NotFound` vs. any transport failure.
+    let existing = match client
+        .get_type(ctx, spec.code)
+        .await
+        .map_err(ResourceGroupError::from)
+    {
         Ok(t) => Some(t),
         Err(ResourceGroupError::NotFound { .. }) => None,
         Err(e) => {
@@ -284,7 +290,11 @@ async fn register_one(
     }
 
     // Type is absent -- register it.
-    match client.create_type(ctx, spec.to_create_request()).await {
+    match client
+        .create_type(ctx, spec.to_create_request())
+        .await
+        .map_err(ResourceGroupError::from)
+    {
         Ok(_) => {
             emit_metric(
                 AM_DEPENDENCY_HEALTH,
@@ -311,7 +321,7 @@ async fn register_one(
         // surface that as `ServiceUnavailable` so the operator can
         // retry init; do NOT default to `AlreadyPresent` because the
         // traits-equivalence invariant is unverified.
-        Err(ResourceGroupError::TypeAlreadyExists { .. }) => {
+        Err(ResourceGroupError::AlreadyExists { .. }) => {
             match client.get_type(ctx, spec.code).await {
                 Ok(racy) => {
                     info!(
@@ -360,7 +370,7 @@ async fn register_one(
 
 /// Equivalence predicate: every trait `spec` declares MUST be honoured
 /// by `existing`. Shared by the step-1 "type already exists" path and
-/// the `TypeAlreadyExists` race-loser path so both honour the same
+/// the `AlreadyExists` race-loser path so both honour the same
 /// "AM MUST NOT auto-repair divergent traits" invariant.
 ///
 /// The check is **inclusive-equivalence**: RG is allowed to seed
