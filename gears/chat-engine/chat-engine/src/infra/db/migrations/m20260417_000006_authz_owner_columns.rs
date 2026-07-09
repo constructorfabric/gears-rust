@@ -99,6 +99,35 @@ impl MigrationTrait for Migration {
                      ALTER COLUMN user_id TYPE UUID USING user_id::UUID",
                 )
                 .await?;
+
+                // message_reactions.user_id (reactor identity, a composite-PK
+                // member) is also stored as UUID-formatted text sourced from
+                // SecurityContext. The Scopable entity declares it as `Uuid`, so
+                // the physical column must be cast to match, or Postgres reads
+                // decode-fail. (Reactor identity is attribution, not a scoping
+                // key — its type is Uuid purely for storage consistency.)
+                let bad_reaction: i64 = {
+                    let row = db
+                        .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                            backend,
+                            "SELECT COUNT(*) AS cnt FROM message_reactions \
+                             WHERE user_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'",
+                        ))
+                        .await?;
+                    row.map(|r| r.try_get::<i64>("", "cnt").unwrap_or(0))
+                        .unwrap_or(0)
+                };
+                if bad_reaction > 0 {
+                    return Err(DbErr::Custom(format!(
+                        "Migration aborted: {bad_reaction} row(s) in `message_reactions` \
+                         have user_id values that cannot be cast to UUID."
+                    )));
+                }
+                db.execute_unprepared(
+                    "ALTER TABLE message_reactions \
+                     ALTER COLUMN user_id TYPE UUID USING user_id::UUID",
+                )
+                .await?;
             }
             sea_orm::DatabaseBackend::Sqlite => {
                 // SQLite is typeless; the format guard (regex check) is the
