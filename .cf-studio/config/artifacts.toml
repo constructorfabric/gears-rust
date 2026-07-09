@@ -170,7 +170,7 @@ extensions = [".rs"]
 # children block only matches this specific parent + plugin pair, rather than being
 # evaluated against every sibling gear under `gears/$system`.
 [[systems.autodetect.children]]
-kit = "sdlc"
+kit = "gears"
 system_root = "{project_root}/gears/serverless-runtime/plugins/composed-runtime-plugin"
 artifacts_root = "{system_root}/docs"
 
