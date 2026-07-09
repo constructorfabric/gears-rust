@@ -114,8 +114,8 @@ impl SessionRepo for SeaSessionRepo {
         use sea_orm::ActiveValue::{NotSet, Set};
         let model = session_entity::ActiveModel {
             session_id: Set(new.session_id),
-            tenant_id: Set(new.tenant_id),
-            user_id: Set(new.user_id),
+            tenant_id: Set(new.tenant_id.parse::<Uuid>().expect("TenantId was always a UUID string")),
+            user_id: Set(new.user_id.parse::<Uuid>().expect("UserId was always a UUID string")),
             client_id: Set(new.client_id),
             session_type_id: Set(new.session_type_id),
             enabled_capabilities: Set(None),
@@ -547,7 +547,7 @@ impl SessionRepo for SeaSessionRepo {
             .all(&conn)
             .await?;
 
-        let mut tenants: Vec<String> = rows.into_iter().map(|m| m.tenant_id).collect();
+        let mut tenants: Vec<String> = rows.into_iter().map(|m| m.tenant_id.to_string()).collect();
         tenants.sort_unstable();
         tenants.dedup();
         Ok(tenants)

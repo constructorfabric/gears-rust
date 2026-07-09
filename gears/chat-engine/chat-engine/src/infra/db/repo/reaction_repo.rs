@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
+use sea_orm::{ActiveValue::{NotSet, Set}, ColumnTrait, Condition, EntityTrait};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
     AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, TxConfig,
@@ -69,7 +69,10 @@ impl ReactionRepo for SeaReactionRepo {
     ) -> Result<Option<MessageReaction>, ChatEngineError> {
         let conn = self.db.conn()?;
         let scope = AccessScope::allow_all();
-        let row = ReactionEntity::find_by_id((message_id, user_id.to_owned()))
+        let user_uuid = user_id
+            .parse::<Uuid>()
+            .map_err(|_| ChatEngineError::internal("reaction user_id is not a valid UUID"))?;
+        let row = ReactionEntity::find_by_id((message_id, user_uuid))
             .secure()
             .scope_with(&scope)
             .one(&conn)
@@ -88,7 +91,10 @@ impl ReactionRepo for SeaReactionRepo {
             "upsert called with ReactionType::None \u{2014} caller must route to delete"
         );
 
-        let user_id_owned = user_id.to_owned();
+        let user_uuid = user_id
+            .parse::<Uuid>()
+            .map_err(|_| ChatEngineError::internal("reaction user_id is not a valid UUID"))?;
+        let user_id_owned = user_uuid;
         let stored_value = reaction_type.as_str().to_owned();
         let now = OffsetDateTime::now_utc();
 
@@ -113,7 +119,10 @@ impl ReactionRepo for SeaReactionRepo {
 
                         let am = reaction_entity::ActiveModel {
                             message_id: Set(message_id),
-                            user_id: Set(user_id_owned.clone()),
+                            user_id: Set(user_id_owned),
+                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+                            owner_tenant_id: NotSet,
+                            owner_id: NotSet,
                             reaction_type: Set(stored_value),
                             // For new rows `created_at` lands; for the
                             // updated path Postgres ignores it because the
@@ -139,7 +148,7 @@ impl ReactionRepo for SeaReactionRepo {
 
                         // Read back the post-write row (cheap on the same
                         // session, primary-key lookup).
-                        let after = ReactionEntity::find_by_id((message_id, user_id_owned))
+                        let after = ReactionEntity::find_by_id((message_id, user_id_owned.clone()))
                             .secure()
                             .scope_with(&scope)
                             .one(tx)
@@ -175,7 +184,10 @@ impl ReactionRepo for SeaReactionRepo {
 
         // Capture the prior value so the service can populate
         // `previous_reaction_type` on the fire-and-forget plugin event.
-        let prior = ReactionEntity::find_by_id((message_id, user_id.to_owned()))
+        let user_uuid = user_id
+            .parse::<Uuid>()
+            .map_err(|_| ChatEngineError::internal("reaction user_id is not a valid UUID"))?;
+        let prior = ReactionEntity::find_by_id((message_id, user_uuid))
             .secure()
             .scope_with(&scope)
             .one(&conn)
@@ -191,7 +203,7 @@ impl ReactionRepo for SeaReactionRepo {
             .filter(
                 Condition::all()
                     .add(ReactionColumn::MessageId.eq(message_id))
-                    .add(ReactionColumn::UserId.eq(user_id.to_owned())),
+                    .add(ReactionColumn::UserId.eq(user_uuid)),
             )
             .exec(&conn)
             .await?;

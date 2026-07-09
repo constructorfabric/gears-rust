@@ -6,6 +6,8 @@ fn sample_model() -> message_entity::Model {
     message_entity::Model {
         message_id: Uuid::nil(),
         session_id: Uuid::nil(),
+        owner_tenant_id: Uuid::nil(),
+        owner_id: Uuid::nil(),
         tenant_id: Some("tenant-1".to_string()),
         user_id: Some("user-1".to_string()),
         parent_message_id: None,
@@ -119,7 +121,9 @@ fn reaction_model_to_domain_unknown_value_collapses_to_none() {
     let now = OffsetDateTime::now_utc();
     let model = reaction_entity::Model {
         message_id: Uuid::nil(),
-        user_id: "u".into(),
+        user_id: Uuid::nil(),
+        owner_tenant_id: Uuid::nil(),
+        owner_id: Uuid::nil(),
         reaction_type: "purple_heart".into(),
         created_at: now,
         updated_at: now,

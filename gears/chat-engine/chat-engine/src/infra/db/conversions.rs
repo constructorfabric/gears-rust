@@ -33,8 +33,10 @@ impl From<session_entity::Model> for Session {
             .unwrap_or(LifecycleState::Active);
         Session {
             session_id: model.session_id,
-            tenant_id: model.tenant_id.into(),
-            user_id: model.user_id.into(),
+            // `tenant_id`/`user_id` are now `Uuid` in the entity (Phase 2).
+            // `TenantId`/`UserId` wrap `String`; round-trip via `.to_string()`.
+            tenant_id: model.tenant_id.to_string().into(),
+            user_id: model.user_id.to_string().into(),
             client_id: model.client_id,
             session_type_id: model.session_type_id,
             enabled_capabilities: model.enabled_capabilities,
@@ -51,8 +53,19 @@ impl From<Session> for session_entity::ActiveModel {
     fn from(s: Session) -> Self {
         session_entity::ActiveModel {
             session_id: Set(s.session_id),
-            tenant_id: Set(s.tenant_id.into_inner()),
-            user_id: Set(s.user_id.into_inner()),
+            // `TenantId`/`UserId` wrap `String`; the column is now `Uuid`.
+            // Values were always UUID strings from `SecurityContext`; parse is
+            // expected to succeed for all valid sessions.
+            tenant_id: Set(s
+                .tenant_id
+                .into_inner()
+                .parse::<Uuid>()
+                .expect("TenantId was always a UUID string")),
+            user_id: Set(s
+                .user_id
+                .into_inner()
+                .parse::<Uuid>()
+                .expect("UserId was always a UUID string")),
             client_id: Set(s.client_id),
             session_type_id: Set(s.session_type_id),
             enabled_capabilities: Set(s.enabled_capabilities),
@@ -132,6 +145,9 @@ impl From<Message> for message_entity::ActiveModel {
         message_entity::ActiveModel {
             message_id: Set(m.message_id),
             session_id: Set(m.session_id),
+            // TODO Phase 3: Message domain model gains owner_tenant_id/owner_id fields
+            owner_tenant_id: NotSet,
+            owner_id: NotSet,
             tenant_id: Set(m.tenant_id.map(|t| t.as_str().to_owned())),
             user_id: Set(m.user_id.map(|u| u.as_str().to_owned())),
             parent_message_id: Set(m.parent_message_id),
@@ -197,6 +213,9 @@ impl From<MessagePart> for message_part_entity::ActiveModel {
         message_part_entity::ActiveModel {
             id: Set(p.id),
             message_id: Set(p.message_id),
+            // TODO Phase 3: MessagePart domain model gains owner_tenant_id/owner_id fields
+            owner_tenant_id: NotSet,
+            owner_id: NotSet,
             r#type: Set(part_type_to_entity(&p.part_type)),
             content: Set(p.content),
             number: Set(i32::try_from(p.number).unwrap_or(i32::MAX)),
@@ -242,7 +261,9 @@ impl From<reaction_entity::Model> for MessageReaction {
             ReactionType::from_str_value(&m.reaction_type).unwrap_or(ReactionType::None);
         Self {
             message_id: m.message_id,
-            user_id: m.user_id,
+            // `user_id` is now `Uuid` in the entity (Phase 1 cast the column);
+            // the domain `MessageReaction.user_id` is `String` — convert via Display.
+            user_id: m.user_id.to_string(),
             reaction_type,
             created_at: m.created_at,
             updated_at: m.updated_at,

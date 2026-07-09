@@ -11,11 +11,13 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "link_references")]
-#[secure(unrestricted)]
+#[secure(tenant_col = "owner_tenant_id", owner_col = "owner_id", resource_col = "id", no_type)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub message_part_id: Uuid,
+    pub owner_tenant_id: Uuid,
+    pub owner_id: Uuid,
     #[sea_orm(column_type = "JsonBinary")]
     pub content: serde_json::Value,
     pub number: i32,

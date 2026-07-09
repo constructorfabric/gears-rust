@@ -38,7 +38,7 @@ use chat_engine_sdk::models::{
     FileCitation, LinkCitation, LinkReference, MessagePart, MessagePartInput,
 };
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryOrder};
+use sea_orm::{ActiveValue::{NotSet, Set}, ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -238,6 +238,9 @@ impl MessageRepo for SeaMessageRepo {
                         let user_active = message_entity::ActiveModel {
                             message_id: Set(user_message_id),
                             session_id: Set(session_id),
+                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+                            owner_tenant_id: NotSet,
+                            owner_id: NotSet,
                             // Owning tenant (denormalized) + authoring user, both
                             // sourced from the JWT identity by the service layer.
                             tenant_id: Set(user_tenant),
@@ -256,6 +259,9 @@ impl MessageRepo for SeaMessageRepo {
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(assistant_message_id),
                             session_id: Set(session_id),
+                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+                            owner_tenant_id: NotSet,
+                            owner_id: NotSet,
                             // Inherits the owning tenant; assistant messages have
                             // no human author, so `user_id` stays NULL.
                             tenant_id: Set(assistant_tenant),
@@ -660,6 +666,9 @@ impl MessageRepo for SeaMessageRepo {
                     let summary_active = message_entity::ActiveModel {
                         message_id: Set(summary_id),
                         session_id: Set(session_id),
+                        // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+                        owner_tenant_id: NotSet,
+                        owner_id: NotSet,
                         // Inherits the owning tenant; system-generated, no author.
                         tenant_id: Set(tenant_id),
                         user_id: Set(None),
@@ -804,6 +813,9 @@ impl MessageRepo for SeaMessageRepo {
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(new_message_id),
                             session_id: Set(session_id),
+                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+                            owner_tenant_id: NotSet,
+                            owner_id: NotSet,
                             // Inherits the owning tenant; recreated assistant
                             // variant has no human author.
                             tenant_id: Set(variant_tenant),
@@ -906,6 +918,9 @@ where
         let am = message_part_entity::ActiveModel {
             id: Set(Uuid::new_v4()),
             message_id: Set(message_id),
+            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+            owner_tenant_id: NotSet,
+            owner_id: NotSet,
             r#type: Set(part_type_to_entity(&part.part_type)),
             content: Set(part.content.clone()),
             number: Set(i32::try_from(idx).unwrap_or(i32::MAX)),
@@ -937,6 +952,9 @@ where
     let am = message_part_entity::ActiveModel {
         id: Set(part_id),
         message_id: Set(message_id),
+        // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+        owner_tenant_id: NotSet,
+        owner_id: NotSet,
         r#type: Set(message_part_entity::MessagePartType::Text),
         content: Set(text_part_content(text)),
         number: Set(number),
@@ -967,6 +985,9 @@ where
     let am = message_part_entity::ActiveModel {
         id: Set(part_id),
         message_id: Set(message_id),
+        // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+        owner_tenant_id: NotSet,
+        owner_id: NotSet,
         r#type: Set(part_type_to_entity(&part.part_type)),
         content: Set(part.content.clone()),
         number: Set(number),
@@ -995,6 +1016,9 @@ where
         let am = file_citation_entity::ActiveModel {
             id: Set(Uuid::new_v4()),
             message_part_id: Set(part_id),
+            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+            owner_tenant_id: NotSet,
+            owner_id: NotSet,
             content: Set(serde_json::to_value(c).unwrap_or(JsonValue::Null)),
             number: Set(i32::try_from(idx).unwrap_or(i32::MAX)),
         };
@@ -1008,6 +1032,9 @@ where
         let am = link_citation_entity::ActiveModel {
             id: Set(Uuid::new_v4()),
             message_part_id: Set(part_id),
+            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+            owner_tenant_id: NotSet,
+            owner_id: NotSet,
             content: Set(serde_json::to_value(c).unwrap_or(JsonValue::Null)),
             number: Set(i32::try_from(idx).unwrap_or(i32::MAX)),
         };
@@ -1021,6 +1048,9 @@ where
         let am = link_reference_entity::ActiveModel {
             id: Set(Uuid::new_v4()),
             message_part_id: Set(part_id),
+            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
+            owner_tenant_id: NotSet,
+            owner_id: NotSet,
             content: Set(serde_json::to_value(r).unwrap_or(JsonValue::Null)),
             number: Set(i32::try_from(idx).unwrap_or(i32::MAX)),
         };
