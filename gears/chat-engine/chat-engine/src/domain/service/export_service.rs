@@ -51,6 +51,8 @@ use crate::domain::export::{
 use crate::domain::message::{Message, MessagePart, MessagePartType, MessageRole};
 use crate::domain::ports::MessageRepo;
 use crate::domain::ports::SessionRepo;
+use authz_resolver_sdk::pep::PolicyEnforcer;
+
 use crate::domain::service::session_service::Identity;
 use crate::domain::session::{
     LifecycleState, Session, get_share_expires_at, public_metadata, set_share_expires_at,
@@ -105,6 +107,7 @@ pub struct ExportService {
     messages: Arc<dyn MessageRepo>,
     storage: Arc<dyn ExportStorage>,
     share_urls: ShareUrlBuilder,
+    enforcer: PolicyEnforcer,
 }
 
 impl ExportService {
@@ -113,12 +116,14 @@ impl ExportService {
         sessions: Arc<dyn SessionRepo>,
         messages: Arc<dyn MessageRepo>,
         storage: Arc<dyn ExportStorage>,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
             messages,
             storage,
             share_urls: ShareUrlBuilder::default(),
+            enforcer,
         }
     }
 

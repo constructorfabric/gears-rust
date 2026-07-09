@@ -42,6 +42,8 @@ use crate::domain::ports::{DEFAULT_SOFT_DELETE_RETENTION_DAYS, NewSession, Sessi
 use crate::domain::ports::{NewSessionType, SessionTypeRepo};
 use crate::domain::service::plugin_service::PluginService;
 use crate::domain::service::webhook::{WebhookEmitter, WebhookEvent};
+use authz_resolver_sdk::pep::PolicyEnforcer;
+
 use crate::domain::session::{
     RESERVED_METADATA_KEYS, Session, SessionType, ensure_can_transition, public_metadata,
 };
@@ -148,6 +150,7 @@ pub struct SessionService {
     /// Default per-plugin-call deadline; can be overridden per call site via
     /// [`SessionService::with_plugin_timeout`].
     plugin_timeout: Duration,
+    enforcer: PolicyEnforcer,
 }
 
 impl SessionService {
@@ -157,6 +160,7 @@ impl SessionService {
         session_types: Arc<dyn SessionTypeRepo>,
         plugins: PluginService,
         webhooks: Arc<dyn WebhookEmitter>,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
@@ -164,6 +168,7 @@ impl SessionService {
             plugins,
             webhooks,
             plugin_timeout: DEFAULT_PLUGIN_CALL_TIMEOUT,
+            enforcer,
         }
     }
 

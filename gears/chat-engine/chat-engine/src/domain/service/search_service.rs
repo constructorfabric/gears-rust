@@ -54,6 +54,8 @@ use crate::domain::search::{
     Cursor, MAX_QUERY_LENGTH, MessageRef, SearchError, SearchPage, SearchQuery, SearchResult,
     SessionMeta, make_snippet, sanitize_for_tsquery,
 };
+use authz_resolver_sdk::pep::PolicyEnforcer;
+
 use crate::domain::service::session_service::Identity;
 
 /// Scope label used by the `search_duration_seconds` metric / structured log.
@@ -292,6 +294,7 @@ pub struct SearchService {
     sessions: Arc<dyn SessionRepo>,
     messages: Arc<dyn MessageRepo>,
     backend: Arc<dyn SearchBackend>,
+    enforcer: PolicyEnforcer,
 }
 
 impl SearchService {
@@ -300,11 +303,13 @@ impl SearchService {
         sessions: Arc<dyn SessionRepo>,
         messages: Arc<dyn MessageRepo>,
         backend: Arc<dyn SearchBackend>,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
             messages,
             backend,
+            enforcer,
         }
     }
 

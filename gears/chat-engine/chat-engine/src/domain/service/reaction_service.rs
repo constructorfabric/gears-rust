@@ -59,6 +59,8 @@ use crate::domain::ports::ReactionRepo;
 use crate::domain::ports::SessionRepo;
 use crate::domain::ports::SessionTypeRepo;
 use crate::domain::reaction::{MessageReaction, MessageReactionEvent, ReactionType};
+use authz_resolver_sdk::pep::PolicyEnforcer;
+
 use crate::domain::service::plugin_service::PluginService;
 use crate::domain::service::session_service::Identity;
 use crate::domain::session::Session;
@@ -102,6 +104,7 @@ pub struct ReactionService {
     messages: Arc<dyn MessageRepo>,
     reactions: Arc<dyn ReactionRepo>,
     plugins: PluginService,
+    enforcer: PolicyEnforcer,
 }
 
 impl ReactionService {
@@ -112,6 +115,7 @@ impl ReactionService {
         messages: Arc<dyn MessageRepo>,
         reactions: Arc<dyn ReactionRepo>,
         plugins: PluginService,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
@@ -119,6 +123,7 @@ impl ReactionService {
             messages,
             reactions,
             plugins,
+            enforcer,
         }
     }
 

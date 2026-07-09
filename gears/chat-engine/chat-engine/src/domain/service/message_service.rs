@@ -70,6 +70,8 @@ use crate::domain::ports::{
     FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage, PartCitations,
 };
 use crate::domain::service::plugin_service::PluginService;
+use authz_resolver_sdk::pep::PolicyEnforcer;
+
 use crate::domain::service::session_service::{Identity, redact_session};
 use crate::domain::service::webhook::{NoopWebhookEmitter, WebhookEmitter, WebhookEvent};
 use crate::domain::session::Session;
@@ -217,6 +219,7 @@ pub struct MessageService {
     /// it (with `seq`) so a dropped connection can resume via `Last-Event-ID`.
     /// `None` disables buffering (the stream still works; just not resumable).
     stream_buffer: Option<Arc<dyn StreamEventBuffer>>,
+    enforcer: PolicyEnforcer,
 }
 
 impl MessageService {
@@ -226,6 +229,7 @@ impl MessageService {
         session_types: Arc<dyn SessionTypeRepo>,
         messages: Arc<dyn MessageRepo>,
         plugins: PluginService,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
@@ -236,6 +240,7 @@ impl MessageService {
             plugin_deadline: DEFAULT_PLUGIN_DEADLINE,
             webhooks: Arc::new(NoopWebhookEmitter),
             stream_buffer: None,
+            enforcer,
         }
     }
 

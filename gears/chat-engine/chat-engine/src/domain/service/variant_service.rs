@@ -66,6 +66,8 @@ use crate::domain::ports::{MessageRepo, SessionTypeRepo};
 use crate::domain::service::message_service::{
     MessageEventKind, MessageService, SendMessageStream,
 };
+use authz_resolver_sdk::pep::PolicyEnforcer;
+
 use crate::domain::service::plugin_service::PluginService;
 use crate::domain::service::session_service::{Identity, merge_plugin_metadata};
 use crate::domain::session::{Session, SessionType};
@@ -186,6 +188,7 @@ pub struct VariantService {
     plugins: PluginService,
     message_service: Arc<MessageService>,
     plugin_timeout: Duration,
+    enforcer: PolicyEnforcer,
 }
 
 impl VariantService {
@@ -197,6 +200,7 @@ impl VariantService {
         variants: Arc<dyn VariantRepo>,
         plugins: PluginService,
         message_service: Arc<MessageService>,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
@@ -206,6 +210,7 @@ impl VariantService {
             plugins,
             message_service,
             plugin_timeout: DEFAULT_SWITCH_TYPE_DEADLINE,
+            enforcer,
         }
     }
 
