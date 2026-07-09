@@ -295,6 +295,64 @@ pub trait MessageRepo: Send + Sync {
             "delete_message_subtree not implemented for this repository",
         ))
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 4 (PEP) — PDP-scoped surface. Owner filtering is carried by the
+    // PDP-derived `AccessScope` (applied via SecureORM); `MessageService`
+    // calls these. Default impls fail closed so unrelated mocks compile.
+    // @cpt-cf-chat-engine-interface-pep
+    // ---------------------------------------------------------------------
+
+    /// Active visible history for a session under a PDP-derived scope.
+    async fn fetch_active_history_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        depth: Option<u32>,
+    ) -> Result<Vec<Message>, ChatEngineError> {
+        let _ = (scope, session_id, depth);
+        Err(ChatEngineError::internal(
+            "fetch_active_history_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Look up a single message by id under a PDP-derived scope.
+    async fn find_message_by_id_scoped(
+        &self,
+        scope: &AccessScope,
+        message_id: Uuid,
+    ) -> Result<Option<Message>, ChatEngineError> {
+        let _ = (scope, message_id);
+        Err(ChatEngineError::internal(
+            "find_message_by_id_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Look up a single message scoped to a session under a PDP-derived scope.
+    async fn find_message_in_session_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        message_id: Uuid,
+    ) -> Result<Option<Message>, ChatEngineError> {
+        let _ = (scope, session_id, message_id);
+        Err(ChatEngineError::internal(
+            "find_message_in_session_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Cascade-delete a message subtree under a PDP-derived scope.
+    async fn delete_message_subtree_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        root_id: Uuid,
+    ) -> Result<u64, ChatEngineError> {
+        let _ = (scope, session_id, root_id);
+        Err(ChatEngineError::internal(
+            "delete_message_subtree_scoped not implemented for this repository",
+        ))
+    }
 }
 
 // ===========================================================================

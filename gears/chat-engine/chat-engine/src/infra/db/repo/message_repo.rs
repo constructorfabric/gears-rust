@@ -38,7 +38,7 @@ use chat_engine_sdk::models::{
     FileCitation, LinkCitation, LinkReference, MessagePart, MessagePartInput,
 };
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::{NotSet, Set}, ColumnTrait, Condition, EntityTrait, QueryOrder};
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -57,6 +57,7 @@ use crate::infra::db::entity::message::{self as message_entity, Entity as Messag
 use crate::infra::db::entity::message_part::{
     self as message_part_entity, Entity as MessagePartEntity, compute_next_part_number,
 };
+use crate::infra::db::entity::session::{self as session_entity, Entity as SessionEntity};
 use crate::infra::db::entity::{
     file_citation as file_citation_entity, link_citation as link_citation_entity,
     link_reference as link_reference_entity,
@@ -232,15 +233,20 @@ impl MessageRepo for SeaMessageRepo {
                 .transaction_with_config(TxConfig::serializable(), move |tx| {
                     Box::pin(async move {
                         let scope = AccessScope::allow_all();
+                        // Child rows inherit the parent session's owner pair
+                        // (the secure scope columns for `messages`). Derived
+                        // in-transaction so the denormalization can't drift.
+                        // @cpt-cf-chat-engine-interface-pep
+                        let (owner_tenant_id, owner_id) =
+                            session_owner_pair(tx, session_id).await?;
                         let user_variant_index =
                             compute_next_variant_index(tx, session_id, parent).await?;
 
                         let user_active = message_entity::ActiveModel {
                             message_id: Set(user_message_id),
                             session_id: Set(session_id),
-                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-                            owner_tenant_id: NotSet,
-                            owner_id: NotSet,
+                            owner_tenant_id: Set(owner_tenant_id),
+                            owner_id: Set(owner_id),
                             // Owning tenant (denormalized) + authoring user, both
                             // sourced from the JWT identity by the service layer.
                             tenant_id: Set(user_tenant),
@@ -259,9 +265,8 @@ impl MessageRepo for SeaMessageRepo {
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(assistant_message_id),
                             session_id: Set(session_id),
-                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-                            owner_tenant_id: NotSet,
-                            owner_id: NotSet,
+                            owner_tenant_id: Set(owner_tenant_id),
+                            owner_id: Set(owner_id),
                             // Inherits the owning tenant; assistant messages have
                             // no human author, so `user_id` stays NULL.
                             tenant_id: Set(assistant_tenant),
@@ -284,7 +289,15 @@ impl MessageRepo for SeaMessageRepo {
                             .await?;
                         // Persist the user message body as ordered parts; the
                         // assistant stub starts part-less until finalize.
-                        insert_message_parts(tx, &scope, user_message_id, &parts_attempt).await?;
+                        insert_message_parts(
+                            tx,
+                            &scope,
+                            user_message_id,
+                            &parts_attempt,
+                            owner_tenant_id,
+                            owner_id,
+                        )
+                        .await?;
                         MessageEntity::insert(assistant_active)
                             .secure()
                             .scope_unchecked(&scope)?
@@ -393,24 +406,58 @@ impl MessageRepo for SeaMessageRepo {
                         .await?;
 
                     if result.rows_affected == 1 {
-                        let part_id =
-                            append_text_part(tx, &scope, assistant_message_id, &text).await?;
+                        // Appended parts/citations inherit the assistant
+                        // message's owner pair (the `messages`/`message_parts`
+                        // secure scope columns). @cpt-cf-chat-engine-interface-pep
+                        let (owner_tenant_id, owner_id) =
+                            message_owner_pair(tx, assistant_message_id).await?;
+                        let part_id = append_text_part(
+                            tx,
+                            &scope,
+                            assistant_message_id,
+                            &text,
+                            owner_tenant_id,
+                            owner_id,
+                        )
+                        .await?;
                         // Attach the plugin's citations/references to the text
                         // part in the same transaction (FR-023).
-                        insert_part_citations(tx, &scope, part_id, &citations).await?;
+                        insert_part_citations(
+                            tx,
+                            &scope,
+                            part_id,
+                            &citations,
+                            owner_tenant_id,
+                            owner_id,
+                        )
+                        .await?;
                         // Append any parts streamed via `StreamingEvent::Part`
                         // (FR-024 Phase B), each with its own citations.
                         for part in &extra_parts {
-                            let extra_id =
-                                append_part(tx, &scope, assistant_message_id, part).await?;
+                            let extra_id = append_part(
+                                tx,
+                                &scope,
+                                assistant_message_id,
+                                part,
+                                owner_tenant_id,
+                                owner_id,
+                            )
+                            .await?;
                             let part_citations = PartCitations {
                                 file_citations: part.file_citations.clone(),
                                 link_citations: part.link_citations.clone(),
                                 references: part.references.clone(),
                             };
                             if !part_citations.is_empty() {
-                                insert_part_citations(tx, &scope, extra_id, &part_citations)
-                                    .await?;
+                                insert_part_citations(
+                                    tx,
+                                    &scope,
+                                    extra_id,
+                                    &part_citations,
+                                    owner_tenant_id,
+                                    owner_id,
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -657,6 +704,9 @@ impl MessageRepo for SeaMessageRepo {
             .transaction_with_config(TxConfig::serializable(), move |tx| {
                 Box::pin(async move {
                     let scope = AccessScope::allow_all();
+                    // Summary inherits the parent session's owner pair.
+                    // @cpt-cf-chat-engine-interface-pep
+                    let (owner_tenant_id, owner_id) = session_owner_pair(tx, session_id).await?;
                     // The summary is a new root (parent_message_id = NULL).
                     // `uq_messages_session_root_variant` forbids two roots in
                     // the same session sharing a variant_index, so it must take
@@ -666,9 +716,8 @@ impl MessageRepo for SeaMessageRepo {
                     let summary_active = message_entity::ActiveModel {
                         message_id: Set(summary_id),
                         session_id: Set(session_id),
-                        // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-                        owner_tenant_id: NotSet,
-                        owner_id: NotSet,
+                        owner_tenant_id: Set(owner_tenant_id),
+                        owner_id: Set(owner_id),
                         // Inherits the owning tenant; system-generated, no author.
                         tenant_id: Set(tenant_id),
                         user_id: Set(None),
@@ -689,7 +738,8 @@ impl MessageRepo for SeaMessageRepo {
                         .exec(tx)
                         .await?;
                     // The summary body is a single text part.
-                    append_text_part(tx, &scope, summary_id, &text).await?;
+                    append_text_part(tx, &scope, summary_id, &text, owner_tenant_id, owner_id)
+                        .await?;
                     if !summarized.is_empty() {
                         MessageEntity::update_many()
                             .secure()
@@ -807,15 +857,18 @@ impl MessageRepo for SeaMessageRepo {
                 .transaction_with_config(TxConfig::serializable(), move |tx| {
                     Box::pin(async move {
                         let scope = AccessScope::allow_all();
+                        // Variant sibling inherits the parent message's owner pair.
+                        // @cpt-cf-chat-engine-interface-pep
+                        let (owner_tenant_id, owner_id) =
+                            message_owner_pair(tx, parent_message_id).await?;
                         let new_variant_index =
                             compute_next_variant_index(tx, session_id, Some(parent_message_id))
                                 .await?;
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(new_message_id),
                             session_id: Set(session_id),
-                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-                            owner_tenant_id: NotSet,
-                            owner_id: NotSet,
+                            owner_tenant_id: Set(owner_tenant_id),
+                            owner_id: Set(owner_id),
                             // Inherits the owning tenant; recreated assistant
                             // variant has no human author.
                             tenant_id: Set(variant_tenant),
@@ -863,6 +916,181 @@ impl MessageRepo for SeaMessageRepo {
         }
         Err(retry_exhausted_conflict(last_err))
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 4 (PEP) — PDP-scoped surface. Owner filtering is carried by the
+    // PDP-derived scope via SecureORM `.scope_with`; the residual predicates
+    // are the session/message ids. @cpt-cf-chat-engine-interface-pep
+    // ---------------------------------------------------------------------
+
+    async fn fetch_active_history_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        depth: Option<u32>,
+    ) -> Result<Vec<Message>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let mut query = MessageEntity::find()
+            .order_by_asc(message_entity::Column::CreatedAt)
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::SessionId.eq(session_id))
+                    .add(message_entity::Column::IsActive.eq(true))
+                    .add(message_entity::Column::IsHiddenFromBackend.eq(false))
+                    .add(message_entity::Column::IsComplete.eq(true)),
+            );
+
+        if let Some(d) = depth {
+            query = query.limit(u64::from(d));
+        }
+
+        let rows = query.all(&conn).await?;
+        self.attach_parts(rows.into_iter().map(Message::from).collect())
+            .await
+    }
+
+    async fn find_message_by_id_scoped(
+        &self,
+        scope: &AccessScope,
+        message_id: Uuid,
+    ) -> Result<Option<Message>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let row = MessageEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(message_entity::Column::MessageId.eq(message_id)))
+            .one(&conn)
+            .await?;
+        match row {
+            Some(row) => Ok(self.attach_parts(vec![Message::from(row)]).await?.pop()),
+            None => Ok(None),
+        }
+    }
+
+    async fn find_message_in_session_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        message_id: Uuid,
+    ) -> Result<Option<Message>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let row = MessageEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(message_entity::Column::MessageId.eq(message_id))
+                    .add(message_entity::Column::SessionId.eq(session_id)),
+            )
+            .one(&conn)
+            .await?;
+        match row {
+            Some(row) => Ok(self.attach_parts(vec![Message::from(row)]).await?.pop()),
+            None => Ok(None),
+        }
+    }
+
+    async fn delete_message_subtree_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        root_id: Uuid,
+    ) -> Result<u64, ChatEngineError> {
+        let scope = scope.clone();
+        self.db
+            .transaction_with_config(TxConfig::serializable(), move |tx| {
+                Box::pin(async move {
+                    // Same leaves-first subtree walk as `delete_message_subtree`,
+                    // but every read/delete carries the PDP scope so a row
+                    // outside the caller's scope is neither traversed nor removed.
+                    let mut levels: Vec<Vec<Uuid>> = Vec::new();
+                    let mut frontier: Vec<Uuid> = vec![root_id];
+                    loop {
+                        let children: Vec<Uuid> = MessageEntity::find()
+                            .secure()
+                            .scope_with(&scope)
+                            .filter(
+                                Condition::all()
+                                    .add(message_entity::Column::SessionId.eq(session_id))
+                                    .add(
+                                        message_entity::Column::ParentMessageId
+                                            .is_in(frontier.clone()),
+                                    ),
+                            )
+                            .all(tx)
+                            .await?
+                            .into_iter()
+                            .map(|m| m.message_id)
+                            .collect();
+                        levels.push(frontier);
+                        if children.is_empty() {
+                            break;
+                        }
+                        frontier = children;
+                    }
+                    let mut removed: u64 = 0;
+                    for level in levels.into_iter().rev() {
+                        let res = MessageEntity::delete_many()
+                            .secure()
+                            .scope_with(&scope)
+                            .filter(
+                                Condition::all()
+                                    .add(message_entity::Column::SessionId.eq(session_id))
+                                    .add(message_entity::Column::MessageId.is_in(level)),
+                            )
+                            .exec(tx)
+                            .await?;
+                        removed += res.rows_affected;
+                    }
+                    Ok(removed)
+                })
+            })
+            .await
+    }
+}
+
+/// Fetch the owner pair `(owner_tenant_id, owner_id)` of a session inside the
+/// caller's transaction. Messages (and their parts/citations) denormalize the
+/// parent session's owner pair — the `messages` secure scope columns.
+async fn session_owner_pair<R>(
+    runner: &R,
+    session_id: Uuid,
+) -> Result<(Uuid, Uuid), ChatEngineError>
+where
+    R: DBRunner,
+{
+    let scope = AccessScope::allow_all();
+    let row = SessionEntity::find()
+        .secure()
+        .scope_with(&scope)
+        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+        .one(runner)
+        .await?
+        .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+    Ok((row.tenant_id, row.user_id))
+}
+
+/// Fetch the owner pair of an existing message inside the caller's transaction.
+/// Used when a child row (variant sibling, branch message, finalized part) must
+/// inherit an already-persisted message's owner pair.
+pub(crate) async fn message_owner_pair<R>(
+    runner: &R,
+    message_id: Uuid,
+) -> Result<(Uuid, Uuid), ChatEngineError>
+where
+    R: DBRunner,
+{
+    let scope = AccessScope::allow_all();
+    let row = MessageEntity::find()
+        .secure()
+        .scope_with(&scope)
+        .filter(Condition::all().add(message_entity::Column::MessageId.eq(message_id)))
+        .one(runner)
+        .await?
+        .ok_or_else(|| ChatEngineError::not_found("message", message_id))?;
+    Ok((row.owner_tenant_id, row.owner_id))
 }
 
 /// Reach into a `ChatEngineError` to recover the underlying `sea_orm::DbErr`
@@ -910,6 +1138,8 @@ pub(crate) async fn insert_message_parts<R>(
     scope: &AccessScope,
     message_id: Uuid,
     parts: &[MessagePartInput],
+    owner_tenant_id: Uuid,
+    owner_id: Uuid,
 ) -> Result<(), ChatEngineError>
 where
     R: DBRunner,
@@ -918,9 +1148,9 @@ where
         let am = message_part_entity::ActiveModel {
             id: Set(Uuid::new_v4()),
             message_id: Set(message_id),
-            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-            owner_tenant_id: NotSet,
-            owner_id: NotSet,
+            // Inherits the owning message's owner pair (message_parts scope cols).
+            owner_tenant_id: Set(owner_tenant_id),
+            owner_id: Set(owner_id),
             r#type: Set(part_type_to_entity(&part.part_type)),
             content: Set(part.content.clone()),
             number: Set(i32::try_from(idx).unwrap_or(i32::MAX)),
@@ -943,6 +1173,8 @@ async fn append_text_part<R>(
     scope: &AccessScope,
     message_id: Uuid,
     text: &str,
+    owner_tenant_id: Uuid,
+    owner_id: Uuid,
 ) -> Result<Uuid, ChatEngineError>
 where
     R: DBRunner,
@@ -952,9 +1184,9 @@ where
     let am = message_part_entity::ActiveModel {
         id: Set(part_id),
         message_id: Set(message_id),
-        // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-        owner_tenant_id: NotSet,
-        owner_id: NotSet,
+        // Inherits the owning message's owner pair.
+        owner_tenant_id: Set(owner_tenant_id),
+        owner_id: Set(owner_id),
         r#type: Set(message_part_entity::MessagePartType::Text),
         content: Set(text_part_content(text)),
         number: Set(number),
@@ -976,6 +1208,8 @@ async fn append_part<R>(
     scope: &AccessScope,
     message_id: Uuid,
     part: &MessagePartInput,
+    owner_tenant_id: Uuid,
+    owner_id: Uuid,
 ) -> Result<Uuid, ChatEngineError>
 where
     R: DBRunner,
@@ -985,9 +1219,9 @@ where
     let am = message_part_entity::ActiveModel {
         id: Set(part_id),
         message_id: Set(message_id),
-        // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-        owner_tenant_id: NotSet,
-        owner_id: NotSet,
+        // Inherits the owning message's owner pair.
+        owner_tenant_id: Set(owner_tenant_id),
+        owner_id: Set(owner_id),
         r#type: Set(part_type_to_entity(&part.part_type)),
         content: Set(part.content.clone()),
         number: Set(number),
@@ -1008,6 +1242,8 @@ async fn insert_part_citations<R>(
     scope: &AccessScope,
     part_id: Uuid,
     citations: &PartCitations,
+    owner_tenant_id: Uuid,
+    owner_id: Uuid,
 ) -> Result<(), ChatEngineError>
 where
     R: DBRunner,
@@ -1016,9 +1252,9 @@ where
         let am = file_citation_entity::ActiveModel {
             id: Set(Uuid::new_v4()),
             message_part_id: Set(part_id),
-            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-            owner_tenant_id: NotSet,
-            owner_id: NotSet,
+            // Inherits the owning part's owner pair.
+            owner_tenant_id: Set(owner_tenant_id),
+            owner_id: Set(owner_id),
             content: Set(serde_json::to_value(c).unwrap_or(JsonValue::Null)),
             number: Set(i32::try_from(idx).unwrap_or(i32::MAX)),
         };
@@ -1032,9 +1268,9 @@ where
         let am = link_citation_entity::ActiveModel {
             id: Set(Uuid::new_v4()),
             message_part_id: Set(part_id),
-            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-            owner_tenant_id: NotSet,
-            owner_id: NotSet,
+            // Inherits the owning part's owner pair.
+            owner_tenant_id: Set(owner_tenant_id),
+            owner_id: Set(owner_id),
             content: Set(serde_json::to_value(c).unwrap_or(JsonValue::Null)),
             number: Set(i32::try_from(idx).unwrap_or(i32::MAX)),
         };
@@ -1048,9 +1284,9 @@ where
         let am = link_reference_entity::ActiveModel {
             id: Set(Uuid::new_v4()),
             message_part_id: Set(part_id),
-            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-            owner_tenant_id: NotSet,
-            owner_id: NotSet,
+            // Inherits the owning part's owner pair.
+            owner_tenant_id: Set(owner_tenant_id),
+            owner_id: Set(owner_id),
             content: Set(serde_json::to_value(r).unwrap_or(JsonValue::Null)),
             number: Set(i32::try_from(idx).unwrap_or(i32::MAX)),
         };
