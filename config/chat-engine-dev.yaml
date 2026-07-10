@@ -8,7 +8,7 @@ database:
       # (same convention as config/server.yaml). No machine-specific path.
       dsn: "sqlite://chat_engine.db?mode=rwc"
 
-modules:
+gears:
   api-gateway:
     config:
       bind_addr: "127.0.0.1:8087"
