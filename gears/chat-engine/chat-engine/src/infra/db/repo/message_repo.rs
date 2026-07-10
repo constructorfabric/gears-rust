@@ -47,6 +47,7 @@ use toolkit_db::secure::{
 };
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 use crate::domain::message::Message;
 use crate::domain::ports::{
@@ -71,9 +72,9 @@ use crate::infra::db::{
 ///
 /// Holds the toolkit-db `DBProvider` so every query runs against the same
 /// connection the migration runner used. `messages` is marked
-/// `#[secure(unrestricted)]`; the secure wrappers run with
-/// `AccessScope::allow_all()` and exist to expose a `&impl DBRunner`
-/// execution path.
+/// `#[secure(unrestricted)]`; the secure wrappers run with a named bypass
+/// scope from [`crate::domain::authz::bypass`] and exist to expose a
+/// `&impl DBRunner` execution path.
 pub struct SeaMessageRepo {
     db: Arc<ChatEngineDb>,
 }
@@ -95,7 +96,9 @@ impl SeaMessageRepo {
         }
         let ids: Vec<Uuid> = msgs.iter().map(|m| m.message_id).collect();
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let rows = MessagePartEntity::find()
             .order_by_asc(message_part_entity::Column::MessageId)
             .order_by_asc(message_part_entity::Column::Number)
@@ -130,7 +133,9 @@ impl SeaMessageRepo {
         }
         let ids: Vec<Uuid> = parts.iter().map(|p| p.id).collect();
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
 
         let file_rows = file_citation_entity::Entity::find()
             .order_by_asc(file_citation_entity::Column::Number)
@@ -232,7 +237,9 @@ impl MessageRepo for SeaMessageRepo {
                 .db
                 .transaction_with_config(TxConfig::serializable(), move |tx| {
                     Box::pin(async move {
-                        let scope = AccessScope::allow_all();
+                        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+                        // @cpt-cf-chat-engine-design-authz-bypass-registry
+                        let scope = bypass::unrestricted_table_scope();
                         // Child rows inherit the parent session's owner pair
                         // (the secure scope columns for `messages`). Derived
                         // in-transaction so the denormalization can't drift.
@@ -389,7 +396,9 @@ impl MessageRepo for SeaMessageRepo {
             .db
             .transaction(move |tx| {
                 Box::pin(async move {
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: pipeline write; owner inherited from parent in same txn
+                    // @cpt-cf-chat-engine-seq-authz-internal-write
+                    let scope = bypass::internal_write_scope();
                     let result = MessageEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -482,7 +491,9 @@ impl MessageRepo for SeaMessageRepo {
         depth: Option<u32>,
     ) -> Result<Vec<Message>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let mut query = MessageEntity::find()
             .order_by_asc(message_entity::Column::CreatedAt)
             .secure()
@@ -510,7 +521,9 @@ impl MessageRepo for SeaMessageRepo {
         message_id: Uuid,
     ) -> Result<Option<Message>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = MessageEntity::find()
             .secure()
             .scope_with(&scope)
@@ -532,7 +545,9 @@ impl MessageRepo for SeaMessageRepo {
         message_id: Uuid,
     ) -> Result<Option<Message>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = MessageEntity::find()
             .secure()
             .scope_with(&scope)
@@ -547,7 +562,9 @@ impl MessageRepo for SeaMessageRepo {
 
     async fn list_active_path(&self, session_id: Uuid) -> Result<Vec<Message>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         // Active-path traversal per the Phase 6 contract: `is_active=true`
         // siblings only, `created_at ASC`. We also require `is_complete=true`
         // so an in-flight assistant stub does not leak into history. Notably
@@ -575,7 +592,9 @@ impl MessageRepo for SeaMessageRepo {
         session_id: Uuid,
     ) -> Result<Vec<Message>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let rows = MessageEntity::find()
             .order_by_asc(message_entity::Column::CreatedAt)
             .secure()
@@ -597,7 +616,9 @@ impl MessageRepo for SeaMessageRepo {
         older_than: OffsetDateTime,
     ) -> Result<Vec<Message>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let rows = MessageEntity::find()
             .order_by_asc(message_entity::Column::CreatedAt)
             .secure()
@@ -616,7 +637,9 @@ impl MessageRepo for SeaMessageRepo {
 
     async fn count_non_root_messages(&self, session_id: Uuid) -> Result<u64, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let n = MessageEntity::find()
             .secure()
             .scope_with(&scope)
@@ -645,7 +668,9 @@ impl MessageRepo for SeaMessageRepo {
         // [`crate::config::ChatEngineConfig::retention_max_deletes_per_session`]
         // so the per-call cap is small (default 100).
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let rows = MessageEntity::find()
             .order_by_asc(message_entity::Column::CreatedAt)
             .secure()
@@ -671,7 +696,9 @@ impl MessageRepo for SeaMessageRepo {
             return Ok(Vec::new());
         }
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let rows = MessageEntity::find()
             .order_by_asc(message_entity::Column::CreatedAt)
             .secure()
@@ -703,7 +730,9 @@ impl MessageRepo for SeaMessageRepo {
         self.db
             .transaction_with_config(TxConfig::serializable(), move |tx| {
                 Box::pin(async move {
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: pipeline write; owner inherited from parent in same txn
+                    // @cpt-cf-chat-engine-seq-authz-internal-write
+                    let scope = bypass::internal_write_scope();
                     // Summary inherits the parent session's owner pair.
                     // @cpt-cf-chat-engine-interface-pep
                     let (owner_tenant_id, owner_id) = session_owner_pair(tx, session_id).await?;
@@ -777,7 +806,9 @@ impl MessageRepo for SeaMessageRepo {
         self.db
             .transaction_with_config(TxConfig::serializable(), move |tx| {
                 Box::pin(async move {
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     // Collect the subtree breadth-first, one
                     // `is_in(frontier)` query per tree level instead of one
                     // `find` per node (mirrors
@@ -856,7 +887,9 @@ impl MessageRepo for SeaMessageRepo {
                 .db
                 .transaction_with_config(TxConfig::serializable(), move |tx| {
                     Box::pin(async move {
-                        let scope = AccessScope::allow_all();
+                        // AUTHZ-BYPASS: pipeline write; owner inherited from parent in same txn
+                        // @cpt-cf-chat-engine-seq-authz-internal-write
+                        let scope = bypass::internal_write_scope();
                         // Variant sibling inherits the parent message's owner pair.
                         // @cpt-cf-chat-engine-interface-pep
                         let (owner_tenant_id, owner_id) =
@@ -1061,7 +1094,9 @@ async fn session_owner_pair<R>(
 where
     R: DBRunner,
 {
-    let scope = AccessScope::allow_all();
+    // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+    // @cpt-cf-chat-engine-design-authz-bypass-registry
+    let scope = bypass::unrestricted_table_scope();
     let row = SessionEntity::find()
         .secure()
         .scope_with(&scope)
@@ -1082,7 +1117,9 @@ pub(crate) async fn message_owner_pair<R>(
 where
     R: DBRunner,
 {
-    let scope = AccessScope::allow_all();
+    // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+    // @cpt-cf-chat-engine-design-authz-bypass-registry
+    let scope = bypass::unrestricted_table_scope();
     let row = MessageEntity::find()
         .secure()
         .scope_with(&scope)
