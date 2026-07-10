@@ -31,7 +31,6 @@ use uuid::Uuid;
 
 use toolkit_security::SecurityContext;
 
-use crate::api::rest::handlers::sessions::identity_from_ctx;
 use crate::domain::error::Result;
 use crate::domain::search::{SearchPage, SearchQuery};
 use crate::domain::service::search_service::SearchService;
@@ -56,11 +55,10 @@ pub async fn get_search_session(
     Path(session_id): Path<Uuid>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchPage>> {
-    let identity = identity_from_ctx(&ctx)?;
     let q_len = query.q.as_deref().map(|s| s.chars().count()).unwrap_or(0);
     tracing::Span::current().record("query_length", q_len);
 
-    let page = svc.search_in_session(&identity, session_id, &query).await?;
+    let page = svc.search_in_session(&ctx, session_id, &query).await?;
     tracing::Span::current().record("result_count", page.items.len());
     Ok(Json(page))
 }
@@ -83,11 +81,10 @@ pub async fn get_search(
     Extension(svc): Extension<Arc<SearchService>>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchPage>> {
-    let identity = identity_from_ctx(&ctx)?;
     let q_len = query.q.as_deref().map(|s| s.chars().count()).unwrap_or(0);
     tracing::Span::current().record("query_length", q_len);
 
-    let page = svc.search_across_sessions(&identity, &query).await?;
+    let page = svc.search_across_sessions(&ctx, &query).await?;
     tracing::Span::current().record("result_count", page.items.len());
     Ok(Json(page))
 }

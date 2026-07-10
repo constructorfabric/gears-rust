@@ -260,14 +260,13 @@ pub async fn search_in_session(
     Path(session_id): Path<Uuid>,
     Json(body): Json<SearchRequestDto>,
 ) -> Result<Json<SearchResultsDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let query = SearchQuery {
         q: Some(body.query),
         top: body.limit,
         skip: body.offset,
         ..Default::default()
     };
-    let page = svc.search_in_session(&identity, session_id, &query).await?;
+    let page = svc.search_in_session(&ctx, session_id, &query).await?;
     let results: Vec<serde_json::Value> = page
         .items
         .into_iter()
@@ -283,14 +282,13 @@ pub async fn search_across_sessions(
     Extension(svc): Extension<Arc<SearchService>>,
     Json(body): Json<SearchRequestDto>,
 ) -> Result<Json<SearchResultsDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let query = SearchQuery {
         q: Some(body.query),
         top: body.limit,
         skip: body.offset,
         ..Default::default()
     };
-    let page = svc.search_across_sessions(&identity, &query).await?;
+    let page = svc.search_across_sessions(&ctx, &query).await?;
     let results: Vec<serde_json::Value> = page
         .items
         .into_iter()
