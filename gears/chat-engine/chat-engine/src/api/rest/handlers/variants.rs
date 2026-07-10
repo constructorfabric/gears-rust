@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use toolkit_security::SecurityContext;
 
-use crate::api::rest::handlers::sessions::{identity_from_ctx, reject_body_identity};
+use crate::api::rest::handlers::sessions::reject_body_identity;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::service::variant_service::{VariantEntry, VariantListing, VariantService};
 
@@ -172,12 +172,11 @@ pub async fn recreate_variant(
     Json(body): Json<RecreateBody>,
 ) -> Result<Response> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    let identity = identity_from_ctx(&ctx)?;
 
     let cancel = CancellationToken::new();
     let stream = svc
         .recreate_variant(
-            &identity,
+            &ctx,
             session_id,
             message_id,
             body.enabled_capabilities,
@@ -203,12 +202,11 @@ pub async fn branch_message(
     Json(body): Json<BranchBody>,
 ) -> Result<Response> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    let identity = identity_from_ctx(&ctx)?;
 
     let cancel = CancellationToken::new();
     let stream = svc
         .branch_message(
-            &identity,
+            &ctx,
             session_id,
             message_id,
             body.parts,
@@ -231,8 +229,7 @@ pub async fn list_variants(
     Extension(svc): Extension<Arc<VariantService>>,
     Path((session_id, message_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ListVariantsResponse>> {
-    let identity = identity_from_ctx(&ctx)?;
-    let listing = svc.list_variants(&identity, session_id, message_id).await?;
+    let listing = svc.list_variants(&ctx, session_id, message_id).await?;
     Ok(Json(listing.into()))
 }
 
@@ -248,9 +245,8 @@ pub async fn set_active_variant(
     Json(body): Json<ActiveVariantBody>,
 ) -> Result<Json<VariantInfo>> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    let identity = identity_from_ctx(&ctx)?;
     let entry = svc
-        .set_active_variant(&identity, session_id, body.message_id)
+        .set_active_variant(&ctx, session_id, body.message_id)
         .await?;
     Ok(Json(entry.info))
 }
@@ -270,10 +266,9 @@ pub async fn set_active_variant_compat(
     Json(body): Json<ActiveVariantCompatBody>,
 ) -> Result<Json<VariantInfo>> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    let identity = identity_from_ctx(&ctx)?;
 
     // Look up siblings + locate the entry at the requested variant_index.
-    let listing = svc.list_variants(&identity, session_id, message_id).await?;
+    let listing = svc.list_variants(&ctx, session_id, message_id).await?;
     let target = listing
         .variants
         .into_iter()
@@ -285,7 +280,7 @@ pub async fn set_active_variant_compat(
             )
         })?;
     let entry = svc
-        .set_active_variant(&identity, session_id, target.message.message_id)
+        .set_active_variant(&ctx, session_id, target.message.message_id)
         .await?;
     Ok(Json(entry.info))
 }
@@ -302,9 +297,8 @@ pub async fn switch_session_type(
     Json(body): Json<SwitchSessionTypeBody>,
 ) -> Result<Json<chat_engine_sdk::models::Session>> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    let identity = identity_from_ctx(&ctx)?;
     let session = svc
-        .switch_session_type(&identity, session_id, body.session_type_id)
+        .switch_session_type(&ctx, session_id, body.session_type_id)
         .await?;
     Ok(Json(session))
 }
