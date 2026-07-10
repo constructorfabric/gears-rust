@@ -1,6 +1,6 @@
 ---
 title: Errors & the type system
-description: The canonical error model (RFC-9457) and the Global Type System (GTS).
+description: The canonical error model (RFC-9457) and the Global Type System.
 sidebar:
   label: Errors & types
   order: 5
@@ -37,12 +37,12 @@ impl From<DomainError> for CanonicalError {
 ```
 
 A single `From<CanonicalError> for Problem` at the REST layer handles all 16 categories, so
-gears never hand-roll a wire format. The error type carries a GTS identifier (below), which
+gears never hand-roll a wire format. The error type carries a [GTS](https://github.com/GlobalTypeSystem/gts-rust) identifier (below), which
 makes errors routable and lets clients branch on a stable machine code rather than a string.
 
-## The Global Type System (GTS)
+## The [Global Type System (GTS)](https://github.com/GlobalTypeSystem/gts-rust)
 
-GTS gives the platform a **versioned, schema-validated type identity** for domain objects.
+[GTS](https://github.com/GlobalTypeSystem/gts-rust) gives the platform a **versioned, schema-validated type identity** for domain objects.
 A GTS identifier looks like:
 
 ```text
@@ -50,11 +50,11 @@ gts.<vendor>.<package>.<namespace>.<type>.v<MAJOR>[.<MINOR>]~
 ```
 
 New data types — event formats, document schemas, permission types, custom attributes — can
-be introduced by registering new GTS instances, **without modifying existing endpoints or
+be introduced by registering new [GTS](https://github.com/GlobalTypeSystem/gts-rust) instances, **without modifying existing endpoints or
 storage**. In Rust, schemas are derived from source types and registered in the Types
 Registry (the same way OpenAPI is generated from route metadata), so the catalog of types
 stays in sync with the code by construction.
 
 This is the mechanism behind extensibility: error identities, plugin contracts, and
-domain-object schemas are all GTS-typed, which is what lets vendors extend the domain model
+domain-object schemas are all [GTS](https://github.com/GlobalTypeSystem/gts-rust)-typed, which is what lets vendors extend the domain model
 without forking the framework.

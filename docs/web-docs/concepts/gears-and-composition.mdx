@@ -18,7 +18,7 @@ A **gear** is a vertically-sliced, self-contained capability. Each gear:
 - **is discovered at link time** and initialized in dependency order by the runtime;
 - **composes** with other gears through the typed `ClientHub` (in-process) or gRPC
   (out-of-process), behind the same SDK trait;
-- **is extensible** through plugins and the Global Type System.
+- **is extensible** through plugins and the [Global Type System](https://github.com/GlobalTypeSystem/gts-rust).
 
 ## The three-tier hierarchy
 
@@ -101,7 +101,7 @@ Whether the registered implementation is a local adapter (single process) or a g
 
 ### Plugins & providers
 
-Some gears accept multiple implementations of an interface keyed by scope (typically a GTS
+Some gears accept multiple implementations of an interface keyed by scope (typically a [GTS](https://github.com/GlobalTypeSystem/gts-rust)
 instance id) — for example authentication or authorization providers. The main gear selects
 a plugin at runtime; the plugin registers a **scoped** client in `ClientHub`. A "backend" is
 simply one of the implementations behind a facade trait.

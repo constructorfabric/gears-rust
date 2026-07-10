@@ -19,7 +19,7 @@ areas; read them in order, or jump to what you need.
   data path: `SecurityContext`, PDP/PEP authorization, `AccessScope`, `SecureConn`, and the
   tenant tree.
 - **[Errors & the type system](./errors-and-types/)** — the canonical error model
-  (RFC-9457) and the Global Type System (GTS).
+  (RFC-9457) and the [Global Type System (GTS)](https://github.com/GlobalTypeSystem/gts-rust).
 
 When you're ready to apply them, the [first-gear walkthrough](../get-started/your-first-gear/)
 ties everything together against real code, and the [Guides](../guides/) go deep on individual
