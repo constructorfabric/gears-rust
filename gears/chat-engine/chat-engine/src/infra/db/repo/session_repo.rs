@@ -37,6 +37,7 @@ use toolkit_db::secure::{
 use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 use crate::domain::ports::{NewSession, SessionRepo};
 use crate::domain::session::{LifecycleState, Session};
@@ -93,7 +94,9 @@ impl SeaSessionRepo {
         user_id: &str,
         session_id: Uuid,
     ) -> Result<Session, ChatEngineError> {
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -151,7 +154,9 @@ impl SessionRepo for SeaSessionRepo {
             updated_at: Set(new.updated_at),
         };
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let inserted = SessionEntity::insert(model)
             .secure()
             .scope_unchecked(&scope)?
@@ -167,7 +172,9 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
     ) -> Result<Option<OffsetDateTime>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -184,7 +191,9 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
     ) -> Result<Option<Session>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -204,7 +213,9 @@ impl SessionRepo for SeaSessionRepo {
         query: &ODataQuery,
     ) -> Result<Page<Session>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
 
         // Tenant / user scoping and the hard-delete exclusion come from the
         // caller's identity, never from the OData `$filter`, so they live in
@@ -267,7 +278,9 @@ impl SessionRepo for SeaSessionRepo {
                 Box::pin(async move {
                     let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
                     let now = OffsetDateTime::now_utc();
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -299,7 +312,9 @@ impl SessionRepo for SeaSessionRepo {
                 Box::pin(async move {
                     let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
                     let now = OffsetDateTime::now_utc();
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -333,7 +348,9 @@ impl SessionRepo for SeaSessionRepo {
                 Box::pin(async move {
                     let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
                     let now = OffsetDateTime::now_utc();
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     let mut update = SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -379,7 +396,9 @@ impl SessionRepo for SeaSessionRepo {
                     let now = OffsetDateTime::now_utc();
                     let grace = retention_days.max(0);
                     let scheduled = now + Duration::from_secs((grace as u64) * 86_400);
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -417,7 +436,9 @@ impl SessionRepo for SeaSessionRepo {
         self.db
             .transaction_with_config(TxConfig::serializable(), move |tx| {
                 Box::pin(async move {
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     // Re-load inside the transaction to make sure the
                     // ownership/lifecycle check sees the same snapshot as
                     // the cascade deletes.
@@ -522,7 +543,9 @@ impl SessionRepo for SeaSessionRepo {
         limit: u32,
     ) -> Result<Vec<Session>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: system op; not HTTP-exposed
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::system_read_scope();
         let mut filter = Condition::all()
             .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
             .add(
@@ -557,7 +580,9 @@ impl SessionRepo for SeaSessionRepo {
         // already polls regularly. Once `SecureSelect::into_tuple` exists
         // this collapses back to a one-shot `DISTINCT` scan.
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: system op; not HTTP-exposed
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::system_read_scope();
         let rows = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -581,7 +606,9 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
     ) -> Result<Option<Session>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: system op; not HTTP-exposed
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::system_read_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -601,7 +628,9 @@ impl SessionRepo for SeaSessionRepo {
         // single equality lookup — keep the query verbatim so EXPLAIN
         // selects the index per ADR-0016.
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: capability-URL read; token is the grant; 404 on miss/revoked
+        // @cpt-cf-chat-engine-seq-authz-shared-read
+        let scope = bypass::capability_read_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -630,7 +659,9 @@ impl SessionRepo for SeaSessionRepo {
                 Box::pin(async move {
                     let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
                     let now = OffsetDateTime::now_utc();
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
