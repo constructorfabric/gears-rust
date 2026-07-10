@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use toolkit_security::SecurityContext;
 
-use crate::api::rest::handlers::sessions::{identity_from_ctx, reject_body_identity};
+use crate::api::rest::handlers::sessions::reject_body_identity;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::service::session_service::{RegisterSessionTypeRequest, SessionService};
 
@@ -57,10 +57,9 @@ pub async fn register_session_type(
             "`name` is required for session-type registration",
         ));
     }
-    let identity = identity_from_ctx(&ctx)?;
     let session_type = svc
         .register_session_type(
-            &identity,
+            &ctx,
             RegisterSessionTypeRequest {
                 name: body.name,
                 plugin_instance_id: body.plugin_instance_id,
@@ -76,8 +75,7 @@ pub async fn list_session_types(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<SessionService>>,
 ) -> Result<Json<Vec<chat_engine_sdk::models::SessionType>>> {
-    let identity = identity_from_ctx(&ctx)?;
-    let types = svc.list_session_types(&identity).await?;
+    let types = svc.list_session_types(&ctx).await?;
     Ok(Json(types))
 }
 
@@ -87,7 +85,6 @@ pub async fn get_session_type(
     Extension(svc): Extension<Arc<SessionService>>,
     Path(session_type_id): Path<Uuid>,
 ) -> Result<Json<chat_engine_sdk::models::SessionType>> {
-    let identity = identity_from_ctx(&ctx)?;
-    let session_type = svc.get_session_type(&identity, session_type_id).await?;
+    let session_type = svc.get_session_type(&ctx, session_type_id).await?;
     Ok(Json(session_type))
 }

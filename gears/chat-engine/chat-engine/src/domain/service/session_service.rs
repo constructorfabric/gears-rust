@@ -188,9 +188,27 @@ impl SessionService {
 
     pub async fn register_session_type(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         req: RegisterSessionTypeRequest,
     ) -> Result<SessionType> {
+        // @cpt-cf-chat-engine-design-auth-model
+        // session_type mutation is a PDP permission decision, not a SQL scope:
+        // `session_types` is a global unrestricted table (DESIGN §3.5.6). The
+        // returned scope is discarded — this is a pure allow/deny gate.
+        // Denied / unreachable / uncompilable PDP → 403 (fail-closed).
+        self.enforcer
+            .access_scope_with(
+                ctx,
+                &resource_types::SESSION_TYPE,
+                actions::CREATE,
+                None,
+                &AccessRequest::new().require_constraints(false),
+            )
+            .await?;
+
+        // Opaque tenant/user strings for the plugin call context below.
+        let identity = identity_from_ctx(ctx)?;
+
         if req.name.trim().is_empty() {
             return Err(ChatEngineError::bad_request(
                 "session-type name must not be empty",
@@ -292,13 +310,15 @@ impl SessionService {
         Ok(inserted)
     }
 
-    pub async fn list_session_types(&self, _identity: &Identity) -> Result<Vec<SessionType>> {
+    // session_type reads are `.authenticated()`-only — no PDP call (DESIGN §3.5.6).
+    pub async fn list_session_types(&self, _ctx: &SecurityContext) -> Result<Vec<SessionType>> {
         self.session_types.list().await
     }
 
+    // session_type reads are `.authenticated()`-only — no PDP call (DESIGN §3.5.6).
     pub async fn get_session_type(
         &self,
-        _identity: &Identity,
+        _ctx: &SecurityContext,
         session_type_id: Uuid,
     ) -> Result<SessionType> {
         let row = self

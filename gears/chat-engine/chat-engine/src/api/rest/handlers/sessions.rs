@@ -38,7 +38,7 @@ use toolkit_security::SecurityContext;
 
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::service::session_service::{
-    CreateSessionRequest, Identity, SessionDeleteOutcome, SessionService,
+    CreateSessionRequest, SessionDeleteOutcome, SessionService,
 };
 
 /// Body for `POST /sessions`.
@@ -186,22 +186,6 @@ pub async fn restore_session(
 // ---------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------
-
-/// Build a service [`Identity`] from the JWT-derived [`SecurityContext`].
-/// Tenant + user are extracted from the token only — never from the request
-/// body. Anonymous / unauthenticated contexts are rejected with a
-/// `Forbidden` error (mapped to HTTP 403; Phase 14 will refine to 401 for
-/// missing-token vs 403 for missing-claims).
-pub(crate) fn identity_from_ctx(ctx: &SecurityContext) -> Result<Identity> {
-    let tenant = ctx.subject_tenant_id();
-    let user = ctx.subject_id();
-    if tenant.is_nil() || user.is_nil() {
-        return Err(ChatEngineError::forbidden(
-            "authenticated identity required (tenant_id and user_id must be present in the bearer token)",
-        ));
-    }
-    Identity::new(tenant.to_string(), user.to_string(), None)
-}
 
 /// Reject any client attempt to populate `tenant_id` or `user_id` in the
 /// request body — those values are server-side-only (per PRD §7, anti-
