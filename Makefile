@@ -161,25 +161,7 @@ setup: .setup-stamp
 	@echo "Setup complete. All tools installed."
 	@touch .setup-stamp
 
-# -------- Code formatting --------
-
-.PHONY: fmt
-
-# Check code formatting
-fmt:
-	$(call check_rustup_component,rustfmt)
-	cargo fmt --all --check
-	cargo fmt --all --check --manifest-path tools/dylint_lints/Cargo.toml
-
-# -------- Gear naming validation --------
-
-.PHONY: validate-gear-names
-
-## Validate gear folder names follow kebab-case convention
-validate-gear-names:
-	@$(PYTHON) tools/scripts/validate_gear_names.py
-
-# -------- Code safety checks --------
+# -------- Checks --------
 #
 # Tool Comparison - What Each Tool Checks:
 # +-------------+----------------------------------------------------------------------+
@@ -222,7 +204,13 @@ validate-gear-names:
 # |             | - Use 'make dylint-list' to see all available custom lints           |
 # +-------------+----------------------------------------------------------------------+
 
-.PHONY: clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage
+.PHONY: fmt clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage
+
+# Check code formatting
+fmt:
+	$(call check_rustup_component,rustfmt)
+	cargo fmt --all --check
+	cargo fmt --all --check --manifest-path tools/dylint_lints/Cargo.toml
 
 CFS ?= cfs
 CFS_PIPX_SPEC ?= git+https://github.com/constructorfabric/studio.git
@@ -299,6 +287,16 @@ lychee:
 	$(call check_tool,lychee)
 	lychee --exclude-path 'docs/web-docs' docs examples tools/dylint_lints guidelines
 
+## Validate internal links in web-docs.
+# The web-docs pages use Starlight route-relative links (e.g. ../foo/) that only
+# resolve against the *built* site, not the markdown source — so we build the
+# docs site with the local content and run lychee over the generated HTML.
+WEB_DOCS_CACHE ?= .web-docs-preview
+lychee-web-docs:
+	$(call check_tool,lychee)
+	@bash tools/scripts/docs-preview.sh build
+	lychee --offline --root-dir '$(abspath $(WEB_DOCS_CACHE)/dist)' --exclude 'i18n' '$(WEB_DOCS_CACHE)/dist/**/*.html'
+
 # Preview the documentation website with local docs/web-docs content.
 # Clones the web docs site into .web-docs-preview/ and serves it at localhost:4321.
 docs-preview:
@@ -367,6 +365,14 @@ shear:
 # Run all code safety checks
 safety: clippy kani lint dylint # geiger
 	@echo "OK. Rust Safety Pipeline complete"
+
+# -------- Gear naming validation --------
+
+.PHONY:
+
+## Validate gear folder names follow kebab-case convention
+validate-gear-names:
+	@$(PYTHON) tools/scripts/validate_gear_names.py
 
 # -------- Code security checks --------
 

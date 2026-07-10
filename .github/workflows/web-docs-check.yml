@@ -1,0 +1,42 @@
+name: Web Docs Check
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'docs/web-docs/**'
+      - 'tools/scripts/docs-preview.sh'
+      - 'Makefile'
+      - '.github/workflows/web-docs-check.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: web-docs-check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  web_docs_check:
+    name: Check Web Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          clean: 'true'
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.0'
+
+      - name: Install lychee
+        uses: taiki-e/install-action@30eab0fabba9ea3f522099957e668b21876aa39e # v2.66.6
+        with:
+          tool: lychee
+
+      - name: Check web docs links
+        run: make lychee-web-docs
