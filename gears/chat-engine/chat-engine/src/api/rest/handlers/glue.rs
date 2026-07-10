@@ -207,7 +207,6 @@ pub async fn set_reaction(
     Path(message_id): Path<Uuid>,
     Json(body): Json<ReactionRequestDto>,
 ) -> Result<Json<ReactionListDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let reaction_type = ReactionType::from_str_value(&body.kind).ok_or_else(|| {
         ChatEngineError::bad_request(format!("unknown reaction kind: {}", body.kind))
     })?;
@@ -217,14 +216,14 @@ pub async fn set_reaction(
         .session_id;
 
     let (_response, mutation) = reactions
-        .set_reaction(&identity, session_id, message_id, reaction_type)
+        .set_reaction(&ctx, session_id, message_id, reaction_type)
         .await?;
     // Notify the backend plugin out-of-band; the detached task logs failures
     // and never blocks the HTTP response (see `spawn_plugin_notification`).
     drop(reactions.spawn_plugin_notification(mutation));
 
     let listing = reactions
-        .list_reactions(&identity, session_id, message_id)
+        .list_reactions(&ctx, session_id, message_id)
         .await?;
     Ok(Json(ReactionListDto {
         reactions: listing

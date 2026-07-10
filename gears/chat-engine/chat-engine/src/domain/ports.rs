@@ -428,6 +428,21 @@ pub trait ReactionRepo: Send + Sync {
         &self,
         message_id: Uuid,
     ) -> Result<Vec<MessageReaction>, ChatEngineError>;
+
+    /// Phase 4 (PEP). Enumerate reactions on a message under a PDP-derived
+    /// scope (applied via SecureORM). Default impl fails closed so unrelated
+    /// mocks compile.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn list_by_message_scoped(
+        &self,
+        scope: &AccessScope,
+        message_id: Uuid,
+    ) -> Result<Vec<MessageReaction>, ChatEngineError> {
+        let _ = (scope, message_id);
+        Err(ChatEngineError::internal(
+            "list_by_message_scoped not implemented for this repository",
+        ))
+    }
 }
 
 // ===========================================================================

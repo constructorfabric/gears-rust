@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ActiveValue::{NotSet, Set}, ColumnTrait, Condition, EntityTrait};
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
     AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, TxConfig,
@@ -40,6 +40,7 @@ use crate::domain::reaction::{MessageReaction, ReactionType};
 use crate::infra::db::entity::message_reaction::{
     self as reaction_entity, Column as ReactionColumn, Entity as ReactionEntity,
 };
+use crate::infra::db::repo::message_repo::message_owner_pair;
 use crate::infra::db::repo::ChatEngineDb;
 
 /// Sea-ORM-backed implementation of [`ReactionRepo`].
@@ -117,12 +118,17 @@ impl ReactionRepo for SeaReactionRepo {
                                 .one(tx)
                                 .await?;
 
+                        // The reaction inherits the reacted-to message's owner
+                        // pair (the message_reactions secure scope columns).
+                        // @cpt-cf-chat-engine-interface-pep
+                        let (owner_tenant_id, owner_id) =
+                            message_owner_pair(tx, message_id).await?;
+
                         let am = reaction_entity::ActiveModel {
                             message_id: Set(message_id),
                             user_id: Set(user_id_owned),
-                            // TODO Phase 3: populate owner_tenant_id/owner_id from SecurityContext
-                            owner_tenant_id: NotSet,
-                            owner_id: NotSet,
+                            owner_tenant_id: Set(owner_tenant_id),
+                            owner_id: Set(owner_id),
                             reaction_type: Set(stored_value),
                             // For new rows `created_at` lands; for the
                             // updated path Postgres ignores it because the
@@ -223,6 +229,22 @@ impl ReactionRepo for SeaReactionRepo {
         let rows = ReactionEntity::find()
             .secure()
             .scope_with(&scope)
+            .filter(Condition::all().add(ReactionColumn::MessageId.eq(message_id)))
+            .all(&conn)
+            .await?;
+        Ok(rows.into_iter().map(MessageReaction::from).collect())
+    }
+
+    // @cpt-cf-chat-engine-interface-pep
+    async fn list_by_message_scoped(
+        &self,
+        scope: &AccessScope,
+        message_id: Uuid,
+    ) -> Result<Vec<MessageReaction>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let rows = ReactionEntity::find()
+            .secure()
+            .scope_with(scope)
             .filter(Condition::all().add(ReactionColumn::MessageId.eq(message_id)))
             .all(&conn)
             .await?;
