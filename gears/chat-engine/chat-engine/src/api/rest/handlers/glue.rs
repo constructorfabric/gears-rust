@@ -28,7 +28,6 @@ use crate::api::rest::dto::{
     RecreateMessageRequestDto, SearchRequestDto, SearchResultsDto, SendMessageRequestDto,
     VariantInfoDto, VariantListDto, parts_into_sdk,
 };
-use crate::api::rest::handlers::sessions::identity_from_ctx;
 use crate::api::rest::sse_delta_stream_response;
 use crate::api::rest::stream_reader::sse_buffer_reader_response;
 use crate::domain::error::{ChatEngineError, Result};
@@ -245,9 +244,8 @@ pub async fn summarize_session(
     Extension(svc): Extension<Arc<IntelligenceService>>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response> {
-    let identity = identity_from_ctx(&ctx)?;
     let cancel = CancellationToken::new();
-    let stream = svc.summarize_session(&identity, session_id, cancel).await?;
+    let stream = svc.summarize_session(&ctx, session_id, cancel).await?;
     Ok(sse_delta_stream_response(stream))
 }
 
