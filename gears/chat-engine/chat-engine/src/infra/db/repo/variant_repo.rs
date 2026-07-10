@@ -16,11 +16,10 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
-use toolkit_db::secure::{
-    AccessScope, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig,
-};
+use toolkit_db::secure::{SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig};
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::Message;
 use crate::domain::service::variant_service::VariantRepo;
@@ -30,9 +29,9 @@ use crate::infra::db::repo::ChatEngineDb;
 ///
 /// Holds the toolkit-db `DBProvider` so every query runs against the same
 /// connection the migration runner used. `messages` and `sessions` are both
-/// marked `#[secure(unrestricted)]`; the secure wrappers run with
-/// `AccessScope::allow_all()` and exist only to expose a `&impl DBRunner`
-/// execution path.
+/// marked `#[secure(unrestricted)]`; the secure wrappers run with a named
+/// bypass scope (see `crate::domain::authz::bypass`) and exist only to expose
+/// a `&impl DBRunner` execution path.
 pub struct SeaVariantRepo {
     db: Arc<ChatEngineDb>,
 }
@@ -55,7 +54,9 @@ impl VariantRepo for SeaVariantRepo {
 
         let conn = self.db.conn()?;
         // TODO(phase-7): bypass registry — unrestricted_table_scope()
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let parent_cond = match parent_message_id {
             Some(p) => Condition::all().add(message_entity::Column::ParentMessageId.eq(p)),
             None => Condition::all().add(message_entity::Column::ParentMessageId.is_null()),
@@ -119,7 +120,9 @@ impl VariantRepo for SeaVariantRepo {
                             compute_next_variant_index(tx, session_id, Some(parent_message_id))
                                 .await?;
                         // TODO(phase-7): bypass registry — unrestricted_table_scope()
-                        let scope = AccessScope::allow_all();
+                        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+                        // @cpt-cf-chat-engine-design-authz-bypass-registry
+                        let scope = bypass::unrestricted_table_scope();
                         // Branch rows inherit the parent message's owner pair
                         // (the `messages` secure scope columns), derived
                         // in-transaction. @cpt-cf-chat-engine-interface-pep
@@ -223,7 +226,9 @@ impl VariantRepo for SeaVariantRepo {
 
         let conn = self.db.conn()?;
         // TODO(phase-7): bypass registry — unrestricted_table_scope()
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let mut chain = Vec::new();
         let mut cursor: Option<Uuid> = Some(message_id);
         let mut guard = 0_usize;
@@ -254,7 +259,9 @@ impl VariantRepo for SeaVariantRepo {
 
         let conn = self.db.conn()?;
         // TODO(phase-7): bypass registry — unrestricted_table_scope()
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let mut out: Vec<Uuid> = Vec::new();
         let mut frontier: Vec<Uuid> = vec![message_id];
         while !frontier.is_empty() {
@@ -302,7 +309,9 @@ impl VariantRepo for SeaVariantRepo {
             .transaction_with_config(TxConfig::serializable(), move |tx| {
                 Box::pin(async move {
                     // TODO(phase-7): bypass registry — unrestricted_table_scope()
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     if !activate_ids.is_empty() {
                         MessageEntity::update_many()
                             .secure()
@@ -357,7 +366,9 @@ impl VariantRepo for SeaVariantRepo {
             .transaction(move |tx| {
                 Box::pin(async move {
                     // TODO(phase-7): bypass registry — unrestricted_table_scope()
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     let owned_cond = Condition::all()
                         .add(session_entity::Column::SessionId.eq(session_id))
                         .add(session_entity::Column::TenantId.eq(tenant_id.clone()))
