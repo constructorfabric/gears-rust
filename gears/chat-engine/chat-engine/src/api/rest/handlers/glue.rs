@@ -154,7 +154,6 @@ pub async fn recreate_message(
     Path(message_id): Path<Uuid>,
     Json(body): Json<RecreateMessageRequestDto>,
 ) -> Result<Response> {
-    let identity = identity_from_ctx(&ctx)?;
     let session_id = messages
         .resolve_owned_message(&ctx, message_id)
         .await?
@@ -162,7 +161,7 @@ pub async fn recreate_message(
     let cancel = CancellationToken::new();
     let stream = variants
         .recreate_variant(
-            &identity,
+            &ctx,
             session_id,
             message_id,
             capabilities_into_sdk(body.enabled_capabilities),
@@ -180,13 +179,12 @@ pub async fn list_variants(
     Extension(variants): Extension<Arc<VariantService>>,
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<VariantListDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let session_id = messages
         .resolve_owned_message(&ctx, message_id)
         .await?
         .session_id;
     let listing = variants
-        .list_variants(&identity, session_id, message_id)
+        .list_variants(&ctx, session_id, message_id)
         .await?;
     Ok(Json(VariantListDto {
         current_index: listing.current_index,

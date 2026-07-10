@@ -59,6 +59,7 @@ use chat_engine_sdk::models::{
 };
 use chat_engine_sdk::plugin::{PluginCallContext, SessionPluginCtx};
 
+use crate::domain::authz::{actions, resource_types};
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::{Message, MessageRole, StreamingEvent};
 use crate::domain::ports::SessionRepo;
@@ -66,10 +67,11 @@ use crate::domain::ports::{MessageRepo, SessionTypeRepo};
 use crate::domain::service::message_service::{
     MessageEventKind, MessageService, SendMessageStream,
 };
-use authz_resolver_sdk::pep::PolicyEnforcer;
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 
 use crate::domain::service::plugin_service::PluginService;
-use crate::domain::service::session_service::{Identity, merge_plugin_metadata};
+use crate::domain::service::session_service::{identity_from_ctx, merge_plugin_metadata};
 use crate::domain::session::{Session, SessionType};
 
 /// Default plugin-call deadline applied to `on_session_updated` during
@@ -242,7 +244,7 @@ impl VariantService {
     /// against an archived session — only mutations are gated to
     /// `active`).
     #[instrument(
-        skip(self, identity),
+        skip(self, ctx),
         fields(
             session_id = %session_id,
             message_id = %message_id,
@@ -251,13 +253,22 @@ impl VariantService {
     )]
     pub async fn list_variants(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<VariantListing> {
         let started = OffsetDateTime::now_utc();
 
-        let session = self.load_session(identity, session_id).await?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::MESSAGE,
+                actions::READ,
+                Some(session_id),
+            )
+            .await?;
         self.gate_lifecycle_navigation(&session)?;
 
         let target = self
@@ -305,7 +316,7 @@ impl VariantService {
     /// Activates the chosen sibling and runs
     /// [`VariantService::update_active_path`].
     #[instrument(
-        skip(self, identity),
+        skip(self, ctx),
         fields(
             session_id = %session_id,
             message_id = %message_id,
@@ -314,13 +325,22 @@ impl VariantService {
     )]
     pub async fn set_active_variant(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<VariantEntry> {
         let started = OffsetDateTime::now_utc();
 
-        let session = self.load_session(identity, session_id).await?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::MESSAGE,
+                actions::UPDATE,
+                Some(session_id),
+            )
+            .await?;
         self.gate_lifecycle_mutation(&session)?;
 
         let target = self
@@ -441,7 +461,7 @@ impl VariantService {
     /// `StreamingCompleteEvent.metadata` envelope so clients can update
     /// their navigation UI without a follow-up `GET /variants`.
     #[instrument(
-        skip(self, identity, cancel),
+        skip(self, ctx, cancel),
         fields(
             session_id = %session_id,
             message_id = %message_id,
@@ -450,15 +470,26 @@ impl VariantService {
     )]
     pub async fn recreate_variant(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         message_id: Uuid,
         capabilities: Option<Vec<CapabilityValue>>,
         cancel: CancellationToken,
     ) -> Result<SendMessageStream> {
         let started = OffsetDateTime::now_utc();
+        // Opaque tenant/user strings for stub stamping + plugin dispatch.
+        let identity = identity_from_ctx(ctx)?;
 
-        let session = self.load_session(identity, session_id).await?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::MESSAGE,
+                actions::CREATE,
+                None,
+            )
+            .await?;
         self.gate_lifecycle_mutation(&session)?;
 
         // Validate target message: must be an assistant message in the
@@ -545,7 +576,7 @@ impl VariantService {
         let stream = self
             .message_service
             .dispatch_to_plugin(
-                identity,
+                &identity,
                 session_id,
                 session_type_id,
                 plugin_instance_id,
@@ -603,7 +634,7 @@ impl VariantService {
     /// [`MessageService::dispatch_to_plugin`] with
     /// [`MessageEventKind::New`].
     #[instrument(
-        skip(self, identity, parts, cancel),
+        skip(self, ctx, parts, cancel),
         fields(
             session_id = %session_id,
             branch_point_message_id = %branch_point_message_id,
@@ -612,7 +643,7 @@ impl VariantService {
     )]
     pub async fn branch_message(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         branch_point_message_id: Uuid,
         parts: Vec<MessagePartInput>,
@@ -621,8 +652,19 @@ impl VariantService {
         cancel: CancellationToken,
     ) -> Result<SendMessageStream> {
         let started = OffsetDateTime::now_utc();
+        // Opaque tenant/user strings for branch-row stamping + plugin dispatch.
+        let identity = identity_from_ctx(ctx)?;
 
-        let session = self.load_session(identity, session_id).await?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::MESSAGE,
+                actions::CREATE,
+                None,
+            )
+            .await?;
         self.gate_lifecycle_mutation(&session)?;
 
         let _branch_point = self
@@ -676,7 +718,7 @@ impl VariantService {
         let stream = self
             .message_service
             .dispatch_to_plugin(
-                identity,
+                &identity,
                 session_id,
                 session_type_id,
                 plugin_instance_id,
@@ -753,11 +795,22 @@ impl VariantService {
     /// capabilities and uses that as the canonical superset reference.
     pub async fn validate_session_type_switch(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         target_session_type_id: Uuid,
     ) -> Result<(SessionType, String, Vec<Capability>, Option<JsonValue>)> {
-        let session = self.load_session(identity, session_id).await?;
+        // Opaque tenant/user strings for the plugin call context.
+        let identity = identity_from_ctx(ctx)?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::SESSION,
+                actions::UPDATE,
+                Some(session_id),
+            )
+            .await?;
         self.gate_lifecycle_mutation(&session)?;
 
         let target = self
@@ -844,7 +897,7 @@ impl VariantService {
     /// `PATCH /sessions/{session_id}/type` (canonical) /
     /// `PATCH /sessions/{session_id}/session-type` (compat).
     #[instrument(
-        skip(self, identity),
+        skip(self, ctx),
         fields(
             session_id = %session_id,
             target_session_type_id = %target_session_type_id,
@@ -853,14 +906,16 @@ impl VariantService {
     )]
     pub async fn switch_session_type(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         target_session_type_id: Uuid,
     ) -> Result<Session> {
         let started = OffsetDateTime::now_utc();
+        // Opaque tenant/user strings for the scoped session writes below.
+        let identity = identity_from_ctx(ctx)?;
 
         let (_target_type, _plugin_instance_id, capabilities, plugin_metadata) = self
-            .validate_session_type_switch(identity, session_id, target_session_type_id)
+            .validate_session_type_switch(ctx, session_id, target_session_type_id)
             .await?;
 
         let caps_json = serde_json::to_value(&capabilities).unwrap_or(JsonValue::Array(Vec::new()));
@@ -901,13 +956,49 @@ impl VariantService {
     //  Internal helpers
     // ------------------------------------------------------------------
 
-    async fn load_session(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
-        let row = self
+    /// Trusted prefetch of a session by id, then the PDP decision for
+    /// (`resource`, `action`). Returns the prefetched session (used downstream
+    /// for lifecycle gating / session-type resolution / owner-string stamping).
+    /// The prefetch owner pair is passed to the PDP as ABAC input; a denied /
+    /// unreachable / uncompilable decision fails closed to `Forbidden` via the
+    /// `?`-converted `EnforcerError` (DESIGN §3.5.5). Variant repo mutations
+    /// keep their internal `allow_all()` until Phase 7 (bypass registry).
+    // @cpt-cf-chat-engine-seq-authz-point-op
+    async fn authorize_session_op(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+        resource: &ResourceType,
+        action: &str,
+        resource_id: Option<Uuid>,
+    ) -> Result<Session> {
+        // Trusted prefetch — Phase 7 renames this `allow_all()` to a named
+        // bypass wrapper.
+        let prefetch = self
             .sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
+            .find_by_id_scoped(&AccessScope::allow_all(), session_id)
             .await?
             .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
-        Ok(row)
+
+        // @cpt-cf-chat-engine-interface-pep
+        // @cpt-cf-chat-engine-constraint-fail-closed-authz
+        let _scope = self
+            .enforcer
+            .access_scope_with(
+                ctx,
+                resource,
+                action,
+                resource_id,
+                &AccessRequest::new()
+                    .resource_property(
+                        pep_properties::OWNER_TENANT_ID,
+                        prefetch.tenant_id.as_str(),
+                    )
+                    .resource_property(pep_properties::OWNER_ID, prefetch.user_id.as_str())
+                    .require_constraints(false),
+            )
+            .await?;
+        Ok(prefetch)
     }
 
     fn gate_lifecycle_mutation(&self, session: &Session) -> Result<()> {

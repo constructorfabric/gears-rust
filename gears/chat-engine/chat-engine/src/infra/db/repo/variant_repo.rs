@@ -54,6 +54,7 @@ impl VariantRepo for SeaVariantRepo {
         use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
         let conn = self.db.conn()?;
+        // TODO(phase-7): bypass registry — unrestricted_table_scope()
         let scope = AccessScope::allow_all();
         let parent_cond = match parent_message_id {
             Some(p) => Condition::all().add(message_entity::Column::ParentMessageId.eq(p)),
@@ -117,6 +118,7 @@ impl VariantRepo for SeaVariantRepo {
                         let user_variant_index =
                             compute_next_variant_index(tx, session_id, Some(parent_message_id))
                                 .await?;
+                        // TODO(phase-7): bypass registry — unrestricted_table_scope()
                         let scope = AccessScope::allow_all();
                         // Branch rows inherit the parent message's owner pair
                         // (the `messages` secure scope columns), derived
@@ -220,6 +222,7 @@ impl VariantRepo for SeaVariantRepo {
         use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
         let conn = self.db.conn()?;
+        // TODO(phase-7): bypass registry — unrestricted_table_scope()
         let scope = AccessScope::allow_all();
         let mut chain = Vec::new();
         let mut cursor: Option<Uuid> = Some(message_id);
@@ -250,6 +253,7 @@ impl VariantRepo for SeaVariantRepo {
         use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
         let conn = self.db.conn()?;
+        // TODO(phase-7): bypass registry — unrestricted_table_scope()
         let scope = AccessScope::allow_all();
         let mut out: Vec<Uuid> = Vec::new();
         let mut frontier: Vec<Uuid> = vec![message_id];
@@ -297,6 +301,7 @@ impl VariantRepo for SeaVariantRepo {
         self.db
             .transaction_with_config(TxConfig::serializable(), move |tx| {
                 Box::pin(async move {
+                    // TODO(phase-7): bypass registry — unrestricted_table_scope()
                     let scope = AccessScope::allow_all();
                     if !activate_ids.is_empty() {
                         MessageEntity::update_many()
@@ -351,6 +356,7 @@ impl VariantRepo for SeaVariantRepo {
         self.db
             .transaction(move |tx| {
                 Box::pin(async move {
+                    // TODO(phase-7): bypass registry — unrestricted_table_scope()
                     let scope = AccessScope::allow_all();
                     let owned_cond = Condition::all()
                         .add(session_entity::Column::SessionId.eq(session_id))
@@ -410,7 +416,7 @@ fn chat_engine_db_err(err: &ChatEngineError) -> Option<&sea_orm::DbErr> {
         // already covers that path. `DbError::Other(anyhow)` errors
         // (used by the transaction helpers when a domain error
         // bubbles through) appear as `toolkit_db::DbError`, not as a
-        // bare `DbErr` — so peek through that wrapper too.
+        // bare `DbErr` â so peek through that wrapper too.
         source
             .downcast_ref::<toolkit_db::DbError>()
             .and_then(|dbe| match dbe {
