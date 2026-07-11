@@ -78,7 +78,7 @@ echo "==> cargo-gears docs source: $CARGO_GEARS_PATH"
 cd "$CACHE_DIR"
 
 # Mode: "dev" (default) serves the site; "build" produces a static build in
-# dist/ (used by `make lychee-web-docs` for offline link checking).
+# dist/ (used by `make web-docs-check` for offline link checking).
 MODE="${1:-dev}"
 
 PKG="npm"

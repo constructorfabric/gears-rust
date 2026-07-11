@@ -39,4 +39,4 @@ jobs:
           tool: lychee
 
       - name: Check web docs links
-        run: make lychee-web-docs
+        run: make web-docs-check
