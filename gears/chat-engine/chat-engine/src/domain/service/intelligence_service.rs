@@ -75,13 +75,13 @@ use crate::domain::message::{
     StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent,
     StreamingStartEvent,
 };
-use crate::domain::authz::{actions, resource_types};
+use crate::domain::authz::{actions, bypass, resource_types};
 use crate::domain::ports::MessageRepo;
 use crate::domain::ports::SessionRepo;
 use crate::domain::ports::SessionTypeRepo;
 use crate::domain::retention::RetentionPolicy;
 use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
-use toolkit_security::{AccessScope, SecurityContext, pep_properties};
+use toolkit_security::{SecurityContext, pep_properties};
 
 use crate::domain::service::plugin_service::PluginService;
 use crate::domain::service::session_service::identity_from_ctx;
@@ -798,11 +798,12 @@ impl IntelligenceService {
         action: &str,
         resource_id: Option<Uuid>,
     ) -> Result<Session> {
-        // Trusted prefetch — Phase 7 renames this `allow_all()` to a named
-        // bypass wrapper.
+        // AUTHZ-BYPASS: system-internal owner-pair prefetch preceding the PDP
+        // decision that authorizes this op; scoped by session_id.
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
         let prefetch = self
             .sessions
-            .find_by_id_scoped(&AccessScope::allow_all(), session_id)
+            .find_by_id_scoped(&bypass::system_read_scope(), session_id)
             .await?
             .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
 

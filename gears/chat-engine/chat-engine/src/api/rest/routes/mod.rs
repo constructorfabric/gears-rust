@@ -249,6 +249,10 @@ pub fn register_routes(
         .standard_errors(openapi)
         .register(router, openapi);
 
+    // @cpt-cf-chat-engine-seq-authz-shared-read
+    // Unauthenticated capability-URL route: no SecurityContext / PDP call; the
+    // opaque share token is the grant. See ExportService::access_shared, which
+    // reads under bypass::capability_read_scope() and 404s on miss/revoked.
     router = OperationBuilder::post("/chat-engine/v1/shared/{share_token}")
         .operation_id("chat_engine.session.access_shared")
         .summary("Access a session via a public share token")
