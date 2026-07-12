@@ -30,11 +30,19 @@ use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
+use toolkit::ClientHub;
+
 use crate::domain::ports::{MessageRepo, NewSession, ReactionRepo, SessionRepo, SessionTypeRepo};
+use crate::domain::service::message_service::MessageService;
+use crate::domain::service::plugin_service::PluginService;
+use crate::domain::service::reaction_service::ReactionService;
+use crate::domain::service::session_service::SessionService;
+use crate::domain::service::webhook::NoopWebhookEmitter;
 use crate::domain::session::Session;
 use crate::infra::db::migrations::Migrator;
 use crate::infra::db::repo::ChatEngineDb;
 use crate::infra::db::repo::message_repo::SeaMessageRepo;
+use crate::infra::db::repo::plugin_config_repo::SeaPluginConfigRepo;
 use crate::infra::db::repo::reaction_repo::SeaReactionRepo;
 use crate::infra::db::repo::session_repo::SeaSessionRepo;
 use crate::infra::db::repo::session_type_repo::SeaSessionTypeRepo;
@@ -113,6 +121,53 @@ pub fn reaction_repo(db: &Arc<ChatEngineDb>) -> Arc<dyn ReactionRepo> {
 #[must_use]
 pub fn session_type_repo(db: &Arc<ChatEngineDb>) -> Arc<dyn SessionTypeRepo> {
     Arc::new(SeaSessionTypeRepo::new(Arc::clone(db)))
+}
+
+// ---------------------------------------------------------------------------
+// Service builders (real repos + inmem DB + injected enforcer)
+// ---------------------------------------------------------------------------
+
+/// Empty plugin service (real `SeaPluginConfigRepo`, empty `ClientHub`). The
+/// authz tests deny/allow before any plugin call, so no plugin needs to be
+/// registered.
+#[must_use]
+fn test_plugins(db: &Arc<ChatEngineDb>) -> PluginService {
+    let hub = Arc::new(ClientHub::new());
+    PluginService::new(hub, Arc::new(SeaPluginConfigRepo::new(Arc::clone(db))))
+}
+
+#[must_use]
+pub fn build_session_service(db: &Arc<ChatEngineDb>, enforcer: PolicyEnforcer) -> SessionService {
+    SessionService::new(
+        session_repo(db),
+        session_type_repo(db),
+        test_plugins(db),
+        Arc::new(NoopWebhookEmitter),
+        enforcer,
+    )
+}
+
+#[must_use]
+pub fn build_message_service(db: &Arc<ChatEngineDb>, enforcer: PolicyEnforcer) -> MessageService {
+    MessageService::new(
+        session_repo(db),
+        session_type_repo(db),
+        message_repo(db),
+        test_plugins(db),
+        enforcer,
+    )
+}
+
+#[must_use]
+pub fn build_reaction_service(db: &Arc<ChatEngineDb>, enforcer: PolicyEnforcer) -> ReactionService {
+    ReactionService::new(
+        session_repo(db),
+        session_type_repo(db),
+        message_repo(db),
+        reaction_repo(db),
+        test_plugins(db),
+        enforcer,
+    )
 }
 
 // ---------------------------------------------------------------------------

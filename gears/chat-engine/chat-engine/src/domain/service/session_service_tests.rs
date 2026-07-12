@@ -109,3 +109,213 @@ fn ensure_can_transition_path_used_by_service_for_archive() {
     let to = LifecycleState::Archived;
     ensure_can_transition(from, to).expect("active->archived is valid");
 }
+
+// ===========================================================================
+// Authorization suite (Phase 8) — PEP enforcement on SessionService.
+// Real Sea-ORM repos over an in-memory SQLite DB + a mock PDP, so each test
+// exercises the full enforcer -> AccessScope -> SecureORM WHERE flow.
+// ===========================================================================
+
+use crate::domain::service::test_support::{
+    build_session_service, ctx_allow_tenants, ctx_for_subject, enforcer_allow,
+    enforcer_compile_fail, enforcer_deny, enforcer_failing, inmem_db, seed_session,
+};
+use toolkit_odata::ODataQuery;
+
+// --- 2a. PDP deny (Denied) -> 403 -----------------------------------------
+
+#[tokio::test]
+async fn pdp_denied_list_sessions_returns_forbidden() {
+    let db = inmem_db().await;
+    let svc = build_session_service(&db, enforcer_deny());
+    let ctx = ctx_allow_tenants(&[Uuid::new_v4()]);
+    let err = svc
+        .list_sessions(&ctx, &ODataQuery::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "Expected Forbidden from DenyAll, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn pdp_denied_create_session_returns_forbidden() {
+    let db = inmem_db().await;
+    let svc = build_session_service(&db, enforcer_deny());
+    let ctx = ctx_allow_tenants(&[Uuid::new_v4()]);
+    let err = svc
+        .create_session(
+            &ctx,
+            CreateSessionRequest {
+                session_type_id: None,
+                metadata: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "Expected Forbidden from DenyAll, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn pdp_denied_get_session_returns_forbidden() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_session_service(&db, enforcer_deny());
+    let err = svc
+        .get_session(&ctx_for_subject(user, tenant), sid)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "Expected Forbidden from DenyAll, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn pdp_denied_update_session_returns_forbidden() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_session_service(&db, enforcer_deny());
+    let err = svc
+        .update_metadata(
+            &ctx_for_subject(user, tenant),
+            sid,
+            serde_json::json!({"title": "x"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "Expected Forbidden from DenyAll, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn pdp_denied_delete_session_returns_forbidden() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_session_service(&db, enforcer_deny());
+    let err = svc
+        .delete_session(&ctx_for_subject(user, tenant), sid, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "Expected Forbidden from DenyAll, got: {err:?}"
+    );
+}
+
+// --- 2b. EvaluationFailed -> 403 (fail-closed) ----------------------------
+
+#[tokio::test]
+async fn evaluation_failed_list_sessions_returns_forbidden() {
+    let db = inmem_db().await;
+    let svc = build_session_service(&db, enforcer_failing());
+    let ctx = ctx_allow_tenants(&[Uuid::new_v4()]);
+    let err = svc
+        .list_sessions(&ctx, &ODataQuery::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "Expected Forbidden (fail-closed) from PDP failure, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn evaluation_failed_get_session_returns_forbidden() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_session_service(&db, enforcer_failing());
+    let err = svc
+        .get_session(&ctx_for_subject(user, tenant), sid)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "Expected Forbidden (fail-closed) from PDP failure, got: {err:?}"
+    );
+}
+
+// --- 2c. CompileFailed -> 403 (fail-closed) -------------------------------
+
+#[tokio::test]
+async fn compile_failed_list_sessions_returns_forbidden() {
+    let db = inmem_db().await;
+    let svc = build_session_service(&db, enforcer_compile_fail());
+    let ctx = ctx_allow_tenants(&[Uuid::new_v4()]);
+    let err = svc
+        .list_sessions(&ctx, &ODataQuery::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "Expected Forbidden (fail-closed) from empty constraints, got: {err:?}"
+    );
+}
+
+// --- 2d. Point-op scope-miss -> 404 (anti-enumeration) --------------------
+
+#[tokio::test]
+async fn get_session_wrong_tenant_returns_not_found() {
+    let db = inmem_db().await;
+    let (tenant_a, user_a, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant_a, user_a).await;
+
+    // A subject in a different tenant: PDP allows with owner constraints that
+    // filter to the subject's own rows, so the scoped re-read yields 0 rows.
+    let svc = build_session_service(&db, enforcer_allow());
+    let err = svc
+        .get_session(&ctx_allow_tenants(&[Uuid::new_v4()]), sid)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "Expected NotFound for cross-tenant access, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_session_wrong_tenant_returns_not_found() {
+    let db = inmem_db().await;
+    let (tenant_a, user_a, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant_a, user_a).await;
+
+    let svc = build_session_service(&db, enforcer_allow());
+    let err = svc
+        .delete_session(&ctx_allow_tenants(&[Uuid::new_v4()]), sid, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "Expected NotFound for cross-tenant delete, got: {err:?}"
+    );
+}
+
+// --- happy path: owner can read its own session ---------------------------
+
+#[tokio::test]
+async fn get_session_owner_returns_session() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_session_service(&db, enforcer_allow());
+    let got = svc
+        .get_session(&ctx_for_subject(user, tenant), sid)
+        .await
+        .expect("owner should read its own session");
+    assert_eq!(got.session_id, sid);
+}
