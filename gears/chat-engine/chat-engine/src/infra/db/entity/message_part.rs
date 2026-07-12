@@ -10,10 +10,11 @@
 
 use sea_orm::entity::prelude::*;
 use sea_orm::{Condition, QueryOrder, QuerySelect};
-use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt};
+use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
@@ -84,7 +85,9 @@ pub async fn compute_next_part_number<R>(
 where
     R: DBRunner,
 {
-    let scope = AccessScope::allow_all();
+    // AUTHZ-BYPASS: globally non-tenant compute helper (MAX(number)+1); scoped by explicit WHERE
+    // @cpt-cf-chat-engine-design-authz-bypass-registry
+    let scope = bypass::unrestricted_table_scope();
     let row = Entity::find()
         .order_by_desc(Column::Number)
         .limit(1)

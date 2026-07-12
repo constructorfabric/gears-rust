@@ -4,10 +4,11 @@
 use sea_orm::entity::prelude::*;
 use sea_orm::{Condition, QueryOrder, QuerySelect, SqlErr};
 use time::OffsetDateTime;
-use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt};
+use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 use crate::infra::db::migrations::{UQ_VARIANT_INDEX, UQ_VARIANT_INDEX_ROOT};
 
@@ -132,7 +133,9 @@ pub async fn compute_next_variant_index<R>(
 where
     R: DBRunner,
 {
-    let scope = AccessScope::allow_all();
+    // AUTHZ-BYPASS: globally non-tenant compute helper (MAX(variant_index)+1); scoped by explicit WHERE
+    // @cpt-cf-chat-engine-design-authz-bypass-registry
+    let scope = bypass::unrestricted_table_scope();
 
     let parent_filter = match parent {
         Some(p) => Condition::all().add(Column::ParentMessageId.eq(p)),
