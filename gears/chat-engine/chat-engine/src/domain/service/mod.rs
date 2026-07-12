@@ -17,6 +17,9 @@ pub mod session_service;
 pub mod variant_service;
 pub mod webhook;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use export_service::{ExportService, ShareUrlBuilder, is_share_token_expired};
 pub use intelligence_service::{
     DEFAULT_SUMMARY_BUFFER_SIZE, DEFAULT_SUMMARY_DEADLINE, IntelligenceService,
