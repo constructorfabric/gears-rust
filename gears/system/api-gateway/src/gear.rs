@@ -157,10 +157,7 @@ impl ApiGateway {
                             (
                                 axum::http::StatusCode::OK,
                                 [
-                                    (
-                                        axum::http::header::CONTENT_TYPE,
-                                        "text/html; charset=utf-8",
-                                    ),
+                                    (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
                                     (axum::http::header::CACHE_CONTROL, "no-cache"),
                                 ],
                                 body,
