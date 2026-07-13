@@ -74,11 +74,6 @@ pub fn ctx_for_subject(subject_id: Uuid, tenant_id: Uuid) -> SecurityContext {
         .unwrap()
 }
 
-/// Anonymous (nil subject/tenant) context.
-#[must_use]
-pub fn ctx_deny_all() -> SecurityContext {
-    SecurityContext::anonymous()
-}
 
 // ---------------------------------------------------------------------------
 // In-memory database + repo builders

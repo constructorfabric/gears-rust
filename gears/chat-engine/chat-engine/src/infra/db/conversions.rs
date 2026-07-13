@@ -49,41 +49,6 @@ impl From<session_entity::Model> for Session {
     }
 }
 
-impl From<Session> for session_entity::ActiveModel {
-    fn from(s: Session) -> Self {
-        session_entity::ActiveModel {
-            session_id: Set(s.session_id),
-            // `TenantId`/`UserId` wrap `String`; the column is now `Uuid`.
-            // Values were always UUID strings from `SecurityContext`; parse is
-            // expected to succeed for all valid sessions.
-            tenant_id: Set(s
-                .tenant_id
-                .into_inner()
-                .parse::<Uuid>()
-                .expect("TenantId was always a UUID string")),
-            user_id: Set(s
-                .user_id
-                .into_inner()
-                .parse::<Uuid>()
-                .expect("UserId was always a UUID string")),
-            client_id: Set(s.client_id),
-            session_type_id: Set(s.session_type_id),
-            enabled_capabilities: Set(s.enabled_capabilities),
-            metadata: Set(s.metadata),
-            lifecycle_state: Set(s.lifecycle_state.as_str().to_string()),
-            share_token: Set(s.share_token),
-            // `deleted_at` / `scheduled_hard_delete_at` are owned by the
-            // soft-delete service (Phase 12) — leave untouched here so an
-            // accidental `From` round-trip from a non-deleted session does
-            // not wipe out the columns.
-            deleted_at: NotSet,
-            scheduled_hard_delete_at: NotSet,
-            created_at: Set(s.created_at),
-            updated_at: Set(s.updated_at),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // message
 // ---------------------------------------------------------------------------

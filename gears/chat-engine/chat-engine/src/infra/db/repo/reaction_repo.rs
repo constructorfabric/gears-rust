@@ -117,7 +117,7 @@ impl ReactionRepo for SeaReactionRepo {
                         let scope = bypass::unrestricted_table_scope();
 
                         let previous =
-                            ReactionEntity::find_by_id((message_id, user_id_owned.clone()))
+                            ReactionEntity::find_by_id((message_id, user_id_owned))
                                 .secure()
                                 .scope_with(&scope)
                                 .one(tx)
@@ -159,7 +159,7 @@ impl ReactionRepo for SeaReactionRepo {
 
                         // Read back the post-write row (cheap on the same
                         // session, primary-key lookup).
-                        let after = ReactionEntity::find_by_id((message_id, user_id_owned.clone()))
+                        let after = ReactionEntity::find_by_id((message_id, user_id_owned))
                             .secure()
                             .scope_with(&scope)
                             .one(tx)
