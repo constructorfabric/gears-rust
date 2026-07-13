@@ -17,6 +17,8 @@ use crate::domain::ports::PluginConfigRepo;
 use crate::domain::ports::SessionRepo;
 use crate::domain::ports::SessionTypeRepo;
 use crate::domain::ports::{FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage};
+use crate::domain::service::test_support;
+use toolkit_security::AccessScope;
 
 // ----- Mocks -------------------------------------------------------
 
@@ -53,6 +55,21 @@ impl SessionRepo for MockSessionRepo {
                     && r.tenant_id.as_str() == tenant_id
                     && r.user_id.as_str() == user_id
             })
+            .cloned())
+    }
+
+    // Scoped (Phase 4) prefetch used by authorize_session_op under a
+    // permissive enforcer: ignore the scope, match on session_id.
+    async fn find_by_id_scoped(
+        &self,
+        _scope: &AccessScope,
+        session_id: Uuid,
+    ) -> std::result::Result<Option<Session>, ChatEngineError> {
+        Ok(self
+            .rows
+            .lock()
+            .iter()
+            .find(|r| r.session_id == session_id)
             .cloned())
     }
 
@@ -424,11 +441,29 @@ fn make_service(
         session_types,
         messages as Arc<dyn MessageRepo>,
         plugins,
+        test_support::enforcer_allow(),
     )
 }
 
-fn identity() -> Identity {
-    Identity::new("t", "u", None).unwrap()
+fn make_service_with_enforcer(
+    sessions: Arc<MockSessionRepo>,
+    messages: Arc<MockMessageRepo>,
+    enforcer: PolicyEnforcer,
+) -> IntelligenceService {
+    let session_types: Arc<dyn SessionTypeRepo> = Arc::new(MockSessionTypeRepo);
+    let hub = Arc::new(ClientHub::new());
+    let plugins = PluginService::new(hub, Arc::new(StubPluginConfigRepo));
+    IntelligenceService::new(
+        sessions as Arc<dyn SessionRepo>,
+        session_types,
+        messages as Arc<dyn MessageRepo>,
+        plugins,
+        enforcer,
+    )
+}
+
+fn ctx() -> SecurityContext {
+    test_support::ctx_allow_tenants(&[Uuid::new_v4()])
 }
 
 // ----- evaluate_retention_policy ----------------------------------
@@ -637,7 +672,7 @@ async fn get_effective_returns_per_session_when_set() {
     let msgs = MockMessageRepo::new(vec![]);
     let svc = make_service(sessions, msgs);
     let out = svc
-        .get_effective_retention_policy(&identity(), session_id)
+        .get_effective_retention_policy(&ctx(), session_id)
         .await
         .unwrap();
     assert!(matches!(out, RetentionPolicy::AgeBased { max_age_days: 7 }));
@@ -651,7 +686,7 @@ async fn get_effective_falls_back_to_none_when_unset() {
     let msgs = MockMessageRepo::new(vec![]);
     let svc = make_service(sessions, msgs);
     let out = svc
-        .get_effective_retention_policy(&identity(), session_id)
+        .get_effective_retention_policy(&ctx(), session_id)
         .await
         .unwrap();
     assert!(matches!(out, RetentionPolicy::None));
@@ -668,7 +703,7 @@ async fn update_persists_policy_in_metadata() {
     let svc = make_service(sessions.clone(), msgs);
     let updated = svc
         .update_session_retention_policy(
-            &identity(),
+            &ctx(),
             session_id,
             RetentionPolicy::CountBased {
                 max_message_count: 100,
@@ -700,7 +735,7 @@ async fn update_rejects_invalid_max_age_days() {
     let svc = make_service(sessions, msgs);
     let err = svc
         .update_session_retention_policy(
-            &identity(),
+            &ctx(),
             session_id,
             RetentionPolicy::AgeBased { max_age_days: 0 },
         )
@@ -718,7 +753,7 @@ async fn update_rejects_soft_deleted_session() {
     let msgs = MockMessageRepo::new(vec![]);
     let svc = make_service(sessions, msgs);
     let err = svc
-        .update_session_retention_policy(&identity(), session_id, RetentionPolicy::None)
+        .update_session_retention_policy(&ctx(), session_id, RetentionPolicy::None)
         .await
         .unwrap_err();
     assert!(matches!(err, ChatEngineError::Conflict { .. }));
@@ -840,6 +875,7 @@ fn make_service_with_plugin(
         st_repo,
         msgs.clone() as Arc<dyn MessageRepo>,
         plugins,
+        test_support::enforcer_allow(),
     );
     (svc, sessions, msgs)
 }
@@ -857,7 +893,7 @@ async fn summarize_pre_stream_error_propagates() {
         make_service_with_plugin(plugin_id, plugin_dyn, session_type_id, row);
 
     let cancel = CancellationToken::new();
-    let result = svc.summarize_session(&identity(), session_id, cancel).await;
+    let result = svc.summarize_session(&ctx(), session_id, cancel).await;
     let err = match result {
         Ok(_) => panic!("pre-stream failure must surface as Err"),
         Err(e) => e,
@@ -935,10 +971,11 @@ async fn summarize_returns_422_style_when_plugin_unregistered() {
         st_repo,
         msgs as Arc<dyn MessageRepo>,
         plugins,
+        test_support::enforcer_allow(),
     );
 
     let cancel = CancellationToken::new();
-    let result = svc.summarize_session(&identity(), session_id, cancel).await;
+    let result = svc.summarize_session(&ctx(), session_id, cancel).await;
     let err = match result {
         Ok(_) => panic!("unregistered plugin must produce an error"),
         Err(e) => e,
@@ -982,9 +1019,11 @@ async fn summarize_happy_path_persists_on_complete() {
     let (svc, _sessions, msgs) =
         make_service_with_plugin(plugin_id, plugin_dyn, session_type_id, row);
 
+    let tenant = Uuid::new_v4();
+    let caller = test_support::ctx_for_subject(Uuid::new_v4(), tenant);
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .summarize_session(&identity(), session_id, cancel)
+        .summarize_session(&caller, session_id, cancel)
         .await
         .expect("summary dispatch");
     let mut kinds = Vec::new();
@@ -1010,7 +1049,7 @@ async fn summarize_happy_path_persists_on_complete() {
     // (denormalized owning tenant), threaded from the JWT identity.
     assert_eq!(
         summaries[0].2.as_deref(),
-        Some("t"),
+        Some(tenant.to_string().as_str()),
         "summary must inherit the identity tenant_id",
     );
 }
@@ -1047,7 +1086,7 @@ async fn summarize_persist_failure_emits_error_not_complete() {
 
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .summarize_session(&identity(), session_id, cancel)
+        .summarize_session(&ctx(), session_id, cancel)
         .await
         .expect("summary dispatch");
     let mut kinds = Vec::new();
@@ -1294,4 +1333,64 @@ async fn run_cleanup_all_tenants_returns_empty_when_no_active_tenants() {
     let svc = make_service(sessions, msgs);
     let report = svc.run_retention_cleanup_all_tenants().await.unwrap();
     assert!(report.sessions.is_empty());
+}
+
+// --------------------------- Authz (PEP) tests ------------------------
+//
+// The subject-facing intelligence surface (retention get/update, summarize)
+// gates through authorize_session_op as SESSION READ/UPDATE point-ops. An
+// explicit PDP deny or an evaluation error fails closed to `Forbidden` (403)
+// via `From<EnforcerError>`. The background retention sweep has no subject,
+// so it never calls the enforcer (covered by the run_cleanup_* tests).
+// @cpt-cf-chat-engine-interface-pep
+
+#[tokio::test]
+async fn get_effective_pdp_denied_returns_forbidden() {
+    let session_id = Uuid::new_v4();
+    let sessions = MockSessionRepo::new(vec![make_session(session_id, None)]);
+    let msgs = MockMessageRepo::new(vec![]);
+    let svc = make_service_with_enforcer(sessions, msgs, test_support::enforcer_deny());
+
+    let res = svc
+        .get_effective_retention_policy(&ctx(), session_id)
+        .await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
+}
+
+#[tokio::test]
+async fn get_effective_evaluation_failed_returns_forbidden() {
+    let session_id = Uuid::new_v4();
+    let sessions = MockSessionRepo::new(vec![make_session(session_id, None)]);
+    let msgs = MockMessageRepo::new(vec![]);
+    let svc = make_service_with_enforcer(sessions, msgs, test_support::enforcer_failing());
+
+    let res = svc
+        .get_effective_retention_policy(&ctx(), session_id)
+        .await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
+}
+
+#[tokio::test]
+async fn update_retention_pdp_denied_returns_forbidden() {
+    let session_id = Uuid::new_v4();
+    let sessions = MockSessionRepo::new(vec![make_session(session_id, None)]);
+    let msgs = MockMessageRepo::new(vec![]);
+    let svc = make_service_with_enforcer(sessions, msgs, test_support::enforcer_deny());
+
+    let res = svc
+        .update_session_retention_policy(&ctx(), session_id, RetentionPolicy::None)
+        .await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
+}
+
+#[tokio::test]
+async fn summarize_pdp_denied_returns_forbidden() {
+    let session_id = Uuid::new_v4();
+    let sessions = MockSessionRepo::new(vec![make_session(session_id, None)]);
+    let msgs = MockMessageRepo::new(vec![]);
+    let svc = make_service_with_enforcer(sessions, msgs, test_support::enforcer_deny());
+
+    let cancel = CancellationToken::new();
+    let res = svc.summarize_session(&ctx(), session_id, cancel).await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
 }
