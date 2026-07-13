@@ -111,7 +111,7 @@ make admin                       # builds the SPA, serves it at http://localhost
 cd apps/admin-panel && npm install && npm run dev
 ```
 
-See the [Admin panel guide](docs/web-docs/guides/admin-panel.md) and the design set under
+See the [Admin panel guide](docs/web-docs/build-with-gears/admin-panel.md) and the design set under
 [`docs/arch/admin-panel/`](docs/arch/admin-panel/) (PRD, DESIGN, ADRs).
 
 ### Example Configuration (config/quickstart.yaml)

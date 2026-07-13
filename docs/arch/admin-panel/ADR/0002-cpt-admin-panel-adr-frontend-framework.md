@@ -57,7 +57,7 @@ Stack:
 - **Build**: Vite, emitting a static `dist/` bundle served by the example server under `/cf/admin`.
 - **UI kit**: Ant Design (`@refinedev/antd`) for batteries-included tables, forms, and filters suited to admin CRUD.
 - **Routing**: React Router, with nested routes for tenant scope.
-- **Data**: a custom Refine **data provider** that maps list/read/create/update/delete and `custom()` actions onto Gears API requests, consuming `x-odata-*` extensions and cursor pagination, and normalizing RFC-9457 errors. The provider calls a typed client generated from `/openapi.json` (e.g. `openapi-typescript`) to stay in sync with the spec.
+- **Data**: a custom Refine **data provider** that maps list/read/create/update/delete and `custom()` actions onto Gears API requests, consuming `x-odata-*` extensions and cursor pagination, and normalizing RFC-9457 errors. It issues requests through a small hand-written `apiFetch` helper (`src/httpClient.ts`) rather than a generated client; the spec is consumed **at runtime** for discovery — fields from component schemas, CRUD routes and custom actions from paths — so resources stay in sync with `/openapi.json` without a codegen build step.
 - **Auth**: Refine **auth provider** (bearer token) and **access-control provider** (`can()`), both wired to the admin-context endpoint and the platform security model.
 
 UI kit choice (Ant Design vs MUI) and the exact OpenAPI client tooling are refined in DESIGN; the framework decision (Refine) is fixed here.

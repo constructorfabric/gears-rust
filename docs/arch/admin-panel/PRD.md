@@ -355,7 +355,7 @@ The panel **SHOULD** expose nodes registry information, file-parser capabilities
 
 The panel **MUST** fetch the current admin context at startup — current principal, tenant, admin mode, enabled gears, and capabilities — and **MUST** show or hide resources based on backend capabilities, keeping backend authorization as the final authority.
 
-- **Rationale**: All navigation, mode selection, and capability gating depend on a context fetch; this endpoint does not exist today and must be built.
+- **Rationale**: All navigation, mode selection, and capability gating depend on a context fetch; this endpoint does not exist today and must be built. As implemented, the admin-context endpoint returns subject/tenant/mode/capabilities (the flat `AdminContextDto`), and **enabled gears are fetched separately** from `GET /gear-orchestrator/v1/gears` — so the context contract stays a thin identity/authorization projection.
 - **Actors**: `cpt-admin-panel-actor-platform-operator`, `cpt-admin-panel-actor-tenant-admin`, `cpt-admin-panel-actor-security-resolvers`
 
 #### Admin Role Stub
@@ -575,13 +575,18 @@ Demo/static auth and IdP plugins, and the v0 admin role stub, **MUST** be clearl
 
 ## 13. Open Questions
 
-- Where does the implementation live — embedded SPA in `apps/cf-gears-example-server` or a separate `constructorfabric/` repository plus a `make admin` sidecar? (Blocks DESIGN topology.)
-- Which gear owns the admin-context endpoint (account-management, API Gateway, or a new admin gear), and what is its exact shape?
-- How is admin mode represented beyond the v0 static stub — authorization action, token scope claim, or computed identity field?
-- Should the UI be driven purely by OpenAPI discovery, by explicit gear-contributed descriptors, or a hybrid, for v0 versus later?
-- Is a global `GET /tenants` list needed for platform admin, or is starting from the root tenant via children sufficient for v0?
-- Is the frontend stack confirmed as Refine, and is there a licensing constraint (must remain MIT/OSS)?
-- How does the SPA authenticate against a non-`auth_disabled` deployment — reuse the authn-resolver bearer flow or a dedicated admin login?
+**Resolved during implementation:**
+
+- ~~Where does the implementation live?~~ **Embedded in the monorepo for v0**, served by the example server at `/cf/admin`; extraction to a dedicated `constructorfabric/` repo is a follow-up ([ADR-0001](ADR/0001-cpt-admin-panel-adr-placement-and-delivery.md), 2026-07-13).
+- ~~Which gear owns the admin-context endpoint, and what is its shape?~~ **account-management**, `GET /account-management/v1/admin/context`, returning the flat `AdminContextDto` (subject, home tenant, admin mode, capabilities); enabled gears are read separately from the gear orchestrator ([ADR-0004](ADR/0004-cpt-admin-panel-adr-admin-role-and-context.md)).
+- ~~OpenAPI discovery vs gear-contributed descriptors vs hybrid?~~ **Concern-split**: API-intrinsic facts derived from OpenAPI at runtime, presentation/policy in a declarative panel-side JSON config — no per-project TypeScript, no framework change ([ADR-0003](ADR/0003-cpt-admin-panel-adr-resource-discovery.md), 2026-07-02).
+- ~~Is the frontend stack confirmed as Refine?~~ **Yes**, Refine + Ant Design (MIT) ([ADR-0002](ADR/0002-cpt-admin-panel-adr-frontend-framework.md)).
+- ~~How does the SPA authenticate against a non-`auth_disabled` deployment?~~ **Reuses the authn-resolver bearer flow** (dev tokens via the non-production static-auth stub for v0).
+
+**Still open (deferred, out of v0):**
+
+- How is admin mode represented beyond the v0 static stub — authorization action, token scope claim, or computed identity field? (The stub and the admin-context contract are designed so the production model can replace the stub without changing the frontend.)
+- Is a global `GET /tenants` list needed for platform admin, or is starting from the root tenant via children sufficient? (v0 uses the root + `/children`; owner of authz decides if a global list is added.)
 
 ## 14. Traceability
 

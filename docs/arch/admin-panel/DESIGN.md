@@ -346,31 +346,32 @@ Does not replace `/me`; does not store state; does not perform per-request enume
 
 - **Contracts**: `cpt-admin-panel-contract-openapi`
 - **Technology**: REST / OpenAPI (JSON), served under the API Gateway prefix `/cf`
-- **Location**: new admin-context endpoint (host gear settled in implementation — account-management, API Gateway, or a thin admin gear)
+- **Location**: admin-context endpoint hosted by **account-management** (`GET /cf/account-management/v1/admin/context`).
 
 **Endpoints Overview**:
 
 | Method | Path | Description | Stability |
 |--------|------|-------------|-----------|
-| `GET` | `/cf/<host>/v1/admin/context` | Returns principal, resolved tenant, admin mode, enabled gears, capabilities | unstable |
+| `GET` | `/cf/account-management/v1/admin/context` | Returns subject, home tenant, admin mode, capabilities | unstable |
+| `GET` | `/cf/gear-orchestrator/v1/gears` | Enabled gears + status (existing; read separately by the panel) | stable |
 | `GET` | `/cf/openapi.json` | Aggregated OpenAPI used for discovery (existing) | stable |
 | `GET` | `/cf/admin/*` | Static SPA assets with SPA fallback (existing server, new mount) | unstable |
 | `GET` | `/cf/account-management/v1/me` | Identity reflection (existing, unchanged) | stable |
 
-Admin-context response (illustrative shape; finalized in implementation):
+Admin-context response (the implemented flat `AdminContextDto`):
 
 ```json
 {
-  "principal": { "subject_id": "uuid", "subject_type": "platform_admin|tenant_admin|null" },
-  "tenant": { "id": "uuid", "name": "string", "root": true },
+  "subject_id": "uuid",
+  "subject_type": "platform_admin|tenant_admin|null",
+  "subject_tenant_id": "uuid",
   "admin_mode": "platform|tenant",
-  "enabled_gears": ["account-management", "resource-group", "types-registry", "gear-orchestrator"],
   "capabilities": ["tenants:read", "tenants:write", "tenants:suspend", "resource-groups:read", "..."],
   "non_production_auth": true
 }
 ```
 
-The v0 resources are driven by existing gear endpoints (account-management tenants/metadata/conversions, resource-group groups/memberships, types-registry entities, gear-orchestrator gears); the data provider consumes them via OpenAPI discovery. No gear API is modified for v0 except the addition of the admin-context endpoint.
+Enabled gears are intentionally **not** part of this response — the panel reads them separately from `GET /cf/gear-orchestrator/v1/gears`, so the admin-context contract stays a thin identity/authorization projection. The v0 resources are driven by existing gear endpoints (account-management tenants/metadata/conversions, resource-group groups/memberships, types-registry entities, gear-orchestrator gears); the data provider consumes them via OpenAPI discovery. No gear API is modified for v0 except the addition of the admin-context endpoint.
 
 ### 3.4 Internal Dependencies
 

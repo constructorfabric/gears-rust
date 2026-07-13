@@ -21,6 +21,9 @@ decision-makers: gears-rust admin-panel working group
 >
 > **Consequence:** the SPA becomes fully generic — **no per-project TypeScript and no framework changes.** The hardcoded in-app `registry.ts` is dropped: its API-intrinsic content comes from the spec, its presentation content moves to config. The `x-cf-admin-*` vendor-extension idea (Option-B transport) is **not required** and is retained only as a later optimization should a genuinely API-intrinsic fact appear that the spec cannot yet carry. This supersedes the "leaning toward vendor extensions" note above. Distribution (pre-built artifact + thin Rust loader, later extracted to a dedicated `constructorfabric/` repo) is tracked separately in [ADR-0001](0001-cpt-admin-panel-adr-placement-and-delivery.md).
 
+> **Revision (2026-07-13) — implemented; the sections below are the original decision record and are superseded by this note.**
+> The concern-split above is now the shipped design. In the codebase: `apps/admin-panel/src/resources/admin.config.json` holds declarative per-resource registration (list columns, labels, `schema` name, `basePath`, verb suppression, custom actions, option sources); `openapiOps.ts` derives CRUD routes and custom actions structurally from `/cf/openapi.json`; `openapi.ts` derives fields from component schemas. There is **no hardcoded in-app resource registry** — the "New v0 resources are added by editing the in-app registry" and "gear-contributed descriptor mechanism ... migration from the hardcoded registry" consequences below are obsolete. Adding an admin object is a JSON edit; a second project ships the same pre-built panel and edits only its own config. The gear-contributed-descriptor mechanism remains an optional future enhancement, not a v0 dependency.
+
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)
