@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::service::test_support;
 use crate::domain::ports::NewSession;
 use crate::domain::ports::NewSessionType;
 use crate::domain::session::LifecycleState;
@@ -128,6 +129,26 @@ impl SessionRepo for MockSessionRepo {
         _id: Uuid,
     ) -> std::result::Result<bool, ChatEngineError> {
         Ok(true)
+    }
+
+    // Scoped (Phase 4) surface used by the service under a permissive enforcer.
+    // These unit mocks ignore the scope and return the single fixed session.
+    async fn find_by_id_scoped(
+        &self,
+        _scope: &AccessScope,
+        session_id: Uuid,
+    ) -> std::result::Result<Option<Session>, ChatEngineError> {
+        let s = self.session.lock().clone();
+        Ok((s.session_id == session_id).then_some(s))
+    }
+
+    async fn update_metadata_scoped(
+        &self,
+        _scope: &AccessScope,
+        _session_id: Uuid,
+        _metadata: Option<JsonValue>,
+    ) -> std::result::Result<Session, ChatEngineError> {
+        Ok(self.session.lock().clone())
     }
 }
 
@@ -349,8 +370,8 @@ fn empty_stream_pending() -> PluginStream {
 
 // ----------------- Test fixtures -----------------
 
-fn make_identity() -> Identity {
-    Identity::new("t", "u", None).unwrap()
+fn make_ctx() -> SecurityContext {
+    test_support::ctx_allow_tenants(&[Uuid::new_v4()])
 }
 
 fn make_service(
@@ -372,6 +393,7 @@ fn make_service(
         session_types as Arc<dyn SessionTypeRepo>,
         messages.clone() as Arc<dyn MessageRepo>,
         plugin_service,
+        test_support::enforcer_allow(),
     );
     (svc, sessions, messages)
 }
@@ -425,7 +447,7 @@ async fn happy_path_emits_start_chunks_complete() {
     let req = make_request(sessions.session_id());
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .send_message(req, make_identity(), cancel)
+        .send_message(req, &make_ctx(), cancel)
         .await
         .expect("send_message dispatch");
 
@@ -466,7 +488,7 @@ async fn mid_stream_cancellation_finalizes_with_cancelled() {
     let req = make_request(sessions.session_id());
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .send_message(req, make_identity(), cancel.clone())
+        .send_message(req, &make_ctx(), cancel.clone())
         .await
         .expect("send_message dispatch");
 
@@ -503,7 +525,7 @@ async fn pre_stream_timeout_maps_to_backend_unavailable() {
 
     let req = make_request(sessions.session_id());
     let cancel = CancellationToken::new();
-    let result = svc.send_message(req, make_identity(), cancel).await;
+    let result = svc.send_message(req, &make_ctx(), cancel).await;
     let err = match result {
         Ok(_) => panic!("pre-stream timeout must surface as Err"),
         Err(e) => e,
@@ -547,7 +569,7 @@ async fn mid_stream_err_emits_streaming_error_event_and_finalizes() {
     let req = make_request(sessions.session_id());
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .send_message(req, make_identity(), cancel)
+        .send_message(req, &make_ctx(), cancel)
         .await
         .expect("send_message dispatch");
 
@@ -593,7 +615,7 @@ async fn empty_content_rejected_as_bad_request() {
     let mut req = make_request(sessions.session_id());
     req.parts = vec![];
     let cancel = CancellationToken::new();
-    let result = svc.send_message(req, make_identity(), cancel).await;
+    let result = svc.send_message(req, &make_ctx(), cancel).await;
     let err = match result {
         Ok(_) => panic!("message with no parts must be rejected"),
         Err(e) => e,
@@ -620,7 +642,7 @@ async fn capability_not_in_session_rejected() {
         value: serde_json::json!(true),
     }]);
     let cancel = CancellationToken::new();
-    let result = svc.send_message(req, make_identity(), cancel).await;
+    let result = svc.send_message(req, &make_ctx(), cancel).await;
     let err = match result {
         Ok(_) => panic!("disallowed capability must be rejected"),
         Err(e) => e,
@@ -797,6 +819,7 @@ fn make_strategy_service(active_path: Vec<Message>) -> (MessageService, Arc<Scri
         session_types as Arc<dyn SessionTypeRepo>,
         messages.clone() as Arc<dyn MessageRepo>,
         plugins,
+        test_support::enforcer_allow(),
     );
     (svc, messages)
 }
@@ -1008,6 +1031,7 @@ fn make_service_with_session_repo(sessions: Arc<MockSessionRepo>) -> MessageServ
         session_types as Arc<dyn SessionTypeRepo>,
         messages as Arc<dyn MessageRepo>,
         plugins,
+        test_support::enforcer_allow(),
     )
 }
 
@@ -1018,7 +1042,7 @@ async fn update_strategy_rejects_invalid_window() {
     let svc = make_service_with_session_repo(repo);
     let err = svc
         .update_memory_strategy(
-            &make_identity(),
+            &make_ctx(),
             session_id,
             MemoryStrategy::SlidingWindow { window_size: 0 },
         )
@@ -1034,7 +1058,7 @@ async fn update_strategy_rejects_summarized_below_two() {
     let svc = make_service_with_session_repo(repo);
     let err = svc
         .update_memory_strategy(
-            &make_identity(),
+            &make_ctx(),
             session_id,
             MemoryStrategy::Summarized {
                 recent_messages_to_keep: 1,
@@ -1051,7 +1075,7 @@ async fn update_strategy_rejects_soft_deleted_session() {
     let session_id = repo.session_id();
     let svc = make_service_with_session_repo(repo);
     let err = svc
-        .update_memory_strategy(&make_identity(), session_id, MemoryStrategy::Full)
+        .update_memory_strategy(&make_ctx(), session_id, MemoryStrategy::Full)
         .await
         .expect_err("soft_deleted rejected as 409");
     assert!(matches!(err, ChatEngineError::Conflict { .. }));
@@ -1063,7 +1087,7 @@ async fn update_strategy_rejects_hard_deleted_session() {
     let session_id = repo.session_id();
     let svc = make_service_with_session_repo(repo);
     let err = svc
-        .update_memory_strategy(&make_identity(), session_id, MemoryStrategy::Full)
+        .update_memory_strategy(&make_ctx(), session_id, MemoryStrategy::Full)
         .await
         .expect_err("hard_deleted rejected as 409");
     assert!(matches!(err, ChatEngineError::Conflict { .. }));
@@ -1075,7 +1099,7 @@ async fn update_strategy_accepts_active_session() {
     let session_id = repo.session_id();
     let svc = make_service_with_session_repo(repo);
     svc.update_memory_strategy(
-        &make_identity(),
+        &make_ctx(),
         session_id,
         MemoryStrategy::SlidingWindow { window_size: 4 },
     )
@@ -1088,7 +1112,7 @@ async fn update_strategy_accepts_archived_session() {
     let repo = make_repo_with_state("archived");
     let session_id = repo.session_id();
     let svc = make_service_with_session_repo(repo);
-    svc.update_memory_strategy(&make_identity(), session_id, MemoryStrategy::Full)
+    svc.update_memory_strategy(&make_ctx(), session_id, MemoryStrategy::Full)
         .await
         .expect("archived session accepts strategy update");
 }
@@ -1384,6 +1408,26 @@ impl MessageRepo for DeleteMessageRepo {
         }
         Ok(removed)
     }
+
+    // Scoped (Phase 4) surface: delete_message_cascade runs under a permissive
+    // enforcer here, so the mock delegates to the unscoped logic above.
+    async fn find_message_in_session_scoped(
+        &self,
+        _scope: &AccessScope,
+        session_id: Uuid,
+        message_id: Uuid,
+    ) -> std::result::Result<Option<Message>, ChatEngineError> {
+        self.find_message_in_session(session_id, message_id).await
+    }
+
+    async fn delete_message_subtree_scoped(
+        &self,
+        _scope: &AccessScope,
+        session_id: Uuid,
+        root_id: Uuid,
+    ) -> std::result::Result<u64, ChatEngineError> {
+        self.delete_message_subtree(session_id, root_id).await
+    }
 }
 
 /// Snapshot webhook emitter that records every emitted event in a
@@ -1460,6 +1504,7 @@ fn make_delete_fixture(
         session_types as Arc<dyn SessionTypeRepo>,
         messages.clone() as Arc<dyn MessageRepo>,
         plugins,
+        test_support::enforcer_allow(),
     )
     .with_webhook_emitter(webhooks.clone() as Arc<dyn WebhookEmitter>);
     (svc, sessions, messages, webhooks)
@@ -1519,8 +1564,10 @@ async fn delete_cascade_happy_path_removes_subtree_and_reactions() {
     assert_eq!(messages.message_count(), 5);
     assert_eq!(messages.reaction_count(), 5);
 
+    let tenant = Uuid::new_v4();
+    let user = Uuid::new_v4();
     let outcome = svc
-        .delete_message_cascade(&make_identity(), session_id, target_id)
+        .delete_message_cascade(&test_support::ctx_for_subject(user, tenant), session_id, target_id)
         .await
         .expect("happy path cascade");
 
@@ -1554,8 +1601,8 @@ async fn delete_cascade_happy_path_removes_subtree_and_reactions() {
         } => {
             assert_eq!(*ev_session, session_id);
             assert_eq!(*ev_msg, target_id);
-            assert_eq!(tenant_id, "t");
-            assert_eq!(user_id, "u");
+            assert_eq!(tenant_id, &tenant.to_string());
+            assert_eq!(user_id, &user.to_string());
             assert_eq!(*deleted_count, 3);
         }
         other => panic!("expected MessageDeleted, got {other:?}"),
@@ -1576,7 +1623,7 @@ async fn delete_root_returns_conflict_without_writes() {
     messages.insert(child);
 
     let err = svc
-        .delete_message_cascade(&make_identity(), session_id, root_id)
+        .delete_message_cascade(&make_ctx(), session_id, root_id)
         .await
         .expect_err("root delete must 409");
     assert!(matches!(err, ChatEngineError::Conflict { .. }));
@@ -1593,49 +1640,13 @@ async fn delete_root_returns_conflict_without_writes() {
     );
 }
 
-#[tokio::test]
-async fn delete_cross_tenant_returns_forbidden() {
-    let (svc, sessions, messages, webhooks) = make_delete_fixture("tenant-a", "u");
-    let session_id = sessions.session_id();
-    let root = delete_message_row(session_id, None);
-    let target = delete_message_row(session_id, Some(root.message_id));
-    let target_id = target.message_id;
-    messages.insert(root);
-    messages.insert(target);
-
-    let other_tenant = Identity::new("tenant-b", "u", None).unwrap();
-    let err = svc
-        .delete_message_cascade(&other_tenant, session_id, target_id)
-        .await
-        .expect_err("cross-tenant must 403");
-    assert!(matches!(err, ChatEngineError::Forbidden { .. }));
-    // No subtree mutation.
-    assert!(messages.has_message(target_id));
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(webhooks.snapshot().is_empty());
-}
-
-#[tokio::test]
-async fn delete_cross_user_same_tenant_returns_not_found() {
-    let (svc, sessions, messages, webhooks) = make_delete_fixture("t", "owner");
-    let session_id = sessions.session_id();
-    let root = delete_message_row(session_id, None);
-    let target = delete_message_row(session_id, Some(root.message_id));
-    let target_id = target.message_id;
-    messages.insert(root);
-    messages.insert(target);
-
-    // Different user, same tenant → 404 (anti-enumeration).
-    let other_user = Identity::new("t", "intruder", None).unwrap();
-    let err = svc
-        .delete_message_cascade(&other_user, session_id, target_id)
-        .await
-        .expect_err("cross-user must 404");
-    assert!(matches!(err, ChatEngineError::NotFound { .. }));
-    assert!(messages.has_message(target_id));
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(webhooks.snapshot().is_empty());
-}
+// NOTE: the old `delete_cross_tenant_returns_forbidden` /
+// `delete_cross_user_same_tenant_returns_not_found` tests asserted the
+// pre-Phase-4 `check_session_scope` behavior (403/404), which no longer exists —
+// delete_message_cascade now gates via access_scope(MESSAGE, delete) and a
+// scoped find. The cross-tenant → 404 semantics are covered by
+// `delete_message_wrong_tenant_returns_not_found` in the real-DB authz suite
+// below.
 
 #[tokio::test]
 async fn delete_missing_message_returns_not_found() {
@@ -1644,7 +1655,7 @@ async fn delete_missing_message_returns_not_found() {
     // No messages inserted — target id resolves to nothing.
     let phantom_id = Uuid::new_v4();
     let err = svc
-        .delete_message_cascade(&make_identity(), session_id, phantom_id)
+        .delete_message_cascade(&make_ctx(), session_id, phantom_id)
         .await
         .expect_err("missing message must 404");
     assert!(matches!(err, ChatEngineError::NotFound { .. }));
@@ -1666,14 +1677,14 @@ async fn delete_idempotent_re_delete_returns_not_found() {
 
     // First delete succeeds.
     let outcome = svc
-        .delete_message_cascade(&make_identity(), session_id, target_id)
+        .delete_message_cascade(&make_ctx(), session_id, target_id)
         .await
         .expect("first delete succeeds");
     assert_eq!(outcome.deleted_count, 1);
 
     // Second delete — target no longer exists → 404.
     let err = svc
-        .delete_message_cascade(&make_identity(), session_id, target_id)
+        .delete_message_cascade(&make_ctx(), session_id, target_id)
         .await
         .expect_err("re-delete must 404");
     assert!(matches!(err, ChatEngineError::NotFound { .. }));
@@ -1694,10 +1705,196 @@ async fn delete_missing_session_returns_not_found() {
     let phantom_session = Uuid::new_v4();
     let phantom_message = Uuid::new_v4();
     let err = svc
-        .delete_message_cascade(&make_identity(), phantom_session, phantom_message)
+        .delete_message_cascade(&make_ctx(), phantom_session, phantom_message)
         .await
         .expect_err("missing session must 404");
     assert!(matches!(err, ChatEngineError::NotFound { .. }));
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(webhooks.snapshot().is_empty());
+}
+
+// ===========================================================================
+// Authorization suite (Phase 8) — real Sea-ORM repos over in-memory SQLite +
+// mock PDP, exercising the enforcer -> AccessScope -> SecureORM flow.
+// ===========================================================================
+
+/// Seed a session + a (user, assistant) message pair via the real repo. The
+/// child owner pair is inherited from the session in the same transaction
+/// (internal_write_scope path). Returns the assistant (non-root) message id.
+async fn seed_session_with_message(
+    db: &std::sync::Arc<crate::infra::db::repo::ChatEngineDb>,
+    tenant: Uuid,
+    user: Uuid,
+) -> (Uuid, InsertedPair) {
+    let session_id = Uuid::new_v4();
+    test_support::seed_session(db, session_id, tenant, user).await;
+    let ins = test_support::message_repo(db)
+        .insert_user_and_assistant_stub(NewUserMessage {
+            session_id,
+            tenant_id: Some(tenant.to_string()),
+            user_id: Some(user.to_string()),
+            parent_message_id: None,
+            parts: vec![MessagePartInput {
+                part_type: chat_engine_sdk::models::MessagePartType::Text,
+                content: serde_json::json!({ "text": "hi" }),
+                file_citations: vec![],
+                link_citations: vec![],
+                references: vec![],
+            }],
+            file_ids: None,
+            metadata: None,
+        })
+        .await
+        .expect("seed message");
+    (session_id, ins)
+}
+
+// --- PDP deny (Denied) -> 403 ---------------------------------------------
+
+#[tokio::test]
+async fn pdp_denied_list_messages_returns_forbidden() {
+    let db = test_support::inmem_db().await;
+    let svc = test_support::build_message_service(&db, test_support::enforcer_deny());
+    let err = svc
+        .list_active_messages(&make_ctx(), Uuid::new_v4(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn pdp_denied_get_message_returns_forbidden() {
+    let db = test_support::inmem_db().await;
+    let svc = test_support::build_message_service(&db, test_support::enforcer_deny());
+    let err = svc
+        .resolve_owned_message(&make_ctx(), Uuid::new_v4())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn pdp_denied_delete_message_returns_forbidden() {
+    let db = test_support::inmem_db().await;
+    let svc = test_support::build_message_service(&db, test_support::enforcer_deny());
+    let err = svc
+        .delete_message_cascade(&make_ctx(), Uuid::new_v4(), Uuid::new_v4())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn pdp_denied_send_message_returns_forbidden() {
+    let db = test_support::inmem_db().await;
+    let (tenant, user) = (Uuid::new_v4(), Uuid::new_v4());
+    let session_id = Uuid::new_v4();
+    test_support::seed_session(&db, session_id, tenant, user).await;
+
+    let svc = test_support::build_message_service(&db, test_support::enforcer_deny());
+    // send_message returns a non-Debug BoxStream on Ok, so match instead of unwrap_err.
+    let res = svc
+        .send_message(
+            make_request(session_id),
+            &test_support::ctx_for_subject(user, tenant),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(res, Err(ChatEngineError::Forbidden { .. })),
+        "expected Forbidden from DenyAll on send"
+    );
+}
+
+// --- EvaluationFailed / CompileFailed -> 403 (fail-closed) ----------------
+
+#[tokio::test]
+async fn evaluation_failed_list_messages_returns_forbidden() {
+    let db = test_support::inmem_db().await;
+    let svc = test_support::build_message_service(&db, test_support::enforcer_failing());
+    let err = svc
+        .list_active_messages(&make_ctx(), Uuid::new_v4(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn compile_failed_list_messages_returns_forbidden() {
+    let db = test_support::inmem_db().await;
+    let svc = test_support::build_message_service(&db, test_support::enforcer_compile_fail());
+    let err = svc
+        .list_active_messages(&make_ctx(), Uuid::new_v4(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+}
+
+// --- Point-op scope-miss -> 404 (anti-enumeration) ------------------------
+
+#[tokio::test]
+async fn get_message_wrong_tenant_returns_not_found() {
+    let db = test_support::inmem_db().await;
+    let (_sid, ins) = seed_session_with_message(&db, Uuid::new_v4(), Uuid::new_v4()).await;
+
+    let svc = test_support::build_message_service(&db, test_support::enforcer_allow());
+    let err = svc
+        .resolve_owned_message(&test_support::ctx_allow_tenants(&[Uuid::new_v4()]), ins.user_message_id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "cross-tenant message read must 404, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_message_wrong_tenant_returns_not_found() {
+    let db = test_support::inmem_db().await;
+    let (session_id, ins) = seed_session_with_message(&db, Uuid::new_v4(), Uuid::new_v4()).await;
+
+    let svc = test_support::build_message_service(&db, test_support::enforcer_allow());
+    let err = svc
+        .delete_message_cascade(
+            &test_support::ctx_allow_tenants(&[Uuid::new_v4()]),
+            session_id,
+            ins.assistant_message_id,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "cross-tenant message delete must 404, got: {err:?}"
+    );
+}
+
+// --- Denormalization invariant --------------------------------------------
+
+// @cpt-cf-chat-engine-principle-owner-denorm-invariant
+#[tokio::test]
+async fn internal_write_copies_owner_pair_from_session() {
+    use crate::infra::db::entity::message::{self, Entity as MessageEntity};
+    use sea_orm::{ColumnTrait, Condition, EntityTrait};
+    use toolkit_db::secure::{AccessScope, SecureEntityExt};
+
+    let db = test_support::inmem_db().await;
+    let (tenant, user) = (Uuid::new_v4(), Uuid::new_v4());
+    let (_session_id, ins) = seed_session_with_message(&db, tenant, user).await;
+
+    // The raw DatabaseConnection is hidden by the secure layer, so verify the
+    // stored owner pair via a tenant-scoped secure read on the entity model:
+    // the row is returned ONLY if owner_tenant_id == tenant (tenant half), then
+    // assert owner_id == session.user_id (owner half).
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::for_tenant(tenant);
+    let row = MessageEntity::find()
+        .secure()
+        .scope_with(&scope)
+        .filter(Condition::all().add(message::Column::MessageId.eq(ins.user_message_id)))
+        .one(&conn)
+        .await
+        .expect("query message")
+        .expect("message row visible under session tenant scope");
+    assert_eq!(row.owner_tenant_id, tenant, "child inherits session owner_tenant_id");
+    assert_eq!(row.owner_id, user, "child inherits session owner_id");
 }
