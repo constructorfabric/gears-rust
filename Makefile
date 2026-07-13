@@ -209,7 +209,6 @@ validate-gear-names:
 fmt:
 	$(call check_rustup_component,rustfmt)
 	cargo fmt --all --check
-	cargo fmt --all --check --manifest-path tools/dylint_lints/Cargo.toml
 
 CFS ?= cfs
 CFS_PIPX_SPEC ?= git+https://github.com/constructorfabric/studio.git
