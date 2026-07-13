@@ -21,6 +21,7 @@ use chat_engine_sdk::{
     stream_from_events,
 };
 
+pub mod authz;
 pub mod db;
 
 /// Plugin script — what events (or error / hang) the fake plugin produces on
