@@ -49,17 +49,24 @@ export function deriveOps(spec: OpenApiPaths, basePath: string): DerivedOps {
   const paths = spec.paths ?? {};
   const has = (k: string, m: string): boolean =>
     Boolean(paths[k]) && m in paths[k];
-  const keys = Object.keys(paths).filter(
-    (k) => k === basePath || k.startsWith(`${basePath}/`),
-  );
 
+  // Match spec paths *structurally*: a descriptor's `basePath` uses the config's
+  // own placeholder convention (`{tenant}`), which need not equal the spec's
+  // parameter names (`{tenant_id}`). Collapse every path parameter to a single
+  // wildcard before comparing so `{tenant}` lines up with `{tenant_id}`. The
+  // templates returned are the spec's *real* keys, so `resolvePath` fills the
+  // real parameters (it keys off `/tenant/i`, not an exact name).
+  const norm = (s: string): string => s.replace(/\{[^/]+\}/g, "{}");
+  const bp = norm(basePath);
+  const specKeys = Object.keys(paths);
+
+  const collection = specKeys.find((k) => norm(k) === bp);
   // Item path = collection + a single path parameter segment.
-  const itemRe = new RegExp(`^${escapeRe(basePath)}/\\{[^/]+\\}$`);
-  const item = keys.find((k) => itemRe.test(k));
+  const item = specKeys.find((k) => norm(k) === `${bp}/{}`);
 
   const templates: Partial<Record<Verb, string>> = {};
-  if (has(basePath, "get")) templates.list = basePath;
-  if (has(basePath, "post")) templates.create = basePath;
+  if (collection && has(collection, "get")) templates.list = collection;
+  if (collection && has(collection, "post")) templates.create = collection;
 
   let updateMethod: "PUT" | "PATCH" | undefined;
   if (item) {
@@ -74,13 +81,14 @@ export function deriveOps(spec: OpenApiPaths, basePath: string): DerivedOps {
     if (has(item, "delete")) templates.remove = item;
   }
 
-  // Actions are POST-only leaves under the item path. A leaf that also has a
-  // GET is a sub-collection (e.g. `/tenants/{id}/users`), not an action.
+  // Actions are POST-only literal leaves under the item path. A leaf that also
+  // has a GET is a sub-collection (e.g. `/tenants/{id}/users`), not an action;
+  // a leaf that is itself a parameter (`{...}`) is a nested record, not a verb.
   const actions: DerivedAction[] = [];
   if (item) {
-    const actRe = new RegExp(`^${escapeRe(item)}/([a-z0-9-]+)$`);
-    for (const k of keys) {
-      const m = actRe.exec(k);
+    const actRe = new RegExp(`^${escapeRe(norm(item))}/([a-z0-9-]+)$`);
+    for (const k of specKeys) {
+      const m = actRe.exec(norm(k));
       if (m && has(k, "post") && !has(k, "get")) {
         actions.push({ name: m[1], method: "POST", template: k });
       }

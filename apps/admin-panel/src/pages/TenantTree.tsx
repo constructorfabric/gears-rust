@@ -88,8 +88,15 @@ export const TenantTree = () => {
     if (!expanded) return;
     const loaded = record.children?.some((c) => !isPlaceholder(c));
     if (loaded) return;
-    const kids = await fetchChildren(id);
-    setRows((prev) => injectChildren(prev, id, kids));
+    try {
+      const kids = await fetchChildren(id);
+      setRows((prev) => injectChildren(prev, id, kids));
+    } catch (e) {
+      // Surface the failure instead of swallowing it: collapse the node again
+      // and show the error so the expander doesn't sit on an empty placeholder.
+      setExpandedKeys((prev) => prev.filter((k) => k !== id));
+      setError((e as Error).message);
+    }
   };
 
   if (error) {
