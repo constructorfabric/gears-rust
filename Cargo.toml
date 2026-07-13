@@ -344,7 +344,7 @@ tracing-opentelemetry = "0.32"
 tracing-appender = "0.2"
 tracing-test = "0.2"
 opentelemetry = { version = "0.31", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.31", features = [
     "grpc-tonic",
     "http-proto",
