@@ -41,14 +41,6 @@ impl MigrationTrait for Migration {
         // Guard 1: abort on any NULL values (NULLs cast to NULL and would
         // violate the NOT NULL invariant; they are not caught by the cast guard).
         let null_count: i64 = {
-            let result = db
-                .execute_unprepared(
-                    "SELECT COUNT(*) FROM sessions \
-                     WHERE tenant_id IS NULL OR user_id IS NULL",
-                )
-                .await?;
-            // execute_unprepared doesn't return rows; use query_one instead.
-            drop(result);
             let row = db
                 .query_one(sea_orm_migration::sea_orm::Statement::from_string(
                     backend,

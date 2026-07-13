@@ -729,10 +729,9 @@ pub trait SessionRepo: Send + Sync {
     // @cpt-cf-chat-engine-interface-pep
     async fn list_scoped(
         &self,
-        scope: &AccessScope,
-        query: &ODataQuery,
+        _scope: &AccessScope,
+        _query: &ODataQuery,
     ) -> Result<Page<Session>, ChatEngineError> {
-        let _ = (scope, query);
         Err(ChatEngineError::internal(
             "list_scoped not implemented for this repository",
         ))

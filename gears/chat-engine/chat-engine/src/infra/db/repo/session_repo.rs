@@ -49,6 +49,16 @@ use crate::infra::db::entity::session::{self as session_entity, Entity as Sessio
 use crate::infra::db::odata_mapper::{SessionODataMapper, SessionQueryFilterField};
 use crate::infra::db::repo::ChatEngineDb;
 
+/// Parse a `sessions` owner identifier (tenant/user) into its `Uuid` column
+/// value. The strings always originate from a `SecurityContext` UUID, so a
+/// parse failure is an internal invariant break rather than a client error —
+/// surfaced as a fail-closed internal error instead of a panic.
+fn parse_owner_uuid(value: &str, field: &str) -> Result<Uuid, ChatEngineError> {
+    value.parse::<Uuid>().map_err(|err| {
+        ChatEngineError::internal(format!("session {field} is not a valid UUID: {err}"))
+    })
+}
+
 /// Maximum results returned per page.
 pub const MAX_PAGE_SIZE: u32 = 100;
 
@@ -138,10 +148,12 @@ impl SeaSessionRepo {
 impl SessionRepo for SeaSessionRepo {
     async fn insert(&self, new: NewSession) -> Result<Session, ChatEngineError> {
         use sea_orm::ActiveValue::{NotSet, Set};
+        let tenant_uuid = parse_owner_uuid(&new.tenant_id, "tenant_id")?;
+        let user_uuid = parse_owner_uuid(&new.user_id, "user_id")?;
         let model = session_entity::ActiveModel {
             session_id: Set(new.session_id),
-            tenant_id: Set(new.tenant_id.parse::<Uuid>().expect("TenantId was always a UUID string")),
-            user_id: Set(new.user_id.parse::<Uuid>().expect("UserId was always a UUID string")),
+            tenant_id: Set(tenant_uuid),
+            user_id: Set(user_uuid),
             client_id: Set(new.client_id),
             session_type_id: Set(new.session_type_id),
             enabled_capabilities: Set(None),
@@ -696,16 +708,12 @@ impl SessionRepo for SeaSessionRepo {
         new: NewSession,
     ) -> Result<Session, ChatEngineError> {
         use sea_orm::ActiveValue::{NotSet, Set};
+        let tenant_uuid = parse_owner_uuid(&new.tenant_id, "tenant_id")?;
+        let user_uuid = parse_owner_uuid(&new.user_id, "user_id")?;
         let model = session_entity::ActiveModel {
             session_id: Set(new.session_id),
-            tenant_id: Set(new
-                .tenant_id
-                .parse::<Uuid>()
-                .expect("TenantId was always a UUID string")),
-            user_id: Set(new
-                .user_id
-                .parse::<Uuid>()
-                .expect("UserId was always a UUID string")),
+            tenant_id: Set(tenant_uuid),
+            user_id: Set(user_uuid),
             client_id: Set(new.client_id),
             session_type_id: Set(new.session_type_id),
             enabled_capabilities: Set(None),
