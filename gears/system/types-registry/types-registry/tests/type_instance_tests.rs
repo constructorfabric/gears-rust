@@ -6,6 +6,8 @@ mod common;
 
 use common::create_service;
 use serde_json::json;
+use toolkit_gts::gts_id;
+use toolkit_gts::gts_uri;
 use types_registry::domain::model::ListQuery;
 
 // =============================================================================
@@ -19,7 +21,7 @@ async fn test_type_with_valid_instances() {
     // Register a base type schema (User type)
     // Types end with ~ and define the schema
     let user_type = json!({
-        "$id": "gts://gts.acme.core.models.user.v1~",
+        "$id": gts_uri!("acme.core.models.user.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -46,7 +48,7 @@ async fn test_type_with_valid_instances() {
     // Instances have format: parent~instance (at least 2 segments)
     // Note: "type" field is not needed - schema ID is derived from $id
     let valid_instance1 = json!({
-        "id": "gts.acme.core.models.user.v1~acme.core.instances.user1.v1",
+        "id": gts_id!("acme.core.models.user.v1~acme.core.instances.user1.v1"),
         "userId": "user-001",
         "email": "alice@example.com",
         "age": 30,
@@ -54,7 +56,7 @@ async fn test_type_with_valid_instances() {
     });
 
     let valid_instance2 = json!({
-        "id": "gts.acme.core.models.user.v1~acme.core.instances.user2.v1",
+        "id": gts_id!("acme.core.models.user.v1~acme.core.instances.user2.v1"),
         "userId": "user-002",
         "email": "bob@example.com"
         // age and isActive are optional
@@ -75,11 +77,15 @@ async fn test_type_with_valid_instances() {
     );
 
     // Verify instances are retrievable
-    let i1 = service.get("gts.acme.core.models.user.v1~acme.core.instances.user1.v1");
+    let i1 = service.get(gts_id!(
+        "acme.core.models.user.v1~acme.core.instances.user1.v1"
+    ));
     assert!(i1.is_ok());
     assert!(i1.unwrap().is_instance());
 
-    let i2 = service.get("gts.acme.core.models.user.v1~acme.core.instances.user2.v1");
+    let i2 = service.get(gts_id!(
+        "acme.core.models.user.v1~acme.core.instances.user2.v1"
+    ));
     assert!(i2.is_ok());
 }
 
@@ -89,7 +95,7 @@ async fn test_type_with_invalid_instance_missing_required_field() {
 
     // Register a type with required fields
     let order_type = json!({
-        "$id": "gts://gts.acme.core.models.order.v1~",
+        "$id": gts_uri!("acme.core.models.order.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -107,7 +113,7 @@ async fn test_type_with_invalid_instance_missing_required_field() {
     // Try to register an instance missing required "total" field
     // Note: "type" field is not needed - schema ID is derived from $id
     let invalid_instance = json!({
-        "id": "gts.acme.core.models.order.v1~acme.core.instances.order1.v1",
+        "id": gts_id!("acme.core.models.order.v1~acme.core.instances.order1.v1"),
         "orderId": "order-001",
         "customerId": "cust-001"
         // Missing required "total" field
@@ -129,7 +135,7 @@ async fn test_type_with_invalid_instance_wrong_field_type() {
 
     // Register a type with specific field types
     let product_type = json!({
-        "$id": "gts://gts.acme.core.models.product.v1~",
+        "$id": gts_uri!("acme.core.models.product.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -148,7 +154,7 @@ async fn test_type_with_invalid_instance_wrong_field_type() {
     // Try to register an instance with wrong type for "price" (string instead of number)
     // Note: "type" field is not needed - schema ID is derived from $id
     let invalid_instance = json!({
-        "id": "gts.acme.core.models.product.v1~acme.core.instances.prod1.v1",
+        "id": gts_id!("acme.core.models.product.v1~acme.core.instances.prod1.v1"),
         "productId": "prod-001",
         "name": "Widget",
         "price": "not-a-number",  // Should be a number
@@ -171,7 +177,7 @@ async fn test_multiple_instances_of_same_type() {
 
     // Register an event type
     let event_type = json!({
-        "$id": "gts://gts.acme.core.events.user_action.v1~",
+        "$id": gts_uri!("acme.core.events.user_action.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -191,21 +197,21 @@ async fn test_multiple_instances_of_same_type() {
     // Note: "type" field is not needed - schema ID is derived from $id
     let instances = vec![
         json!({
-            "id": "gts.acme.core.events.user_action.v1~acme.core.instances.event1.v1",
+            "id": gts_id!("acme.core.events.user_action.v1~acme.core.instances.event1.v1"),
             "eventId": "evt-001",
             "userId": "user-001",
             "action": "login",
             "timestamp": "2024-01-15T10:30:00Z"
         }),
         json!({
-            "id": "gts.acme.core.events.user_action.v1~acme.core.instances.event2.v1",
+            "id": gts_id!("acme.core.events.user_action.v1~acme.core.instances.event2.v1"),
             "eventId": "evt-002",
             "userId": "user-001",
             "action": "purchase",
             "timestamp": "2024-01-15T11:00:00Z"
         }),
         json!({
-            "id": "gts.acme.core.events.user_action.v1~acme.core.instances.event3.v1",
+            "id": gts_id!("acme.core.events.user_action.v1~acme.core.instances.event3.v1"),
             "eventId": "evt-003",
             "userId": "user-002",
             "action": "logout",
@@ -243,7 +249,7 @@ async fn test_nested_object_type_with_instance() {
 
     // Register a complex type with nested objects
     let customer_type = json!({
-        "$id": "gts://gts.acme.core.models.customer.v1~",
+        "$id": gts_uri!("acme.core.models.customer.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -269,7 +275,7 @@ async fn test_nested_object_type_with_instance() {
     // Register a valid customer instance with nested address
     // Note: "type" field is not needed - schema ID is derived from $id
     let valid_customer = json!({
-        "id": "gts.acme.core.models.customer.v1~acme.core.instances.cust1.v1",
+        "id": gts_id!("acme.core.models.customer.v1~acme.core.instances.cust1.v1"),
         "customerId": "cust-001",
         "name": "Acme Corp",
         "billingAddress": {
@@ -287,7 +293,9 @@ async fn test_nested_object_type_with_instance() {
     );
 
     // Verify the instance
-    let customer = service.get("gts.acme.core.models.customer.v1~acme.core.instances.cust1.v1");
+    let customer = service.get(gts_id!(
+        "acme.core.models.customer.v1~acme.core.instances.cust1.v1"
+    ));
     assert!(customer.is_ok());
     assert!(customer.unwrap().is_instance());
 }
@@ -298,7 +306,7 @@ async fn test_array_type_with_instance() {
 
     // Register a type with array properties
     let cart_type = json!({
-        "$id": "gts://gts.acme.core.models.cart.v1~",
+        "$id": gts_uri!("acme.core.models.cart.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -325,7 +333,7 @@ async fn test_array_type_with_instance() {
     // Register a valid cart instance with array items
     // Note: "type" field is not needed - schema ID is derived from $id
     let valid_cart = json!({
-        "id": "gts.acme.core.models.cart.v1~acme.core.instances.cart1.v1",
+        "id": gts_id!("acme.core.models.cart.v1~acme.core.instances.cart1.v1"),
         "cartId": "cart-001",
         "items": [
             { "productId": "prod-001", "quantity": 2 },
@@ -347,7 +355,7 @@ async fn test_instance_with_mismatched_type_field_is_ignored_for_well_known_inst
 
     // Register two different type schemas
     let user_type = json!({
-        "$id": "gts://gts.acme.core.models.user.v1~",
+        "$id": gts_uri!("acme.core.models.user.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -359,7 +367,7 @@ async fn test_instance_with_mismatched_type_field_is_ignored_for_well_known_inst
     });
 
     let product_type = json!({
-        "$id": "gts://gts.acme.core.models.product.v1~",
+        "$id": gts_uri!("acme.core.models.product.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -378,8 +386,8 @@ async fn test_instance_with_mismatched_type_field_is_ignored_for_well_known_inst
     // - "type" field explicitly claims parent is "product" type (gts.acme.core.models.product.v1~)
     // Chained GTS ID ALWAYS takes priority over explicit type field, so validation uses user schema
     let mismatched_instance = json!({
-        "id": "gts.acme.core.models.user.v1~acme.core.instances.user1.v1",
-        "type": "gts.acme.core.models.product.v1~",
+        "id": gts_id!("acme.core.models.user.v1~acme.core.instances.user1.v1"),
+        "type": gts_id!("acme.core.models.product.v1~"),
         "userId": "user-001",
         "name": "Alice"
     });

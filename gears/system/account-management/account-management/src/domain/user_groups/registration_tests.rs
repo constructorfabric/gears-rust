@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
 use resource_group_sdk::{
@@ -50,7 +51,7 @@ use super::{USER_GROUP_TYPE_CODE, USER_MEMBERSHIP_TYPE};
 // synthesize the canonical errors the real RG ladder emits, so the
 // production code's `.map_err(ResourceGroupError::from)` dispatch
 // (NotFound vs. transport failure) is exercised exactly as in prod.
-#[resource_error("gts.cf.core.resource_group.group.v1~")]
+#[resource_error(gts_id!("cf.core.resource_group.group.v1~"))]
 struct RgErr;
 
 fn rg_not_found(code: &str) -> CanonicalError {
@@ -491,8 +492,8 @@ async fn container_loose_extras_accepted() {
     // the previous single-type "extras accepted" test, now exercised
     // against the post-Path-D two-type spec.
     let row = FakeRgClient::loose_container_row(
-        &["gts.cf.core.rg.type.v1~extra.type.v1~"],
-        &["gts.cf.core.rg.type.v1~extra.member.v1~"],
+        &[gts_id!("cf.core.rg.type.v1~extra.rg.test.type.v1~")],
+        &[gts_id!("cf.core.rg.type.v1~extra.rg.test.member.v1~")],
     );
     let client =
         FakeRgClient::defaults().with(USER_GROUP_TYPE_CODE, TypeState::already_present(row));

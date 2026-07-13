@@ -21,6 +21,7 @@ mod wire_vocabulary_round_trip {
     use crate::gts::{self, TypeResource};
     use crate::{field, precondition};
     use toolkit_canonical_errors::{CanonicalError, Problem};
+    use toolkit_gts::gts_id;
 
     fn problem(err: CanonicalError) -> serde_json::Value {
         serde_json::to_value(Problem::from(err)).expect("Problem serializes")
@@ -63,9 +64,11 @@ mod wire_vocabulary_round_trip {
     #[test]
     fn parent_not_registered_type_round_trips_to_violations() {
         let err = TypeResource::failed_precondition()
-            .with_resource("gts.acme.core.events.base.v1~acme.x.derived.v1.0~")
+            .with_resource(gts_id!(
+                "acme.core.events.base.v1~acme.x.events.derived.v2~"
+            ))
             .with_precondition_violation(
-                "gts.acme.core.events.base.v1~",
+                gts_id!("acme.core.events.base.v1~"),
                 "required type-schema is not registered",
                 precondition::PARENT_NOT_REGISTERED,
             )
@@ -77,7 +80,8 @@ mod wire_vocabulary_round_trip {
             "type must round-trip into violations[].type",
         );
         assert_eq!(
-            json["context"]["violations"][0]["subject"], "gts.acme.core.events.base.v1~",
+            json["context"]["violations"][0]["subject"],
+            gts_id!("acme.core.events.base.v1~"),
             "parent id must round-trip into violations[].subject",
         );
     }
@@ -94,6 +98,7 @@ mod projection_tests {
     use crate::gts::{self, TypeResource};
     use crate::precondition;
     use toolkit_canonical_errors::{CanonicalError, Problem};
+    use toolkit_gts::gts_id;
 
     #[test]
     fn invalid_argument_projects_typed_validation_reason() {
@@ -114,7 +119,7 @@ mod projection_tests {
     #[test]
     fn not_found_projects_resource_type_and_name() {
         let canonical = TypeResource::not_found("type schema not found")
-            .with_resource("gts.acme.core.events.test.v1~")
+            .with_resource(gts_id!("acme.core.events.test.v1~"))
             .create();
         match TypesRegistryError::from(canonical) {
             TypesRegistryError::NotFound {
@@ -123,7 +128,7 @@ mod projection_tests {
                 ..
             } => {
                 assert_eq!(resource_type, gts::TYPE_RESOURCE_TYPE);
-                assert_eq!(name, "gts.acme.core.events.test.v1~");
+                assert_eq!(name, gts_id!("acme.core.events.test.v1~"));
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -132,7 +137,7 @@ mod projection_tests {
     #[test]
     fn already_exists_projects_resource_type_and_name() {
         let canonical = TypeResource::already_exists("entity exists")
-            .with_resource("gts.acme.core.events.test.v1~")
+            .with_resource(gts_id!("acme.core.events.test.v1~"))
             .create();
         match TypesRegistryError::from(canonical) {
             TypesRegistryError::AlreadyExists {
@@ -141,7 +146,7 @@ mod projection_tests {
                 ..
             } => {
                 assert_eq!(resource_type, gts::TYPE_RESOURCE_TYPE);
-                assert_eq!(name, "gts.acme.core.events.test.v1~");
+                assert_eq!(name, gts_id!("acme.core.events.test.v1~"));
             }
             other => panic!("expected AlreadyExists, got {other:?}"),
         }
@@ -156,7 +161,7 @@ mod projection_tests {
     fn not_found_without_resource_type_falls_through_to_other() {
         let canonical = malformed_without_resource_type(
             TypeResource::not_found("missing")
-                .with_resource("gts.acme.core.events.test.v1~")
+                .with_resource(gts_id!("acme.core.events.test.v1~"))
                 .create(),
         );
         assert!(
@@ -181,7 +186,7 @@ mod projection_tests {
     fn already_exists_without_resource_type_falls_through_to_other() {
         let canonical = malformed_without_resource_type(
             TypeResource::already_exists("entity exists")
-                .with_resource("gts.acme.core.events.test.v1~")
+                .with_resource(gts_id!("acme.core.events.test.v1~"))
                 .create(),
         );
         assert!(
@@ -216,9 +221,11 @@ mod projection_tests {
     #[test]
     fn failed_precondition_projects_parent_not_registered() {
         let canonical = TypeResource::failed_precondition()
-            .with_resource("gts.acme.core.events.base.v1~acme.x.derived.v1.0~")
+            .with_resource(gts_id!(
+                "acme.core.events.base.v1~acme.x.events.derived.v2~"
+            ))
             .with_precondition_violation(
-                "gts.acme.core.events.base.v1~",
+                gts_id!("acme.core.events.base.v1~"),
                 "required type-schema is not registered",
                 precondition::PARENT_NOT_REGISTERED,
             )
@@ -229,10 +236,10 @@ mod projection_tests {
                 dependent_id,
                 detail,
             } => {
-                assert_eq!(parent_type_id, "gts.acme.core.events.base.v1~");
+                assert_eq!(parent_type_id, gts_id!("acme.core.events.base.v1~"));
                 assert_eq!(
                     dependent_id,
-                    "gts.acme.core.events.base.v1~acme.x.derived.v1.0~"
+                    gts_id!("acme.core.events.base.v1~acme.x.events.derived.v2~")
                 );
                 assert_eq!(detail, "required type-schema is not registered");
             }
@@ -297,9 +304,11 @@ mod projection_tests {
         // in-process ClientHub caller — exercised on the lossless
         // parent-not-registered encoding.
         let canonical = TypeResource::failed_precondition()
-            .with_resource("gts.acme.core.events.base.v1~acme.x.derived.v1.0~")
+            .with_resource(gts_id!(
+                "acme.core.events.base.v1~acme.x.events.derived.v2~"
+            ))
             .with_precondition_violation(
-                "gts.acme.core.events.base.v1~",
+                gts_id!("acme.core.events.base.v1~"),
                 "required type-schema is not registered",
                 precondition::PARENT_NOT_REGISTERED,
             )
@@ -315,10 +324,10 @@ mod projection_tests {
                 dependent_id,
                 ..
             } => {
-                assert_eq!(parent_type_id, "gts.acme.core.events.base.v1~");
+                assert_eq!(parent_type_id, gts_id!("acme.core.events.base.v1~"));
                 assert_eq!(
                     dependent_id,
-                    "gts.acme.core.events.base.v1~acme.x.derived.v1.0~"
+                    gts_id!("acme.core.events.base.v1~acme.x.events.derived.v2~")
                 );
             }
             other => panic!("expected ParentNotRegistered after round-trip, got {other:?}"),

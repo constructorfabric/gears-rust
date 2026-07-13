@@ -6,6 +6,7 @@ mod common;
 
 use common::create_service;
 use serde_json::json;
+use toolkit_gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, gts_id, gts_uri};
 
 // =============================================================================
 // Error Handling Tests
@@ -16,7 +17,7 @@ async fn test_get_nonexistent_entity() {
     let service = create_service();
     service.switch_to_ready().unwrap();
 
-    let result = service.get("gts.nonexistent.pkg.ns.type.v1~");
+    let result = service.get(gts_id!("nonexistent.pkg.ns.type.v1~"));
     assert!(result.is_err());
 }
 
@@ -27,8 +28,8 @@ async fn test_invalid_gts_id_formats() {
     let invalid_entities = vec![
         json!({ "$id": "not-a-gts-id", "type": "object" }),
         json!({ "$id": "gts", "type": "object" }),
-        json!({ "$id": "gts.vendor", "type": "object" }),
-        json!({ "$id": "gts://gts.vendor", "type": "object" }),
+        json!({ "$id": format!("{GTS_ID_PREFIX}vendor"), "type": "object" }),
+        json!({ "$id": format!("{GTS_ID_URI_PREFIX}{GTS_ID_PREFIX}vendor"), "type": "object" }),
         json!({ "$id": "", "type": "object" }),
     ];
 
@@ -51,7 +52,7 @@ async fn test_gts_id_extraction_priority() {
     // Test that $id field is used when present (highest priority)
     // The repository extracts GTS ID from configured fields in order
     let entity = json!({
-        "$id": "gts://gts.acme.core.events.from_dollar_id.v1~",
+        "$id": gts_uri!("acme.core.events.from_dollar_id.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object"
     });
@@ -62,11 +63,11 @@ async fn test_gts_id_extraction_priority() {
     service.switch_to_ready().unwrap();
 
     // Verify the entity was registered with the $id value
-    let retrieved = service.get("gts.acme.core.events.from_dollar_id.v1~");
+    let retrieved = service.get(gts_id!("acme.core.events.from_dollar_id.v1~"));
     assert!(retrieved.is_ok());
     assert_eq!(
         retrieved.unwrap().gts_id,
-        "gts.acme.core.events.from_dollar_id.v1~"
+        gts_id!("acme.core.events.from_dollar_id.v1~")
     );
 }
 
@@ -79,7 +80,7 @@ async fn test_entity_content_preserved() {
     let service = create_service();
 
     let original_content = json!({
-        "$id": "gts://gts.acme.core.events.content_test.v1~",
+        "$id": gts_uri!("acme.core.events.content_test.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -102,7 +103,7 @@ async fn test_entity_content_preserved() {
     service.switch_to_ready().unwrap();
 
     let retrieved = service
-        .get("gts.acme.core.events.content_test.v1~")
+        .get(gts_id!("acme.core.events.content_test.v1~"))
         .unwrap();
 
     // Verify description is extracted
@@ -121,7 +122,7 @@ async fn test_entity_segments_parsed_correctly() {
     let service = create_service();
 
     let entity = json!({
-        "$id": "gts://gts.myvendor.mypackage.mynamespace.mytype.v2~",
+        "$id": gts_uri!("myvendor.mypackage.mynamespace.mytype.v2~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object"
     });
@@ -130,7 +131,7 @@ async fn test_entity_segments_parsed_correctly() {
     service.switch_to_ready().unwrap();
 
     let retrieved = service
-        .get("gts.myvendor.mypackage.mynamespace.mytype.v2~")
+        .get(gts_id!("myvendor.mypackage.mynamespace.mytype.v2~"))
         .unwrap();
 
     assert_eq!(retrieved.vendor(), Some("myvendor"));
@@ -150,12 +151,12 @@ async fn test_gts_id_with_special_segments() {
     // GTS IDs with underscores and numbers
     let entities = vec![
         json!({
-            "$id": "gts://gts.acme_corp.core_v2.events_ns.my_type_123.v1~",
+            "$id": gts_uri!("acme_corp.core_v2.events_ns.my_type_123.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object"
         }),
         json!({
-            "$id": "gts://gts.vendor123.pkg456.ns789.type000.v99~",
+            "$id": gts_uri!("vendor123.pkg456.ns789.type000.v99~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object"
         }),
@@ -175,6 +176,6 @@ async fn test_gts_id_with_special_segments() {
 
     service.switch_to_ready().unwrap();
 
-    let e1 = service.get("gts.acme_corp.core_v2.events_ns.my_type_123.v1~");
+    let e1 = service.get(gts_id!("acme_corp.core_v2.events_ns.my_type_123.v1~"));
     assert!(e1.is_ok());
 }

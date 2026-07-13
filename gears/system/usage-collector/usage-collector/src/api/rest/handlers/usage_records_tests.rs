@@ -17,6 +17,7 @@
 //!   [`crate::domain::service::service_tests`].
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use axum::Json;
 use axum::extract::{Extension, Path};
@@ -336,7 +337,7 @@ use usage_collector_sdk::{
 };
 
 const HAPPY_RECORD_GTS_ID: &str =
-    "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
 fn happy_usage_type() -> UsageType {
     UsageType {
@@ -1300,6 +1301,7 @@ mod parse_required_gts_id_tests {
     use toolkit_canonical_errors::context::InvalidArgumentV1;
 
     use super::super::parse_required_gts_id;
+    use super::HAPPY_RECORD_GTS_ID;
 
     fn p(key: &str, value: &str) -> (String, String) {
         (key.to_owned(), value.to_owned())
@@ -1341,8 +1343,7 @@ mod parse_required_gts_id_tests {
         // would silently mask the caller bug. The helper MUST reject
         // outright. Pin BOTH the field/reason and that the rejection
         // happens regardless of whether either value is well-formed.
-        let valid_gts =
-            "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1".to_owned();
+        let valid_gts = HAPPY_RECORD_GTS_ID.to_owned();
         let err =
             parse_required_gts_id(&[p("gts_id", &valid_gts), p("gts_id", "even.something.else")])
                 .expect_err("duplicate gts_id MUST reject");
@@ -1371,7 +1372,7 @@ mod parse_required_gts_id_tests {
 
     #[test]
     fn well_formed_gts_id_round_trips_through_the_typed_newtype() {
-        let raw = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+        let raw = HAPPY_RECORD_GTS_ID;
         let parsed = parse_required_gts_id(&[p("gts_id", raw)]).expect("well-formed gts_id passes");
         assert_eq!(AsRef::<str>::as_ref(&parsed), raw);
     }
@@ -1583,7 +1584,7 @@ mod handle_list_usage_records_tests {
     use uuid::Uuid;
 
     use super::super::handle_list_usage_records;
-    use super::sample_persisted_record;
+    use super::{HAPPY_RECORD_GTS_ID, sample_persisted_record};
     use crate::domain::Service;
     use crate::domain::test_support::{
         CountingPermitResolver, CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx,
@@ -1659,10 +1660,7 @@ mod handle_list_usage_records_tests {
             Extension(SecurityContext::anonymous()),
             Extension(service),
             Query(vec![
-                (
-                    "gts_id".to_owned(),
-                    "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1".to_owned(),
-                ),
+                ("gts_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
                 ("totally_unknown".to_owned(), "x".to_owned()),
             ]),
             OData(ODataQuery::new()),
@@ -1693,10 +1691,7 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(vec![(
-                "gts_id".to_owned(),
-                "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1".to_owned(),
-            )]),
+            Query(vec![("gts_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())]),
             OData(q),
         )
         .await
@@ -1732,10 +1727,7 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(authenticated_ctx()),
             Extension(service),
-            Query(vec![(
-                "gts_id".to_owned(),
-                "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1".to_owned(),
-            )]),
+            Query(vec![("gts_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())]),
             OData(super::bounded_window_query()),
         )
         .await
@@ -1813,6 +1805,7 @@ mod handle_list_usage_records_tests {
 
 mod handle_query_aggregated_usage_records_tests {
     use std::sync::Arc;
+    use toolkit_gts::gts_id;
 
     use axum::Json;
     use axum::extract::{Extension, Query};
@@ -1836,7 +1829,8 @@ mod handle_query_aggregated_usage_records_tests {
         enforcer_for, hub_with_plugin,
     };
 
-    const VALID_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    const VALID_GTS_ID: &str =
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
     fn service_no_plugin() -> Arc<Service> {
         let hub = Arc::new(ClientHub::new());

@@ -1,6 +1,7 @@
 use axum::Router;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::LicenseFeature;
+use toolkit_gts::gts_id;
 
 use crate::gear::AppState;
 
@@ -8,11 +9,13 @@ mod proxy;
 mod route;
 mod upstream;
 
+const OAGW_BASE_LICENSE_FEATURE: &str = gts_id!("cf.core.lic.feat.v1~cf.core.oagw.base.v1");
+
 pub(super) struct License;
 
 impl AsRef<str> for License {
     fn as_ref(&self) -> &'static str {
-        "gts.cf.core.lic.feat.v1~cf.core.oagw.base.v1"
+        OAGW_BASE_LICENSE_FEATURE
     }
 }
 

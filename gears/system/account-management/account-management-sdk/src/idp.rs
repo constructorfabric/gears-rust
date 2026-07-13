@@ -135,7 +135,7 @@ pub struct IdpProvisionTenantRequest {
     /// is self-describing for plugin authors and surfaces with
     /// `format: gts-schema-id` in any generated JSON Schema. The
     /// wire shape stays a string; AM-side consumers run full chain
-    /// validation by passing the value through `gts::GtsID::new`.
+    /// validation by passing the value through `gts::GtsId::try_new`.
     pub tenant_type: GtsTypeId,
     /// Opaque provider-specific metadata from `TenantCreateRequest.provisioning_metadata`.
     pub metadata: Option<Value>,

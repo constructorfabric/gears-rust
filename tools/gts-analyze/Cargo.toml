@@ -22,3 +22,8 @@ clap = { workspace = true }
 walkdir = { workspace = true }
 regex = { workspace = true }
 anyhow = { workspace = true }
+# For `GtsId` parsing and the upstream maximum GTS-id length constant.
+gts-id = { workspace = true }
+# For the compile-time configured GTS ID prefixes re-exported through the
+# toolkit GTS facade.
+toolkit-gts = { workspace = true }

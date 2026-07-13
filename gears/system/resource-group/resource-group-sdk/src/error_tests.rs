@@ -25,7 +25,7 @@ mod wire_vocabulary_round_trip {
     // Its literal MUST equal `gts::GROUP_RESOURCE_TYPE` — the
     // `gts_resource_type_round_trip` test asserts that equality (the
     // proc-macro cannot reference the const directly).
-    #[resource_error("gts.cf.core.resource_group.group.v1~")]
+    #[resource_error(gts_id!("cf.core.resource_group.group.v1~"))]
     struct RgScope;
 
     fn problem(err: CanonicalError) -> serde_json::Value {
@@ -132,7 +132,7 @@ mod projection_tests {
     use crate::{field, gts, precondition, reason};
     use toolkit_canonical_errors::{CanonicalError, Problem, resource_error};
 
-    #[resource_error("gts.cf.core.resource_group.group.v1~")]
+    #[resource_error(gts_id!("cf.core.resource_group.group.v1~"))]
     struct RgScope;
 
     #[test]

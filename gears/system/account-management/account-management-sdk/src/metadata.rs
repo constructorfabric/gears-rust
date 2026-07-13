@@ -177,7 +177,7 @@ pub struct MetadataEntryQuery {
     #[odata(filter(kind = "DateTimeUtc"))]
     pub updated_at: OffsetDateTime,
     /// Deterministic `UUIDv5` derived server-side from the chained
-    /// `type_id` (via the upstream `gts::GtsID::to_uuid()` namespace).
+    /// `type_id` (via the upstream `gts::GtsId::to_uuid()` namespace).
     /// Exposed as a filter / order field so the repo layer can
     /// stable-sort rows whose `updated_at` collide. Callers can also
     /// use it for an exact `$filter=schema_uuid eq <uuid>` lookup

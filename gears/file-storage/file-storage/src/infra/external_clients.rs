@@ -34,7 +34,7 @@ pub trait QuotaClient: Send + Sync {
     /// `additional_bytes` more. Returns `Allowed` or `Denied`.
     ///
     /// `metric_name` is the metric identifier used in the quota system
-    /// (e.g. `"gts.cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1"`).
+    /// (e.g. `gts_id!("cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1")`).
     async fn check_storage_quota(
         &self,
         tenant_id: Uuid,

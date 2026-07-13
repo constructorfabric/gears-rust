@@ -7,11 +7,11 @@ use toolkit_canonical_errors::{CanonicalError, resource_error};
 use super::LedgerError;
 
 // Minimal resource stubs for constructing canonical errors in tests.
-#[resource_error("gts.cf.bss.ledger.entry.v1~")]
+#[resource_error(gts_id!("cf.bss.ledger.entry.v1~"))]
 struct TestEntry;
-#[resource_error("gts.cf.bss.ledger.ledger.v1~")]
+#[resource_error(gts_id!("cf.bss.ledger.ledger.v1~"))]
 struct TestLedger;
-#[resource_error("gts.cf.bss.ledger.fiscal_period.v1~")]
+#[resource_error(gts_id!("cf.bss.ledger.fiscal_period.v1~"))]
 struct TestFiscalPeriod;
 
 // ---------------------------------------------------------------------------

@@ -8,10 +8,12 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use toolkit_gts::gts_uri;
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
+use toolkit_gts::gts_id;
 use usage_collector_sdk::{
     IdempotencyKey, ResourceRef, UsageCollectorError, UsageRecord, UsageRecordStatus,
     UsageTypeGtsId, ValidationReason,
@@ -23,7 +25,7 @@ use super::{
 };
 
 const SAMPLE_USAGE_TYPE_ID: &str =
-    "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
 const SAMPLE_RECORD_RFC3339: &str = "2026-06-11T12:34:56Z";
 const SAMPLE_RECORD_VALUE: &str = "42.5";
@@ -372,7 +374,7 @@ fn create_usage_record_result_dto_serialises_accepted_with_lowercase_tag() {
 #[test]
 fn create_usage_record_result_dto_serialises_rejected_with_lowercase_tag() {
     let problem = Problem {
-        problem_type: "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~".to_owned(),
+        problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~").to_owned(),
         title: "Invalid argument".to_owned(),
         status: 400,
         detail: "test rejection".to_owned(),

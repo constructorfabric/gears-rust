@@ -10,6 +10,7 @@
 use resource_group::domain::error::DomainError;
 use resource_group::domain::validation::{self, RG_TYPE_PREFIX};
 use toolkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
 
 /// Build the wire `Problem` the canonical error middleware would emit
 /// for a given `DomainError`. The integration tests run without the
@@ -22,18 +23,18 @@ fn wire(err: DomainError) -> Problem {
 
 // Canonical category problem-type URIs. See
 // `docs/arch/errors/categories/*.md`.
-const NOT_FOUND_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~";
-const ALREADY_EXISTS_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~";
+const NOT_FOUND_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~");
+const ALREADY_EXISTS_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.already_exists.v1~");
 const INVALID_ARGUMENT_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~");
 const FAILED_PRECONDITION_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~");
 const PERMISSION_DENIED_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~";
-const INTERNAL_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~");
+const INTERNAL_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.internal.v1~");
 
 /// Resource-group GTS prefix (matches `RgError`'s `#[resource_error(...)]`).
-const RG_GTS: &str = "gts.cf.core.resource_group.group.v1~";
+const RG_GTS: &str = gts_id!("cf.core.resource_group.group.v1~");
 
 // ── validate_type_code ──────────────────────────────────────────────────
 
@@ -102,7 +103,7 @@ fn validate_type_code_rejects_prefix_only() {
 fn validate_membership_type_code_accepts_non_rg_prefix() {
     // Per DESIGN.md, membership resource types are external domain types
     // and do NOT require the `gts.cf.core.rg.type.v1~` prefix.
-    let result = validation::validate_membership_type_code("gts.cf.core.idp.user.v1~");
+    let result = validation::validate_membership_type_code(gts_id!("cf.core.idp.user.v1~"));
     assert!(result.is_ok(), "Expected ok, got {result:?}");
 }
 
@@ -128,7 +129,8 @@ fn validate_membership_type_code_rejects_empty() {
 fn validate_membership_type_code_rejects_trailing_wildcard_after_tilde() {
     // Wildcard patterns are not accepted: `gts_type_allowed_membership`
     // stores a SMALLINT FK to a concrete registered type, not a pattern.
-    let result = validation::validate_membership_type_code("gts.cf.core.rg.type.v1~*");
+    let pattern = format!("{GTS_ID_PREFIX}cf.core.rg.type.v1~*");
+    let result = validation::validate_membership_type_code(pattern.as_str());
     assert!(result.is_err(), "Expected err, got {result:?}");
     assert!(matches!(
         result.unwrap_err(),
@@ -138,8 +140,8 @@ fn validate_membership_type_code_rejects_trailing_wildcard_after_tilde() {
 
 #[test]
 fn validate_membership_type_code_rejects_trailing_wildcard_after_dot() {
-    // `gts.cf.*` -- a wildcard pattern, rejected like any other wildcard.
-    let result = validation::validate_membership_type_code("gts.cf.*");
+    let invalid_pattern = format!("{GTS_ID_PREFIX}cf.*");
+    let result = validation::validate_membership_type_code(&invalid_pattern);
     assert!(result.is_err(), "Expected err, got {result:?}");
     assert!(matches!(
         result.unwrap_err(),
@@ -159,7 +161,8 @@ fn validate_membership_type_code_rejects_malformed_gts_path() {
 
 #[test]
 fn validate_membership_type_code_rejects_mid_string_wildcard() {
-    let result = validation::validate_membership_type_code("gts.cf.*.user.v1~");
+    let invalid_pattern = format!("{GTS_ID_PREFIX}cf.*.user.v1~");
+    let result = validation::validate_membership_type_code(&invalid_pattern);
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -945,7 +948,7 @@ fn domain_to_problem_conflict_is_409() {
     assert_eq!(problem.status, 409);
     assert_eq!(
         problem.problem_type,
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~"
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.aborted.v1~")
     );
     assert_eq!(problem.context["resource_type"], RG_GTS);
     assert_eq!(problem.context["reason"], "CONFLICT");

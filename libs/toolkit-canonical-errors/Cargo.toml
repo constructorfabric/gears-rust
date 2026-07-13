@@ -34,7 +34,7 @@ http = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 toolkit-canonical-errors-macro = { workspace = true }
+toolkit-gts = { workspace = true }
 
 [dev-dependencies]
-gts-id = { workspace = true }
 trybuild = { workspace = true }

@@ -67,7 +67,7 @@ pub struct IdentityConfig {
     pub token_scopes: Vec<String>,
 
     /// Subject type — opaque metadata passed through to PDP via `EvaluationRequest.Subject`.
-    /// Recommended format: GTS type identifier (e.g. `"gts.cf.core.security.subject_user.v1~"`).
+    /// Recommended format: GTS type identifier produced via `gts_id!(...)`.
     /// The platform does not interpret this value; PDP policies may use it for role/permission mapping.
     pub subject_type: Option<String>,
 }

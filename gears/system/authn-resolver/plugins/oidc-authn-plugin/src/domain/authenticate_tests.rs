@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
 use authn_resolver_sdk::ClientCredentialsRequest;
@@ -14,7 +15,7 @@ use crate::test_support::test_fixtures::{
     TEST_ISSUER, TEST_KID, future_exp, sign_jwt, test_jwk_json,
 };
 
-const TEST_S2S_DEFAULT_SUBJECT_TYPE: &str = "gts.cf.core.security.subject_user.v1~";
+const TEST_S2S_DEFAULT_SUBJECT_TYPE: &str = gts_id!("cf.core.security.subject_user.v1~");
 
 fn test_issuer_trust() -> IssuerTrustConfig {
     IssuerTrustConfig::from_exact_issuers(vec![TEST_ISSUER.to_owned()])

@@ -2,7 +2,7 @@ use toolkit_canonical_errors::{CanonicalError, resource_error};
 
 use crate::domain::error::DomainError;
 
-#[resource_error("gts.cf.file_parser.parser.file.v1~")]
+#[resource_error(gts_id!("cf.file_parser.parser.file.v1~"))]
 pub struct FileParserError;
 
 impl From<DomainError> for CanonicalError {

@@ -22,10 +22,10 @@ use usage_collector_sdk::{USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageColle
 //   - UsageTypeResource → catalog REST surface (create / get / list / delete)
 //   - UsageRecordResource → ingestion REST surface (create / deactivate)
 
-#[resource_error("gts.cf.core.uc.usage_type.v1~")]
+#[resource_error(gts_id!("cf.core.uc.usage_type.v1~"))]
 pub(crate) struct UsageTypeResource;
 
-#[resource_error("gts.cf.core.uc.usage_record.v1~")]
+#[resource_error(gts_id!("cf.core.uc.usage_record.v1~"))]
 pub(crate) struct UsageRecordResource;
 
 /// Lift the SDK error envelope onto the AIP-193 canonical shape for the

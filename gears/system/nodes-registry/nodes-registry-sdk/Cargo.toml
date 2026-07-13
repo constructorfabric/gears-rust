@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 
 toolkit-canonical-errors = { workspace = true }
+toolkit-gts = { workspace = true }
 toolkit-node-info = { workspace = true }
 
 [dev-dependencies]

@@ -60,5 +60,5 @@ def gts_file_type():
     """A syntactically valid GTS file type accepted at upload time."""
     return os.getenv(
         "E2E_FS_GTS_TYPE",
-        "gts.cf.fstorage.file.type.v1~x.e2e.test.v1~",
+        "gts.cf.fstorage.file.type.v1~x.e2e.file.type.v1~",
     )

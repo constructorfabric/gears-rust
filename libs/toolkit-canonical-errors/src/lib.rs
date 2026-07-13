@@ -18,3 +18,9 @@ pub use context::{
 pub use error::CanonicalError;
 pub use problem::{Problem, ProblemConversionError};
 pub use toolkit_canonical_errors_macro::resource_error;
+// Re-export the `gts_id!` helper so consumers using `#[resource_error(...)]`
+// can write `#[resource_error(gts_id!("cf.core.users.user.v1~"))]` without
+// adding a separate `gts-macros` dependency. The macro expands at compile
+// time to a `&'static str` literal with the configured GTS ID prefix
+// prepended (overridable via `GTS_ID_PREFIX`).
+pub use toolkit_gts::gts_id;

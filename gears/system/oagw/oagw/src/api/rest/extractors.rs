@@ -16,11 +16,12 @@ pub fn parse_gts_id(gts_str: &str, expected_schema: &str, instance: &str) -> Res
     let (schema, uuid) = gts_helpers::parse_resource_gts(gts_str)
         .map_err(|e| domain_error_to_problem(e, instance))?;
     let expected_prefix = expected_schema.trim_end_matches('~');
-    if schema != expected_prefix {
+    let actual_prefix = schema.trim_end_matches('~');
+    if actual_prefix != expected_prefix {
         let err = DomainError::Validation {
             field: "gts_id",
             reason: field::INVALID_GTS_SCHEMA,
-            detail: format!("expected GTS schema '{expected_schema}' but got '{schema}~'"),
+            detail: format!("expected GTS schema '{expected_schema}' but got '{schema}'"),
             instance: instance.to_string(),
         };
         return Err(domain_error_to_problem(err, instance));

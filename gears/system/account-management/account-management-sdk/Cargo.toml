@@ -79,7 +79,6 @@ toolkit-security = { workspace = true }
 # `toolkit` ships `PluginV1<P>` (re-exported from `toolkit-gts`);
 # `schemars` is the runtime JSON-Schema reflection backend the
 # macro generates code against.
-gts-macros = { workspace = true }
 toolkit = { workspace = true }
 toolkit-gts = { workspace = true }
 schemars = { workspace = true }

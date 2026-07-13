@@ -10,6 +10,7 @@
 //!    (`GroupService.list_groups` / `get_group` call enforcer internally)
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -25,7 +26,7 @@ use toolkit_security::{SecurityContext, pep_properties};
 // ── Resource type descriptor (mirrors what RG handlers will declare) ────
 
 const RG_GROUP: ResourceType = ResourceType::from_static(
-    "gts.cf.core.rg.group.v1~",
+    gts_id!("cf.core.rg.group.v1~"),
     &[pep_properties::OWNER_TENANT_ID],
 );
 

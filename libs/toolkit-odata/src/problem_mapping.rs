@@ -141,8 +141,9 @@ impl From<Error> for CanonicalError {
 mod tests {
     use super::*;
     use toolkit_canonical_errors::Problem;
+    use toolkit_gts::gts_id;
 
-    const ODATA_RESOURCE_TYPE: &str = "gts.cf.core.odata.query.v1~";
+    const ODATA_RESOURCE_TYPE: &str = gts_id!("cf.core.odata.query.v1~");
 
     fn wire(err: Error) -> Problem {
         Problem::from(CanonicalError::from(err))

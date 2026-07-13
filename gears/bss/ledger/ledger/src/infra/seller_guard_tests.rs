@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
+use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::*;
 
-const SELLER: &str = "gts.cf.core.am.tenant_type.v1~vz.ams.tenants.partner.v1~";
-const BUYER: &str = "gts.cf.core.am.tenant_type.v1~vz.ams.tenants.organization.v1~";
+const SELLER: &str = gts_id!("cf.core.am.tenant_type.v1~vz.ams.tenants.partner.v1~");
+const BUYER: &str = gts_id!("cf.core.am.tenant_type.v1~vz.ams.tenants.organization.v1~");
 
 /// Canned tenant-type reader (stands in for the AM `get_tenant` adapter).
 struct FakeReader(Option<String>);

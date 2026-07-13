@@ -31,7 +31,7 @@ use crate::models::{
     GtsInstance, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
     is_type_schema_id,
 };
-use gts::{GtsID, GtsInstanceId};
+use gts::{GtsId, GtsInstanceId};
 
 /// Builds the `InvalidArgument` canonical error the registry returns for a
 /// malformed / kind-mismatched GTS id (reason [`field::INVALID_GTS_ID`]),
@@ -186,7 +186,7 @@ impl TypesRegistryClient for MockTypesRegistryClient {
         if !is_type_schema_id(type_id) {
             return Err(invalid_gts_id(format!("{type_id} does not end with `~`")));
         }
-        GtsID::new(type_id).map_err(|e| invalid_gts_id(format!("{e}")))?;
+        GtsId::try_new(type_id).map_err(|e| invalid_gts_id(format!("{e}")))?;
         self.type_schemas
             .iter()
             .find(|s| s.type_id == type_id)
@@ -261,7 +261,7 @@ impl TypesRegistryClient for MockTypesRegistryClient {
                 "{id} ends with `~` (looks like a type-schema id)",
             )));
         }
-        GtsID::new(id).map_err(|e| invalid_gts_id(format!("{e}")))?;
+        GtsId::try_new(id).map_err(|e| invalid_gts_id(format!("{e}")))?;
         self.instances
             .iter()
             .find(|e| e.id == id)

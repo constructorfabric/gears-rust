@@ -80,7 +80,7 @@ const MAX_USERNAME_CHARS: usize = 255;
 /// `display_name`) enforced at the AM boundary as a cheap
 /// **pre-flight cap** before the JSON-Schema validator runs.
 ///
-/// A missing `gts.cf.core.am.user.v1~` schema is NOT a fallback
+/// A missing `USER_RESOURCE_TYPE` schema is NOT a fallback
 /// case for this constant — that path is fail-closed in
 /// [`crate::domain::gts_validation::validate_new_user_payload_via_gts`]
 /// (surfaces `ServiceUnavailable` until the catalog is seeded).
@@ -101,6 +101,7 @@ const MAX_PROFILE_FIELD_CHARS: usize = 255;
 /// a cross-check test pins them in sync.
 pub(crate) mod pep {
     use super::{ResourceType, pep_properties};
+    use account_management_sdk::USER_RESOURCE_TYPE;
 
     /// Resource declaration for `IdpUser`. AM persists no user table
     /// (per `cpt-cf-account-management-constraint-no-user-storage`),
@@ -120,7 +121,7 @@ pub(crate) mod pep {
     ///   compiled subtree clamp on `tenants` resolves through this
     ///   property.
     pub const USER: ResourceType = ResourceType::from_static(
-        "gts.cf.core.am.user.v1~",
+        USER_RESOURCE_TYPE,
         &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
     );
 

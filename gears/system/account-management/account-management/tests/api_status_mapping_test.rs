@@ -51,18 +51,19 @@
 mod common;
 
 use axum::http::StatusCode;
+use toolkit_gts::{gts_id, gts_uri};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::*;
 
-const TENANT_GTS: &str = "gts.cf.core.am.tenant.v1~";
-const CONVERSION_REQUEST_GTS: &str = "gts.cf.core.am.conversion_request.v1~";
+const TENANT_GTS: &str = gts_id!("cf.core.am.tenant.v1~");
+const CONVERSION_REQUEST_GTS: &str = gts_id!("cf.core.am.conversion_request.v1~");
 
 const INVALID_ARGUMENT_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~");
 const FAILED_PRECONDITION_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~");
 
 #[tokio::test]
 async fn root_tenant_cannot_delete_envelope() {

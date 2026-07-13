@@ -9,11 +9,10 @@
 //! emission) is upstream's contract and is covered by upstream's own
 //! tests.
 
-use gts_macros::GtsTraitsSchema;
 use schemars::JsonSchema;
 use toolkit_gts::{
-    GtsInstanceId, GtsSchema, InventoryInstance, InventoryTypeSchema, gts_instance,
-    gts_instance_raw, gts_type_schema,
+    GtsInstanceId, GtsSchema, GtsTraitsSchema, InventoryInstance, InventoryTypeSchema, gts_id,
+    gts_instance, gts_instance_raw, gts_type_schema, gts_uri,
 };
 
 // =====================================================================
@@ -26,7 +25,7 @@ use toolkit_gts::{
 /// 2. Submit an `InventoryTypeSchema` entry with the same `type_id`.
 #[gts_type_schema(
     dir_path = "schemas",
-    type_id = "gts.test.cf.toolkit_gts.thing.v1~",
+    type_id = gts_id!("test.cf.toolkit_gts.thing.v1~"),
     description = "Test base type for toolkit-gts wrapper integration tests",
     properties = "id,name",
     base = true
@@ -39,14 +38,14 @@ pub struct TestThingV1 {
 // `gts_instance_raw!` — submits one inventory entry; the value itself
 // is built lazily by the closure inside `payload_fn`.
 gts_instance_raw!({
-    "id": "gts.test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.raw.v1",
+    "id": gts_id!("test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.raw.v1"),
     "name": "raw",
 });
 
 // `gts_instance!` (typed) — same: one inventory entry, value built lazily.
 gts_instance! {
     TestThingV1 {
-        id: "gts.test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.typed.v1",
+        id: gts_id!("test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.typed.v1"),
         name: "typed".to_owned(),
     }
 }
@@ -58,7 +57,7 @@ gts_instance! {
 gts_instance! {
     #[gts_static(NAMED_INSTANCE)]
     TestThingV1 {
-        id: "gts.test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.named.v1",
+        id: gts_id!("test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.named.v1"),
         name: "named".to_owned(),
     }
 }
@@ -76,7 +75,7 @@ gts_instance! {
 
 #[derive(JsonSchema, serde::Serialize, GtsTraitsSchema)]
 pub struct EventTraits {
-    #[schemars(extend("x-gts-ref" = "gts.x.core.events.topic.v1~"))]
+    #[schemars(extend("x-gts-ref" = gts_id!("x.core.events.topic.v1~")))]
     pub topic_ref: String,
 }
 
@@ -86,7 +85,7 @@ pub struct EventTraits {
 #[gts_type_schema(
     dir_path = "schemas",
     base = true,
-    type_id = "gts.test.cf.toolkit_gts.event.v1~",
+    type_id = gts_id!("test.cf.toolkit_gts.event.v1~"),
     description = "Abstract base event with inline traits schema",
     properties = "id,payload",
     traits_schema = inline(EventTraits),
@@ -102,10 +101,10 @@ pub struct EventV1<P> {
 #[gts_type_schema(
     dir_path = "schemas",
     base = EventV1,
-    type_id = "gts.test.cf.toolkit_gts.event.v1~test.cf.toolkit_gts.order_placed.v1~",
+    type_id = gts_id!("test.cf.toolkit_gts.event.v1~test.cf.toolkit_gts.order_placed.v1~"),
     description = "Final order-placed event",
     properties = "order_id",
-    traits = serde_json::json!({ "topic_ref": "gts.x.core.events.topic.v1~test.cf._.orders.v1" }),
+    traits = serde_json::json!({ "topic_ref": gts_id!("x.core.events.topic.v1~test.cf._.orders.v1") }),
     gts_final = true
 )]
 pub struct OrderPlacedV1 {
@@ -116,13 +115,14 @@ pub struct OrderPlacedV1 {
 //                                Tests
 // =====================================================================
 
-const TYPE_ID: &str = "gts.test.cf.toolkit_gts.thing.v1~";
-const EVENT_BASE_ID: &str = "gts.test.cf.toolkit_gts.event.v1~";
+const TYPE_ID: &str = gts_id!("test.cf.toolkit_gts.thing.v1~");
+const EVENT_BASE_ID: &str = gts_id!("test.cf.toolkit_gts.event.v1~");
 const ORDER_PLACED_ID: &str =
-    "gts.test.cf.toolkit_gts.event.v1~test.cf.toolkit_gts.order_placed.v1~";
-const RAW_ID: &str = "gts.test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.raw.v1";
-const TYPED_ID: &str = "gts.test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.typed.v1";
-const NAMED_ID: &str = "gts.test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.named.v1";
+    gts_id!("test.cf.toolkit_gts.event.v1~test.cf.toolkit_gts.order_placed.v1~");
+const RAW_ID: &str = gts_id!("test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.raw.v1");
+const TYPED_ID: &str = gts_id!("test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.typed.v1");
+const NAMED_ID: &str = gts_id!("test.cf.toolkit_gts.thing.v1~test.cf.toolkit_gts.named.v1");
+const TYPE_URI: &str = gts_uri!("test.cf.toolkit_gts.thing.v1~");
 
 fn schema_ids() -> Vec<&'static str> {
     inventory::iter::<InventoryTypeSchema>
@@ -143,6 +143,64 @@ fn find_instance(id: &str) -> &'static InventoryInstance {
         .into_iter()
         .find(|e| e.instance_id == id)
         .unwrap_or_else(|| panic!("instance {id} not in inventory; got: {:?}", instance_ids()))
+}
+
+#[test]
+fn gts_uri_macro_prepends_uri_and_configured_id_prefix() {
+    assert_eq!(TYPE_URI, gts_uri!("test.cf.toolkit_gts.thing.v1~"));
+    assert!(TYPE_URI.ends_with(TYPE_ID));
+}
+
+#[test]
+fn gts_id_macro_detects_already_prefixed_literal() {
+    // gts_id! on a literal that already starts with GTS_ID_PREFIX should
+    // emit it as-is, without doubling the prefix.
+    let already_prefixed: &str = gts_id!("gts.test.cf.toolkit_gts.thing.v1~");
+    assert_eq!(already_prefixed, TYPE_ID);
+}
+
+#[test]
+fn gts_uri_macro_detects_already_prefixed_literal() {
+    // A literal that already includes GTS_ID_PREFIX should not get it doubled.
+    let already_prefixed: &str = concat!(gts_id!("test.cf.toolkit_gts.thing.v1~"));
+    let uri_from_prefixed: String = gts_uri!(already_prefixed);
+    let uri_from_suffix: &str = gts_uri!("test.cf.toolkit_gts.thing.v1~");
+    assert_eq!(uri_from_prefixed.as_str(), uri_from_suffix);
+}
+
+#[test]
+fn gts_uri_macro_detects_already_uri_prefixed_literal() {
+    // A literal that already starts with GTS_ID_URI_PREFIX should be
+    // emitted as-is.
+    let already_uri: &str = gts_uri!("gts://gts.test.cf.toolkit_gts.thing.v1~");
+    assert_eq!(already_uri, TYPE_URI);
+}
+
+#[test]
+fn gts_uri_macro_runtime_expr_with_uri_prefix() {
+    // Runtime expression that already starts with GTS_ID_URI_PREFIX —
+    // returned as-is.
+    let uri_in: String = TYPE_URI.to_owned();
+    let uri: String = gts_uri!(uri_in);
+    assert_eq!(uri.as_str(), TYPE_URI);
+}
+
+#[test]
+fn gts_uri_macro_runtime_expr_with_prefix() {
+    // Runtime expression that already starts with GTS_ID_PREFIX — only URI
+    // prefix should be prepended.
+    let id: String = TYPE_ID.to_owned();
+    let uri: String = gts_uri!(id);
+    assert_eq!(uri.as_str(), TYPE_URI);
+}
+
+#[test]
+fn gts_uri_macro_runtime_expr_without_prefix() {
+    // Runtime expression without GTS_ID_PREFIX — both URI and ID prefix
+    // should be prepended.
+    let suffix: String = "test.cf.toolkit_gts.thing.v1~".to_owned();
+    let uri: String = gts_uri!(suffix);
+    assert_eq!(uri.as_str(), TYPE_URI);
 }
 
 #[test]

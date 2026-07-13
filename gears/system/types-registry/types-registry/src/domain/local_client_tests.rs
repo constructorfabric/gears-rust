@@ -11,6 +11,8 @@ use gts::GtsConfig;
 use serde_json::json;
 use std::time::Duration;
 use toolkit_canonical_errors::InvalidArgument;
+use toolkit_gts::gts_id;
+use toolkit_gts::gts_uri;
 
 const JSON_SCHEMA_DRAFT_07: &str = "https://json-schema.org/draft-07/schema#";
 
@@ -60,7 +62,7 @@ fn create_client() -> TypesRegistryLocalClient {
 async fn test_register_and_get_type_schema() {
     let client = create_client();
     let entity = json!({
-        "$id": "gts://gts.acme.core.events.user_created.v1~",
+        "$id": gts_uri!("acme.core.events.user_created.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
         "properties": { "userId": { "type": "string" } }
@@ -72,12 +74,12 @@ async fn test_register_and_get_type_schema() {
     client.service.switch_to_ready().unwrap();
 
     let retrieved = client
-        .get_type_schema("gts.acme.core.events.user_created.v1~")
+        .get_type_schema(gts_id!("acme.core.events.user_created.v1~"))
         .await
         .unwrap();
     assert_eq!(
         retrieved.type_id.as_ref(),
-        "gts.acme.core.events.user_created.v1~"
+        gts_id!("acme.core.events.user_created.v1~")
     );
     assert!(retrieved.parent.is_none());
 }
@@ -85,20 +87,20 @@ async fn test_register_and_get_type_schema() {
 #[tokio::test]
 async fn test_get_type_schema_resolves_parent_chain() {
     let client = create_client();
-    let base_id = "gts.acme.core.events.base.v1~";
-    let derived_id = "gts.acme.core.events.base.v1~acme.core.events.derived.v1.0~";
+    let base_id = gts_id!("acme.core.events.base.v1~");
+    let derived_id = gts_id!("acme.core.events.base.v1~acme.core.events.derived.v1.0~");
     let base = json!({
-        "$id": format!("gts://{base_id}"),
+        "$id": gts_uri!(base_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
         "properties": { "id": { "type": "string" } }
     });
     let derived = json!({
-        "$id": format!("gts://{derived_id}"),
+        "$id": gts_uri!(derived_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
         "allOf": [
-            { "$ref": format!("gts://{base_id}") },
+            { "$ref": gts_uri!(base_id) },
             { "properties": { "name": { "type": "string" } } }
         ]
     });
@@ -117,26 +119,26 @@ async fn test_get_type_schema_resolves_parent_chain() {
 #[tokio::test]
 async fn test_type_schema_cache_dedups_parents() {
     let client = create_client();
-    let base_id = "gts.acme.core.events.base.v1~";
-    let d1_id = "gts.acme.core.events.base.v1~acme.core.events.d1.v1.0~";
-    let d2_id = "gts.acme.core.events.base.v1~acme.core.events.d2.v1.0~";
+    let base_id = gts_id!("acme.core.events.base.v1~");
+    let d1_id = gts_id!("acme.core.events.base.v1~acme.core.events.d1.v1.0~");
+    let d2_id = gts_id!("acme.core.events.base.v1~acme.core.events.d2.v1.0~");
     let base = json!({
-        "$id": format!("gts://{base_id}"),
+        "$id": gts_uri!(base_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
         "properties": { "id": { "type": "string" } }
     });
     let d1 = json!({
-        "$id": format!("gts://{d1_id}"),
+        "$id": gts_uri!(d1_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
-        "allOf": [{ "$ref": format!("gts://{base_id}") }]
+        "allOf": [{ "$ref": gts_uri!(base_id) }]
     });
     let d2 = json!({
-        "$id": format!("gts://{d2_id}"),
+        "$id": gts_uri!(d2_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
-        "allOf": [{ "$ref": format!("gts://{base_id}") }]
+        "allOf": [{ "$ref": gts_uri!(base_id) }]
     });
     client.register(vec![base, d1, d2]).await.unwrap();
     client.service.switch_to_ready().unwrap();
@@ -152,25 +154,30 @@ async fn test_type_schema_cache_dedups_parents() {
 async fn test_get_instance_carries_type_schema_arc() {
     let client = create_client();
     let schema = json!({
-        "$id": "gts://gts.acme.core.events.user.v1~",
+        "$id": gts_uri!("acme.core.events.user.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
     let instance = json!({
-        "id": "gts.acme.core.events.user.v1~acme.core.instances.u1.v1",
-        "type": "gts.acme.core.events.user.v1~"
+        "id": gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1"),
+        "type": gts_id!("acme.core.events.user.v1~")
     });
     client.register(vec![schema, instance]).await.unwrap();
     client.service.switch_to_ready().unwrap();
 
     let inst = client
-        .get_instance("gts.acme.core.events.user.v1~acme.core.instances.u1.v1")
+        .get_instance(gts_id!(
+            "acme.core.events.user.v1~acme.core.instances.u1.v1"
+        ))
         .await
         .unwrap();
-    assert_eq!(inst.type_id().as_ref(), "gts.acme.core.events.user.v1~");
+    assert_eq!(
+        inst.type_id().as_ref(),
+        gts_id!("acme.core.events.user.v1~")
+    );
     assert_eq!(
         inst.type_schema.type_id.as_ref(),
-        "gts.acme.core.events.user.v1~"
+        gts_id!("acme.core.events.user.v1~")
     );
 }
 
@@ -180,18 +187,18 @@ async fn test_instance_cache_returns_same_value() {
     // returns an equal value.
     let client = create_client();
     let schema = json!({
-        "$id": "gts://gts.acme.core.events.user.v1~",
+        "$id": gts_uri!("acme.core.events.user.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
     let instance = json!({
-        "id": "gts.acme.core.events.user.v1~acme.core.instances.u1.v1",
-        "type": "gts.acme.core.events.user.v1~"
+        "id": gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1"),
+        "type": gts_id!("acme.core.events.user.v1~")
     });
     client.register(vec![schema, instance]).await.unwrap();
     client.service.switch_to_ready().unwrap();
 
-    let id = "gts.acme.core.events.user.v1~acme.core.instances.u1.v1";
+    let id = gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1");
     let i1 = client.get_instance(id).await.unwrap();
     let i2 = client.get_instance(id).await.unwrap();
     assert_eq!(i1.id, i2.id);
@@ -204,7 +211,7 @@ async fn test_instance_cache_returns_same_value() {
 async fn test_clear_caches_drops_type_schema_arcs() {
     let client = create_client();
     let schema = json!({
-        "$id": "gts://gts.acme.core.events.user.v1~",
+        "$id": gts_uri!("acme.core.events.user.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
@@ -212,7 +219,7 @@ async fn test_clear_caches_drops_type_schema_arcs() {
     client.service.switch_to_ready().unwrap();
 
     let s1 = client
-        .get_type_schema("gts.acme.core.events.user.v1~")
+        .get_type_schema(gts_id!("acme.core.events.user.v1~"))
         .await
         .unwrap();
     // After the get, the cache must hold the entry — both LRU and the
@@ -227,7 +234,7 @@ async fn test_clear_caches_drops_type_schema_arcs() {
 
     // Subsequent get rebuilds and repopulates the cache.
     let s2 = client
-        .get_type_schema("gts.acme.core.events.user.v1~")
+        .get_type_schema(gts_id!("acme.core.events.user.v1~"))
         .await
         .unwrap();
     assert_eq!(s2.type_id, s1.type_id);
@@ -238,12 +245,12 @@ async fn test_clear_caches_drops_type_schema_arcs() {
 async fn test_invalidate_type_schema_drops_only_one_entry() {
     let client = create_client();
     let s1 = json!({
-        "$id": "gts://gts.acme.core.events.a.v1~",
+        "$id": gts_uri!("acme.core.events.a.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
     let s2 = json!({
-        "$id": "gts://gts.acme.core.events.b.v1~",
+        "$id": gts_uri!("acme.core.events.b.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
@@ -251,16 +258,16 @@ async fn test_invalidate_type_schema_drops_only_one_entry() {
     client.service.switch_to_ready().unwrap();
 
     client
-        .get_type_schema("gts.acme.core.events.a.v1~")
+        .get_type_schema(gts_id!("acme.core.events.a.v1~"))
         .await
         .unwrap();
     client
-        .get_type_schema("gts.acme.core.events.b.v1~")
+        .get_type_schema(gts_id!("acme.core.events.b.v1~"))
         .await
         .unwrap();
     assert_eq!(client.type_schemas.len(), 2);
 
-    client.invalidate_type_schema("gts.acme.core.events.a.v1~");
+    client.invalidate_type_schema(gts_id!("acme.core.events.a.v1~"));
     assert_eq!(client.type_schemas.len(), 1);
 }
 
@@ -279,14 +286,14 @@ async fn test_custom_cache_configs_apply() {
         CacheConfig::instances().with_capacity(8),
     );
     let s = json!({
-        "$id": "gts://gts.acme.core.events.user.v1~",
+        "$id": gts_uri!("acme.core.events.user.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
     client.register(vec![s]).await.unwrap();
     client.service.switch_to_ready().unwrap();
     let _ = client
-        .get_type_schema("gts.acme.core.events.user.v1~")
+        .get_type_schema(gts_id!("acme.core.events.user.v1~"))
         .await
         .unwrap();
     assert_eq!(client.type_schemas.len(), 1);
@@ -300,7 +307,7 @@ async fn test_custom_cache_configs_apply() {
     assert!(
         client
             .type_schemas
-            .get("gts.acme.core.events.user.v1~")
+            .get(gts_id!("acme.core.events.user.v1~"))
             .is_none(),
         "TTL did not evict expired entry"
     );
@@ -308,7 +315,7 @@ async fn test_custom_cache_configs_apply() {
 
     // Subsequent get rebuilds and repopulates the cache.
     let _ = client
-        .get_type_schema("gts.acme.core.events.user.v1~")
+        .get_type_schema(gts_id!("acme.core.events.user.v1~"))
         .await
         .unwrap();
     assert_eq!(client.type_schemas.len(), 1);
@@ -318,19 +325,21 @@ async fn test_custom_cache_configs_apply() {
 async fn test_get_type_schema_rejects_instance() {
     let client = create_client();
     let schema = json!({
-        "$id": "gts://gts.acme.core.events.user.v1~",
+        "$id": gts_uri!("acme.core.events.user.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
     let instance = json!({
-        "id": "gts.acme.core.events.user.v1~acme.core.instances.u1.v1",
-        "type": "gts.acme.core.events.user.v1~"
+        "id": gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1"),
+        "type": gts_id!("acme.core.events.user.v1~")
     });
     client.register(vec![schema, instance]).await.unwrap();
     client.service.switch_to_ready().unwrap();
 
     let err = client
-        .get_type_schema("gts.acme.core.events.user.v1~acme.core.instances.u1.v1")
+        .get_type_schema(gts_id!(
+            "acme.core.events.user.v1~acme.core.instances.u1.v1"
+        ))
         .await
         .unwrap_err();
     assert!(is_invalid_gts_id(&err));
@@ -340,8 +349,8 @@ async fn test_get_type_schema_rejects_instance() {
 async fn test_register_type_schemas_rejects_instance_input() {
     let client = create_client();
     let instance = json!({
-        "id": "gts.acme.core.events.user.v1~acme.core.instances.u1.v1",
-        "type": "gts.acme.core.events.user.v1~"
+        "id": gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1"),
+        "type": gts_id!("acme.core.events.user.v1~")
     });
     let results = client.register_type_schemas(vec![instance]).await.unwrap();
     assert_eq!(results.len(), 1);
@@ -356,18 +365,18 @@ async fn test_register_type_schemas_unsorted_batch_succeeds() {
     // Batch order [derived, base] is reordered by sort to [base, derived]
     // so the parent registers before its child within a single call.
     let client = create_client();
-    let base_id = "gts.acme.core.events.base.v1~";
-    let derived_id = "gts.acme.core.events.base.v1~acme.core.events.derived.v1.0~";
+    let base_id = gts_id!("acme.core.events.base.v1~");
+    let derived_id = gts_id!("acme.core.events.base.v1~acme.core.events.derived.v1.0~");
     let base = json!({
-        "$id": format!("gts://{base_id}"),
+        "$id": gts_uri!(base_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
     });
     let derived = json!({
-        "$id": format!("gts://{derived_id}"),
+        "$id": gts_uri!(derived_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
-        "allOf": [{ "$ref": format!("gts://{base_id}") }]
+        "allOf": [{ "$ref": gts_uri!(base_id) }]
     });
     // Pass derived first; sort should put base first.
     let results = client
@@ -387,9 +396,9 @@ async fn test_register_type_schemas_orphan_derived_in_ready_fails() {
     let client = create_client();
     client.service.switch_to_ready().unwrap();
 
-    let derived_id = "gts.acme.core.events.base.v1~acme.core.events.derived.v1.0~";
+    let derived_id = gts_id!("acme.core.events.base.v1~acme.core.events.derived.v1.0~");
     let derived = json!({
-        "$id": format!("gts://{derived_id}"),
+        "$id": gts_uri!(derived_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
     });
@@ -411,8 +420,8 @@ async fn test_register_instances_orphan_in_ready_fails() {
     client.service.switch_to_ready().unwrap();
 
     let instance = json!({
-        "id": "gts.acme.core.events.user.v1~acme.core.instances.u1.v1",
-        "type": "gts.acme.core.events.user.v1~"
+        "id": gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1"),
+        "type": gts_id!("acme.core.events.user.v1~")
     });
     let results = client.register_instances(vec![instance]).await.unwrap();
     assert_eq!(results.len(), 1);
@@ -428,13 +437,13 @@ async fn test_register_instances_orphan_in_ready_fails() {
 async fn test_list_type_schemas_and_instances_filtered() {
     let client = create_client();
     let schema = json!({
-        "$id": "gts://gts.acme.core.events.user.v1~",
+        "$id": gts_uri!("acme.core.events.user.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
     let instance = json!({
-        "id": "gts.acme.core.events.user.v1~acme.core.instances.u1.v1",
-        "type": "gts.acme.core.events.user.v1~"
+        "id": gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1"),
+        "type": gts_id!("acme.core.events.user.v1~")
     });
     client.register(vec![schema, instance]).await.unwrap();
     client.service.switch_to_ready().unwrap();
@@ -458,7 +467,7 @@ async fn test_list_type_schemas_and_instances_filtered() {
 async fn test_get_type_schema_by_uuid() {
     let client = create_client();
     let schema = json!({
-        "$id": "gts://gts.acme.core.events.user.v1~",
+        "$id": gts_uri!("acme.core.events.user.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
@@ -471,7 +480,10 @@ async fn test_get_type_schema_by_uuid() {
         .unwrap();
     let uuid = listed[0].type_uuid;
     let by_uuid = client.get_type_schema_by_uuid(uuid).await.unwrap();
-    assert_eq!(by_uuid.type_id.as_ref(), "gts.acme.core.events.user.v1~");
+    assert_eq!(
+        by_uuid.type_id.as_ref(),
+        gts_id!("acme.core.events.user.v1~")
+    );
 
     let unknown = client
         .get_type_schema_by_uuid(Uuid::nil())
@@ -487,7 +499,7 @@ async fn test_uuid_index_populated_by_get() {
     // can take the fast path.
     let client = create_client();
     let schema = json!({
-        "$id": "gts://gts.acme.core.events.user.v1~",
+        "$id": gts_uri!("acme.core.events.user.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
@@ -497,7 +509,7 @@ async fn test_uuid_index_populated_by_get() {
     // First call by gts_id — populates type_schema cache, which writes the
     // uuid → gts_id mapping into the cache's internal reverse index.
     let by_id = client
-        .get_type_schema("gts.acme.core.events.user.v1~")
+        .get_type_schema(gts_id!("acme.core.events.user.v1~"))
         .await
         .unwrap();
     assert!(client.type_schemas.get_by_uuid(by_id.type_uuid).is_some());
@@ -516,19 +528,19 @@ async fn test_invalidate_type_schema_cascades_to_dependents() {
     // schemas whose chain references the base. Cache walks the
     // resolved Arc chain via `ancestors()`.
     let client = create_client();
-    let base_id = "gts.acme.core.events.base.v1~";
-    let derived_id = "gts.acme.core.events.base.v1~acme.core.events.derived.v1.0~";
+    let base_id = gts_id!("acme.core.events.base.v1~");
+    let derived_id = gts_id!("acme.core.events.base.v1~acme.core.events.derived.v1.0~");
     let base = json!({
-        "$id": format!("gts://{base_id}"),
+        "$id": gts_uri!(base_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
     });
     let derived = json!({
-        "$id": format!("gts://{derived_id}"),
+        "$id": gts_uri!(derived_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
         "allOf": [
-            { "$ref": format!("gts://{base_id}") },
+            { "$ref": gts_uri!(base_id) },
             { "properties": { "extra": { "type": "string" } } }
         ],
     });
@@ -549,14 +561,14 @@ async fn test_invalidate_type_schema_cascades_to_dependents() {
 async fn test_clear_caches_resets_uuid_index() {
     let client = create_client();
     let schema = json!({
-        "$id": "gts://gts.acme.core.events.user.v1~",
+        "$id": gts_uri!("acme.core.events.user.v1~"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
     client.register(vec![schema]).await.unwrap();
     client.service.switch_to_ready().unwrap();
     let warmed = client
-        .get_type_schema("gts.acme.core.events.user.v1~")
+        .get_type_schema(gts_id!("acme.core.events.user.v1~"))
         .await
         .unwrap();
     assert!(client.type_schemas.get_by_uuid(warmed.type_uuid).is_some());
@@ -572,18 +584,18 @@ async fn test_get_type_schemas_returns_keyed_map() {
     let client = create_client();
     client
         .register(vec![
-            json!({"$id": "gts://gts.acme.core.events.alpha.v1~", "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
-            json!({"$id": "gts://gts.acme.core.events.beta.v1~",  "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
-            json!({"$id": "gts://gts.acme.core.events.gamma.v1~", "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
+            json!({"$id": gts_uri!("acme.core.events.alpha.v1~"), "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
+            json!({"$id": gts_uri!("acme.core.events.beta.v1~"),  "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
+            json!({"$id": gts_uri!("acme.core.events.gamma.v1~"), "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
         ])
         .await
         .unwrap();
     client.service.switch_to_ready().unwrap();
 
     let ids = vec![
-        "gts.acme.core.events.gamma.v1~".to_owned(),
-        "gts.acme.core.events.alpha.v1~".to_owned(),
-        "gts.acme.core.events.beta.v1~".to_owned(),
+        gts_id!("acme.core.events.gamma.v1~").to_owned(),
+        gts_id!("acme.core.events.alpha.v1~").to_owned(),
+        gts_id!("acme.core.events.beta.v1~").to_owned(),
     ];
     let results = client.get_type_schemas(ids.clone()).await;
     assert_eq!(results.len(), 3);
@@ -604,16 +616,16 @@ async fn test_get_type_schemas_partial_failures() {
     let client = create_client();
     client
         .register(vec![
-            json!({"$id": "gts://gts.acme.core.events.alpha.v1~", "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
-            json!({"$id": "gts://gts.acme.core.events.gamma.v1~", "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
+            json!({"$id": gts_uri!("acme.core.events.alpha.v1~"), "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
+            json!({"$id": gts_uri!("acme.core.events.gamma.v1~"), "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
         ])
         .await
         .unwrap();
     client.service.switch_to_ready().unwrap();
 
-    let alpha = "gts.acme.core.events.alpha.v1~";
-    let missing = "gts.acme.core.events.missing.v1~";
-    let gamma = "gts.acme.core.events.gamma.v1~";
+    let alpha = gts_id!("acme.core.events.alpha.v1~");
+    let missing = gts_id!("acme.core.events.missing.v1~");
+    let gamma = gts_id!("acme.core.events.gamma.v1~");
     let results = client
         .get_type_schemas(vec![alpha.to_owned(), missing.to_owned(), gamma.to_owned()])
         .await;
@@ -635,7 +647,7 @@ async fn test_get_type_schemas_kind_mismatch() {
     // must surface as an invalid-GTS-id validation error for that single
     // item, not fail the whole batch.
     let client = create_client();
-    let bad = "gts.acme.core.events.user.v1~acme.core.instances.u1.v1";
+    let bad = gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1");
     let results = client.get_type_schemas(vec![bad.to_owned()]).await;
     assert_eq!(results.len(), 1);
     assert!(is_invalid_gts_id(
@@ -650,13 +662,13 @@ async fn test_get_type_schemas_by_uuid_warm_cache_uses_index() {
     let client = create_client();
     client
         .register(vec![
-            json!({"$id": "gts://gts.acme.core.events.alpha.v1~", "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
+            json!({"$id": gts_uri!("acme.core.events.alpha.v1~"), "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
         ])
         .await
         .unwrap();
     client.service.switch_to_ready().unwrap();
     let warmed = client
-        .get_type_schema("gts.acme.core.events.alpha.v1~")
+        .get_type_schema(gts_id!("acme.core.events.alpha.v1~"))
         .await
         .unwrap();
     assert!(client.type_schemas.get_by_uuid(warmed.type_uuid).is_some());
@@ -681,7 +693,7 @@ async fn test_get_type_schemas_by_uuid_cold_falls_back_to_storage() {
     let client = create_client();
     client
         .register(vec![
-            json!({"$id": "gts://gts.acme.core.events.alpha.v1~", "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
+            json!({"$id": gts_uri!("acme.core.events.alpha.v1~"), "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
         ])
         .await
         .unwrap();
@@ -709,17 +721,17 @@ async fn test_get_instances_keyed_with_partial_failures() {
     let client = create_client();
     client
         .register(vec![
-            json!({"$id": "gts://gts.acme.core.events.user.v1~",            "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
-            json!({"id": "gts.acme.core.events.user.v1~acme.core.instances.u1.v1"}),
-            json!({"id": "gts.acme.core.events.user.v1~acme.core.instances.u2.v1"}),
+            json!({"$id": gts_uri!("acme.core.events.user.v1~"),            "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
+            json!({"id": gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1")}),
+            json!({"id": gts_id!("acme.core.events.user.v1~acme.core.instances.u2.v1")}),
         ])
         .await
         .unwrap();
     client.service.switch_to_ready().unwrap();
 
-    let u2 = "gts.acme.core.events.user.v1~acme.core.instances.u2.v1";
-    let missing = "gts.acme.core.events.user.v1~acme.core.instances.missing.v1";
-    let u1 = "gts.acme.core.events.user.v1~acme.core.instances.u1.v1";
+    let u2 = gts_id!("acme.core.events.user.v1~acme.core.instances.u2.v1");
+    let missing = gts_id!("acme.core.events.user.v1~acme.core.instances.missing.v1");
+    let u1 = gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1");
     let results = client
         .get_instances(vec![u2.to_owned(), missing.to_owned(), u1.to_owned()])
         .await;
@@ -747,14 +759,16 @@ async fn test_get_instances_by_uuid_warm_cache_uses_index() {
     let client = create_client();
     client
         .register(vec![
-            json!({"$id": "gts://gts.acme.core.events.user.v1~", "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
-            json!({"id": "gts.acme.core.events.user.v1~acme.core.instances.u1.v1"}),
+            json!({"$id": gts_uri!("acme.core.events.user.v1~"), "$schema": JSON_SCHEMA_DRAFT_07, "type": "object"}),
+            json!({"id": gts_id!("acme.core.events.user.v1~acme.core.instances.u1.v1")}),
         ])
         .await
         .unwrap();
     client.service.switch_to_ready().unwrap();
     let warmed = client
-        .get_instance("gts.acme.core.events.user.v1~acme.core.instances.u1.v1")
+        .get_instance(gts_id!(
+            "acme.core.events.user.v1~acme.core.instances.u1.v1"
+        ))
         .await
         .unwrap();
     assert!(client.instances.get_by_uuid(warmed.uuid).is_some());
@@ -790,18 +804,18 @@ async fn test_get_batch_empty_input() {
 #[tokio::test]
 async fn test_register_preserves_caller_order() {
     let client = create_client();
-    let base_id = "gts.acme.core.events.base.v1~";
-    let derived_id = "gts.acme.core.events.base.v1~acme.core.events.derived.v1.0~";
+    let base_id = gts_id!("acme.core.events.base.v1~");
+    let derived_id = gts_id!("acme.core.events.base.v1~acme.core.events.derived.v1.0~");
     let base = json!({
-        "$id": format!("gts://{base_id}"),
+        "$id": gts_uri!(base_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
     let derived = json!({
-        "$id": format!("gts://{derived_id}"),
+        "$id": gts_uri!(derived_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
-        "allOf": [{ "$ref": format!("gts://{base_id}") }]
+        "allOf": [{ "$ref": gts_uri!(base_id) }]
     });
 
     // Caller passes child first, parent second. Internal sort flips this so
@@ -821,18 +835,18 @@ async fn test_register_preserves_caller_order() {
 #[tokio::test]
 async fn test_register_typed_preserves_caller_order() {
     let client = create_client();
-    let base_id = "gts.acme.core.events.base.v1~";
-    let derived_id = "gts.acme.core.events.base.v1~acme.core.events.derived.v1.0~";
+    let base_id = gts_id!("acme.core.events.base.v1~");
+    let derived_id = gts_id!("acme.core.events.base.v1~acme.core.events.derived.v1.0~");
     let base = json!({
-        "$id": format!("gts://{base_id}"),
+        "$id": gts_uri!(base_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object"
     });
     let derived = json!({
-        "$id": format!("gts://{derived_id}"),
+        "$id": gts_uri!(derived_id),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "type": "object",
-        "allOf": [{ "$ref": format!("gts://{base_id}") }]
+        "allOf": [{ "$ref": gts_uri!(base_id) }]
     });
 
     let schema_results = client
@@ -845,12 +859,12 @@ async fn test_register_typed_preserves_caller_order() {
 
     // For instances, register a parent schema first, then verify caller order
     // for two instances of it.
-    let parent_id = "gts.acme.core.events.parent.v1~";
-    let earlier = "gts.acme.core.events.parent.v1~acme.core.evt.a.v1";
-    let later = "gts.acme.core.events.parent.v1~acme.core.evt.b.v1";
+    let parent_id = gts_id!("acme.core.events.parent.v1~");
+    let earlier = gts_id!("acme.core.events.parent.v1~acme.core.evt.a.v1");
+    let later = gts_id!("acme.core.events.parent.v1~acme.core.evt.b.v1");
     client
         .register(vec![json!({
-            "$id": format!("gts://{parent_id}"),
+            "$id": gts_uri!(parent_id),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         })])

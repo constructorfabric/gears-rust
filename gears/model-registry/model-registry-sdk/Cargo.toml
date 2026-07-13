@@ -26,5 +26,5 @@ serde_json = { workspace = true }
 schemars = { workspace = true, features = ["chrono04"] }
 toolkit-security = { workspace = true }
 toolkit-odata = { workspace = true }
+toolkit-gts = { workspace = true }
 gts = { workspace = true }
-gts-macros = { workspace = true }

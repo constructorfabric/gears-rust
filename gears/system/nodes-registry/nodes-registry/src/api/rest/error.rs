@@ -1,7 +1,7 @@
 use crate::domain::error::DomainError;
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 
-#[resource_error("gts.cf.nodes_registry.registry.node.v1~")]
+#[resource_error(gts_id!("cf.nodes_registry.registry.node.v1~"))]
 pub struct NodeError;
 
 impl From<DomainError> for CanonicalError {

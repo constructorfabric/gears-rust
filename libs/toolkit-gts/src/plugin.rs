@@ -29,7 +29,7 @@ use gts::GtsInstanceId;
 #[derive(Debug)]
 #[gts_type_schema(
     dir_path = "schemas",
-    type_id = "gts.cf.toolkit.plugins.plugin.v1~",
+    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~"),
     description = "Base toolkit plugin schema",
     properties = "id,vendor,priority,properties",
     base = true

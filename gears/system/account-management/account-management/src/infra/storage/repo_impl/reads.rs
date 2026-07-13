@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use account_management_sdk::TenantInfoFilterField;
 use bigdecimal::BigDecimal;
-use gts::GtsID;
+use gts::GtsId;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, Order, QuerySelect};
 use serde_json::Value;
@@ -109,7 +109,7 @@ impl FieldToColumn<TenantInfoFilterField> for TenantODataMapper {
             }
             // Chained `gts.*` tenant-type string → its deterministic UUIDv5,
             // compared against the `tenant_type_uuid` column. Same derivation
-            // as `uuid_for_registered_schema` (`GtsID::new(s).to_uuid()`), so a
+            // as `uuid_for_registered_schema` (`GtsId::try_new(s).to_uuid()`), so a
             // value taken from the projection round-trips to the stored UUID.
             // Only membership operators are admissible — an ordered comparison
             // on a derived UUID has no honest meaning (mirrors `status`).
@@ -124,7 +124,7 @@ impl FieldToColumn<TenantInfoFilterField> for TenantODataMapper {
                         ));
                     }
                 }
-                let uuid = GtsID::new(s).map(|g| g.to_uuid()).map_err(|e| {
+                let uuid = GtsId::try_new(s).map(|g| g.to_uuid()).map_err(|e| {
                     format!(
                         "invalid `tenant_type` value '{s}'; expected a chained GTS \
                          type id (e.g. 'gts.cf.core.am.tenant_type.v1~…~'): {e}"
@@ -588,11 +588,13 @@ pub(super) async fn is_descendant(
 #[cfg(test)]
 mod tenant_type_filter_tests {
     use super::*;
+    use toolkit_gts::gts_id;
 
     // A valid `cf`-vendor chained tenant-type id (the one `service_tests`
     // uses). de0901 validates GTS string literals via `GtsOps::parse_id`; a
     // valid `cf` id is accepted, so no lint suppression is needed.
-    const SAMPLE_TENANT_TYPE_GTS: &str = "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~";
+    const SAMPLE_TENANT_TYPE_GTS: &str =
+        gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
 
     type Mapper = TenantODataMapper;
     type Field = TenantInfoFilterField;
@@ -600,10 +602,12 @@ mod tenant_type_filter_tests {
     /// `$filter=tenant_type eq '<gts>'` maps the chained string to the same
     /// deterministic `UUIDv5` the storage column holds, so a value
     /// taken from the projection round-trips. Pins the derivation against
-    /// `GtsID::to_uuid` so a future codec change is caught.
+    /// `GtsId::to_uuid` so a future codec change is caught.
     #[test]
     fn tenant_type_string_maps_to_derived_uuidv5() {
-        let expected = GtsID::new(SAMPLE_TENANT_TYPE_GTS).expect("gts").to_uuid();
+        let expected = GtsId::try_new(SAMPLE_TENANT_TYPE_GTS)
+            .expect("gts")
+            .to_uuid();
         let out = <Mapper as FieldToColumn<Field>>::map_value(
             Field::TenantType,
             FilterOp::Eq,

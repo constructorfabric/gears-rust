@@ -20,12 +20,13 @@
 mod common;
 
 use axum::http::{StatusCode, header};
+use toolkit_gts::gts_id;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::*;
 
-const SAMPLE_TENANT_TYPE: &str = "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~";
+const SAMPLE_TENANT_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
 
 // ─── POST /tenants ───────────────────────────────────────────────────
 

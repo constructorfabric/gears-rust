@@ -6,6 +6,9 @@ import pytest
 
 from .helpers import create_route, create_upstream, delete_upstream, unique_alias
 
+GTS_ID_PREFIX = "gts" + "."
+GTS_URI_PREFIX = "gts://" + GTS_ID_PREFIX
+
 
 @pytest.mark.asyncio
 async def test_proxy_authz_allowed(
@@ -82,6 +85,9 @@ async def test_proxy_authz_forbidden_nil_tenant(
             body = resp.json()
             assert body["status"] == 403
             assert body["title"] == "Permission Denied"
-            assert body["type"] == "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
+            assert (
+                body["type"]
+                == f"{GTS_URI_PREFIX}cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
+            )
         finally:
             await delete_upstream(client, oagw_base_url, oagw_headers, uid)

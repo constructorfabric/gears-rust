@@ -10,6 +10,7 @@ use super::*;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
 use types_registry_sdk::{GtsInstance, GtsTypeId, InstanceQuery, RegisterResult, TypeSchemaQuery};
 
 /// Build a `GtsTypeSchema` for testing. `traits_schema` carries
@@ -21,7 +22,7 @@ fn schema(
     own_allowed_parents: Option<Vec<&str>>,
 ) -> Arc<GtsTypeSchema> {
     let mut raw = json!({
-        "$id": format!("gts://{type_id}"),
+        "$id": gts_uri!(type_id),
         "type": "object",
     });
     if let Some(parents) = own_allowed_parents {
@@ -39,7 +40,7 @@ fn schema(
 /// to `[]`, mirroring `docs/schemas/tenant_type.v1.schema.json`.
 fn envelope() -> Arc<GtsTypeSchema> {
     let raw = json!({
-        "$id": format!("gts://{TENANT_TYPE_BASE_GTS_ID}"),
+        "$id": gts_uri!(TENANT_TYPE_BASE_GTS_ID),
         "type": "object",
         "x-gts-traits-schema": {
             "type": "object",
@@ -177,16 +178,16 @@ impl TypesRegistryClient for FakeRegistry {
 async fn admits_when_parent_in_child_allowed_parent_types() {
     let envelope = envelope();
     let parent_schema = schema(
-        "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~",
+        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"),
         Some(envelope.clone()),
         None,
     );
     let child_schema = schema(
-        "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~",
+        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
         Some(envelope),
-        Some(vec![
-            "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~",
-        ]),
+        Some(vec![gts_id!(
+            "cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"
+        )]),
     );
     let parent_uuid = parent_schema.type_uuid;
     let child_uuid = child_schema.type_uuid;
@@ -217,12 +218,12 @@ async fn admits_when_parent_in_child_allowed_parent_types() {
 async fn admits_same_type_nesting_when_self_listed() {
     let envelope = envelope();
     let nested = schema(
-        "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.partner.v1~",
+        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.partner.v1~"),
         Some(envelope),
         // Self-reference admits same-type nesting.
-        Some(vec![
-            "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.partner.v1~",
-        ]),
+        Some(vec![gts_id!(
+            "cf.core.am.tenant_type.v1~acme.am.tenant_type.partner.v1~"
+        )]),
     );
     let nested_uuid = nested.type_uuid;
     let registry = Arc::new(FakeRegistry::new(vec![(
@@ -240,12 +241,12 @@ async fn admits_same_type_nesting_when_self_listed() {
 async fn rejects_same_type_nesting_when_self_not_listed() {
     let envelope = envelope();
     let leaf = schema(
-        "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~",
+        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
         Some(envelope),
         // Self NOT in the list → same-type nesting disallowed.
-        Some(vec![
-            "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~",
-        ]),
+        Some(vec![gts_id!(
+            "cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"
+        )]),
     );
     let leaf_uuid = leaf.type_uuid;
     let registry = Arc::new(FakeRegistry::new(vec![(
@@ -267,16 +268,16 @@ async fn rejects_same_type_nesting_when_self_not_listed() {
 async fn rejects_when_parent_not_in_allowed_list() {
     let envelope = envelope();
     let parent_schema = schema(
-        "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.stranger.v1~",
+        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.stranger.v1~"),
         Some(envelope.clone()),
         None,
     );
     let child_schema = schema(
-        "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~",
+        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
         Some(envelope),
-        Some(vec![
-            "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~",
-        ]),
+        Some(vec![gts_id!(
+            "cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"
+        )]),
     );
     let parent_uuid = parent_schema.type_uuid;
     let child_uuid = child_schema.type_uuid;
@@ -299,9 +300,9 @@ async fn rejects_child_not_under_envelope_as_invalid_tenant_type() {
     // Schema is registered, but its chain root is not the AM
     // tenant_type envelope — every membership check would be against
     // a meaningless trait map.
-    let alien_root = schema("gts.acme.core.events.type.v1~", None, None);
+    let alien_root = schema(gts_id!("acme.core.events.type.v1~"), None, None);
     let alien_leaf = schema(
-        "gts.acme.core.events.type.v1~acme.commerce.orders.order.v1~",
+        gts_id!("acme.core.events.type.v1~acme.commerce.orders.order.v1~"),
         Some(alien_root),
         Some(vec!["whatever"]),
     );
@@ -312,7 +313,7 @@ async fn rejects_child_not_under_envelope_as_invalid_tenant_type() {
         (
             parent,
             Ok(GtsTypeSchema::try_new(
-                GtsTypeId::new("gts.acme.core.events.type.v1~"),
+                GtsTypeId::new(gts_id!("acme.core.events.type.v1~")),
                 json!({"type": "object"}),
                 None,
                 None,
@@ -340,20 +341,20 @@ async fn rejects_parent_not_under_envelope_as_invalid_tenant_type() {
     // would still match and admit a non-tenant-type parent; the
     // envelope re-check turns this into a clear `InvalidTenantType`.
     let envelope = envelope();
-    let alien_root = schema("gts.acme.core.events.type.v1~", None, None);
+    let alien_root = schema(gts_id!("acme.core.events.type.v1~"), None, None);
     let alien_parent = schema(
-        "gts.acme.core.events.type.v1~acme.commerce.orders.order.v1~",
+        gts_id!("acme.core.events.type.v1~acme.commerce.orders.order.v1~"),
         Some(alien_root),
         None,
     );
     let child_schema = schema(
-        "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~",
+        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
         Some(envelope),
         // Deliberately list the alien parent's id — without the
         // envelope re-check the membership would match and admit.
-        Some(vec![
-            "gts.acme.core.events.type.v1~acme.commerce.orders.order.v1~",
-        ]),
+        Some(vec![gts_id!(
+            "acme.core.events.type.v1~acme.commerce.orders.order.v1~"
+        )]),
     );
     let parent_uuid = alien_parent.type_uuid;
     let child_uuid = child_schema.type_uuid;
@@ -397,11 +398,11 @@ async fn rejects_child_not_registered_as_invalid_tenant_type() {
 async fn rejects_parent_not_registered_as_invalid_tenant_type() {
     let envelope = envelope();
     let child_schema = schema(
-        "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~",
+        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
         Some(envelope),
-        Some(vec![
-            "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~",
-        ]),
+        Some(vec![gts_id!(
+            "cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"
+        )]),
     );
     let child_uuid = child_schema.type_uuid;
     let parent_uuid = Uuid::from_u128(0xCAFE);
@@ -439,17 +440,19 @@ async fn rejects_when_allowed_parent_types_contains_non_tenant_type_chained_id()
     // an otherwise legit type-shape entry. The whole list must
     // collapse to malformed.
     let raw = json!({
-        "$id": "gts://gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.child.v1~",
+        "$id": gts_uri!("cf.core.am.tenant_type.v1~acme.am.tenant_type.child.v1~"),
         "type": "object",
         "x-gts-traits": {
             ALLOWED_PARENT_TYPES_TRAIT: [
-                "gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.parent.v1~",
-                "gts.cf.core.am.tenant_type.v1~acme.am.customer.v1~prod-acct-42",
+                gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.parent.v1~"),
+                format!("{GTS_ID_PREFIX}cf.core.am.tenant_type.v1~acme.am.tenant.customer.v1~prod_acct_42"),
             ],
         },
     });
     let child = GtsTypeSchema::try_new(
-        GtsTypeId::new("gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.child.v1~"),
+        GtsTypeId::new(gts_id!(
+            "cf.core.am.tenant_type.v1~acme.am.tenant_type.child.v1~"
+        )),
         raw,
         None,
         Some(envelope),
@@ -475,14 +478,16 @@ async fn rejects_when_allowed_parent_types_is_not_an_array() {
     // overriding the envelope's `default: []`.
     let envelope = envelope();
     let raw = json!({
-        "$id": "gts://gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.broken.v1~",
+        "$id": gts_uri!("cf.core.am.tenant_type.v1~acme.am.tenant_type.broken.v1~"),
         "type": "object",
         "x-gts-traits": {
             ALLOWED_PARENT_TYPES_TRAIT: "not an array",
         },
     });
     let broken = GtsTypeSchema::try_new(
-        GtsTypeId::new("gts.cf.core.am.tenant_type.v1~acme.am.tenant_type.broken.v1~"),
+        GtsTypeId::new(gts_id!(
+            "cf.core.am.tenant_type.v1~acme.am.tenant_type.broken.v1~"
+        )),
         raw,
         None,
         Some(envelope),

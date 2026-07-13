@@ -18,23 +18,23 @@ use crate::domain::service::{MutationError, StreamError};
 // ---------------------------------------------------------------------------
 
 /// Errors attributable to a chat as a resource.
-#[resource_error("gts.cf.core.mini_chat.chat.v1~")]
+#[resource_error(gts_id!("cf.core.mini_chat.chat.v1~"))]
 pub struct MiniChatChatError;
 
 /// Errors attributable to a message as a resource.
-#[resource_error("gts.cf.core.mini_chat.message.v1~")]
+#[resource_error(gts_id!("cf.core.mini_chat.message.v1~"))]
 pub struct MiniChatMessageError;
 
 /// Errors attributable to a turn as a resource.
-#[resource_error("gts.cf.core.mini_chat.turn.v1~")]
+#[resource_error(gts_id!("cf.core.mini_chat.turn.v1~"))]
 pub struct MiniChatTurnError;
 
 /// Errors attributable to an attachment as a resource.
-#[resource_error("gts.cf.core.mini_chat.attachment.v1~")]
+#[resource_error(gts_id!("cf.core.mini_chat.attachment.v1~"))]
 pub struct MiniChatAttachmentError;
 
 /// Errors attributable to a model as a resource.
-#[resource_error("gts.cf.core.mini_chat.model.v1~")]
+#[resource_error(gts_id!("cf.core.mini_chat.model.v1~"))]
 pub struct MiniChatModelError;
 
 // ---------------------------------------------------------------------------
@@ -351,6 +351,7 @@ impl From<StreamError> for CanonicalError {
 mod tests {
     use super::*;
     use toolkit_canonical_errors::Problem;
+    use toolkit_gts::{gts_id, gts_uri};
     use uuid::Uuid;
 
     /// Build the wire `Problem` the canonical error middleware would emit
@@ -371,25 +372,25 @@ mod tests {
         }
     }
 
-    const NOT_FOUND_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~";
+    const NOT_FOUND_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~");
     const INVALID_ARGUMENT_TYPE: &str =
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~";
-    const OUT_OF_RANGE_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.out_of_range.v1~";
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~");
+    const OUT_OF_RANGE_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.out_of_range.v1~");
     const RESOURCE_EXHAUSTED_TYPE: &str =
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~";
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~");
     const FAILED_PRECONDITION_TYPE: &str =
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~";
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~");
     const PERMISSION_DENIED_TYPE: &str =
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~";
-    const ABORTED_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~";
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~");
+    const ABORTED_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.aborted.v1~");
     const SERVICE_UNAVAILABLE_TYPE: &str =
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~";
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~");
 
-    const CHAT_GTS: &str = "gts.cf.core.mini_chat.chat.v1~";
-    const MESSAGE_GTS: &str = "gts.cf.core.mini_chat.message.v1~";
-    const TURN_GTS: &str = "gts.cf.core.mini_chat.turn.v1~";
-    const ATTACHMENT_GTS: &str = "gts.cf.core.mini_chat.attachment.v1~";
-    const MODEL_GTS: &str = "gts.cf.core.mini_chat.model.v1~";
+    const CHAT_GTS: &str = gts_id!("cf.core.mini_chat.chat.v1~");
+    const MESSAGE_GTS: &str = gts_id!("cf.core.mini_chat.message.v1~");
+    const TURN_GTS: &str = gts_id!("cf.core.mini_chat.turn.v1~");
+    const ATTACHMENT_GTS: &str = gts_id!("cf.core.mini_chat.attachment.v1~");
+    const MODEL_GTS: &str = gts_id!("cf.core.mini_chat.model.v1~");
 
     // ── Resource scope coverage (one not_found per scope) ────────────────
 

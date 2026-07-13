@@ -5,11 +5,12 @@ use dashmap::DashMap;
 use http::Method;
 use std::sync::Arc;
 use toolkit::api::OperationSpec;
+use toolkit_gts::gts_id;
 
 use crate::middleware::common;
 use crate::middleware::errors::ApiGatewayRouteError;
 
-const BASE_FEATURE: &str = "gts.cf.core.lic.feat.v1~cf.core.global.base.v1";
+const BASE_FEATURE: &str = gts_id!("cf.core.lic.feat.v1~cf.core.global.base.v1");
 
 type LicenseKey = (Method, String);
 

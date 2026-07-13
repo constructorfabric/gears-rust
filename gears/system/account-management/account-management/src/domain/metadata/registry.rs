@@ -29,7 +29,7 @@
 //!   pairs so per-schema policy can be scripted from service-level
 //!   unit tests. Reverse lookup uses the same map keyed by the
 //!   deterministic `UUIDv5` derivation via upstream
-//!   [`gts::GtsID::to_uuid`].
+//!   [`gts::GtsId::to_uuid`].
 //! * `GtsMetadataSchemaRegistry` — the production implementation
 //!   backed by `types_registry_sdk::TypesRegistryClient`.
 //!
@@ -62,7 +62,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use gts::{GtsID, GtsTypeId};
+use gts::{GtsId, GtsTypeId};
 use parking_lot::Mutex;
 use serde_json::Value;
 use toolkit_macros::domain_model;
@@ -212,7 +212,7 @@ pub trait MetadataSchemaRegistry: Send + Sync {
 
 /// Compute the deterministic `schema_uuid` for an already-validated
 /// `type_id` string. AM-internal helper shared between Stub and
-/// production registries — both rely on `gts::GtsID::to_uuid()` for
+/// production registries — both rely on `gts::GtsId::to_uuid()` for
 /// the canonical namespace.
 ///
 /// # Panics
@@ -227,7 +227,7 @@ pub trait MetadataSchemaRegistry: Send + Sync {
               an unparseable input here is a service-layer contract break"
 )]
 fn uuid_for_registered_schema(type_id: &GtsTypeId) -> Uuid {
-    GtsID::new(type_id.as_ref())
+    GtsId::try_new(type_id.as_ref())
         .expect(
             "registry was given a type_id that does not parse as a GTS id - \
              caller (service layer) is contract-broken",

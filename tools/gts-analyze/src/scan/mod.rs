@@ -4,6 +4,7 @@ pub mod rust;
 
 use regex::Regex;
 use std::sync::OnceLock;
+use toolkit_gts::GTS_ID_PREFIX;
 
 /// One GTS-segment grammar (matches the spec subset used elsewhere in the project).
 /// Form: `<vendor>.<package>.<namespace>.<type>.v<MAJOR>[.<MINOR>]`.
@@ -25,7 +26,8 @@ pub fn gts_in_string_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         let body = id_with_wildcard();
-        Regex::new(&format!(r#""(gts\.{body})""#)).expect("static regex")
+        let prefix = regex::escape(GTS_ID_PREFIX);
+        Regex::new(&format!(r#""({prefix}{body})""#)).expect("static regex")
     })
 }
 
@@ -38,14 +40,21 @@ pub fn gts_bare_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         let body = id_with_wildcard();
-        Regex::new(&format!(r"(?:^|[^a-z0-9_])(gts\.{body})")).expect("static regex")
+        let prefix = regex::escape(GTS_ID_PREFIX);
+        Regex::new(&format!(r"(?:^|[^a-z0-9_])({prefix}{body})")).expect("static regex")
     })
 }
 
 /// True if a string passes the loose GTS-id heuristic used by the Rust scanner —
 /// permits chained ids and `~`-suffixes, not a strict spec validator.
 pub fn looks_like_gts_id(s: &str) -> bool {
-    if !s.starts_with("gts.") || s.len() > 512 {
+    if s.len() > gts_id::GTS_ID_MAX_LENGTH {
+        return false;
+    }
+    // Use the compile-time configured prefix instead of a
+    // hard-coded literal so the heuristic tracks whatever prefix the GTS-id
+    // crate was built with.
+    if !s.starts_with(GTS_ID_PREFIX) {
         return false;
     }
     s.contains(".v")

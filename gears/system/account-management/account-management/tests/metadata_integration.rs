@@ -34,6 +34,7 @@
 mod common;
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use account_management::domain::error::DomainError;
 use account_management::domain::metadata::registry::{
@@ -53,8 +54,10 @@ use uuid::Uuid;
 use common::*;
 use gts::GtsTypeId;
 
-const SCHEMA_A: &str = "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.feature_flag.v1~";
-const SCHEMA_B: &str = "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.org_branding.v1~";
+const SCHEMA_A: &str =
+    gts_id!("cf.core.am.tenant_metadata.v1~vendor.app.metadata.feature_flag.v1~");
+const SCHEMA_B: &str =
+    gts_id!("cf.core.am.tenant_metadata.v1~vendor.app.metadata.org_branding.v1~");
 
 fn schema_a() -> GtsTypeId {
     GtsTypeId::new(SCHEMA_A)
@@ -72,7 +75,7 @@ fn schema_b() -> GtsTypeId {
     reason = "test helpers only see hand-crafted valid schema ids"
 )]
 fn schema_uuid_for(type_id: &str) -> Uuid {
-    gts::GtsID::new(type_id)
+    gts::GtsId::try_new(type_id)
         .expect("valid GTS id in tests")
         .to_uuid()
 }

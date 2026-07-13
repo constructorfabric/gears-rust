@@ -25,11 +25,10 @@
 //! updates take effect immediately. The SDK's local-client cache is
 //! responsible for any short-lived caching it chooses to do internally.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use gts::{GtsID, GtsTypeId};
+use gts::{GtsId, GtsTypeId};
 use serde_json::Value;
+use std::sync::Arc;
 use toolkit_canonical_errors::CanonicalError;
 use types_registry_sdk::TypesRegistryClient;
 use uuid::Uuid;
@@ -86,7 +85,7 @@ fn map_registry_err(err: CanonicalError, schema_token: &str) -> DomainError {
 /// Compute the deterministic `schema_uuid` for an already-validated
 /// `type_id` string. Mirrors the helper in
 /// [`crate::domain::metadata::registry`] — both rely on
-/// `gts::GtsID::to_uuid()` for the canonical namespace.
+/// `gts::GtsId::to_uuid()` for the canonical namespace.
 ///
 /// # Panics
 ///
@@ -100,7 +99,7 @@ fn map_registry_err(err: CanonicalError, schema_token: &str) -> DomainError {
               an unparseable input here is a service-layer contract break"
 )]
 fn uuid_for_registered_schema(type_id: &str) -> Uuid {
-    GtsID::new(type_id)
+    GtsId::try_new(type_id)
         .expect(
             "types-registry returned a type_id that does not parse as a GTS id - \
              upstream SDK contract break",
@@ -249,7 +248,7 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
         let resolved = schema.effective_schema();
         // The base AM metadata envelope declares `$schema:
         // "http://json-schema.org/draft-07/schema#"`, and derived metadata
-        // schemas carry `$schema: "gts://gts.cf.core.am.tenant_metadata.v1~"`
+        // schemas carry `$schema: gts_uri!("cf.core.am.tenant_metadata.v1~")`
         // -- the GTS chain identifier that AM uses for inheritance. The
         // generic `jsonschema::validator_for` auto-detects the draft from
         // `$schema` and fails closed when the URI is not a registered

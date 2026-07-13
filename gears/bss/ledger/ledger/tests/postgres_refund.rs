@@ -64,6 +64,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -1145,7 +1146,7 @@ fn dc_ctx(subject: Uuid, tenant: Uuid) -> SecurityContext {
     SecurityContext::builder()
         .subject_id(subject)
         .subject_tenant_id(tenant)
-        .subject_type("gts.cf.core.security.subject_user.v1~")
+        .subject_type(gts_id!("cf.core.security.subject_user.v1~"))
         .token_scopes(vec!["*".to_owned()])
         .build()
         .expect("authed SecurityContext must build")

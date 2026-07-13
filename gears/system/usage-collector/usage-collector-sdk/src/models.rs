@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use toolkit_odata_macros::ODataFilterable;
 use uuid::Uuid;
 
-use gts::{GtsID, GtsInstanceId};
+use gts::{GtsId, GtsIdSegment, GtsInstanceId};
 
 use crate::error::UsageCollectorError;
 
@@ -450,12 +450,12 @@ impl UsageTypeGtsId {
     /// Every catalog `gts_id` MUST left-prefix-match this value and carry at
     /// least one further `~`-separated derivation segment. The base itself
     /// is abstract and rejected as a bare value.
-    pub const USAGE_RECORD_BASE: &'static str = "gts.cf.core.uc.usage_record.v1~";
+    pub const USAGE_RECORD_BASE: &'static str = crate::gts::USAGE_RECORD_RESOURCE;
 
     /// Creates a `UsageTypeGtsId` after validating that the input is a
     /// well-formed GTS instance id deriving from [`Self::USAGE_RECORD_BASE`].
     ///
-    /// Validation routes through [`gts::GtsID::new`], which enforces the GTS
+    /// Validation routes through [`gts::GtsId::try_new`], which enforces the GTS
     /// per-segment grammar (`vendor.package.namespace.type.v<major>[.<minor>]`),
     /// the allowed character set, terminator semantics, and the chained-id
     /// rules. That is the same validator other gears use for catalog-key
@@ -472,7 +472,7 @@ impl UsageTypeGtsId {
     /// segment of the parsed chain).
     pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
         let raw = value.into();
-        let parsed = GtsID::new(&raw).map_err(|e| {
+        let parsed = GtsId::try_new(&raw).map_err(|e| {
             UsageCollectorError::invalid_usage_type_gts_id(
                 &raw,
                 &format!("usage type gts_id `{raw}` is not a valid GTS id: {e}"),
@@ -508,7 +508,7 @@ impl UsageTypeGtsId {
         // returning `Some(base)` implies `gts_id_segments.len() >= 2` —
         // but is kept as a graceful error rather than `expect` to satisfy
         // the workspace `clippy::expect_used` rule.
-        let Some(segment) = parsed.gts_id_segments.last().map(|s| s.segment.as_str()) else {
+        let Some(segment) = parsed.segments().last().map(GtsIdSegment::raw) else {
             return Err(UsageCollectorError::invalid_usage_type_gts_id(
                 &raw,
                 &format!("usage type gts_id `{raw}` is missing a derivation segment"),

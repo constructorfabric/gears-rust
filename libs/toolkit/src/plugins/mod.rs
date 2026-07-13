@@ -210,6 +210,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use toolkit_gts::gts_id;
+
+    const PLUGIN_A: &str =
+        gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.a.test.plugin.v1");
+    const PLUGIN_B: &str =
+        gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.b.test.plugin.v1");
+    const CONCURRENT_PLUGIN: &str = gts_id!(
+        "cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.concurrent.test.plugin.v1"
+    );
 
     #[tokio::test]
     async fn resolve_called_once_returns_same_str() {
@@ -220,10 +229,7 @@ mod tests {
         let id_a = selector
             .get_or_init(|| async move {
                 calls_a.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, std::convert::Infallible>(
-                    "gts.cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.a.test.plugin.v1"
-                        .to_owned(),
-                )
+                Ok::<_, std::convert::Infallible>(PLUGIN_A.to_owned())
             })
             .await
             .unwrap();
@@ -232,10 +238,7 @@ mod tests {
         let id_b = selector
             .get_or_init(|| async move {
                 calls_b.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, std::convert::Infallible>(
-                    "gts.cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.b.test.plugin.v1"
-                        .to_owned(),
-                )
+                Ok::<_, std::convert::Infallible>(PLUGIN_B.to_owned())
             })
             .await
             .unwrap();
@@ -253,16 +256,10 @@ mod tests {
         let id_a = selector
             .get_or_init(|| async move {
                 calls_a.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, std::convert::Infallible>(
-                    "gts.cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.a.test.plugin.v1"
-                        .to_owned(),
-                )
+                Ok::<_, std::convert::Infallible>(PLUGIN_A.to_owned())
             })
             .await;
-        assert_eq!(
-            &*id_a.unwrap(),
-            "gts.cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.a.test.plugin.v1"
-        );
+        assert_eq!(&*id_a.unwrap(), PLUGIN_A);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(selector.reset().await);
 
@@ -270,16 +267,10 @@ mod tests {
         let id_b = selector
             .get_or_init(|| async move {
                 calls_b.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, std::convert::Infallible>(
-                    "gts.cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.b.test.plugin.v1"
-                        .to_owned(),
-                )
+                Ok::<_, std::convert::Infallible>(PLUGIN_B.to_owned())
             })
             .await;
-        assert_eq!(
-            &*id_b.unwrap(),
-            "gts.cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.b.test.plugin.v1"
-        );
+        assert_eq!(&*id_b.unwrap(), PLUGIN_B);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -298,10 +289,7 @@ mod tests {
                         // Small delay to increase chance of concurrent access
                         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                         calls.fetch_add(1, Ordering::SeqCst);
-                        Ok::<_, std::convert::Infallible>(
-                            "gts.cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.concurrent.test.plugin.v1"
-                                .to_owned(),
-                        )
+                        Ok::<_, std::convert::Infallible>(CONCURRENT_PLUGIN.to_owned())
                     })
                     .await
             }));
@@ -315,10 +303,7 @@ mod tests {
 
         // All results should be the same
         for id in &results {
-            assert_eq!(
-                &**id,
-                "gts.cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~vendor.concurrent.test.plugin.v1"
-            );
+            assert_eq!(&**id, CONCURRENT_PLUGIN);
         }
 
         // Resolve should have been called exactly once

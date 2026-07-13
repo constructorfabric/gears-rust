@@ -23,3 +23,4 @@ time = { workspace = true }
 
 # Canonical error envelope (re-exported as `FileStorageError`)
 toolkit-canonical-errors = { workspace = true }
+toolkit-gts = { workspace = true }

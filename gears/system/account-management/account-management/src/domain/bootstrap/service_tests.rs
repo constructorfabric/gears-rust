@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_gts::gts_id;
 use types_registry_sdk::{
     GtsInstance, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
     TypesRegistryClient,
@@ -38,8 +39,10 @@ use types_registry_sdk::{
 use uuid::Uuid;
 
 const ROOT_ID_RAW: u128 = 0x100;
+const TENANT_TYPE_SCHEMA: &str = gts_id!("cf.core.am.tenant_type.v1~");
+const TENANT_SCHEMA: &str = gts_id!("cf.core.am.tenant.v1~");
 const TENANT_TYPE_UUID_RAW: u128 = 0xAA;
-const ROOT_TENANT_TYPE: &str = "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~";
+const ROOT_TENANT_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.platform.v1~");
 
 fn root_id() -> Uuid {
     Uuid::from_u128(ROOT_ID_RAW)
@@ -111,11 +114,11 @@ impl StubTypesRegistry {
         // segment) so `GtsTypeSchema::try_new` does not require a
         // pre-resolved parent. Bootstrap preflight only inspects the
         // chain prefix on `type_id` (must start with
-        // `gts.cf.core.am.tenant_type.v1~`) and the optional
+        // the AM tenant-type root schema) and the optional
         // `x-gts-traits.allowed_parent_types` array (left unset so
         // the eligibility check passes).
         GtsTypeSchema::try_new(
-            GtsTypeId::new("gts.cf.core.am.tenant_type.v1~"),
+            GtsTypeId::new(TENANT_TYPE_SCHEMA),
             serde_json::json!({}),
             None,
             None,
@@ -123,7 +126,7 @@ impl StubTypesRegistry {
         .expect("canned root schema must construct")
     }
 
-    /// Canned `gts.cf.core.am.tenant.v1~` projection schema. Pins the
+    /// Canned AM tenant projection schema. Pins the
     /// `name` field bounds (`minLength: 1, maxLength: 255`) so
     /// [`crate::domain::gts_validation::validate_tenant_name_via_gts`]
     /// — called from `insert_root_provisioning` — has a registered
@@ -132,7 +135,7 @@ impl StubTypesRegistry {
     /// bounds would not gate the saga in tests.
     fn canned_tenant_schema() -> GtsTypeSchema {
         GtsTypeSchema::try_new(
-            GtsTypeId::new("gts.cf.core.am.tenant.v1~"),
+            GtsTypeId::new(TENANT_SCHEMA),
             serde_json::json!({
                 "type": "object",
                 "required": ["id", "name"],
@@ -167,16 +170,16 @@ impl TypesRegistryClient for StubTypesRegistry {
         // Dispatch by the two ids bootstrap consults:
         //   * `ROOT_TENANT_TYPE` — preflight tenant-type eligibility
         //     (`preflight_root_tenant_type`).
-        //   * `gts.cf.core.am.tenant.v1~` — `root_name` structural
+        //   * `TENANT_SCHEMA` — `root_name` structural
         //     validation in `insert_root_provisioning` mirroring the
         //     `create_tenant` site. Any other id is a wiring regression
         //     and trips a loud panic, same posture as the previous
         //     single-id assertion.
         match type_id {
             ROOT_TENANT_TYPE => Ok(Self::canned_schema()),
-            "gts.cf.core.am.tenant.v1~" => Ok(Self::canned_tenant_schema()),
+            TENANT_SCHEMA => Ok(Self::canned_tenant_schema()),
             other => panic!(
-                "bootstrap queried unexpected type_id `{other}` (expected `{ROOT_TENANT_TYPE}` or `gts.cf.core.am.tenant.v1~`)"
+                "bootstrap queried unexpected type_id `{other}` (expected `{ROOT_TENANT_TYPE}` or `{TENANT_SCHEMA}`)"
             ),
         }
     }
@@ -719,7 +722,7 @@ async fn run_rejects_root_name_violating_tenant_v1_schema_via_gts() {
     match &err {
         DomainError::Validation { detail } => {
             assert!(
-                detail.contains("name") && detail.contains("gts.cf.core.am.tenant.v1~"),
+                detail.contains("name") && detail.contains(TENANT_SCHEMA),
                 "Validation must name the offending field and schema, got: {detail}"
             );
         }

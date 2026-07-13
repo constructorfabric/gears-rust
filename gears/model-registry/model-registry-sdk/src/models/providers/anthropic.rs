@@ -6,7 +6,7 @@
 //! [`AnthropicSettingsV1`]. The per-model override policy
 //! (`allow_parameter_override`, `allow_extra_params`) is **not** here —
 //! those are flat fields on [`crate::models::ModelInfoV1`]. Declared as a
-//! GTS schema leaf via [`struct_to_gts_schema`]; its parent envelope is
+//! GTS schema leaf via [`gts_type_schema`]; its parent envelope is
 //! `ModelInfoV1<P>`.
 //!
 //! Per-request fields (`messages`, `model`, `tools`, `metadata`,
@@ -16,7 +16,7 @@
 //! Note: `supported_api` and `provider_model_id` live on `ModelInfoV1`
 //! (common), not on `AnthropicSettingsV1`.
 
-use gts_macros::struct_to_gts_schema;
+use toolkit_gts::gts_type_schema;
 
 use crate::models::ModelInfoV1;
 
@@ -212,12 +212,12 @@ pub struct AnthropicCost {
 ///
 /// # GTS schema
 ///
-/// - **`schema_id`**: `gts.cf.genai.model.info.v1~cf.genai._.anthropic.v1~`
+/// - **`schema_id`**: `gts_id!("cf.genai.model.info.v1~cf.genai._.anthropic.v1~")`
 /// - **base**: `ModelInfoV1` (the generic envelope)
-#[struct_to_gts_schema(
+#[gts_type_schema(
     dir_path = "schemas",
     base = ModelInfoV1,
-    type_id = "gts.cf.genai.model.info.v1~cf.genai._.anthropic.v1~",
+    type_id = gts_id!("cf.genai.model.info.v1~cf.genai._.anthropic.v1~"),
     description = "Anthropic provider settings (Messages API)",
     properties = "oagw_alias,anthropic_version,anthropic_beta,temperature,top_p,top_k,max_tokens,stop_sequences,system,inference_geo,service_tier,container,thinking,tool_choice,output_config,cost"
 )]

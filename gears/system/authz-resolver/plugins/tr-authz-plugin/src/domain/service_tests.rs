@@ -13,6 +13,7 @@ use tenant_resolver_sdk::{
     GetTenantsOptions, IsAncestorOptions, TenantId, TenantInfo, TenantRef, TenantResolverClient,
     TenantResolverError, TenantStatus,
 };
+use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -150,7 +151,7 @@ fn make_request(tenant_id: Uuid) -> EvaluationRequest {
             name: "list".to_owned(),
         },
         resource: Resource {
-            resource_type: "gts.cf.test.v1~".to_owned(),
+            resource_type: gts_id!("cf.test.authz.resource.v1~").to_owned(),
             id: None,
             properties: std::collections::HashMap::default(),
         },
@@ -179,7 +180,7 @@ fn make_request_no_tenant() -> EvaluationRequest {
             name: "list".to_owned(),
         },
         resource: Resource {
-            resource_type: "gts.cf.test.v1~".to_owned(),
+            resource_type: gts_id!("cf.test.authz.resource.v1~").to_owned(),
             id: None,
             properties: std::collections::HashMap::default(),
         },
@@ -456,7 +457,7 @@ fn build_r_request(
             name: action.to_owned(),
         },
         resource: Resource {
-            resource_type: "gts.cf.test.v1~".to_owned(),
+            resource_type: gts_id!("cf.test.authz.resource.v1~").to_owned(),
             id: resource_id,
             properties: resource_props,
         },

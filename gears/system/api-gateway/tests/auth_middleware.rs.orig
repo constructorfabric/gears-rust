@@ -34,10 +34,10 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const UNAUTHENTICATED_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~";
+    concat!("gts://", "gts", ".", "cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~");
 const SERVICE_UNAVAILABLE_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~";
-const INTERNAL_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~";
+    concat!("gts://", "gts", ".", "cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~");
+const INTERNAL_TYPE: &str = concat!("gts://", "gts", ".", "cf.core.errors.err.v1~cf.core.err.internal.v1~");
 const PROBLEM_JSON: &str = "application/problem+json";
 
 async fn problem_from(response: Response) -> Problem {

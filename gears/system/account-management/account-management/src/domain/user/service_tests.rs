@@ -25,6 +25,7 @@
 )]
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use account_management_sdk::{
     IdpNewUser, IdpUser, IdpUserFilterField, IdpUserPagination, ListUsersQuery,
@@ -42,6 +43,8 @@ use crate::domain::tenant::test_support::{FakeTenantRepo, mock_enforcer};
 use crate::domain::user::service::UserService;
 use crate::domain::user::test_support::{FakeIdpUserProvisioner, FakeUserOutcome};
 
+const USER_SCHEMA: &str = gts_id!("cf.core.am.user.v1~");
+
 /// Canonical chained `tenant_type` every seeded tenant carries. The
 /// matching `GtsTypeSchema` is pre-registered in [`make_service`]'s
 /// `MockTypesRegistryClient` so `UserService::resolve_active_tenant`
@@ -50,10 +53,10 @@ use crate::domain::user::test_support::{FakeIdpUserProvisioner, FakeUserOutcome}
 /// isolation refactor — a missing schema now surfaces as
 /// `ServiceUnavailable` instead of `Option::None`). Tests that need
 /// a specific failure shape override the registry stub.
-const TEST_TENANT_TYPE_ID: &str = "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~";
+const TEST_TENANT_TYPE_ID: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
 
 fn test_tenant_type_uuid() -> Uuid {
-    gts::GtsID::new(TEST_TENANT_TYPE_ID)
+    gts::GtsId::try_new(TEST_TENANT_TYPE_ID)
         .expect("hardcoded chain is valid")
         .to_uuid()
 }
@@ -120,7 +123,7 @@ fn user_schema() -> GtsTypeSchema {
             "display_name": { "type": "string", "minLength": 1, "maxLength": 255 },
         },
     });
-    GtsTypeSchema::try_new(GtsTypeId::new("gts.cf.core.am.user.v1~"), body, None, None)
+    GtsTypeSchema::try_new(GtsTypeId::new(USER_SCHEMA), body, None, None)
         .expect("synthetic user schema is valid")
 }
 
@@ -299,7 +302,7 @@ async fn create_user_without_registered_user_schema_returns_service_unavailable(
     match err {
         DomainError::ServiceUnavailable { detail, .. } => {
             assert!(
-                detail.contains("gts.cf.core.am.user.v1~") && detail.contains("catalog"),
+                detail.contains(USER_SCHEMA) && detail.contains("catalog"),
                 "ServiceUnavailable.detail must name the missing schema and the \
                  catalog-seed remediation; got: {detail}"
             );
@@ -1163,7 +1166,7 @@ mod cleanup {
     // canonical `NotFound` the real RG ladder emits so the user-cleanup
     // path's `.map_err(ResourceGroupError::from)` idempotent dispatch is
     // exercised as in prod.
-    #[resource_error("gts.cf.core.resource_group.group.v1~")]
+    #[resource_error(gts_id!("cf.core.resource_group.group.v1~"))]
     struct RgErr;
 
     fn rg_not_found(code: &str) -> CanonicalError {

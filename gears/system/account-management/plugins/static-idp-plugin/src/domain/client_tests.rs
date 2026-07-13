@@ -6,6 +6,7 @@
 //! new `CursorV1` key-tuple cursor walk end-to-end.
 
 use std::collections::HashSet;
+use toolkit_gts::gts_id;
 
 use account_management_sdk::{
     IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest, IdpListUsersRequest, IdpNewUser,
@@ -23,7 +24,7 @@ fn ctx() -> SecurityContext {
     SecurityContext::anonymous()
 }
 
-const TENANT_TYPE: &str = "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~";
+const TENANT_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
 
 fn tenant_type() -> gts::GtsTypeId {
     gts::GtsTypeId::new(TENANT_TYPE)

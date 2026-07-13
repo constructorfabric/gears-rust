@@ -7,6 +7,7 @@
 //! error-envelope compaction — the public envelope is terminal — so these
 //! tests exercise the plugin->domain and domain->SDK directions only.
 
+use toolkit_gts::gts_id;
 use usage_collector_sdk::{
     ConflictReason, USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError,
     UsageCollectorPluginError, UsageTypeGtsId, ValidationReason,
@@ -15,7 +16,7 @@ use usage_collector_sdk::{
 use super::*;
 
 const SAMPLE_USAGE_TYPE_ID: &str =
-    "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
 fn sample_gts_id() -> UsageTypeGtsId {
     UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived usage-type gts_id")

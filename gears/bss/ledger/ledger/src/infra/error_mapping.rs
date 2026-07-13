@@ -14,11 +14,11 @@ use toolkit::api::canonical_prelude::{CanonicalError, resource_error};
 
 use crate::domain::error::DomainError;
 
-#[resource_error("gts.cf.bss.ledger.entry.v1~")]
+#[resource_error(gts_id!("cf.bss.ledger.entry.v1~"))]
 struct EntryResource;
-#[resource_error("gts.cf.bss.ledger.ledger.v1~")]
+#[resource_error(gts_id!("cf.bss.ledger.ledger.v1~"))]
 struct LedgerResource;
-#[resource_error("gts.cf.bss.ledger.fiscal_period.v1~")]
+#[resource_error(gts_id!("cf.bss.ledger.fiscal_period.v1~"))]
 struct FiscalPeriodResource;
 
 impl From<DomainError> for CanonicalError {

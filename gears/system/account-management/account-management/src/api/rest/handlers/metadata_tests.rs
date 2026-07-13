@@ -37,6 +37,7 @@
 )]
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use axum::Extension;
 use axum::extract::Path;
@@ -87,15 +88,19 @@ fn ctx() -> SecurityContext {
 }
 
 fn schema_a() -> GtsTypeId {
-    GtsTypeId::new("gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.theme.v1~")
+    GtsTypeId::new(gts_id!(
+        "cf.core.am.tenant_metadata.v1~vendor.app.metadata.theme.v1~"
+    ))
 }
 
 fn schema_b() -> GtsTypeId {
-    GtsTypeId::new("gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.billing.v1~")
+    GtsTypeId::new(gts_id!(
+        "cf.core.am.tenant_metadata.v1~vendor.app.metadata.billing.v1~"
+    ))
 }
 
 fn schema_a_raw() -> String {
-    "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.theme.v1~".to_owned()
+    gts_id!("cf.core.am.tenant_metadata.v1~vendor.app.metadata.theme.v1~").to_owned()
 }
 
 /// Seed a single tenant + its `(subject_root, id, 0)` /
@@ -142,7 +147,7 @@ async fn seed_metadata_row(
     type_id: &GtsTypeId,
     value: serde_json::Value,
 ) {
-    let schema_uuid = gts::GtsID::new(type_id.as_ref())
+    let schema_uuid = gts::GtsId::try_new(type_id.as_ref())
         .expect("valid GTS id in tests")
         .to_uuid();
     let scope = toolkit_security::AccessScope::allow_all();

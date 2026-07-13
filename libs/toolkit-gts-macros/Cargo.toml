@@ -24,3 +24,7 @@ proc-macro-crate = { workspace = true }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
+# For the configured GTS_ID_PREFIX used when expanding the `gts_id!("...")`
+# marker form inside `type_id = ...` / `id: ...` / `"id": ...` args.
+gts-id = { workspace = true }
+gts = { workspace = true }

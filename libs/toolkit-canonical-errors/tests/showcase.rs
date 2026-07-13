@@ -2,17 +2,23 @@ extern crate toolkit_canonical_errors;
 
 use toolkit_canonical_errors::resource_error;
 use toolkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_gts::{gts_id, gts_uri};
 
-#[resource_error("gts.cf.core.users.user.v1~")]
+const USER_RESOURCE: &str = gts_id!("cf.core.users.user.v1~");
+const FILE_RESOURCE: &str = gts_id!("cf.core.files.file.v1~");
+const TENANT_RESOURCE: &str = gts_id!("cf.core.tenants.tenant.v1~");
+const UPSTREAM_RESOURCE: &str = gts_id!("cf.oagw.upstreams.upstream.v1~");
+
+#[resource_error(gts_id!("cf.core.users.user.v1~"))]
 struct UserResourceError;
 
-#[resource_error("gts.cf.core.files.file.v1~")]
+#[resource_error(gts_id!("cf.core.files.file.v1~"))]
 struct FileResourceError;
 
-#[resource_error("gts.cf.core.tenants.tenant.v1~")]
+#[resource_error(gts_id!("cf.core.tenants.tenant.v1~"))]
 struct TenantResourceError;
 
-#[resource_error("gts.cf.oagw.upstreams.upstream.v1~")]
+#[resource_error(gts_id!("cf.oagw.upstreams.upstream.v1~"))]
 struct UpstreamResourceError;
 
 // =========================================================================
@@ -30,12 +36,12 @@ fn showcase_not_found() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~"),
             "title": "Not Found",
             "status": 404,
             "detail": "User not found",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~",
+                "resource_type": USER_RESOURCE,
                 "resource_name": "user-123"
             }
         })
@@ -53,12 +59,12 @@ fn showcase_already_exists() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.already_exists.v1~"),
             "title": "Already Exists",
             "status": 409,
             "detail": "User already exists",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~",
+                "resource_type": USER_RESOURCE,
                 "resource_name": "alice@example.com"
             }
         })
@@ -76,12 +82,12 @@ fn showcase_data_loss() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.data_loss.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.data_loss.v1~"),
             "title": "Data Loss",
             "status": 500,
             "detail": "Data loss detected",
             "context": {
-                "resource_type": "gts.cf.core.files.file.v1~",
+                "resource_type": FILE_RESOURCE,
                 "resource_name": "01JFILE-ABC"
             }
         })
@@ -101,12 +107,12 @@ fn showcase_invalid_argument() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"),
             "title": "Invalid Argument",
             "status": 400,
             "detail": "Request validation failed",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~",
+                "resource_type": USER_RESOURCE,
                 "field_violations": [
                     {
                         "field": "email",
@@ -136,12 +142,12 @@ fn showcase_invalid_argument_format() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"),
             "title": "Invalid Argument",
             "status": 400,
             "detail": "Request body is not valid JSON",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~",
+                "resource_type": USER_RESOURCE,
                 "format": "Request body is not valid JSON"
             }
         })
@@ -160,12 +166,12 @@ fn showcase_invalid_argument_constraint() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"),
             "title": "Invalid Argument",
             "status": 400,
             "detail": "at most 10 tags allowed per resource",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~",
+                "resource_type": USER_RESOURCE,
                 "constraint": "at most 10 tags allowed per resource"
             }
         })
@@ -185,12 +191,12 @@ fn showcase_invalid_argument_format_with_resource() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"),
             "title": "Invalid Argument",
             "status": 400,
             "detail": "Request body is not valid JSON",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~",
+                "resource_type": USER_RESOURCE,
                 "resource_name": "user-123",
                 "format": "Request body is not valid JSON"
             }
@@ -213,12 +219,12 @@ fn showcase_out_of_range() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.out_of_range.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.out_of_range.v1~"),
             "title": "Out of Range",
             "status": 400,
             "detail": "Page out of range",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~",
+                "resource_type": USER_RESOURCE,
                 "field_violations": [
                     {
                         "field": "page",
@@ -242,12 +248,12 @@ fn showcase_permission_denied() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"),
             "title": "Permission Denied",
             "status": 403,
             "detail": "You do not have permission to perform this operation",
             "context": {
-                "resource_type": "gts.cf.core.tenants.tenant.v1~",
+                "resource_type": TENANT_RESOURCE,
                 "reason": "CROSS_TENANT_ACCESS"
             }
         })
@@ -265,12 +271,12 @@ fn showcase_aborted() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.aborted.v1~"),
             "title": "Aborted",
             "status": 409,
             "detail": "Operation aborted due to concurrency conflict",
             "context": {
-                "resource_type": "gts.cf.oagw.upstreams.upstream.v1~",
+                "resource_type": UPSTREAM_RESOURCE,
                 "reason": "OPTIMISTIC_LOCK_FAILURE"
             }
         })
@@ -286,12 +292,12 @@ fn showcase_unimplemented() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.unimplemented.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.unimplemented.v1~"),
             "title": "Unimplemented",
             "status": 501,
             "detail": "This operation is not implemented",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~"
+                "resource_type": USER_RESOURCE
             }
         })
     );
@@ -312,12 +318,12 @@ fn showcase_failed_precondition() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~"),
             "title": "Failed Precondition",
             "status": 400,
             "detail": "Operation precondition not met",
             "context": {
-                "resource_type": "gts.cf.core.tenants.tenant.v1~",
+                "resource_type": TENANT_RESOURCE,
                 "violations": [
                     {
                         "type": "STATE",
@@ -339,7 +345,7 @@ fn showcase_internal() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.internal.v1~"),
             "title": "Internal",
             "status": 500,
             "detail": "An internal error occurred. Please retry later.",
@@ -358,12 +364,12 @@ fn showcase_deadline_exceeded() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~"),
             "title": "Deadline Exceeded",
             "status": 504,
             "detail": "Request timed out",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~"
+                "resource_type": USER_RESOURCE
             }
         })
     );
@@ -378,12 +384,12 @@ fn showcase_cancelled() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.cancelled.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.cancelled.v1~"),
             "title": "Cancelled",
             "status": 499,
             "detail": "Operation cancelled by the client",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~"
+                "resource_type": USER_RESOURCE
             }
         })
     );
@@ -404,7 +410,7 @@ fn showcase_unauthenticated() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~"),
             "title": "Unauthenticated",
             "status": 401,
             "detail": "Authentication required",
@@ -429,12 +435,12 @@ fn showcase_resource_exhausted() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~"),
             "title": "Resource Exhausted",
             "status": 429,
             "detail": "Quota exceeded",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~",
+                "resource_type": USER_RESOURCE,
                 "violations": [
                     {
                         "subject": "requests_per_minute",
@@ -458,7 +464,7 @@ fn showcase_unavailable() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~"),
             "title": "Service Unavailable",
             "status": 503,
             "detail": "Service temporarily unavailable",
@@ -478,12 +484,12 @@ fn showcase_unknown() {
     assert_eq!(
         json,
         serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.unknown.v1~",
+            "type": gts_uri!("cf.core.errors.err.v1~cf.core.err.unknown.v1~"),
             "title": "Unknown",
             "status": 500,
             "detail": "An unknown error occurred",
             "context": {
-                "resource_type": "gts.cf.core.users.user.v1~"
+                "resource_type": USER_RESOURCE
             }
         })
     );

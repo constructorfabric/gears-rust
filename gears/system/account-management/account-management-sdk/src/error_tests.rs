@@ -25,16 +25,16 @@ mod wire_vocabulary_round_trip {
     // Test scopes mirroring the impl crate's `#[resource_error]` markers.
     // Their literals MUST equal the `gts::*` constants — the
     // `gts_resource_types_round_trip` test asserts that equality.
-    #[resource_error("gts.cf.core.am.tenant.v1~")]
+    #[resource_error(gts_id!("cf.core.am.tenant.v1~"))]
     struct TenantScope;
 
-    #[resource_error("gts.cf.core.am.user.v1~")]
+    #[resource_error(gts_id!("cf.core.am.user.v1~"))]
     struct UserScope;
 
-    #[resource_error("gts.cf.core.am.tenant_metadata.v1~")]
+    #[resource_error(gts_id!("cf.core.am.tenant_metadata.v1~"))]
     struct MetadataScope;
 
-    #[resource_error("gts.cf.core.am.conversion_request.v1~")]
+    #[resource_error(gts_id!("cf.core.am.conversion_request.v1~"))]
     struct ConversionScope;
 
     fn problem(err: CanonicalError) -> serde_json::Value {
@@ -203,10 +203,10 @@ mod projection_tests {
     use crate::{field, gts, precondition, quota, reason};
     use toolkit_canonical_errors::{CanonicalError, Problem, resource_error};
 
-    #[resource_error("gts.cf.core.am.tenant.v1~")]
+    #[resource_error(gts_id!("cf.core.am.tenant.v1~"))]
     struct TenantScope;
 
-    #[resource_error("gts.cf.core.am.tenant_metadata.v1~")]
+    #[resource_error(gts_id!("cf.core.am.tenant_metadata.v1~"))]
     struct MetadataScope;
 
     #[test]

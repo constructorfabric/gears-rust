@@ -13,6 +13,7 @@ use resource_group_sdk::{
 };
 use std::sync::Mutex;
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_gts::gts_id;
 use toolkit_odata::Page;
 
 #[allow(
@@ -70,7 +71,7 @@ impl FakeRgClient {
 fn sample_group(tenant_id: Uuid) -> ResourceGroup {
     ResourceGroup {
         id: Uuid::from_u128(0xDEAD),
-        code: "gts.cf.core.rg.type.v1~acme.rg.test.example.v1~".into(),
+        code: gts_id!("cf.core.rg.type.v1~acme.rg.test.example.v1~").into(),
         name: "sample".into(),
         hierarchy: GroupHierarchy {
             parent_id: None,

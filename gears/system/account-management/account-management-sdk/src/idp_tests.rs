@@ -2,6 +2,7 @@
 //! and the metric-label constants on the failure enums.
 
 use super::*;
+use toolkit_gts::gts_id;
 
 use crate::{IdpNewUser, IdpTenantContext, IdpUserPagination};
 use async_trait::async_trait;
@@ -20,7 +21,7 @@ fn sample_tenant_context() -> IdpTenantContext {
     IdpTenantContext::new(
         Uuid::nil(),
         "t",
-        gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"),
+        gts::GtsTypeId::new(gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~")),
         None,
     )
 }
@@ -49,7 +50,7 @@ async fn provision_tenant_default_impl_returns_unsupported_operation() {
     let req = IdpProvisionTenantRequest::for_root(
         Uuid::nil(),
         "t",
-        gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"),
+        gts::GtsTypeId::new(gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~")),
     );
     let err = s
         .provision_tenant(&sample_security_context(), &req)
@@ -108,7 +109,7 @@ async fn list_users_default_impl_returns_unsupported_operation() {
 
 #[test]
 fn parent_context_defaults_none_and_builder_sets_it() {
-    let tt = gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
+    let tt = gts::GtsTypeId::new(gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"));
     let req = IdpProvisionTenantRequest::new(Uuid::nil(), Uuid::nil(), "t", tt.clone());
     assert!(
         req.parent_context.is_none(),

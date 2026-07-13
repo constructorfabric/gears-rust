@@ -12,6 +12,7 @@
 use super::*;
 use serde_json::json;
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
+use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
 
 /// `try_new` now returns `CanonicalError`; the legacy `is_invalid_gts_*`
 /// predicates are gone. The kind distinction collapsed at the canonical
@@ -38,10 +39,10 @@ fn make_type_schema(
 }
 
 // Reusable chain-form ids (string-shape valid for derive_parent_type_id).
-const BASE_ID: &str = "gts.acme.core.events.base.v1~";
-const DERIVED_ID: &str = "gts.acme.core.events.base.v1~acme.core.events.derived.v1.0~";
+const BASE_ID: &str = gts_id!("acme.core.events.base.v1~");
+const DERIVED_ID: &str = gts_id!("acme.core.events.base.v1~acme.core.events.derived.v1.0~");
 const LEAF_ID: &str =
-    "gts.acme.core.events.base.v1~acme.core.events.derived.v1.0~vendor.x.y.leaf.v1.0~";
+    gts_id!("acme.core.events.base.v1~acme.core.events.derived.v1.0~vendor.x.y.leaf.v1.0~");
 
 #[test]
 fn test_type_schema_try_new_extracts_traits() {
@@ -75,13 +76,16 @@ fn test_derive_parent_type_id() {
         Some(DERIVED_ID.to_owned())
     );
     // Instance (no trailing `~`) → no parent (helper is type-schemas-only).
-    assert!(GtsTypeSchema::derive_parent_type_id("gts.foo.bar.baz.v1~inst").is_none());
+    let invalid_instance = format!("{GTS_ID_PREFIX}foo.bar.baz.v1~inst");
+    assert!(GtsTypeSchema::derive_parent_type_id(&invalid_instance).is_none());
 }
 
 #[test]
 fn test_type_schema_rejects_instance_id() {
     let err = GtsTypeSchema::try_new(
-        GtsTypeId::new("gts.acme.core.events.user.v1~acme.core.instances.u1.v1"),
+        GtsTypeId::new(gts_id!(
+            "acme.core.events.user.v1~acme.core.instances.u1.v1"
+        )),
         json!({}),
         None,
         None,
@@ -92,11 +96,11 @@ fn test_type_schema_rejects_instance_id() {
 
 #[test]
 fn test_type_schema_rejects_mismatched_parent() {
-    // BASE_ID and "gts.contoso.vendor.events.x.v1~" are unrelated; passing
+    // BASE_ID and the Contoso parent are unrelated; passing
     // the wrong one as parent of DERIVED_ID must error rather than
     // silently corrupt the chain.
     let wrong_parent = Arc::new(make_type_schema(
-        "gts.contoso.vendor.events.base.v1~",
+        gts_id!("contoso.vendor.events.base.v1~"),
         json!({}),
         None,
     ));
@@ -140,7 +144,7 @@ fn test_effective_properties_deep_merge() {
         DERIVED_ID,
         json!({
             "allOf": [
-                { "$ref": format!("gts://{BASE_ID}") },
+                { "$ref": gts_uri!(BASE_ID) },
                 { "properties": { "name": { "type": "string" } } }
             ]
         }),
@@ -161,7 +165,7 @@ fn test_effective_properties_child_overrides_parent() {
     let child = make_type_schema(
         DERIVED_ID,
         json!({
-            "allOf": [{ "$ref": format!("gts://{BASE_ID}") }],
+            "allOf": [{ "$ref": gts_uri!(BASE_ID) }],
             "properties": { "field": { "type": "string", "title": "from-child" } }
         }),
         Some(base),
@@ -185,7 +189,7 @@ fn test_effective_required_dedup() {
         DERIVED_ID,
         json!({
             "allOf": [
-                { "$ref": format!("gts://{BASE_ID}") },
+                { "$ref": gts_uri!(BASE_ID) },
                 { "required": ["name", "id"] }
             ]
         }),
@@ -244,7 +248,7 @@ fn test_effective_schema_inlines_refs() {
         DERIVED_ID,
         json!({
             "allOf": [
-                { "$ref": format!("gts://{BASE_ID}") },
+                { "$ref": gts_uri!(BASE_ID) },
                 { "properties": { "name": { "type": "string" } } }
             ]
         }),
@@ -274,7 +278,7 @@ fn test_effective_properties_three_level_chain() {
     let parent = Arc::new(make_type_schema(
         DERIVED_ID,
         json!({
-            "allOf": [{ "$ref": format!("gts://{BASE_ID}") }],
+            "allOf": [{ "$ref": gts_uri!(BASE_ID) }],
             "properties": {
                 "b": { "type": "string", "title": "from-parent" },
                 "shared": { "type": "string", "title": "from-parent" }
@@ -285,7 +289,7 @@ fn test_effective_properties_three_level_chain() {
     let child = make_type_schema(
         LEAF_ID,
         json!({
-            "allOf": [{ "$ref": format!("gts://{DERIVED_ID}") }],
+            "allOf": [{ "$ref": gts_uri!(DERIVED_ID) }],
             "properties": {
                 "c": { "type": "string", "title": "from-child" },
                 "shared": { "type": "string", "title": "from-child" }
@@ -338,7 +342,7 @@ fn test_effective_properties_from_allof_inline_overlay() {
         DERIVED_ID,
         json!({
             "allOf": [
-                { "$ref": format!("gts://{BASE_ID}") },
+                { "$ref": gts_uri!(BASE_ID) },
                 { "properties": { "from_overlay": { "type": "string" } } }
             ]
         }),
@@ -361,7 +365,7 @@ fn test_effective_required_three_level_dedup_and_order() {
     let parent = Arc::new(make_type_schema(
         DERIVED_ID,
         json!({
-            "allOf": [{ "$ref": format!("gts://{BASE_ID}") }],
+            "allOf": [{ "$ref": gts_uri!(BASE_ID) }],
             "required": ["name", "id"]
         }),
         Some(grand),
@@ -369,7 +373,7 @@ fn test_effective_required_three_level_dedup_and_order() {
     let child = make_type_schema(
         LEAF_ID,
         json!({
-            "allOf": [{ "$ref": format!("gts://{DERIVED_ID}") }],
+            "allOf": [{ "$ref": gts_uri!(DERIVED_ID) }],
             "required": ["age", "name"]
         }),
         Some(parent),
@@ -648,7 +652,7 @@ fn test_effective_schema_strips_id_and_schema_from_inlined_parent() {
     let base = Arc::new(make_type_schema(
         BASE_ID,
         json!({
-            "$id": format!("gts://{BASE_ID}"),
+            "$id": gts_uri!(BASE_ID),
             "$schema": "https://json-schema.org/draft-07/schema#",
             "type": "object",
             "properties": { "id": { "type": "string" } }
@@ -658,7 +662,7 @@ fn test_effective_schema_strips_id_and_schema_from_inlined_parent() {
     let child = make_type_schema(
         DERIVED_ID,
         json!({
-            "allOf": [{ "$ref": format!("gts://{BASE_ID}") }]
+            "allOf": [{ "$ref": gts_uri!(BASE_ID) }]
         }),
         Some(base),
     );
@@ -675,13 +679,13 @@ fn test_effective_schema_leaves_non_parent_refs_alone() {
     // A `$ref` in `allOf` that points to something OTHER than the GTS
     // parent (a "mixin") is left as-is — only the parent's body is inlined.
     let base = Arc::new(make_type_schema(BASE_ID, json!({"type": "object"}), None));
-    let mixin_id = "gts.contoso.vendor.events.mixin.v1~";
+    let mixin_id = gts_id!("contoso.vendor.events.mixin.v1~");
     let child = make_type_schema(
         DERIVED_ID,
         json!({
             "allOf": [
-                { "$ref": format!("gts://{BASE_ID}") },
-                { "$ref": format!("gts://{mixin_id}") }
+                { "$ref": gts_uri!(BASE_ID) },
+                { "$ref": gts_uri!(mixin_id) }
             ]
         }),
         Some(base),
@@ -693,7 +697,7 @@ fn test_effective_schema_leaves_non_parent_refs_alone() {
     // Mixin ref preserved.
     assert_eq!(
         all_of[1]["$ref"].as_str(),
-        Some(format!("gts://{mixin_id}").as_str())
+        Some(gts_uri!(mixin_id).as_str())
     );
 }
 
@@ -713,29 +717,35 @@ fn test_ancestors_chain_walk() {
 #[test]
 fn test_instance_try_new_validates_chain_match() {
     let type_schema = Arc::new(make_type_schema(
-        "gts.acme.core.events.user.v1~",
+        gts_id!("acme.core.events.user.v1~"),
         json!({}),
         None,
     ));
     let inst = GtsInstance::try_new(
-        GtsInstanceId::new("gts.acme.core.events.user.v1~", "acme.core.instances.u1.v1"),
+        GtsInstanceId::new(
+            gts_id!("acme.core.events.user.v1~"),
+            "acme.core.instances.u1.v1",
+        ),
         json!({ "id": "acme.core.instances.u1.v1" }),
         None,
         type_schema,
     )
     .unwrap();
-    assert_eq!(inst.type_id().as_ref(), "gts.acme.core.events.user.v1~");
+    assert_eq!(
+        inst.type_id().as_ref(),
+        gts_id!("acme.core.events.user.v1~")
+    );
 }
 
 #[test]
 fn test_instance_try_new_rejects_mismatched_type_schema() {
     let type_schema = Arc::new(make_type_schema(
-        "gts.acme.other.pkg.type.v1~",
+        gts_id!("acme.other.pkg.type.v1~"),
         json!({}),
         None,
     ));
     let err = GtsInstance::try_new(
-        GtsInstanceId::new("gts.acme.core.events.user.v1~", "u1"),
+        GtsInstanceId::new(gts_id!("acme.core.events.user.v1~"), "u1"),
         json!({}),
         None,
         type_schema,
@@ -747,12 +757,12 @@ fn test_instance_try_new_rejects_mismatched_type_schema() {
 #[test]
 fn test_instance_rejects_type_id() {
     let type_schema = Arc::new(make_type_schema(
-        "gts.acme.core.users.user.v1~",
+        gts_id!("acme.core.users.user.v1~"),
         json!({}),
         None,
     ));
     let err = GtsInstance::try_new(
-        GtsInstanceId::new("gts.acme.core.users.user.v1~", ""),
+        GtsInstanceId::new(gts_id!("acme.core.users.user.v1~"), ""),
         json!({}),
         None,
         type_schema,
@@ -766,7 +776,8 @@ fn test_type_schema_query_builder() {
     let empty = TypeSchemaQuery::new();
     assert!(empty.is_empty());
 
-    let q = TypeSchemaQuery::new().with_pattern("gts.acme.*");
+    let pattern = format!("{GTS_ID_PREFIX}acme.*");
+    let q = TypeSchemaQuery::new().with_pattern(pattern.as_str());
     assert!(!q.is_empty());
-    assert_eq!(q.pattern.as_deref(), Some("gts.acme.*"));
+    assert_eq!(q.pattern.as_deref(), Some(pattern.as_str()));
 }

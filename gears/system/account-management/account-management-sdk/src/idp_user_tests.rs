@@ -9,11 +9,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, reason = "test helpers")]
 
 use super::*;
+use toolkit_gts::gts_id;
 
 #[test]
 fn tenant_context_new_carries_inputs_verbatim() {
     let id = Uuid::from_u128(0x42);
-    let tenant_type = gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
+    let tenant_type =
+        gts::GtsTypeId::new(gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"));
     let ctx = IdpTenantContext::new(id, "acme", tenant_type.clone(), None);
     assert_eq!(ctx.tenant_id, id);
     assert_eq!(ctx.tenant_name, "acme");
@@ -24,7 +26,8 @@ fn tenant_context_new_carries_inputs_verbatim() {
 #[test]
 fn tenant_context_new_with_metadata_populates_field() {
     let id = Uuid::from_u128(0x43);
-    let tenant_type = gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
+    let tenant_type =
+        gts::GtsTypeId::new(gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"));
     let metadata = serde_json::json!({"realm": "acme-prod"});
     let ctx = IdpTenantContext::new(id, "acme", tenant_type.clone(), Some(metadata.clone()));
     assert_eq!(ctx.tenant_type, tenant_type);
@@ -36,7 +39,7 @@ fn tenant_context_serde_skips_absent_metadata() {
     // `metadata = None` is the default-and-most-common shape for
     // plugins that bind via external configuration; the wire payload
     // stays minimal in that case.
-    let tenant_type = gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.x.v1~");
+    let tenant_type = gts::GtsTypeId::new(gts_id!("cf.core.am.tenant_type.v1~cf.core.am.x.v1~"));
     let ctx = IdpTenantContext::new(Uuid::from_u128(0x44), "acme", tenant_type.clone(), None);
     let json = serde_json::to_value(&ctx).expect("serialise");
     let obj = json.as_object().expect("object");
@@ -411,7 +414,7 @@ fn idp_list_users_request_carries_typed_filter_and_order() {
     let ctx = IdpTenantContext::new(
         Uuid::from_u128(1),
         "acme",
-        gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"),
+        gts::GtsTypeId::new(gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~")),
         None,
     );
     let pagination = IdpUserPagination::default();
@@ -445,7 +448,7 @@ fn idp_list_users_request_new_defaults_filter_and_order_to_none() {
     let ctx = IdpTenantContext::new(
         Uuid::from_u128(2),
         "acme",
-        gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"),
+        gts::GtsTypeId::new(gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~")),
         None,
     );
     let req = IdpListUsersRequest::new(ctx, IdpUserPagination::default());

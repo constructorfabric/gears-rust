@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use toolkit::client_hub::ClientHub;
+use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
     UsageCollectorClientV1, UsageCollectorError, UsageKind, UsageType, UsageTypeGtsId,
@@ -20,7 +21,7 @@ use crate::domain::test_support::{UnreachableResolver, enforcer_for};
 use super::*;
 
 const SAMPLE_USAGE_TYPE_ID: &str =
-    "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
 fn make_client() -> UsageCollectorLocalClient {
     let hub = Arc::new(ClientHub::new());

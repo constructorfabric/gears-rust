@@ -25,7 +25,7 @@ mod wire_vocabulary_round_trip {
     // Test scope mirroring the impl crate's `#[resource_error]` marker.
     // Its literal MUST equal `gts::NODE_RESOURCE_TYPE` — the
     // `node_resource_type_round_trip` test asserts that equality.
-    #[resource_error("gts.cf.nodes_registry.registry.node.v1~")]
+    #[resource_error(gts_id!("cf.nodes_registry.registry.node.v1~"))]
     struct NodeScope;
 
     fn problem(err: CanonicalError) -> serde_json::Value {
@@ -76,7 +76,7 @@ mod projection_tests {
     use crate::{field, gts};
     use toolkit_canonical_errors::{CanonicalError, resource_error};
 
-    #[resource_error("gts.cf.nodes_registry.registry.node.v1~")]
+    #[resource_error(gts_id!("cf.nodes_registry.registry.node.v1~"))]
     struct NodeScope;
 
     #[test]

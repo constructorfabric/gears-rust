@@ -161,6 +161,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::domain::test_support::MockCredStoreClient;
+    use toolkit_gts::gts_id;
 
     use super::*;
 
@@ -203,7 +204,9 @@ mod tests {
     #[test]
     fn unknown_plugin_returns_error() {
         let registry = make_registry();
-        let err = registry.resolve("gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.unknown.v1");
+        let err = registry.resolve(gts_id!(
+            "cf.core.oagw.auth_plugin.v1~cf.core.oagw.unknown.v1"
+        ));
         assert!(err.is_err());
     }
 
@@ -216,7 +219,9 @@ mod tests {
     #[test]
     fn unknown_guard_plugin_returns_error() {
         let registry = GuardPluginRegistry::with_builtins();
-        let err = registry.resolve("gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.unknown.v1");
+        let err = registry.resolve(gts_id!(
+            "cf.core.oagw.guard_plugin.v1~cf.core.oagw.unknown.v1"
+        ));
         assert!(err.is_err());
     }
 
@@ -237,7 +242,9 @@ mod tests {
     #[test]
     fn unknown_transform_plugin_returns_error() {
         let registry = TransformPluginRegistry::with_builtins();
-        let err = registry.resolve("gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.unknown.v1");
+        let err = registry.resolve(gts_id!(
+            "cf.core.oagw.transform_plugin.v1~cf.core.oagw.unknown.v1"
+        ));
         assert!(err.is_err());
     }
 

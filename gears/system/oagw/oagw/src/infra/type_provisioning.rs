@@ -776,6 +776,8 @@ impl TypeProvisioningService for TypeProvisioningServiceImpl {
 
 #[cfg(test)]
 mod tests {
+    use oagw_sdk::HTTP_PROTOCOL_ID;
+    use toolkit_gts::gts_id;
     use types_registry_sdk::{
         GtsInstance,
         testing::{MockTypesRegistryClient, internal, make_test_instance},
@@ -797,7 +799,7 @@ mod tests {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": 8080, "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "enabled": true,
             "tags": []
         })
@@ -824,7 +826,7 @@ mod tests {
         let tenant = Uuid::new_v4();
         let instance_id = Uuid::new_v4();
         let content = upstream_content(tenant);
-        let gts_id = format!("gts.cf.core.oagw.upstream.v1~{instance_id}");
+        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.upstream.v1~"), instance_id);
 
         let registry = Arc::new(
             MockTypesRegistryClient::new()
@@ -844,7 +846,7 @@ mod tests {
         let registry =
             Arc::new(
                 MockTypesRegistryClient::new().with_instances([make_upstream_instance(
-                    "gts.cf.core.oagw.upstream.v1~cf.core.oagw.test.v1",
+                    gts_id!("cf.core.oagw.upstream.v1~cf.core.oagw.test.v1"),
                     upstream_content(Uuid::new_v4()),
                 )]),
             );
@@ -861,7 +863,7 @@ mod tests {
     #[tokio::test]
     async fn list_upstreams_rejects_invalid_content() {
         let instance_id = Uuid::new_v4();
-        let gts_id = format!("gts.cf.core.oagw.upstream.v1~{instance_id}");
+        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.upstream.v1~"), instance_id);
         let registry =
             Arc::new(
                 MockTypesRegistryClient::new().with_instances([make_upstream_instance(
@@ -904,7 +906,7 @@ mod tests {
         let upstream_id = Uuid::new_v4();
         let route_instance_id = Uuid::new_v4();
         let content = route_content(tenant, upstream_id);
-        let gts_id = format!("gts.cf.core.oagw.route.v1~{route_instance_id}");
+        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.route.v1~"), route_instance_id);
 
         let registry = Arc::new(
             MockTypesRegistryClient::new().with_instances([make_route_instance(&gts_id, content)]),
@@ -924,7 +926,7 @@ mod tests {
         let registry =
             Arc::new(
                 MockTypesRegistryClient::new().with_instances([make_route_instance(
-                    "gts.cf.core.oagw.route.v1~cf.core.oagw.test.v1",
+                    gts_id!("cf.core.oagw.route.v1~cf.core.oagw.test.v1"),
                     route_content(Uuid::new_v4(), Uuid::new_v4()),
                 )]),
             );
@@ -941,7 +943,7 @@ mod tests {
     #[tokio::test]
     async fn list_routes_rejects_invalid_content() {
         let instance_id = Uuid::new_v4();
-        let gts_id = format!("gts.cf.core.oagw.route.v1~{instance_id}");
+        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.route.v1~"), instance_id);
         let registry =
             Arc::new(
                 MockTypesRegistryClient::new().with_instances([make_route_instance(
@@ -979,7 +981,7 @@ mod tests {
         assert_eq!(queries.len(), 1);
         assert_eq!(
             queries[0].pattern.as_deref(),
-            Some("gts.cf.core.oagw.upstream.v1~*")
+            Some(format!("{UPSTREAM_SCHEMA}*").as_str())
         );
     }
 
@@ -993,7 +995,7 @@ mod tests {
         assert_eq!(queries.len(), 1);
         assert_eq!(
             queries[0].pattern.as_deref(),
-            Some("gts.cf.core.oagw.route.v1~*")
+            Some(format!("{ROUTE_SCHEMA}*").as_str())
         );
     }
 
@@ -1012,7 +1014,7 @@ mod tests {
                     {"scheme": "http", "host": "fallback.local", "port": 8080}
                 ]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "openai",
             "auth": {
                 "type": "apikey",
@@ -1039,10 +1041,7 @@ mod tests {
         assert_eq!(req.server.endpoints[0].host, "api.openai.com");
         assert_eq!(req.server.endpoints[0].port, 443);
         assert_eq!(req.server.endpoints[1].scheme, domain::Scheme::Http);
-        assert_eq!(
-            req.protocol,
-            "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1"
-        );
+        assert_eq!(req.protocol, HTTP_PROTOCOL_ID);
         assert_eq!(req.alias.as_deref(), Some("openai"));
         assert!(req.enabled);
         assert_eq!(req.tags, vec!["prod", "llm"]);
@@ -1094,7 +1093,10 @@ mod tests {
         let payload: RoutePayload = serde_json::from_value(json).unwrap();
         let route_uuid = Uuid::new_v4();
         let provisioned = payload
-            .into_provisioned("gts.cf.core.oagw.route.v1~cf.core.oagw.test.v1", route_uuid)
+            .into_provisioned(
+                gts_id!("cf.core.oagw.route.v1~cf.core.oagw.test.v1"),
+                route_uuid,
+            )
             .expect("upstream_id should parse");
 
         assert_eq!(provisioned.tenant_id, Some(tenant));
@@ -1158,7 +1160,10 @@ mod tests {
         let payload: RoutePayload = serde_json::from_value(json).unwrap();
         let route_uuid = Uuid::new_v4();
         let provisioned = payload
-            .into_provisioned("gts.cf.core.oagw.route.v1~cf.core.oagw.test.v1", route_uuid)
+            .into_provisioned(
+                gts_id!("cf.core.oagw.route.v1~cf.core.oagw.test.v1"),
+                route_uuid,
+            )
             .unwrap();
         assert_eq!(provisioned.tenant_id, None);
     }
@@ -1170,11 +1175,11 @@ mod tests {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": 8080, "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "enabled": true,
             "tags": []
         });
-        let gts_id = format!("gts.cf.core.oagw.upstream.v1~{instance_id}");
+        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.upstream.v1~"), instance_id);
 
         let registry = Arc::new(
             MockTypesRegistryClient::new()

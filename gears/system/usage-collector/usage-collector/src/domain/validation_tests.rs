@@ -1,6 +1,7 @@
 //! Unit tests for the shape-validation algorithm.
 
 use std::collections::{BTreeMap, BTreeSet};
+use toolkit_gts::gts_id;
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -23,8 +24,8 @@ fn mk_keys<const N: usize>(values: [&str; N]) -> BTreeSet<MetadataKey> {
     values.into_iter().map(mk_key).collect()
 }
 
-const SAMPLE_COUNTER_ID: &str = "gts.cf.core.uc.usage_record.v1~tenant.example._.foo.v1";
-const SAMPLE_GAUGE_ID: &str = "gts.cf.core.uc.usage_record.v1~tenant.example._.bar.v1";
+const SAMPLE_COUNTER_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.foo.v1");
+const SAMPLE_GAUGE_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.bar.v1");
 
 fn counter_id() -> UsageTypeGtsId {
     UsageTypeGtsId::new(SAMPLE_COUNTER_ID).expect("valid usage_record-derived id")

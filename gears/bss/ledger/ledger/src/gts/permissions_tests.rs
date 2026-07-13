@@ -3,45 +3,48 @@
 //! set matches exactly, and the catalog's distinct `resource_type`s equal
 //! `crate::authz::labels::ALL` (anti-drift).
 
-use toolkit_gts::InventoryInstance;
+use toolkit_gts::{InventoryInstance, gts_id};
 
-const PERMISSION_TYPE_ID: &str = "gts.cf.toolkit.authz.permission.v1~";
-const INSTANCE_PREFIX: &str = "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.";
+const PERMISSION_TYPE_ID: &str = gts_id!("cf.toolkit.authz.permission.v1~");
+const INSTANCE_SUFFIX_PREFIX: &str = "cf.bss.ledger.";
 
 /// Every ledger permission instance id — one per `(resource_type, action)`
 /// pair the ledger surfaces enforce.
 const EXPECTED_PERMISSION_IDS: &[&str] = &[
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_post.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_reverse.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_approve.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_read.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_annotate.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_audit_read.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_erase.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_reidentify.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.ledger_provision.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.ledger_read.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.fiscal_period_close.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.payment_write.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.payment_read.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.credit_application_write.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.dispute_write.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.dispute_read.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.dual_control_policy_write.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.dual_control_policy_read.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.recognition_write.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.recognition_read.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_read.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_run.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_resolve.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.config_write.v1",
-    "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.config_read.v1",
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_post.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_reverse.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_approve.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_read.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_annotate.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_audit_read.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_erase.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_reidentify.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.ledger_provision.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.ledger_read.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.fiscal_period_close.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.payment_write.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.payment_read.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.credit_application_write.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.dispute_write.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.dispute_read.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.dual_control_policy_write.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.dual_control_policy_read.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.recognition_write.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.recognition_read.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_read.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_run.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_resolve.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.config_write.v1"),
+    gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.config_read.v1"),
 ];
 
 fn ledger_permission_instances() -> Vec<&'static InventoryInstance> {
     toolkit_gts::inventory::iter::<InventoryInstance>
         .into_iter()
-        .filter(|e| e.instance_id.starts_with(INSTANCE_PREFIX))
+        .filter(|e| {
+            e.instance_id.starts_with(PERMISSION_TYPE_ID)
+                && e.instance_id[PERMISSION_TYPE_ID.len()..].starts_with(INSTANCE_SUFFIX_PREFIX)
+        })
         .collect()
 }
 

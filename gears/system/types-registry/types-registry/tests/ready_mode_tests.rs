@@ -6,6 +6,7 @@ mod common;
 
 use common::create_service;
 use serde_json::json;
+use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
 use types_registry::domain::model::ListQuery;
 
 // =============================================================================
@@ -24,7 +25,7 @@ async fn test_ready_mode_validates_immediately_with_correct_order() {
     let entities = vec![
         // Parent type - must be first for instances to validate against it
         json!({
-            "$id": "gts://gts.acme.core.models.person.v1~",
+            "$id": gts_uri!("acme.core.models.person.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "properties": {
@@ -36,19 +37,19 @@ async fn test_ready_mode_validates_immediately_with_correct_order() {
         }),
         // Instance 1 - valid, conforms to schema
         json!({
-            "id": "gts.acme.core.models.person.v1~acme.core.instances.person1.v1",
+            "id": gts_id!("acme.core.models.person.v1~acme.core.instances.person1.v1"),
             "name": "Alice",
             "age": 30
         }),
         // Instance 2 - valid
         json!({
-            "id": "gts.acme.core.models.person.v1~acme.core.instances.person2.v1",
+            "id": gts_id!("acme.core.models.person.v1~acme.core.instances.person2.v1"),
             "name": "Bob",
             "age": 25
         }),
         // Instance 3 - valid
         json!({
-            "id": "gts.acme.core.models.person.v1~acme.core.instances.person3.v1",
+            "id": gts_id!("acme.core.models.person.v1~acme.core.instances.person3.v1"),
             "name": "Charlie",
             "age": 35
         }),
@@ -90,13 +91,13 @@ async fn test_ready_mode_fails_when_instance_before_parent() {
     let entities = vec![
         // Instance first - will fail because parent doesn't exist yet
         json!({
-            "id": "gts.acme.core.models.widget.v1~acme.core.instances.widget1.v1",
+            "id": gts_id!("acme.core.models.widget.v1~acme.core.instances.widget1.v1"),
             "widgetId": "w-001",
             "color": "red"
         }),
         // Parent type - registered after instance
         json!({
-            "$id": "gts://gts.acme.core.models.widget.v1~",
+            "$id": gts_uri!("acme.core.models.widget.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "properties": {
@@ -136,7 +137,7 @@ async fn test_ready_mode_validates_invalid_instance_immediately() {
     let entities = vec![
         // Parent type
         json!({
-            "$id": "gts://gts.acme.core.models.employee.v1~",
+            "$id": gts_uri!("acme.core.models.employee.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "properties": {
@@ -149,7 +150,7 @@ async fn test_ready_mode_validates_invalid_instance_immediately() {
         }),
         // Invalid instance - missing required "salary" field
         json!({
-            "id": "gts.acme.core.models.employee.v1~acme.core.instances.emp1.v1",
+            "id": gts_id!("acme.core.models.employee.v1~acme.core.instances.emp1.v1"),
             "employeeId": "emp-001",
             "department": "Engineering"
             // Missing required "salary" field
@@ -184,7 +185,7 @@ async fn test_ready_mode_batch_with_valid_and_invalid_instances() {
     let entities = vec![
         // Parent type
         json!({
-            "$id": "gts://gts.acme.core.models.item.v1~",
+            "$id": gts_uri!("acme.core.models.item.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "properties": {
@@ -196,19 +197,19 @@ async fn test_ready_mode_batch_with_valid_and_invalid_instances() {
         }),
         // Valid instance
         json!({
-            "id": "gts.acme.core.models.item.v1~acme.core.instances.item1.v1",
+            "id": gts_id!("acme.core.models.item.v1~acme.core.instances.item1.v1"),
             "itemId": "item-001",
             "price": 29.99
         }),
         // Invalid instance - wrong type for price
         json!({
-            "id": "gts.acme.core.models.item.v1~acme.core.instances.item2.v1",
+            "id": gts_id!("acme.core.models.item.v1~acme.core.instances.item2.v1"),
             "itemId": "item-002",
             "price": "not-a-number"  // Should be number
         }),
         // Another valid instance
         json!({
-            "id": "gts.acme.core.models.item.v1~acme.core.instances.item3.v1",
+            "id": gts_id!("acme.core.models.item.v1~acme.core.instances.item3.v1"),
             "itemId": "item-003",
             "price": 49.99
         }),
@@ -244,7 +245,7 @@ async fn test_configuration_mode_defers_validation() {
 
     // Register a type schema
     let type_schema = json!({
-        "$id": "gts://gts.acme.core.models.config_test.v1~",
+        "$id": gts_uri!("acme.core.models.config_test.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -258,7 +259,7 @@ async fn test_configuration_mode_defers_validation() {
     // Register an instance that would fail validation (missing required field)
     // In configuration mode, this should succeed (deferred validation)
     let invalid_instance = json!({
-        "id": "gts.acme.core.models.config_test.v1~acme.core.instances.test1.v1"
+        "id": gts_id!("acme.core.models.config_test.v1~acme.core.instances.test1.v1")
         // Missing "requiredField"
     });
 
@@ -278,12 +279,12 @@ async fn test_switch_to_production_validates_all_entities() {
     // Register valid entities in configuration mode
     let entities = vec![
         json!({
-            "$id": "gts://gts.acme.core.events.valid1.v1~",
+            "$id": gts_uri!("acme.core.events.valid1.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object"
         }),
         json!({
-            "$id": "gts://gts.acme.core.events.valid2.v1~",
+            "$id": gts_uri!("acme.core.events.valid2.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object"
         }),
@@ -310,7 +311,7 @@ async fn test_switch_to_ready_is_idempotent() {
 
     // Register something first
     _ = service.register(vec![json!({
-        "$id": "gts://gts.acme.core.events.state_test.v1~",
+        "$id": gts_uri!("acme.core.events.state_test.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object"
     })]);
@@ -332,7 +333,7 @@ async fn test_list_before_ready_returns_empty() {
 
     // Register entities in configuration mode
     _ = service.register(vec![json!({
-        "$id": "gts://gts.acme.core.events.not_visible.v1~",
+        "$id": gts_uri!("acme.core.events.not_visible.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object"
     })]);
@@ -348,13 +349,13 @@ async fn test_get_before_ready_fails() {
 
     // Register entity in configuration mode
     _ = service.register(vec![json!({
-        "$id": "gts://gts.acme.core.events.not_accessible.v1~",
+        "$id": gts_uri!("acme.core.events.not_accessible.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object"
     })]);
 
     // Get should fail before switching to ready
-    let result = service.get("gts.acme.core.events.not_accessible.v1~");
+    let result = service.get(gts_id!("acme.core.events.not_accessible.v1~"));
     assert!(result.is_err(), "Get should fail before ready mode");
 }
 
@@ -364,11 +365,12 @@ async fn test_get_before_ready_fails() {
 
 #[tokio::test]
 async fn test_switch_to_ready_returns_errors_as_list() {
+    const PRODUCT_ID: &str = gts_id!("acme.core.models.product.v1~");
     let service = create_service();
 
     // Register a parent type schema
     let parent_type = json!({
-        "$id": "gts://gts.acme.core.models.product.v1~",
+        "$id": gts_uri!("acme.core.models.product.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -384,13 +386,13 @@ async fn test_switch_to_ready_returns_errors_as_list() {
     // Register multiple invalid child instances in configuration mode
     // Child 1: Missing all required fields
     let invalid_child1 = json!({
-        "id": "gts.acme.core.models.product.v1~acme.core.instances.product1.v1"
+        "id": gts_id!("acme.core.models.product.v1~acme.core.instances.product1.v1")
         // Missing productId, name, price
     });
 
     // Child 2: Missing price field
     let invalid_child2 = json!({
-        "id": "gts.acme.core.models.product.v1~acme.core.instances.product2.v1",
+        "id": gts_id!("acme.core.models.product.v1~acme.core.instances.product2.v1"),
         "productId": "prod-002",
         "name": "Widget"
         // Missing price
@@ -398,7 +400,7 @@ async fn test_switch_to_ready_returns_errors_as_list() {
 
     // Child 3: Wrong type for price (string instead of number)
     let invalid_child3 = json!({
-        "id": "gts.acme.core.models.product.v1~acme.core.instances.product3.v1",
+        "id": gts_id!("acme.core.models.product.v1~acme.core.instances.product3.v1"),
         "productId": "prod-003",
         "name": "Gadget",
         "price": "not-a-number"  // Should be number
@@ -445,7 +447,7 @@ async fn test_switch_to_ready_returns_errors_as_list() {
     // Each error should have the GTS ID of the failing entity
     for err in errors {
         assert!(
-            err.gts_id.contains("gts.acme.core.models.product.v1~"),
+            err.gts_id.contains(PRODUCT_ID),
             "Error should contain GTS ID: {err:?}"
         );
     }
@@ -464,11 +466,13 @@ async fn test_switch_to_ready_returns_errors_as_list() {
 
 #[tokio::test]
 async fn test_switch_to_ready_error_contains_gts_ids() {
+    const MISSING_NAME_ID: &str =
+        gts_id!("acme.core.models.error_test.v1~acme.core.instances.missing_name.v1");
     let service = create_service();
 
     // Register a type schema
     let type_schema = json!({
-        "$id": "gts://gts.acme.core.models.error_test.v1~",
+        "$id": gts_uri!("acme.core.models.error_test.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -481,7 +485,7 @@ async fn test_switch_to_ready_error_contains_gts_ids() {
 
     // Register an invalid instance
     let invalid_instance = json!({
-        "id": "gts.acme.core.models.error_test.v1~acme.core.instances.missing_name.v1"
+        "id": MISSING_NAME_ID
         // Missing required "name" field
     });
 
@@ -503,8 +507,7 @@ async fn test_switch_to_ready_error_contains_gts_ids() {
     // The error should contain the GTS ID of the failing entity
     let err = &errors[0];
     assert!(
-        err.gts_id
-            .contains("gts.acme.core.models.error_test.v1~acme.core.instances.missing_name.v1"),
+        err.gts_id.contains(MISSING_NAME_ID),
         "Error gts_id should reference the failing entity: {err:?}"
     );
     assert!(
@@ -519,7 +522,7 @@ async fn test_switch_to_ready_success_with_valid_types_only() {
 
     // Register only valid type schemas (no instances that need validation)
     let type_schema1 = json!({
-        "$id": "gts://gts.acme.core.models.fixable1.v1~",
+        "$id": gts_uri!("acme.core.models.fixable1.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -528,7 +531,7 @@ async fn test_switch_to_ready_success_with_valid_types_only() {
     });
 
     let type_schema2 = json!({
-        "$id": "gts://gts.acme.core.models.fixable2.v1~",
+        "$id": gts_uri!("acme.core.models.fixable2.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -565,8 +568,9 @@ async fn test_concurrent_registrations() {
     for i in 0..10 {
         let svc = service.clone();
         let handle = tokio::spawn(async move {
+            let gts_id = format!("{GTS_ID_PREFIX}acme.core.events.concurrent_{i}.v1~");
             let entity = json!({
-                "$id": format!("gts://gts.acme.core.events.concurrent_{i}.v1~"),
+                "$id": gts_uri!(gts_id.as_str()),
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object"
             });

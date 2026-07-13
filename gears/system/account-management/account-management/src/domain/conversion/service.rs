@@ -335,7 +335,7 @@ pub(crate) mod pep {
     ///   compiled subtree clamp on `tenants` resolves through this
     ///   property).
     pub const CONVERSION: ResourceType = ResourceType::from_static(
-        "gts.cf.core.am.conversion_request.v1~",
+        account_management_sdk::CONVERSION_REQUEST_RESOURCE_TYPE,
         &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
     );
 

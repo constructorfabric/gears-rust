@@ -204,7 +204,7 @@ impl GroupRepository {
     /// Resolve `type` string values to SMALLINT IDs in a validated `FilterNode`.
     ///
     /// Called AFTER `convert_expr_to_filter_node` validates the filter (String kind
-    /// for `type` field). Walks the tree and replaces `Value::String("gts...")`
+    /// for `type` field). Walks the tree and replaces GTS string values
     /// with `Value::Number(id)` for `GroupFilterField::Type` fields. The resolved
     /// numeric value is then handled by `filter_node_to_condition` which converts
     /// it to `sea_orm::Value::BigInt` — `PostgreSQL` implicitly casts to SMALLINT.

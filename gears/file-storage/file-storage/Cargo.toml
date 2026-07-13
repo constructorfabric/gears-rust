@@ -96,6 +96,8 @@ toolkit-db-macros = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
 toolkit-macros = { workspace = true }
+toolkit-gts = { workspace = true }
+gts = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_gts::GTS_ID_URI_PREFIX;
 use toolkit_macros::domain_model;
 use types_registry_sdk::RegisterResult;
 use uuid::Uuid;
@@ -161,7 +162,7 @@ impl TypesRegistryService {
             for field in &self.config.entity_id_fields {
                 if let Some(id) = obj.get(field.as_str()).and_then(|v| v.as_str()) {
                     let cleaned_id = if field == "$id" {
-                        id.strip_prefix("gts://").unwrap_or(id)
+                        id.strip_prefix(GTS_ID_URI_PREFIX).unwrap_or(id)
                     } else {
                         id
                     };
@@ -178,6 +179,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
     use toolkit_macros::domain_model;
     use uuid::Uuid;
 
@@ -249,7 +251,7 @@ mod tests {
         fn list(&self, _query: &ListQuery) -> Result<Vec<GtsEntity>, DomainError> {
             Ok(vec![GtsEntity::new(
                 Uuid::nil(),
-                "gts.test.pkg.ns.type.v1~".to_owned(),
+                gts_id!("test.pkg.ns.type.v1~").to_owned(),
                 vec![],
                 true,
                 json!({}),
@@ -268,8 +270,8 @@ mod tests {
         fn switch_to_ready(&self) -> Result<(), Vec<String>> {
             if self.fail_switch {
                 return Err(vec![
-                    "gts.test1~: error1".to_owned(),
-                    "gts.test2~: error2".to_owned(),
+                    format!("{GTS_ID_PREFIX}test1~: error1"),
+                    format!("{GTS_ID_PREFIX}test2~: error2"),
                 ]);
             }
             self.is_ready.store(true, Ordering::SeqCst);
@@ -284,16 +286,16 @@ mod tests {
             crate::config::TypesRegistryConfig::default(),
         );
 
-        let entity = json!({"$id": "gts://gts.acme.core.events.test.v1~"});
+        let entity = json!({"$id": gts_uri!("acme.core.events.test.v1~")});
         assert_eq!(
             service.extract_gts_id(&entity),
-            Some("gts.acme.core.events.test.v1~".to_owned())
+            Some(gts_id!("acme.core.events.test.v1~").to_owned())
         );
 
-        let entity = json!({"gtsId": "gts.acme.core.events.test.v1~"});
+        let entity = json!({"gtsId": gts_id!("acme.core.events.test.v1~")});
         assert_eq!(
             service.extract_gts_id(&entity),
-            Some("gts.acme.core.events.test.v1~".to_owned())
+            Some(gts_id!("acme.core.events.test.v1~").to_owned())
         );
 
         let entity = json!({"other": "value"});
@@ -308,8 +310,8 @@ mod tests {
         );
 
         let entities = vec![
-            json!({"$id": "gts://gts.acme.core.events.test.v1~"}),
-            json!({"$id": "gts://gts.acme.core.events.test2.v1~"}),
+            json!({"$id": gts_uri!("acme.core.events.test.v1~")}),
+            json!({"$id": gts_uri!("acme.core.events.test2.v1~")}),
         ];
 
         let results = service.register(entities);
@@ -326,8 +328,8 @@ mod tests {
         );
 
         let entities = vec![
-            json!({"$id": "gts://gts.acme.core.events.test.v1~"}),
-            json!({"$id": "gts://gts.acme.core.events.fail.v1~"}),
+            json!({"$id": gts_uri!("acme.core.events.test.v1~")}),
+            json!({"$id": gts_uri!("acme.core.events.fail.v1~")}),
             json!({"other": "no id"}),
         ];
 
@@ -344,7 +346,7 @@ mod tests {
             Arc::new(MockRepo::new()),
             crate::config::TypesRegistryConfig::default(),
         );
-        let result = service.get("gts.acme.core.events.test.v1~");
+        let result = service.get(gts_id!("acme.core.events.test.v1~"));
         assert!(result.is_ok());
     }
 
@@ -354,7 +356,7 @@ mod tests {
             Arc::new(MockRepo::new()),
             crate::config::TypesRegistryConfig::default(),
         );
-        let result = service.get("gts.vendor.pkg.ns.notfound.v1~");
+        let result = service.get(gts_id!("vendor.pkg.ns.notfound.v1~"));
         assert!(result.is_err());
     }
 
@@ -393,7 +395,7 @@ mod tests {
         match result.unwrap_err() {
             DomainError::ReadyCommitFailed(errors) => {
                 assert_eq!(errors.len(), 2);
-                assert_eq!(errors[0].gts_id, "gts.test1~");
+                assert_eq!(errors[0].gts_id, format!("{GTS_ID_PREFIX}test1~"));
                 assert_eq!(errors[0].message, "error1");
             }
             _ => panic!("Expected ReadyCommitFailed"),

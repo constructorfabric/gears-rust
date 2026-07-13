@@ -11,72 +11,74 @@
 //! `TypedEvent::TYPE_ID` on the payload — a lockstep checked by the unit tests.
 
 use anyhow::Context;
+use toolkit_gts::gts_id;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.entry.posted` event type.
-pub const ENTRY_POSTED_TYPE_ID: &str = "gts.cf.core.events.event.v1~cf.bss.ledger.entry_posted.v1";
+pub const ENTRY_POSTED_TYPE_ID: &str =
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.entry_posted.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.entry.reversed` event type.
 pub const ENTRY_REVERSED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.entry_reversed.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.entry_reversed.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.invariant.alarm` event type.
 pub const INVARIANT_ALARM_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.invariant_alarm.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.invariant_alarm.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.dispute.recorded` event type.
 pub const DISPUTE_RECORDED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.dispute_recorded.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.dispute_recorded.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.settlement.returned` event type.
 pub const SETTLEMENT_RETURNED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.settlement_returned.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.settlement_returned.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.revenue.recognized` event type.
 pub const REVENUE_RECOGNIZED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.revenue_recognized.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.revenue_recognized.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the
 /// `billing.ledger.revenue.recognition_reversed` event type.
 pub const REVENUE_RECOGNITION_REVERSED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.revenue_recognition_reversed.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.revenue_recognition_reversed.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.schedule.changed` event type.
 pub const SCHEDULE_CHANGED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.schedule_changed.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.schedule_changed.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.credit_note.posted` event type.
 pub const CREDIT_NOTE_POSTED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.credit_note_posted.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.credit_note_posted.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.debit_note.posted` event type.
 pub const DEBIT_NOTE_POSTED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.debit_note_posted.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.debit_note_posted.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.refund.recorded` event type.
 pub const REFUND_RECORDED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.refund_recorded.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.refund_recorded.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.manual_adjustment.posted` event type.
 pub const MANUAL_ADJUSTMENT_POSTED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.manual_adjustment_posted.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.manual_adjustment_posted.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.fx.revaluation_completed` event type.
 pub const FX_REVALUATION_COMPLETED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.fx_revaluation_completed.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.fx_revaluation_completed.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.fx.revaluation_reversed` event type.
 pub const FX_REVALUATION_REVERSED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.fx_revaluation_reversed.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.fx_revaluation_reversed.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.period.closed` event type.
 pub const PERIOD_CLOSED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.period_closed.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.period_closed.v1");
 
 /// Bare GTS id (no `gts://` prefix) of the `billing.ledger.reconciliation.completed`
 /// event type.
 pub const RECONCILIATION_COMPLETED_TYPE_ID: &str =
-    "gts.cf.core.events.event.v1~cf.bss.ledger.reconciliation_completed.v1";
+    gts_id!("cf.core.events.event.v1~cf.bss.ledger.reconciliation_completed.v1");
 
 /// Vendored JSON-Schema for the posted-entry event.
 const ENTRY_POSTED_SCHEMA_JSON: &str =

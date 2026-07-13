@@ -52,6 +52,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+use toolkit_gts::gts_id;
 use toolkit_security::{SecurityContext, pep_properties};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -102,7 +103,7 @@ fn ctx_for(tenant: Uuid) -> SecurityContext {
     SecurityContext::builder()
         .subject_id(Uuid::now_v7())
         .subject_tenant_id(tenant)
-        .subject_type("gts.cf.core.security.subject_user.v1~")
+        .subject_type(gts_id!("cf.core.security.subject_user.v1~"))
         .token_scopes(vec!["*".to_owned()])
         .build()
         .expect("authed SecurityContext must build")

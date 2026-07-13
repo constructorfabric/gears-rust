@@ -40,6 +40,7 @@
       - [Example: before and after](#example-before-and-after)
       - [When string constants are still appropriate](#when-string-constants-are-still-appropriate)
   - [6.7 Heterogeneous Dispatch — `GtsSchema for Value` and `try_narrow`](#67-heterogeneous-dispatch--gtsschema-for-value-and-try_narrow)
+  - [6.8 Compile-Time Prefix Customization (`GTS_ID_PREFIX`)](#68-compile-time-prefix-customization-gts_id_prefix)
   - [7. Base Types — Design Guidelines](#7-base-types--design-guidelines)
   - [8. GTS-Based Security and Wildcard Access Control](#8-gts-based-security-and-wildcard-access-control)
     - [8.1 Why Naming Structure Matters for Security](#81-why-naming-structure-matters-for-security)
@@ -78,7 +79,7 @@ GTS brings the following capabilities to Gears:
 3. **Wildcard-based access control (ABAC)** — grant or restrict permissions using patterns like `gts.cf.core.events.type.v1~acme.*` instead of maintaining explicit resource lists, can be useful for cross-vendor data isolation
 4. **Extensible (derived) types** — third-party vendors safely extend platform base types via inheritance chains while maintaining compatibility guarantees
 5. **Hybrid storage pattern** — store base-type fields in indexed DB columns, vendor-specific extensions in JSONB — no schema migrations needed for new type variants
-6. **Code-generated JSON Schema contracts** — GTS Type Schemas generated from Rust structs via `#[struct_to_gts_schema]`, keeping type definitions in code rather than hand-maintained JSON
+6. **Code-generated JSON Schema contracts** — GTS Type Schemas generated from Rust structs via `#[gts_type_schema]` (the `toolkit_gts` wrapper around upstream `#[struct_to_gts_schema]`), keeping type definitions in code rather than hand-maintained JSON
 7. **Globally unique identifiers across vendors** — no naming collisions; deterministic UUID v5 derivation from any GTS identifier for compact, fixed-size DB storage and external system interop
 8. **Semantic trait metadata attached to type schemas** — cross-cutting properties (e.g., event routing topic, retention policy, audit requirements) declared as structured values in `x-gts-traits`, with their shape/defaults defined by `x-gts-traits-schema`, inherited and merged across the derivation chain
 9. **GTS Registry** — GTS Type Schemas and well-known Instances indexed by GTS Identifier for discovery, validation, compatibility checking, and plugin resolution
@@ -342,7 +343,9 @@ This is the core database pattern that GTS enables. A gear stores base-type fiel
 
 ```rust
 // gts-rust deterministic UUID derivation
-let type_uuid = gts::GtsID::new("gts.cf.core.events.type.v1~")?.to_uuid();
+use toolkit_gts::gts_id;
+
+let type_uuid = gts::GtsID::new(gts_id!("cf.core.events.type.v1~"))?.to_uuid();
 // Always produces the same UUID for the same GTS string
 ```
 
@@ -497,28 +500,48 @@ The `$id` uses the `gts://` URI prefix. The `$ref` references the base type. The
 
 ## 6. GTS in Rust Code
 
-**Upstream naming has shifted to `type_id` terminology.** In new Rust code and in PR reviews, prefer `type_id`, `TYPE_ID`, `BASE_TYPE_ID`, `gts_type_id()`, `gts_base_type_id()`, `innermost_type_id()`, and `GtsTypeId`. Treat `schema_id`, `SCHEMA_ID`, `BASE_SCHEMA_ID`, `gts_schema_id()`, and `GtsSchemaId` as deprecated compatibility aliases unless you are touching legacy call sites. `GtsSchemaId` is now a deprecated type alias (`pub type GtsSchemaId = GtsTypeId`). The `schema_id = "..."` macro attribute emits a compile-time deprecation warning — new code must use `type_id = "..."`. Specifying both `type_id` and `schema_id` on the same struct is a hard compile error.
+**Upstream naming has shifted to `type_id` terminology.** In new Rust code and in PR reviews, prefer `type_id`, `TYPE_ID`, `BASE_TYPE_ID`, `gts_type_id()`, `gts_base_type_id()`, `innermost_type_id()`, and `GtsTypeId`. Treat `schema_id`, `SCHEMA_ID`, `BASE_SCHEMA_ID`, `gts_schema_id()`, and `GtsSchemaId` as deprecated compatibility aliases unless you are touching legacy call sites. `GtsSchemaId` is now a deprecated type alias (`pub type GtsSchemaId = GtsTypeId`). The `schema_id = "..."` macro attribute emits a compile-time deprecation warning — new code must use `type_id = "..."` (or `type_id = gts_id!("...")`). Specifying both `type_id` and `schema_id` on the same struct is a hard compile error.
 
 In gts-rust result types, note the distinction between two predicates: `is_type_schema` (entity results — is this entity a GTS Type Schema, not an instance?) vs `is_type` (parse/validate ID results — does this GTS Identifier end with `~`, making it a type rather than an instance ID?).
 
-Gears generate GTS type schemas from Rust structs using the `#[struct_to_gts_schema]` macro. This keeps type definitions in code, not in hand-maintained JSON files.
+Gears generate GTS type schemas from Rust structs using the `#[struct_to_gts_schema]` macro (wrapped as `#[gts_type_schema]` via `toolkit_gts`). This keeps type definitions in code, not in hand-maintained JSON files.
+
+**GTS identifier literals must use the `gts_id!` / `gts_uri!` macros.** As of gts-rust v0.11.0, the `gts.` prefix is no longer hardcoded — it is a compile-time configurable constant (`GTS_ID_PREFIX`, default `"gts."`). All GTS identifier string literals in Rust code must be written through the `gts_id!` macro, which prepends the prefix automatically. The `gts_uri!` macro does the same for URI-form identifiers (`gts://`). Both macros are re-exported from `toolkit_gts`.
+
+```rust
+use toolkit_gts::gts_id;
+
+// Suffix without "gts." prefix — the macro adds it
+const TYPE_ID: &str = gts_id!("cf.core.toolkit.plugin.v1~");
+// Expands to: "gts.cf.core.toolkit.plugin.v1~"
+
+// Already-prefixed literals are passed through unchanged
+const ALSO_OK: &str = gts_id!("gts.cf.core.toolkit.plugin.v1~");
+
+// URI form for $id / $ref in JSON schemas and RFC 9457 type URIs
+use toolkit_gts::gts_uri;
+const SCHEMA_URI: &str = gts_uri!("cf.core.events.type.v1~");
+// Expands to: "gts://gts.cf.core.events.type.v1~"
+```
+
+The same `gts_id!("...")` form is accepted inside `type_id = ...`, `id: ...`, and `"id": ...` arguments of `#[gts_type_schema]`, `gts_instance!`, and `gts_instance_raw!`. Always write the suffix **without** the `gts.` prefix in these positions.
 
 ### 6.1 Defining a Base Type
 
 ```rust
-// libs/toolkit/src/gts/plugin.rs
+// libs/toolkit-gts/src/plugin.rs
 use gts::GtsInstanceId;
-use gts_macros::struct_to_gts_schema;
+use toolkit_gts::gts_type_schema;
 
 #[derive(Debug)]
-#[struct_to_gts_schema(
+#[gts_type_schema(
     dir_path = "schemas",
     base = true,
-    type_id = "gts.cf.core.toolkit.plugin.v1~",
+    type_id = gts_id!("cf.core.toolkit.plugin.v1~"),
     description = "Base toolkit plugin schema",
     properties = "id,vendor,priority,properties"
 )]
-pub struct BaseToolkitPluginV1<P: gts::GtsSchema> {
+pub struct PluginV1<P: gts::GtsSchema> {
     pub id: GtsInstanceId,
     pub vendor: String,
     pub priority: i16,
@@ -538,25 +561,25 @@ Using `String` bypasses structural validation and makes the origin of the value 
 
 ```rust
 // gears/credstore/credstore-sdk/src/gts.rs
-use gts_macros::struct_to_gts_schema;
-use toolkit::gts::BaseToolkitPluginV1;
+use toolkit_gts::gts_type_schema;
+use toolkit_gts::PluginV1;
 
-#[struct_to_gts_schema(
+#[gts_type_schema(
     dir_path = "schemas",
-    base = BaseToolkitPluginV1,
-    type_id = "gts.cf.core.toolkit.plugin.v1~cf.core.credstore.plugin.v1~",
+    base = PluginV1,
+    type_id = gts_id!("cf.core.toolkit.plugin.v1~cf.core.credstore.plugin.v1~"),
     description = "CredStore plugin specification",
     properties = ""
 )]
 pub struct CredStorePluginSpecV1;
 ```
 
-The `base = BaseToolkitPluginV1` links this derived type to its base. The `type_id` is a chained GTS identifier showing the inheritance: `base~derived~`.
+The `base = PluginV1` links this derived type to its base. The `type_id` is a chained GTS identifier showing the inheritance: `base~derived~`.
 
-**Review note — generated schema shape matters:** when PRs add or modify generic or nested derived GTS structs, review the generated schema artifact or tests, not just the Rust type. Derived overlays must be wrapped at the full nesting path under the intended extension field; otherwise fields can leak to the top level and accidentally violate `additionalProperties: false` contracts. The `description` attribute is now emitted into the generated JSON schema root — a PR that adds or changes `description` on a `#[struct_to_gts_schema]` struct must also update the checked-in schema artifact.
+**Review note — generated schema shape matters:** when PRs add or modify generic or nested derived GTS structs, review the generated schema artifact or tests, not just the Rust type. Derived overlays must be wrapped at the full nesting path under the intended extension field; otherwise fields can leak to the top level and accidentally violate `additionalProperties: false` contracts. The `description` attribute is now emitted into the generated JSON schema root — a PR that adds or changes `description` on a `#[gts_type_schema]` struct must also update the checked-in schema artifact.
 
 **Review note — type schema definition checklist:**
-- `type_id = "..."` attribute ends with `~`; use `type_id` not the deprecated `schema_id`
+- `type_id = gts_id!("...")` attribute ends with `~`; use `type_id` not the deprecated `schema_id`
 - For base types: `base = true`; for derived types: `base = ParentStruct` (not `base = true`) — the macro validates at compile time that the `type_id` prefix matches `<ParentStruct as GtsSchema>::TYPE_ID`
 - `description` attribute is present — it is now emitted into the schema JSON root
 - Struct fields that reference other GTS types use `GtsTypeId` / `GtsInstanceId`, not `String`
@@ -599,7 +622,7 @@ async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
 - The `segment` argument does **not** end with `~` — instance identifiers are not type identifiers
 - The struct field holding the instance ID uses `GtsInstanceId`, not `String`
 - The instance payload body must **not** contain schema-only keywords (`x-gts-traits`, `x-gts-traits-schema`, `x-gts-final`, `x-gts-abstract`) — the library rejects such payloads at registration with a structured error
-- The type used as the instance's schema must itself be defined via `#[struct_to_gts_schema]` before any instances are registered
+- The type used as the instance's schema must itself be defined via `#[gts_type_schema]` before any instances are registered
 
 ### 6.4 Defining GTS Constants
 
@@ -607,16 +630,17 @@ For well-known types and instances, define constants in a dedicated `gts_helpers
 
 ```rust
 // gears/system/oagw/oagw/src/domain/gts_helpers.rs
+use toolkit_gts::gts_id;
 
-// Schema GTS identifiers (types)
-pub const UPSTREAM_SCHEMA: &str  = "gts.cf.core.oagw.upstream.v1~";
-pub const ROUTE_SCHEMA: &str     = "gts.cf.core.oagw.route.v1~";
-pub const AUTH_PLUGIN_SCHEMA: &str = "gts.cf.core.oagw.auth_plugin.v1~";
+// Schema GTS identifiers (types) — suffix without "gts." prefix
+pub const UPSTREAM_SCHEMA: &str  = gts_id!("cf.core.oagw.upstream.v1~");
+pub const ROUTE_SCHEMA: &str     = gts_id!("cf.core.oagw.route.v1~");
+pub const AUTH_PLUGIN_SCHEMA: &str = gts_id!("cf.core.oagw.auth_plugin.v1~");
 
 // Builtin instances (well-known — no trailing ~)
-pub const HTTP_PROTOCOL_ID: &str = "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1";
-pub const APIKEY_AUTH_ID: &str   = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1";
-pub const BEARER_AUTH_ID: &str   = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1";
+pub const HTTP_PROTOCOL_ID: &str = gts_id!("cf.core.oagw.protocol.v1~cf.core.oagw.http.v1");
+pub const APIKEY_AUTH_ID: &str   = gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1");
+pub const BEARER_AUTH_ID: &str   = gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1");
 
 // Format an anonymous instance (UUID-based)
 pub fn format_upstream_gts(id: Uuid) -> String {
@@ -643,16 +667,18 @@ Avoid `format!` to build GTS identifiers at runtime — typed constructors valid
 GTS identifiers are used as the `type` URI in RFC 9457 Problem responses:
 
 ```rust
+use toolkit_gts::gts_uri;
+
 impl From<SlessOrchestratorError> for Problem {
     fn from(e: SlessOrchestratorError) -> Self {
         match e {
             SlessOrchestratorError::NotFound { id } =>
                 Problem::not_found()
-                    .with_type_uri("gts://gts.cf.core.sless.err.v1~cf.core.sless.err.not_found.v1~")
+                    .with_type_uri(gts_uri!("cf.core.sless.err.v1~cf.core.sless.err.not_found.v1~"))
                     .with_detail(format!("Function not found: {id}")),
             SlessOrchestratorError::RateLimited { retry_after_seconds, .. } =>
                 Problem::too_many_requests()
-                    .with_type_uri("gts://gts.cf.core.sless.err.v1~cf.core.sless.err.rate_limited.v1~")
+                    .with_type_uri(gts_uri!("cf.core.sless.err.v1~cf.core.sless.err.rate_limited.v1~"))
                     .with_header("Retry-After", retry_after_seconds),
             // ...
         }
@@ -831,6 +857,90 @@ match gts_type.as_ref() {
 - Using `Base<Value>` as a permanent storage or processing type — narrow to a concrete type before business logic
 - Deserializing macro-generated nested GTS types directly with `serde::from_value` — use `try_narrow`, which correctly routes through `GtsDeserializeWrapper`
 - Comparing runtime discriminator strings to raw string literals instead of `<Q>::innermost_type_id()`
+
+### 6.8 Compile-Time Prefix Customization (`GTS_ID_PREFIX`)
+
+By default, all GTS identifiers start with `gts.`. Since gts-rust v0.11.0, this prefix is **not hardcoded** — it is a compile-time constant (`GTS_ID_PREFIX`) resolved from the `GTS_ID_PREFIX` environment variable, defaulting to `"gts."` when unset. This allows an organization to use a custom prefix (e.g. `acme.`) across the entire codebase without modifying any source code.
+
+#### How it works
+
+The `gts-id` crate resolves the prefix at compile time via `option_env!("GTS_ID_PREFIX")` with a `const` validation function. The value is baked into the binary — a single binary cannot work with multiple prefixes. The crate's `build.rs` emits `cargo:rerun-if-env-changed=GTS_ID_PREFIX` so Cargo automatically rebuilds when the variable changes.
+
+The `gts_id!` and `gts_uri!` proc-macros (re-exported from `toolkit_gts`) read `gts_id::GTS_ID_PREFIX` at macro-expansion time, so all GTS identifier literals in the codebase automatically use the configured prefix. **No source code changes are required** — as long as all identifiers are written via `gts_id!("suffix")` (without a hardcoded `gts.` prefix), the entire binary switches to the custom prefix.
+
+#### Setting a custom prefix
+
+```bash
+# Build with a custom prefix
+GTS_ID_PREFIX=acme. cargo build
+
+# Run tests with a custom prefix
+GTS_ID_PREFIX=acme. cargo test
+
+# CI / deployment
+GTS_ID_PREFIX=acme. cargo build --release
+```
+
+With `GTS_ID_PREFIX=acme.`, the macros expand as follows:
+
+```rust
+use toolkit_gts::gts_id;
+
+// Suffix written without prefix — the macro prepends the configured prefix
+const TYPE_ID: &str = gts_id!("cf.core.toolkit.plugin.v1~");
+// Expands to: "acme.cf.core.toolkit.plugin.v1~" (instead of "gts.cf.core.toolkit.plugin.v1~")
+
+// Already-prefixed literals are detected and passed through unchanged
+const ALSO_OK: &str = gts_id!("acme.cf.core.toolkit.plugin.v1~");
+// Expands to: "acme.cf.core.toolkit.plugin.v1~" (no doubling)
+```
+
+#### Prefix validation rules
+
+The prefix is validated at compile time — an invalid value fails the build with a clear diagnostic. A valid prefix is a single lowercase token (`[a-z][a-z0-9_]*`) terminated by a single `.`:
+
+| Value | Accepted? | Reason |
+|-------|-----------|--------|
+| `gts.` | ✅ | The default |
+| `acme.` | ✅ | Single lowercase token + trailing dot |
+| `acme` | ❌ | Missing trailing `.` |
+| `Acme.` | ❌ | Uppercase rejected |
+| `my.org.` | ❌ | Multi-segment (contains an extra `.`) |
+| `acme-prod.` | ❌ | Hyphen is not allowed |
+| `_.` | ❌ | Must start with a letter, not underscore |
+| (empty) | ❌ | Empty prefix |
+
+#### Relevant constants
+
+| Constant | Source | Description |
+|----------|--------|-------------|
+| `GTS_ID_PREFIX` | `gts_id` / `toolkit_gts` | The configured prefix (default `"gts."`). |
+| `DEFAULT_GTS_ID_PREFIX` | `gts_id` | The default prefix (`"gts."`), regardless of override. |
+| `GTS_ID_PREFIX_ENV` | `gts_id` | The env var name (`"GTS_ID_PREFIX"`). |
+| `GTS_ID_URI_PREFIX` | `gts` / `toolkit_gts` | The URI prefix (`"gts://"`), not affected by `GTS_ID_PREFIX`. |
+
+#### What you need to do
+
+- **Always write GTS identifiers via `gts_id!("suffix")`** — never hardcode the `gts.` prefix in string literals
+- **Write suffixes without the prefix** — `gts_id!("cf.core.toolkit.plugin.v1~")`, not `gts_id!("gts.cf.core.toolkit.plugin.v1~")`
+- **Use `GTS_ID_PREFIX` constant** (from `toolkit_gts`) when you need to reference the prefix at runtime, e.g. for string manipulation or validation
+- **Set the env var for the entire build** — since the prefix is baked into the binary at compile time, all crates in the dependency graph must be compiled with the same `GTS_ID_PREFIX` value. Cargo handles this automatically via `rerun-if-env-changed`
+
+#### Testing the customization
+
+The workspace includes tests that verify prefix customization works end-to-end:
+
+```bash
+# Default prefix
+cargo test -p cf-gears-toolkit-gts --test prefix_customization -- --nocapture
+# Output: Compiled with GTS_ID_PREFIX = "gts."
+
+# Custom prefix
+GTS_ID_PREFIX=acme. cargo test -p cf-gears-toolkit-gts --test prefix_customization -- --nocapture
+# Output: Compiled with GTS_ID_PREFIX = "acme."
+```
+
+Both runs pass — the tests check structural invariants (prefix prepended, suffix preserved, URI form correct) rather than hardcoding `"gts."`.
 
 ---
 
@@ -1059,7 +1169,7 @@ Types that **must not be extended**. No derived types are allowed.
 
 1. **Vendor prefix**: all Constructor Fabric- defined base types use `cf` as vendor (include the Gears types)
 2. **SDK placement**: GTS type definitions live in `<gear>-sdk/src/gts.rs`
-3. **Schema generation**: use `#[struct_to_gts_schema]` macro — do not maintain schemas by hand
+3. **Schema generation**: use `#[gts_type_schema]` macro (from `toolkit_gts`) — do not maintain schemas by hand
 4. **Constants**: well-known GTS identifiers are defined as `const` strings in `domain/gts_helpers.rs` or `gts.rs`
 5. **Registration**: plugins register GTS instances in the GTS Registry during `init()`
 6. **DB storage**: base fields in columns, extension data in `JSONB` or `TEXT`
@@ -1067,7 +1177,8 @@ Types that **must not be extended**. No derived types are allowed.
 8. **Access control**: structure identifiers so that wildcard policies can grant/revoke access at the vendor, package, or namespace level
 9. **Dylint enforcement**: GTS-specific lints validate identifier correctness and prevent unsupported patterns at compile time
 10. **Constants as GTS instances**: discriminator fields and string constants that select behavior, routing, or authorization should be GTS well-known instances — not raw strings or Rust enums (see [section 6.6](#66-gts-well-known-instances-for-constants-and-discriminator-values))
-11. **Rust naming**: in new code prefer `type_id`/`TYPE_ID`/`GtsTypeId` naming; treat `schema_id` names as deprecated compatibility aliases. The `schema_id = "..."` macro attribute produces a compile-time deprecation warning — use `type_id = "..."` instead
+11. **Rust naming**: in new code prefer `type_id`/`TYPE_ID`/`GtsTypeId` naming; treat `schema_id` names as deprecated compatibility aliases. The `schema_id = "..."` macro attribute produces a compile-time deprecation warning — use `type_id = "..."` (or `type_id = gts_id!("...")`) instead
+16. **GTS identifier literals**: use `gts_id!("<suffix>")` for all GTS identifier string literals in Rust code — the `gts.` prefix is prepended at compile time from the configurable `GTS_ID_PREFIX`. Use `gts_uri!("<suffix>")` for URI-form identifiers (`gts://`). Both macros are re-exported from `toolkit_gts`. The same `gts_id!("...")` form is accepted inside `type_id`/`id`/`"id"` arguments of `#[gts_type_schema]`, `gts_instance!`, and `gts_instance_raw!` — always write the suffix without the `gts.` prefix
 12. **Schema dialect**: handwritten GTS JSON Schemas and fixtures must target Draft-07 (`"$schema": "http://json-schema.org/draft-07/schema#"`) and avoid post-Draft-07 keywords; use `definitions` (not `$defs`) for local reusable subschemas
 13. **Heterogeneous carriers**: when a type must hold multiple concrete GTS leaf types at runtime, use `serde_json::Value` as the generic parameter with `try_narrow` for typed dispatch (see [section 6.7](#67-heterogeneous-dispatch--gtsschema-for-value-and-try_narrow))
 14. **Typed GTS ID fields**: Rust struct fields that carry GTS identifiers use `GtsTypeId` (for type refs ending with `~`) or `GtsInstanceId` (for instance refs) — never plain `String` or `&str`
@@ -1149,7 +1260,8 @@ When reviewing Rust code, verify not just naming correctness but also that the c
 
 **Rust review checks:**
 - Prefer canonical naming: `type_id`, `TYPE_ID`, `BASE_TYPE_ID`, `gts_type_id()`, `GtsTypeId`
-- Use `#[struct_to_gts_schema]` for GTS schema generation instead of hand-maintained JSON where possible
+- Use `gts_id!("...")` / `gts_uri!("...")` for all GTS identifier string literals — never hardcode the `gts.` prefix in Rust code
+- Use `#[gts_type_schema]` (from `toolkit_gts`) for GTS schema generation instead of hand-maintained JSON where possible
 - Ensure generated schemas use Draft-07 semantics and GTS URI forms for `$id` / `$ref`
 - Validate boundary fields as full GTS Type Identifiers ending with `~`
 - Keep schema-only keywords out of instance documents
@@ -1165,13 +1277,13 @@ When reviewing Rust code, verify not just naming correctness but also that the c
 - If the PR introduces a `Base<serde_json::Value>` heterogeneous carrier, is `try_narrow` used for dispatch, and are discriminators compared via `<Q>::innermost_type_id()` rather than raw string literals?
 
 **High-risk Rust changes to inspect carefully:**
-- Macro attribute changes on `#[struct_to_gts_schema]`
+- Macro attribute changes on `#[gts_type_schema]` / `#[struct_to_gts_schema]`
 - Renames touching `type_id` fields, constants, or generated methods
 - Changes to JSON Schema emission, `allOf` structure, nested generic paths, or `$ref` generation
 - Changes to validation/parsing at API boundaries
 - Changes that allow instances to carry schema-only keywords
 - Changes that replace GTS-backed values with raw strings or enums
-- Changes to `description` attribute values on `#[struct_to_gts_schema]` structs — verify the checked-in schema artifact reflects the new value in the JSON root
+- Changes to `description` attribute values on a `#[gts_type_schema]` struct — verify the checked-in schema artifact reflects the new value in the JSON root
 - New `Base<serde_json::Value>` carrier patterns without a corresponding `try_narrow` dispatch site
 
 **Common Rust anti-patterns:**
@@ -1198,6 +1310,7 @@ When reviewing Rust code, verify not just naming correctness but also that the c
 - [ ] If JSON Schema is handwritten, does it use Draft-07 (`http://json-schema.org/draft-07/schema#`) and avoid post-Draft-07 keywords such as `$defs`?
 - [ ] Do type-reference fields at boundaries validate a full GTS Type Identifier ending with `~`, not just a `gts.` prefix?
 - [ ] Do Rust struct fields that carry GTS identifiers use `GtsTypeId` (type refs) or `GtsInstanceId` (instance refs), not `String`?
+- [ ] Are all GTS identifier string literals written via `gts_id!("...")` / `gts_uri!("...")` — no hardcoded `gts.` prefix in Rust code?
 - [ ] For a new GTS type: does `type_id` end with `~`, and for derived types does `base = ParentStruct` correctly reflect the parent chain?
 - [ ] Are instance IDs constructed via `gts_make_instance_id()`, not via string concatenation or `format!`?
 - [ ] Does the instance payload omit all schema-only keywords (`x-gts-traits`, `x-gts-traits-schema`, `x-gts-final`, `x-gts-abstract`)?
@@ -1205,7 +1318,7 @@ When reviewing Rust code, verify not just naming correctness but also that the c
 - [ ] Are GTS constants defined in Rust code, not magic strings scattered across handlers?
 - [ ] In new Rust code, are canonical names used (`type_id`, `TYPE_ID`, `GtsTypeId`, `gts_type_id()`), with deprecated `schema_id` aliases avoided unless needed for compatibility?
 - [ ] If this PR changes generic or nested derived structs, do generated schema artifacts/tests prove the overlay lands at the correct full nesting path?
-- [ ] If `description` was added or changed on a `#[struct_to_gts_schema]` struct, does the checked-in schema artifact reflect the update in the JSON root?
+- [ ] If `description` was added or changed on a `#[gts_type_schema]` struct, does the checked-in schema artifact reflect the update in the JSON root?
 - [ ] If the PR introduces a `Base<serde_json::Value>` heterogeneous carrier, is `try_narrow` used for dispatch and are `NarrowError` variants handled?
 - [ ] Should any string-constant discriminator fields use GTS instances instead? (see [section 6.6](#66-gts-well-known-instances-for-constants-and-discriminator-values))
 - [ ] Do discriminator schemas carry `properties` that the engine can read instead of `match` arms?

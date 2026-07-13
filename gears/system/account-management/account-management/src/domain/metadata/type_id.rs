@@ -4,18 +4,18 @@
 //! wire `type_id` string into a typed value before any registry or
 //! repo call. Four checks run in order:
 //!
-//! 1. Parse the wire `type_id` string via [`gts::GtsID::new`] —
+//! 1. Parse the wire `type_id` string via [`gts::GtsId::try_new`] —
 //!    rejects malformed GTS syntax.
 //! 2. Require the root segment match
 //!    [`METADATA_ROOT_SEGMENT`] (`cf.core.am.tenant_metadata.v1`) —
 //!    rejects schemas from other namespaces.
 //! 3. Require at least one chained user-registered schema segment
 //!    after the root.
-//! 4. Require schema-shape (`GtsID::is_type` — every segment ends
+//! 4. Require schema-shape (`GtsId::is_type` — every segment ends
 //!    with `~`); reject instance-id shapes.
 //!
 //! On success [`ParsedTypeId`] also caches the deterministic
-//! `UUIDv5` derived through [`gts::GtsID::to_uuid`] — same namespace
+//! `UUIDv5` derived through [`gts::GtsId::to_uuid`] — same namespace
 //! the upstream `gts` crate uses internally, so AM and any sibling
 //! consuming the `gts` crate directly agree on the storage-side
 //! `schema_uuid` mapping.
@@ -26,7 +26,8 @@
 //! boundary. The SDK ships raw `String` for `type_id` and never
 //! sees the granular validation error variants.
 
-use gts::{GtsID, GtsTypeId};
+use gts::{GtsId, GtsTypeId};
+use toolkit_gts::GTS_ID_PREFIX;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -60,16 +61,16 @@ impl ParsedTypeId {
     /// specific failure mode (malformed GTS, wrong root segment,
     /// missing chained segment, instance-id shape).
     pub(crate) fn parse(s: &str) -> Result<Self, DomainError> {
-        let parsed = GtsID::new(s).map_err(|err| DomainError::MetadataValidation {
+        let parsed = GtsId::try_new(s).map_err(|err| DomainError::MetadataValidation {
             detail: format!("malformed metadata schema id: {err}"),
         })?;
 
-        let segments = &parsed.gts_id_segments;
+        let segments = parsed.segments();
         if segments.len() < 2 {
             return Err(DomainError::MetadataValidation {
                 detail: format!(
                     "metadata schema id `{}` is missing a chained user-registered segment \
-                     after the root (`gts.{METADATA_ROOT_SEGMENT}`)",
+                     after the root (`{GTS_ID_PREFIX}{METADATA_ROOT_SEGMENT}`)",
                     parsed.as_ref()
                 ),
             });
@@ -77,19 +78,19 @@ impl ParsedTypeId {
 
         // `GtsIdSegment.segment` includes the trailing `~`; strip
         // before comparing against the root constant.
-        let root_str = segments[0].segment.trim_end_matches('~');
+        let root_str = segments[0].raw().trim_end_matches('~');
         if root_str != METADATA_ROOT_SEGMENT {
             return Err(DomainError::MetadataValidation {
                 detail: format!(
-                    "metadata schema id must start with `gts.{METADATA_ROOT_SEGMENT}`, \
-                     got `gts.{root_str}`"
+                    "metadata schema id must start with `{GTS_ID_PREFIX}{METADATA_ROOT_SEGMENT}`, \
+                     got `{GTS_ID_PREFIX}{root_str}`"
                 ),
             });
         }
 
         // Schema-shape: every segment of a schema chain ends with `~`.
         // An instance id whose tail segment lacks `~` parses cleanly
-        // as a `GtsID` but is NOT a schema chain — reject at the
+        // as a `GtsId` but is NOT a schema chain — reject at the
         // boundary so the downstream `schema_uuid` lookup does not
         // surface as a confusing 404.
         if !parsed.is_type() {
@@ -101,13 +102,13 @@ impl ParsedTypeId {
             });
         }
 
-        // `gts::GtsID::to_uuid()` hashes `self.id.as_bytes()` under the
+        // `gts::GtsId::to_uuid()` hashes `self.id.as_bytes()` under the
         // upstream `GTS_NS` (= `Uuid::new_v5(&NAMESPACE_URL, b"gts")`).
         // Single source of truth shared with every sibling that
         // imports the `gts` crate.
         let uuid = parsed.to_uuid();
 
-        // Use parsed.as_ref(), not the original `s`: GtsID::new trims
+        // Use parsed.as_ref(), not the original `s`: GtsId::try_new trims
         // whitespace; storing the trimmed form keeps schema_uuid
         // consistent with reverse-hydration.
         Ok(Self {

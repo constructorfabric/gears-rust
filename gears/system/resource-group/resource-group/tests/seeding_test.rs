@@ -12,6 +12,7 @@
 mod common;
 
 use std::sync::Arc;
+use toolkit_gts::GTS_ID_PREFIX;
 
 use common::{make_ctx, make_group_service, make_membership_service, test_db};
 use uuid::Uuid;
@@ -48,7 +49,7 @@ fn unique_type_code(suffix: &str) -> String {
     // (lowercased); UUID-hex (with `i` prefix to start with a letter)
     // goes in type.
     format!(
-        "gts.cf.core.rg.type.v1~x.test.{}.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}.i{}.v1~",
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     )

@@ -2,6 +2,9 @@
 mod tests {
     use crate::domain::error::DomainError;
     use toolkit_canonical_errors::{CanonicalError, Problem};
+    use toolkit_gts::gts_id;
+
+    const SETTINGS_RESOURCE_TYPE: &str = gts_id!("cf.simple_user_settings.settings.user.v1~");
 
     /// Build the wire `Problem` the canonical error middleware would emit
     /// for a given `DomainError`. Tests run without the middleware in
@@ -23,7 +26,7 @@ mod tests {
                 .context
                 .get("resource_type")
                 .and_then(|v| v.as_str()),
-            Some("gts.cf.simple_user_settings.settings.user.v1~"),
+            Some(SETTINGS_RESOURCE_TYPE),
         );
     }
 
@@ -84,7 +87,7 @@ mod tests {
                 .context
                 .get("resource_type")
                 .and_then(|v| v.as_str()),
-            Some("gts.cf.simple_user_settings.settings.user.v1~"),
+            Some(SETTINGS_RESOURCE_TYPE),
         );
     }
 

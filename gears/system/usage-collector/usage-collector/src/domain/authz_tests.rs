@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use authz_resolver_sdk::models::EvaluationRequest;
 use rust_decimal::Decimal;
@@ -33,7 +34,7 @@ use super::{
 use crate::domain::ports::metrics::{NoopMetrics, PdpOp};
 use crate::domain::test_support::{CapturingTenantPermitResolver, enforcer_for};
 
-const SAMPLE_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+const SAMPLE_GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
 fn ctx() -> SecurityContext {
     SecurityContext::builder()

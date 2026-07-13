@@ -23,6 +23,7 @@ with-utoipa = ["dep:utoipa"]
 
 [dependencies]
 toolkit-canonical-errors = { workspace = true }
+toolkit-gts = { workspace = true }
 bigdecimal = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }

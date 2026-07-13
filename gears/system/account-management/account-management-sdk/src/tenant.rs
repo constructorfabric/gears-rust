@@ -117,7 +117,7 @@ pub struct Tenant {
 ///
 /// `tenant_type` is a chained GTS identifier (e.g.
 /// `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~`); AM derives
-/// the canonical `UUIDv5` via [`gts::GtsID`] internally so callers do not
+/// the canonical `UUIDv5` via [`gts::GtsId`] internally so callers do not
 /// have to supply two parallel identifiers that can diverge. The field
 /// is typed [`GtsTypeId`] rather than `String` so callers (REST
 /// handler, inter-gear Rust consumers) get a self-documenting

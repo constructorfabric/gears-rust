@@ -53,7 +53,7 @@ use gts::GtsInstanceId;
 /// GTS Type Identifier: `gts.cf.toolkit.authz.permission.v1~`
 #[gts_type_schema(
     dir_path = "schemas",
-    type_id = "gts.cf.toolkit.authz.permission.v1~",
+    type_id = gts_id!("cf.toolkit.authz.permission.v1~"),
     description = "Gears authorization permission",
     properties = "id,resource_type,action,display_name",
     base = true

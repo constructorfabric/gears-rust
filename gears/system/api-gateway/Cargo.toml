@@ -24,6 +24,7 @@ toolkit-http = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.18", path = "../authn-resolver/authn-resolver-sdk" }
+toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 inventory = { workspace = true }
 anyhow = { workspace = true }

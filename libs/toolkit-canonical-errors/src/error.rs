@@ -1,5 +1,12 @@
 use std::fmt;
 
+// `gts_id!` is the prefix-free GTS-id construction macro (re-exported at the
+// crate root from `gts_macros`). It expands at compile time to a `&'static
+// str` literal with the configured `GTS_ID_PREFIX`
+// prepended, so the canonical error type ids below track the configured
+// prefix without hard-coding the literal prefix.
+use crate::gts_id;
+
 use crate::context::{
     Aborted, AlreadyExists, Cancelled, DataLoss, DeadlineExceeded, FailedPrecondition, Internal,
     InvalidArgument, NotFound, OutOfRange, PermissionDenied, ResourceExhausted, ServiceUnavailable,
@@ -466,37 +473,41 @@ impl CanonicalError {
     #[must_use]
     pub fn gts_type(&self) -> &'static str {
         match self {
-            Self::Cancelled { .. } => "gts.cf.core.errors.err.v1~cf.core.err.cancelled.v1~",
-            Self::Unknown { .. } => "gts.cf.core.errors.err.v1~cf.core.err.unknown.v1~",
+            Self::Cancelled { .. } => gts_id!("cf.core.errors.err.v1~cf.core.err.cancelled.v1~"),
+            Self::Unknown { .. } => gts_id!("cf.core.errors.err.v1~cf.core.err.unknown.v1~"),
             Self::InvalidArgument { .. } => {
-                "gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"
+                gts_id!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~")
             }
             Self::DeadlineExceeded { .. } => {
-                "gts.cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~"
+                gts_id!("cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~")
             }
-            Self::NotFound { .. } => "gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+            Self::NotFound { .. } => gts_id!("cf.core.errors.err.v1~cf.core.err.not_found.v1~"),
             Self::AlreadyExists { .. } => {
-                "gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~"
+                gts_id!("cf.core.errors.err.v1~cf.core.err.already_exists.v1~")
             }
             Self::PermissionDenied { .. } => {
-                "gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
+                gts_id!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~")
             }
             Self::ResourceExhausted { .. } => {
-                "gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~"
+                gts_id!("cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~")
             }
             Self::FailedPrecondition { .. } => {
-                "gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~"
+                gts_id!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~")
             }
-            Self::Aborted { .. } => "gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~",
-            Self::OutOfRange { .. } => "gts.cf.core.errors.err.v1~cf.core.err.out_of_range.v1~",
-            Self::Unimplemented { .. } => "gts.cf.core.errors.err.v1~cf.core.err.unimplemented.v1~",
-            Self::Internal { .. } => "gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
+            Self::Aborted { .. } => gts_id!("cf.core.errors.err.v1~cf.core.err.aborted.v1~"),
+            Self::OutOfRange { .. } => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.out_of_range.v1~")
+            }
+            Self::Unimplemented { .. } => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.unimplemented.v1~")
+            }
+            Self::Internal { .. } => gts_id!("cf.core.errors.err.v1~cf.core.err.internal.v1~"),
             Self::ServiceUnavailable { .. } => {
-                "gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~"
+                gts_id!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~")
             }
-            Self::DataLoss { .. } => "gts.cf.core.errors.err.v1~cf.core.err.data_loss.v1~",
+            Self::DataLoss { .. } => gts_id!("cf.core.errors.err.v1~cf.core.err.data_loss.v1~"),
             Self::Unauthenticated { .. } => {
-                "gts.cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~"
+                gts_id!("cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~")
             }
         }
     }

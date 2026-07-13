@@ -14,14 +14,15 @@
 //! `CanonicalError` keeps the SDK on a single error type end-to-end).
 
 use toolkit_canonical_errors::resource_error;
+use toolkit_gts::gts_id;
 
 /// The canonical GTS resource type for types-registry entities. Lands in
 /// `CanonicalError` `resource_type` / the wire `context.resource_type`.
-pub const TYPE_RESOURCE_TYPE: &str = "gts.cf.types_registry.registry.type.v1~";
+pub const TYPE_RESOURCE_TYPE: &str = gts_id!("cf.types_registry.registry.type.v1~");
 
 /// SDK-internal canonical-error scope. Mirrors the impl crate's
 /// `#[resource_error]` marker so the SDK's `try_new` constructors emit the same
 /// `resource_type` the REST ladder does. Its literal MUST equal
 /// [`TYPE_RESOURCE_TYPE`] — pinned by `gts_resource_type_round_trips`.
-#[resource_error("gts.cf.types_registry.registry.type.v1~")]
+#[resource_error(gts_id!("cf.types_registry.registry.type.v1~"))]
 pub(crate) struct TypeResource;

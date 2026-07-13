@@ -6,11 +6,13 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use toolkit_gts::gts_uri;
 
 use oagw::test_support::{
     APIKEY_AUTH_PLUGIN_ID, AppHarness, CapturingAuthZResolverClient, DenyingAuthZResolverClient,
     MockBody, MockGuard, MockResponse,
 };
+use oagw_sdk::{HTTP_PROTOCOL_ID, PROXY_SCHEMA};
 
 // 10.1: E2E — create upstream, create route, proxy chat completion, verify round-trip.
 #[tokio::test]
@@ -28,7 +30,7 @@ async fn e2e_chat_completion_round_trip() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-openai",
             "enabled": true,
             "tags": []
@@ -100,7 +102,7 @@ async fn e2e_sse_streaming() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-sse",
             "enabled": true,
             "tags": []
@@ -160,7 +162,7 @@ async fn e2e_auth_injection() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-auth",
             "enabled": true,
             "tags": [],
@@ -239,7 +241,7 @@ async fn e2e_disabled_upstream_returns_503() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-disabled",
             "enabled": false,
             "tags": []
@@ -267,7 +269,7 @@ async fn e2e_upstream_500_passthrough() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-errors",
             "enabled": true,
             "tags": []
@@ -317,7 +319,7 @@ async fn e2e_rate_limit_returns_429() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-rl",
             "enabled": true,
             "tags": [],
@@ -380,7 +382,7 @@ async fn e2e_management_lifecycle() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "lifecycle",
             "enabled": true,
             "tags": []
@@ -409,7 +411,7 @@ async fn e2e_management_lifecycle() {
                     {"host": "127.0.0.2", "port": h.mock_port(), "scheme": "http"}
                 ]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "lifecycle",
             "enabled": true,
             "tags": []
@@ -473,7 +475,7 @@ async fn e2e_invalid_content_length_returns_400() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-cl",
             "enabled": true,
             "tags": []
@@ -526,7 +528,7 @@ async fn e2e_body_exceeding_limit_returns_400() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-big",
             "enabled": true,
             "tags": []
@@ -593,7 +595,7 @@ async fn e2e_upstream_timeout_returns_504() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-timeout",
             "enabled": true,
             "tags": []
@@ -646,7 +648,7 @@ async fn e2e_authz_forbidden_returns_403() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-forbidden",
             "enabled": true,
             "tags": []
@@ -686,7 +688,7 @@ async fn e2e_authz_forbidden_returns_403() {
     assert_eq!(body["title"], "Permission Denied");
     assert_eq!(
         body["type"],
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~")
     );
 }
 
@@ -718,7 +720,7 @@ async fn e2e_authz_request_carries_tenant_context() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-authz-ctx",
             "enabled": true,
             "tags": []
@@ -767,7 +769,7 @@ async fn e2e_authz_request_carries_tenant_context() {
         Some(h.security_context().subject_tenant_id()),
         "tenant_context.root_id should match subject_tenant_id"
     );
-    assert_eq!(req.resource.resource_type, "gts.cf.core.oagw.proxy.v1~");
+    assert_eq!(req.resource.resource_type, PROXY_SCHEMA);
     assert_eq!(req.action.name, "invoke");
 }
 
@@ -789,7 +791,7 @@ async fn setup_rate_limited_upstream(
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": alias,
             "enabled": true,
             "tags": [],
@@ -1143,7 +1145,7 @@ async fn e2e_rate_limit_route_level_enforcement() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-rl-route",
             "enabled": true,
             "tags": []
@@ -1201,7 +1203,7 @@ async fn e2e_rate_limit_upstream_and_route_both_applied() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-rl-dual",
             "enabled": true,
             "tags": [],

@@ -1406,7 +1406,7 @@ async fn cancellation_terminates_stream() {
 
 // ── Integration test: OAGW error paths ─────────────────────────────────
 
-#[resource_error("gts.cf.core.oagw.proxy.v1~")]
+#[resource_error(gts_id!("cf.core.oagw.proxy.v1~"))]
 struct TestProxyScope;
 
 #[tokio::test]

@@ -252,6 +252,7 @@ mod tests {
     use super::*;
     use crate::config::RoutePolicyRule;
     use toolkit_canonical_errors::Problem;
+    use toolkit_gts::gts_uri;
 
     fn build_config(enabled: bool, routes: Vec<(&str, Vec<&str>)>) -> RoutePoliciesConfig {
         build_config_with_methods(
@@ -334,7 +335,7 @@ mod tests {
         assert_eq!(problem.status, 403);
         assert_eq!(
             problem.problem_type,
-            "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~")
         );
         assert_eq!(problem.context["reason"], "INSUFFICIENT_SCOPES");
     }
@@ -353,7 +354,7 @@ mod tests {
         assert_eq!(problem.status, 403);
         assert_eq!(
             problem.problem_type,
-            "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~")
         );
     }
 

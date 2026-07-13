@@ -9,6 +9,7 @@
 //! `tests/api_status_mapping_test.rs`.
 
 use std::time::Duration;
+use toolkit_gts::gts_id;
 
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
 
@@ -236,7 +237,7 @@ fn metadata_entry_not_found_uses_metadata_resource_type_with_chained_type_id_as_
     // `TENANT_METADATA_RESOURCE_TYPE` (`gts.cf.core.am.tenant_metadata.v1~`)
     // with the chained `type_id` the caller supplied as
     // `resource_name`.
-    let chain = "gts.cf.core.am.tenant_metadata.v1~cf.core.billing.usage.v1~";
+    let chain = gts_id!("cf.core.am.tenant_metadata.v1~cf.core.billing.usage.v1~");
     let canonical = round_trip(DomainError::MetadataEntryNotFound {
         detail: "entry missing".to_owned(),
         entry: chain.to_owned(),
@@ -292,7 +293,7 @@ fn metadata_version_mismatch_maps_to_aborted_409_with_reason() {
     // conflict from a generic 409, and a future mapper drift that
     // dropped `with_reason` would change the wire envelope in a way
     // unit-tested ONLY here.
-    let chain = "gts.cf.core.am.tenant_metadata.v1~cf.core.billing.usage.v1~";
+    let chain = gts_id!("cf.core.am.tenant_metadata.v1~cf.core.billing.usage.v1~");
     let canonical = round_trip(DomainError::MetadataVersionMismatch {
         entry: chain.to_owned(),
         expected: 4,

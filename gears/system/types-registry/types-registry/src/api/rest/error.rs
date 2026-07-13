@@ -5,7 +5,7 @@ use types_registry_sdk::{field, precondition};
 
 use crate::domain::error::DomainError;
 
-#[resource_error("gts.cf.types_registry.registry.type.v1~")]
+#[resource_error(gts_id!("cf.types_registry.registry.type.v1~"))]
 pub struct TypeRegistryError;
 
 impl From<DomainError> for CanonicalError {
@@ -80,6 +80,7 @@ impl From<DomainError> for CanonicalError {
 mod tests {
     use super::*;
     use toolkit_canonical_errors::Problem;
+    use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 
     fn problem_from(err: DomainError) -> Problem {
         // Construct the wire `Problem` the same way the canonical error
@@ -90,7 +91,9 @@ mod tests {
 
     #[test]
     fn test_domain_error_to_problem_not_found_by_id() {
-        let problem = problem_from(DomainError::not_found_by_id("gts.cf.core.events.test.v1~"));
+        let problem = problem_from(DomainError::not_found_by_id(gts_id!(
+            "cf.core.events.test.v1~"
+        )));
         assert_eq!(problem.status, 404);
         // `instance` is filled by the canonical error middleware on the way
         // out — at the unit-test level no middleware is in scope.
@@ -98,7 +101,7 @@ mod tests {
         assert!(
             problem
                 .detail
-                .contains("GTS ID: gts.cf.core.events.test.v1~"),
+                .contains(&format!("GTS ID: {}", gts_id!("cf.core.events.test.v1~"))),
             "expected GTS-id-keyed detail, got {:?}",
             problem.detail,
         );
@@ -119,7 +122,9 @@ mod tests {
 
     #[test]
     fn test_domain_error_to_problem_already_exists() {
-        let problem = problem_from(DomainError::already_exists("gts.cf.core.events.test.v1~"));
+        let problem = problem_from(DomainError::already_exists(gts_id!(
+            "cf.core.events.test.v1~"
+        )));
         assert_eq!(problem.status, 409);
     }
 
@@ -145,9 +150,9 @@ mod tests {
     fn test_domain_error_to_problem_ready_commit_failed() {
         use crate::domain::error::ValidationError;
         let problem = problem_from(DomainError::ReadyCommitFailed(vec![
-            ValidationError::new("gts.test1~", "error1"),
-            ValidationError::new("gts.test2~", "error2"),
-            ValidationError::new("gts.test3~", "error3"),
+            ValidationError::new(format!("{GTS_ID_PREFIX}test1~"), "error1"),
+            ValidationError::new(format!("{GTS_ID_PREFIX}test2~"), "error2"),
+            ValidationError::new(format!("{GTS_ID_PREFIX}test3~"), "error3"),
         ]));
         // ReadyCommitFailed is only produced by post_init lifecycle and
         // never reaches a REST response; map opaquely to internal.

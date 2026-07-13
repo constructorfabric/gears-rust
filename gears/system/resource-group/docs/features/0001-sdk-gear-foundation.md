@@ -97,10 +97,8 @@ Not applicable. This feature provides SDK contracts and gear infrastructure with
    1. [x] - `p1` - **RETURN** Validation error: "GTS type path must not be empty" - `inst-gts-val-3a`
 4. [x] - `p1` - **IF** string does not match pattern `^gts\.[a-z0-9_.]+~([a-z0-9_.]+~)*$` - `inst-gts-val-4`
    1. [x] - `p1` - **RETURN** Validation error: "Invalid GTS type path format" - `inst-gts-val-4a`
-5. [x] - `p1` - **IF** string length exceeds maximum (255 chars) - `inst-gts-val-5`
-   1. [x] - `p1` - **RETURN** Validation error: "GTS type path exceeds maximum length" - `inst-gts-val-5a`
-6. [x] - `p1` - Construct `GtsTypePath` value object wrapping the validated string - `inst-gts-val-6`
-7. [x] - `p1` - **RETURN** validated `GtsTypePath` - `inst-gts-val-7`
+5. [x] - `p1` - Construct `GtsTypePath` value object wrapping the validated string - `inst-gts-val-6`
+6. [x] - `p1` - **RETURN** validated `GtsTypePath` - `inst-gts-val-7`
 
 ### Domain Error to Problem Mapping
 

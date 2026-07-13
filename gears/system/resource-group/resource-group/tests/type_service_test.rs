@@ -10,6 +10,7 @@
 mod common;
 
 use std::sync::Arc;
+use toolkit_gts::GTS_ID_PREFIX;
 
 use serde_json::json;
 use uuid::Uuid;
@@ -31,7 +32,7 @@ use toolkit_security::AccessScope;
 /// Generate a unique GTS type code with the given suffix.
 fn type_code(suffix: &str) -> String {
     format!(
-        "gts.cf.core.rg.type.v1~x.test.{}{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}{}.v1~",
         suffix,
         Uuid::now_v7().as_simple()
     )

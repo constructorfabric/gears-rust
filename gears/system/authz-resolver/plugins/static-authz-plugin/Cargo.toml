@@ -24,6 +24,7 @@ types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.0
 
 # ToolKit dependencies
 toolkit = { workspace = true }
+toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
 

@@ -28,6 +28,7 @@ use axum::Json;
 use axum::extract::Extension;
 use axum::http::{StatusCode, Uri, header};
 use toolkit::client_hub::ClientHub;
+use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 
 use super::{
@@ -297,7 +298,8 @@ async fn register_with_unknown_kind_returns_validation_problem() {
         .parse()
         .expect("static uri parses");
 
-    let raw_gts_id = "gts.cf.core.uc.usage_record.v1~tenant.example._.unknown_kind.v1".to_owned();
+    let raw_gts_id =
+        gts_id!("cf.core.uc.usage_record.v1~tenant.example._.unknown_kind.v1").to_owned();
     let response = handle_create_usage_type(
         Extension(SecurityContext::anonymous()),
         Extension(service),
@@ -375,7 +377,7 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, page::PageInfo};
 use usage_collector_sdk::{UsageKind, UsageType, UsageTypeGtsId};
 
 const HAPPY_USAGE_TYPE_GTS_ID: &str =
-    "gts.cf.core.uc.usage_record.v1~cf.handler_tests._.happy_counter.v1";
+    gts_id!("cf.core.uc.usage_record.v1~cf.handler_tests._.happy_counter.v1");
 
 fn happy_usage_type() -> UsageType {
     UsageType {

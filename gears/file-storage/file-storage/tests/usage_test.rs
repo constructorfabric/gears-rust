@@ -26,6 +26,7 @@ use bytes::Bytes;
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+use toolkit_gts::gts_id;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -46,7 +47,7 @@ use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{NewFile, OwnerKind};
 
-const GTS: &str = "gts.cf.fstorage.file.type.v1~x.usage-test.v1~";
+const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.usage_test.file.type.v1~");
 
 // ── fake usage reporter ─────────────────────────────────────────────────────
 

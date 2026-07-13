@@ -1395,6 +1395,7 @@ dependencies = [
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-odata-macros",
@@ -1498,7 +1499,6 @@ dependencies = [
  "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-security",
  "gts",
- "gts-macros",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1520,6 +1520,7 @@ dependencies = [
  "cf-gears-authn-resolver-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
@@ -1665,6 +1666,7 @@ dependencies = [
  "cf-gears-credstore-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "cf-gears-types-registry-sdk",
@@ -1782,9 +1784,11 @@ dependencies = [
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "futures",
+ "gts",
  "hex",
  "http",
  "hyper-util",
@@ -1819,6 +1823,7 @@ name = "cf-gears-file-storage-sdk"
 version = "0.1.0"
 dependencies = [
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "time",
  "uuid",
 ]
@@ -1954,11 +1959,11 @@ name = "cf-gears-model-registry-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
  "chrono",
  "gts",
- "gts-macros",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1976,6 +1981,7 @@ dependencies = [
  "cf-gears-nodes-registry-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-node-info",
  "chrono",
@@ -1993,6 +1999,7 @@ version = "0.1.22"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-node-info",
  "serde_json",
  "thiserror 2.0.18",
@@ -2038,6 +2045,7 @@ dependencies = [
  "cf-gears-toolkit",
  "cf-gears-toolkit-auth",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
@@ -2088,6 +2096,7 @@ dependencies = [
  "axum",
  "bytes",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-security",
  "futures-core",
  "futures-util",
@@ -2113,6 +2122,7 @@ dependencies = [
  "base64 0.22.1",
  "cf-gears-authn-resolver-sdk",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "cf-gears-types-registry-sdk",
@@ -2154,6 +2164,7 @@ dependencies = [
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
@@ -2260,6 +2271,7 @@ dependencies = [
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "inventory",
@@ -2331,6 +2343,7 @@ dependencies = [
  "async-trait",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "cf-gears-types-registry-sdk",
@@ -2370,6 +2383,7 @@ dependencies = [
  "cf-gears-account-management-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
@@ -2557,7 +2571,7 @@ version = "0.7.4"
 dependencies = [
  "axum",
  "cf-gears-toolkit-canonical-errors-macro",
- "gts-id",
+ "cf-gears-toolkit-gts",
  "http",
  "sea-orm",
  "serde",
@@ -2572,6 +2586,7 @@ dependencies = [
 name = "cf-gears-toolkit-canonical-errors-macro"
 version = "0.6.1"
 dependencies = [
+ "gts-id",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -2650,6 +2665,8 @@ dependencies = [
 name = "cf-gears-toolkit-gts-macros"
 version = "0.1.2"
 dependencies = [
+ "gts",
+ "gts-id",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -2761,6 +2778,7 @@ dependencies = [
  "base64 0.22.1",
  "bigdecimal",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "chrono",
  "chrono-tz",
  "peg",
@@ -2849,6 +2867,7 @@ dependencies = [
  "cf-gears-authz-resolver-sdk",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "cf-gears-types-registry-sdk",
@@ -2892,6 +2911,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "gts",
  "serde_json",
  "thiserror 2.0.18",
@@ -4516,9 +4536,9 @@ dependencies = [
 
 [[package]]
 name = "gts"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78d5445277d7f0df598295f7e53608540ae5fe0b830d5010f8f7cce21c69d09f"
+checksum = "04c85c9d9cd01c81990a8ccb5f9d584d83571f2d4df2ae6d974170c780bdf693"
 dependencies = [
  "gts-id",
  "jsonschema",
@@ -4529,7 +4549,6 @@ dependencies = [
  "shellexpand",
  "thiserror 2.0.18",
  "tracing",
- "uuid",
  "walkdir",
 ]
 
@@ -4538,7 +4557,9 @@ name = "gts-analyze"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cf-gears-toolkit-gts",
  "clap",
+ "gts-id",
  "proc-macro2",
  "regex",
  "serde",
@@ -4549,18 +4570,19 @@ dependencies = [
 
 [[package]]
 name = "gts-id"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7375046849cd80b1db1ed549272eb2fab826b13b13e9efb4333a6ec606070c8c"
+checksum = "bb0e34e1934f1197b1cb68eb0020cb5aadd79a93b7b8f030d9ebee8dc5a027f2"
 dependencies = [
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
 name = "gts-macros"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20a84d8b5e87ab37b5539bb5e9d830b40235918f375405569c219f4de9b3f7d4"
+checksum = "07961d01ac64b0ec00940d53a1361926cf759df8750fbaf236d43990e6718efe"
 dependencies = [
  "gts-id",
  "proc-macro2",
@@ -10919,6 +10941,7 @@ version = "0.6.1"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-sdk",

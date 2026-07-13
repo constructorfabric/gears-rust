@@ -68,3 +68,4 @@ tokio = { workspace = true, features = ["test-util"] }
 # instrument names / labels / buckets against DESIGN §3.11.5. Test-only —
 # the gear never constructs an exporter at runtime (ToolKit owns it).
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+toolkit-gts = { workspace = true }

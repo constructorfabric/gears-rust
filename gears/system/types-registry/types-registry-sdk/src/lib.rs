@@ -19,9 +19,9 @@
 //!
 //! let client = hub.get::<dyn TypesRegistryClient>()?;
 //!
-//! let schema = client.get_type_schema("gts.acme.core.events.user.v1~").await?;
+//! let schema = client.get_type_schema(gts_id!("acme.core.events.user.v1~")).await?;
 //! let schemas = client
-//!     .list_type_schemas(TypeSchemaQuery::default().with_pattern("gts.acme.*"))
+//!     .list_type_schemas(TypeSchemaQuery::default().with_pattern(format!("{GTS_ID_PREFIX}acme.*")))
 //!     .await?;
 //! ```
 //!

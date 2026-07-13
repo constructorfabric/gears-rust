@@ -27,6 +27,7 @@ types-registry-sdk = {
 
 # ToolKit dependencies
 toolkit.workspace = true
+toolkit-gts = { workspace = true }
 toolkit-macros.workspace = true
 toolkit-security.workspace = true
 inventory.workspace = true

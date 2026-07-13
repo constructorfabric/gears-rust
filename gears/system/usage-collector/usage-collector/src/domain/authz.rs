@@ -200,10 +200,10 @@ impl AttributionTupleKey {
 /// alone and the [`RESOURCE`] declares no attributes.
 pub(crate) mod usage_type {
     use authz_resolver_sdk::pep::ResourceType;
+    use usage_collector_sdk::USAGE_TYPE_RESOURCE;
 
     /// PEP resource type for the `UsageType` catalog.
-    pub const RESOURCE: ResourceType =
-        ResourceType::from_static("gts.cf.core.uc.usage_type.v1~", &[]);
+    pub const RESOURCE: ResourceType = ResourceType::from_static(USAGE_TYPE_RESOURCE, &[]);
 
     /// `UsageType` action vocabulary. Renaming any of these is a contract
     /// change against the PDP policy bundle.
@@ -227,6 +227,7 @@ pub(crate) mod usage_type {
 pub(crate) mod usage_record {
     use authz_resolver_sdk::pep::ResourceType;
     use toolkit_security::pep_properties;
+    use usage_collector_sdk::USAGE_RECORD_RESOURCE;
 
     /// PEP attribute key carrying the caller-supplied `resource_type`.
     pub const PROP_RESOURCE_TYPE: &str = "resource_type";
@@ -242,7 +243,7 @@ pub(crate) mod usage_record {
     /// PEP resource type for the `UsageRecord` ingestion surface. Declares the
     /// attribution-tuple attributes the PDP may key its policy on.
     pub const RESOURCE: ResourceType = ResourceType::from_static(
-        "gts.cf.core.uc.usage_record.v1~",
+        USAGE_RECORD_RESOURCE,
         &[
             pep_properties::OWNER_TENANT_ID,
             pep_properties::OWNER_ID,

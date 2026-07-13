@@ -34,3 +34,6 @@ toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-node-info = { workspace = true }
 toolkit-macros = { workspace = true }
 nodes_registry-sdk = { package = "cf-gears-nodes-registry-sdk", version = "0.1.22", path = "../nodes-registry-sdk" }
+
+[dev-dependencies]
+toolkit-gts = { workspace = true }

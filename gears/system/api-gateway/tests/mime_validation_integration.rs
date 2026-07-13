@@ -16,6 +16,7 @@ use http::Method;
 use serde_json::json;
 use toolkit::api::OperationSpec;
 use toolkit_canonical_errors::Problem;
+use toolkit_gts::gts_uri;
 use tower::ServiceExt; // for oneshot
 
 use api_gateway::middleware::mime_validation::{
@@ -24,7 +25,7 @@ use api_gateway::middleware::mime_validation::{
 use toolkit::api::operation_builder::VendorExtensions;
 
 const INVALID_ARGUMENT_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~");
 const PROBLEM_JSON: &str = "application/problem+json";
 
 /// Helper to extract Problem from response

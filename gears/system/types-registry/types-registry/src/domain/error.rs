@@ -189,13 +189,14 @@ impl DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 
     #[test]
     fn test_error_constructors() {
         let err = DomainError::invalid_gts_id("missing vendor");
         assert!(matches!(err, DomainError::InvalidGtsId(_)));
 
-        let err = DomainError::not_found_by_id("gts.acme.core.events.test.v1~");
+        let err = DomainError::not_found_by_id(gts_id!("acme.core.events.test.v1~"));
         assert!(matches!(
             err,
             DomainError::NotFound {
@@ -213,7 +214,7 @@ mod tests {
             }
         ));
 
-        let err = DomainError::already_exists("gts.acme.core.events.test.v1~");
+        let err = DomainError::already_exists(gts_id!("acme.core.events.test.v1~"));
         assert!(matches!(err, DomainError::AlreadyExists(_)));
 
         let err = DomainError::validation_failed("schema invalid");
@@ -225,10 +226,13 @@ mod tests {
         let err = DomainError::InvalidGtsId("bad format".to_owned());
         assert_eq!(err.to_string(), "Invalid GTS ID: bad format");
 
-        let err = DomainError::not_found_by_id("gts.cf.core.events.test.v1~");
+        let err = DomainError::not_found_by_id(gts_id!("cf.core.events.test.v1~"));
         assert_eq!(
             err.to_string(),
-            "Entity not found (GTS ID): gts.cf.core.events.test.v1~"
+            format!(
+                "Entity not found (GTS ID): {}",
+                gts_id!("cf.core.events.test.v1~")
+            )
         );
 
         let err = DomainError::not_found_by_uuid(uuid::Uuid::nil());
@@ -237,10 +241,13 @@ mod tests {
             "Entity not found (UUID): 00000000-0000-0000-0000-000000000000"
         );
 
-        let err = DomainError::AlreadyExists("gts.cf.core.events.test.v1~".to_owned());
+        let err = DomainError::AlreadyExists(gts_id!("cf.core.events.test.v1~").to_owned());
         assert_eq!(
             err.to_string(),
-            "Entity already exists: gts.cf.core.events.test.v1~"
+            format!(
+                "Entity already exists: {}",
+                gts_id!("cf.core.events.test.v1~")
+            )
         );
 
         let err = DomainError::ValidationFailed("schema invalid".to_owned());
@@ -250,9 +257,9 @@ mod tests {
         assert_eq!(err.to_string(), "Not in ready mode");
 
         let err = DomainError::ReadyCommitFailed(vec![
-            ValidationError::new("gts.test1~", "error1"),
-            ValidationError::new("gts.test2~", "error2"),
-            ValidationError::new("gts.test3~", "error3"),
+            ValidationError::new(format!("{GTS_ID_PREFIX}test1~"), "error1"),
+            ValidationError::new(format!("{GTS_ID_PREFIX}test2~"), "error2"),
+            ValidationError::new(format!("{GTS_ID_PREFIX}test3~"), "error3"),
         ]);
         assert_eq!(err.to_string(), "Ready commit failed with 3 errors");
     }

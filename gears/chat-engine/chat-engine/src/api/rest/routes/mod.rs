@@ -21,7 +21,9 @@ use std::sync::Arc;
 use axum::{Extension, Router};
 use http::StatusCode;
 use toolkit::api::OpenApiRegistry;
-use toolkit::api::operation_builder::{LicenseFeature, OperationBuilder};
+use toolkit::api::operation_builder::{
+    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder,
+};
 
 use crate::api::rest::WebhookEmitter;
 use crate::api::rest::dto::{
@@ -44,13 +46,12 @@ const API_TAG: &str = "Chat Engine";
 
 /// License feature required by all `cf-chat-engine` endpoints.
 ///
-/// Mirrors the gating policy used by sibling modules
-/// (`gts.cf.core.lic.feat.v1~cf.core.global.base.v1`).
+/// Mirrors the gating policy used by sibling modules.
 pub(crate) struct ChatEngineLicense;
 
 impl AsRef<str> for ChatEngineLicense {
     fn as_ref(&self) -> &'static str {
-        "gts.cf.core.lic.feat.v1~cf.core.global.base.v1"
+        CORE_GLOBAL_BASE_LICENSE_FEATURE
     }
 }
 

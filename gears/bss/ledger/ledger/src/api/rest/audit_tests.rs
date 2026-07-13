@@ -176,6 +176,7 @@ use authz_resolver_sdk::models::{
     EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
 use authz_resolver_sdk::{AuthZResolverClient, AuthZResolverError, PolicyEnforcer};
+use toolkit_gts::gts_id;
 use toolkit_security::{SecurityContext, pep_properties};
 
 use crate::infra::authz::cross_tenant::TargetScope;
@@ -229,7 +230,7 @@ fn ctx_for(tenant: Uuid) -> SecurityContext {
     SecurityContext::builder()
         .subject_id(Uuid::now_v7())
         .subject_tenant_id(tenant)
-        .subject_type("gts.cf.core.security.subject_user.v1~")
+        .subject_type(gts_id!("cf.core.security.subject_user.v1~"))
         .token_scopes(vec!["*".to_owned()])
         .build()
         .expect("authed SecurityContext must build")

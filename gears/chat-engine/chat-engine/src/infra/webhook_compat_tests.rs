@@ -1,6 +1,7 @@
 use super::*;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use chat_engine_sdk::models::{TenantId, UserId};
@@ -191,8 +192,9 @@ fn status_mapping_table() {
 
 #[test]
 fn plugin_instance_id_returns_constructor_value() {
-    let p = WebhookCompatPlugin::with_client("gts.cf.webhook.v1~vendor", Client::new());
-    assert_eq!(p.plugin_instance_id(), "gts.cf.webhook.v1~vendor");
+    const PLUGIN_ID: &str = gts_id!("cf.webhook.compat.plugin.v1~vendor.webhook.test.instance.v1~");
+    let p = WebhookCompatPlugin::with_client(PLUGIN_ID, Client::new());
+    assert_eq!(p.plugin_instance_id(), PLUGIN_ID);
 }
 
 #[tokio::test]

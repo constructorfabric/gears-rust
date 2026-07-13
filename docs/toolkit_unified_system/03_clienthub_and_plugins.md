@@ -56,9 +56,10 @@ For plugin-like scenarios where multiple implementations of the same interface c
 
 ```rust
 use toolkit::client_hub::ClientScope;
+use toolkit_gts::gts_id;
 
 // Plugin registers with a scope (e.g., GTS instance ID)
-let scope = ClientScope::gts_id("gts.cf.toolkit.plugins.plugin.v1~vendor.pkg.my_gear.plugin.v1~acme.test._.plugin.v1");
+let scope = ClientScope::gts_id(gts_id!("cf.toolkit.plugins.plugin.v1~vendor.pkg.my_gear.plugin.v1~acme.test._.plugin.v1"));
 ctx.client_hub().register_scoped::<dyn MyPluginClient>(scope, plugin_impl);
 
 // Main gear resolves the selected plugin
@@ -168,13 +169,13 @@ pub trait MyGearPluginClient: Send + Sync {
 
 ```rust
 // <gear>-sdk/src/gts.rs
-use gts_macros::struct_to_gts_schema;
-use toolkit::gts::PluginV1;
+use toolkit_gts::gts_type_schema;
+use toolkit_gts::PluginV1;
 
-#[struct_to_gts_schema(
+#[gts_type_schema(
     dir_path = "schemas",
     base = PluginV1,
-    schema_id = "gts.cf.toolkit.plugins.plugin.v1~cf.y.my_gear.plugin.v1~",
+    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.y.my_gear.plugin.v1~"),
     description = "My Gear plugin specification",
     properties = ""
 )]
@@ -281,7 +282,7 @@ impl Service {
 
     async fn resolve_plugin(&self) -> Result<String, DomainError> {
         let registry = self.hub.get::<dyn TypesRegistryClient>()?;
-        let plugin_type_id = MyGearPluginSpecV1::gts_schema_id().clone();
+        let plugin_type_id = MyGearPluginSpecV1::gts_type_id().clone();
         let instances = registry
             .list(ListQuery::new()
                 .with_pattern(format!("{plugin_type_id}*"))
@@ -348,9 +349,9 @@ gears:
 ### Plugin Checklist
 
 - [ ] SDK defines both `<Gear>Client` trait (public) and `<Gear>PluginClient` trait (plugins)
-- [ ] SDK defines GTS schema type with `#[struct_to_gts_schema]`
+- [ ] SDK defines GTS schema type with `#[gts_type_schema]` (from `toolkit_gts`)
 - [ ] Main gear depends on `types-registry` but MUST NOT depend on plugin crates
-- [ ] Main gear registers plugin **schema** using `gts_schema_with_refs_as_string()`
+- [ ] Main gear registers plugin **schema** using `gts_type_schema_with_refs_as_string()`
 - [ ] Main gear registers public client WITHOUT scope
 - [ ] Main gear resolves plugin lazily (after types-registry is ready)
 - [ ] Each plugin depends on `types-registry`

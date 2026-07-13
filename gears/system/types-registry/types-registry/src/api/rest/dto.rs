@@ -26,11 +26,11 @@ pub struct GtsIdSegmentDto {
 impl From<&GtsIdSegment> for GtsIdSegmentDto {
     fn from(segment: &GtsIdSegment) -> Self {
         Self {
-            vendor: segment.vendor.clone(),
-            package: segment.package.clone(),
-            namespace: segment.namespace.clone(),
-            type_name: segment.type_name.clone(),
-            ver_major: segment.ver_major,
+            vendor: segment.vendor().to_owned(),
+            package: segment.package().to_owned(),
+            namespace: segment.namespace().to_owned(),
+            type_name: segment.type_name().to_owned(),
+            ver_major: segment.ver_major(),
         }
     }
 }
@@ -214,13 +214,23 @@ pub struct ListEntitiesResponse {
 mod tests {
     use super::*;
     use gts::GtsIdSegment;
+    use toolkit_gts::{GTS_ID_PREFIX, gts_id};
+
+    fn seg(full_id: &str, idx: usize) -> GtsIdSegment {
+        gts::GtsId::try_new(full_id)
+            .unwrap_or_else(|e| panic!("invalid GTS id `{full_id}`: {e}"))
+            .into_segments()
+            .remove(idx)
+    }
 
     #[test]
     fn test_gts_entity_dto_from_entity() {
-        let segment = GtsIdSegment::new(0, 0, "acme.core.events.user_created.v1~").unwrap();
+        const TYPE_ID: &str = gts_id!("acme.core.events.user_created.v1~");
+
+        let segment = seg(TYPE_ID, 0);
         let entity = GtsEntity::new(
             Uuid::nil(),
-            "gts.acme.core.events.user_created.v1~",
+            TYPE_ID,
             vec![segment],
             true, // is_schema
             serde_json::json!({"type": "object"}),
@@ -228,7 +238,7 @@ mod tests {
         );
 
         let dto: GtsEntityDto = entity.into();
-        assert_eq!(dto.gts_id, "gts.acme.core.events.user_created.v1~");
+        assert_eq!(dto.gts_id, TYPE_ID);
         assert!(dto.is_schema);
         assert_eq!(dto.segments.len(), 1);
         assert_eq!(dto.segments[0].vendor, "acme");
@@ -241,9 +251,12 @@ mod tests {
 
     #[test]
     fn test_gts_entity_dto_instance() {
+        const INSTANCE_ID: &str =
+            gts_id!("acme.core.events.user_created.v1~acme.core.instances.instance1.v1");
+
         let entity = GtsEntity::new(
             Uuid::nil(),
-            "gts.acme.core.events.user_created.v1~acme.core.instances.instance1.v1",
+            INSTANCE_ID,
             vec![],
             false, // is_schema
             serde_json::json!({"data": "value"}),
@@ -258,11 +271,13 @@ mod tests {
 
     #[test]
     fn test_gts_entity_dto_with_multiple_segments() {
-        let segment1 = GtsIdSegment::new(0, 0, "acme.core.models.user.v1~").unwrap();
-        let segment2 = GtsIdSegment::new(1, 30, "acme.core.instances.user1.v1").unwrap();
+        const INSTANCE_ID: &str = gts_id!("acme.core.models.user.v1~acme.core.instances.user1.v1");
+
+        let segment1 = seg(INSTANCE_ID, 0);
+        let segment2 = seg(INSTANCE_ID, 1);
         let entity = GtsEntity::new(
             Uuid::nil(),
-            "gts.acme.core.models.user.v1~acme.core.instances.user1.v1",
+            INSTANCE_ID,
             vec![segment1, segment2],
             false, // is_schema
             serde_json::json!({"userId": "user-001"}),
@@ -282,12 +297,15 @@ mod tests {
 
     #[test]
     fn test_gts_entity_dto_with_different_vendors_in_segments() {
+        const INSTANCE_ID: &str =
+            gts_id!("acme.core.models.product.v1~globex.retail.instances.prod1.v1");
+
         // Instance where type and instance have different vendors
-        let segment1 = GtsIdSegment::new(0, 0, "acme.core.models.product.v1~").unwrap();
-        let segment2 = GtsIdSegment::new(1, 32, "globex.retail.instances.prod1.v1").unwrap();
+        let segment1 = seg(INSTANCE_ID, 0);
+        let segment2 = seg(INSTANCE_ID, 1);
         let entity = GtsEntity::new(
             Uuid::nil(),
-            "gts.acme.core.models.product.v1~globex.retail.instances.prod1.v1",
+            INSTANCE_ID,
             vec![segment1, segment2],
             false, // is_schema
             serde_json::json!({"productId": "prod-001"}),
@@ -312,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_gts_id_segment_dto_serialization() {
-        let segment = GtsIdSegment::new(0, 0, "acme.billing.invoices.invoice.v2~").unwrap();
+        let segment = seg(gts_id!("acme.billing.invoices.invoice.v2~"), 0);
         let dto = GtsIdSegmentDto::from(&segment);
 
         let json = serde_json::to_value(&dto).unwrap();
@@ -325,11 +343,13 @@ mod tests {
 
     #[test]
     fn test_gts_entity_dto_segments_serialization() {
-        let segment1 = GtsIdSegment::new(0, 0, "fabrikam.pkg1.ns1.type1.v1~").unwrap();
-        let segment2 = GtsIdSegment::new(1, 28, "contoso.pkg2.ns2.inst1.v2").unwrap();
+        const INSTANCE_ID: &str = gts_id!("fabrikam.pkg1.ns1.type1.v1~contoso.pkg2.ns2.inst1.v2");
+
+        let segment1 = seg(INSTANCE_ID, 0);
+        let segment2 = seg(INSTANCE_ID, 1);
         let entity = GtsEntity::new(
             Uuid::nil(),
-            "gts.fabrikam.pkg1.ns1.type1.v1~contoso.pkg2.ns2.inst1.v2",
+            INSTANCE_ID,
             vec![segment1, segment2],
             false, // is_schema
             serde_json::json!({}),
@@ -347,16 +367,17 @@ mod tests {
 
     #[test]
     fn test_list_entities_query_to_list_query() {
+        let pattern = format!("{GTS_ID_PREFIX}acme.*");
         let dto = ListEntitiesQuery {
             #[allow(unknown_lints)]
             #[allow(de0901_gts_string_pattern)]
-            pattern: Some("gts.acme.*".to_owned()),
+            pattern: Some(pattern.clone()),
             is_schema: Some(true),
             ..ListEntitiesQuery::default()
         };
 
         let query = dto.to_list_query();
-        assert_eq!(query.pattern, Some("gts.acme.*".to_owned()));
+        assert_eq!(query.pattern, Some(pattern));
         assert_eq!(query.is_type, Some(true));
     }
 

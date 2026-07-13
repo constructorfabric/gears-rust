@@ -2,7 +2,7 @@ use toolkit_canonical_errors::{CanonicalError, resource_error};
 
 use crate::domain::error::DomainError;
 
-#[resource_error("gts.cf.simple_user_settings.settings.user.v1~")]
+#[resource_error(gts_id!("cf.simple_user_settings.settings.user.v1~"))]
 pub struct UserSettingsError;
 
 impl From<DomainError> for CanonicalError {

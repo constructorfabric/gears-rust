@@ -26,6 +26,7 @@ clippy_utils.workspace = true
 dylint_linting.workspace = true
 lint_utils.workspace = true
 gts.workspace = true
+toolkit-gts.workspace = true
 
 [dev-dependencies]
 dylint_testing.workspace = true

@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 use rust_decimal::Decimal;
 use serde_json::json;
+use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 use uuid::Uuid;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +33,7 @@ fn metadata_map<const N: usize>(entries: [(&str, &str); N]) -> BTreeMap<Metadata
 }
 
 const SAMPLE_USAGE_TYPE_ID: &str =
-    "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
 fn sample_id() -> UsageTypeGtsId {
     UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived id")
@@ -71,7 +72,7 @@ fn sample_usage_record(subject_ref: Option<SubjectRef>, corrects_id: Option<Uuid
 // further `~`-separated segment.
 #[test]
 fn usage_type_gts_id_accepts_one_level_derivation() {
-    let input = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
+    let input = gts_id!("cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1");
     let id = UsageTypeGtsId::new(input).expect("one-level derivation accepted");
     assert_eq!(
         id.as_ref(),
@@ -87,7 +88,7 @@ fn usage_type_gts_id_accepts_one_level_derivation() {
 
 #[test]
 fn usage_type_gts_id_rejects_unknown_base() {
-    let err = UsageTypeGtsId::new("gts.cf.core.metric.v1~z")
+    let err = UsageTypeGtsId::new(format!("{GTS_ID_PREFIX}cf.core.metric.v1~z"))
         .expect_err("non-usage_record base must be rejected");
     assert!(
         matches!(
@@ -105,7 +106,7 @@ fn usage_type_gts_id_rejects_unknown_base() {
 fn usage_type_gts_id_rejects_legacy_counter_base() {
     // The old counter/gauge bases must be rejected explicitly to surface
     // wire-shape drift if any legacy producer still emits them.
-    let err = UsageTypeGtsId::new("gts.cf.core.usage.counter.v1~legacy")
+    let err = UsageTypeGtsId::new(format!("{GTS_ID_PREFIX}cf.core.usage.counter.v1~legacy"))
         .expect_err("legacy counter base must be rejected");
     assert!(matches!(
         err,
@@ -148,11 +149,13 @@ fn usage_type_gts_id_rejects_bare_base() {
 // `UsageTypeGtsId` claims to wrap a GTS *instance* id (no trailing `~`).
 // A derivation segment that itself ends with `~` would produce a GTS
 // *type* id, breaking that invariant — the old byte-level `strip_prefix`
-// path accepted it; the GtsID-routed validator rejects it.
+// path accepted it; the GtsId-routed validator rejects it.
 #[test]
 fn usage_type_gts_id_rejects_derived_type_id_with_trailing_tilde() {
-    let err = UsageTypeGtsId::new("gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~")
-        .expect_err("trailing `~` (a type id, not an instance id) must be rejected");
+    let err = UsageTypeGtsId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~"
+    ))
+    .expect_err("trailing `~` (a type id, not an instance id) must be rejected");
     assert!(matches!(
         err,
         UsageCollectorError::InvalidArgument {
@@ -164,11 +167,13 @@ fn usage_type_gts_id_rejects_derived_type_id_with_trailing_tilde() {
 
 // Whitespace in the derivation segment is not a valid GTS character. The
 // old `strip_prefix` path treated the segment as opaque text and would
-// have accepted this; the GtsID parser rejects it as a malformed segment.
+// have accepted this; the GtsId parser rejects it as a malformed segment.
 #[test]
 fn usage_type_gts_id_rejects_whitespace_in_segment() {
-    let err = UsageTypeGtsId::new("gts.cf.core.uc.usage_record.v1~cf.compute _.vcpu_hours.v1")
-        .expect_err("whitespace in segment must be rejected");
+    let err = UsageTypeGtsId::new(format!(
+        "{GTS_ID_PREFIX}cf.core.uc.usage_record.v1~cf.compute _.vcpu_hours.v1"
+    ))
+    .expect_err("whitespace in segment must be rejected");
     assert!(matches!(
         err,
         UsageCollectorError::InvalidArgument {
@@ -185,8 +190,10 @@ fn usage_type_gts_id_rejects_whitespace_in_segment() {
 // the prior implementation silently let through.
 #[test]
 fn usage_type_gts_id_rejects_malformed_derivation_segment() {
-    let err = UsageTypeGtsId::new("gts.cf.core.uc.usage_record.v1~not_a_gts_segment")
-        .expect_err("non-GTS-shaped derivation segment must be rejected");
+    let err = UsageTypeGtsId::new(format!(
+        "{GTS_ID_PREFIX}cf.core.uc.usage_record.v1~not_a_gts_segment"
+    ))
+    .expect_err("non-GTS-shaped derivation segment must be rejected");
     assert!(matches!(
         err,
         UsageCollectorError::InvalidArgument {
@@ -198,12 +205,14 @@ fn usage_type_gts_id_rejects_malformed_derivation_segment() {
 
 // Empty inner segment (consecutive `~`) is invalid per the GTS chained-id
 // rules. The old `strip_prefix` would return `Some("~foo")` and the
-// non-empty check would let it through; `GtsID::new` flags the empty
+// non-empty check would let it through; `GtsId::try_new` flags the empty
 // segment between the two tildes.
 #[test]
 fn usage_type_gts_id_rejects_consecutive_tildes() {
-    let err = UsageTypeGtsId::new("gts.cf.core.uc.usage_record.v1~~foo.bar.v1")
-        .expect_err("consecutive tildes must be rejected");
+    let err = UsageTypeGtsId::new(format!(
+        "{GTS_ID_PREFIX}cf.core.uc.usage_record.v1~~foo.bar.v1"
+    ))
+    .expect_err("consecutive tildes must be rejected");
     assert!(matches!(
         err,
         UsageCollectorError::InvalidArgument {
@@ -220,9 +229,9 @@ fn usage_type_gts_id_rejects_consecutive_tildes() {
 // contract against a future GTS parser change.
 #[test]
 fn usage_type_gts_id_rejects_deep_derivation_chain() {
-    let err = UsageTypeGtsId::new(
-        "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~cf.compute._.tail.v1",
-    )
+    let err = UsageTypeGtsId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~cf.compute._.tail.v1"
+    ))
     .expect_err("deep-derivation chain must be rejected - only direct base derivation is admitted");
     assert!(matches!(
         err,
@@ -246,8 +255,10 @@ fn usage_type_gts_id_deserialize_round_trips_valid_string() {
 
 #[test]
 fn usage_type_gts_id_deserialize_surfaces_validation_as_serde_error() {
-    let err = serde_json::from_value::<UsageTypeGtsId>(json!("gts.cf.core.metric.v1~oops"))
-        .expect_err("malformed gts_id must surface as a serde error");
+    let err = serde_json::from_value::<UsageTypeGtsId>(json!(format!(
+        "{GTS_ID_PREFIX}cf.core.metric.v1~oops"
+    )))
+    .expect_err("malformed gts_id must surface as a serde error");
     assert!(
         err.to_string().contains("usage type gts_id"),
         "serde error must carry the Validation detail; got {err}"
@@ -323,7 +334,7 @@ fn usage_type_serde_round_trip_carries_kind_and_metadata_fields() {
 #[test]
 fn usage_type_rejects_unknown_fields() {
     let payload = json!({
-        "gts_id": "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1",
+        "gts_id": gts_id!("cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1"),
         "kind": "counter",
         "metadata_fields": [],
         "legacy_schema_field": {"type": "object"},
@@ -336,7 +347,7 @@ fn usage_type_rejects_unknown_fields() {
 #[test]
 fn usage_type_rejects_unknown_kind_at_deserialize_boundary() {
     let payload = json!({
-        "gts_id": "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1",
+        "gts_id": gts_id!("cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1"),
         "kind": "histogram",
         "metadata_fields": [],
     });

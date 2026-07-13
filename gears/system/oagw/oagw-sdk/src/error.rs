@@ -397,7 +397,7 @@ mod sdk_vocabulary_round_trip_tests {
     use crate::{field, quota, reason};
     use toolkit_canonical_errors::{CanonicalError, Problem, resource_error};
 
-    #[resource_error("gts.cf.core.oagw.proxy.v1~")]
+    #[resource_error(gts_id!("cf.core.oagw.proxy.v1~"))]
     struct ProxyScope;
 
     fn problem(err: CanonicalError) -> serde_json::Value {
@@ -521,17 +521,18 @@ mod projection_tests {
     use super::*;
     use crate::{field, reason};
     use toolkit_canonical_errors::{CanonicalError, resource_error};
+    use toolkit_gts::gts_id;
 
-    #[resource_error("gts.cf.core.oagw.proxy.v1~")]
+    #[resource_error(gts_id!("cf.core.oagw.proxy.v1~"))]
     struct ProxyScope;
 
-    #[resource_error("gts.cf.core.oagw.upstream.v1~")]
+    #[resource_error(gts_id!("cf.core.oagw.upstream.v1~"))]
     struct UpstreamScope;
 
-    #[resource_error("gts.cf.core.oagw.route.v1~")]
+    #[resource_error(gts_id!("cf.core.oagw.route.v1~"))]
     struct RouteScope;
 
-    #[resource_error("gts.cf.core.oagw.auth_plugin.v1~")]
+    #[resource_error(gts_id!("cf.core.oagw.auth_plugin.v1~"))]
     struct AuthPluginScope;
 
     #[test]
@@ -777,7 +778,9 @@ mod projection_tests {
         }
 
         let canonical = AuthPluginScope::not_found("plugin gone")
-            .with_resource("gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1")
+            .with_resource(gts_id!(
+                "cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
+            ))
             .create();
         match ServiceGatewayError::from(canonical) {
             ServiceGatewayError::NotFound { resource, .. } => {
@@ -805,7 +808,7 @@ mod projection_tests {
     fn unknown_resource_scope_preserves_wire_string() {
         // If the impl ever emits a NotFound under a resource scope the
         // SDK doesn't model, the projection preserves the raw string.
-        #[resource_error("gts.cf.future.oagw.something_new.v1~")]
+        #[resource_error(gts_id!("cf.future.oagw.something_new.v1~"))]
         struct FutureScope;
 
         let canonical = FutureScope::not_found("???")
@@ -815,7 +818,7 @@ mod projection_tests {
             ServiceGatewayError::NotFound {
                 resource: Resource::Unknown(s),
                 ..
-            } => assert_eq!(s, "gts.cf.future.oagw.something_new.v1~"),
+            } => assert_eq!(s, gts_id!("cf.future.oagw.something_new.v1~")),
             other => panic!("expected NotFound::Unknown, got {other:?}"),
         }
     }

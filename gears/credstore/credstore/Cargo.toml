@@ -39,4 +39,5 @@ toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 
 [dev-dependencies]
+toolkit-gts = { workspace = true }
 types-registry-sdk = { workspace = true, features = ["test-util"] }

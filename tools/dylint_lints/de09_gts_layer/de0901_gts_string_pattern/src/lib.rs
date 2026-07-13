@@ -5,7 +5,7 @@ extern crate rustc_ast;
 extern crate rustc_span;
 
 use clippy_utils::diagnostics::span_lint_and_then;
-use gts::{GtsIdSegment, GtsOps};
+use gts::GtsOps;
 use lint_utils::{filename_str, is_temp_path};
 use rustc_ast::token::LitKind;
 use rustc_ast::{AttrKind, Attribute, Expr, ExprKind, Item, ItemKind};
@@ -13,6 +13,7 @@ use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_span::Span;
 use std::cell::RefCell;
 use std::collections::HashSet;
+use toolkit_gts::GTS_ID_PREFIX;
 
 // Thread-local storage for spans to skip (inside starts_with calls)
 thread_local! {
@@ -59,8 +60,8 @@ impl EarlyLintPass for De0901GtsStringPattern {
     ///
     /// | Item name         | Value                             | Result  |
     /// |-------------------|-----------------------------------|---------|
-    /// | `SRR_WILDCARD`    | `"gts.cf.core.srr.resource.v1~*"` | ✅ allowed — name ends with `_WILDCARD` |
-    /// | `SRR_PATTERN`     | `"gts.cf.core.srr.resource.v1~*"` | ❌ flagged — name must end with `_WILDCARD` |
+    /// | `SRR_WILDCARD`    | prefixed GTS wildcard | allowed — name ends with `_WILDCARD` |
+    /// | `SRR_PATTERN`     | prefixed GTS wildcard | flagged — name must end with `_WILDCARD` |
     ///
     /// Items with a compliant name are added to the skip set so their value span
     /// is not re-checked by `check_expr`.
@@ -78,11 +79,11 @@ impl EarlyLintPass for De0901GtsStringPattern {
         };
         let Some(init) = init_expr else { return };
 
-        // Only act on GTS wildcard string values (starts with "gts." and contains '*').
+        // Only act on GTS wildcard string values.
         let Some(s) = Self::string_lit_value(init) else {
             return;
         };
-        if !s.starts_with("gts.") || !s.contains('*') {
+        if !s.starts_with(GTS_ID_PREFIX) || !s.contains('*') {
             return;
         }
 
@@ -96,7 +97,7 @@ impl EarlyLintPass for De0901GtsStringPattern {
                 format!("invalid GTS wildcard pattern in `{item_name}`: '{s}' (DE0901)"),
                 |diag| {
                     diag.note(result.error);
-                    diag.help("Example: gts.cf.core.srr.resource.v1~*");
+                    diag.help(format!("Example: {GTS_ID_PREFIX}cf.core.srr.resource.v1~*"));
                 },
             );
             // Still skip-list so check_expr doesn't double-report the literal.
@@ -160,7 +161,7 @@ impl EarlyLintPass for De0901GtsStringPattern {
                 || method_name == "resolve_to_uuids"
             {
                 // Validate nested string literals BEFORE skip-listing so that
-                // deeply nested GTS strings (e.g. inside &["gts...".to_owned()])
+                // deeply nested GTS strings (e.g. inside array literals)
                 // are checked rather than silently escaping validation.
                 for arg in &method_call.args {
                     self.validate_nested_gts_strings(cx, arg, true);
@@ -176,8 +177,8 @@ impl EarlyLintPass for De0901GtsStringPattern {
             }
         }
 
-        // Detect free-function calls: `GtsWildcard::new("...")` or `SomeType::new(...)` where
-        // the path contains "GtsWildcard".  Arguments are allowed to contain wildcards.
+        // Detect free-function calls: `GtsIdPattern::try_new("...")` or `SomeType::new(...)` where
+        // the path contains "GtsIdPattern".  Arguments are allowed to contain wildcards.
         if let ExprKind::Call(func, args) = &expr.kind
             && is_gts_wildcard_new_call(func)
         {
@@ -227,7 +228,7 @@ impl EarlyLintPass for De0901GtsStringPattern {
 }
 
 /// Recursively collect spans from all sub-expressions so that deeply nested
-/// string literals (e.g. inside `&["gts...".to_owned()]`) are included in the
+/// string literals (e.g. inside nested arrays) are included in the
 /// skip set.
 fn collect_nested_spans(expr: &Expr, spans: &mut HashSet<Span>) {
     spans.insert(expr.span);
@@ -264,13 +265,13 @@ fn collect_nested_spans(expr: &Expr, spans: &mut HashSet<Span>) {
     }
 }
 
-/// Returns `true` if `func_expr` is a path call of the form `GtsWildcard::new`
-/// (or `gts::GtsWildcard::new`, `<anything>::GtsWildcard::new`, etc.).
+/// Returns `true` if `func_expr` is a path call of the form `GtsIdPattern::try_new`
+/// (or `gts::GtsIdPattern::try_new`, `<anything>::GtsIdPattern::try_new`, etc.).
 ///
 /// We check that:
 /// 1. The expression is a `Path` with at least two segments.
-/// 2. The last segment is named `new`.
-/// 3. At least one other segment is named `GtsWildcard`.
+/// 2. The last segment is named `try_new`.
+/// 3. At least one other segment is named `GtsIdPattern`.
 fn is_gts_wildcard_new_call(func_expr: &Expr) -> bool {
     let ExprKind::Path(_, path) = &func_expr.kind else {
         return false;
@@ -280,12 +281,12 @@ fn is_gts_wildcard_new_call(func_expr: &Expr) -> bool {
         return false;
     }
     let last = segments.last().unwrap();
-    if last.ident.name.as_str() != "new" {
+    if last.ident.name.as_str() != "try_new" {
         return false;
     }
     segments
         .iter()
-        .any(|seg| seg.ident.name.as_str() == "GtsWildcard")
+        .any(|seg| seg.ident.name.as_str() == "GtsIdPattern")
 }
 
 fn is_in_test() -> bool {
@@ -428,8 +429,8 @@ impl De0901GtsStringPattern {
         if let Some(s) = Self::string_lit_value(expr) {
             let s = s.trim();
 
-            // Option 1: String starts with "gts." - validate directly
-            if s.starts_with("gts.") {
+            // Option 1: string starts with the configured GTS prefix - validate directly
+            if s.starts_with(GTS_ID_PREFIX) {
                 if allow_wildcards {
                     self.validate_any_gts_id_allow_wildcards(cx, expr.span, s);
                 } else {
@@ -442,7 +443,7 @@ impl De0901GtsStringPattern {
             // Permission strings ALWAYS allow wildcards in their GTS parts
             if s.contains(':') {
                 for part in s.split(':') {
-                    if part.trim().starts_with("gts.") {
+                    if part.trim().starts_with(GTS_ID_PREFIX) {
                         self.validate_any_gts_id_allow_wildcards(cx, expr.span, part.trim());
                         break; // Only validate the first GTS part found
                     }
@@ -533,7 +534,7 @@ impl De0901GtsStringPattern {
                 format!("invalid GTS schema_id: '{}' (DE0901)", s),
                 |diag| {
                     diag.note(result.error);
-                    diag.help("Example: gts.cf.core.events.type.v1~");
+                    diag.help(format!("Example: {GTS_ID_PREFIX}cf.core.events.type.v1~"));
                 },
             );
             return;
@@ -551,7 +552,7 @@ impl De0901GtsStringPattern {
                 ),
                 |diag| {
                     diag.note("schema_id must end with '~' to indicate it's a type schema");
-                    diag.help("Example: gts.cf.core.events.type.v1~");
+                    diag.help(format!("Example: {GTS_ID_PREFIX}cf.core.events.type.v1~"));
                 },
             );
         } else {
@@ -598,34 +599,43 @@ impl De0901GtsStringPattern {
             return;
         }
 
-        match GtsIdSegment::new(0, 0, s) {
-            Err(e) => {
-                span_lint_and_then(
-                    cx,
-                    DE0901_GTS_STRING_PATTERN,
-                    span,
-                    format!("invalid GTS segment: '{}' (DE0901)", s),
-                    |diag| {
-                        diag.note(e.to_string());
-                        diag.help("Example: vendor.package.sku.abc.v1");
-                    },
-                );
-            }
-            Ok(seg) if !allowed_vendors(cx, span).contains(&seg.vendor.as_str()) => {
-                span_lint_and_then(
-                    cx,
-                    DE0901_GTS_STRING_PATTERN,
-                    span,
-                    format!("invalid GTS vendor in segment: '{}' (DE0901)", s),
-                    |diag| {
-                        diag.note(format!(
-                            "found vendor '{}', allowed vendors are 'cf' and 'example'",
-                            seg.vendor
-                        ));
-                    },
-                );
-            }
-            Ok(_) => {}
+        // `gts_make_instance_id` takes a single *segment* (no GTS prefix),
+        // but the parser only exposes full-id validation. Pin a dummy type
+        // segment in front, parse the whole id, then validate the trailing
+        // segment (the user-provided one).
+        let result = GtsOps::parse_id(&format!("{GTS_ID_PREFIX}cf.core.dummy.t.v1~{s}"));
+        if !result.ok {
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!("invalid GTS segment: '{}' (DE0901)", s),
+                |diag| {
+                    diag.note(result.error);
+                    diag.help("Example: vendor.package.sku.abc.v1");
+                },
+            );
+            return;
+        }
+        let Some(seg) = result.segments.last() else {
+            return;
+        };
+        if !seg.vendor.is_empty()
+            && seg.vendor != "*"
+            && !allowed_vendors(cx, span).contains(&seg.vendor.as_str())
+        {
+            span_lint_and_then(
+                cx,
+                DE0901_GTS_STRING_PATTERN,
+                span,
+                format!("invalid GTS vendor in segment: '{}' (DE0901)", s),
+                |diag| {
+                    diag.note(format!(
+                        "found vendor '{}', allowed vendors are 'cf' and 'example'",
+                        seg.vendor
+                    ));
+                },
+            );
         }
     }
 

@@ -279,6 +279,7 @@ impl ClientHub {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use toolkit_gts::gts_id;
 
     #[async_trait::async_trait]
     trait TestApi: Send + Sync {
@@ -337,12 +338,12 @@ mod tests {
     #[tokio::test]
     async fn scoped_register_and_get_dyn_trait() {
         let hub = ClientHub::new();
-        let scope_a = ClientScope::gts_id(
-            "gts.cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~contoso.app._.plugin.v1.0",
-        );
-        let scope_b = ClientScope::gts_id(
-            "gts.cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~fabrikam.app._.plugin.v1.0",
-        );
+        let scope_a = ClientScope::gts_id(gts_id!(
+            "cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~contoso.app._.plugin.v1.0"
+        ));
+        let scope_b = ClientScope::gts_id(gts_id!(
+            "cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~fabrikam.app._.plugin.v1.0"
+        ));
 
         let api_a: Arc<dyn TestApi> = Arc::new(ImplA(1));
         let api_b: Arc<dyn TestApi> = Arc::new(ImplA(2));
@@ -363,9 +364,9 @@ mod tests {
     #[test]
     fn scoped_get_is_independent_from_global_get() {
         let hub = ClientHub::new();
-        let scope = ClientScope::gts_id(
-            "gts.cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~fabrikam.app._.plugin.v1.0",
-        );
+        let scope = ClientScope::gts_id(gts_id!(
+            "cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~fabrikam.app._.plugin.v1.0"
+        ));
         hub.register::<str>(Arc::from("global"));
         hub.register_scoped::<str>(scope.clone(), Arc::from("scoped"));
 
@@ -376,9 +377,9 @@ mod tests {
     #[test]
     fn try_get_scoped_returns_some_on_hit() {
         let hub = ClientHub::new();
-        let scope = ClientScope::gts_id(
-            "gts.cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~contoso.app._.plugin.v1.0",
-        );
+        let scope = ClientScope::gts_id(gts_id!(
+            "cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~contoso.app._.plugin.v1.0"
+        ));
         hub.register_scoped::<str>(scope.clone(), Arc::from("scoped"));
 
         let got = hub.try_get_scoped::<str>(&scope);
@@ -388,9 +389,9 @@ mod tests {
     #[test]
     fn try_get_scoped_returns_none_on_miss() {
         let hub = ClientHub::new();
-        let scope = ClientScope::gts_id(
-            "gts.cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~fabrikam.app._.plugin.v1.0",
-        );
+        let scope = ClientScope::gts_id(gts_id!(
+            "cf.core.toolkit.plugins.v1~cf.core.tenant_resolver.plugin.v1~fabrikam.app._.plugin.v1.0"
+        ));
 
         let got = hub.try_get_scoped::<str>(&scope);
         assert!(got.is_none());

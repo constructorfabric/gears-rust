@@ -5,7 +5,7 @@ use toolkit_canonical_errors::problem::APPLICATION_PROBLEM_JSON;
 use toolkit_canonical_errors::resource_error;
 use toolkit_canonical_errors::{CanonicalError, Problem};
 
-#[resource_error("gts.cf.core.test.axum.v1~")]
+#[resource_error(gts_id!("cf.core.test.axum.v1~"))]
 struct AxumTestR;
 
 #[test]

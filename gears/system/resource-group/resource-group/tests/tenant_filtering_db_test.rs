@@ -12,6 +12,7 @@
 mod common;
 
 use std::sync::Arc;
+use toolkit_gts::GTS_ID_PREFIX;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -490,11 +491,11 @@ async fn group_based_membership_data_correctly_stored() {
 
     // Create types: project (root, allows "task" members) and task
     let project_type = format!(
-        "gts.cf.core.rg.type.v1~x.test.proj.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.proj.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     let task_type = format!(
-        "gts.cf.core.rg.type.v1~x.test.task.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.task.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
 

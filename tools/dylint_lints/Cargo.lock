@@ -601,6 +601,7 @@ version = "0.7.4"
 dependencies = [
  "axum 0.8.9",
  "cf-gears-toolkit-canonical-errors-macro",
+ "cf-gears-toolkit-gts",
  "http",
  "serde",
  "serde_json",
@@ -613,6 +614,7 @@ dependencies = [
 name = "cf-gears-toolkit-canonical-errors-macro"
 version = "0.6.1"
 dependencies = [
+ "gts-id",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -678,6 +680,8 @@ dependencies = [
 name = "cf-gears-toolkit-gts-macros"
 version = "0.1.2"
 dependencies = [
+ "gts",
+ "gts-id",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -702,6 +706,7 @@ dependencies = [
  "base64",
  "bigdecimal",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "chrono",
  "chrono-tz",
  "peg",
@@ -1206,6 +1211,7 @@ dependencies = [
 name = "de0901_gts_string_pattern"
 version = "0.1.0"
 dependencies = [
+ "cf-gears-toolkit-gts",
  "clippy_utils",
  "dylint_linting",
  "dylint_testing",
@@ -1895,9 +1901,9 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gts"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78d5445277d7f0df598295f7e53608540ae5fe0b830d5010f8f7cce21c69d09f"
+checksum = "04c85c9d9cd01c81990a8ccb5f9d584d83571f2d4df2ae6d974170c780bdf693"
 dependencies = [
  "gts-id",
  "jsonschema",
@@ -1908,24 +1914,24 @@ dependencies = [
  "shellexpand",
  "thiserror 2.0.18",
  "tracing",
- "uuid",
  "walkdir",
 ]
 
 [[package]]
 name = "gts-id"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a85a48bfcfaa558f7eaee74e9a7d153d0924eac2d4d287f93323b756fe2700fe"
+checksum = "bb0e34e1934f1197b1cb68eb0020cb5aadd79a93b7b8f030d9ebee8dc5a027f2"
 dependencies = [
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
 name = "gts-macros"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20a84d8b5e87ab37b5539bb5e9d830b40235918f375405569c219f4de9b3f7d4"
+checksum = "07961d01ac64b0ec00940d53a1361926cf759df8750fbaf236d43990e6718efe"
 dependencies = [
  "gts-id",
  "proc-macro2",

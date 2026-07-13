@@ -23,13 +23,12 @@ pub(crate) use service::DataPlaneServiceImpl;
 
 pub(crate) mod resources {
     use super::ResourceType;
+    use oagw_sdk::PROXY_SCHEMA;
     use toolkit_security::pep_properties;
 
     /// Resource type identifying a proxied upstream target.
-    pub const PROXY: ResourceType = ResourceType::from_static(
-        "gts.cf.core.oagw.proxy.v1~",
-        &[pep_properties::OWNER_TENANT_ID],
-    );
+    pub const PROXY: ResourceType =
+        ResourceType::from_static(PROXY_SCHEMA, &[pep_properties::OWNER_TENANT_ID]);
 }
 
 pub(crate) mod actions {

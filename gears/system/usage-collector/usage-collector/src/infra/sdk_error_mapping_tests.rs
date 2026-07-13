@@ -17,7 +17,10 @@
 //! Operator triage for 503s reads the curated `detail` string instead.
 
 use toolkit_canonical_errors::{CanonicalError, Problem};
-use usage_collector_sdk::{UsageCollectorError, UsageTypeGtsId};
+use toolkit_gts::{GTS_ID_PREFIX, gts_id};
+use usage_collector_sdk::{
+    USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageTypeGtsId,
+};
 use uuid::Uuid;
 
 use super::{
@@ -27,7 +30,7 @@ use super::{
 };
 
 const SAMPLE_USAGE_TYPE_ID: &str =
-    "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
 fn sample_gts_id() -> UsageTypeGtsId {
     UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived usage-type gts_id")
@@ -38,7 +41,7 @@ fn usage_type_resource_type_matches_uc_usage_type_marker() {
     let err: CanonicalError = UsageTypeResource::not_found("x")
         .with_resource("x")
         .create();
-    assert_eq!(err.resource_type(), Some("gts.cf.core.uc.usage_type.v1~"));
+    assert_eq!(err.resource_type(), Some(USAGE_TYPE_RESOURCE));
 }
 
 #[test]
@@ -46,7 +49,7 @@ fn usage_record_resource_type_is_record_sibling() {
     let err: CanonicalError = UsageRecordResource::not_found("r")
         .with_resource("r")
         .create();
-    assert_eq!(err.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(err.resource_type(), Some(USAGE_RECORD_RESOURCE));
 }
 
 // ---------------------------------------------------------------------------
@@ -59,7 +62,7 @@ fn authorization_from_usage_type_surface_uses_usage_type_resource() {
     let c = lift_type(UsageCollectorError::permission_denied("denied"));
     assert_eq!(c.status_code(), 403);
     assert_eq!(c.title(), "Permission Denied");
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_type.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
 }
 
 #[test]
@@ -67,7 +70,7 @@ fn authorization_from_usage_record_surface_uses_usage_record_resource() {
     let c = lift_record(UsageCollectorError::permission_denied("denied"));
     assert_eq!(c.status_code(), 403);
     assert_eq!(c.title(), "Permission Denied");
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
 }
 
 #[test]
@@ -95,7 +98,7 @@ fn invalid_resource_ref_maps_to_400_invalid_argument() {
     ));
     assert_eq!(c.status_code(), 400);
     assert_eq!(c.title(), "Invalid Argument");
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
 }
 
 #[test]
@@ -103,7 +106,7 @@ fn metadata_size_exceeded_maps_to_400_invalid_argument_with_usage_record_resourc
     let c = lift_record(UsageCollectorError::metadata_size_exceeded(9000, 8192));
     assert_eq!(c.status_code(), 400);
     assert_eq!(c.title(), "Invalid Argument");
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
 }
 
 #[test]
@@ -111,7 +114,7 @@ fn invalid_metadata_field_maps_to_400_invalid_argument() {
     let c = lift_type(UsageCollectorError::invalid_metadata_field(1, true));
     assert_eq!(c.status_code(), 400);
     assert_eq!(c.title(), "Invalid Argument");
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_type.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
 }
 
 #[test]
@@ -119,7 +122,7 @@ fn duplicate_metadata_field_maps_to_400_invalid_argument() {
     let c = lift_type(UsageCollectorError::duplicate_metadata_field(2));
     assert_eq!(c.status_code(), 400);
     assert_eq!(c.title(), "Invalid Argument");
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_type.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
 }
 
 #[test]
@@ -127,7 +130,7 @@ fn invalid_batch_size_maps_to_400_invalid_argument() {
     let c = lift_record(UsageCollectorError::invalid_batch_size(0, 1, 100));
     assert_eq!(c.status_code(), 400);
     assert_eq!(c.title(), "Invalid Argument");
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
 }
 
 /// `UnknownMetadataKey` lifts onto `InvalidArgument` (HTTP 400) and identifies
@@ -142,7 +145,7 @@ fn unknown_metadata_key_maps_to_invalid_argument() {
         "unexpected",
     ));
     assert_eq!(c.status_code(), 400);
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_type.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
     assert_eq!(c.resource_name(), Some(gts_id.as_ref()));
 }
 
@@ -151,7 +154,7 @@ fn usage_type_not_found_maps_to_404() {
     let gts_id = sample_gts_id();
     let c = lift_type(UsageCollectorError::usage_type_not_found(&gts_id));
     assert_eq!(c.status_code(), 404);
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_type.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
     assert_eq!(c.resource_name(), Some(gts_id.as_ref()));
 }
 
@@ -160,7 +163,7 @@ fn usage_record_not_found_maps_to_404() {
     let id = Uuid::from_u128(0x1234);
     let c = lift_record(UsageCollectorError::usage_record_not_found(id));
     assert_eq!(c.status_code(), 404);
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
 }
 
 #[test]
@@ -168,7 +171,7 @@ fn already_inactive_maps_to_409_aborted_with_already_inactive_reason() {
     let id = Uuid::from_u128(0xCAFE_BABE);
     let c = lift_record(UsageCollectorError::already_inactive(id));
     assert_eq!(c.status_code(), 409);
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
     assert_eq!(c.resource_name(), Some(id.to_string().as_str()));
 
     let problem = Problem::from(c);
@@ -203,7 +206,7 @@ fn idempotency_conflict_maps_to_409_aborted() {
         existing_uuid,
     ));
     assert_eq!(c.status_code(), 409);
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
     assert_eq!(c.resource_name(), Some(existing_uuid.to_string().as_str()));
 }
 
@@ -239,12 +242,13 @@ fn non_negative_counter_compensation_carries_semantics_violation_reason() {
 
 #[test]
 fn gauge_compensation_rejected_maps_to_invalid_argument_with_reason() {
-    let gts_id =
-        UsageTypeGtsId::new("gts.cf.core.uc.usage_record.v1~tenant.example._.cpu_seconds.v1")
-            .expect("gauge gts_id");
+    let gts_id = UsageTypeGtsId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~tenant.example._.cpu_seconds.v1"
+    ))
+    .expect("gauge gts_id");
     let c = lift_record(UsageCollectorError::gauge_compensation_rejected(&gts_id));
     assert_eq!(c.status_code(), 400);
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
     let problem = Problem::from(c);
     assert_eq!(
         first_field_violation_string(&problem, "reason").as_deref(),
@@ -295,7 +299,7 @@ fn corrects_id_targets_compensation_maps_to_409_aborted_with_reason() {
         corrects_id,
     ));
     assert_eq!(c.status_code(), 409);
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
     let problem = Problem::from(c);
     assert_eq!(
         problem_context_string(&problem, "reason").as_deref(),
@@ -384,7 +388,7 @@ fn first_field_violation_string(problem: &Problem, key: &str) -> Option<String> 
 
 #[test]
 fn invalid_base_gts_id_envelope_carries_field_violation_discriminator() {
-    let raw = "gts.cf.core.metric.histogram.v1~bogus".to_owned();
+    let raw = format!("{GTS_ID_PREFIX}cf.core.metric.histogram.v1~bogus");
     let reason = "usage type gts_id must derive from the reserved base \
                   `gts.cf.core.uc.usage_record.v1~`"
         .to_owned();
@@ -412,10 +416,7 @@ fn create_usage_type_already_exists_envelope_carries_resource_identity() {
     let gts_id = sample_gts_id();
     let canonical = lift_type(UsageCollectorError::usage_type_already_exists(&gts_id));
     assert_eq!(canonical.status_code(), 409);
-    assert_eq!(
-        canonical.resource_type(),
-        Some("gts.cf.core.uc.usage_type.v1~")
-    );
+    assert_eq!(canonical.resource_type(), Some(USAGE_TYPE_RESOURCE));
     assert_eq!(canonical.resource_name(), Some(gts_id.as_ref()));
 }
 
@@ -461,7 +462,7 @@ fn invalid_metadata_key_uses_usage_record_resource() {
         "metadata key must not be empty",
     ));
     assert_eq!(c.status_code(), 400);
-    assert_eq!(c.resource_type(), Some("gts.cf.core.uc.usage_record.v1~"));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
 }
 
 // ---------------------------------------------------------------------------

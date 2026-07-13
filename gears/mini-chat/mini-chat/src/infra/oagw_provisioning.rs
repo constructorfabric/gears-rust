@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use oagw_sdk::HTTP_PROTOCOL_ID;
 use oagw_sdk::ServiceGatewayClientV1;
 use tracing::{info, warn};
 
@@ -107,9 +108,7 @@ async fn create_upstream(
         endpoints: vec![endpoint_for(entry)],
     };
 
-    let mut builder =
-        CreateUpstreamRequest::builder(server, "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1")
-            .enabled(true);
+    let mut builder = CreateUpstreamRequest::builder(server, HTTP_PROTOCOL_ID).enabled(true);
 
     // Only pass alias when explicitly configured (IP-based hosts).
     if let Some(alias) = &entry.upstream_alias {
@@ -176,9 +175,7 @@ async fn create_tenant_upstream(
         endpoints: vec![ep],
     };
 
-    let mut builder =
-        CreateUpstreamRequest::builder(server, "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1")
-            .enabled(true);
+    let mut builder = CreateUpstreamRequest::builder(server, HTTP_PROTOCOL_ID).enabled(true);
 
     // Only pass alias when the tenant override explicitly sets one (IP-based hosts).
     if let Some(alias) = entry

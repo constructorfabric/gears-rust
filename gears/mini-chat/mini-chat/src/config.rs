@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::gear::DEFAULT_URL_PREFIX;
 use crate::infra::llm::ProviderKind;
+use oagw_sdk::APIKEY_AUTH_PLUGIN_ID;
 
 pub mod background;
 pub use background::{CleanupWorkerConfig, OrphanWatchdogConfig, ThreadSummaryWorkerConfig};
@@ -310,9 +311,7 @@ fn default_providers() -> HashMap<String, ProviderEntry> {
             port: None,
             use_http: false,
             api_path: default_api_path(),
-            auth_plugin_type: Some(
-                "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1".to_owned(),
-            ),
+            auth_plugin_type: Some(APIKEY_AUTH_PLUGIN_ID.to_owned()),
             auth_config: Some({
                 let mut c = HashMap::new();
                 c.insert("header".to_owned(), "Authorization".to_owned());
@@ -1292,18 +1291,18 @@ mod tests {
 
     #[test]
     fn provider_entry_deser_with_auth() {
-        let json = r#"{
+        let json = serde_json::json!({
             "kind": "openai_responses",
             "storage_kind": "openai",
             "host": "api.openai.com",
-            "auth_plugin_type": "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1",
+            "auth_plugin_type": APIKEY_AUTH_PLUGIN_ID,
             "auth_config": {
                 "header": "Authorization",
                 "prefix": "Bearer ",
                 "secret_ref": "cred://openai-key"
             }
-        }"#;
-        let entry: ProviderEntry = serde_json::from_str(json).unwrap();
+        });
+        let entry: ProviderEntry = serde_json::from_value(json).unwrap();
         assert!(entry.auth_plugin_type.is_some());
         let config = entry.auth_config.unwrap();
         assert_eq!(config.get("header").unwrap(), "Authorization");

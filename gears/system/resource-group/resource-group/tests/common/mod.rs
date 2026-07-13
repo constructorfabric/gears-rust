@@ -7,6 +7,7 @@
 //! and assertion utilities. Used by Phases 2-5 of the unit test plan.
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -293,7 +294,8 @@ pub async fn create_root_type(
     // CamelCase without breaking the GTS regex); UUID-hex (prefixed with
     // `i` so it starts with a letter) goes in type.
     let code = format!(
-        "gts.cf.core.rg.type.v1~x.test.{}.i{}.v1~",
+        "{}x.test.{}.i{}.v1~",
+        gts_id!("cf.core.rg.type.v1~"),
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
@@ -320,7 +322,8 @@ pub async fn create_child_type(
     // CamelCase without breaking the GTS regex); UUID-hex (prefixed with
     // `i` so it starts with a letter) goes in type.
     let code = format!(
-        "gts.cf.core.rg.type.v1~x.test.{}.i{}.v1~",
+        "{}x.test.{}.i{}.v1~",
+        gts_id!("cf.core.rg.type.v1~"),
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );

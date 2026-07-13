@@ -50,46 +50,48 @@ use uuid::Uuid;
 /// in the `bss-ledger` crate (`crate::gts::permissions`) share one source of
 /// truth.
 pub mod labels {
+    use toolkit_gts::gts_id;
+
     /// Journal entries / balances — data plane (`post`, `reverse`, `read`).
     /// OUTSIDE `gts.cf.resources.*` so only an explicit billing role covers it.
-    pub const ENTRY: &str = "gts.cf.bss.ledger.entry.v1~";
+    pub const ENTRY: &str = gts_id!("cf.bss.ledger.entry.v1~");
     /// The seller's ledger — `provision` seeds its chart of accounts, currency
     /// scales, fiscal calendar, and first period; `read` lists its chart of
     /// accounts. OUTSIDE `gts.cf.resources.*`.
-    pub const LEDGER: &str = "gts.cf.bss.ledger.ledger.v1~";
+    pub const LEDGER: &str = gts_id!("cf.bss.ledger.ledger.v1~");
     /// A fiscal period — `close` transitions it `OPEN`→`CLOSED`. OUTSIDE
     /// `gts.cf.resources.*`.
-    pub const FISCAL_PERIOD: &str = "gts.cf.bss.ledger.fiscal_period.v1~";
+    pub const FISCAL_PERIOD: &str = gts_id!("cf.bss.ledger.fiscal_period.v1~");
     /// A payment — `write` settles a receipt / allocates it to receivables;
     /// `read` lists a payment's allocations / the payer's unallocated pool.
     /// OUTSIDE `gts.cf.resources.*`.
-    pub const PAYMENT: &str = "gts.cf.bss.ledger.payment.v1~";
+    pub const PAYMENT: &str = gts_id!("cf.bss.ledger.payment.v1~");
     /// A reusable-credit wallet operation — `write` grants the payer's
     /// unallocated pool cash into the wallet sub-grain, or applies the wallet to
     /// open receivables (architecture §5.2). OUTSIDE `gts.cf.resources.*`.
-    pub const CREDIT_APPLICATION: &str = "gts.cf.bss.ledger.credit_application.v1~";
+    pub const CREDIT_APPLICATION: &str = gts_id!("cf.bss.ledger.credit_application.v1~");
     /// A chargeback dispute — `write` records a dispute phase (open / win /
     /// lose) on a payment; `read` lists disputes / reads one by id (architecture
     /// §4.5). OUTSIDE `gts.cf.resources.*`.
-    pub const DISPUTE: &str = "gts.cf.bss.ledger.dispute.v1~";
+    pub const DISPUTE: &str = gts_id!("cf.bss.ledger.dispute.v1~");
     /// The tenant dual-control threshold policy — `write` appends an
     /// effective-dated D2/A6/TTL version (DC8); `read` returns the effective
     /// policy. Its OWN resource (not a `ledger` action) so a governance-officer
     /// role grants threshold read/write independently of ledger provisioning or
     /// the `entry` data plane. OUTSIDE `gts.cf.resources.*`.
-    pub const DUAL_CONTROL_POLICY: &str = "gts.cf.bss.ledger.dual_control_policy.v1~";
+    pub const DUAL_CONTROL_POLICY: &str = gts_id!("cf.bss.ledger.dual_control_policy.v1~");
     /// ASC 606 revenue recognition — `write` triggers a recognition run or
     /// changes a schedule; `read` lists runs / schedules / revenue disaggregation.
     /// Its OWN resource (a job-driven revenue-accounting domain, not the `entry`
     /// data plane) so a revenue-accountant role grants recognition read/write
     /// independently of posting refunds / notes. OUTSIDE `gts.cf.resources.*`.
-    pub const RECOGNITION: &str = "gts.cf.bss.ledger.recognition.v1~";
+    pub const RECOGNITION: &str = gts_id!("cf.bss.ledger.recognition.v1~");
     /// Reconciliation & Revenue Assurance — `read` lists the exception queue /
     /// reconciliation runs; `run` triggers a reconciliation check. Its OWN resource
     /// (a distinct Revenue-Assurance surface, mirroring how `dispute` / `recognition`
     /// got their own) so a revenue-assurance role grants recon read/run independently
     /// of the `entry` data plane or `fiscal_period` close. OUTSIDE `gts.cf.resources.*`.
-    pub const RECONCILIATION: &str = "gts.cf.bss.ledger.reconciliation.v1~";
+    pub const RECONCILIATION: &str = gts_id!("cf.bss.ledger.reconciliation.v1~");
     /// Tenant ledger config plane (VHP-1853 invoice-posting policy + VHP-1986 FX
     /// revaluation mode) — `write` appends an effective-dated version of a tenant
     /// setting; `read` the effective value. ONE shared config resource so a
@@ -97,7 +99,7 @@ pub mod labels {
     /// the `entry` data plane. NOTE: `dual_control_policy` is deliberately a
     /// SEPARATE resource (segregation of duties — a config admin must not be able
     /// to weaken its own approval thresholds). OUTSIDE `gts.cf.resources.*`.
-    pub const LEDGER_CONFIG: &str = "gts.cf.bss.ledger.config.v1~";
+    pub const LEDGER_CONFIG: &str = gts_id!("cf.bss.ledger.config.v1~");
 
     /// Every authz label, stable order. The single canonical list driving the
     /// per-label stub type-schema registration (see

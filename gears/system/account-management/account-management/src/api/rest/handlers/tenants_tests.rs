@@ -50,6 +50,7 @@
 )]
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use axum::http::{StatusCode, Uri, header};
 use axum::response::IntoResponse;
@@ -93,7 +94,9 @@ fn sample_active_tenant() -> Tenant {
         id: TenantId(sample_tenant_id()),
         name: "acme corp".into(),
         status: TenantStatus::Active,
-        tenant_type: Some("gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~".into()),
+        tenant_type: Some(
+            gts_id!("cf.core.am.tenant_type.v1~vendor.app.tenant.customer.v1~").into(),
+        ),
         parent_id: Some(TenantId(sample_parent_id())),
         self_managed: false,
         depth: 2,

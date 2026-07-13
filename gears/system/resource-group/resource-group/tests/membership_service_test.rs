@@ -23,6 +23,7 @@ use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::CreateTypeRequest;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use toolkit_db::secure::SecureEntityExt;
+use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 use toolkit_security::AccessScope;
 
 /// Helper: create a root type that allows the given membership type paths.
@@ -32,7 +33,7 @@ async fn create_type_with_memberships(
     memberships: &[&str],
 ) -> resource_group_sdk::ResourceGroupType {
     let code = format!(
-        "gts.cf.core.rg.type.v1~x.test.{}{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}{}.v1~",
         suffix,
         Uuid::now_v7().as_simple()
     );
@@ -168,7 +169,12 @@ async fn membership_add_unregistered_resource_type() {
 
     // Try to add membership with a type path that is NOT registered in gts_type table
     let err = mbr_svc
-        .add_membership(&ctx, group.id, "gts.cf.fake.nonexistent.v1~", "res-001")
+        .add_membership(
+            &ctx,
+            group.id,
+            gts_id!("cf.fake.nonexistent.type.v1~"),
+            "res-001",
+        )
         .await
         .expect_err("unregistered type should fail");
 
@@ -423,7 +429,12 @@ async fn membership_remove_unregistered_resource_type() {
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     let err = mbr_svc
-        .remove_membership(&ctx, group.id, "gts.cf.fake.unregistered.v1~", "res-001")
+        .remove_membership(
+            &ctx,
+            group.id,
+            gts_id!("cf.fake.unregistered.type.v1~"),
+            "res-001",
+        )
         .await
         .expect_err("remove with unregistered type should fail");
 

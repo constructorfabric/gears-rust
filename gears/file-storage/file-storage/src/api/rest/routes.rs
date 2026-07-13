@@ -8,6 +8,7 @@ use axum::Router;
 use http::StatusCode;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::{LicenseFeature, OperationBuilder};
+use toolkit_gts::gts_id;
 
 use super::dto;
 use super::handlers;
@@ -23,7 +24,7 @@ pub(crate) struct License;
 
 impl AsRef<str> for License {
     fn as_ref(&self) -> &'static str {
-        "gts.cf.core.lic.feat.v1~cf.core.global.base.v1"
+        gts_id!("cf.core.lic.feat.v1~cf.core.global.base.v1")
     }
 }
 

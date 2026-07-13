@@ -1,8 +1,9 @@
 //! In-memory repository implementation using gts-rust.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use toolkit_gts::GTS_ID_URI_PREFIX;
 
-use gts::{GtsConfig, GtsID, GtsIdSegment, GtsOps, GtsWildcard};
+use gts::{GtsConfig, GtsId, GtsIdPattern, GtsIdSegment, GtsOps};
 use parking_lot::Mutex;
 use uuid::Uuid;
 
@@ -46,9 +47,10 @@ impl InMemoryGtsRepository {
 
     /// Converts a gts-rust entity result to our SDK `GtsEntity`.
     fn to_gts_entity(gts_id: &str, content: &serde_json::Value) -> Result<GtsEntity, DomainError> {
-        let parsed = GtsID::new(gts_id).map_err(|e| DomainError::invalid_gts_id(e.to_string()))?;
+        let parsed =
+            GtsId::try_new(gts_id).map_err(|e| DomainError::invalid_gts_id(e.to_string()))?;
 
-        let segments: Vec<GtsIdSegment> = parsed.gts_id_segments.clone();
+        let segments: Vec<GtsIdSegment> = parsed.segments().to_vec();
 
         let is_schema = gts_id.ends_with('~');
 
@@ -71,14 +73,14 @@ impl InMemoryGtsRepository {
 
     /// Extracts the GTS ID from an entity JSON value using configured fields.
     ///
-    /// Strips the `gts://` URI prefix from `$id` fields for JSON Schema compatibility (gts-rust v0.7.0+).
+    /// Strips the GTS URI prefix from `$id` fields for JSON Schema compatibility.
     fn extract_gts_id(&self, entity: &serde_json::Value) -> Option<String> {
         if let Some(obj) = entity.as_object() {
             for field in &self.config.entity_id_fields {
                 if let Some(id) = obj.get(field).and_then(|v| v.as_str()) {
-                    // Strip gts:// prefix from $id field (JSON Schema URI format)
+                    // Strip GTS URI prefix from $id field (JSON Schema URI format)
                     let cleaned_id = if field == "$id" {
-                        id.strip_prefix("gts://").unwrap_or(id)
+                        id.strip_prefix(GTS_ID_URI_PREFIX).unwrap_or(id)
                     } else {
                         id
                     };
@@ -93,17 +95,17 @@ impl InMemoryGtsRepository {
     ///
     /// The pattern is parsed once at the start of [`Self::list`] (so an
     /// invalid pattern fails the whole call rather than silently passing
-    /// through every entity) and the resulting [`GtsWildcard`] is threaded
+    /// through every entity) and the resulting [`GtsIdPattern`] is threaded
     /// in here.
     fn matches_query(
         entity: &GtsEntity,
-        wildcard: Option<&GtsWildcard>,
+        wildcard: Option<&GtsIdPattern>,
         query: &ListQuery,
     ) -> bool {
         if let Some(wildcard) = wildcard {
-            match GtsID::new(&entity.gts_id) {
+            match GtsId::try_new(&entity.gts_id) {
                 Ok(gts_id) => {
-                    if !gts_id.wildcard_match(wildcard) {
+                    if !gts_id.matches_pattern(wildcard) {
                         return false;
                     }
                 }
@@ -126,19 +128,21 @@ impl InMemoryGtsRepository {
         };
 
         if let Some(ref vendor) = query.vendor
-            && !segments_to_check.iter().any(|s| s.vendor == *vendor)
+            && !segments_to_check.iter().any(|s| s.vendor() == *vendor)
         {
             return false;
         }
 
         if let Some(ref package) = query.package
-            && !segments_to_check.iter().any(|s| s.package == *package)
+            && !segments_to_check.iter().any(|s| s.package() == *package)
         {
             return false;
         }
 
         if let Some(ref namespace) = query.namespace
-            && !segments_to_check.iter().any(|s| s.namespace == *namespace)
+            && !segments_to_check
+                .iter()
+                .any(|s| s.namespace() == *namespace)
         {
             return false;
         }
@@ -157,7 +161,7 @@ impl GtsRepository for InMemoryGtsRepository {
             .extract_gts_id(entity)
             .ok_or_else(|| DomainError::invalid_gts_id("No GTS ID field found in entity"))?;
 
-        GtsID::new(&gts_id).map_err(|e| DomainError::invalid_gts_id(e.to_string()))?;
+        GtsId::try_new(&gts_id).map_err(|e| DomainError::invalid_gts_id(e.to_string()))?;
 
         if self.is_ready.load(Ordering::SeqCst) {
             let mut persistent = self.persistent.lock();
@@ -225,7 +229,7 @@ impl GtsRepository for InMemoryGtsRepository {
         let persistent = self.persistent.lock();
         for (gts_id, gts_entity) in persistent.store.items() {
             // UUIDs are deterministic v5 from gts_id; recompute and compare.
-            if let Ok(parsed) = GtsID::new(gts_id)
+            if let Ok(parsed) = GtsId::try_new(gts_id)
                 && parsed.to_uuid() == id
             {
                 return Self::to_gts_entity(gts_id, &gts_entity.content);
@@ -237,7 +241,7 @@ impl GtsRepository for InMemoryGtsRepository {
     fn list(&self, query: &ListQuery) -> Result<Vec<GtsEntity>, DomainError> {
         // Validate the pattern once up front. `None` means "no filter".
         // `Some("")` is a caller bug — it's distinct from `None` but can't
-        // mean anything meaningful, and `GtsWildcard::new("")` may not
+        // mean anything meaningful, and `GtsIdPattern::try_new("")` may not
         // surface a user-friendly diagnostic. An invalid wildcard (multiple
         // `*`s, mid-pattern `*`, segment-boundary violation — see GTS spec
         // section 10) is also a caller bug that previously slipped through
@@ -249,7 +253,7 @@ impl GtsRepository for InMemoryGtsRepository {
                     "pattern is empty (use `None` to mean \"no filter\")",
                 ));
             }
-            Some(p) => Some(GtsWildcard::new(p).map_err(|e| {
+            Some(p) => Some(GtsIdPattern::try_new(p).map_err(|e| {
                 DomainError::invalid_query(format!("invalid GTS wildcard pattern `{p}`: {e}"))
             })?),
             None => None,
@@ -366,8 +370,16 @@ impl GtsRepository for InMemoryGtsRepository {
 mod tests {
     use super::*;
     use serde_json::json;
+    use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
 
     const JSON_SCHEMA_DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
+    const USER_CREATED_ID: &str = gts_id!("acme.core.events.user_created.v1~");
+    const ORDER_PLACED_ID: &str = gts_id!("globex.core.events.order_placed.v1~");
+    const MISSING_ID: &str = gts_id!("fabrikam.pkg.ns.type.v1~");
+
+    fn schema_uri(id: &str) -> String {
+        gts_uri!(id)
+    }
 
     fn default_config() -> GtsConfig {
         crate::config::TypesRegistryConfig::default().to_gts_config()
@@ -378,7 +390,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object",
             "properties": {
@@ -390,7 +402,7 @@ mod tests {
         assert!(result.is_ok());
 
         let registered = result.unwrap();
-        assert_eq!(registered.gts_id, "gts.acme.core.events.user_created.v1~");
+        assert_eq!(registered.gts_id, USER_CREATED_ID);
         assert!(registered.is_type());
     }
 
@@ -399,7 +411,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
@@ -416,13 +428,13 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity1 = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
 
         let entity2 = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object",
             "description": "Different content"
@@ -467,7 +479,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object",
             "properties": {
@@ -483,7 +495,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(repo.is_ready());
 
-        let get_result = repo.get("gts.acme.core.events.user_created.v1~");
+        let get_result = repo.get(USER_CREATED_ID);
         assert!(get_result.is_ok());
     }
 
@@ -492,12 +504,12 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let type1 = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
         let type2 = json!({
-            "$id": "gts://gts.globex.core.events.order_placed.v1~",
+            "$id": schema_uri(ORDER_PLACED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
@@ -515,7 +527,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
         repo.switch_to_ready().unwrap();
 
-        let result = repo.get("gts.fabrikam.pkg.ns.type.v1~");
+        let result = repo.get(MISSING_ID);
         assert!(matches!(result, Err(DomainError::NotFound { .. })));
     }
 
@@ -525,7 +537,7 @@ mod tests {
         repo.switch_to_ready().unwrap();
 
         let entity = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
@@ -533,7 +545,7 @@ mod tests {
         let result = repo.register(&entity, true);
         assert!(result.is_ok());
 
-        let get_result = repo.get("gts.acme.core.events.user_created.v1~");
+        let get_result = repo.get(USER_CREATED_ID);
         assert!(get_result.is_ok());
     }
 
@@ -543,7 +555,7 @@ mod tests {
         repo.switch_to_ready().unwrap();
 
         let entity = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
@@ -562,13 +574,13 @@ mod tests {
         repo.switch_to_ready().unwrap();
 
         let entity1 = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
 
         let entity2 = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object",
             "description": "Different content"
@@ -584,7 +596,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
@@ -592,8 +604,8 @@ mod tests {
         repo.register(&entity, false).unwrap();
         repo.switch_to_ready().unwrap();
 
-        assert!(repo.exists("gts.acme.core.events.user_created.v1~"));
-        assert!(!repo.exists("gts.fabrikam.pkg.ns.type.v1~"));
+        assert!(repo.exists(USER_CREATED_ID));
+        assert!(!repo.exists(MISSING_ID));
     }
 
     #[test]
@@ -601,7 +613,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let type_entity = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
@@ -623,7 +635,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
@@ -631,11 +643,11 @@ mod tests {
         repo.register(&entity, false).unwrap();
         repo.switch_to_ready().unwrap();
 
-        let query = ListQuery::default().with_pattern("gts.acme.*");
+        let query = ListQuery::default().with_pattern(format!("{GTS_ID_PREFIX}acme.*"));
         let results = repo.list(&query).unwrap();
         assert_eq!(results.len(), 1);
 
-        let query = ListQuery::default().with_pattern("gts.contoso.*");
+        let query = ListQuery::default().with_pattern(format!("{GTS_ID_PREFIX}contoso.*"));
         let results = repo.list(&query).unwrap();
         assert_eq!(results.len(), 0);
     }
@@ -672,7 +684,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
         repo.register(
             &json!({
-                "$id": "gts://gts.acme.core.events.x.v1~",
+                "$id": schema_uri(gts_id!("acme.core.events.x.v1~")),
                 "$schema": JSON_SCHEMA_DRAFT_07,
                 "type": "object"
             }),
@@ -682,11 +694,12 @@ mod tests {
         repo.switch_to_ready().unwrap();
 
         // Multi-wildcard pattern → invalid per spec.
-        let query = ListQuery::default().with_pattern("gts.*.*.rg.*");
+        let invalid_pattern = format!("{GTS_ID_PREFIX}*.*.rg.*");
+        let query = ListQuery::default().with_pattern(invalid_pattern.clone());
         match repo.list(&query) {
             Err(DomainError::InvalidQuery(msg)) => {
                 assert!(
-                    msg.contains("gts.*.*.rg.*"),
+                    msg.contains(&invalid_pattern),
                     "msg should cite the input: {msg}"
                 );
             }
@@ -703,7 +716,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity = json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": schema_uri(USER_CREATED_ID),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object",
             "description": "A user created event"
@@ -718,7 +731,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity = json!({
-            "id": "gts.acme.core.events.user_created.v1~acme.core.events.instance.v1",
+            "id": gts_id!("acme.core.events.user_created.v1~acme.core.events.instance.v1"),
             "data": "value"
         });
 
@@ -731,7 +744,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity = json!({
-            "gtsId": "gts.acme.core.events.user_created.v1~",
+            "gtsId": USER_CREATED_ID,
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });
@@ -745,7 +758,7 @@ mod tests {
         let repo = InMemoryGtsRepository::new(default_config());
 
         let entity = json!({
-            "id": "gts.acme.core.events.user_created.v1~",
+            "id": USER_CREATED_ID,
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         });

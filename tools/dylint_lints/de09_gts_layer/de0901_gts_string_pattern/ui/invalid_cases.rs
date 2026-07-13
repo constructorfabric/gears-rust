@@ -8,7 +8,7 @@ use gts_macros::struct_to_gts_schema;
     dir_path = "schemas",
     base = true,
     // Should NOT trigger - valid GTS schema_id string
-    type_id = "gts.vendor.test.entities.product.v1~",
+    type_id = gts_id!("vendor.test.entities.product.v1~"),
     description = "Product entity",
     properties = "id"
 )]

@@ -36,21 +36,23 @@
 //! [`gts_instance!`]: toolkit_gts::gts_instance
 
 use crate::domain::service::actions;
-use toolkit_gts::{AuthzPermissionV1, gts_instance};
+use toolkit_gts::{AuthzPermissionV1, gts_id, gts_instance};
 
 /// Wildcard `resource_type` for permissions over any mini-chat chat.
 ///
 /// Covers `gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.v1~` (the
 /// concrete type the PEP sends) plus any future derivation under that
 /// subtree.
-const CHAT_RESOURCE_TYPE_WILDCARD: &str = "gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.*";
+const CHAT_RESOURCE_TYPE_WILDCARD: &str =
+    gts_id!("cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.*");
 
 /// Wildcard `resource_type` for permissions over any mini-chat model.
-const MODEL_RESOURCE_TYPE_WILDCARD: &str = "gts.cf.core.ai_chat.model.v1~cf.core.mini_chat.model.*";
+const MODEL_RESOURCE_TYPE_WILDCARD: &str =
+    gts_id!("cf.core.ai_chat.model.v1~cf.core.mini_chat.model.*");
 
 /// Wildcard `resource_type` for permissions over any mini-chat user-quota.
 const USER_QUOTA_RESOURCE_TYPE_WILDCARD: &str =
-    "gts.cf.core.ai_chat.user_quota.v1~cf.core.mini_chat.user_quota.*";
+    gts_id!("cf.core.ai_chat.user_quota.v1~cf.core.mini_chat.user_quota.*");
 
 // =====================================================================
 //                       CHAT resource permissions
@@ -59,7 +61,7 @@ const USER_QUOTA_RESOURCE_TYPE_WILDCARD: &str =
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_create.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_create.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::CREATE.to_owned(),
         display_name: "Create chat".to_owned(),    }
@@ -67,7 +69,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read chat".to_owned(),    }
@@ -75,7 +77,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_list.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_list.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::LIST.to_owned(),
         display_name: "List chats".to_owned(),    }
@@ -83,7 +85,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_update.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_update.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::UPDATE.to_owned(),
         display_name: "Update chat".to_owned(),    }
@@ -91,7 +93,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::DELETE.to_owned(),
         display_name: "Delete chat".to_owned(),    }
@@ -99,7 +101,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_list_messages.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_list_messages.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::LIST_MESSAGES.to_owned(),
         display_name: "List chat messages".to_owned(),    }
@@ -107,7 +109,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_send_message.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_send_message.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::SEND_MESSAGE.to_owned(),
         display_name: "Send chat message".to_owned(),    }
@@ -115,7 +117,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read_turn.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read_turn.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::READ_TURN.to_owned(),
         display_name: "Read chat turn".to_owned(),    }
@@ -123,7 +125,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_retry_turn.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_retry_turn.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::RETRY_TURN.to_owned(),
         display_name: "Retry chat turn".to_owned(),    }
@@ -131,7 +133,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_edit_turn.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_edit_turn.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::EDIT_TURN.to_owned(),
         display_name: "Edit chat turn".to_owned(),    }
@@ -139,7 +141,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_turn.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_turn.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::DELETE_TURN.to_owned(),
         display_name: "Delete chat turn".to_owned(),    }
@@ -147,7 +149,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_upload_attachment.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_upload_attachment.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::UPLOAD_ATTACHMENT.to_owned(),
         display_name: "Upload attachment".to_owned(),    }
@@ -155,7 +157,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read_attachment.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read_attachment.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::READ_ATTACHMENT.to_owned(),
         display_name: "Read attachment".to_owned(),    }
@@ -163,7 +165,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_attachment.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_attachment.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::DELETE_ATTACHMENT.to_owned(),
         display_name: "Delete attachment".to_owned(),    }
@@ -171,7 +173,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_set_reaction.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_set_reaction.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::SET_REACTION.to_owned(),
         display_name: "Set reaction".to_owned(),    }
@@ -179,7 +181,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_reaction.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_reaction.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::DELETE_REACTION.to_owned(),
         display_name: "Delete reaction".to_owned(),    }
@@ -192,7 +194,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.model_list.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.model_list.v1"),
         resource_type: MODEL_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::LIST.to_owned(),
         display_name: "List models".to_owned(),    }
@@ -200,7 +202,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.model_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.model_read.v1"),
         resource_type: MODEL_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read model".to_owned(),    }
@@ -213,7 +215,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.user_quota_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.user_quota_read.v1"),
         resource_type: USER_QUOTA_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read user quota".to_owned(),    }
@@ -226,33 +228,36 @@ mod tests {
         USER_QUOTA_RESOURCE_TYPE_WILDCARD, actions,
     };
     use crate::domain::service::resources;
-    use toolkit_gts::InventoryInstance;
+    use toolkit_gts::{InventoryInstance, gts_id};
 
     #[allow(unknown_lints, de0901_gts_string_pattern)]
-    const INSTANCE_PREFIX: &str = "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.";
+    const INSTANCE_PREFIX: &str = concat!(
+        gts_id!("cf.toolkit.authz.permission.v1~"),
+        "cf.mini_chat._."
+    );
 
     /// Expected set of permission instance ids for mini-chat. One entry per
     /// `(resource, action)` tuple the gear exposes at PEP call-sites.
     const EXPECTED_PERMISSION_IDS: &[&str] = &[
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_create.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_list.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_update.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_list_messages.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_send_message.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read_turn.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_retry_turn.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_edit_turn.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_turn.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_upload_attachment.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read_attachment.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_attachment.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_set_reaction.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_reaction.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.model_list.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.model_read.v1",
-        "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.user_quota_read.v1",
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_create.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_list.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_update.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_list_messages.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_send_message.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read_turn.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_retry_turn.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_edit_turn.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_turn.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_upload_attachment.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read_attachment.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_attachment.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_set_reaction.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_delete_reaction.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.model_list.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.model_read.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.user_quota_read.v1"),
     ];
 
     fn mini_chat_permission_instances() -> Vec<&'static InventoryInstance> {

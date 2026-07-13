@@ -205,7 +205,7 @@ impl ResourceType {
         }
     }
 
-    /// Dotted resource type name (e.g. `"gts.cf.core.users.user.v1~"`).
+    /// Dotted resource type name (for example, a `gts_id!(...)` value).
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -232,7 +232,7 @@ impl ResourceType {
 /// use toolkit_security::pep_properties;
 ///
 /// const USER: ResourceType = ResourceType::from_static(
-///     "gts.cf.core.users.user.v1~",
+///     gts_id!("cf.core.users.user.v1~"),
 ///     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 /// );
 ///

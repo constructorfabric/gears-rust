@@ -13,26 +13,20 @@
 //!   build graphs slim.
 //!
 //! Strings follow the AM-specific GTS namespace convention from
-//! `gears/system/account-management/docs/DESIGN.md` (PEP table):
-//! `gts.cf.core.am.{resource}.v1~`. The trailing `~` is the GTS
-//! terminator and is part of the identifier.
+//! `gears/system/account-management/docs/DESIGN.md` (PEP table).
 //!
 //! Mirrors the `gts` gear layout used by `resource-group-sdk` —
 //! see `account_management_sdk::lib` rationale for the SDK split.
 //!
 //! # Note on `#[resource_error]` macro arguments
 //!
-//! The `toolkit_canonical_errors::resource_error` proc-macro takes a
-//! literal string at expansion time and cannot resolve constants —
-//! the impl-crate sites that call the macro therefore duplicate
-//! these literals. The `domain::error_tests` gear asserts the
-//! impl-crate strings match the constants below, so a divergence
-//! trips at test time, not in production.
+//! Use the marker form `#[resource_error(gts_id!("..."))]` in impl
+//! crates so IDs flow through the same toolkit GTS macro path.
 
 /// AM Tenant resource. Used for PEP authorization on the `tenants`
 /// table and as the `resource_type` field on tenant-scoped canonical
 /// errors (e.g. `tenant {id} not found` → 404).
-pub const TENANT_RESOURCE_TYPE: &str = "gts.cf.core.am.tenant.v1~";
+pub const TENANT_RESOURCE_TYPE: &str = gts_id!("cf.core.am.tenant.v1~");
 
 /// AM `TenantMetadata` resource. Used for every canonical error
 /// raised by the metadata surface — both "schema not registered" and
@@ -41,12 +35,12 @@ pub const TENANT_RESOURCE_TYPE: &str = "gts.cf.core.am.tenant.v1~";
 /// `type_id` string the caller supplied so consumers can still see
 /// **which** schema was involved without needing a separate
 /// `resource_type` discriminator.
-pub const TENANT_METADATA_RESOURCE_TYPE: &str = "gts.cf.core.am.tenant_metadata.v1~";
+pub const TENANT_METADATA_RESOURCE_TYPE: &str = gts_id!("cf.core.am.tenant_metadata.v1~");
 
 /// AM `ConversionRequest` resource. Used for canonical errors raised
 /// by the conversion-request feature and for the future PEP gate on
 /// conversion read / approve / reject endpoints.
-pub const CONVERSION_REQUEST_RESOURCE_TYPE: &str = "gts.cf.core.am.conversion_request.v1~";
+pub const CONVERSION_REQUEST_RESOURCE_TYPE: &str = gts_id!("cf.core.am.conversion_request.v1~");
 
 /// AM `IdpUser` resource projection. Mirror of the
 /// `gts.cf.core.am.user.v1~` JSON Schema declared in
@@ -54,7 +48,7 @@ pub const CONVERSION_REQUEST_RESOURCE_TYPE: &str = "gts.cf.core.am.conversion_re
 /// and produced by [`crate::IdpUser`]. Surfaces as the `resource_type`
 /// on user-scoped canonical errors raised by the user-operations
 /// feature (`feature-idp-user-operations-contract`).
-pub const USER_RESOURCE_TYPE: &str = "gts.cf.core.am.user.v1~";
+pub const USER_RESOURCE_TYPE: &str = gts_id!("cf.core.am.user.v1~");
 
 // ---------------------------------------------------------------------------
 // IdpUser-groups feature -- two flavours of identifiers
@@ -80,7 +74,7 @@ pub const USER_RESOURCE_TYPE: &str = "gts.cf.core.am.user.v1~";
 /// The string lives in RG's type-registry namespace
 /// (`gts.cf.core.rg.type.v1~` prefix) as required by RG's
 /// `validate_type_code`.
-pub const USER_GROUP_RG_TYPE_CODE: &str = "gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~";
+pub const USER_GROUP_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user_group.v1~");
 
 /// RG type-registry code for the AM user **member-handle** type.
 ///
@@ -96,7 +90,7 @@ pub const USER_GROUP_RG_TYPE_CODE: &str = "gts.cf.core.rg.type.v1~cf.core.am.use
 /// This is a type-registry-only entry; AM users themselves live in
 /// AM's tables + `IdP`, never as RG groups. Wraps
 /// [`USER_RESOURCE_TYPE`] in the RG type-registry namespace.
-pub const USER_RG_TYPE_CODE: &str = "gts.cf.core.rg.type.v1~cf.core.am.user.v1~";
+pub const USER_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user.v1~");
 
 // ---------------------------------------------------------------------------
 // AM base envelope schema registration
@@ -133,10 +127,9 @@ pub const USER_RG_TYPE_CODE: &str = "gts.cf.core.rg.type.v1~cf.core.am.user.v1~"
 // AM resource type schema mirrors
 // ---------------------------------------------------------------------------
 
-use gts_macros::GtsTraitsSchema;
 use schemars::JsonSchema;
 use toolkit::gts::PluginV1;
-use toolkit_gts::gts_type_schema;
+use toolkit_gts::{GtsTraitsSchema, gts_id, gts_type_schema};
 
 /// GTS Type Schema mirror for the AM `IdpUser` resource type
 /// (`gts.cf.core.am.user.v1~`).
@@ -173,7 +166,7 @@ use toolkit_gts::gts_type_schema;
 /// `user_schema_constraints_tests` guards against regression.
 #[gts_type_schema(
     dir_path = "schemas",
-    type_id = "gts.cf.core.am.user.v1~",
+    type_id = gts_id!("cf.core.am.user.v1~"),
     description = "Account Management user resource — IdP-issued user identity projection",
     properties = "id,username,email,display_name,first_name,last_name",
     base = true
@@ -247,7 +240,7 @@ pub struct UserV1 {
 #[gts_type_schema(
     dir_path = "schemas",
     base = PluginV1,
-    type_id = "gts.cf.toolkit.plugins.plugin.v1~cf.core.idp.plugin.v1~",
+    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.idp.plugin.v1~"),
     description = "IdP provider plugin specification",
     properties = "",
 )]
@@ -275,7 +268,7 @@ pub struct IdpPluginSpecV1;
 /// `tenant_schema_constraints_tests`.
 #[gts_type_schema(
     dir_path = "schemas",
-    type_id = "gts.cf.core.am.tenant.v1~",
+    type_id = gts_id!("cf.core.am.tenant.v1~"),
     description = "Account Management tenant resource — RBAC/PEP target type",
     properties = "id,name",
     base = true
@@ -295,7 +288,7 @@ pub struct TenantV1 {
 /// `pep::CONVERSION`). See [`TenantV1`] for the RBAC-authorizability rationale.
 #[gts_type_schema(
     dir_path = "schemas",
-    type_id = "gts.cf.core.am.conversion_request.v1~",
+    type_id = gts_id!("cf.core.am.conversion_request.v1~"),
     description = "Account Management tenant conversion-request resource — RBAC/PEP target type",
     properties = "id",
     base = true
@@ -322,18 +315,16 @@ pub struct ConversionRequestV1 {
 // A single `allowed_parent_types` entry: the GTS type identifier of a
 // tenant type permitted as parent. The `x-gts-ref` extension makes the
 // gts store validate each value is a `tenant_type.v1~`-derived type id
-// when a derived tenant-type schema is registered. The value is a bare
-// `gts.`-prefixed literal, which per GTS spec §9.6 is enforced as a
-// `startsWith` prefix check (no glob `*` — that is non-canonical; only
-// the literal `gts.*` is a wildcard). The prefix also permits same-type
-// nesting (a type listing its own id); `/$id` self-reference is a
-// different, exact-match construct and is not what we want here.
+// when a derived tenant-type schema is registered. The prefix also
+// permits same-type nesting (a type listing its own id); `/$id`
+// self-reference is a different, exact-match construct and is not what
+// we want here.
 // `transparent` so the schema is just the inner string + the extension
 // (no wrapper title) and the value serialises as a bare string.
 #[allow(dead_code)]
 #[derive(serde::Serialize, JsonSchema)]
 #[serde(transparent)]
-#[schemars(transparent, extend("x-gts-ref" = "gts.cf.core.am.tenant_type.v1~"))]
+#[schemars(transparent, extend("x-gts-ref" = gts_id!("cf.core.am.tenant_type.v1~")))]
 pub struct TenantTypeRef(pub String);
 
 #[allow(clippy::doc_markdown)]
@@ -355,7 +346,7 @@ pub struct TenantTypeTraits {
 #[gts_type_schema(
     dir_path = "schemas",
     base = true,
-    type_id = "gts.cf.core.am.tenant_type.v1~",
+    type_id = gts_id!("cf.core.am.tenant_type.v1~"),
     description = "Base tenant type schema for Account Management. Derived tenant type schemas resolve behavioral traits via x-gts-traits. Traits configure system behavior for processing tenants of each type - they are not part of the tenant instance data model.",
     properties = "id",
     traits_schema = inline(TenantTypeTraits),
@@ -412,7 +403,7 @@ pub struct TenantMetadataTraits {
 #[gts_type_schema(
     dir_path = "schemas",
     base = true,
-    type_id = "gts.cf.core.am.tenant_metadata.v1~",
+    type_id = gts_id!("cf.core.am.tenant_metadata.v1~"),
     description = "Base tenant metadata schema for Account Management. Derived metadata schemas resolve behavioral traits via x-gts-traits. Traits configure how MetadataService treats entries of each schema - they are not part of the metadata payload.",
     properties = "id",
     traits_schema = inline(TenantMetadataTraits),

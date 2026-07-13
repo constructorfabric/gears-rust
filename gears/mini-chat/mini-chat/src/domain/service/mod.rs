@@ -74,10 +74,11 @@ pub(crate) type DbProvider = DBProvider<toolkit_db::DbError>;
 #[allow(dead_code)]
 pub(crate) mod resources {
     use super::ResourceType;
+    use mini_chat_sdk::{CHAT_RESOURCE_TYPE, MODEL_RESOURCE_TYPE, USER_QUOTA_RESOURCE_TYPE};
     use toolkit_security::pep_properties;
 
     pub const CHAT: ResourceType = ResourceType::from_static(
-        "gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.v1~",
+        CHAT_RESOURCE_TYPE,
         &[
             pep_properties::OWNER_TENANT_ID,
             pep_properties::OWNER_ID,
@@ -85,13 +86,11 @@ pub(crate) mod resources {
         ],
     );
 
-    pub const MODEL: ResourceType = ResourceType::from_static(
-        "gts.cf.core.ai_chat.model.v1~cf.core.mini_chat.model.v1~",
-        &[pep_properties::OWNER_TENANT_ID],
-    );
+    pub const MODEL: ResourceType =
+        ResourceType::from_static(MODEL_RESOURCE_TYPE, &[pep_properties::OWNER_TENANT_ID]);
 
     pub const USER_QUOTA: ResourceType = ResourceType::from_static(
-        "gts.cf.core.ai_chat.user_quota.v1~cf.core.mini_chat.user_quota.v1~",
+        USER_QUOTA_RESOURCE_TYPE,
         &[pep_properties::OWNER_TENANT_ID, pep_properties::OWNER_ID],
     );
 }

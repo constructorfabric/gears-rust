@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use toolkit::api::OpenApiRegistry;
+use toolkit::api::operation_builder::CORE_GLOBAL_BASE_LICENSE_FEATURE;
 use toolkit::api::operation_builder::LicenseFeature;
 
 use crate::gear::AppServices;
@@ -25,7 +26,7 @@ pub(crate) struct AiChatLicense;
 // once the license plugin can provide necessary information.
 impl AsRef<str> for AiChatLicense {
     fn as_ref(&self) -> &'static str {
-        "gts.cf.core.lic.feat.v1~cf.core.global.base.v1"
+        CORE_GLOBAL_BASE_LICENSE_FEATURE
     }
 }
 

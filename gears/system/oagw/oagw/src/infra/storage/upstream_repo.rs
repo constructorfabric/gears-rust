@@ -172,6 +172,7 @@ impl UpstreamRepository for InMemoryUpstreamRepo {
 #[cfg(test)]
 mod tests {
     use crate::domain::model::{Endpoint, Scheme, Server};
+    use oagw_sdk::HTTP_PROTOCOL_ID;
 
     use super::*;
 
@@ -187,7 +188,7 @@ mod tests {
                     port: 443,
                 }],
             },
-            protocol: "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1".into(),
+            protocol: HTTP_PROTOCOL_ID.into(),
             enabled: true,
             auth: None,
             headers: None,

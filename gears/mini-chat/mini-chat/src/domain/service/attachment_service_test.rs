@@ -8,7 +8,7 @@ use uuid::Uuid;
 /// Local resource scope for fabricating canonical errors that mirror what
 /// the OAGW impl crate emits at runtime — used by the `MockOagwGateway`
 /// fixtures below.
-#[resource_error("gts.cf.core.oagw.proxy.v1~")]
+#[resource_error(gts_id!("cf.core.oagw.proxy.v1~"))]
 struct TestProxyScope;
 
 fn timeout_error(detail: &str) -> CanonicalError {

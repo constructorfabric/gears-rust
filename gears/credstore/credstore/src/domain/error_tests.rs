@@ -1,5 +1,6 @@
 // Created: 2026-04-07 by Constructor Tech
 use toolkit::plugins::ChoosePluginError;
+use toolkit_gts::gts_id;
 
 use super::*;
 
@@ -42,7 +43,7 @@ fn from_serde_json_error_becomes_internal() {
 #[test]
 fn from_choose_plugin_error_not_found_becomes_plugin_not_found() {
     let src = ChoosePluginError::PluginNotFound {
-        type_id: "gts.cf.core.test.plugin.v1~".into(),
+        type_id: gts_id!("cf.core.test.plugin.v1~").into(),
         vendor: "acme".into(),
     };
     let dst = DomainError::from(src);
@@ -52,13 +53,13 @@ fn from_choose_plugin_error_not_found_becomes_plugin_not_found() {
 #[test]
 fn from_choose_plugin_error_invalid_instance_becomes_invalid_plugin_instance() {
     let src = ChoosePluginError::InvalidPluginInstance {
-        gts_id: "gts.cf.core.test.error.v1~".into(),
+        gts_id: gts_id!("cf.core.test.error.v1~").into(),
         reason: "bad content".into(),
     };
     let dst = DomainError::from(src);
     assert!(
         matches!(dst, DomainError::InvalidPluginInstance { gts_id, reason }
-            if gts_id == "gts.cf.core.test.error.v1~" && reason == "bad content")
+            if gts_id == gts_id!("cf.core.test.error.v1~") && reason == "bad content")
     );
 }
 
@@ -112,28 +113,30 @@ fn domain_plugin_not_found_becomes_no_plugin_available() {
 
 #[test]
 fn domain_invalid_plugin_instance_becomes_internal() {
+    const TEST_ERROR_ID: &str = gts_id!("cf.core.test.error.v1~");
     let src = DomainError::InvalidPluginInstance {
-        gts_id: "gts.cf.core.test.error.v1~".into(),
+        gts_id: TEST_ERROR_ID.into(),
         reason: "bad".into(),
     };
     let dst = CredStoreError::from(src);
     assert!(
         matches!(dst, CredStoreError::Internal(ref msg)
-            if msg.contains("gts.cf.core.test.error.v1~") && msg.contains("bad")),
+            if msg.contains(TEST_ERROR_ID) && msg.contains("bad")),
         "expected Internal with gts_id and reason, got: {dst:?}"
     );
 }
 
 #[test]
 fn domain_plugin_unavailable_becomes_service_unavailable() {
+    const TEST_ERROR_ID: &str = gts_id!("cf.core.test.error.v1~");
     let src = DomainError::PluginUnavailable {
-        gts_id: "gts.cf.core.test.error.v1~".into(),
+        gts_id: TEST_ERROR_ID.into(),
         reason: "not ready".into(),
     };
     let dst = CredStoreError::from(src);
     assert!(
         matches!(dst, CredStoreError::ServiceUnavailable(ref msg)
-            if msg.contains("gts.cf.core.test.error.v1~") && msg.contains("not ready")),
+            if msg.contains(TEST_ERROR_ID) && msg.contains("not ready")),
         "expected ServiceUnavailable with gts_id and reason, got: {dst:?}"
     );
 }

@@ -28,7 +28,7 @@ use crate::gear::ConcreteAppServices;
 use axum::Router;
 use std::sync::Arc;
 use toolkit::api::OpenApiRegistry;
-use toolkit::api::operation_builder::LicenseFeature;
+use toolkit::api::operation_builder::{CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature};
 
 mod addresses;
 mod cities;
@@ -39,7 +39,7 @@ pub(super) struct License;
 
 impl AsRef<str> for License {
     fn as_ref(&self) -> &'static str {
-        "gts.cf.core.lic.feat.v1~cf.core.global.base.v1"
+        CORE_GLOBAL_BASE_LICENSE_FEATURE
     }
 }
 

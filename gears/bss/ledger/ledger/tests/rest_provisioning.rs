@@ -39,6 +39,7 @@ use bss_ledger_sdk::api::LedgerClientV1;
 use bss_ledger_sdk::posting::{ODataQuery, Page, PostEntry, PostingRef};
 use bss_ledger_sdk::{ProvisionOutcome, ProvisionRequest};
 use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit_gts::gts_id;
 use toolkit_odata::PageInfo;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -368,7 +369,7 @@ fn authed_context() -> toolkit_security::SecurityContext {
     toolkit_security::SecurityContext::builder()
         .subject_id(uuid::uuid!("11111111-2222-3333-4444-555555555555"))
         .subject_tenant_id(SUBJECT_TENANT)
-        .subject_type("gts.cf.core.security.subject_user.v1~")
+        .subject_type(gts_id!("cf.core.security.subject_user.v1~"))
         .token_scopes(vec!["*".to_owned()])
         .build()
         .expect("authed SecurityContext must build")

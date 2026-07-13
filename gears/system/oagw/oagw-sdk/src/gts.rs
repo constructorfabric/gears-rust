@@ -23,23 +23,34 @@
 //! }
 //! ```
 
+use toolkit_gts::gts_id;
 /// Umbrella resource scope for gateway data-plane / proxy errors.
-pub const PROXY_SCHEMA: &str = "gts.cf.core.oagw.proxy.v1~";
+pub const PROXY_SCHEMA: &str = gts_id!("cf.core.oagw.proxy.v1~");
 
 /// Resource scope for a specific upstream definition.
-pub const UPSTREAM_SCHEMA: &str = "gts.cf.core.oagw.upstream.v1~";
+pub const UPSTREAM_SCHEMA: &str = gts_id!("cf.core.oagw.upstream.v1~");
 
 /// Resource scope for a specific route definition.
-pub const ROUTE_SCHEMA: &str = "gts.cf.core.oagw.route.v1~";
+pub const ROUTE_SCHEMA: &str = gts_id!("cf.core.oagw.route.v1~");
 
 /// Resource scope for a specific authentication plugin instance.
-pub const AUTH_PLUGIN_SCHEMA: &str = "gts.cf.core.oagw.auth_plugin.v1~";
+pub const AUTH_PLUGIN_SCHEMA: &str = gts_id!("cf.core.oagw.auth_plugin.v1~");
 
 /// Resource scope for errors raised by guard plugins.
-pub const GUARD_PLUGIN_SCHEMA: &str = "gts.cf.core.oagw.guard_plugin.v1~";
+pub const GUARD_PLUGIN_SCHEMA: &str = gts_id!("cf.core.oagw.guard_plugin.v1~");
 
 /// Resource scope for a specific transform plugin instance.
-pub const TRANSFORM_PLUGIN_SCHEMA: &str = "gts.cf.core.oagw.transform_plugin.v1~";
+pub const TRANSFORM_PLUGIN_SCHEMA: &str = gts_id!("cf.core.oagw.transform_plugin.v1~");
+
+/// Resource scope for the protocol configuration type.
+pub const PROTOCOL_SCHEMA: &str = gts_id!("cf.core.oagw.protocol.v1~");
+
+/// Built-in HTTP protocol instance used by OAGW upstreams and routes.
+pub const HTTP_PROTOCOL_ID: &str = gts_id!("cf.core.oagw.protocol.v1~cf.core.oagw.http.v1");
+
+/// Built-in API-key auth plugin instance used by examples and defaults.
+pub const APIKEY_AUTH_PLUGIN_ID: &str =
+    gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1");
 
 // ---------------------------------------------------------------------------
 // Typed view of the wire `resource_type` strings above.
@@ -114,6 +125,7 @@ impl Resource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use toolkit_gts::GTS_ID_PREFIX;
 
     /// Sanity-check the literal shape every constant must satisfy — caught at
     /// compile time by the `#[resource_error]` macro on the impl side, but
@@ -128,7 +140,7 @@ mod tests {
             GUARD_PLUGIN_SCHEMA,
             TRANSFORM_PLUGIN_SCHEMA,
         ] {
-            assert!(s.starts_with("gts."), "missing gts. prefix: {s}");
+            assert!(s.starts_with(GTS_ID_PREFIX), "missing GTS prefix: {s}");
             assert!(s.ends_with('~'), "missing trailing ~: {s}");
             assert!(
                 s.contains(".oagw."),
@@ -155,7 +167,7 @@ mod tests {
 
     #[test]
     fn resource_unknown_preserves_wire_string() {
-        let raw = "gts.cf.future.oagw.something_new.v1~";
+        let raw = gts_id!("cf.future.oagw.something_new.v1~");
         let kind = Resource::from_wire(raw);
         match &kind {
             Resource::Unknown(s) => assert_eq!(s, raw),

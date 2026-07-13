@@ -12,6 +12,8 @@
 mod common;
 
 use std::sync::Arc;
+use toolkit_gts::GTS_ID_PREFIX;
+use toolkit_gts::gts_id;
 
 use serde_json::json;
 use uuid::Uuid;
@@ -237,7 +239,7 @@ async fn group_create_nonexistent_type() {
             &ctx,
             CreateGroupRequest {
                 id: None,
-                code: "gts.cf.core.rg.type.v1~x.test.nonexistent.v1~".to_owned(),
+                code: gts_id!("cf.core.rg.type.v1~x.test.nonexistent.type.v1~").to_owned(),
                 name: "Ghost".to_owned(),
                 parent_id: None,
                 metadata: None,
@@ -559,7 +561,7 @@ async fn group_move_child_to_root() {
     // Create a type that can be both root and child
     let root_type = common::create_root_type(&type_svc, "org").await;
     let child_code = format!(
-        "gts.cf.core.rg.type.v1~x.test.flexible{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flexible{}.v1~",
         Uuid::now_v7().as_simple()
     );
     let _flexible_type = type_svc
@@ -681,7 +683,7 @@ async fn group_move_max_width_exceeded() {
 
     let root_type = common::create_root_type(&type_svc, "org").await;
     let child_code = format!(
-        "gts.cf.core.rg.type.v1~x.test.flex{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flex{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1288,7 +1290,7 @@ async fn group_move_max_depth_exceeded() {
     let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
     // sub_type allows child_type as parent, can also be root
     let sub_code = format!(
-        "gts.cf.core.rg.type.v1~x.test.sub{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.sub{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1320,7 +1322,7 @@ async fn group_move_max_depth_exceeded() {
         common::create_root_group(&group_svc, &ctx, &sub_code, "Standalone", tenant_id).await;
     // sub needs a type that allows sub_code as parent -- create another type for that
     let subsub_code = format!(
-        "gts.cf.core.rg.type.v1~x.test.subsub{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.subsub{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1929,7 +1931,7 @@ async fn create_adr_types(
     let course_type = common::create_root_type(type_svc, "adrcourse").await;
 
     let suffix_t = format!("adrtenant{}", uuid::Uuid::now_v7().as_simple());
-    let tenant_code = format!("gts.cf.core.rg.type.v1~x.test.{suffix_t}.v1~");
+    let tenant_code = format!("{}x.test.{suffix_t}.v1~", gts_id!("cf.core.rg.type.v1~"));
 
     // Tenant type: create first without self-reference, then update
     type_svc

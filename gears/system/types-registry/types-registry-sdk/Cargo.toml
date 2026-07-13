@@ -43,3 +43,4 @@ serde_json = { workspace = true }
 
 # GTS types (from git dependency)
 gts = { workspace = true }
+toolkit-gts = { workspace = true }

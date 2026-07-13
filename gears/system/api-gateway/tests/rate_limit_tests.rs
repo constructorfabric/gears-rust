@@ -21,14 +21,15 @@ use toolkit::{
     contracts::{ApiGatewayCapability, OpenApiRegistry},
 };
 use toolkit_canonical_errors::Problem;
+use toolkit_gts::gts_uri;
 use tower::ServiceExt;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 const RESOURCE_EXHAUSTED_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~");
 const SERVICE_UNAVAILABLE_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~");
 const PROBLEM_JSON: &str = "application/problem+json";
 
 /// Helper to create a test `GearCtx`

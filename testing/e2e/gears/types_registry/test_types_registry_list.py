@@ -2,27 +2,30 @@
 import httpx
 import pytest
 
+GTS_ID_PREFIX = "gts" + "."
+GTS_URI_PREFIX = "gts://" + GTS_ID_PREFIX
+
 
 async def register_test_entities(client, base_url, auth_headers):
     """Helper to register test entities for list tests."""
     payload = {
         "entities": [
             {
-                "$id": "gts://gts.e2e.list.acme.models.user.v1~",
+                "$id": f"{GTS_URI_PREFIX}e2e.list.acme.models.user.v1~",
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
                 "description": "User type from acme vendor"
             },
             {
-                "$id": "gts://gts.e2e.list.acme.events.created.v1~",
+                "$id": f"{GTS_URI_PREFIX}e2e.list.acme.events.created.v1~",
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
                 "properties": {"timestamp": {"type": "string"}},
                 "description": "Created event from acme vendor"
             },
             {
-                "$id": "gts://gts.e2e.list.globex.models.product.v1~",
+                "$id": f"{GTS_URI_PREFIX}e2e.list.globex.models.product.v1~",
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
                 "properties": {"productId": {"type": "string"}},
@@ -402,7 +405,7 @@ async def test_list_entities_response_structure(base_url, auth_headers):
         payload = {
             "entities": [
                 {
-                    "$id": "gts://gts.e2e.structure.models.test.v1~",
+                    "$id": f"{GTS_URI_PREFIX}e2e.structure.models.test.v1~",
                     "$schema": "http://json-schema.org/draft-07/schema#",
                     "type": "object",
                     "properties": {"value": {"type": "string"}},

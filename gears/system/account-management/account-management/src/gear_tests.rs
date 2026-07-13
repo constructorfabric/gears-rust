@@ -10,6 +10,7 @@
 )]
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -27,6 +28,9 @@ use crate::domain::tenant::test_support::{
 
 use crate::domain::bootstrap::BootstrapService;
 use crate::domain::tenant::TenantRepo;
+
+const TENANT_SCHEMA: &str = gts_id!("cf.core.am.tenant.v1~");
+const TENANT_TYPE_SCHEMA: &str = gts_id!("cf.core.am.tenant_type.v1~");
 
 /// Test-only helper that combines bootstrap config validation + saga
 /// execution in one call, mirroring the split init/serve production
@@ -192,7 +196,7 @@ async fn stateful_task_shuts_down_on_cancel() {
 // + `FakeTenantRepo` infra; no `BootstrapService` mocking required.
 // ---------------------------------------------------------------------
 
-const ROOT_TENANT_TYPE: &str = "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~";
+const ROOT_TENANT_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.platform.v1~");
 
 fn root_id() -> Uuid {
     Uuid::from_u128(0x100)
@@ -410,9 +414,9 @@ fn stub_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
             // `validate_tenant_name_via_gts` rejects `root_name` and
             // the "valid config + CleanFailure" path never reaches
             // `FakeOutcome::CleanFailure`.
-            let (id, body) = if type_id == "gts.cf.core.am.tenant.v1~" {
+            let (id, body) = if type_id == TENANT_SCHEMA {
                 (
-                    "gts.cf.core.am.tenant.v1~",
+                    TENANT_SCHEMA,
                     serde_json::json!({
                         "type": "object",
                         "properties": {
@@ -421,7 +425,7 @@ fn stub_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
                     }),
                 )
             } else {
-                ("gts.cf.core.am.tenant_type.v1~", serde_json::json!({}))
+                (TENANT_TYPE_SCHEMA, serde_json::json!({}))
             };
             Ok(GtsTypeSchema::try_new(GtsTypeId::new(id), body, None, None)
                 .expect("canned root schema must construct"))

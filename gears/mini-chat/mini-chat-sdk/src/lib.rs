@@ -10,6 +10,7 @@ pub use audit_models::{
     TurnMutationAuditEvent, TurnMutationAuditEventType, TurnRetryAuditEvent,
 };
 pub use error::{MiniChatAuditPluginError, MiniChatModelPolicyPluginError, PublishError};
+pub use gts::{CHAT_RESOURCE_TYPE, MODEL_RESOURCE_TYPE, USER_QUOTA_RESOURCE_TYPE};
 pub use gts::{MiniChatAuditPluginSpecV1, MiniChatModelPolicyPluginSpecV1};
 pub use models::{
     EstimationBudgets, KillSwitches, ModelApiParams, ModelCatalogEntry, ModelGeneralConfig,

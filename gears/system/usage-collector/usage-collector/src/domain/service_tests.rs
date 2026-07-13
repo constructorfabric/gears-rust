@@ -312,6 +312,7 @@ mod create_usage_type_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use toolkit_gts::gts_id;
 
     use std::collections::BTreeSet;
 
@@ -332,8 +333,8 @@ mod create_usage_type_tests {
     use crate::domain::local_client::UsageCollectorLocalClient;
     use crate::domain::test_support::{CountingAllowAllResolver, DenyAllResolver, enforcer_for};
 
-    const COUNTER_ID: &str = "gts.cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1";
-    const GAUGE_ID: &str = "gts.cf.core.uc.usage_record.v1~example.usage._.cpu_load.v1";
+    const COUNTER_ID: &str = gts_id!("cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1");
+    const GAUGE_ID: &str = gts_id!("cf.core.uc.usage_record.v1~example.usage._.cpu_load.v1");
 
     fn keyset<const N: usize>(values: [&str; N]) -> BTreeSet<MetadataKey> {
         values
@@ -826,6 +827,7 @@ mod catalog_dispatch_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use toolkit_gts::gts_id;
 
     use async_trait::async_trait;
     use toolkit::client_hub::{ClientHub, ClientScope};
@@ -851,7 +853,7 @@ mod catalog_dispatch_tests {
             .collect()
     }
 
-    const COUNTER_ID: &str = "gts.cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1";
+    const COUNTER_ID: &str = gts_id!("cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1");
 
     // ── programmable stub plugin: per-op response queues + call counters ────
 
@@ -1434,6 +1436,7 @@ mod deactivate_usage_record_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use toolkit_gts::gts_id;
 
     use async_trait::async_trait;
     use toolkit::client_hub::{ClientHub, ClientScope};
@@ -1521,9 +1524,9 @@ mod deactivate_usage_record_tests {
         use usage_collector_sdk::{IdempotencyKey, ResourceRef, UsageRecordStatus, UsageTypeGtsId};
         UsageRecord {
             uuid: Uuid::from_u128(0xAAAA_AAAA),
-            gts_id: UsageTypeGtsId::new(
-                "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1",
-            )
+            gts_id: UsageTypeGtsId::new(gts_id!(
+                "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"
+            ))
             .expect("valid usage_record-derived gts_id"),
             tenant_id: Uuid::from_u128(2),
             resource_ref: ResourceRef::new("rsc-stub", "compute.vm").expect("valid resource ref"),
@@ -1964,6 +1967,7 @@ mod pdp_dedup_tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use toolkit_gts::gts_id;
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
@@ -1977,7 +1981,8 @@ mod pdp_dedup_tests {
         service_with_counting_permit,
     };
 
-    const HAPPY_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    const HAPPY_GTS_ID: &str =
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
     fn happy_usage_type() -> UsageType {
         UsageType {
@@ -2352,6 +2357,7 @@ mod gts_id_dedup_tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use toolkit_gts::gts_id;
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
@@ -2363,9 +2369,9 @@ mod gts_id_dedup_tests {
 
     use crate::domain::test_support::{HappyPathPlugin, authenticated_ctx, service_with_permit};
 
-    const GTS_A: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
-    const GTS_B: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_emitted.v1";
-    const GTS_C: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_buffered.v1";
+    const GTS_A: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+    const GTS_B: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_emitted.v1");
+    const GTS_C: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_buffered.v1");
 
     fn counter_usage_type() -> UsageType {
         UsageType {
@@ -2592,6 +2598,7 @@ mod corrects_id_dedup_tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use toolkit_gts::gts_id;
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
@@ -2603,7 +2610,8 @@ mod corrects_id_dedup_tests {
 
     use crate::domain::test_support::{HappyPathPlugin, authenticated_ctx, service_with_permit};
 
-    const COUNTER_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    const COUNTER_GTS_ID: &str =
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
     fn counter_usage_type() -> UsageType {
         UsageType {
@@ -2895,6 +2903,7 @@ mod corrects_id_dedup_tests {
 // - Prefetch transient error lifts to `ServiceUnavailable`.
 mod get_usage_record_tests {
     use std::sync::Arc;
+    use toolkit_gts::gts_id;
 
     use usage_collector_sdk::{
         USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginV1, UsageRecord,
@@ -2909,7 +2918,7 @@ mod get_usage_record_tests {
     };
 
     const HAPPY_RECORD_GTS_ID: &str =
-        "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
     fn sample_persisted_record(uuid: Uuid, tenant_id: Uuid) -> UsageRecord {
         use std::collections::BTreeMap;
@@ -3279,6 +3288,7 @@ mod private_helpers_tests {
 mod create_usage_record_path_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use toolkit_gts::gts_id;
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
@@ -3294,8 +3304,10 @@ mod create_usage_record_path_tests {
         service_with_permit,
     };
 
-    const COUNTER_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
-    const GAUGE_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_inflight.v1";
+    const COUNTER_GTS_ID: &str =
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+    const GAUGE_GTS_ID: &str =
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_inflight.v1");
 
     fn counter_usage_type() -> UsageType {
         UsageType {
@@ -3695,6 +3707,7 @@ mod create_usage_record_path_tests {
 mod batch_size_cap_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use toolkit_gts::gts_id;
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
@@ -3706,7 +3719,7 @@ mod batch_size_cap_tests {
     use crate::domain::service::MAX_BATCH_RECORDS;
     use crate::domain::test_support::{HappyPathPlugin, authenticated_ctx, service_with_permit};
 
-    const GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
     fn counter_usage_type() -> UsageType {
         UsageType {

@@ -35,20 +35,20 @@ use crate::domain::error::ChatEngineError;
 // ---------------------------------------------------------------------------
 
 /// Session-scoped error type used for not-found / conflict mappings.
-#[resource_error("gts.cf.core.chat_engine.session.v1~")]
+#[resource_error(gts_id!("cf.core.chat_engine.session.v1~"))]
 pub struct ChatEngineSessionError;
 
 /// Message-scoped error type.
-#[resource_error("gts.cf.core.chat_engine.message.v1~")]
+#[resource_error(gts_id!("cf.core.chat_engine.message.v1~"))]
 pub struct ChatEngineMessageError;
 
 /// Plugin-scoped error type (used by `BackendUnavailable`).
-#[resource_error("gts.cf.core.chat_engine.plugin.v1~")]
+#[resource_error(gts_id!("cf.core.chat_engine.plugin.v1~"))]
 pub struct ChatEnginePluginError;
 
 /// Generic chat-engine resource type used when the inner variant lacks a
 /// more precise scope.
-#[resource_error("gts.cf.core.chat_engine.resource.v1~")]
+#[resource_error(gts_id!("cf.core.chat_engine.resource.v1~"))]
 pub struct ChatEngineResourceError;
 
 // ---------------------------------------------------------------------------

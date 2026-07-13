@@ -4,7 +4,7 @@ use crate::infra::storage::sea_orm_repo::SeaOrmSettingsRepository;
 use axum::http::StatusCode;
 use axum::{Extension, Router};
 use std::sync::Arc;
-use toolkit::api::operation_builder::LicenseFeature;
+use toolkit::api::operation_builder::{CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature};
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 /// Type alias for the concrete service type.
@@ -14,7 +14,7 @@ struct License;
 
 impl AsRef<str> for License {
     fn as_ref(&self) -> &'static str {
-        "gts.cf.core.lic.feat.v1~cf.core.global.base.v1"
+        CORE_GLOBAL_BASE_LICENSE_FEATURE
     }
 }
 
@@ -97,10 +97,7 @@ mod tests {
     #[test]
     fn test_license_as_ref() {
         let license = License;
-        assert_eq!(
-            license.as_ref(),
-            "gts.cf.core.lic.feat.v1~cf.core.global.base.v1"
-        );
+        assert_eq!(license.as_ref(), CORE_GLOBAL_BASE_LICENSE_FEATURE);
     }
 
     #[test]

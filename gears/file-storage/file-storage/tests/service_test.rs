@@ -13,6 +13,7 @@ use bytes::Bytes;
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -29,7 +30,7 @@ use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 
-const GTS: &str = "gts.cf.fstorage.file.type.v1~x.test.v1~";
+const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
 async fn build_service() -> (Arc<FileService>, DataPlaneService) {
     let (svc, dp, _store) = build_service_with_page_sizes(50, 1000).await;

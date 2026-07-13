@@ -26,13 +26,13 @@
 //!    cost struct, and any provider-specific helper enums (response format
 //!    variants, tool-choice shapes, etc.).
 //!
-//! 2. Decorate the aggregate with [`gts_macros::struct_to_gts_schema`]:
+//! 2. Decorate the aggregate with [`toolkit_gts::gts_type_schema`]:
 //!
 //!    ```ignore
-//!    #[struct_to_gts_schema(
+//!    #[gts_type_schema(
 //!        dir_path = "schemas",
 //!        base = ModelInfoV1,
-//!        type_id = "gts.cf.genai.model.info.v1~<vendor>.<package>.<name>.v<n>~",
+//!        type_id = gts_id!("cf.genai.model.info.v1~<vendor>.<package>.<name>.v<n>~"),
 //!        description = "<Name> provider settings",
 //!        properties = "<comma-separated list of every flat field, ending with `cost`>"
 //!    )]

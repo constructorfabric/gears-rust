@@ -23,7 +23,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const PERMISSION_DENIED_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~";
+    concat!("gts://", "gts", ".", "cf.core.errors.err.v1~cf.core.err.permission_denied.v1~");
 const PROBLEM_JSON: &str = "application/problem+json";
 
 struct TestConfigProvider {

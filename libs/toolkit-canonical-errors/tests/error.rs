@@ -2,8 +2,9 @@ extern crate toolkit_canonical_errors;
 
 use toolkit_canonical_errors::resource_error;
 use toolkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_gts::{GtsId, gts_id};
 
-#[resource_error("gts.cf.core.users.user.v1~")]
+#[resource_error(gts_id!("cf.core.users.user.v1~"))]
 struct R;
 
 #[test]
@@ -13,7 +14,7 @@ fn not_found_gts_type() {
         .create();
     assert_eq!(
         err.gts_type(),
-        "gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~"
+        gts_id!("cf.core.errors.err.v1~cf.core.err.not_found.v1~")
     );
 }
 
@@ -110,7 +111,7 @@ fn from_io_error_produces_internal() {
     assert_eq!(err.title(), "Internal");
     assert_eq!(
         err.gts_type(),
-        "gts.cf.core.errors.err.v1~cf.core.err.internal.v1~"
+        gts_id!("cf.core.errors.err.v1~cf.core.err.internal.v1~")
     );
 }
 
@@ -126,7 +127,7 @@ fn from_serde_json_error_produces_invalid_argument() {
     assert_eq!(err.detail(), raw_msg);
     assert_eq!(
         err.gts_type(),
-        "gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"
+        gts_id!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~")
     );
     assert_eq!(err.diagnostic(), None);
 }
@@ -153,7 +154,7 @@ fn question_mark_propagation_serde_json() {
     assert_eq!(err.status_code(), 400);
     assert_eq!(
         err.gts_type(),
-        "gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"
+        gts_id!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~")
     );
 }
 
@@ -202,7 +203,6 @@ fn validate_all_gts_ids() {
     for err in &errors {
         let id = err.gts_type();
         assert!(id.ends_with('~'), "GTS type ID must end with ~: {id}");
-        gts_id::validate_gts_id(id, false)
-            .unwrap_or_else(|e| panic!("Invalid GTS type ID '{id}': {e}"));
+        GtsId::try_new(id).unwrap_or_else(|e| panic!("Invalid GTS type ID '{id}': {e}"));
     }
 }

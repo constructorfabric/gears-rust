@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
-use resource_group_sdk::models::ResourceGroupMembership;
+use resource_group_sdk::{GROUP_MEMBERSHIP_RESOURCE_TYPE, models::ResourceGroupMembership};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
@@ -22,7 +22,7 @@ use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeR
 
 /// `AuthZ` resource type descriptor for group memberships.
 pub const RG_MEMBERSHIP_RESOURCE: ResourceType = ResourceType::from_static(
-    "gts.cf.core.rg.group_membership.v1~",
+    GROUP_MEMBERSHIP_RESOURCE_TYPE,
     &[pep_properties::OWNER_TENANT_ID],
 );
 

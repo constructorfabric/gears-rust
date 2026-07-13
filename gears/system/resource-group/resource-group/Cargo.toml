@@ -66,6 +66,7 @@ gts = { workspace = true }
 toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-gts = { workspace = true }
 toolkit-db-macros = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }

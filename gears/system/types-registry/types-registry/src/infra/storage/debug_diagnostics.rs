@@ -7,6 +7,7 @@
 //! - Cycle detection for circular schema references
 
 use std::collections::HashSet;
+use toolkit_gts::GTS_ID_URI_PREFIX;
 
 use gts::GtsOps;
 use serde_json::Value;
@@ -217,13 +218,16 @@ fn collect_schema_refs(schema: &Value) -> Vec<String> {
 /// Normalizes a reference to a GTS ID.
 ///
 /// Handles both:
-/// - Direct GTS IDs: `gts.vendor.pkg.ns.type.v1~`
-/// - URI format: `gts://gts.vendor.pkg.ns.type.v1~`
+/// - Direct GTS IDs
+/// - GTS URI format
 fn normalize_gts_ref(ref_val: &str) -> Option<String> {
-    let cleaned = ref_val.strip_prefix("gts://").unwrap_or(ref_val);
+    let cleaned = ref_val.strip_prefix(GTS_ID_URI_PREFIX).unwrap_or(ref_val);
 
-    // Only return if it looks like a GTS ID
-    if cleaned.starts_with("gts.") {
+    // Only return if it parses as a concrete GTS ID under the configured
+    // prefix. A bare prefix check would miss malformed-but-prefixed ids and
+    // would silently hard-code the prefix; the parser is the spec source of
+    // truth.
+    if gts::GtsId::try_new(cleaned).is_ok() {
         Some(cleaned.to_owned())
     } else {
         None
@@ -234,47 +238,49 @@ fn normalize_gts_ref(ref_val: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use toolkit_gts::{gts_id, gts_uri};
 
     #[test]
     fn test_extract_schema_id() {
-        assert_eq!(
-            extract_schema_id("gts.vendor.pkg.ns.type.v1~vendor.app.instance.v1"),
-            Some("gts.vendor.pkg.ns.type.v1~".to_owned())
-        );
+        const INSTANCE_ID: &str = gts_id!("vendor.pkg.ns.type.v1~vendor.app.ns.instance.v1");
+        const SCHEMA_ID: &str = gts_id!("vendor.pkg.ns.type.v1~");
+
+        assert_eq!(extract_schema_id(INSTANCE_ID), Some(SCHEMA_ID.to_owned()));
         // Schema IDs (ending with ~) don't have an "instance" portion
-        assert_eq!(extract_schema_id("gts.vendor.pkg.ns.type.v1~"), None);
+        assert_eq!(extract_schema_id(SCHEMA_ID), None);
         assert_eq!(extract_schema_id("no-tilde"), None);
     }
 
     #[test]
     fn test_normalize_gts_ref() {
-        assert_eq!(
-            normalize_gts_ref("gts://gts.vendor.pkg.ns.type.v1~"),
-            Some("gts.vendor.pkg.ns.type.v1~".to_owned())
-        );
-        assert_eq!(
-            normalize_gts_ref("gts.vendor.pkg.ns.type.v1~"),
-            Some("gts.vendor.pkg.ns.type.v1~".to_owned())
-        );
+        const SCHEMA_ID: &str = gts_id!("vendor.pkg.ns.type.v1~");
+        const SCHEMA_URI: &str = gts_uri!("vendor.pkg.ns.type.v1~");
+
+        assert_eq!(normalize_gts_ref(SCHEMA_URI), Some(SCHEMA_ID.to_owned()));
+        assert_eq!(normalize_gts_ref(SCHEMA_ID), Some(SCHEMA_ID.to_owned()));
         assert_eq!(normalize_gts_ref("#/definitions/Something"), None);
         assert_eq!(normalize_gts_ref("http://example.com/schema"), None);
     }
 
     #[test]
     fn test_collect_schema_refs() {
+        const BASE_ID: &str = gts_id!("vendor.pkg.ns.base.v1~");
+        const MIXIN_ID: &str = gts_id!("vendor.pkg.ns.mixin.v1~");
+        const OTHER_ID: &str = gts_id!("vendor.pkg.ns.other.v1~");
+
         let schema = json!({
-            "$ref": "gts://gts.vendor.pkg.ns.base.v1~",
+            "$ref": gts_uri!("vendor.pkg.ns.base.v1~"),
             "allOf": [
-                { "$ref": "gts.vendor.pkg.ns.mixin.v1~" }
+                { "$ref": MIXIN_ID }
             ],
-            "x-gts-ref": "gts.vendor.pkg.ns.other.v1~"
+            "x-gts-ref": OTHER_ID
         });
 
         let refs = collect_schema_refs(&schema);
         assert_eq!(refs.len(), 3);
-        assert!(refs.contains(&"gts.vendor.pkg.ns.base.v1~".to_owned()));
-        assert!(refs.contains(&"gts.vendor.pkg.ns.mixin.v1~".to_owned()));
-        assert!(refs.contains(&"gts.vendor.pkg.ns.other.v1~".to_owned()));
+        assert!(refs.contains(&BASE_ID.to_owned()));
+        assert!(refs.contains(&MIXIN_ID.to_owned()));
+        assert!(refs.contains(&OTHER_ID.to_owned()));
     }
 
     #[test]
@@ -293,7 +299,7 @@ mod tests {
     #[test]
     fn test_cycle_detection_in_visited_set() {
         let mut visited: HashSet<String> = HashSet::new();
-        let type_id = "gts.vendor.pkg.ns.type.v1~";
+        let type_id = gts_id!("vendor.pkg.ns.type.v1~");
 
         // First visit should succeed
         assert!(!visited.contains(type_id));
@@ -306,11 +312,12 @@ mod tests {
     #[test]
     fn test_log_registration_failure_with_gts_id() {
         // This test verifies the function doesn't panic
+        const TYPE_ID: &str = gts_id!("acme.core.events.test.v1~");
         let entity = json!({
-            "$id": "gts://gts.acme.core.events.test.v1~",
+            "$id": gts_uri!("acme.core.events.test.v1~"),
             "type": "object"
         });
-        log_registration_failure(Some("gts.acme.core.events.test.v1~"), &entity, "Test error");
+        log_registration_failure(Some(TYPE_ID), &entity, "Test error");
     }
 
     #[test]
@@ -325,36 +332,39 @@ mod tests {
     #[test]
     fn test_log_schema_validation_failure() {
         // This test verifies the function doesn't panic
+        const TYPE_ID: &str = gts_id!("acme.core.events.test.v1~");
         let schema = json!({
-            "$id": "gts://gts.acme.core.events.test.v1~",
+            "$id": gts_uri!("acme.core.events.test.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "invalid_type"
         });
-        log_schema_validation_failure("gts.acme.core.events.test.v1~", &schema, "Invalid type");
+        log_schema_validation_failure(TYPE_ID, &schema, "Invalid type");
     }
 
     #[test]
     fn test_extract_schema_id_with_chained_instance() {
         // Instance with multiple segments
-        assert_eq!(
-            extract_schema_id("gts.a.b.c.d.v1~vendor.app.x.y.v1"),
-            Some("gts.a.b.c.d.v1~".to_owned())
-        );
+        const INSTANCE_ID: &str = gts_id!("a.b.c.d.v1~vendor.app.x.y.v1");
+        const SCHEMA_ID: &str = gts_id!("a.b.c.d.v1~");
+        assert_eq!(extract_schema_id(INSTANCE_ID), Some(SCHEMA_ID.to_owned()));
     }
 
     #[test]
     fn test_collect_schema_refs_nested_allof() {
+        const BASE1_ID: &str = gts_id!("vendor.pkg.ns.base1.v1~");
+        const BASE2_ID: &str = gts_id!("vendor.pkg.ns.base2.v1~");
+
         let schema = json!({
             "allOf": [
-                { "$ref": "gts.vendor.pkg.ns.base1.v1~" },
-                { "$ref": "gts.vendor.pkg.ns.base2.v1~" },
+                { "$ref": BASE1_ID },
+                { "$ref": BASE2_ID },
                 { "type": "object" }
             ]
         });
 
         let refs = collect_schema_refs(&schema);
         assert_eq!(refs.len(), 2);
-        assert!(refs.contains(&"gts.vendor.pkg.ns.base1.v1~".to_owned()));
-        assert!(refs.contains(&"gts.vendor.pkg.ns.base2.v1~".to_owned()));
+        assert!(refs.contains(&BASE1_ID.to_owned()));
+        assert!(refs.contains(&BASE2_ID.to_owned()));
     }
 }

@@ -136,6 +136,7 @@ pub struct ProviderV1 {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+    use toolkit_gts::gts_id;
 
     use gts::GtsSchema;
 
@@ -289,7 +290,7 @@ mod tests {
         // caller asks for OpenAi — typed-narrowing must surface a SchemaId
         // error rather than silently deserializing the wrong shape.
         let m = raw_model(
-            "gts.cf.genai.model.info.v1~cf.genai._.anthropic.v1~",
+            gts_id!("cf.genai.model.info.v1~cf.genai._.anthropic.v1~"),
             openai_payload(),
         );
         let err = m
@@ -300,7 +301,7 @@ mod tests {
                 assert_eq!(expected, OpenAiSettingsV1::TYPE_ID);
                 assert_eq!(
                     actual,
-                    "gts.cf.genai.model.info.v1~cf.genai._.anthropic.v1~"
+                    gts_id!("cf.genai.model.info.v1~cf.genai._.anthropic.v1~")
                 );
             }
             other @ gts::NarrowError::Deserialize(_) => {
@@ -313,7 +314,7 @@ mod tests {
     fn try_into_typed_fails_on_unknown_gts_type() {
         // Unknown / unmodeled provider — base envelope schema with no leaf.
         let m = raw_model(
-            "gts.cf.genai.model.info.v1~",
+            gts_id!("cf.genai.model.info.v1~"),
             serde_json::json!({ "anything": "goes" }),
         );
         let err = m

@@ -34,6 +34,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -50,7 +51,7 @@ use crate::domain::tenant_type::checker::TenantTypeChecker;
 /// `allowed_parent_types` trait — they're rejected as
 /// [`DomainError::InvalidTenantType`] regardless of what the
 /// effective-trait merge produces.
-const TENANT_TYPE_BASE_GTS_ID: &str = "gts.cf.core.am.tenant_type.v1~";
+const TENANT_TYPE_BASE_GTS_ID: &str = gts_id!("cf.core.am.tenant_type.v1~");
 
 /// Top-level key on the effective trait map carrying the list of
 /// admitted parent GTS identifiers. Defined on

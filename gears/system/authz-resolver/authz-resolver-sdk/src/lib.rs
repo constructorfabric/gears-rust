@@ -19,7 +19,7 @@
 //! };
 //!
 //! const USER: ResourceType = ResourceType::from_static(
-//!     "gts.cf.core.users.user.v1~",
+//!     gts_id!("cf.core.users.user.v1~"),
 //!     &["owner_tenant_id", "id"],
 //! );
 //!

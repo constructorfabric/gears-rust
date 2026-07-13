@@ -11,6 +11,9 @@ use serde::Deserialize;
 use crate::domain::claim_mapper::{ClaimMapperConfig, ClaimMapperOptions};
 use crate::infra::url_policy::UrlSecurityPolicy;
 
+#[cfg(test)]
+use toolkit_gts::gts_id;
+
 /// Stable plugin instance suffix used by `AuthN` resolver plugin selection.
 pub const INSTANCE_SUFFIX: &str = "cf.builtin.oidc_authn_resolver.plugin.v1";
 
@@ -1114,6 +1117,14 @@ fn parse_duration_millis(input: &str) -> Result<u64> {
 }
 
 #[cfg(test)]
+fn expand_test_gts(json: &str) -> String {
+    json.replace("{subject_user_type}", SUBJECT_USER_TYPE)
+}
+
+#[cfg(test)]
+const SUBJECT_USER_TYPE: &str = gts_id!("cf.core.security.subject_user.v1~");
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1509,11 +1520,11 @@ mod gear_input_tests {
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
                 "token_cache": { "ttl": "600s", "max_entries": 120 },
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("documented config should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("documented config should deserialize");
         let resolved = config
             .resolve()
             .expect("documented config should resolve to runtime config");
@@ -1558,10 +1569,7 @@ mod gear_input_tests {
             resolved.plugin.s2s.discovery_url.as_str(),
             "https://oidc/realms/platform"
         );
-        assert_eq!(
-            resolved.plugin.s2s_default_subject_type,
-            "gts.cf.core.security.subject_user.v1~"
-        );
+        assert_eq!(resolved.plugin.s2s_default_subject_type, SUBJECT_USER_TYPE);
         assert_eq!(resolved.plugin.s2s.token_cache_ttl_secs, 600);
         assert_eq!(resolved.plugin.s2s.token_cache_max_entries, 120);
         assert_eq!(resolved.request_timeout, Duration::from_secs(5));
@@ -1589,11 +1597,11 @@ mod gear_input_tests {
             },
             "s2s_oauth": {
                 "discovery_url": "https://obo.example.com",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("per-issuer override config should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("per-issuer override config should deserialize");
         let resolved = config
             .resolve()
             .expect("per-issuer override config should resolve");
@@ -1629,7 +1637,7 @@ mod gear_input_tests {
                 "discovery_url": "https://oidc/realms/platform"
             }
         }"#;
-        let error = serde_json::from_str::<OidcAuthNGearConfig>(json)
+        let error = serde_json::from_str::<OidcAuthNGearConfig>(&expand_test_gts(json))
             .expect_err("missing S2S default subject type should fail deserialization");
 
         assert!(
@@ -1652,8 +1660,8 @@ mod gear_input_tests {
                 "default_subject_type": "   "
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("blank string should deserialize before validation");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("blank string should deserialize before validation");
         let error = config
             .resolve()
             .expect_err("blank S2S default subject type should fail resolution");
@@ -1676,11 +1684,11 @@ mod gear_input_tests {
             "http_client": { "custom_ca_certificate_paths": ["   "] },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("blank CA path should deserialize before validation");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("blank CA path should deserialize before validation");
         let error = config
             .resolve()
             .expect_err("blank CA path should fail resolution");
@@ -1703,11 +1711,11 @@ mod gear_input_tests {
             "http_client": { "request_timeout": "0s" },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("zero request timeout should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("zero request timeout should deserialize");
         let error = config
             .resolve()
             .expect_err("zero request timeout should fail resolution");
@@ -1729,11 +1737,11 @@ mod gear_input_tests {
             },
             "s2s_oauth": {
                 "discovery_url": "   ",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("blank string should deserialize before validation");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("blank string should deserialize before validation");
         let error = config
             .resolve()
             .expect_err("blank S2S discovery URL should fail resolution");
@@ -1755,10 +1763,10 @@ mod gear_input_tests {
             },
             "s2s_oauth": {
                 "discovery_url": "http://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let error = serde_json::from_str::<OidcAuthNGearConfig>(json)
+        let error = serde_json::from_str::<OidcAuthNGearConfig>(&expand_test_gts(json))
             .expect("config JSON should parse")
             .resolve()
             .expect_err("HTTP S2S discovery URL should fail under default URL policy");
@@ -1778,11 +1786,11 @@ mod gear_input_tests {
             },
             "s2s_oauth": {
                 "discovery_url": "  https://oidc/realms/platform  ",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("padded discovery URL should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("padded discovery URL should deserialize");
         let resolved = config
             .resolve()
             .expect("padded discovery URL should resolve");
@@ -1802,10 +1810,10 @@ mod gear_input_tests {
             },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig = serde_json::from_str(json)
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
             .expect("blank subject tenant ID should deserialize before validation");
         let error = config
             .resolve()
@@ -1829,11 +1837,11 @@ mod gear_input_tests {
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
                 "claim_mapping": { "subject_tenant_id": "  s2s_tenant_id  " },
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("padded subject tenant IDs should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("padded subject tenant IDs should deserialize");
         let resolved = config
             .resolve()
             .expect("padded subject tenant IDs should resolve");
@@ -1856,11 +1864,11 @@ mod gear_input_tests {
             },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("optional audience config should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("optional audience config should deserialize");
         let resolved = config
             .resolve()
             .expect("optional audience config should resolve");
@@ -1883,11 +1891,11 @@ mod gear_input_tests {
             },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("algorithm subset config should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("algorithm subset config should deserialize");
         let resolved = config
             .resolve()
             .expect("algorithm subset config should resolve");
@@ -1909,11 +1917,11 @@ mod gear_input_tests {
             },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("unsupported algorithm config should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("unsupported algorithm config should deserialize");
         let error = config
             .resolve()
             .expect_err("unsupported algorithm should fail resolution");
@@ -1936,11 +1944,11 @@ mod gear_input_tests {
             },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("clock skew config should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("clock skew config should deserialize");
         let error = config
             .resolve()
             .expect_err("clock skew over 300s should fail resolution");
@@ -1963,11 +1971,11 @@ mod gear_input_tests {
             "jwks_cache": { "ttl": "10m", "stale_ttl": "5m" },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("stale ttl config should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("stale ttl config should deserialize");
         let error = config
             .resolve()
             .expect_err("stale ttl shorter than fresh ttl should fail resolution");
@@ -1992,12 +2000,12 @@ mod gear_input_tests {
                     "circuit_breaker": {{ "reset_timeout": "{reset_timeout}" }},
                     "s2s_oauth": {{
                         "discovery_url": "https://oidc/realms/platform",
-                        "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                        "default_subject_type": "{{subject_user_type}}"
                     }}
                 }}"#
             );
-            let config: OidcAuthNGearConfig =
-                serde_json::from_str(&json).expect("reset timeout config should deserialize");
+            let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(&json))
+                .expect("reset timeout config should deserialize");
             let error = config
                 .resolve()
                 .expect_err("zero reset timeout should fail resolution");
@@ -2021,11 +2029,11 @@ mod gear_input_tests {
             "jwks_cache": { "ttl": "10m", "stale_ttl": "0s" },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
-                "default_subject_type": "gts.cf.core.security.subject_user.v1~"
+                "default_subject_type": "{subject_user_type}"
             }
         }"#;
-        let config: OidcAuthNGearConfig =
-            serde_json::from_str(json).expect("zero stale ttl config should deserialize");
+        let config: OidcAuthNGearConfig = serde_json::from_str(&expand_test_gts(json))
+            .expect("zero stale ttl config should deserialize");
         let resolved = config
             .resolve()
             .expect("zero stale ttl should disable stale fallback");

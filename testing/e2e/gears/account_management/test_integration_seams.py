@@ -64,6 +64,9 @@ from .conftest import (
     unique_name,
 )
 
+GTS_ID_PREFIX = "gts" + "."
+GTS_URI_PREFIX = "gts://" + GTS_ID_PREFIX
+
 
 # ── S1: Route smoke ─────────────────────────────────────────────────────
 
@@ -90,7 +93,7 @@ def _route_reached(r: httpx.Response) -> bool:
         return False
     return isinstance(body, dict) and isinstance(body.get("type"), str) and body[
         "type"
-    ].startswith("gts://gts.cf.core.errors.err.v1~")
+    ].startswith(f"{GTS_URI_PREFIX}cf.core.errors.err.v1~")
 
 
 @pytest.mark.smoke

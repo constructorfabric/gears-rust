@@ -18,6 +18,7 @@
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::macros::datetime;
+use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use account_management_sdk::{IdpUser, MetadataEntry, Tenant, TenantId, TenantStatus};
@@ -36,7 +37,11 @@ fn sample_tenant() -> Uuid {
 }
 
 fn sample_schema() -> &'static str {
-    "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.theme.v1~"
+    gts_id!("cf.core.am.tenant_metadata.v1~vendor.app.metadata.theme.v1~")
+}
+
+fn sample_tenant_type() -> &'static str {
+    gts_id!("cf.core.am.tenant_type.v1~vendor.app.tenant.customer.v1~")
 }
 
 fn sample_updated() -> OffsetDateTime {
@@ -395,7 +400,7 @@ fn sample_active_tenant() -> Tenant {
         id: sample_tenant_id(),
         name: "acme corp".into(),
         status: TenantStatus::Active,
-        tenant_type: Some("gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~".into()),
+        tenant_type: Some(sample_tenant_type().into()),
         parent_id: Some(sample_parent_id()),
         self_managed: false,
         depth: 2,
@@ -416,7 +421,7 @@ fn tenant_dto_active_wire_shape_mirrors_openapi() {
             "id": "33333333-3333-3333-3333-333333333333",
             "name": "acme corp",
             "status": "active",
-            "tenant_type": "gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~",
+            "tenant_type": sample_tenant_type(),
             "parent_id": "44444444-4444-4444-4444-444444444444",
             "self_managed": false,
             "depth": 2,
@@ -483,18 +488,16 @@ fn tenant_create_request_required_fields_only_deserialise() {
     // `name`, `parent_id`, `tenant_type` are the required wire fields;
     // `self_managed` defaults to `false`, `provisioning_metadata` to
     // `None`. The lowering generates a fresh UUIDv4 for the child id.
-    let raw = r#"{
+    let raw = json!({
         "name": "acme corp",
         "parent_id": "44444444-4444-4444-4444-444444444444",
-        "tenant_type": "gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~"
-    }"#;
-    let dto: TenantCreateRequestDto = serde_json::from_str(raw).unwrap();
+        "tenant_type": sample_tenant_type()
+    })
+    .to_string();
+    let dto: TenantCreateRequestDto = serde_json::from_str(&raw).unwrap();
     assert_eq!(dto.name, "acme corp");
     assert_eq!(dto.parent_id, sample_parent_id().0);
-    assert_eq!(
-        dto.tenant_type,
-        "gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~"
-    );
+    assert_eq!(dto.tenant_type, sample_tenant_type());
     assert!(!dto.self_managed);
     assert!(dto.provisioning_metadata.is_none());
 
@@ -512,14 +515,15 @@ fn tenant_create_request_required_fields_only_deserialise() {
 
 #[test]
 fn tenant_create_request_full_payload_round_trips_into_sdk() {
-    let raw = r#"{
+    let raw = json!({
         "name": "acme child",
         "parent_id": "44444444-4444-4444-4444-444444444444",
-        "tenant_type": "gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~",
+        "tenant_type": sample_tenant_type(),
         "self_managed": true,
         "provisioning_metadata": {"vendor": "okta", "domain": "acme.example"}
-    }"#;
-    let dto: TenantCreateRequestDto = serde_json::from_str(raw).unwrap();
+    })
+    .to_string();
+    let dto: TenantCreateRequestDto = serde_json::from_str(&raw).unwrap();
     let request = dto.into_sdk_create_request();
     assert!(request.self_managed);
     assert_eq!(
@@ -571,13 +575,14 @@ fn tenant_create_request_rejects_non_object_provisioning_metadata() {
     // plugin (which has no input validation in this layer). The
     // happy path with a JSON object is covered by
     // `tenant_create_request_full_payload_round_trips_into_sdk`.
-    let raw_array = r#"{
+    let raw_array = json!({
         "name": "acme corp",
         "parent_id": "44444444-4444-4444-4444-444444444444",
-        "tenant_type": "gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~",
+        "tenant_type": sample_tenant_type(),
         "provisioning_metadata": [1, 2, 3]
-    }"#;
-    let err = serde_json::from_str::<TenantCreateRequestDto>(raw_array)
+    })
+    .to_string();
+    let err = serde_json::from_str::<TenantCreateRequestDto>(&raw_array)
         .expect_err("provisioning_metadata must be object | null per yaml");
     // serde reports the typed deserialise mismatch by shape ("expected
     // a map") rather than by field name. Either signal is fine as long
@@ -588,25 +593,27 @@ fn tenant_create_request_rejects_non_object_provisioning_metadata() {
         "error pinpoints the type mismatch: got `{err}`",
     );
 
-    let raw_string = r#"{
+    let raw_string = json!({
         "name": "acme corp",
         "parent_id": "44444444-4444-4444-4444-444444444444",
-        "tenant_type": "gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~",
+        "tenant_type": sample_tenant_type(),
         "provisioning_metadata": "literal"
-    }"#;
+    })
+    .to_string();
     assert!(
-        serde_json::from_str::<TenantCreateRequestDto>(raw_string).is_err(),
+        serde_json::from_str::<TenantCreateRequestDto>(&raw_string).is_err(),
         "string provisioning_metadata must also be rejected",
     );
 
     // `null` explicitly is admissible per yaml `type: [object, 'null']`.
-    let raw_null = r#"{
+    let raw_null = json!({
         "name": "acme corp",
         "parent_id": "44444444-4444-4444-4444-444444444444",
-        "tenant_type": "gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~",
+        "tenant_type": sample_tenant_type(),
         "provisioning_metadata": null
-    }"#;
-    let dto: TenantCreateRequestDto = serde_json::from_str(raw_null).unwrap();
+    })
+    .to_string();
+    let dto: TenantCreateRequestDto = serde_json::from_str(&raw_null).unwrap();
     assert!(dto.provisioning_metadata.is_none());
 }
 
@@ -673,13 +680,14 @@ fn tenant_create_request_rejects_unknown_fields() {
     // field) would otherwise receive `201 Created` for a
     // server-allocated UUID DIFFERENT from the one they sent —
     // believing it created a specific tenant id when it did not.
-    let raw = r#"{
+    let raw = json!({
         "name": "acme corp",
         "parent_id": "44444444-4444-4444-4444-444444444444",
-        "tenant_type": "gts.cf.core.am.tenant_type.v1~vendor.app.customer.v1~",
+        "tenant_type": sample_tenant_type(),
         "child_id": "55555555-5555-5555-5555-555555555555"
-    }"#;
-    let err = serde_json::from_str::<TenantCreateRequestDto>(raw)
+    })
+    .to_string();
+    let err = serde_json::from_str::<TenantCreateRequestDto>(&raw)
         .expect_err("child_id is not part of the wire contract");
     assert!(
         err.to_string().contains("child_id") || err.to_string().contains("unknown"),

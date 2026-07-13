@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+// `GTS_ID_PREFIX` is the compile-time configured GTS identifier prefix
+// (overridable via the `GTS_ID_PREFIX` env var at build
+// time). Used to assemble the canonical error type id prefix without
+// hard-coding the literal prefix.
+use toolkit_gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, gts_uri};
+
 use crate::context::{
     Aborted, AlreadyExists, Cancelled, DataLoss, DeadlineExceeded, FailedPrecondition, Internal,
     InvalidArgument, NotFound, OutOfRange, PermissionDenied, ResourceExhausted, ServiceUnavailable,
@@ -38,7 +44,7 @@ impl Problem {
     /// should never fail, but this keeps the failure visible rather than
     /// silently producing an empty `"context": {}`.
     pub fn from_error(err: &CanonicalError) -> Result<Self, serde_json::Error> {
-        let problem_type = format!("gts://{}", err.gts_type());
+        let problem_type = gts_uri!(err.gts_type());
         let title = err.title().to_owned();
         let status = err.status_code();
         let detail = err.detail().to_owned();
@@ -133,7 +139,7 @@ impl From<CanonicalError> for Problem {
         match Problem::from_error(&err) {
             Ok(p) => p,
             Err(ser_err) => Problem {
-                problem_type: format!("gts://{}", err.gts_type()),
+                problem_type: gts_uri!(err.gts_type()),
                 title: err.title().to_owned(),
                 status: err.status_code(),
                 detail: err.detail().to_owned(),
@@ -164,7 +170,7 @@ impl From<CanonicalError> for Problem {
 // ---------------------------------------------------------------------------
 
 /// Prefix on `Problem.problem_type` produced by the forward conversion.
-const PROBLEM_TYPE_PREFIX: &str = "gts://";
+const PROBLEM_TYPE_PREFIX: &str = GTS_ID_URI_PREFIX;
 
 /// Reasons a `Problem` cannot be reconstructed as a `CanonicalError`.
 #[derive(Debug, thiserror::Error)]
@@ -191,15 +197,28 @@ pub enum ProblemConversionError {
 /// itself — only the concatenation `{prefix}{category}{suffix}` is a valid
 /// GTS identifier.
 #[allow(unknown_lints, de0901_gts_string_pattern)]
-const GTS_TYPE_PREFIX: &str = "gts.cf.core.errors.err.v1~cf.core.err.";
-/// Suffix of every canonical GTS identifier. See [`GTS_TYPE_PREFIX`].
+/// Prefix of every canonical GTS error type id. Built by concatenating the
+/// configured GTS ID prefix (overridable via `GTS_ID_PREFIX`
+/// at compile time) with the fixed "cf.core.errors.err.v1~cf.core.err."
+/// suffix. This is *not* a complete GTS id (the trailing per-error token is
+/// appended at runtime in `CanonicalError::gts_type`), so `gts_id!` (which
+/// validates a full id at macro-expansion time) is not applicable here.
+/// `concat!` also cannot be used since it only accepts literals; the value
+/// is therefore materialised once via a `OnceLock` and exposed as a
+/// `&'static str`.
+fn gts_type_prefix() -> &'static str {
+    use std::sync::OnceLock;
+    static PREFIX: OnceLock<String> = OnceLock::new();
+    PREFIX.get_or_init(|| format!("{GTS_ID_PREFIX}cf.core.errors.err.v1~cf.core.err."))
+}
+/// Suffix of every canonical GTS identifier. See [`gts_type_prefix`].
 const GTS_TYPE_SUFFIX: &str = ".v1~";
 
-/// Strip `gts://gts.cf.core.errors.err.v1~cf.core.err.<category>.v1~` down to
+/// Strip the canonical problem-type URI down to
 /// `<category>`. Returns `None` if the URI doesn't match the canonical shape.
 fn category_from_problem_type(problem_type: &str) -> Option<&str> {
     let rest = problem_type.strip_prefix(PROBLEM_TYPE_PREFIX)?;
-    let after_prefix = rest.strip_prefix(GTS_TYPE_PREFIX)?;
+    let after_prefix = rest.strip_prefix(gts_type_prefix())?;
     after_prefix.strip_suffix(GTS_TYPE_SUFFIX)
 }
 
@@ -376,7 +395,12 @@ impl axum::response::IntoResponse for Problem {
                     status = self.status,
                     "failed to serialize Problem; emitting fallback body",
                 );
-                let body: &[u8] = br#"{"type":"gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~","title":"Internal","status":500,"detail":"failed to serialize problem","context":{}}"#;
+                let body = format!(
+                    r#"{{"type":"{}{}internal{}","title":"Internal","status":500,"detail":"failed to serialize problem","context":{{}}}}"#,
+                    PROBLEM_TYPE_PREFIX,
+                    gts_type_prefix(),
+                    GTS_TYPE_SUFFIX
+                );
                 (
                     http::StatusCode::INTERNAL_SERVER_ERROR,
                     [(http::header::CONTENT_TYPE, APPLICATION_PROBLEM_JSON)],

@@ -4,6 +4,7 @@
 //! ready for `TypesRegistryClient::register()`.
 
 use serde_json::{Value, json};
+use toolkit_gts::gts_uri;
 
 use super::gts_helpers::*;
 
@@ -13,7 +14,7 @@ use super::gts_helpers::*;
 /// a schema (type definition) rather than an instance.
 fn schema_entity(gts_id: &str, description: &str) -> Value {
     json!({
-        "$id": format!("gts://{gts_id}"),
+        "$id": gts_uri!(gts_id),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": description,
         "type": "object"
@@ -72,10 +73,11 @@ pub fn oagw_gts_entities() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use toolkit_gts::GTS_ID_URI_PREFIX;
 
     /// Strip the `gts://` URI prefix that schema `$id` fields use.
     fn strip_gts_uri(id: &str) -> &str {
-        id.strip_prefix("gts://").unwrap_or(id)
+        id.strip_prefix(GTS_ID_URI_PREFIX).unwrap_or(id)
     }
 
     #[test]
@@ -96,8 +98,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("entity missing $id: {entity}"));
             let id = strip_gts_uri(raw_id);
             assert!(
-                id.starts_with("gts."),
-                "GTS ID should start with 'gts.': {id}"
+                gts::GtsId::try_new(id).is_ok(),
+                "GTS ID should parse as a concrete GTS ID: {id}"
             );
         }
     }
@@ -108,7 +110,7 @@ mod tests {
             if entity.get("$schema").is_some() {
                 let id = entity["$id"].as_str().unwrap();
                 assert!(
-                    id.starts_with("gts://"),
+                    id.starts_with(GTS_ID_URI_PREFIX),
                     "Schema $id must use gts:// URI format: {id}"
                 );
             }
@@ -137,7 +139,7 @@ mod tests {
             let raw_id = entity["$id"].as_str().unwrap();
             let id = strip_gts_uri(raw_id);
             // Validate via the gts crate
-            gts::GtsID::new(id).unwrap_or_else(|e| panic!("invalid GTS ID '{id}': {e}"));
+            gts::GtsId::try_new(id).unwrap_or_else(|e| panic!("invalid GTS ID '{id}': {e}"));
         }
     }
 }

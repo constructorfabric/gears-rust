@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
+use toolkit_gts::gts_id;
 use toolkit_odata::{CursorV1, ODataQuery, Page as ODataPage, PageInfo, SortDir};
 use usage_collector_sdk::{
     AggregationBucket, AggregationOp, AggregationResult, AggregationSpec, IdempotencyKey,
@@ -39,7 +40,7 @@ use crate::domain::test_support::{
 };
 use usage_collector_sdk::UsageCollectorPluginError;
 
-const SAMPLE_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1";
+const SAMPLE_GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1");
 
 fn sample_record() -> UsageRecord {
     UsageRecord {
@@ -70,7 +71,7 @@ fn sample_usage_type() -> UsageType {
 /// refresh's `CursorV1::decode` succeeds and the pagination loop advances.
 fn encoded_cursor() -> String {
     CursorV1 {
-        k: vec!["gts.cf.core.uc.usage_record.v1~sample".to_owned()],
+        k: vec![gts_id!("cf.core.uc.usage_record.v1~example.usage._.sample.v1").to_owned()],
         o: SortDir::Asc,
         s: "gts_id".to_owned(),
         f: None,

@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
 use tenant_resolver_sdk::{
@@ -51,7 +52,7 @@ const DELETED: TenantStatus = TenantStatus::Deleted;
 
 // ── Registry stubs ────────────────────────────────────────────────────────
 
-const TEST_TYPE_ID: &str = "gts.cf.core.test.tenant.v1~";
+const TEST_TYPE_ID: &str = gts_id!("cf.core.test.tenant.v1~");
 
 /// Dual-mode stub: when `fail=false` it returns a fixed `GtsTypeSchema` for
 /// any UUID; when `fail=true` every lookup returns `CanonicalError::NotFound`.

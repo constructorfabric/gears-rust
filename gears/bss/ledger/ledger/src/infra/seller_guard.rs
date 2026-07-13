@@ -17,7 +17,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 /// Stamps `resource_type` on the rejection (the seller's ledger).
-#[resource_error("gts.cf.bss.ledger.ledger.v1~")]
+#[resource_error(gts_id!("cf.bss.ledger.ledger.v1~"))]
 struct LedgerResource;
 
 /// Narrow port: resolve a tenant's chained GTS tenant-type id. Adapts AM's

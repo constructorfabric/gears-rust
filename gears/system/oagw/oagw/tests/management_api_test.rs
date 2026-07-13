@@ -5,6 +5,9 @@
 #![cfg(not(feature = "fips"))]
 
 use oagw::test_support::{AppHarness, format_upstream_gts};
+use oagw_sdk::HTTP_PROTOCOL_ID;
+use toolkit_gts::gts_id;
+use toolkit_gts::gts_uri;
 use uuid::Uuid;
 
 // 7.8: POST upstream with valid body -> 201 + GTS id + alias generated.
@@ -19,7 +22,7 @@ async fn create_upstream_success() {
             "server": {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "enabled": true,
             "tags": []
         }))
@@ -28,7 +31,13 @@ async fn create_upstream_success() {
 
     let json = resp.json();
     let id_str = json["id"].as_str().unwrap();
-    assert!(id_str.starts_with("gts.cf.core.oagw.upstream.v1~"));
+    assert_eq!(
+        gts::GtsId::try_new(id_str)
+            .expect("upstream id should be a valid GTS id")
+            .get_type_id()
+            .as_deref(),
+        Some(gts_id!("cf.core.oagw.upstream.v1~"))
+    );
     assert_eq!(json["alias"].as_str().unwrap(), "api.openai.com");
 }
 
@@ -40,7 +49,7 @@ async fn create_upstream_missing_server_returns_422() {
     h.api_v1()
         .post_upstream()
         .with_body(serde_json::json!({
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1"
+            "protocol": HTTP_PROTOCOL_ID
         }))
         .expect_status(422)
         .await;
@@ -63,7 +72,7 @@ async fn get_upstream_by_gts_id() {
                         port: 443,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .build(),
         )
@@ -90,7 +99,7 @@ async fn get_upstream_invalid_gts_returns_400() {
     let json = resp.json();
     assert_eq!(
         json["type"].as_str().unwrap(),
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~")
     );
 }
 
@@ -120,7 +129,7 @@ async fn update_upstream_preserves_id() {
                         port: 443,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("openai")
             .build(),
@@ -137,7 +146,7 @@ async fn update_upstream_preserves_id() {
             "server": {
                 "endpoints": [{"host": "10.0.0.1", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "openai",
             "enabled": true,
             "tags": []
@@ -167,7 +176,7 @@ async fn delete_upstream_returns_204() {
                         port: 443,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .build(),
         )
@@ -196,7 +205,7 @@ async fn create_route_success() {
                         port: 443,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .build(),
         )
@@ -222,11 +231,12 @@ async fn create_route_success() {
         .await;
 
     let json = resp.json();
-    assert!(
-        json["id"]
-            .as_str()
-            .unwrap()
-            .starts_with("gts.cf.core.oagw.route.v1~")
+    assert_eq!(
+        gts::GtsId::try_new(json["id"].as_str().unwrap())
+            .expect("route id should be a valid GTS id")
+            .get_type_id()
+            .as_deref(),
+        Some(gts_id!("cf.core.oagw.route.v1~"))
     );
 }
 
@@ -248,7 +258,7 @@ async fn list_upstreams_with_pagination() {
                             port: 443,
                         }],
                     },
-                    "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                    HTTP_PROTOCOL_ID,
                 )
                 .build(),
             )
@@ -297,7 +307,7 @@ async fn get_route_by_gts_id() {
             "server": {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "enabled": true,
             "tags": []
         }))
@@ -352,7 +362,7 @@ async fn update_route_changes_fields() {
             "server": {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "enabled": true,
             "tags": []
         }))
@@ -417,7 +427,7 @@ async fn delete_route_returns_204_then_get_returns_404() {
             "server": {
                 "endpoints": [{"host": "api.openai.com", "port": 443, "scheme": "https"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "enabled": true,
             "tags": []
         }))
@@ -469,7 +479,7 @@ async fn list_routes_filters_by_upstream() {
                 "server": {
                     "endpoints": [{"host": host, "port": 443, "scheme": "https"}]
                 },
-                "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                "protocol": HTTP_PROTOCOL_ID,
                 "enabled": true,
                 "tags": []
             }))

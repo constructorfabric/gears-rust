@@ -5,7 +5,9 @@ use std::sync::Arc;
 use axum::{Extension, Router};
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::canonical_prelude::StatusCode;
-use toolkit::api::operation_builder::{LicenseFeature, OperationBuilder};
+use toolkit::api::operation_builder::{
+    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder,
+};
 
 use super::dto::{
     GtsEntityDto, ListEntitiesResponse, RegisterEntitiesRequest, RegisterEntitiesResponse,
@@ -19,7 +21,7 @@ struct License;
 
 impl AsRef<str> for License {
     fn as_ref(&self) -> &'static str {
-        "gts.cf.core.lic.feat.v1~cf.core.global.base.v1"
+        CORE_GLOBAL_BASE_LICENSE_FEATURE
     }
 }
 

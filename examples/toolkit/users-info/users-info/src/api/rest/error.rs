@@ -2,13 +2,13 @@ use toolkit::api::canonical_prelude::*;
 
 use crate::domain::error::DomainError;
 
-#[resource_error("gts.cf.example1.users.user.v1~")]
+#[resource_error(gts_id!("cf.example1.users.user.v1~"))]
 struct UserResourceError;
 
-#[resource_error("gts.cf.example1.users.city.v1~")]
+#[resource_error(gts_id!("cf.example1.users.city.v1~"))]
 struct CityResourceError;
 
-#[resource_error("gts.cf.example1.users.address.v1~")]
+#[resource_error(gts_id!("cf.example1.users.address.v1~"))]
 struct AddressResourceError;
 
 fn map_entity_not_found(entity_type: &str, id: String) -> CanonicalError {

@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use time::OffsetDateTime;
+use toolkit_gts::gts_id;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -44,7 +45,7 @@ use file_storage_sdk::ByteRange;
 
 /// Quota metric name (duplicated from service.rs; both refer to the same
 /// platform metric — no abstraction needed here).
-const QUOTA_METRIC_NAME: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1";
+const QUOTA_METRIC_NAME: &str = gts_id!("cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1");
 
 /// Diff the plan's expected part numbers against the parts actually reported,
 /// returning the missing ones in ascending order.

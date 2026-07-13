@@ -9,6 +9,7 @@
 mod common;
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -38,6 +39,12 @@ use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
 use resource_group::infra::storage::migrations::Migrator;
 use resource_group::infra::storage::type_repo::TypeRepository;
+
+macro_rules! rg_type_id {
+    ($($arg:tt)*) => {
+        format!("{}{}", gts_id!("cf.core.rg.type.v1~"), format_args!($($arg)*))
+    };
+}
 
 // ── Noop OpenAPI Registry for tests ─────────────────────────────────────
 
@@ -194,10 +201,7 @@ async fn response_body(resp: axum::http::Response<Body>) -> serde_json::Value {
 async fn create_type_returns_201() {
     let (router, _) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.api.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.api.{}.v1~", Uuid::now_v7().as_simple());
 
     let req = json_request(
         "POST",
@@ -223,10 +227,7 @@ async fn create_type_returns_201() {
 async fn create_type_duplicate_returns_409() {
     let (router, type_svc) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.dup.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.dup.{}.v1~", Uuid::now_v7().as_simple());
 
     // Pre-create via service
     type_svc
@@ -281,10 +282,7 @@ async fn create_type_invalid_code_returns_400() {
 async fn list_types_returns_200_with_page() {
     let (router, type_svc) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.list.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.list.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
@@ -311,10 +309,7 @@ async fn list_types_returns_200_with_page() {
 async fn get_type_returns_200() {
     let (router, type_svc) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.get.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.get.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
@@ -345,7 +340,7 @@ async fn get_type_returns_200() {
 async fn get_type_not_found_returns_404() {
     let (router, _) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = "gts.cf.core.rg.type.v1~nonexistent.v1~";
+    let code = gts_id!("cf.core.rg.type.v1~test.rg.nonexistent.type.v1~");
     let encoded = code.replace('~', "%7E");
 
     let req = json_request(
@@ -362,10 +357,7 @@ async fn get_type_not_found_returns_404() {
 async fn delete_type_returns_204() {
     let (router, type_svc) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.del.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.del.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
@@ -395,10 +387,7 @@ async fn delete_type_returns_204() {
 async fn create_group_returns_201() {
     let (router, type_svc) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let type_code = format!(
-        "gts.cf.core.rg.type.v1~test.grp.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let type_code = rg_type_id!("test.grp.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
@@ -527,10 +516,7 @@ fn assert_no_surrogate_ids(json: &serde_json::Value) {
 async fn rest_put_type_returns_200() {
     let (router, type_svc) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.put.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.put.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
@@ -569,7 +555,7 @@ async fn rest_put_type_returns_200() {
 async fn rest_put_type_not_found_returns_404() {
     let (router, _) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = "gts.cf.core.rg.type.v1~nonexistent.put.v1~";
+    let code = gts_id!("cf.core.rg.type.v1~test.rg.nonexistent.put.v1~");
     let encoded = code.replace('~', "%7E");
 
     let req = json_request(
@@ -594,10 +580,7 @@ async fn rest_post_membership_returns_201() {
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
 
-    let mt_code = format!(
-        "gts.cf.core.rg.type.v1~test.mt2._.i{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let mt_code = rg_type_id!("test.mt2._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
@@ -609,10 +592,7 @@ async fn rest_post_membership_returns_201() {
         .await
         .unwrap();
 
-    let gt_code = format!(
-        "gts.cf.core.rg.type.v1~test.gt2.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let gt_code = rg_type_id!("test.gt2.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
@@ -662,11 +642,7 @@ async fn rest_post_membership_returns_201() {
 
 /// Helper: create a self-referencing root type (create, then update to allow self as parent).
 async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &str) -> String {
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.{}.{}.v1~",
-        suffix,
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.{}.{}.v1~", suffix, Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
@@ -734,10 +710,7 @@ async fn rest_delete_membership_returns_204() {
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
 
-    let mt = format!(
-        "gts.cf.core.rg.type.v1~test.mtr._.i{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let mt = rg_type_id!("test.mtr._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
@@ -749,10 +722,7 @@ async fn rest_delete_membership_returns_204() {
         .await
         .unwrap();
 
-    let gt = format!(
-        "gts.cf.core.rg.type.v1~test.gtr.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let gt = rg_type_id!("test.gtr.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
@@ -819,10 +789,7 @@ async fn rest_post_group_with_parent_returns_201() {
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
 
-    let root_type = format!(
-        "gts.cf.core.rg.type.v1~test.rtp.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let root_type = rg_type_id!("test.rtp.{}.v1~", Uuid::now_v7().as_simple());
     // Create type first without self-reference, then update to allow self as parent
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
@@ -1005,10 +972,7 @@ async fn rest_get_group_hierarchy_returns_200() {
 async fn rest_create_type_with_metadata_schema() {
     let (router, _) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.ms.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.ms.{}.v1~", Uuid::now_v7().as_simple());
 
     let req = json_request(
         "POST",
@@ -1045,10 +1009,7 @@ async fn rest_create_group_with_metadata() {
     let (router, type_svc, _, _) = build_shared_router().await;
     let tenant_id = Uuid::now_v7();
 
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.gm.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.gm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
@@ -1084,10 +1045,7 @@ async fn rest_group_response_omits_null_metadata() {
     let (router, type_svc, _, _) = build_shared_router().await;
     let tenant_id = Uuid::now_v7();
 
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.nm.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.nm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
@@ -1123,10 +1081,7 @@ async fn rest_group_response_omits_null_metadata() {
 async fn rest_type_response_omits_null_metadata_schema() {
     let (router, _) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.nms.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.nms.{}.v1~", Uuid::now_v7().as_simple());
 
     let req = json_request(
         "POST",
@@ -1163,7 +1118,7 @@ async fn input_create_type_non_rg_prefix_returns_400() {
         "POST",
         "/types-registry/v1/types",
         Some(serde_json::json!({
-            "code": "gts.cf.other.prefix.v1~test.v1~",
+            "code": gts_id!("cf.other.prefix.type.v1~test.rg.other.type.v1~"),
             "can_be_root": true,
             "allowed_parent_types": [],
             "allowed_membership_types": []
@@ -1226,7 +1181,7 @@ async fn input_create_group_non_rg_type_returns_400() {
         "POST",
         "/resource-group/v1/groups",
         Some(serde_json::json!({
-            "type": "gts.cf.other.prefix.v1~test.v1~",
+            "type": gts_id!("cf.other.prefix.type.v1~test.rg.other.type.v1~"),
             "name": "BadGroup"
         })),
         tenant_id,
@@ -1270,10 +1225,7 @@ async fn input_membership_non_gts_resource_type() {
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
 
-    let rt = format!(
-        "gts.cf.core.rg.type.v1~test.ngts.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let rt = rg_type_id!("test.ngts.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: rt.clone(),
@@ -1377,7 +1329,7 @@ async fn input_deser_type_can_be_root_string_returns_error() {
         "POST",
         "/types-registry/v1/types",
         Some(serde_json::json!({
-            "code": "gts.cf.core.rg.type.v1~test.deser.v1~",
+            "code": gts_id!("cf.core.rg.type.v1~test.rg.deser.type.v1~"),
             "can_be_root": "yes",
             "allowed_parent_types": [],
             "allowed_membership_types": []
@@ -1402,7 +1354,7 @@ async fn input_deser_type_missing_can_be_root_returns_error() {
         "POST",
         "/types-registry/v1/types",
         Some(serde_json::json!({
-            "code": "gts.cf.core.rg.type.v1~test.missing.v1~"
+            "code": gts_id!("cf.core.rg.type.v1~test.rg.missing.type.v1~")
         })),
         tenant_id,
     );
@@ -1446,7 +1398,7 @@ async fn input_deser_group_invalid_parent_uuid_returns_error() {
         "POST",
         "/resource-group/v1/groups",
         Some(serde_json::json!({
-            "type": "gts.cf.core.rg.type.v1~test.v1~",
+            "type": gts_id!("cf.core.rg.type.v1~test.rg.simple.type.v1~"),
             "name": "BadParent",
             "parent_id": "not-a-uuid"
         })),
@@ -1508,10 +1460,7 @@ async fn input_deser_group_empty_name_returns_400() {
     let (router, type_svc, _, _) = build_shared_router().await;
     let tenant_id = Uuid::now_v7();
 
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.en.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.en.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
@@ -1560,7 +1509,10 @@ async fn input_deser_membership_path_non_uuid_returns_400() {
 
     let req = json_request(
         "POST",
-        "/resource-group/v1/memberships/not-a-uuid/gts.cf.core.rg.type.v1~test.v1~/res-001",
+        &format!(
+            "/resource-group/v1/memberships/not-a-uuid/{}/res-001",
+            gts_id!("cf.core.rg.type.v1~test.rg.simple.type.v1~")
+        ),
         None,
         tenant_id,
     );
@@ -1573,10 +1525,7 @@ async fn input_deser_membership_path_non_uuid_returns_400() {
 async fn input_deser_extra_fields_behavior() {
     let (router, _) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.extra.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.extra.{}.v1~", Uuid::now_v7().as_simple());
 
     let req = json_request(
         "POST",
@@ -1613,10 +1562,7 @@ async fn gts_membership_post_tilde_encoded() {
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
 
-    let mt = format!(
-        "gts.cf.core.rg.type.v1~test.tmt._.i{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let mt = rg_type_id!("test.tmt._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
@@ -1628,10 +1574,7 @@ async fn gts_membership_post_tilde_encoded() {
         .await
         .unwrap();
 
-    let gt = format!(
-        "gts.cf.core.rg.type.v1~test.tgt.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let gt = rg_type_id!("test.tgt.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
@@ -1679,10 +1622,7 @@ async fn gts_membership_delete_tilde_encoded() {
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
 
-    let mt = format!(
-        "gts.cf.core.rg.type.v1~test.tmd._.i{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let mt = rg_type_id!("test.tmd._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
@@ -1694,10 +1634,7 @@ async fn gts_membership_delete_tilde_encoded() {
         .await
         .unwrap();
 
-    let gt = format!(
-        "gts.cf.core.rg.type.v1~test.tgd.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let gt = rg_type_id!("test.tgd.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
@@ -1749,10 +1686,7 @@ async fn gts_put_type_tilde_encoded() {
     let (router, type_svc, _, _) = build_shared_router().await;
     let tenant_id = Uuid::now_v7();
 
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.tput.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.tput.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
@@ -1785,10 +1719,7 @@ async fn smallint_type_response_has_no_surrogate_ids() {
     let (router, type_svc, _, _) = build_shared_router().await;
     let tenant_id = Uuid::now_v7();
 
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.sid.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.sid.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
@@ -1822,10 +1753,7 @@ async fn smallint_group_response_has_no_surrogate_ids() {
     let (router, type_svc, _, _) = build_shared_router().await;
     let tenant_id = Uuid::now_v7();
 
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.gsid.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.gsid.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
@@ -1862,10 +1790,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
 
-    let mt = format!(
-        "gts.cf.core.rg.type.v1~test.msid._.i{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let mt = rg_type_id!("test.msid._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
@@ -1877,10 +1802,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
         .await
         .unwrap();
 
-    let gt = format!(
-        "gts.cf.core.rg.type.v1~test.gsidm.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let gt = rg_type_id!("test.gsidm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
@@ -2018,10 +1940,7 @@ async fn rest_error_responses_have_problem_content_type_and_status() {
     assert!(body.get("backtrace").is_none(), "no backtrace leaked");
 
     // --- 409 Conflict: duplicate type ---
-    let code = format!(
-        "gts.cf.core.rg.type.v1~test.errdup.{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    let code = rg_type_id!("test.errdup.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
         .create_type(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
@@ -2083,7 +2002,7 @@ async fn rest_error_responses_have_problem_content_type_and_status() {
         "POST",
         "/resource-group/v1/groups",
         Some(serde_json::json!({
-            "type": "gts.cf.core.rg.type.v1~nonexistent.v1~",
+            "type": gts_id!("cf.core.rg.type.v1~test.rg.nonexistent.type.v1~"),
             "name": "Ghost"
         })),
         tenant_id,
@@ -2118,7 +2037,7 @@ async fn rest_route_smoke_all_endpoints_registered() {
     let (router, _, _, _) = build_shared_router().await;
     let tenant_id = Uuid::now_v7();
     let fake_id = Uuid::now_v7();
-    let fake_code = "gts.cf.core.rg.type.v1~smoke.v1%7E";
+    let fake_code = rg_type_id!("smoke.v1%7E");
 
     // (method, path, has_body?, description)
     let endpoints: Vec<(&str, String, bool, &str)> = vec![

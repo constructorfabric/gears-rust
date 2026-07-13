@@ -17,9 +17,11 @@
 use super::*;
 use serde_json::json;
 use time::macros::datetime;
+use toolkit_gts::gts_id;
 
 /// Canonical valid chained schema id used across positive-path tests.
-const VALID_TYPE_ID: &str = "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.branding.v1~";
+const VALID_TYPE_ID: &str =
+    gts_id!("cf.core.am.tenant_metadata.v1~vendor.app.metadata.branding.v1~");
 
 fn valid_type_id() -> GtsTypeId {
     GtsTypeId::new(VALID_TYPE_ID)

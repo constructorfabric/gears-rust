@@ -21,6 +21,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use oagw::test_support::{AppHarness, test_server_config};
+use oagw_sdk::HTTP_PROTOCOL_ID;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
@@ -189,7 +190,7 @@ async fn e2e_http2_upstream_round_trip() {
                     "scheme": "https"
                 }]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-h2",
             "enabled": true,
             "tags": []
@@ -262,7 +263,7 @@ async fn e2e_http2_upstream_get_no_body() {
                     "scheme": "https"
                 }]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-h2-get",
             "enabled": true,
             "tags": []
@@ -328,7 +329,7 @@ async fn e2e_http2_upstream_large_body() {
                     "scheme": "https"
                 }]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-h2-large",
             "enabled": true,
             "tags": []
@@ -402,7 +403,7 @@ async fn e2e_http2_upstream_sse_streaming() {
                     "scheme": "https"
                 }]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "e2e-h2-sse",
             "enabled": true,
             "tags": []

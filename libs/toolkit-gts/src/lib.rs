@@ -36,7 +36,7 @@ pub use plugin::PluginV1;
 
 // Re-export GTS primitives used by the wrapper macros and downstream
 // callers. Keeps `toolkit_gts::*` self-sufficient at the top level.
-pub use gts::{GtsInstanceId, GtsSchema};
+pub use gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, GtsId, GtsInstanceId, GtsSchema};
 
 // Re-export `inventory` so the macro expansions can emit
 // `<crate>::inventory::submit!` without requiring consumer crates to add
@@ -45,7 +45,8 @@ pub use gts::{GtsInstanceId, GtsSchema};
 pub use inventory;
 
 // Re-export the companion proc-macros so consumers need only one crate dep.
-pub use toolkit_gts_macros::{gts_instance, gts_instance_raw, gts_type_schema};
+pub use gts_macros::GtsTraitsSchema;
+pub use toolkit_gts_macros::{gts_id, gts_instance, gts_instance_raw, gts_type_schema, gts_uri};
 
 /// Hidden re-exports used by the `cf-gears-toolkit-gts-macros` proc-macro
 /// expansions to reach the upstream construction macros without forcing
@@ -53,7 +54,8 @@ pub use toolkit_gts_macros::{gts_instance, gts_instance_raw, gts_type_schema};
 #[doc(hidden)]
 pub mod __private {
     pub use ::gts_macros::{
-        gts_instance as upstream_gts_instance, gts_instance_raw as upstream_gts_instance_raw,
+        gts_id as upstream_gts_id, gts_instance as upstream_gts_instance,
+        gts_instance_raw as upstream_gts_instance_raw,
         struct_to_gts_schema as upstream_struct_to_gts_schema,
     };
 }
@@ -168,11 +170,11 @@ mod tests {
             .map(|e| e.type_id)
             .collect();
         assert!(
-            ids.contains(&"gts.cf.toolkit.plugins.plugin.v1~"),
+            ids.contains(&crate::gts_id!("cf.toolkit.plugins.plugin.v1~")),
             "PluginV1 not registered; got ids: {ids:?}"
         );
         assert!(
-            ids.contains(&"gts.cf.toolkit.authz.permission.v1~"),
+            ids.contains(&crate::gts_id!("cf.toolkit.authz.permission.v1~")),
             "AuthzPermissionV1 not registered; got ids: {ids:?}"
         );
         assert_eq!(

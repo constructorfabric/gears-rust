@@ -7,6 +7,8 @@ mod common;
 use axum::extract::Json;
 use common::create_service;
 use serde_json::json;
+use toolkit_gts::gts_uri;
+use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 use types_registry::api::rest::dto::ListEntitiesQuery;
 use types_registry::domain::model::ListQuery;
 
@@ -19,10 +21,10 @@ async fn test_list_with_pattern_filter() {
     let service = create_service();
 
     let entities = vec![
-        json!({ "$id": "gts://gts.acme.core.events.user_created.v1~", "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
-        json!({ "$id": "gts://gts.acme.core.events.user_updated.v1~", "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
-        json!({ "$id": "gts://gts.acme.core.events.order_created.v1~", "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
-        json!({ "$id": "gts://gts.globex.core.events.shipment.v1~", "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
+        json!({ "$id": gts_uri!("acme.core.events.user_created.v1~"), "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
+        json!({ "$id": gts_uri!("acme.core.events.user_updated.v1~"), "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
+        json!({ "$id": gts_uri!("acme.core.events.order_created.v1~"), "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
+        json!({ "$id": gts_uri!("globex.core.events.shipment.v1~"), "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
     ];
 
     _ = service.register(entities);
@@ -30,20 +32,20 @@ async fn test_list_with_pattern_filter() {
 
     // Wildcard limited to one vendor.
     let acme = service
-        .list(&ListQuery::default().with_pattern("gts.acme.*"))
+        .list(&ListQuery::default().with_pattern(format!("{GTS_ID_PREFIX}acme.*")))
         .unwrap();
     assert_eq!(acme.len(), 3);
     assert!(acme.iter().all(|e| e.vendor() == Some("acme")));
 
     // Tighter wildcard: vendor + package.
     let acme_core = service
-        .list(&ListQuery::default().with_pattern("gts.acme.core.*"))
+        .list(&ListQuery::default().with_pattern(format!("{GTS_ID_PREFIX}acme.core.*")))
         .unwrap();
     assert_eq!(acme_core.len(), 3);
 
     // No matches.
     let none = service
-        .list(&ListQuery::default().with_pattern("gts.nope.*"))
+        .list(&ListQuery::default().with_pattern(format!("{GTS_ID_PREFIX}nope.*")))
         .unwrap();
     assert!(none.is_empty());
 }
@@ -53,7 +55,7 @@ async fn test_list_with_is_type_filter() {
     let service = create_service();
 
     let type_schema = json!({
-        "$id": "gts://gts.acme.core.models.filter_test.v1~",
+        "$id": gts_uri!("acme.core.models.filter_test.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": { "name": { "type": "string" } }
@@ -64,11 +66,11 @@ async fn test_list_with_is_type_filter() {
 
     let instances = vec![
         json!({
-            "id": "gts.acme.core.models.filter_test.v1~acme.core.instances.i1.v1",
+            "id": gts_id!("acme.core.models.filter_test.v1~acme.core.instances.i1.v1"),
             "name": "instance1"
         }),
         json!({
-            "id": "gts.acme.core.models.filter_test.v1~acme.core.instances.i2.v1",
+            "id": gts_id!("acme.core.models.filter_test.v1~acme.core.instances.i2.v1"),
             "name": "instance2"
         }),
     ];
@@ -106,13 +108,13 @@ async fn test_rest_list_handler_integration() {
     let service = create_service();
 
     _ = service.register(vec![
-        json!({ "$id": "gts://gts.acme.core.events.list_test1.v1~", "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
-        json!({ "$id": "gts://gts.acme.core.events.list_test2.v1~", "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
+        json!({ "$id": gts_uri!("acme.core.events.list_test1.v1~"), "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
+        json!({ "$id": gts_uri!("acme.core.events.list_test2.v1~"), "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" }),
     ]);
     service.switch_to_ready().unwrap();
 
     let query = ListEntitiesQuery {
-        pattern: Some("gts.acme.*".to_owned()),
+        pattern: Some(format!("{GTS_ID_PREFIX}acme.*")),
         ..Default::default()
     };
 
@@ -132,7 +134,7 @@ async fn test_rest_list_empty_results() {
     service.switch_to_ready().unwrap();
 
     let query = ListEntitiesQuery {
-        pattern: Some("gts.nonexistent.*".to_owned()),
+        pattern: Some(format!("{GTS_ID_PREFIX}nonexistent.*")),
         ..Default::default()
     };
 
@@ -156,7 +158,7 @@ async fn test_rest_get_handler_integration() {
     let service = create_service();
 
     _ = service.register(vec![json!({
-        "$id": "gts://gts.acme.core.events.get_test.v1~",
+        "$id": gts_uri!("acme.core.events.get_test.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "description": "Test entity for GET handler"
@@ -165,13 +167,13 @@ async fn test_rest_get_handler_integration() {
 
     let result = get_entity(
         Extension(service),
-        Path("gts.acme.core.events.get_test.v1~".to_owned()),
+        Path(gts_id!("acme.core.events.get_test.v1~").to_owned()),
     )
     .await;
     assert!(result.is_ok());
 
     let Json(entity) = result.unwrap();
-    assert_eq!(entity.gts_id, "gts.acme.core.events.get_test.v1~");
+    assert_eq!(entity.gts_id, gts_id!("acme.core.events.get_test.v1~"));
     assert_eq!(
         entity.description,
         Some("Test entity for GET handler".to_owned())
@@ -188,7 +190,7 @@ async fn test_rest_get_handler_not_found() {
 
     let result = get_entity(
         Extension(service),
-        Path("gts.nonexistent.pkg.ns.type.v1~".to_owned()),
+        Path(gts_id!("nonexistent.pkg.ns.type.v1~").to_owned()),
     )
     .await;
 

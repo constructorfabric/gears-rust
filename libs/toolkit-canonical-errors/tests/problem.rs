@@ -2,11 +2,15 @@ extern crate toolkit_canonical_errors;
 
 use toolkit_canonical_errors::resource_error;
 use toolkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_gts::{gts_id, gts_uri};
 
-#[resource_error("gts.cf.core.users.user.v1~")]
+const USER_RESOURCE: &str = gts_id!("cf.core.users.user.v1~");
+const FUTURE_PROBLEM_TYPE: &str = gts_uri!("cf.future.errors.something_new.v1~");
+
+#[resource_error(gts_id!("cf.core.users.user.v1~"))]
 struct R;
 
-#[resource_error("gts.cf.core.test.resource.v1~")]
+#[resource_error(gts_id!("cf.core.test.resource.v1~"))]
 struct TestR;
 
 #[test]
@@ -17,15 +21,12 @@ fn problem_from_not_found_has_correct_fields() {
     let problem = Problem::from(err);
     assert_eq!(
         problem.problem_type,
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~"
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~")
     );
     assert_eq!(problem.title, "Not Found");
     assert_eq!(problem.status, 404);
     assert_eq!(problem.detail, "Resource not found");
-    assert_eq!(
-        problem.context["resource_type"],
-        "gts.cf.core.users.user.v1~"
-    );
+    assert_eq!(problem.context["resource_type"], USER_RESOURCE);
     assert_eq!(problem.context["resource_name"], "user-123");
 }
 
@@ -160,7 +161,7 @@ fn round_trip_invalid_argument_with_field_violation() {
             ..
         } => {
             assert_eq!(detail, "Request validation failed");
-            assert_eq!(resource_type.as_deref(), Some("gts.cf.core.users.user.v1~"));
+            assert_eq!(resource_type.as_deref(), Some(USER_RESOURCE));
             assert!(resource_name.is_none());
             match ctx {
                 toolkit_canonical_errors::InvalidArgument::FieldViolations { field_violations } => {
@@ -203,7 +204,7 @@ fn round_trip_not_found_preserves_resource_type_and_name() {
             ..
         } => {
             assert_eq!(detail, "User not found");
-            assert_eq!(resource_type.as_deref(), Some("gts.cf.core.users.user.v1~"));
+            assert_eq!(resource_type.as_deref(), Some(USER_RESOURCE));
             assert_eq!(resource_name.as_deref(), Some("user-42"));
         }
         other => panic!("expected NotFound, got {other:?}"),
@@ -466,7 +467,7 @@ fn round_trip_data_loss() {
 #[test]
 fn try_from_unknown_problem_type_returns_error() {
     let problem = Problem {
-        problem_type: "gts://gts.cf.future.errors.something_new.v1~".to_owned(),
+        problem_type: FUTURE_PROBLEM_TYPE.to_owned(),
         title: "Future".to_owned(),
         status: 599,
         detail: "Not in canonical taxonomy".to_owned(),
@@ -477,7 +478,7 @@ fn try_from_unknown_problem_type_returns_error() {
     let result = CanonicalError::try_from(problem);
     match result {
         Err(ProblemConversionError::UnknownProblemType(t)) => {
-            assert_eq!(t, "gts://gts.cf.future.errors.something_new.v1~");
+            assert_eq!(t, FUTURE_PROBLEM_TYPE);
         }
         other => panic!("expected UnknownProblemType, got {other:?}"),
     }
@@ -506,7 +507,7 @@ fn try_from_malformed_context_returns_error() {
     // deserialize into the expected ResourceExhausted shape — `violations`
     // must be an array, not a number.
     let problem = Problem {
-        problem_type: "gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~"
+        problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~")
             .to_owned(),
         title: "Resource Exhausted".to_owned(),
         status: 429,
@@ -539,7 +540,7 @@ fn round_trip_preserves_resource_type_when_context_is_empty_struct() {
             resource_name,
             ..
         } => {
-            assert_eq!(resource_type.as_deref(), Some("gts.cf.core.users.user.v1~"));
+            assert_eq!(resource_type.as_deref(), Some(USER_RESOURCE));
             assert_eq!(resource_name.as_deref(), Some("session-abc"));
         }
         other => panic!("expected DeadlineExceeded, got {other:?}"),

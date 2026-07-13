@@ -43,6 +43,7 @@
 )]
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use anyhow::Result;
 use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QueryFilter};
@@ -950,7 +951,8 @@ pub fn inert_resource_checker()
 /// Mirrors the in-source `domain::user::service_tests::TEST_TENANT_TYPE_ID`
 /// so the harness lines up byte-for-byte with the canonical AM unit-test
 /// shape.
-pub const HARNESS_TENANT_TYPE_ID: &str = "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~";
+pub const HARNESS_TENANT_TYPE_ID: &str =
+    gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
 
 /// The deterministic UUIDv5 derived from [`HARNESS_TENANT_TYPE_ID`].
 /// Used as the `tenant_type_uuid` on every tenant row seeded for HTTP
@@ -958,14 +960,14 @@ pub const HARNESS_TENANT_TYPE_ID: &str = "gts.cf.core.am.tenant_type.v1~cf.core.
 /// without a real catalog.
 #[must_use]
 pub fn harness_tenant_type_uuid() -> Uuid {
-    gts::GtsID::new(HARNESS_TENANT_TYPE_ID)
+    gts::GtsId::try_new(HARNESS_TENANT_TYPE_ID)
         .expect("HARNESS_TENANT_TYPE_ID is a valid chain")
         .to_uuid()
 }
 
 /// `MockTypesRegistryClient` pre-seeded with the schemas the AM REST
 /// surface needs to reach its happy-path branches: the
-/// `gts.cf.core.am.user.v1~` user-projection schema (required by
+/// AM user-projection schema (required by
 /// `create_user` per the fail-closed GTS validator) and a minimal
 /// tenant-type schema chain so `resolve_active_tenant` (which uses
 /// `tenant_type_uuid` to compute the chained id) does not fail closed.
@@ -986,7 +988,7 @@ pub fn types_registry_for_users() -> Arc<dyn types_registry_sdk::TypesRegistryCl
         },
     });
     let user_schema = GtsTypeSchema::try_new(
-        GtsTypeId::new("gts.cf.core.am.user.v1~"),
+        GtsTypeId::new(gts_id!("cf.core.am.user.v1~")),
         user_body,
         None,
         None,
@@ -1031,12 +1033,12 @@ pub fn metadata_registry_with(
 /// integration suite and conforms to the GTS chain grammar
 /// (`vendor.package.namespace.type.vMAJOR[.MINOR]` on each segment).
 pub const REGISTERED_METADATA_SCHEMA: &str =
-    "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.feature_flag.v1~";
+    gts_id!("cf.core.am.tenant_metadata.v1~vendor.app.metadata.feature_flag.v1~");
 
 /// Canonical "unregistered" metadata schema id — same chained shape,
 /// but the harness does NOT pre-seed it in [`metadata_registry_with`].
 pub const UNREGISTERED_METADATA_SCHEMA: &str =
-    "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.unregistered.v1~";
+    gts_id!("cf.core.am.tenant_metadata.v1~vendor.app.metadata.unregistered.v1~");
 
 // ── Router builder ───────────────────────────────────────────────────
 

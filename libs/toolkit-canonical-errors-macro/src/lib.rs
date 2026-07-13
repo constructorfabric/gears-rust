@@ -1,7 +1,7 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 //! Proc-macro for canonical error resource types.
 //!
-//! Provides the `#[resource_error("gts...")]` attribute macro.
+//! Provides the `#[resource_error(...)]` attribute macro.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -18,7 +18,7 @@ use syn::parse_macro_input;
 /// ```rust,ignore
 /// use toolkit_canonical_errors::resource_error;
 ///
-/// #[resource_error("gts.cf.core.users.user.v1~")]
+/// #[resource_error(gts_id!("cf.core.users.user.v1~"))]
 /// struct UserResourceError;
 /// ```
 ///
@@ -29,7 +29,47 @@ use syn::parse_macro_input;
 /// typestate enforcement.
 #[proc_macro_attribute]
 pub fn resource_error(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let gts_lit = parse_macro_input!(attr as LitStr);
+    // Accept either a plain full-id string literal
+    // or the `gts_id!("<suffix>")` marker form to avoid hard-coding the
+    // configured GTS ID prefix. The marker form is expanded here by
+    // prepending `gts_id::GTS_ID_PREFIX` (the compile-time configured
+    // prefix); a plain literal is taken verbatim and must already include
+    // the full prefix.
+    let attr_ts: proc_macro2::TokenStream = attr.into();
+    let gts_lit: LitStr = match syn::parse2::<syn::Expr>(attr_ts) {
+        Ok(syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        })) => s,
+        Ok(syn::Expr::Macro(syn::ExprMacro { mac, .. }))
+            if mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|seg| seg.ident == "gts_id") =>
+        {
+            let suffix: LitStr = if let Ok(s) = mac.parse_body() {
+                s
+            } else {
+                let err = syn::Error::new_spanned(
+                    mac,
+                    "`gts_id!` takes a single string-literal suffix, \
+                     e.g. `gts_id!(\"cf.core.users.user.v1~\")`",
+                );
+                return err.to_compile_error().into();
+            };
+            LitStr::new(
+                &format!("{}{}", gts_id::GTS_ID_PREFIX, suffix.value()),
+                suffix.span(),
+            )
+        }
+        Ok(other) => {
+            let err =
+                syn::Error::new_spanned(other, "expected a string literal or `gts_id!(\"...\")`");
+            return err.to_compile_error().into();
+        }
+        Err(e) => return e.to_compile_error().into(),
+    };
     let input = parse_macro_input!(item as syn::ItemStruct);
 
     match generate_resource_error(&gts_lit, &input) {
@@ -246,83 +286,20 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
     })
 }
 
-/// Validates a GTS resource-type literal at proc-macro time.
+/// Validates a GTS resource-type literal at proc-macro time by delegating
+/// to the canonical `GtsId` parser from the `gts-id` crate.
 ///
-/// Expected format: `gts.<vendor>.<package>.<namespace>.<type>.<version>~`
+/// This is equivalent to `GtsTypeId::try_new` from the `gts` crate (which
+/// internally calls `GtsId::try_new` + `is_type()`), but avoids pulling the
+/// heavy `gts` crate (jsonschema, schemars, …) into a proc-macro.
 fn validate_gts_resource_type_str(s: &str, span: Span) -> syn::Result<()> {
-    let b = s.as_bytes();
-    let len = b.len();
-
-    if len == 0 {
-        return Err(syn::Error::new(span, "GTS resource type must not be empty"));
-    }
-
-    if b[len - 1] != b'~' {
-        return Err(syn::Error::new(span, "GTS resource type must end with '~'"));
-    }
-
-    #[allow(unknown_lints)]
-    #[allow(de0901_gts_string_pattern)]
-    if len < 6 || !s.starts_with("gts.") {
+    let parsed = gts_id::GtsId::try_new(s)
+        .map_err(|e| syn::Error::new(span, format!("invalid GTS resource type: {e}")))?;
+    if !parsed.is_type() {
         return Err(syn::Error::new(
             span,
-            "GTS resource type must start with 'gts.'",
+            "GTS resource type must end with '~' (type id, not instance id)",
         ));
     }
-
-    let body = &s[4..len - 1];
-    if body.is_empty() {
-        return Err(syn::Error::new(
-            span,
-            "GTS resource type must have segments after 'gts.' prefix",
-        ));
-    }
-
-    let segments: Vec<&str> = body.split('.').collect();
-
-    for seg in &segments {
-        if seg.is_empty() {
-            return Err(syn::Error::new(
-                span,
-                "GTS resource type contains an empty segment",
-            ));
-        }
-        if !seg
-            .bytes()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
-        {
-            return Err(syn::Error::new(
-                span,
-                "GTS resource type segments must contain only lowercase ASCII letters, digits, or underscores",
-            ));
-        }
-    }
-
-    // Need >= 5 segments: vendor.package.namespace.type.version
-    if segments.len() < 5 {
-        return Err(syn::Error::new(
-            span,
-            "GTS resource type must have at least 5 segments after 'gts.': vendor.package.namespace.type.version",
-        ));
-    }
-
-    // Version segment validation
-    // SAFETY: segments.len() >= 5 is checked above, so `.last()` is always `Some`.
-    let Some(version) = segments.last() else {
-        unreachable!()
-    };
-    if !version.starts_with('v') || version.len() < 2 {
-        return Err(syn::Error::new(
-            span,
-            "GTS resource type must end with a version segment starting with 'v' (e.g. v1)",
-        ));
-    }
-    if !version[1..].bytes().all(|c| c.is_ascii_digit()) {
-        return Err(syn::Error::new(
-            span,
-            "GTS resource type version segment after 'v' must contain only ASCII digits",
-        ));
-    }
-
     Ok(())
 }

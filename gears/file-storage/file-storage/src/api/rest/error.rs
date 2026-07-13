@@ -4,10 +4,10 @@ use toolkit::api::canonical_prelude::*;
 
 use crate::domain::error::DomainError;
 
-#[resource_error("gts.cf.fstorage.file.object.v1~")]
+#[resource_error(gts_id!("cf.fstorage.file.object.v1~"))]
 struct FileResourceError;
 
-#[resource_error("gts.cf.fstorage.retention_rule.object.v1~")]
+#[resource_error(gts_id!("cf.fstorage.retention_rule.object.v1~"))]
 struct RetentionRuleResourceError;
 
 impl From<DomainError> for CanonicalError {

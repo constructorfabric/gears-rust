@@ -23,3 +23,7 @@ proc-macro-crate = { workspace = true }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
+# For validating the GTS resource type prefix in `#[resource_error("...")]`
+# without hard-coding the literal prefix. The prefix is the compile-time
+# configured one (`gts_id::GTS_ID_PREFIX`).
+gts-id = { workspace = true }

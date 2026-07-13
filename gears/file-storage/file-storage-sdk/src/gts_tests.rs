@@ -1,16 +1,17 @@
 use super::*;
+use toolkit_gts::gts_id;
 
 #[test]
 fn file_type_resource_has_exact_expected_value() {
     // Pinning the literal: the Authorization Service matches on this string, so
     // a silent change here would break per-type access decisions.
-    assert_eq!(FILE_TYPE_RESOURCE, "gts.cf.fstorage.file.type.v1~");
+    assert_eq!(FILE_TYPE_RESOURCE, gts_id!("cf.fstorage.file.type.v1~"));
 }
 
 #[test]
 fn file_type_resource_follows_gts_type_format() {
     assert!(
-        FILE_TYPE_RESOURCE.starts_with("gts.cf.fstorage.file.type.v1"),
+        FILE_TYPE_RESOURCE.starts_with(gts_id!("cf.fstorage.file.type.v1~")),
         "must be the fstorage file-type family: {FILE_TYPE_RESOURCE}"
     );
     assert!(

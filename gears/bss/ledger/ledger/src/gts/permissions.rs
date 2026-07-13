@@ -30,7 +30,7 @@ use crate::authz::{actions, labels};
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_post.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_post.v1"),
         resource_type: labels::ENTRY.to_owned(),
         action: actions::POST.to_owned(),
         display_name: "Post a ledger entry".to_owned(),
@@ -38,7 +38,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_reverse.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_reverse.v1"),
         resource_type: labels::ENTRY.to_owned(),
         action: actions::REVERSE.to_owned(),
         display_name: "Reverse a ledger entry".to_owned(),
@@ -46,7 +46,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_approve.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_approve.v1"),
         resource_type: labels::ENTRY.to_owned(),
         action: actions::APPROVE.to_owned(),
         display_name: "Approve a dual-control ledger entry".to_owned(),
@@ -54,7 +54,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_read.v1"),
         resource_type: labels::ENTRY.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read ledger balances".to_owned(),
@@ -62,7 +62,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_annotate.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_annotate.v1"),
         resource_type: labels::ENTRY.to_owned(),
         action: actions::ANNOTATE.to_owned(),
         display_name: "Annotate an entry with a controlled non-financial note".to_owned(),
@@ -70,7 +70,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_audit_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_audit_read.v1"),
         resource_type: labels::ENTRY.to_owned(),
         action: actions::AUDIT_READ.to_owned(),
         display_name: "Read the secured audit surface (incl. cross-tenant elevation)".to_owned(),
@@ -78,7 +78,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_erase.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_erase.v1"),
         resource_type: labels::ENTRY.to_owned(),
         action: actions::ERASE.to_owned(),
         display_name: "Erase a payer's PII (GDPR right-to-erasure)".to_owned(),
@@ -86,7 +86,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_reidentify.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.entry_reidentify.v1"),
         resource_type: labels::ENTRY.to_owned(),
         action: actions::REIDENTIFY.to_owned(),
         display_name: "Re-identify a payer's PII reference (forensic)".to_owned(),
@@ -97,7 +97,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.ledger_provision.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.ledger_provision.v1"),
         resource_type: labels::LEDGER.to_owned(),
         action: actions::PROVISION.to_owned(),
         display_name: "Provision a ledger".to_owned(),
@@ -105,7 +105,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.ledger_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.ledger_read.v1"),
         resource_type: labels::LEDGER.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read a ledger's chart of accounts".to_owned(),
@@ -116,7 +116,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.fiscal_period_close.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.fiscal_period_close.v1"),
         resource_type: labels::FISCAL_PERIOD.to_owned(),
         action: actions::CLOSE.to_owned(),
         display_name: "Close a fiscal period".to_owned(),
@@ -127,7 +127,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.payment_write.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.payment_write.v1"),
         resource_type: labels::PAYMENT.to_owned(),
         action: actions::WRITE.to_owned(),
         display_name: "Settle or allocate a payment".to_owned(),
@@ -135,7 +135,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.payment_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.payment_read.v1"),
         resource_type: labels::PAYMENT.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read payment allocations / unallocated".to_owned(),
@@ -146,7 +146,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.credit_application_write.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.credit_application_write.v1"),
         resource_type: labels::CREDIT_APPLICATION.to_owned(),
         action: actions::WRITE.to_owned(),
         display_name: "Grant or apply reusable credit".to_owned(),
@@ -157,7 +157,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.dispute_write.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.dispute_write.v1"),
         resource_type: labels::DISPUTE.to_owned(),
         action: actions::WRITE.to_owned(),
         display_name: "Record a chargeback dispute phase".to_owned(),
@@ -165,7 +165,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.dispute_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.dispute_read.v1"),
         resource_type: labels::DISPUTE.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read / list chargeback disputes".to_owned(),
@@ -176,7 +176,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.dual_control_policy_write.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.dual_control_policy_write.v1"),
         resource_type: labels::DUAL_CONTROL_POLICY.to_owned(),
         action: actions::WRITE.to_owned(),
         display_name: "Configure dual-control thresholds (D2/A6/TTL)".to_owned(),
@@ -184,7 +184,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.dual_control_policy_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.dual_control_policy_read.v1"),
         resource_type: labels::DUAL_CONTROL_POLICY.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read the effective dual-control policy".to_owned(),
@@ -195,7 +195,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.config_write.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.config_write.v1"),
         resource_type: labels::LEDGER_CONFIG.to_owned(),
         action: actions::WRITE.to_owned(),
         display_name: "Configure ledger tenant settings (posting policy, FX revaluation mode)"
@@ -204,7 +204,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.config_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.config_read.v1"),
         resource_type: labels::LEDGER_CONFIG.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read the effective ledger tenant settings".to_owned(),
@@ -215,7 +215,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.recognition_write.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.recognition_write.v1"),
         resource_type: labels::RECOGNITION.to_owned(),
         action: actions::WRITE.to_owned(),
         display_name: "Trigger a recognition run or change a schedule".to_owned(),
@@ -223,7 +223,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.recognition_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.recognition_read.v1"),
         resource_type: labels::RECOGNITION.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read recognition runs / schedules / disaggregation".to_owned(),
@@ -234,7 +234,7 @@ gts_instance! {
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_read.v1"),
         resource_type: labels::RECONCILIATION.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read the exception queue / reconciliation runs".to_owned(),
@@ -242,7 +242,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_run.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_run.v1"),
         resource_type: labels::RECONCILIATION.to_owned(),
         action: actions::RUN.to_owned(),
         display_name: "Trigger a reconciliation check".to_owned(),
@@ -250,7 +250,7 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_resolve.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.bss.ledger.reconciliation_resolve.v1"),
         resource_type: labels::RECONCILIATION.to_owned(),
         action: actions::RESOLVE.to_owned(),
         display_name: "Resolve / acknowledge / approve a close-blocking exception".to_owned(),

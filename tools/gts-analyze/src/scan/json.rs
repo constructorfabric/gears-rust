@@ -2,10 +2,11 @@
 //! GTS-id string-literal references from the JSON body.
 
 use std::path::Path;
+use toolkit_gts::GTS_ID_URI_PREFIX;
 
 use crate::classify::classify_location;
 use crate::model::{Reference, TypeDef};
-use crate::scan::{gts_in_string_re, line_at, looks_like_gts_id, shorten_line};
+use crate::scan::{gts_in_string_re, line_at, shorten_line};
 
 /// Scan a JSON file. Pushes a TypeDef when the document is a GTS schema (`$id` matches),
 /// and a Reference for every other GTS string literal it contains.
@@ -34,16 +35,14 @@ fn scan_schema(rel: &str, location: &str, text: &str) -> Option<TypeDef> {
     let obj = data.as_object()?;
     let sid = obj.get("$id")?.as_str()?;
     let sid = sid
-        .strip_prefix("gts://")
+        .strip_prefix(GTS_ID_URI_PREFIX)
         .unwrap_or(sid)
         .split('?')
         .next()?
         .split('#')
         .next()?;
-    if !sid.starts_with("gts.") {
-        return None;
-    }
-    if !looks_like_gts_id(sid) {
+    let parsed = gts_id::GtsId::try_new(sid).ok()?;
+    if !parsed.is_type() {
         return None;
     }
     let description = obj

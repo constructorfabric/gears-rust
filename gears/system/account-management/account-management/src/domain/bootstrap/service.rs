@@ -35,6 +35,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use toolkit_gts::gts_id;
 
 use time::OffsetDateTime;
 use tokio::time::Instant;
@@ -895,9 +896,14 @@ impl<R: TenantRepo> BootstrapService<R> {
 
         // `GtsTypeSchema` is by construction a type-schema (the
         // `is_schema` axis is implicit in the type), so the only check
-        // remaining is the AM-tenant-type chain prefix on `type_id`.
+        // remaining is that the chain root is AM's tenant_type root.
         let entity_type_id = entity.type_id.as_ref();
-        if !entity_type_id.starts_with("gts.cf.core.am.tenant_type.v1~") {
+        let is_am_tenant_type = gts::GtsId::try_new(entity_type_id)
+            .ok()
+            .filter(gts::GtsId::is_type)
+            .and_then(|id| id.chain_ids().into_iter().next())
+            .is_some_and(|root| root == gts_id!("cf.core.am.tenant_type.v1~"));
+        if !is_am_tenant_type {
             emit_metric(
                 AM_BOOTSTRAP_LIFECYCLE,
                 MetricKind::Counter,
@@ -1056,14 +1062,14 @@ impl<R: TenantRepo> BootstrapService<R> {
         // (`parent_id IS NULL AND depth = 0`) and the
         // `ux_tenants_single_root` partial unique index.
         // Derive `tenant_type_uuid` from the configured GTS id via
-        // `gts::GtsID::to_uuid()` — the same canonical V5-UUID
+        // `gts::GtsId::to_uuid()` — the same canonical V5-UUID
         // algorithm `create_tenant` uses, so the bootstrap and
         // child-create paths produce identical FK values for the
-        // same `root_tenant_type`. `GtsID::new` additionally
+        // same `root_tenant_type`. `GtsId::try_new` additionally
         // validates the chain shape, surfacing
         // `DomainError::InvalidTenantType` early on a malformed
         // configuration rather than at the FK insert.
-        let tenant_type_uuid = gts::GtsID::new(self.cfg.root_tenant_type.as_ref())
+        let tenant_type_uuid = gts::GtsId::try_new(self.cfg.root_tenant_type.as_ref())
             .map_err(|e| DomainError::InvalidTenantType {
                 detail: format!(
                     "invalid root_tenant_type chain `{}`: {e}",

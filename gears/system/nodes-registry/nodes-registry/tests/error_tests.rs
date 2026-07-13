@@ -10,6 +10,9 @@
 
 use nodes_registry::domain::error::DomainError;
 use toolkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_gts::GTS_ID_URI_PREFIX;
+use toolkit_gts::gts_id;
+use toolkit_gts::gts_uri;
 
 /// Build the wire `Problem` the canonical error middleware would emit
 /// for a given `DomainError`.
@@ -29,19 +32,19 @@ fn test_error_conversion_mapping() {
             DomainError::NodeNotFound(test_id),
             404,
             Some(test_id.to_string()),
-            "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~"),
         ),
         (
             DomainError::SysInfoCollectionFailed("Failed to read CPU info".to_owned()),
             500,
             None,
-            "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.internal.v1~"),
         ),
         (
             DomainError::SysCapCollectionFailed("GPU detection failed".to_owned()),
             500,
             None,
-            "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.internal.v1~"),
         ),
         (
             DomainError::InvalidInput("Invalid capability key format".to_owned()),
@@ -49,13 +52,13 @@ fn test_error_conversion_mapping() {
             // InvalidArgument + with_field_violation sets a generic top-level detail;
             // caller-supplied text lives in context.field_violations[0].description.
             None,
-            "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"),
         ),
         (
             DomainError::Internal("Database connection lost".to_owned()),
             500,
             None,
-            "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.internal.v1~"),
         ),
     ];
 
@@ -81,7 +84,7 @@ fn test_error_conversion_mapping() {
              at the conversion layer it stays None"
         );
         assert!(
-            problem.problem_type.starts_with("gts://"),
+            problem.problem_type.starts_with(GTS_ID_URI_PREFIX),
             "Problem type should start with gts://"
         );
     }
@@ -96,7 +99,7 @@ fn test_node_not_found_sets_resource_type() {
         .get("resource_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    assert_eq!(rt, "gts.cf.nodes_registry.registry.node.v1~");
+    assert_eq!(rt, gts_id!("cf.nodes_registry.registry.node.v1~"));
     let rn = problem
         .context
         .get("resource_name")

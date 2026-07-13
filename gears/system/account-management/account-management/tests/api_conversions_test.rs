@@ -19,6 +19,8 @@
 mod common;
 
 use axum::http::{StatusCode, header};
+use toolkit_gts::gts_id;
+use toolkit_gts::gts_uri;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -127,7 +129,8 @@ async fn request_own_conversion_when_pending_exists_returns_409() {
     // `type` is `gts://<gts_type>` per toolkit_canonical_errors::Problem;
     // the `already_exists` category surfaces with the canonical chain.
     assert_eq!(
-        body["type"], "gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~",
+        body["type"],
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.already_exists.v1~"),
         "envelope `type` MUST point at the canonical AlreadyExists GTS id: {body}"
     );
     // `context.resource_type` pins the AM-side resource that collided;
@@ -135,7 +138,8 @@ async fn request_own_conversion_when_pending_exists_returns_409() {
     // the caller can cancel / reject it before retrying without a
     // separate lookup.
     assert_eq!(
-        body["context"]["resource_type"], "gts.cf.core.am.conversion_request.v1~",
+        body["context"]["resource_type"],
+        gts_id!("cf.core.am.conversion_request.v1~"),
         "envelope `context.resource_type` MUST be the conversion-request \
          resource (not the tenant resource): {body}"
     );

@@ -13,7 +13,7 @@ error: invalid GTS segment: 'vendor.package.sku.v1' (DE0901)
 LL |     let _id2 = ProductV1::<()>::gts_make_instance_id("vendor.package.sku.v1");
    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
-   = note: Invalid GTS segment #0 @ offset 0: 'vendor.package.sku.v1': Too few tokens (got 4, min 5). Expected format: vendor.package.namespace.type.vMAJOR[.MINOR]
+   = note: Invalid GTS segment #2 @ offset 23: 'vendor.package.sku.v1': Too few tokens (got 4, min 5). Expected format: vendor.package.namespace.type.vMAJOR[.MINOR]
    = help: Example: vendor.package.sku.abc.v1
 
 error: gts_make_instance_id expects a single GTS segment, got: 'vendor.package.sku.abc.v1~' (DE0901)

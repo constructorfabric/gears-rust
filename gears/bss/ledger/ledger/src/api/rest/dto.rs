@@ -1609,7 +1609,7 @@ impl From<bss_ledger_sdk::UnallocatedView> for UnallocatedDto {
 /// raises for a malformed `kind` / missing field (mirrors the `resource_error`
 /// structs in `error.rs` / `error_mapping.rs`). The body-shape validation lives
 /// here on the DTO; the `DomainError` ladder handles the post-time caps.
-#[resource_error("gts.cf.bss.ledger.credit_application.v1~")]
+#[resource_error(gts_id!("cf.bss.ledger.credit_application.v1~"))]
 struct CreditApplicationResource;
 
 /// The `POST /credit-applications` request body: ONE wire shape for both wallet

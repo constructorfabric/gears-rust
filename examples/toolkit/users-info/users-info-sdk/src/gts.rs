@@ -19,15 +19,16 @@
 //! impl-crate sites that call the macro therefore duplicate these
 //! literals. A test in the impl crate asserts the strings stay in sync.
 
+use toolkit_gts::gts_id;
 /// `User` resource. Used as the `resource_type` field on canonical
 /// errors emitted from user-scoped operations (e.g. `user {id} not
 /// found` → 404).
-pub const USER_RESOURCE_TYPE: &str = "gts.cf.example1.users.user.v1~";
+pub const USER_RESOURCE_TYPE: &str = gts_id!("cf.example1.users.user.v1~");
 
 /// `City` resource. Used as the `resource_type` field on canonical
 /// errors emitted from city-scoped operations.
-pub const CITY_RESOURCE_TYPE: &str = "gts.cf.example1.users.city.v1~";
+pub const CITY_RESOURCE_TYPE: &str = gts_id!("cf.example1.users.city.v1~");
 
 /// `Address` resource. Used as the `resource_type` field on canonical
 /// errors emitted from address-scoped operations.
-pub const ADDRESS_RESOURCE_TYPE: &str = "gts.cf.example1.users.address.v1~";
+pub const ADDRESS_RESOURCE_TYPE: &str = gts_id!("cf.example1.users.address.v1~");

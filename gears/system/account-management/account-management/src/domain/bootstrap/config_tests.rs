@@ -8,6 +8,7 @@
 )]
 
 use std::time::Duration;
+use toolkit_gts::gts_id;
 
 use super::*;
 
@@ -47,9 +48,9 @@ fn validate_accepts_fully_specified_config() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(
-            "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~",
-        ),
+        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+            "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        )),
         root_tenant_metadata: None,
         idp_wait_timeout: Duration::from_mins(5),
         idp_retry_backoff_initial: Duration::from_secs(2),
@@ -64,9 +65,9 @@ fn validate_rejects_zero_idp_wait_timeout() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(
-            "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~",
-        ),
+        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+            "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        )),
         root_tenant_metadata: None,
         idp_wait_timeout: Duration::ZERO,
         idp_retry_backoff_initial: Duration::from_secs(2),
@@ -85,9 +86,9 @@ fn validate_rejects_idp_wait_timeout_above_cap() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(
-            "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~",
-        ),
+        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+            "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        )),
         root_tenant_metadata: None,
         // One past the documented cap; with no upper bound the
         // deadline math `Instant::now() + idp_wait_timeout` and the
@@ -109,9 +110,9 @@ fn validate_accepts_idp_wait_timeout_at_cap() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(
-            "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~",
-        ),
+        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+            "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        )),
         root_tenant_metadata: None,
         idp_wait_timeout: MAX_IDP_WAIT_TIMEOUT,
         idp_retry_backoff_initial: Duration::from_secs(2),
@@ -126,9 +127,9 @@ fn validate_rejects_inverted_backoff_envelope() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(
-            "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~",
-        ),
+        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+            "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        )),
         root_tenant_metadata: None,
         idp_wait_timeout: Duration::from_mins(5),
         idp_retry_backoff_initial: Duration::from_mins(1),

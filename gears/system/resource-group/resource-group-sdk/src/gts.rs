@@ -1,6 +1,7 @@
 // Created: 2026-04-16 by Constructor Tech
 //! GTS schema definitions for the Resource Group type system.
 
+use toolkit_gts::gts_id;
 use toolkit_gts::gts_type_schema;
 
 /// GTS base type schema for Resource Group types.
@@ -35,7 +36,7 @@ use toolkit_gts::gts_type_schema;
 /// ```
 #[gts_type_schema(
     dir_path = "schemas",
-    type_id = "gts.cf.core.rg.type.v1~",
+    type_id = gts_id!("cf.core.rg.type.v1~"),
     description = "Resource Group base type — defines placement and tenant scope traits",
     properties = "id,can_be_root,allowed_parent_types,allowed_membership_types",
     base = true
@@ -62,7 +63,10 @@ pub struct ResourceGroupTypeV1 {
 /// Match it against the resource-scoped projection variants
 /// ([`crate::ResourceGroupError::NotFound`] /
 /// [`crate::ResourceGroupError::AlreadyExists`]).
-pub const GROUP_RESOURCE_TYPE: &str = "gts.cf.core.resource_group.group.v1~";
+pub const GROUP_RESOURCE_TYPE: &str = gts_id!("cf.core.resource_group.group.v1~");
+
+/// Canonical GTS resource type for a resource-group membership link.
+pub const GROUP_MEMBERSHIP_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.group_membership.v1~");
 
 /// GTS type path for the tenant resource-group type.
 ///
@@ -74,4 +78,4 @@ pub const GROUP_RESOURCE_TYPE: &str = "gts.cf.core.resource_group.group.v1~";
 ///
 /// The tenant RG type itself is seeded externally (via API/config) with
 /// `can_be_root: true` so root tenants are valid placements.
-pub const TENANT_RG_TYPE_PATH: &str = "gts.cf.core.rg.type.v1~cf.core._.tenant.v1~";
+pub const TENANT_RG_TYPE_PATH: &str = gts_id!("cf.core.rg.type.v1~cf.core._.tenant.v1~");

@@ -14,6 +14,7 @@ use sea_orm_migration::MigratorTrait;
 use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+use toolkit_gts::gts_id;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -21,7 +22,7 @@ use file_storage::infra::storage::migrations::Migrator;
 use file_storage::infra::storage::repo::{FileRepo, VersionRepo};
 use file_storage_sdk::{File, FileVersion, OwnerKind, VersionStatus};
 
-const GTS: &str = "gts.cf.fstorage.file.type.v1~x.test.v1~";
+const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
 /// A unique temp-file SQLite DB (mirrors `service_test.rs::build_service`) —
 /// a bare `sqlite::memory:` gives each pooled connection its own empty DB.

@@ -8,7 +8,7 @@
 //! per-model override policy (`allow_parameter_override`,
 //! `allow_extra_params`) is **not** here — those are flat fields on
 //! [`crate::models::ModelInfoV1`]. Declared as a GTS schema leaf via
-//! [`struct_to_gts_schema`]; its parent envelope is `ModelInfoV1<P>`.
+//! [`gts_type_schema`]; its parent envelope is `ModelInfoV1<P>`.
 //!
 //! Field set is verified against the `OpenAPI` spec for `POST
 //! /v1/chat/completions`, `POST /v1/responses`, and `POST /v1/embeddings`.
@@ -22,7 +22,7 @@
 //! Note: `supported_api` and `provider_model_id` live on `ModelInfoV1`
 //! (common), not on `OpenAiSettingsV1`.
 
-use gts_macros::struct_to_gts_schema;
+use toolkit_gts::gts_type_schema;
 
 use crate::models::{ModelInfoV1, ReasoningSummary, TextVerbosity, TruncationStrategy};
 
@@ -221,12 +221,12 @@ pub struct OpenAiCost {
 ///
 /// # GTS schema
 ///
-/// - **`schema_id`**: `gts.cf.genai.model.info.v1~cf.genai._.openai.v1~`
+/// - **`schema_id`**: `gts_id!("cf.genai.model.info.v1~cf.genai._.openai.v1~")`
 /// - **base**: `ModelInfoV1` (the generic envelope)
-#[struct_to_gts_schema(
+#[gts_type_schema(
     dir_path = "schemas",
     base = ModelInfoV1,
-    type_id = "gts.cf.genai.model.info.v1~cf.genai._.openai.v1~",
+    type_id = gts_id!("cf.genai.model.info.v1~cf.genai._.openai.v1~"),
     description = "OpenAI provider settings (Chat Completions / Responses / Embeddings)",
     properties = "oagw_alias,endpoint_kind,organization,project,temperature,top_p,presence_penalty,frequency_penalty,top_logprobs,service_tier,prompt_cache_retention,reasoning_effort,reasoning_summary,verbosity,parallel_tool_calls,store,response_format,max_tokens,max_completion_tokens,n,stop,seed,logprobs,max_output_tokens,max_tool_calls,truncation,encoding_format,dimensions,cost"
 )]

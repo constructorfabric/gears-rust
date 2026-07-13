@@ -105,6 +105,7 @@ mod tests {
     use crate::infra::InMemoryGtsRepository;
     use gts::GtsConfig;
     use serde_json::json;
+    use toolkit_gts::{gts_id, gts_uri};
 
     const JSON_SCHEMA_DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 
@@ -127,7 +128,7 @@ mod tests {
 
         let req = RegisterEntitiesRequest {
             entities: vec![json!({
-                "$id": "gts://gts.acme.core.events.user_created.v1~",
+                "$id": gts_uri!("acme.core.events.user_created.v1~"),
                 "$schema": JSON_SCHEMA_DRAFT_07,
                 "type": "object"
             })],
@@ -154,7 +155,7 @@ mod tests {
 
         let result = get_entity(
             Extension(service),
-            Path("gts.acme.core.events.user_created.v1~".to_owned()),
+            Path(gts_id!("acme.core.events.user_created.v1~").to_owned()),
         )
         .await;
         assert!(result.is_err());
@@ -167,7 +168,7 @@ mod tests {
 
         let req = RegisterEntitiesRequest {
             entities: vec![json!({
-                "$id": "gts://gts.acme.core.events.user_created.v1~",
+                "$id": gts_uri!("acme.core.events.user_created.v1~"),
                 "$schema": JSON_SCHEMA_DRAFT_07,
                 "type": "object"
             })],
@@ -190,12 +191,12 @@ mod tests {
         // Register entities via internal API (before ready)
         _ = service.register(vec![
             json!({
-                "$id": "gts://gts.acme.core.events.user_created.v1~",
+                "$id": gts_uri!("acme.core.events.user_created.v1~"),
                 "$schema": JSON_SCHEMA_DRAFT_07,
                 "type": "object"
             }),
             json!({
-                "$id": "gts://gts.globex.core.events.order_placed.v1~",
+                "$id": gts_uri!("globex.core.events.order_placed.v1~"),
                 "$schema": JSON_SCHEMA_DRAFT_07,
                 "type": "object"
             }),
@@ -216,7 +217,7 @@ mod tests {
 
         // Register entity via internal API (before ready)
         _ = service.register(vec![json!({
-            "$id": "gts://gts.acme.core.events.user_created.v1~",
+            "$id": gts_uri!("acme.core.events.user_created.v1~"),
             "$schema": JSON_SCHEMA_DRAFT_07,
             "type": "object"
         })]);
@@ -224,13 +225,13 @@ mod tests {
 
         let result = get_entity(
             Extension(service),
-            Path("gts.acme.core.events.user_created.v1~".to_owned()),
+            Path(gts_id!("acme.core.events.user_created.v1~").to_owned()),
         )
         .await;
         assert!(result.is_ok());
 
         let Json(entity) = result.unwrap();
-        assert_eq!(entity.gts_id, "gts.acme.core.events.user_created.v1~");
+        assert_eq!(entity.gts_id, gts_id!("acme.core.events.user_created.v1~"));
     }
 
     #[tokio::test]
@@ -240,7 +241,7 @@ mod tests {
 
         let result = get_entity(
             Extension(service),
-            Path("gts.fabrikam.pkg.ns.type.v1~".to_owned()),
+            Path(gts_id!("fabrikam.pkg.ns.type.v1~").to_owned()),
         )
         .await;
         assert!(result.is_err());

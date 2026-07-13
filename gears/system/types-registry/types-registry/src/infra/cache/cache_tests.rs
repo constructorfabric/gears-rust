@@ -7,6 +7,8 @@
 use super::*;
 use serde_json::json;
 use std::thread::sleep;
+use toolkit_gts::GTS_ID_PREFIX;
+use toolkit_gts::gts_id;
 use types_registry_sdk::GtsTypeId;
 
 fn make_type_schema(type_id: &str) -> Arc<GtsTypeSchema> {
@@ -17,16 +19,16 @@ fn make_type_schema(type_id: &str) -> Arc<GtsTypeSchema> {
 fn test_get_miss_returns_none() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> =
         InMemoryCache::<Arc<GtsTypeSchema>>::new(CacheConfig::type_schemas());
-    assert!(cache.get("gts.cf.y.z.t.v1~").is_none());
+    assert!(cache.get(gts_id!("cf.y.z.t.v1~")).is_none());
 }
 
 #[test]
 fn test_put_then_get_returns_value() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> =
         InMemoryCache::<Arc<GtsTypeSchema>>::new(CacheConfig::type_schemas());
-    let schema = make_type_schema("gts.cf.y.z.t.v1~");
-    cache.put("gts.cf.y.z.t.v1~".to_owned(), Arc::clone(&schema));
-    let hit = cache.get("gts.cf.y.z.t.v1~").unwrap();
+    let schema = make_type_schema(gts_id!("cf.y.z.t.v1~"));
+    cache.put(gts_id!("cf.y.z.t.v1~").to_owned(), Arc::clone(&schema));
+    let hit = cache.get(gts_id!("cf.y.z.t.v1~")).unwrap();
     assert!(Arc::ptr_eq(&hit, &schema));
 }
 
@@ -34,18 +36,18 @@ fn test_put_then_get_returns_value() {
 fn test_invalidate_removes_entry() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> =
         InMemoryCache::<Arc<GtsTypeSchema>>::new(CacheConfig::type_schemas());
-    let schema = make_type_schema("gts.cf.y.z.t.v1~");
-    cache.put("gts.cf.y.z.t.v1~".to_owned(), schema);
-    cache.invalidate("gts.cf.y.z.t.v1~");
-    assert!(cache.get("gts.cf.y.z.t.v1~").is_none());
+    let schema = make_type_schema(gts_id!("cf.y.z.t.v1~"));
+    cache.put(gts_id!("cf.y.z.t.v1~").to_owned(), schema);
+    cache.invalidate(gts_id!("cf.y.z.t.v1~"));
+    assert!(cache.get(gts_id!("cf.y.z.t.v1~")).is_none());
 }
 
 #[test]
 fn test_clear_drops_all() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> =
         InMemoryCache::<Arc<GtsTypeSchema>>::new(CacheConfig::type_schemas());
-    cache.put("a~".to_owned(), make_type_schema("gts.cf.y.z.a.v1~"));
-    cache.put("b~".to_owned(), make_type_schema("gts.cf.y.z.b.v1~"));
+    cache.put("a~".to_owned(), make_type_schema(gts_id!("cf.y.z.a.v1~")));
+    cache.put("b~".to_owned(), make_type_schema(gts_id!("cf.y.z.b.v1~")));
     assert_eq!(cache.len(), 2);
     cache.clear();
     assert!(cache.is_empty());
@@ -56,9 +58,9 @@ fn test_lru_eviction_at_capacity() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> = InMemoryCache::<Arc<GtsTypeSchema>>::new(
         CacheConfig::type_schemas().with_capacity(2).without_ttl(),
     );
-    cache.put("a".to_owned(), make_type_schema("gts.cf.y.z.a.v1~"));
-    cache.put("b".to_owned(), make_type_schema("gts.cf.y.z.b.v1~"));
-    cache.put("c".to_owned(), make_type_schema("gts.cf.y.z.c.v1~"));
+    cache.put("a".to_owned(), make_type_schema(gts_id!("cf.y.z.a.v1~")));
+    cache.put("b".to_owned(), make_type_schema(gts_id!("cf.y.z.b.v1~")));
+    cache.put("c".to_owned(), make_type_schema(gts_id!("cf.y.z.c.v1~")));
     // a was the least recently used → evicted.
     assert!(cache.get("a").is_none());
     assert!(cache.get("b").is_some());
@@ -70,7 +72,7 @@ fn test_ttl_expiry() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> = InMemoryCache::<Arc<GtsTypeSchema>>::new(
         CacheConfig::type_schemas().with_ttl(Duration::from_millis(50)),
     );
-    cache.put("a".to_owned(), make_type_schema("gts.cf.y.z.a.v1~"));
+    cache.put("a".to_owned(), make_type_schema(gts_id!("cf.y.z.a.v1~")));
     assert!(cache.get("a").is_some());
     sleep(Duration::from_millis(80));
     assert!(cache.get("a").is_none());
@@ -81,7 +83,7 @@ fn test_no_ttl_keeps_entry() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> = InMemoryCache::<Arc<GtsTypeSchema>>::new(
         CacheConfig::type_schemas().without_ttl().with_capacity(8),
     );
-    cache.put("a".to_owned(), make_type_schema("gts.cf.y.z.a.v1~"));
+    cache.put("a".to_owned(), make_type_schema(gts_id!("cf.y.z.a.v1~")));
     sleep(Duration::from_millis(20));
     assert!(cache.get("a").is_some());
 }
@@ -93,9 +95,9 @@ fn test_zero_capacity_clamped_to_one() {
             capacity: 0,
             ttl: None,
         });
-    cache.put("a".to_owned(), make_type_schema("gts.cf.y.z.a.v1~"));
+    cache.put("a".to_owned(), make_type_schema(gts_id!("cf.y.z.a.v1~")));
     // capacity = 1 means second put evicts the first.
-    cache.put("b".to_owned(), make_type_schema("gts.cf.y.z.b.v1~"));
+    cache.put("b".to_owned(), make_type_schema(gts_id!("cf.y.z.b.v1~")));
     assert!(cache.get("a").is_none());
     assert!(cache.get("b").is_some());
 }
@@ -117,15 +119,15 @@ fn test_default_configs() {
 fn test_get_many_preserves_order_and_gaps() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> =
         InMemoryCache::<Arc<GtsTypeSchema>>::new(CacheConfig::type_schemas());
-    let a = make_type_schema("gts.cf.y.z.a.v1~");
-    let c = make_type_schema("gts.cf.y.z.c.v1~");
-    cache.put("gts.cf.y.z.a.v1~".to_owned(), Arc::clone(&a));
-    cache.put("gts.cf.y.z.c.v1~".to_owned(), Arc::clone(&c));
+    let a = make_type_schema(gts_id!("cf.y.z.a.v1~"));
+    let c = make_type_schema(gts_id!("cf.y.z.c.v1~"));
+    cache.put(gts_id!("cf.y.z.a.v1~").to_owned(), Arc::clone(&a));
+    cache.put(gts_id!("cf.y.z.c.v1~").to_owned(), Arc::clone(&c));
 
     let results = cache.get_many(&[
-        "gts.cf.y.z.a.v1~",
-        "gts.cf.y.z.b.v1~", // not in cache
-        "gts.cf.y.z.c.v1~",
+        gts_id!("cf.y.z.a.v1~"),
+        gts_id!("cf.y.z.b.v1~"), // not in cache
+        gts_id!("cf.y.z.c.v1~"),
     ]);
     assert_eq!(results.len(), 3);
     assert!(Arc::ptr_eq(results[0].as_ref().unwrap(), &a));
@@ -145,7 +147,7 @@ fn test_get_many_empty_input() {
 fn test_get_many_all_misses() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> =
         InMemoryCache::<Arc<GtsTypeSchema>>::new(CacheConfig::type_schemas());
-    let results = cache.get_many(&["gts.cf.y.z.a.v1~", "gts.cf.y.z.b.v1~"]);
+    let results = cache.get_many(&[gts_id!("cf.y.z.a.v1~"), gts_id!("cf.y.z.b.v1~")]);
     assert_eq!(results.len(), 2);
     assert!(results[0].is_none());
     assert!(results[1].is_none());
@@ -160,23 +162,23 @@ fn test_get_many_evicts_expired_entries() {
         CacheConfig::type_schemas().with_ttl(Duration::from_millis(50)),
     );
     cache.put(
-        "gts.cf.y.z.expired.v1~".to_owned(),
-        make_type_schema("gts.cf.y.z.expired.v1~"),
+        gts_id!("cf.y.z.expired.v1~").to_owned(),
+        make_type_schema(gts_id!("cf.y.z.expired.v1~")),
     );
     sleep(Duration::from_millis(80));
     // Fresh entry inserted AFTER the sleep — its TTL clock is reset.
     cache.put(
-        "gts.cf.y.z.fresh.v1~".to_owned(),
-        make_type_schema("gts.cf.y.z.fresh.v1~"),
+        gts_id!("cf.y.z.fresh.v1~").to_owned(),
+        make_type_schema(gts_id!("cf.y.z.fresh.v1~")),
     );
 
-    let results = cache.get_many(&["gts.cf.y.z.expired.v1~", "gts.cf.y.z.fresh.v1~"]);
+    let results = cache.get_many(&[gts_id!("cf.y.z.expired.v1~"), gts_id!("cf.y.z.fresh.v1~")]);
     assert!(results[0].is_none());
     assert!(results[1].is_some());
 
     // Expired entry must be evicted as a side effect.
-    assert!(cache.get("gts.cf.y.z.expired.v1~").is_none());
-    assert!(cache.get("gts.cf.y.z.fresh.v1~").is_some());
+    assert!(cache.get(gts_id!("cf.y.z.expired.v1~")).is_none());
+    assert!(cache.get(gts_id!("cf.y.z.fresh.v1~")).is_some());
     assert_eq!(cache.len(), 1);
 }
 
@@ -188,35 +190,38 @@ fn test_put_many_inserts_all_entries() {
         InMemoryCache::<Arc<GtsTypeSchema>>::new(CacheConfig::type_schemas());
     cache.put_many(vec![
         (
-            "gts.cf.y.z.a.v1~".to_owned(),
-            make_type_schema("gts.cf.y.z.a.v1~"),
+            gts_id!("cf.y.z.a.v1~").to_owned(),
+            make_type_schema(gts_id!("cf.y.z.a.v1~")),
         ),
         (
-            "gts.cf.y.z.b.v1~".to_owned(),
-            make_type_schema("gts.cf.y.z.b.v1~"),
+            gts_id!("cf.y.z.b.v1~").to_owned(),
+            make_type_schema(gts_id!("cf.y.z.b.v1~")),
         ),
         (
-            "gts.cf.y.z.c.v1~".to_owned(),
-            make_type_schema("gts.cf.y.z.c.v1~"),
+            gts_id!("cf.y.z.c.v1~").to_owned(),
+            make_type_schema(gts_id!("cf.y.z.c.v1~")),
         ),
     ]);
     assert_eq!(cache.len(), 3);
-    assert!(cache.get("gts.cf.y.z.a.v1~").is_some());
-    assert!(cache.get("gts.cf.y.z.b.v1~").is_some());
-    assert!(cache.get("gts.cf.y.z.c.v1~").is_some());
+    assert!(cache.get(gts_id!("cf.y.z.a.v1~")).is_some());
+    assert!(cache.get(gts_id!("cf.y.z.b.v1~")).is_some());
+    assert!(cache.get(gts_id!("cf.y.z.c.v1~")).is_some());
 }
 
 #[test]
 fn test_put_many_replaces_existing() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> =
         InMemoryCache::<Arc<GtsTypeSchema>>::new(CacheConfig::type_schemas());
-    let v1 = make_type_schema("gts.cf.y.z.a.v1~");
-    let v2 = make_type_schema("gts.cf.y.z.a.v1~");
-    cache.put("gts.cf.y.z.a.v1~".to_owned(), Arc::clone(&v1));
-    cache.put_many(vec![("gts.cf.y.z.a.v1~".to_owned(), Arc::clone(&v2))]);
+    let v1 = make_type_schema(gts_id!("cf.y.z.a.v1~"));
+    let v2 = make_type_schema(gts_id!("cf.y.z.a.v1~"));
+    cache.put(gts_id!("cf.y.z.a.v1~").to_owned(), Arc::clone(&v1));
+    cache.put_many(vec![(gts_id!("cf.y.z.a.v1~").to_owned(), Arc::clone(&v2))]);
     assert_eq!(cache.len(), 1);
     // The replacement won — same key now points to v2's Arc.
-    assert!(Arc::ptr_eq(&cache.get("gts.cf.y.z.a.v1~").unwrap(), &v2));
+    assert!(Arc::ptr_eq(
+        &cache.get(gts_id!("cf.y.z.a.v1~")).unwrap(),
+        &v2
+    ));
 }
 
 #[test]
@@ -235,22 +240,22 @@ fn test_put_many_respects_capacity() {
     );
     cache.put_many(vec![
         (
-            "gts.cf.y.z.a.v1~".to_owned(),
-            make_type_schema("gts.cf.y.z.a.v1~"),
+            gts_id!("cf.y.z.a.v1~").to_owned(),
+            make_type_schema(gts_id!("cf.y.z.a.v1~")),
         ),
         (
-            "gts.cf.y.z.b.v1~".to_owned(),
-            make_type_schema("gts.cf.y.z.b.v1~"),
+            gts_id!("cf.y.z.b.v1~").to_owned(),
+            make_type_schema(gts_id!("cf.y.z.b.v1~")),
         ),
         (
-            "gts.cf.y.z.c.v1~".to_owned(),
-            make_type_schema("gts.cf.y.z.c.v1~"),
+            gts_id!("cf.y.z.c.v1~").to_owned(),
+            make_type_schema(gts_id!("cf.y.z.c.v1~")),
         ),
     ]);
     assert_eq!(cache.len(), 2);
-    assert!(cache.get("gts.cf.y.z.a.v1~").is_none()); // evicted (LRU)
-    assert!(cache.get("gts.cf.y.z.b.v1~").is_some());
-    assert!(cache.get("gts.cf.y.z.c.v1~").is_some());
+    assert!(cache.get(gts_id!("cf.y.z.a.v1~")).is_none()); // evicted (LRU)
+    assert!(cache.get(gts_id!("cf.y.z.b.v1~")).is_some());
+    assert!(cache.get(gts_id!("cf.y.z.c.v1~")).is_some());
 }
 
 // ── reverse `uuid → gts_id` index pruning ────────────────────────────────
@@ -265,7 +270,7 @@ fn test_reverse_index_pruned_on_capacity_eviction() {
         CacheConfig::type_schemas().with_capacity(2).without_ttl(),
     );
     let schemas: Vec<Arc<GtsTypeSchema>> = (0..5)
-        .map(|i| make_type_schema(&format!("gts.cf.y.z.s{i}.v1~")))
+        .map(|i| make_type_schema(&format!("{GTS_ID_PREFIX}cf.y.z.s{i}.v1~")))
         .collect();
     for s in &schemas {
         cache.put(s.type_id.to_string(), Arc::clone(s));
@@ -287,11 +292,11 @@ fn test_reverse_index_pruned_on_capacity_eviction() {
 fn test_reverse_index_pruned_on_invalidate() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> =
         InMemoryCache::<Arc<GtsTypeSchema>>::new(CacheConfig::type_schemas());
-    let s = make_type_schema("gts.cf.y.z.t.v1~");
+    let s = make_type_schema(gts_id!("cf.y.z.t.v1~"));
     let uuid = s.type_uuid;
     cache.put(s.type_id.to_string(), s);
     assert!(cache.get_by_uuid(uuid).is_some());
-    cache.invalidate("gts.cf.y.z.t.v1~");
+    cache.invalidate(gts_id!("cf.y.z.t.v1~"));
     // After invalidate, the reverse index must not retain a dangling
     // mapping that points at a now-evicted LRU entry.
     assert!(cache.get_by_uuid(uuid).is_none());
@@ -302,9 +307,9 @@ fn test_reverse_index_pruned_on_retain() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> = InMemoryCache::<Arc<GtsTypeSchema>>::new(
         CacheConfig::type_schemas().with_capacity(4).without_ttl(),
     );
-    let kept = make_type_schema("gts.cf.y.z.keep.v1~");
-    let first_dropped = make_type_schema("gts.cf.y.z.drop_a.v1~");
-    let second_dropped = make_type_schema("gts.cf.y.z.drop_b.v1~");
+    let kept = make_type_schema(gts_id!("cf.y.z.keep.v1~"));
+    let first_dropped = make_type_schema(gts_id!("cf.y.z.drop_a.v1~"));
+    let second_dropped = make_type_schema(gts_id!("cf.y.z.drop_b.v1~"));
     let kept_uuid = kept.type_uuid;
     let first_uuid = first_dropped.type_uuid;
     let second_uuid = second_dropped.type_uuid;
@@ -325,13 +330,13 @@ fn test_reverse_index_pruned_on_ttl_expiry() {
     let cache: InMemoryCache<Arc<GtsTypeSchema>> = InMemoryCache::<Arc<GtsTypeSchema>>::new(
         CacheConfig::type_schemas().with_ttl(Duration::from_millis(50)),
     );
-    let s = make_type_schema("gts.cf.y.z.t.v1~");
+    let s = make_type_schema(gts_id!("cf.y.z.t.v1~"));
     let uuid = s.type_uuid;
     cache.put(s.type_id.to_string(), s);
     sleep(Duration::from_millis(80));
     // First lookup observes expiry and evicts the LRU entry; the
     // reverse mapping must drop in the same step so the second lookup
     // doesn't see a dangling pointer.
-    assert!(cache.get("gts.cf.y.z.t.v1~").is_none());
+    assert!(cache.get(gts_id!("cf.y.z.t.v1~")).is_none());
     assert!(cache.get_by_uuid(uuid).is_none());
 }

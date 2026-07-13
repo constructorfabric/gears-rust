@@ -57,3 +57,4 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 # in `domain::client::pagination_tests` builds a sample context per
 # request. Dev-only so the runtime crate stays free of the dependency.
 gts = { workspace = true }
+toolkit-gts = { workspace = true }

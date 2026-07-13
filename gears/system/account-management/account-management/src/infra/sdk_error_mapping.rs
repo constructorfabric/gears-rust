@@ -52,10 +52,10 @@ use crate::domain::metrics::{AM_CROSS_TENANT_DENIAL, MetricKind, emit_metric};
 // Resource markers — kept in sync with account_management_sdk::gts.
 // ---------------------------------------------------------------------------
 
-#[resource_error("gts.cf.core.am.tenant.v1~")]
+#[resource_error(gts_id!("cf.core.am.tenant.v1~"))]
 pub(crate) struct TenantResource;
 
-#[resource_error("gts.cf.core.am.user.v1~")]
+#[resource_error(gts_id!("cf.core.am.user.v1~"))]
 pub(crate) struct UserResource;
 
 // `TenantMetadataResource` carries the unified 404 for the metadata
@@ -64,10 +64,10 @@ pub(crate) struct UserResource;
 // `type_id` the caller supplied is surfaced through `resource_name`,
 // so consumers still see *which* schema was involved without a separate
 // type-level discriminator.
-#[resource_error("gts.cf.core.am.tenant_metadata.v1~")]
+#[resource_error(gts_id!("cf.core.am.tenant_metadata.v1~"))]
 pub(crate) struct TenantMetadataResource;
 
-#[resource_error("gts.cf.core.am.conversion_request.v1~")]
+#[resource_error(gts_id!("cf.core.am.conversion_request.v1~"))]
 pub(crate) struct ConversionRequestResource;
 
 // ---------------------------------------------------------------------------

@@ -16,9 +16,6 @@ use uuid::Uuid;
 // -- GtsTypePath value object --
 
 // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-1
-/// Maximum length of a GTS type path.
-const GTS_TYPE_PATH_MAX_LEN: usize = 1024;
-
 /// Validated GTS type path value object.
 ///
 /// A GTS type path follows the pattern `gts.<segment>~(<segment>~)*` where
@@ -32,8 +29,8 @@ impl GtsTypePath {
     /// Create a new `GtsTypePath` from a raw string, applying validation.
     ///
     /// # Errors
-    /// Returns an error if the string is empty, exceeds 1024 characters,
-    /// or does not match the GTS type path format.
+    /// Returns an error if the string is empty or does not match the GTS
+    /// type path format (including exceeding the 1024-char GTS ID limit).
     pub fn new(raw: impl Into<String>) -> Result<Self, String> {
         // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-2
         let raw = raw.into();
@@ -48,19 +45,11 @@ impl GtsTypePath {
         }
         // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-3
 
-        // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-5
-        if s.len() > GTS_TYPE_PATH_MAX_LEN {
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-5a
-            return Err("GTS type path exceeds maximum length".to_owned());
-            // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-5a
-        }
-        // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-5
-
         // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-4
         // Validate format using the canonical gts crate parser.
         // Each tilde-separated segment must be a valid GTS ID with 5+ tokens
         // (vendor.package.namespace.type.vMAJOR).
-        if gts::GtsID::new(&s).is_err() {
+        if gts::GtsId::try_new(&s).is_err() {
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-4a
             return Err("Invalid GTS type path format".to_owned());
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-4a

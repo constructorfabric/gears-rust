@@ -80,17 +80,18 @@
 use account_management_sdk::IdpNewUser;
 use serde_json::Value;
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_gts::gts_id;
 use types_registry_sdk::TypesRegistryClient;
 
 use crate::domain::error::DomainError;
 
 /// GTS type id of the Account Management user resource. Pinned to the
 /// same string the published JSON Schema declares as its `$id`.
-pub(crate) const USER_TYPE_ID: &str = "gts.cf.core.am.user.v1~";
+pub(crate) const USER_TYPE_ID: &str = gts_id!("cf.core.am.user.v1~");
 
 /// GTS type id of the Account Management tenant resource. Pinned to
 /// the same string the published JSON Schema declares as its `$id`.
-pub(crate) const TENANT_TYPE_ID: &str = "gts.cf.core.am.tenant.v1~";
+pub(crate) const TENANT_TYPE_ID: &str = gts_id!("cf.core.am.tenant.v1~");
 
 /// Validate the structural fields of a [`IdpNewUser`] against the
 /// registered `gts.cf.core.am.user.v1~` schema.

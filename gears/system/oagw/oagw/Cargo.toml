@@ -37,6 +37,7 @@ oagw-sdk = { path = "../oagw-sdk", package="cf-gears-oagw-sdk", version = "0.5.3
 toolkit = { workspace = true }
 toolkit-auth = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
+toolkit-gts = { workspace = true }
 toolkit-http = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }

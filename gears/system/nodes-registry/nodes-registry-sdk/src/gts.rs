@@ -18,6 +18,7 @@
 //! `resource_type` equals this constant, so a divergence trips at test
 //! time, not in production.
 
+use toolkit_gts::gts_id;
 /// Nodes-registry node resource. Surfaces as the `resource_type` on the
 /// canonical `NotFound` raised when a node id does not resolve (404).
-pub const NODE_RESOURCE_TYPE: &str = "gts.cf.nodes_registry.registry.node.v1~";
+pub const NODE_RESOURCE_TYPE: &str = gts_id!("cf.nodes_registry.registry.node.v1~");

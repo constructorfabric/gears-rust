@@ -33,6 +33,7 @@
 )]
 
 use std::sync::Arc;
+use toolkit_gts::gts_id;
 
 use account_management_sdk::{MetadataEntry, UpsertMetadataRequest};
 use serde_json::{Value, json};
@@ -96,15 +97,21 @@ fn first_page() -> ODataQuery {
 }
 
 fn schema_a() -> GtsTypeId {
-    GtsTypeId::new("gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.theme.v1~")
+    GtsTypeId::new(gts_id!(
+        "cf.core.am.tenant_metadata.v1~vendor.app.metadata.theme.v1~"
+    ))
 }
 
 fn schema_b() -> GtsTypeId {
-    GtsTypeId::new("gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.billing.v1~")
+    GtsTypeId::new(gts_id!(
+        "cf.core.am.tenant_metadata.v1~vendor.app.metadata.billing.v1~"
+    ))
 }
 
 fn schema_unknown() -> GtsTypeId {
-    GtsTypeId::new("gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.absent.v1~")
+    GtsTypeId::new(gts_id!(
+        "cf.core.am.tenant_metadata.v1~vendor.app.metadata.absent.v1~"
+    ))
 }
 
 /// Compute the same deterministic `UUIDv5` the service / repo use
@@ -116,7 +123,7 @@ fn schema_unknown() -> GtsTypeId {
     reason = "test helpers only see hand-crafted valid schema ids"
 )]
 fn schema_uuid_for(type_id: &str) -> Uuid {
-    gts::GtsID::new(type_id)
+    gts::GtsId::try_new(type_id)
         .expect("valid GTS id in tests")
         .to_uuid()
 }

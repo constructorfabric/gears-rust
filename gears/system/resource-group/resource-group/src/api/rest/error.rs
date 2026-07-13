@@ -18,7 +18,7 @@ use crate::domain::error::DomainError;
 /// The macro literal mirrors [`resource_group_sdk::gts::GROUP_RESOURCE_TYPE`]
 /// (proc-macros cannot resolve a const); the SDK round-trip tests pin the
 /// two equal.
-#[resource_error("gts.cf.core.resource_group.group.v1~")]
+#[resource_error(gts_id!("cf.core.resource_group.group.v1~"))]
 pub struct RgError;
 
 /// Implement `From<DomainError> for CanonicalError` so `?` works in

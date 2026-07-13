@@ -44,3 +44,6 @@ toolkit-db-macros = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
+
+[dev-dependencies]
+toolkit-gts = { workspace = true }

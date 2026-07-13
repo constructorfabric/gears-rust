@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use toolkit_canonical_errors::problem;
+use toolkit_gts::gts_id;
 
 /// Convert OpenAPI-style path placeholders to Axum 0.8+ style path parameters.
 ///
@@ -60,6 +61,10 @@ pub fn axum_to_openapi_path(path: &str) -> String {
     // Regular parameters are the same in both
     path.replace("{*", "{")
 }
+
+/// Canonical base license feature used by the example gears.
+pub const CORE_GLOBAL_BASE_LICENSE_FEATURE: &str =
+    gts_id!("cf.core.lic.feat.v1~cf.core.global.base.v1");
 
 /// Type-state markers for compile-time enforcement
 pub mod state {
@@ -900,7 +905,7 @@ where
     /// impl AsRef<str> for License {
     ///     fn as_ref(&self) -> &str {
     ///         match self {
-    ///             License::Base => "gts.cf.core.lic.feat.v1~cf.core.global.base.v1",
+    ///             License::Base => CORE_GLOBAL_BASE_LICENSE_FEATURE,
     ///         }
     ///     }
     /// }

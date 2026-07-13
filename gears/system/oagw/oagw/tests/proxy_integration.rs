@@ -5,14 +5,15 @@
 #![cfg(not(feature = "fips"))]
 
 use std::collections::HashMap;
+use toolkit_gts::{GTS_ID_URI_PREFIX, gts_id};
 
 use http::{Method, StatusCode};
 use oagw::test_support::{
     APIKEY_AUTH_PLUGIN_ID, AppHarness, MockBody, MockGuard, MockResponse, MockUpstream,
     OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
 };
-use oagw_sdk::Body;
 use oagw_sdk::api::ErrorSource;
+use oagw_sdk::{Body, HTTP_PROTOCOL_ID};
 use oagw_sdk::{
     BurstConfig, CorsConfig, CorsHttpMethod, CreateRouteRequest, CreateUpstreamRequest, Endpoint,
     HeadersConfig, HttpMatch, HttpMethod, MatchRules, PassthroughMode, PathSuffixMode,
@@ -37,7 +38,7 @@ async fn setup_openai_mock() -> AppHarness {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "mock-upstream",
             "enabled": true,
             "tags": [],
@@ -143,7 +144,7 @@ async fn proxy_injects_auth_header() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("auth-hdr-test")
             .auth(oagw_sdk::AuthConfig {
@@ -244,7 +245,7 @@ async fn proxy_sse_streaming() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("sse-test")
             .build(),
@@ -357,7 +358,7 @@ async fn proxy_disabled_upstream_returns_503() {
                         port: 9999,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("disabled-upstream")
             .enabled(false)
@@ -395,7 +396,7 @@ async fn proxy_rate_limit_exceeded_returns_429() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("rate-limited")
             .rate_limit(RateLimitConfig {
@@ -479,7 +480,7 @@ async fn proxy_rate_limit_scope_user_isolates_by_subject() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("scope-user")
             .rate_limit(RateLimitConfig {
@@ -611,7 +612,7 @@ async fn proxy_rate_limit_scope_route_isolates_by_route() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("scope-route")
             .build(),
@@ -774,7 +775,7 @@ async fn proxy_upstream_timeout_returns_504() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("timeout-upstream")
             .build(),
@@ -831,7 +832,7 @@ async fn proxy_query_allowlist_allowed_param_succeeds() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("ql-test")
             .build(),
@@ -885,7 +886,7 @@ async fn proxy_query_allowlist_unknown_param_rejected() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("ql-reject")
             .build(),
@@ -942,11 +943,12 @@ async fn proxy_nonexistent_auth_plugin_returns_error() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("bad-auth")
             .auth(oagw_sdk::AuthConfig {
-                plugin_type: "gts.cf.core.oagw.auth.v1~nonexistent.plugin.v1".into(),
+                plugin_type: gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.nonexistent.v1")
+                    .into(),
                 sharing: SharingMode::Private,
                 config: None,
             })
@@ -1019,7 +1021,7 @@ async fn proxy_recorded_request_has_correct_uri_and_body() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("rec-test")
             .build(),
@@ -1085,7 +1087,7 @@ async fn proxy_response_headers_sanitized() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("resp-hdr-test")
             .build(),
@@ -1177,7 +1179,7 @@ async fn proxy_path_suffix_disabled_rejects_extra_path() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("psm-test")
             .build(),
@@ -1265,7 +1267,7 @@ async fn proxy_multi_endpoint_round_robin() {
                         },
                     ],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("rr-test")
             .build(),
@@ -1345,7 +1347,7 @@ async fn proxy_target_host_header_selects_endpoint() {
                         },
                     ],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("target-host-test")
             .build(),
@@ -1402,7 +1404,7 @@ async fn proxy_target_host_unknown_returns_error() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("target-host-unknown")
             .build(),
@@ -1468,7 +1470,7 @@ async fn proxy_all_backends_unreachable() {
                         port: 19991,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("unreachable-test")
             .build(),
@@ -1538,7 +1540,7 @@ async fn proxy_crud_invalidation_after_update() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": port_a, "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "crud-invalidation",
             "enabled": true,
             "tags": []
@@ -1590,7 +1592,7 @@ async fn proxy_crud_invalidation_after_update() {
             "server": {
                 "endpoints": [{"host": "127.0.0.1", "port": port_b, "scheme": "http"}]
             },
-            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "protocol": HTTP_PROTOCOL_ID,
             "alias": "crud-invalidation",
             "enabled": true,
             "tags": []
@@ -1648,7 +1650,7 @@ async fn proxy_with_mock_guard_custom_response() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("guard-test")
             .build(),
@@ -1717,7 +1719,7 @@ async fn proxy_websocket_upgrade_returns_101() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("ws-echo-test")
             .build(),
@@ -1795,7 +1797,7 @@ async fn proxy_websocket_upgrade_rejected_returns_503_protocol_error() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("ws-reject-test")
             .build(),
@@ -1907,7 +1909,7 @@ async fn proxy_websocket_auth_injected_during_handshake() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("ws-auth-test")
             .auth(oagw_sdk::AuthConfig {
@@ -2019,7 +2021,7 @@ async fn proxy_websocket_rate_limit_on_handshake() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("ws-rate-limit")
             .rate_limit(RateLimitConfig {
@@ -2157,7 +2159,7 @@ async fn proxy_unreachable_backend_returns_rfc9457_problem_body() {
                         port: 19993,
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("rfc9457-body-test")
             .build(),
@@ -2226,8 +2228,11 @@ async fn proxy_unreachable_backend_returns_rfc9457_problem_body() {
 
             // GTS type must not be about:blank.
             let gts_type = body["type"].as_str().unwrap();
+            let gts_id = gts_type
+                .strip_prefix(GTS_ID_URI_PREFIX)
+                .expect("canonical problem type should use GTS URI prefix");
             assert!(
-                gts_type.starts_with("gts://gts."),
+                gts::GtsId::try_new(gts_id).is_ok(),
                 "expected canonical GTS error type, got: {gts_type}"
             );
 
@@ -2273,7 +2278,7 @@ async fn proxy_streaming_body_exceeding_limit_returns_400() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("body-limit-test")
             .build(),
@@ -2358,7 +2363,7 @@ async fn proxy_streaming_body_post_arrives_intact() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("stream-body-test")
             .build(),
@@ -2449,7 +2454,7 @@ async fn proxy_streaming_body_with_empty_chunks_succeeds() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("stream-empty-chunks")
             .build(),
@@ -2543,7 +2548,7 @@ async fn proxy_streaming_body_single_chunk() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("stream-single-chunk")
             .build(),
@@ -2629,7 +2634,7 @@ async fn proxy_streaming_body_error_mid_stream_does_not_send_terminator() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("stream-err-test")
             .build(),
@@ -2738,7 +2743,7 @@ async fn proxy_oauth2_client_cred_injects_bearer_token() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("oauth2-test")
             .auth(oagw_sdk::AuthConfig {
@@ -2843,7 +2848,7 @@ async fn proxy_oauth2_missing_credentials_returns_error() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("oauth2-missing-creds")
             .auth(oagw_sdk::AuthConfig {
@@ -2910,7 +2915,7 @@ async fn proxy_oauth2_missing_credentials_returns_error() {
 // ---------------------------------------------------------------------------
 
 const REQUIRED_HEADERS_GUARD_PLUGIN_ID: &str =
-    "gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.required_headers.v1";
+    gts_id!("cf.core.oagw.guard_plugin.v1~cf.core.oagw.required_headers.v1");
 
 /// Verify that the RequiredHeadersGuardPlugin allows requests that include
 /// all required headers.
@@ -2942,7 +2947,7 @@ async fn proxy_guard_allows_when_required_header_present() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("guard-hdr-ok")
             .headers(HeadersConfig {
@@ -3026,7 +3031,7 @@ async fn proxy_guard_rejects_missing_required_header() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("guard-hdr-miss")
             .plugins(PluginsConfig {
@@ -3135,7 +3140,7 @@ async fn proxy_guard_allows_unconfigured() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("guard-hdr-noconf")
             .plugins(PluginsConfig {
@@ -3189,7 +3194,7 @@ async fn proxy_guard_allows_unconfigured() {
 // ---------------------------------------------------------------------------
 
 const REQUEST_ID_TRANSFORM_PLUGIN_ID: &str =
-    "gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.request_id.v1";
+    gts_id!("cf.core.oagw.transform_plugin.v1~cf.core.oagw.request_id.v1");
 
 /// Verify that the RequestIdTransformPlugin injects an X-Request-ID header when
 /// the inbound request does not include one.
@@ -3221,7 +3226,7 @@ async fn proxy_transform_injects_request_id() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("transform-inject")
             .plugins(PluginsConfig {
@@ -3313,7 +3318,7 @@ async fn proxy_transform_preserves_request_id() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("transform-preserve")
             .headers(HeadersConfig {
@@ -3416,14 +3421,16 @@ async fn proxy_transform_error_continues_pipeline() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("transform-error")
             .plugins(PluginsConfig {
                 sharing: SharingMode::Private,
                 items: vec![PluginBinding {
-                    plugin_ref: "gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.nonexistent.v1"
-                        .to_string(),
+                    plugin_ref: gts_id!(
+                        "cf.core.oagw.transform_plugin.v1~cf.core.oagw.nonexistent.v1"
+                    )
+                    .to_string(),
                     config: Default::default(),
                 }],
             })
@@ -3503,7 +3510,7 @@ async fn setup_cors_upstream(
                 port: h.mock_port(),
             }],
         },
-        "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+        HTTP_PROTOCOL_ID,
     )
     .alias(alias);
 
@@ -3837,7 +3844,7 @@ async fn cors_route_inherit_merges_origins() {
                 port: h.mock_port(),
             }],
         },
-        "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+        HTTP_PROTOCOL_ID,
     )
     .alias("cors-route-inherit");
     builder = builder.cors(upstream_cors);
@@ -3964,7 +3971,7 @@ async fn cors_actual_request_disallowed_method_rejected_before_upstream() {
                 port: h.mock_port(),
             }],
         },
-        "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+        HTTP_PROTOCOL_ID,
     )
     .alias("cors-reject-method");
     builder = builder.cors(cors);
@@ -4312,7 +4319,7 @@ async fn setup_ws_upstream(h: &AppHarness, alias: &str) {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias(alias)
             .build(),
@@ -4786,7 +4793,7 @@ async fn proxy_response_header_rules_applied() {
                         port: h.mock_port(),
                     }],
                 },
-                "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+                HTTP_PROTOCOL_ID,
             )
             .alias("resp-rules-test")
             .headers(HeadersConfig {

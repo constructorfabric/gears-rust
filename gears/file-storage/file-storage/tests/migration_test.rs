@@ -9,6 +9,7 @@
 
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
+use toolkit_gts::gts_id;
 
 use file_storage::Migrator;
 
@@ -18,7 +19,7 @@ const FILE: &str = "00000000-0000-0000-0000-0000000000c1";
 /// Version id used by the ADR-0006 content-hash-modes tests appended at the
 /// end of this file.
 const VERSION: &str = "00000000-0000-0000-0000-0000000000d1";
-const GTS: &str = "gts.cf.fstorage.file.type.v1~x.test.v1~";
+const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 /// 32 zero bytes — the only hash length the P1 `SHA-256` CHECK accepts.
 const HASH32: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 

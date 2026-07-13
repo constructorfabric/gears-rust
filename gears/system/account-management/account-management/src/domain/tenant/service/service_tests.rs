@@ -3,6 +3,7 @@
 //! no filesystem.
 
 use account_management_sdk::TenantStatus as PublicTenantStatus;
+use toolkit_gts::gts_id;
 use toolkit_odata::ODataQuery;
 use toolkit_odata::ast::{CompareOperator, Expr, Value as OdataValue};
 
@@ -40,6 +41,8 @@ use async_trait::async_trait;
 use std::sync::Mutex;
 use time::OffsetDateTime;
 use toolkit_security::AccessScope;
+
+const CUSTOMER_TENANT_TYPE_ID: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
 
 /// Test-only `TypesRegistryClient` that resolves every UUID to the
 /// same hard-coded chained `GtsTypeSchema`. The reaper / retention
@@ -103,9 +106,7 @@ impl types_registry_sdk::TypesRegistryClient for ConstantTypesRegistry {
         &self,
         _type_uuid: Uuid,
     ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        Ok(synth_type_schema(
-            "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~",
-        ))
+        Ok(synth_type_schema(CUSTOMER_TENANT_TYPE_ID))
     }
     async fn get_type_schemas(
         &self,
@@ -321,7 +322,7 @@ fn child_input(child_id: Uuid, parent_id: Uuid) -> CreateTenantRequest {
         child_id,
         parent_id,
         "child",
-        gts::GtsTypeId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"),
+        gts::GtsTypeId::new(CUSTOMER_TENANT_TYPE_ID),
     )
 }
 
@@ -2728,7 +2729,7 @@ async fn create_tenant_succeeds_when_parent_child_compatible() {
 
     // Root tenant_type_uuid is `0xAA` per `FakeTenantRepo::with_root`,
     // and the child uuid is derived from the chained-id string in
-    // `child_input` via `gts::GtsID::new(...).to_uuid()`.
+    // `child_input` via `gts::GtsId::try_new(...).to_uuid()`.
     let created = svc
         .create_tenant(&ctx_for(root), child_input(child, root))
         .await
@@ -2736,10 +2737,9 @@ async fn create_tenant_succeeds_when_parent_child_compatible() {
     assert_eq!(created.id.0, child);
     assert_eq!(created.status, PublicTenantStatus::Active);
 
-    let expected_child_type_uuid =
-        gts::GtsID::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~")
-            .expect("valid gts chain")
-            .to_uuid();
+    let expected_child_type_uuid = gts::GtsId::try_new(CUSTOMER_TENANT_TYPE_ID)
+        .expect("valid gts chain")
+        .to_uuid();
     let calls = checker.calls();
     assert_eq!(calls.len(), 1, "barrier must be invoked exactly once");
     assert_eq!(calls[0].0, Uuid::from_u128(0xAA), "parent type");
@@ -2795,7 +2795,7 @@ async fn create_tenant_rejects_same_type_nesting_when_disallowed() {
     // pairing). Without this alignment the test would exercise the
     // mixed-type path instead — see assertions at `*_calls_checker_*`
     // for the chain UUID derivation.
-    let same_type_uuid = gts::GtsID::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~")
+    let same_type_uuid = gts::GtsId::try_new(CUSTOMER_TENANT_TYPE_ID)
         .expect("valid gts chain")
         .to_uuid();
     repo.state
@@ -2847,7 +2847,7 @@ async fn create_tenant_accepts_same_type_nesting_when_allowed() {
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     // Align root tenant_type_uuid with the chain-derived child UUID —
     // see sibling test for the rationale.
-    let same_type_uuid = gts::GtsID::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~")
+    let same_type_uuid = gts::GtsId::try_new(CUSTOMER_TENANT_TYPE_ID)
         .expect("valid gts chain")
         .to_uuid();
     repo.state

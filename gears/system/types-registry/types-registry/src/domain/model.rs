@@ -78,19 +78,19 @@ impl<C> GtsEntity<C> {
     /// Returns the vendor from the primary segment.
     #[must_use]
     pub fn vendor(&self) -> Option<&str> {
-        self.primary_segment().map(|s| s.vendor.as_str())
+        self.primary_segment().map(GtsIdSegment::vendor)
     }
 
     /// Returns the package from the primary segment.
     #[must_use]
     pub fn package(&self) -> Option<&str> {
-        self.primary_segment().map(|s| s.package.as_str())
+        self.primary_segment().map(GtsIdSegment::package)
     }
 
     /// Returns the namespace from the primary segment.
     #[must_use]
     pub fn namespace(&self) -> Option<&str> {
-        self.primary_segment().map(|s| s.namespace.as_str())
+        self.primary_segment().map(GtsIdSegment::namespace)
     }
 }
 

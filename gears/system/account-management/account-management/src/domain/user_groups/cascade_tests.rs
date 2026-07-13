@@ -43,7 +43,7 @@ use crate::domain::tenant::hooks::HookError;
 // canonical `NotFound` the real RG ladder emits so the cascade hook's
 // `.map_err(ResourceGroupError::from)` idempotent-NotFound dispatch is
 // exercised as in prod.
-#[resource_error("gts.cf.core.resource_group.group.v1~")]
+#[resource_error(gts_id!("cf.core.resource_group.group.v1~"))]
 struct RgErr;
 
 fn rg_not_found(code: &str) -> CanonicalError {

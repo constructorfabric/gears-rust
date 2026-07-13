@@ -357,6 +357,7 @@ mod pg {
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+    use toolkit_gts::gts_id;
     use toolkit_security::SecurityContext;
     use uuid::Uuid;
 
@@ -431,7 +432,8 @@ mod pg {
     // ── seller-type fake (from infra/seller_guard_tests.rs) ────────────────────
     /// The tenant type the boot seller-guard is configured to accept; a
     /// [`FakeReader`] returning it lets `provision` clear the seller gate.
-    pub(super) const SELLER_TYPE: &str = "gts.cf.core.am.tenant_type.v1~seller.v1~";
+    pub(super) const SELLER_TYPE: &str =
+        gts_id!("cf.core.am.tenant_type.v1~cf.bss.ledger.seller.v1~");
 
     /// Canned tenant-type reader (stands in for the AM `get_tenant` adapter).
     /// `Some(t)` resolves every tenant to type `t`; `None` resolves no type
@@ -456,7 +458,7 @@ mod pg {
         SecurityContext::builder()
             .subject_id(Uuid::now_v7())
             .subject_tenant_id(tenant)
-            .subject_type("gts.cf.core.security.subject_user.v1~")
+            .subject_type(gts_id!("cf.core.security.subject_user.v1~"))
             .token_scopes(vec!["*".to_owned()])
             .build()
             .expect("authed SecurityContext")

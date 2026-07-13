@@ -20,7 +20,7 @@ use crate::models::{
 /// Consumers obtain this from `ClientHub`:
 /// ```ignore
 /// let client = hub.get::<dyn ResourceGroupClient>()?;
-/// let rg_type = client.get_type(&ctx, "gts.cf.core.rg.type.v1~...").await?;
+/// let rg_type = client.get_type(&ctx, tenant_resource_group_type).await?;
 /// ```
 ///
 /// # Error envelope

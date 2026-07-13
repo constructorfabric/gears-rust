@@ -5,8 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use toolkit_gts::GTS_ID_URI_PREFIX;
 
-use gts::{GtsID, GtsIdSegment, GtsInstanceId};
+use gts::{GtsId, GtsIdSegment, GtsInstanceId};
 use serde_json::{Map, Value};
 use toolkit_canonical_errors::CanonicalError;
 
@@ -164,9 +165,9 @@ impl GtsTypeSchema {
             _ => {}
         }
         let parsed =
-            GtsID::new(type_id.as_ref()).map_err(|e| invalid_gts_id_error(format!("{e}")))?;
+            GtsId::try_new(type_id.as_ref()).map_err(|e| invalid_gts_id_error(format!("{e}")))?;
         let type_uuid = parsed.to_uuid();
-        let segments = parsed.gts_id_segments;
+        let segments = parsed.segments().to_vec();
         let traits = Self::extract_traits(&raw_schema);
         let traits_schema = Self::extract_traits_schema(&raw_schema);
         let title = Self::extract_title(&raw_schema);
@@ -183,7 +184,7 @@ impl GtsTypeSchema {
         })
     }
 
-    /// Derives the GTS parent's `type_id` by stripping the last `~`-segment.
+    /// Derives the GTS parent's `type_id` from the parsed GTS chain.
     ///
     /// Mirrors gts-rust's chain semantics: for a chained type id like
     /// `gts.cf.core.events.type.v1~x.commerce.orders.order.v1.0~`, the parent
@@ -191,9 +192,11 @@ impl GtsTypeSchema {
     /// type-schemas or for ids that don't end with `~`.
     #[must_use]
     pub fn derive_parent_type_id(type_id: &str) -> Option<GtsTypeId> {
-        let trimmed = type_id.strip_suffix('~')?;
-        let last_tilde = trimmed.rfind('~')?;
-        Some(GtsTypeId::new(&type_id[..=last_tilde]))
+        let parsed = GtsId::try_new(type_id).ok()?;
+        if !parsed.is_type() {
+            return None;
+        }
+        parsed.get_type_id().map(|id| GtsTypeId::new(&id))
     }
 
     /// Reads `x-gts-traits` from the top level of a schema value.
@@ -216,7 +219,7 @@ impl GtsTypeSchema {
         };
         arr.iter()
             .filter_map(|item| item.get("$ref").and_then(|r| r.as_str()))
-            .map(|r| r.strip_prefix("gts://").unwrap_or(r).to_owned())
+            .map(|r| r.strip_prefix(GTS_ID_URI_PREFIX).unwrap_or(r).to_owned())
             .collect()
     }
 
@@ -238,7 +241,7 @@ impl GtsTypeSchema {
     /// Returns the vendor from the primary segment.
     #[must_use]
     pub fn vendor(&self) -> Option<&str> {
-        self.primary_segment().map(|s| s.vendor.as_str())
+        self.primary_segment().map(GtsIdSegment::vendor)
     }
 
     /// Iteration over the inheritance chain (this schema first, then parent,
@@ -454,7 +457,7 @@ fn merge_schema_with_parent(schema: &Value, parent: Option<&GtsTypeSchema>) -> V
                 && obj.len() == 1
                 && let Some(ref_uri) = obj.get("$ref").and_then(|r| r.as_str())
                 && {
-                    let target = ref_uri.strip_prefix("gts://").unwrap_or(ref_uri);
+                    let target = ref_uri.strip_prefix(GTS_ID_URI_PREFIX).unwrap_or(ref_uri);
                     parent.type_id == target
                 } {
                 let mut merged = parent.effective_schema();
@@ -542,9 +545,10 @@ impl GtsInstance {
                 type_schema.type_id
             )));
         }
-        let parsed = GtsID::new(id.as_ref()).map_err(|e| invalid_gts_id_error(format!("{e}")))?;
+        let parsed =
+            GtsId::try_new(id.as_ref()).map_err(|e| invalid_gts_id_error(format!("{e}")))?;
         let uuid = parsed.to_uuid();
-        let segments = parsed.gts_id_segments;
+        let segments = parsed.segments().to_vec();
         Ok(Self {
             uuid,
             id,
@@ -563,11 +567,13 @@ impl GtsInstance {
 
     /// Derives the type-schema (parent type) GTS ID from an instance `id`.
     ///
-    /// Returns everything up to and including the last `~`. `None` when the
-    /// `id` contains no `~`.
+    /// Returns the parsed type-schema segment for the instance id.
     #[must_use]
     pub fn derive_type_id(id: &str) -> Option<GtsTypeId> {
-        id.rfind('~').map(|i| GtsTypeId::new(&id[..=i]))
+        GtsId::try_new(id)
+            .ok()
+            .and_then(|parsed| parsed.get_type_id())
+            .map(|id| GtsTypeId::new(&id))
     }
 
     /// Returns the primary segment (first segment in the chain).
@@ -579,7 +585,7 @@ impl GtsInstance {
     /// Returns the vendor from the primary segment.
     #[must_use]
     pub fn vendor(&self) -> Option<&str> {
-        self.primary_segment().map(|s| s.vendor.as_str())
+        self.primary_segment().map(GtsIdSegment::vendor)
     }
 }
 

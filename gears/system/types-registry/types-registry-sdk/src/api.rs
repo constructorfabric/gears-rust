@@ -17,7 +17,7 @@ use crate::models::{GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, T
 /// This trait can be consumed by other gears via `ClientHub`:
 /// ```ignore
 /// let client = hub.get::<dyn TypesRegistryClient>()?;
-/// let schema = client.get_type_schema("gts.acme.core.events.user.v1~").await?;
+/// let schema = client.get_type_schema(gts_id!("acme.core.events.user.v1~")).await?;
 /// ```
 ///
 /// GTS type-schemas and instances are global resources (not tenant-scoped),

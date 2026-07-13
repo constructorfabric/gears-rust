@@ -3,6 +3,7 @@ use super::*;
 use authz_resolver_sdk::pep::IntoPropertyValue;
 use authz_resolver_sdk::{Action, EvaluationRequestContext, Resource, Subject, TenantContext};
 use std::collections::HashMap;
+use toolkit_gts::gts_id;
 
 fn make_request(require_constraints: bool, tenant_id: Option<Uuid>) -> EvaluationRequest {
     let mut subject_properties = HashMap::new();
@@ -21,7 +22,7 @@ fn make_request(require_constraints: bool, tenant_id: Option<Uuid>) -> Evaluatio
             name: "list".to_owned(),
         },
         resource: Resource {
-            resource_type: "gts.cf.core.users.user.v1~".to_owned(),
+            resource_type: gts_id!("cf.core.users.user.v1~").to_owned(),
             id: None,
             properties: HashMap::new(),
         },
@@ -120,7 +121,7 @@ fn missing_tenant_context_and_subject_property_is_denied() {
             name: "list".to_owned(),
         },
         resource: Resource {
-            resource_type: "gts.cf.core.users.user.v1~".to_owned(),
+            resource_type: gts_id!("cf.core.users.user.v1~").to_owned(),
             id: None,
             properties: HashMap::new(),
         },

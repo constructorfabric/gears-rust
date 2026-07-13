@@ -3,9 +3,10 @@
 //! Shared domain validation utilities.
 
 use crate::domain::error::DomainError;
+use toolkit_gts::gts_id;
 
 /// GTS type path prefix required for resource group types.
-pub const RG_TYPE_PREFIX: &str = "gts.cf.core.rg.type.v1~";
+pub const RG_TYPE_PREFIX: &str = gts_id!("cf.core.rg.type.v1~");
 
 /// Validate a GTS type code: non-empty, correct prefix, length limit.
 ///
@@ -52,7 +53,7 @@ pub fn validate_type_code(code: &str) -> Result<(), DomainError> {
 /// types (e.g. `gts.cf.core.idp.user.v1~`, `gts.cf.vendor.lms.course.v1~`)
 /// and need not live in the RG type-registry namespace.
 ///
-/// Format validation is delegated to [`gts::GtsID::new`], the canonical
+/// Format validation is delegated to [`gts::GtsId::try_new`], the canonical
 /// GTS parser. Only **exact** GTS IDs (`gts.cf.core.idp.user.v1~`) are
 /// accepted; trailing-wildcard patterns (`gts.cf.core.am.*`) are
 /// rejected. `allowed_memberships` entries must resolve to a registered
@@ -64,14 +65,14 @@ pub fn validate_type_code(code: &str) -> Result<(), DomainError> {
 /// Returns [`DomainError::validation`] if the code is not a valid GTS
 /// ID, or if it is a wildcard pattern.
 pub fn validate_membership_type_code(code: &str) -> Result<(), DomainError> {
-    let parsed = gts::GtsID::new(code).map_err(|e| {
-        DomainError::validation(format!("Invalid membership type code '{code}': {e}"))
-    })?;
-    if parsed.gts_id_segments.iter().any(|seg| seg.is_wildcard) {
+    if code.contains('*') {
         return Err(DomainError::validation(format!(
             "Membership type code '{code}' must be a concrete GTS type, not a wildcard pattern"
         )));
     }
+    gts::GtsId::try_new(code).map_err(|e| {
+        DomainError::validation(format!("Invalid membership type code '{code}': {e}"))
+    })?;
     Ok(())
 }
 

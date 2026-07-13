@@ -23,23 +23,27 @@ use serde_json::json;
 use std::sync::Arc;
 use toolkit::{
     ClientHub, Gear,
-    api::{OperationBuilder, operation_builder::LicenseFeature},
+    api::{
+        OperationBuilder,
+        operation_builder::{CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature},
+    },
     config::ConfigProvider,
     context::GearCtx,
     contracts::{ApiGatewayCapability, OpenApiRegistry, RestApiCapability},
 };
 use toolkit_canonical_errors::Problem;
+use toolkit_gts::gts_uri;
 use toolkit_security::SecurityContext;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const UNAUTHENTICATED_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~");
 const SERVICE_UNAVAILABLE_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~";
-const INTERNAL_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~");
+const INTERNAL_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.internal.v1~");
 const PERMISSION_DENIED_TYPE: &str =
-    "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~";
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~");
 const PROBLEM_JSON: &str = "application/problem+json";
 
 async fn problem_from(response: Response) -> Problem {
@@ -144,7 +148,7 @@ struct License;
 
 impl AsRef<str> for License {
     fn as_ref(&self) -> &'static str {
-        "gts.cf.core.lic.feat.v1~cf.core.global.base.v1"
+        CORE_GLOBAL_BASE_LICENSE_FEATURE
     }
 }
 

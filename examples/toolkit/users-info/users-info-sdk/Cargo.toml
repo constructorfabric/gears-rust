@@ -22,6 +22,7 @@ async-trait = { workspace = true }
 
 # Canonical error envelope (re-exported as `UsersInfoError`)
 toolkit-canonical-errors = { workspace = true }
+toolkit-gts = { workspace = true }
 
 # OData macros (for #[derive(ODataFilterable)])
 toolkit-odata-macros = { workspace = true, optional = true }

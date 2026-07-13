@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use time::OffsetDateTime;
+use toolkit_gts::gts_id;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -83,7 +84,7 @@ pub struct DownloadTicket {
 /// Quota metric name used for storage preflight checks.
 /// @cpt-cf-file-storage-fr-storage-quota
 pub(super) const QUOTA_METRIC_NAME: &str =
-    "gts.cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1";
+    gts_id!("cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1");
 
 /// The control-plane file service.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
@@ -152,7 +153,7 @@ impl FileService {
     }
 
     pub(super) fn validate_gts_type(t: &str) -> Result<(), DomainError> {
-        if t.starts_with("gts.") && t.contains('~') {
+        if gts::GtsTypeId::try_new(t).is_ok() {
             Ok(())
         } else {
             Err(DomainError::invalid_gts_type(t))

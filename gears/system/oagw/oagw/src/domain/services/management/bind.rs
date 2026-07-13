@@ -4,11 +4,12 @@ use crate::domain::model::Upstream;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use credstore_sdk::CredStoreClientV1;
+use oagw_sdk::UPSTREAM_SCHEMA;
 use toolkit_security::SecurityContext;
 
 /// Resource type for upstream binding permission checks.
 const UPSTREAM_RESOURCE: ResourceType =
-    ResourceType::from_static("gts.cf.core.oagw.upstream.v1~", &["owner_tenant_id"]);
+    ResourceType::from_static(UPSTREAM_SCHEMA, &["owner_tenant_id"]);
 
 /// Permission action names for ancestor bind checks.
 pub(in crate::domain::services) mod bind_actions {

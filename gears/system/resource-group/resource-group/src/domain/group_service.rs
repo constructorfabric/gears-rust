@@ -16,10 +16,10 @@
 use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
-use resource_group_sdk::TENANT_RG_TYPE_PATH;
 use resource_group_sdk::models::{
     CreateGroupRequest, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
+use resource_group_sdk::{GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
 use toolkit_db::secure::{DBRunner, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{SecurityContext, pep_properties};
@@ -33,7 +33,7 @@ use crate::domain::validation;
 
 /// `AuthZ` resource type descriptor for resource groups.
 pub const RG_GROUP_RESOURCE: ResourceType = ResourceType::from_static(
-    "gts.cf.core.rg.group.v1~",
+    GROUP_RESOURCE_TYPE,
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 

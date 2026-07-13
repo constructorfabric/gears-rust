@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use serde::Deserialize;
+use toolkit_gts::gts_id;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -64,8 +65,8 @@ impl Default for BssLedgerConfig {
 /// Default seller (ledger-owner) tenant types: partner + platform.
 fn default_seller_tenant_types() -> Vec<String> {
     vec![
-        "gts.cf.core.am.tenant_type.v1~vz.ams.tenants.partner.v1~".to_owned(),
-        "gts.cf.core.am.tenant_type.v1~vz.ams.tenants.platform.v1~".to_owned(),
+        gts_id!("cf.core.am.tenant_type.v1~vz.ams.tenants.partner.v1~").to_owned(),
+        gts_id!("cf.core.am.tenant_type.v1~vz.ams.tenants.platform.v1~").to_owned(),
     ]
 }
 

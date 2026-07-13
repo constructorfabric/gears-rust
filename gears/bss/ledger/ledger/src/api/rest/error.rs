@@ -14,7 +14,7 @@ use crate::authz::AuthzError;
 
 /// Stamps `context.resource_type` on the canonical error. GTS id reconciled
 /// with the gear's GTS registration in P7; cosmetic here.
-#[resource_error("gts.cf.bss.ledger.ledger.v1~")]
+#[resource_error(gts_id!("cf.bss.ledger.ledger.v1~"))]
 struct LedgerResourceError;
 
 /// Map an [`AuthzError`] from the PEP gate to a [`CanonicalError`].
