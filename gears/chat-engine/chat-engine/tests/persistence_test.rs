@@ -27,7 +27,6 @@ use std::time::Duration;
 use chat_engine::domain::ports::StreamEventBuffer;
 use chat_engine::domain::service::message_service::{MessageService, SendMessageRequest};
 use chat_engine::domain::service::plugin_service::PluginService;
-use chat_engine::domain::service::session_service::Identity;
 use chat_engine::infra::db::repo::stream_event_repo::SeaStreamEventBuffer;
 use chat_engine_sdk::models::{FileCitation, MessagePartInput, MessagePartType};
 use chat_engine_sdk::{
@@ -42,9 +41,13 @@ use uuid::Uuid;
 
 use common::db::{self, DbHarness};
 use common::{FakePlugin, FakePluginScript};
+use toolkit_security::SecurityContext;
 
-const TENANT_ID: &str = "tenant-it";
-const USER_ID: &str = "user-it";
+// The session repo persists tenant/user as UUIDs, and the mock PDP derives
+// owner constraints from the subject, so the identity strings must be UUIDs
+// that line up across the seeded session, the ctx, and the scoped writes.
+const TENANT_ID: &str = "00000000-0000-0000-0000-0000000000a1";
+const USER_ID: &str = "00000000-0000-0000-0000-0000000000a2";
 
 /// Build a `MessageService` bound to `harness` with `plugin` registered
 /// against `plugin_instance_id`. Mirrors the production wiring in
@@ -54,6 +57,20 @@ fn build_service(
     harness: &DbHarness,
     plugin_instance_id: &str,
     plugin: Arc<dyn ChatEngineBackendPlugin>,
+) -> MessageService {
+    build_service_with_enforcer(
+        harness,
+        plugin_instance_id,
+        plugin,
+        common::authz::enforcer_allow(),
+    )
+}
+
+fn build_service_with_enforcer(
+    harness: &DbHarness,
+    plugin_instance_id: &str,
+    plugin: Arc<dyn ChatEngineBackendPlugin>,
+    enforcer: authz_resolver_sdk::pep::PolicyEnforcer,
 ) -> MessageService {
     let hub = Arc::new(ClientHub::new());
     hub.register_scoped::<dyn ChatEngineBackendPlugin>(
@@ -67,6 +84,7 @@ fn build_service(
         Arc::clone(&harness.session_types),
         Arc::clone(&harness.messages),
         plugins,
+        enforcer,
     )
 }
 
@@ -86,8 +104,12 @@ fn make_request(session_id: Uuid) -> SendMessageRequest {
     }
 }
 
-fn make_identity() -> Identity {
-    Identity::new(TENANT_ID, USER_ID, None).unwrap()
+fn make_ctx() -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(USER_ID.parse().unwrap())
+        .subject_tenant_id(TENANT_ID.parse().unwrap())
+        .build()
+        .unwrap()
 }
 
 // ===========================================================================
@@ -125,7 +147,7 @@ async fn cancel_after_partial_chunks_persists_is_complete_false_against_sqlite()
 
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .send_message(make_request(session_id), make_identity(), cancel.clone())
+        .send_message(make_request(session_id), &make_ctx(), cancel.clone())
         .await
         .expect("send_message dispatch");
 
@@ -241,7 +263,7 @@ async fn multi_part_user_message_round_trips_in_order_against_sqlite() {
 
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .send_message(req, make_identity(), cancel)
+        .send_message(req, &make_ctx(), cancel)
         .await
         .expect("send_message dispatch");
     while stream.next().await.is_some() {}
@@ -309,7 +331,7 @@ async fn assistant_file_citation_persists_against_sqlite() {
 
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .send_message(make_request(session_id), make_identity(), cancel)
+        .send_message(make_request(session_id), &make_ctx(), cancel)
         .await
         .expect("send_message dispatch");
     while stream.next().await.is_some() {}
@@ -357,7 +379,7 @@ async fn send_message_stamps_tenant_and_author_against_sqlite() {
 
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .send_message(make_request(session_id), make_identity(), cancel)
+        .send_message(make_request(session_id), &make_ctx(), cancel)
         .await
         .expect("send_message dispatch");
     while stream.next().await.is_some() {}
@@ -416,7 +438,7 @@ async fn pre_stream_timeout_persists_finish_reason_against_sqlite() {
 
     let cancel = CancellationToken::new();
     let Err(err) = svc
-        .send_message(make_request(session_id), make_identity(), cancel)
+        .send_message(make_request(session_id), &make_ctx(), cancel)
         .await
     else {
         panic!("pre-stream timeout must surface as Err");
@@ -484,7 +506,7 @@ async fn soft_deleted_session_rejects_send_against_sqlite() {
 
     let cancel = CancellationToken::new();
     let Err(err) = svc
-        .send_message(make_request(session_id), make_identity(), cancel)
+        .send_message(make_request(session_id), &make_ctx(), cancel)
         .await
     else {
         panic!("soft_deleted session must reject send_message");
@@ -562,39 +584,42 @@ async fn delete_message_subtree_removes_whole_tree_against_sqlite() {
 }
 
 // ===========================================================================
-// 5. Auth scoping — a different tenant calling send_message on the same
-//    session id must 404 (anti-enumeration). No DB mutation.
+// 5. Auth scoping — a send the PDP denies (e.g. a cross-tenant caller) must
+//    fail closed to Forbidden and mutate nothing. send_message gates at the
+//    parent-session PDP decision (no scoped re-read), so a denied decision is
+//    a 403, not a 404. The always-allow mock cannot model cross-tenant here,
+//    so we drive the deny path directly with a deny-all enforcer.
 // ===========================================================================
 
 #[tokio::test]
-async fn cross_tenant_send_returns_not_found_against_sqlite() {
+async fn pdp_denied_send_returns_forbidden_and_writes_nothing_against_sqlite() {
     let harness = db::setup_sqlite().await;
-    let plugin_id = "cross-tenant-plugin";
+    let plugin_id = "denied-send-plugin";
     let session_type_id = db::seed_session_type(&harness, plugin_id).await;
     let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
 
     let plugin = FakePlugin::new(plugin_id, FakePluginScript::Events(vec![]));
     let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-    let svc = build_service(&harness, plugin_id, plugin_dyn);
+    let svc =
+        build_service_with_enforcer(&harness, plugin_id, plugin_dyn, common::authz::enforcer_deny());
 
-    let intruder = Identity::new("tenant-other", USER_ID, None).unwrap();
     let cancel = CancellationToken::new();
     let Err(err) = svc
-        .send_message(make_request(session_id), intruder, cancel)
+        .send_message(make_request(session_id), &make_ctx(), cancel)
         .await
     else {
-        panic!("cross-tenant send must reject");
+        panic!("PDP-denied send must reject");
     };
     let dbg = format!("{err:?}");
     assert!(
-        dbg.contains("NotFound"),
-        "cross-tenant send must surface as NotFound (anti-enumeration), got {dbg}",
+        dbg.contains("Forbidden"),
+        "a PDP-denied send must fail closed to Forbidden, got {dbg}",
     );
 
     let rows = db::list_messages(&harness.db, session_id).await;
     assert!(
         rows.is_empty(),
-        "cross-tenant rejected send must not insert any messages; got {rows:?}",
+        "a rejected send must not insert any messages; got {rows:?}",
     );
 }
 
@@ -637,7 +662,7 @@ async fn dropped_client_stream_still_completes_generation_against_sqlite() {
 
     let cancel = CancellationToken::new();
     let stream = svc
-        .send_message(make_request(session_id), make_identity(), cancel)
+        .send_message(make_request(session_id), &make_ctx(), cancel)
         .await
         .expect("send_message dispatch");
     // Simulate a client that disconnects immediately: drop the response stream
@@ -709,7 +734,7 @@ async fn streamed_parts_and_metadata_persist_against_sqlite() {
 
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .send_message(make_request(session_id), make_identity(), cancel)
+        .send_message(make_request(session_id), &make_ctx(), cancel)
         .await
         .expect("send_message dispatch");
     while stream.next().await.is_some() {}
@@ -796,12 +821,13 @@ async fn streamed_events_are_buffered_for_resume_against_sqlite() {
         Arc::clone(&harness.session_types),
         Arc::clone(&harness.messages),
         plugins,
+        common::authz::enforcer_allow(),
     )
     .with_stream_buffer(Arc::clone(&buffer));
 
     let cancel = CancellationToken::new();
     let mut stream = svc
-        .send_message(make_request(session_id), make_identity(), cancel)
+        .send_message(make_request(session_id), &make_ctx(), cancel)
         .await
         .expect("send_message dispatch");
     while stream.next().await.is_some() {}
