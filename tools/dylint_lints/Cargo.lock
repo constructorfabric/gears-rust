@@ -1239,6 +1239,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "de0904_no_hardcoded_gts_prefix"
+version = "0.1.0"
+dependencies = [
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "clippy_utils",
+ "dylint_linting",
+ "dylint_testing",
+ "gts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "de1101_tests_in_separate_files"
 version = "0.1.0"
 dependencies = [

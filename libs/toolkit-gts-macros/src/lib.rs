@@ -51,16 +51,46 @@ fn is_prefix_macro_path(path: &syn::Path) -> bool {
         .is_some_and(|seg| seg.ident == PREFIX_MACRO)
 }
 
-/// Extract a full-id `LitStr` from an expression that is either a plain
-/// string literal or the `gts_id!("<suffix>")` marker form. Mirrors
-/// upstream's `gts_id_lit_from_expr` so the wrapper accepts exactly the
-/// same input shapes as the underlying macros.
-fn lit_from_id_expr(expr: &syn::Expr) -> syn::Result<LitStr> {
+/// A GTS ID written either as a full literal or as the prefix-safe
+/// `gts_id!("<suffix>")` marker.
+///
+/// Keep this distinction until code generation. In particular, inventory
+/// registrations must re-emit the marker rather than a proc-macro-created
+/// full literal: that keeps `GTS_ID_PREFIX` configurable at the consuming
+/// crate's compile time and avoids materialising a hard-coded prefix in
+/// generated code.
+enum GtsIdInput {
+    Literal(LitStr),
+    PrefixMacro(LitStr),
+}
+
+impl GtsIdInput {
+    /// Full literal used only for compile-time metadata calculations.
+    fn full_lit(&self) -> LitStr {
+        match self {
+            Self::Literal(lit) => lit.clone(),
+            Self::PrefixMacro(suffix) => build_prefixed_lit(suffix),
+        }
+    }
+
+    /// Expression emitted into generated Rust code.
+    fn emitted_expr(&self, crate_path: &TokenStream2) -> TokenStream2 {
+        match self {
+            Self::Literal(lit) => quote!(#lit),
+            Self::PrefixMacro(suffix) => quote!(#crate_path::gts_id!(#suffix)),
+        }
+    }
+}
+
+/// Parse an expression that is either a plain string literal or the
+/// `gts_id!("<suffix>")` marker form. Mirrors upstream's accepted input
+/// shapes while retaining the marker for generated code.
+fn parse_gts_id_input(expr: &syn::Expr) -> syn::Result<GtsIdInput> {
     match expr {
         syn::Expr::Lit(syn::ExprLit {
             lit: syn::Lit::Str(s),
             ..
-        }) => Ok(s.clone()),
+        }) => Ok(GtsIdInput::Literal(s.clone())),
         syn::Expr::Macro(syn::ExprMacro { mac, .. }) if is_prefix_macro_path(&mac.path) => {
             let suffix: LitStr = mac.parse_body().map_err(|_| {
                 syn::Error::new_spanned(
@@ -71,7 +101,7 @@ fn lit_from_id_expr(expr: &syn::Expr) -> syn::Result<LitStr> {
                     ),
                 )
             })?;
-            Ok(build_prefixed_lit(&suffix))
+            Ok(GtsIdInput::PrefixMacro(suffix))
         }
         other => Err(syn::Error::new_spanned(
             other,
@@ -137,9 +167,9 @@ fn instance_id_prefix(instance_id: &LitStr) -> LitStr {
 /// `InventoryTypeSchema::type_id` — the only piece of information the
 /// wrapper needs from the attribute. Everything else is forwarded verbatim
 /// and parsed by upstream. Both the literal and the `gts_id!("<suffix>")`
-/// marker forms are accepted; the marker form is expanded here to the
-/// full id by prepending the compile-time `GTS_ID_PREFIX`.
-fn extract_type_id(attr: &TokenStream2) -> syn::Result<LitStr> {
+/// marker forms are accepted. The marker is retained for the emitted
+/// inventory registration while its full form is used only internally.
+fn extract_type_id(attr: &TokenStream2) -> syn::Result<GtsIdInput> {
     let mut iter = attr.clone().into_iter().peekable();
     while let Some(tt) = iter.next() {
         if let TokenTree::Ident(ident) = &tt
@@ -170,7 +200,7 @@ fn extract_type_id(attr: &TokenStream2) -> syn::Result<LitStr> {
                     ),
                 )
             })?;
-            return lit_from_id_expr(&expr);
+            return parse_gts_id_input(&expr);
         }
     }
     Err(syn::Error::new(
@@ -210,7 +240,8 @@ pub fn gts_type_schema(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn expand_gts_type_schema(attr: &TokenStream2, input: &ItemStruct) -> syn::Result<TokenStream2> {
     let crate_path = resolve_crate_path()?;
-    let type_id_lit = extract_type_id(attr)?;
+    let type_id_input = extract_type_id(attr)?;
+    let type_id = type_id_input.emitted_expr(&crate_path);
     let struct_name = &input.ident;
 
     // Generic structs need turbofish on the schema-fn call. Upstream's
@@ -247,7 +278,7 @@ fn expand_gts_type_schema(attr: &TokenStream2, input: &ItemStruct) -> syn::Resul
 
         #crate_path::inventory::submit! {
             #crate_path::InventoryTypeSchema {
-                type_id: #type_id_lit,
+                type_id: #type_id,
                 schema_fn: || #schema_fn_body,
             }
         }
@@ -430,9 +461,9 @@ impl Parse for InstanceInput {
 /// Reserved field names for the GTS instance-id slot (mirrors upstream).
 const ID_FIELD_NAMES: &[&str] = &["id", "gts_id", "gtsId"];
 
-/// Locate the GTS id field's string literal in a struct expression.
-fn extract_id_literal(instance: &ExprStruct) -> syn::Result<LitStr> {
-    let mut found: Option<LitStr> = None;
+/// Locate the GTS id field in a struct expression.
+fn extract_id_input(instance: &ExprStruct) -> syn::Result<GtsIdInput> {
+    let mut found: Option<GtsIdInput> = None;
     for field in &instance.fields {
         let syn::Member::Named(ident) = &field.member else {
             continue;
@@ -440,14 +471,14 @@ fn extract_id_literal(instance: &ExprStruct) -> syn::Result<LitStr> {
         if !ID_FIELD_NAMES.contains(&ident.to_string().as_str()) {
             continue;
         }
-        let lit_str = lit_from_id_expr(&field.expr)?;
+        let id_input = parse_gts_id_input(&field.expr)?;
         if found.is_some() {
             return Err(syn::Error::new_spanned(
                 field,
                 "ambiguous id field: only one of `id`, `gts_id`, `gtsId` may be set",
             ));
         }
-        found = Some(lit_str);
+        found = Some(id_input);
     }
     found.ok_or_else(|| {
         syn::Error::new_spanned(
@@ -494,8 +525,12 @@ pub fn gts_instance(input: TokenStream) -> TokenStream {
 fn expand_gts_instance(input: TokenStream2) -> syn::Result<TokenStream2> {
     let parsed: InstanceInput = parse2(input)?;
     let crate_path = resolve_crate_path()?;
-    let id_lit = extract_id_literal(&parsed.instance)?;
-    let type_id_lit = instance_id_prefix(&id_lit);
+    let id_input = extract_id_input(&parsed.instance)?;
+    let type_id_lit = instance_id_prefix(&id_input.full_lit());
+    let instance_id = id_input.emitted_expr(&crate_path);
+    // Reconstruct the derived type through `gts_id!` so the generated
+    // inventory literal stays prefix-safe as well.
+    let type_id = quote!(#crate_path::gts_id!(#type_id_lit));
     let instance_struct = &parsed.instance;
     let attrs = &parsed.attrs;
 
@@ -510,8 +545,8 @@ fn expand_gts_instance(input: TokenStream2) -> syn::Result<TokenStream2> {
     let submit_block = quote! {
         #crate_path::inventory::submit! {
             #crate_path::InventoryInstance {
-                type_id: #type_id_lit,
-                instance_id: #id_lit,
+                type_id: #type_id,
+                instance_id: #instance_id,
                 payload_fn: || ::serde_json::to_value(&#payload_call)
                     .expect("GTS instance must serialize cleanly"),
             }
@@ -557,10 +592,10 @@ pub fn gts_instance_raw(input: TokenStream) -> TokenStream {
 
 /// Walk a brace-delimited JSON object literal and locate the top-level
 /// `"id"` key's value, accepting either a plain string literal or the
-/// `gts_id!("...")` marker form. The wrapper needs the value for the
-/// `InventoryInstance` fields; the marker form is expanded to the full
-/// id here by prepending the compile-time `GTS_ID_PREFIX`.
-fn extract_raw_id_literal(body: &TokenStream2) -> syn::Result<LitStr> {
+/// `gts_id!("...")` marker form. The wrapper retains the marker for the
+/// generated `InventoryInstance` fields and only expands it internally when
+/// deriving the instance's type ID.
+fn extract_raw_id_input(body: &TokenStream2) -> syn::Result<GtsIdInput> {
     let mut iter = body.clone().into_iter().peekable();
     while let Some(tt) = iter.next() {
         // Top-level key must be a string literal.
@@ -610,7 +645,7 @@ fn extract_raw_id_literal(body: &TokenStream2) -> syn::Result<LitStr> {
                 ),
             )
         })?;
-        return lit_from_id_expr(&expr);
+        return parse_gts_id_input(&expr);
     }
     Err(syn::Error::new(
         proc_macro2::Span::call_site(),
@@ -680,14 +715,16 @@ fn expand_gts_instance_raw(input: TokenStream2) -> syn::Result<TokenStream2> {
     }
 
     let body_tokens = body_group.stream();
-    let id_lit = extract_raw_id_literal(&body_tokens)?;
-    let type_id_lit = instance_id_prefix(&id_lit);
+    let id_input = extract_raw_id_input(&body_tokens)?;
+    let type_id_lit = instance_id_prefix(&id_input.full_lit());
+    let instance_id = id_input.emitted_expr(&crate_path);
+    let type_id = quote!(#crate_path::gts_id!(#type_id_lit));
 
     Ok(quote! {
         #crate_path::inventory::submit! {
             #crate_path::InventoryInstance {
-                type_id: #type_id_lit,
-                instance_id: #id_lit,
+                type_id: #type_id,
+                instance_id: #instance_id,
                 payload_fn: || #crate_path::__private::upstream_gts_instance_raw!({
                     #body_tokens
                 }),

@@ -1,0 +1,42 @@
+[package]
+name = "de0904_no_hardcoded_gts_prefix"
+version = "0.1.0"
+authors = ["Constructor Fabric"]
+description = "Forbids hard-coded GTS ID prefixes in user-authored source"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "hardcoded_prefix"
+path = "ui/hardcoded_prefix.rs"
+
+[[example]]
+name = "gts_id_marker"
+path = "ui/gts_id_marker.rs"
+
+[[example]]
+name = "macro_markers"
+path = "ui/macro_markers.rs"
+
+[[example]]
+name = "hardcoded_prefix_in_macros"
+path = "ui/hardcoded_prefix_in_macros.rs"
+
+[dependencies]
+clippy_utils.workspace = true
+dylint_linting.workspace = true
+
+[dev-dependencies]
+dylint_testing.workspace = true
+gts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-gts.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true

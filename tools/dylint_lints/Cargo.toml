@@ -20,6 +20,7 @@ members = [
     "de08_rest_api_conventions/de0803_api_snake_case",
     "de09_gts_layer/de0901_gts_string_pattern",
     "de09_gts_layer/de0902_no_schema_for_on_gts_structs",
+    "de09_gts_layer/de0904_no_hardcoded_gts_prefix",
     "de03_domain_layer/de0309_must_have_domain_model",
     "de05_client_layer/de0504_client_versioning",
     "de07_security/de0707_drop_zeroize",
@@ -45,7 +46,7 @@ authors = ["Constructor Fabric"]
 # - DE0201-DE0204: API layer validation (DTOs location, references, derives)
 # - DE0503-DE0504: Client layer validation (naming conventions, versioning)
 # - DE0801-DE0803: REST API conventions (endpoints, odata, snake_case)
-# - DE0901-DE0902: GTS layer validation (string patterns, schema_for)
+# - DE0901-DE0904: GTS layer validation (string patterns, schema_for, prefix safety)
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -64,6 +65,7 @@ utoipa = "5.2"
 toolkit-macros = { package = "cf-gears-toolkit-macros", path = "../../libs/toolkit-macros" }
 toolkit = { package = "cf-gears-toolkit", path = "../../libs/toolkit" }
 toolkit-gts = { package = "cf-gears-toolkit-gts", path = "../../libs/toolkit-gts" }
+toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", path = "../../libs/toolkit-canonical-errors" }
 # GTS library.
 gts = "0.11.0"
 gts-macros = "0.11.0"

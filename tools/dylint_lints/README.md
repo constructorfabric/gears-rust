@@ -54,6 +54,7 @@ make gts-docs-test       # Run unit tests for GTS validator
 - ✅ DE0901: GTS String Pattern Validator (Rust source code)
 - ✅ DE0902: No `schema_for!` on GTS Structs (Rust source code)
 - ✅ DE0903: GTS Documentation Validator (`.md`, `.json`, `.yaml`, `.yml` files)
+- ✅ DE0904: No Hard-Coded GTS Prefix (Rust source code)
 
 ### Error handling (DE10xx)
 - TODO
@@ -227,6 +228,7 @@ GTS (Global Type System) identifiers are validated by complementary tools that c
 | **DE0901** | GTS string patterns in Rust | Dylint (Rust) | `make dylint` |
 | **DE0902** | No `schema_for!` on GTS structs | Dylint (Rust) | `make dylint` |
 | **DE0903** | GTS in docs (`.md`, `.json`, `.yaml`, `.yml`) | Rust CLI | `make gts-docs` |
+| **DE0904** | Hard-coded `gts.` prefix in Rust source | Dylint (pre-expansion) | `make dylint` |
 
 ### DE0901: GTS String Pattern Validator
 
@@ -276,6 +278,19 @@ gts-validator --vendor cf,vendor,example,fabrikam --exclude "target/*" docs gear
 **Exit codes:**
 - `0` - All GTS identifiers are valid
 - `1` - Invalid GTS identifiers found (fails CI)
+
+### DE0904: No Hard-Coded GTS Prefix
+
+A pre-expansion Dylint lint that rejects user-authored GTS IDs beginning
+with `gts.`. Use `gts_id!("<suffix>")` instead, so `GTS_ID_PREFIX` is
+resolved in the consuming crate.
+
+The pre-expansion phase is intentional: it checks a `gts_type_schema`,
+`gts_instance`, or `resource_error` invocation before ToolKit wrapper macros
+emit inventory registrations and error-builder methods. Generated code is not
+reported as a false positive.
+
+**Location:** [`de09_gts_layer/de0904_no_hardcoded_gts_prefix/`](de09_gts_layer/de0904_no_hardcoded_gts_prefix/)
 
 ### GTS Identifier Format
 

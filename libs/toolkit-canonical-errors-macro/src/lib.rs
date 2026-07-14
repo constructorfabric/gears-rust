@@ -27,20 +27,30 @@ use syn::parse_macro_input;
 /// Generated constructors either accept a detail string or are zero-argument
 /// (using a default message). Each returns a `ResourceErrorBuilder` with
 /// typestate enforcement.
-#[proc_macro_attribute]
-pub fn resource_error(attr: TokenStream, item: TokenStream) -> TokenStream {
-    // Accept either a plain full-id string literal
-    // or the `gts_id!("<suffix>")` marker form to avoid hard-coding the
-    // configured GTS ID prefix. The marker form is expanded here by
-    // prepending `gts_id::GTS_ID_PREFIX` (the compile-time configured
-    // prefix); a plain literal is taken verbatim and must already include
-    // the full prefix.
-    let attr_ts: proc_macro2::TokenStream = attr.into();
-    let gts_lit: LitStr = match syn::parse2::<syn::Expr>(attr_ts) {
+enum ResourceTypeInput {
+    Literal(LitStr),
+    PrefixMacro(LitStr),
+}
+
+impl ResourceTypeInput {
+    /// Full literal used only for validation performed by this proc macro.
+    fn full_lit(&self) -> LitStr {
+        match self {
+            Self::Literal(lit) => lit.clone(),
+            Self::PrefixMacro(suffix) => LitStr::new(
+                &format!("{}{}", gts_id::GTS_ID_PREFIX, suffix.value()),
+                suffix.span(),
+            ),
+        }
+    }
+}
+
+fn parse_resource_type_input(attr: TokenStream2) -> syn::Result<ResourceTypeInput> {
+    match syn::parse2::<syn::Expr>(attr) {
         Ok(syn::Expr::Lit(syn::ExprLit {
             lit: syn::Lit::Str(s),
             ..
-        })) => s,
+        })) => Ok(ResourceTypeInput::Literal(s)),
         Ok(syn::Expr::Macro(syn::ExprMacro { mac, .. }))
             if mac
                 .path
@@ -48,31 +58,37 @@ pub fn resource_error(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .last()
                 .is_some_and(|seg| seg.ident == "gts_id") =>
         {
-            let suffix: LitStr = if let Ok(s) = mac.parse_body() {
-                s
-            } else {
-                let err = syn::Error::new_spanned(
+            let suffix: LitStr = mac.parse_body().map_err(|_| {
+                syn::Error::new_spanned(
                     mac,
                     "`gts_id!` takes a single string-literal suffix, \
                      e.g. `gts_id!(\"cf.core.users.user.v1~\")`",
-                );
-                return err.to_compile_error().into();
-            };
-            LitStr::new(
-                &format!("{}{}", gts_id::GTS_ID_PREFIX, suffix.value()),
-                suffix.span(),
-            )
+                )
+            })?;
+            Ok(ResourceTypeInput::PrefixMacro(suffix))
         }
-        Ok(other) => {
-            let err =
-                syn::Error::new_spanned(other, "expected a string literal or `gts_id!(\"...\")`");
-            return err.to_compile_error().into();
-        }
+        Ok(other) => Err(syn::Error::new_spanned(
+            other,
+            "expected a string literal or `gts_id!(\"...\")`",
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+#[proc_macro_attribute]
+pub fn resource_error(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Accept either a plain full-id string literal
+    // or the `gts_id!("<suffix>")` marker form to avoid hard-coding the
+    // configured GTS ID prefix. It is materialised inside this macro, so
+    // callers do not need a direct `toolkit-gts` dependency.
+    let attr_ts: proc_macro2::TokenStream = attr.into();
+    let resource_type = match parse_resource_type_input(attr_ts) {
+        Ok(input) => input,
         Err(e) => return e.to_compile_error().into(),
     };
     let input = parse_macro_input!(item as syn::ItemStruct);
 
-    match generate_resource_error(&gts_lit, &input) {
+    match generate_resource_error(&resource_type, &input) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -128,7 +144,11 @@ fn resolve_crate_path(gts_lit: &LitStr) -> syn::Result<TokenStream2> {
     }
 }
 
-fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Result<TokenStream2> {
+fn generate_resource_error(
+    resource_type: &ResourceTypeInput,
+    input: &syn::ItemStruct,
+) -> syn::Result<TokenStream2> {
+    let gts_lit = resource_type.full_lit();
     let gts_type = gts_lit.value();
     validate_gts_resource_type_str(&gts_type, gts_lit.span())?;
 
@@ -145,7 +165,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
         ));
     }
 
-    let crate_path = resolve_crate_path(gts_lit)?;
+    let crate_path = resolve_crate_path(&gts_lit)?;
 
     let vis = &input.vis;
     let name = &input.ident;
@@ -162,7 +182,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NoContext,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__not_found(#gts_type, detail)
+                #crate_path::ResourceErrorBuilder::__not_found(#gts_lit, detail)
             }
 
             #vis fn already_exists(detail: impl Into<String>)
@@ -171,7 +191,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NoContext,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__already_exists(#gts_type, detail)
+                #crate_path::ResourceErrorBuilder::__already_exists(#gts_lit, detail)
             }
 
             #vis fn data_loss(detail: impl Into<String>)
@@ -180,7 +200,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NoContext,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__data_loss(#gts_type, detail)
+                #crate_path::ResourceErrorBuilder::__data_loss(#gts_lit, detail)
             }
 
             // --- resource_name optional ---
@@ -191,7 +211,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NeedsReason,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__aborted(#gts_type, detail)
+                #crate_path::ResourceErrorBuilder::__aborted(#gts_lit, detail)
             }
 
             #vis fn unknown(detail: impl Into<String>)
@@ -200,7 +220,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NoContext,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__unknown(#gts_type, detail)
+                #crate_path::ResourceErrorBuilder::__unknown(#gts_lit, detail)
             }
 
             #vis fn deadline_exceeded(detail: impl Into<String>)
@@ -209,7 +229,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NoContext,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__deadline_exceeded(#gts_type, detail)
+                #crate_path::ResourceErrorBuilder::__deadline_exceeded(#gts_lit, detail)
             }
 
             // --- resource_name absent ---
@@ -220,7 +240,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NeedsReason,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__permission_denied(#gts_type, "You do not have permission to perform this operation")
+                #crate_path::ResourceErrorBuilder::__permission_denied(#gts_lit, "You do not have permission to perform this operation")
             }
 
             #vis fn unimplemented(detail: impl Into<String>)
@@ -229,7 +249,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NoContext,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__unimplemented(#gts_type, detail)
+                #crate_path::ResourceErrorBuilder::__unimplemented(#gts_lit, detail)
             }
 
             #vis fn cancelled()
@@ -238,7 +258,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NoContext,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__cancelled(#gts_type, "Operation cancelled by the client")
+                #crate_path::ResourceErrorBuilder::__cancelled(#gts_lit, "Operation cancelled by the client")
             }
 
             // --- resource_name optional, needs field violations ---
@@ -249,7 +269,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NeedsFieldViolation,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__invalid_argument(#gts_type, "Request validation failed")
+                #crate_path::ResourceErrorBuilder::__invalid_argument(#gts_lit, "Request validation failed")
             }
 
             #vis fn out_of_range(detail: impl Into<String>)
@@ -258,7 +278,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NeedsFieldViolation,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__out_of_range(#gts_type, detail)
+                #crate_path::ResourceErrorBuilder::__out_of_range(#gts_lit, detail)
             }
 
             // --- resource_name optional, needs quota violations ---
@@ -269,7 +289,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NeedsQuotaViolation,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__resource_exhausted(#gts_type, detail)
+                #crate_path::ResourceErrorBuilder::__resource_exhausted(#gts_lit, detail)
             }
 
             // --- resource_name optional, needs precondition violations ---
@@ -280,7 +300,7 @@ fn generate_resource_error(gts_lit: &LitStr, input: &syn::ItemStruct) -> syn::Re
                     #crate_path::builder::NeedsPreconditionViolation,
                 >
             {
-                #crate_path::ResourceErrorBuilder::__failed_precondition(#gts_type, "Operation precondition not met")
+                #crate_path::ResourceErrorBuilder::__failed_precondition(#gts_lit, "Operation precondition not met")
             }
         }
     })

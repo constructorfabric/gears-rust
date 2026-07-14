@@ -424,10 +424,9 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run dylint tests
-        working-directory: tools/dylint_lints
         env:
           RUSTFLAGS: "-C debuginfo=0"
-        run: cargo test
+        run: make dylint-test
 
       - name: Run dylint on all crates
         run: make dylint
