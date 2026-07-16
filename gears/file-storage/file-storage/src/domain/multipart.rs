@@ -95,8 +95,10 @@ pub struct CompletedMultipartUpload {
 /// `upload_url` on each [`MissingPart`] is only populated while the session
 /// is still `in_progress` and unexpired -- a terminal (`completed`/`aborted`)
 /// or expired session reports state and part accounting only, no resume
-/// URLs (there is nothing left to resume, or the plan's tokens would outlive
-/// the session's own `expires_at` bound).
+/// URLs (there is nothing left to resume). Each minted resume URL's `exp` is
+/// capped at `min(session.expires_at, now + url_ttl_secs)`: it never outlives
+/// the session, but it also never gets a longer TTL than any freshly-minted
+/// URL just because the session itself is long-lived.
 ///
 /// @cpt-cf-file-storage-fr-multipart-upload
 #[domain_model]
@@ -136,8 +138,9 @@ pub struct MissingPart {
     pub offset: u64,
     pub size: u64,
     /// `Some` only for a live, unexpired `in_progress` session; its token
-    /// `exp` is capped at the session's own `expires_at` rather than a fresh
-    /// full TTL, so a resume URL never outlives the session it resumes.
+    /// `exp` is `min(session.expires_at, now + url_ttl_secs)` -- the same
+    /// short URL TTL as any freshly-minted part URL, additionally capped so
+    /// it never outlives the session it resumes.
     pub upload_url: Option<String>,
 }
 
