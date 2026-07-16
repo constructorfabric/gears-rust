@@ -15,6 +15,12 @@
 //! crash). Step (4) is best-effort: if directory fsync is unsupported or
 //! fails, a warning is logged and `put` still returns `Ok`, since the blob
 //! itself is already durably in place after the rename.
+//!
+//! `publish_exclusive` (the sidecar's single-shot upload path) follows the
+//! same write-to-temp-then-publish shape, but its publish step is a
+//! `std::fs::hard_link` instead of a `rename` — see
+//! [`StorageBackend::publish_exclusive`] for why a `PUT` token replay must
+//! not be allowed to overwrite an already-published object.
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +35,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::infra::content::hash;
 
-use super::{BackendCapabilities, StorageBackend};
+use super::{BackendCapabilities, PublishOutcome, StorageBackend};
 
 /// Filesystem-backed blob store rooted at a configured directory.
 pub struct LocalFsBackend {
@@ -135,6 +141,71 @@ impl LocalFsBackend {
         Ok(())
     }
 
+    /// Atomically publish an already-written-and-fsynced temp file at
+    /// `target` **iff `target` does not already exist** (create-exclusive —
+    /// P2 remediation, replay-`PUT` overwrite fix; see
+    /// [`StorageBackend::publish_exclusive`]'s doc comment for why this must
+    /// not silently replace an existing object like [`Self::publish_tmp`]
+    /// does).
+    ///
+    /// `std::fs::hard_link` creates a second directory entry pointing at
+    /// `tmp`'s inode and, per POSIX `link(2)`, atomically fails with
+    /// `AlreadyExists` if `target` already names something — unlike
+    /// `rename`, which would silently replace it. On success, `tmp`'s own
+    /// directory entry is then removed (the data now lives solely under
+    /// `target`; the underlying inode is not freed since a link still refers
+    /// to it) and the parent directory is best-effort fsynced exactly like
+    /// `publish_tmp`.
+    ///
+    /// Returns `Ok(true)` if this call created `target`, `Ok(false)` if
+    /// `target` already existed — the caller is responsible for cleaning up
+    /// `tmp` in that case (this method never touches `tmp` on the
+    /// already-exists path, so a caller that wants to inspect it first
+    /// still can).
+    async fn publish_tmp_exclusive(
+        &self,
+        tmp: &Path,
+        target: &Path,
+        parent: Option<&Path>,
+    ) -> Result<bool, DomainError> {
+        match tokio::fs::hard_link(tmp, target).await {
+            Ok(()) => {
+                self.finish_exclusive_publish(tmp, parent).await;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(self.io_err(e)),
+        }
+    }
+
+    /// Best-effort cleanup + durability tail of a successful hard-link
+    /// publish: remove the temp file's own directory entry (the data now
+    /// lives solely under `target`, via the hard link) and fsync the parent
+    /// directory, mirroring `publish_tmp`'s own post-rename tail. Both steps
+    /// are best-effort and only logged on failure, never fatal — split out
+    /// of `publish_tmp_exclusive` to keep its own cognitive complexity down.
+    async fn finish_exclusive_publish(&self, tmp: &Path, parent: Option<&Path>) {
+        // Best-effort: a failure here just leaves a harmless extra link,
+        // cleaned up like any other stray `*.tmp.*` by the
+        // orphan-reconciliation sweep.
+        if let Err(e) = tokio::fs::remove_file(tmp).await {
+            tracing::warn!(
+                error = ?e,
+                "failed to remove temp file's directory entry after hard-link publish"
+            );
+        }
+
+        if self.fsync_parent_dir
+            && let Some(parent) = parent
+            && let Err(e) = self.fsync_dir(parent).await
+        {
+            tracing::warn!(
+                error = ?e,
+                "parent-dir fsync failed or unsupported by this filesystem, continuing"
+            );
+        }
+    }
+
     /// Stream `stream`'s chunks into `tmp`, hashing incrementally and
     /// aborting (without waiting for the rest of the stream) the moment the
     /// running byte count exceeds `max_size`. Returns `(bytes_written,
@@ -234,6 +305,58 @@ impl StorageBackend for LocalFsBackend {
 
         self.publish_tmp(&tmp, &target, parent.as_deref()).await?;
         Ok((bytes_written, digest))
+    }
+
+    /// Create-exclusive publish (P2 remediation — replay-`PUT` overwrite
+    /// fix). Writes + hashes the stream into a temp file exactly like
+    /// `put_stream`, but publishes it via [`Self::publish_tmp_exclusive`]
+    /// (hard-link, atomically fails on an existing target) instead of
+    /// `publish_tmp`'s unconditional rename. See
+    /// [`StorageBackend::publish_exclusive`] for the full contract.
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        let (target, parent) = self.prepare_target(path).await?;
+        let tmp = Self::tmp_path_for(&target);
+
+        let write_result = self.write_stream_to_tmp(&tmp, stream, max_size).await;
+        let (bytes_written, digest) = match write_result {
+            Ok(v) => v,
+            Err(e) => {
+                drop(tokio::fs::remove_file(&tmp).await);
+                return Err(e);
+            }
+        };
+
+        match self
+            .publish_tmp_exclusive(&tmp, &target, parent.as_deref())
+            .await
+        {
+            Ok(true) => Ok(PublishOutcome {
+                bytes_written,
+                digest,
+                created: true,
+            }),
+            Ok(false) => {
+                // The destination already existed: it was never touched.
+                // `tmp` still holds this attempt's freshly-written (but
+                // never linked) bytes and must be cleaned up like any other
+                // rejected upload.
+                drop(tokio::fs::remove_file(&tmp).await);
+                Ok(PublishOutcome {
+                    bytes_written,
+                    digest,
+                    created: false,
+                })
+            }
+            Err(e) => {
+                drop(tokio::fs::remove_file(&tmp).await);
+                Err(e)
+            }
+        }
     }
 
     async fn get(&self, path: &str) -> Result<Bytes, DomainError> {

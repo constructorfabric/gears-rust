@@ -239,9 +239,16 @@ pub async fn list_files(
     let files = svc
         .list_files(&ctx, owner, q.limit, q.offset.unwrap_or(0))
         .await?;
+    // Batched (one `IN (...)` query for the whole page) rather than one
+    // `list_metadata` call per file — see `FileService::list_files_with_metadata`.
+    let file_ids: Vec<Uuid> = files.iter().map(|f| f.file_id).collect();
+    let mut metadata_by_file = svc.list_metadata_for_files(&file_ids).await?;
     let items = files
         .into_iter()
-        .map(|f| FileDto::from_parts(f, vec![]))
+        .map(|f| {
+            let meta = metadata_by_file.remove(&f.file_id).unwrap_or_default();
+            FileDto::from_parts(f, meta)
+        })
         .collect();
     Ok(Json(FileDtoList(items)))
 }
@@ -836,6 +843,20 @@ pub async fn report_multipart_part(
 
     let hash_value = hex::decode(&req.hash_hex)
         .map_err(|_| DomainError::validation("hash_hex", "must be valid hex-encoded SHA-256"))?;
+    // Bug fix (integrity remediation): `finalize_version` above already
+    // rejects a hash that does not decode to exactly 32 bytes; this route
+    // must mirror that check — otherwise a wrong-length hash is accepted
+    // here with a `204`, gets persisted unchecked by
+    // `MultipartService::report_part`, and only surfaces later as an opaque
+    // `400` at `complete` (against the wrong actor: whoever happens to call
+    // `complete`, not the caller that actually reported the bad hash).
+    if hash_value.len() != 32 {
+        return Err(DomainError::validation(
+            "hash_hex",
+            "must decode to exactly 32 bytes (SHA-256)",
+        )
+        .into());
+    }
 
     msvc.report_part(&claims, req.backend_etag, hash_value, req.size)
         .await?;
