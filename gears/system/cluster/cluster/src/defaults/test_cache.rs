@@ -163,18 +163,6 @@ impl MemoryCache {
         )
     }
 
-    /// A linearizable cache with no prefix watch whose `watch_prefix` suspends
-    /// once before returning `Unsupported`, so two concurrent `register`s
-    /// interleave deterministically at the maintainer-startup await.
-    pub(super) fn linearizable_without_prefix_watch_slow() -> Arc<Self> {
-        Self::spawn_full(
-            CacheConsistency::Linearizable,
-            false,
-            WatchBehavior::Normal,
-            true,
-        )
-    }
-
     fn spawn(consistency: CacheConsistency, prefix_watch: bool) -> Arc<Self> {
         Self::spawn_with(consistency, prefix_watch, WatchBehavior::Normal)
     }

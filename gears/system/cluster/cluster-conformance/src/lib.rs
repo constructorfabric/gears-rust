@@ -56,18 +56,22 @@
 
 pub mod cache;
 pub mod discovery;
+pub mod factory;
 pub mod fixture;
 pub mod leader;
 pub mod lock;
 pub mod model;
 pub mod restart;
+pub mod time;
 pub mod watch_lifecycle;
 
 pub use cache::run_cache_conformance;
 pub use discovery::run_discovery_conformance;
+pub use factory::ScenarioBackend;
 pub use fixture::MemCache;
 pub use leader::run_leader_conformance;
 pub use lock::run_lock_conformance;
 pub use model::{CacheModel, CacheOp, VersionTarget, replay_against_model};
 pub use restart::run_restart_conformance;
+pub use time::TimeControl;
 pub use watch_lifecycle::run_watch_lifecycle_conformance;

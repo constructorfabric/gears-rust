@@ -5,8 +5,8 @@ extern crate rustc_ast;
 
 use clippy_utils::diagnostics::span_lint_and_then;
 use lint_utils::{
-    is_in_cf_gears_server_path, is_in_contract_module_ast, is_in_toolkit_db_path,
-    use_tree_to_strings,
+    is_in_cf_gears_server_path, is_in_contract_module_ast, is_in_postgres_cluster_plugin_path,
+    is_in_toolkit_db_path, use_tree_to_strings,
 };
 use rustc_ast::{Item, ItemKind, Ty, TyKind};
 use rustc_lint::{EarlyLintPass, LintContext};
@@ -29,6 +29,13 @@ dylint_linting::declare_early_lint! {
     ///
     /// This lint does NOT apply to `libs/toolkit-db/` which is the internal
     /// wrapper library that provides the Sea-ORM/SecORM abstraction layer.
+    ///
+    /// It also does NOT apply to
+    /// `gears/system/cluster/plugins/postgres-cluster-plugin/`, which needs
+    /// session-pinned advisory locks, `LISTEN`/`NOTIFY` streaming, and
+    /// `PgPoolOptions` connect/acquire hooks — none of which have a Sea-ORM
+    /// equivalent (see `lint_utils::is_in_postgres_cluster_plugin_path` for the
+    /// full rationale, and `gears/system/cluster/docs/DESIGN.md` §3.5).
     ///
     /// ### Example
     ///
@@ -185,6 +192,14 @@ impl EarlyLintPass for De0706NoDirectSqlx {
 
         // Skip apps/cf-gears-example-server/ - it needs sqlx driver linkage workaround
         if is_in_cf_gears_server_path(cx.sess().source_map(), item.span) {
+            return;
+        }
+
+        // Skip gears/system/cluster/plugins/postgres-cluster-plugin/ - it needs
+        // session-pinned advisory locks, LISTEN/NOTIFY, and PgPoolOptions
+        // connect/acquire hooks that have no Sea-ORM equivalent (see
+        // is_in_postgres_cluster_plugin_path doc comment for the full rationale)
+        if is_in_postgres_cluster_plugin_path(cx.sess().source_map(), item.span) {
             return;
         }
 
